@@ -75,7 +75,7 @@ second sweep hands the same bytes back again.
       id: 'session-ttl',
       title: 'The session expires after 24 hours',
       detail:
-        '`session:{upload_id}` gets its `EXPIRE` of 86400 seconds when it opens, in the same script, so an abandoned upload stops existing and the sweep can release its reservation.',
+        '`session:{upload_id}` gets its `EXPIRE` of 86400 seconds when it opens, in the same script, so an abandoned upload stops existing and the sweep can release its reservation; acknowledging a part does not extend it.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /SESSION_TTL_S\s*=\s*86400/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /SESSION_TTL_S\s*=\s*86400/]},
@@ -865,31 +865,49 @@ long long sweep(const std::string& tenant) {
     return int(ctx.redis.get(f"quota:used:{tenant}") or 0)
 
 
+def _snapshot(ctx, tenant="t1"):
+    return ctx.redis.zrange(f"quota:reservations:{tenant}", 0, -1), {k: ctx.redis.ttl(k) for k in ctx.redis.keys("session:*")}
+
+
 def check_reserve_atomic(ctx):
     m = ctx.load("state")
     ctx.redis.set("quota:limit:t1", 100)
-    # A second upload of the same tenant lands while this one is reserving.
-    rival = ctx.redis_after("quota:used:t1", lambda: m.open_session("t1", 60, "image/png", "b.png"))
+    # A second upload of the same tenant lands while this one is reserving; first, what the reservation left.
+    def rival_upload():
+        seen = _snapshot(ctx)
+        return seen, m.open_session("t1", 60, "image/png", "b.png")
+
+    rival = ctx.redis_after("quota:used:t1", rival_upload)
     mine = m.open_session("t1", 60, "image/png", "a.png")
     assert rival.fired, "open_session never touched quota:used:t1"
     if rival.error is not None:
         raise rival.error
-    opened = [u for u in (mine, rival.result) if u is not None]
+    (reserved, sessions_seen), theirs = rival.result
+    opened = [u for u in (mine, theirs) if u is not None]
     assert len(opened) == 1, f"two 60-byte uploads against a 100-byte quota both opened ({opened}); quota:used:t1 is {_used(ctx)}. The quota check and the INCRBY must be one script"
+    assert len(reserved) == 1 and len(sessions_seen) == 1, f"right after quota:used:t1 grew, the reservations were {reserved} and the sessions {list(sessions_seen)}: the reservation and the session are written in the same script as the INCRBY"
     assert _used(ctx) == 60, f"quota:used:t1 is {_used(ctx)} after one 60-byte reservation"
     assert ctx.redis.zrange("quota:reservations:t1", 0, -1) == opened, f"quota:reservations:t1 holds {ctx.redis.zrange('quota:reservations:t1', 0, -1)}, expected {opened}"
     assert m.open_session("t1", 50, "image/png", "c.png") is None, "a 50-byte upload with 40 bytes of quota left must not open"
     assert _used(ctx) == 60 and len(ctx.redis.keys("session:*")) == 1, f"a refused upload changed the quota ({_used(ctx)}) or left a session ({ctx.redis.keys('session:*')})"
+    assert m.open_session("t1", 40, "image/png", "d.png") is not None, "a 40-byte upload with exactly 40 bytes of quota left must open"
+    assert _used(ctx) == 100, f"quota:used:t1 is {_used(ctx)} after filling the 100-byte quota"
 
 
 def check_session_ttl(ctx):
     m = ctx.load("state")
+    seen = ctx.redis_after("quota:used:t1", lambda: _snapshot(ctx)[1])
     upload_id = m.open_session("t1", 10, "image/png", "a.png")
     assert upload_id is not None, "a 10-byte upload under the default quota must open"
+    assert seen.fired and seen.error is None, f"open_session never touched quota:used:t1 ({seen.error})"
+    at_open = seen.result.get(f"session:{upload_id}")
+    assert at_open is not None and 86000 <= at_open <= 86400, f"right after the reservation, session:{upload_id} had TTL {at_open}: the session gets its expiry in the script that opens it, not in a later command"
     ttl = ctx.redis.ttl(f"session:{upload_id}")
     assert 86000 <= ttl <= 86400, f"session:{upload_id} has TTL {ttl}: an abandoned upload must expire after 86400 seconds, or its reservation is held forever"
+    ctx.clock.advance(3600)
     assert m.ack_part(upload_id, 1, 4) == 4, "acknowledging part 1 (4 bytes) must answer 4"
-    assert ctx.redis.ttl(f"session:{upload_id}") > 0, "acknowledging a part removed the session's expiry"
+    ttl = ctx.redis.ttl(f"session:{upload_id}")
+    assert 0 < ttl <= 82800, f"an hour after it opened, acknowledging a part left session:{upload_id} with TTL {ttl}: the session expires 86400 seconds after it opens, a part does not extend it"
 
 
 def check_ack_idempotent(ctx):
@@ -903,6 +921,12 @@ def check_ack_idempotent(ctx):
     assert session["actual_bytes"] == 10 and session["parts"] == {1: 4, 2: 6}, f"the session holds {session}, expected actual_bytes 10 and parts {{1: 4, 2: 6}}"
     assert m.ack_part("up-404", 1, 4) == -1, "a part of an upload with no session must answer -1"
     assert ctx.redis.exists("session:up-404") == 0, "acknowledging a part of a gone session recreated it without an expiry"
+    late = m.open_session("t1", 10, "image/png", "b.png")
+    # The session's 24 hours run out while its part is being acknowledged.
+    expired = ctx.redis_after(f"session:{late}", lambda: ctx.redis.delete(f"session:{late}"))
+    answer = m.ack_part(late, 1, 4)
+    assert expired.fired, f"ack_part never touched session:{late}"
+    assert ctx.redis.exists(f"session:{late}") == 0, f"session:{late} expired while part 1 was acknowledged and came back as {ctx.redis.hgetall(f'session:{late}')} with TTL {ctx.redis.ttl(f'session:{late}')} (ack_part answered {answer}): the existence check and the count are one script"
 
 
 def check_sweep_release(ctx):
@@ -922,6 +946,17 @@ def check_sweep_release(ctx):
     mine = m.sweep("t1")
     assert rival.fired and rival.error is None, f"the parallel sweep did not run cleanly: {rival.error}"
     assert mine + rival.result == 100 and _used(ctx) == 300, f"two sweepers released {mine} and {rival.result} bytes of one 100-byte reservation; quota:used:t1 is {_used(ctx)}, expected 300"
+    last = m.open_session("t1", 100, "image/png", "d.png")
+    ctx.redis.delete(f"session:{last}")
+    # This time the other sweeper lands right after this one's next command on the reservations, if it has one.
+    outer = ctx.redis_after(f"session:{last}", lambda: ctx.redis_after("quota:reservations:t1", lambda: m.sweep("t1")))
+    mine = m.sweep("t1")
+    assert outer.fired and outer.error is None, f"the sweep never looked at session:{last} ({outer.error})"
+    inner = outer.result
+    if inner.error is not None:
+        raise inner.error
+    theirs = inner.result if inner.fired else 0
+    assert mine + theirs == 100 and _used(ctx) == 300, f"two sweepers released {mine} and {theirs} bytes of one 100-byte reservation; quota:used:t1 is {_used(ctx)}, expected 300. Release only when your own ZREM removed the member"
 `,
     typescript: `const used = (ctx, tenant = 't1'): number => Number(ctx.redis.get(\`quota:used:\${tenant}\`) ?? 0);
 
@@ -931,29 +966,43 @@ async function settled(probe, what: string) {
   return await probe.result;
 }
 
+function snapshot(ctx): {reserved: string[]; ttls: Record<string, number>} {
+  const ttls: Record<string, number> = {};
+  for (const key of ctx.redis.keys('session:*')) ttls[key] = Number(ctx.redis.ttl(key));
+  return {reserved: ctx.redis.zrange('quota:reservations:t1', 0, -1), ttls};
+}
+
 export async function check_reserve_atomic(ctx) {
   const m = ctx.load('state');
   ctx.redis.set('quota:limit:t1', 100);
-  // A second upload of the same tenant lands while this one is reserving.
-  const rival = ctx.redisAfter('quota:used:t1', () => m.openSession('t1', 60, 'image/png', 'b.png'));
+  // A second upload of the same tenant lands while this one is reserving; first, what the reservation left.
+  const rival = ctx.redisAfter('quota:used:t1', () => ({seen: snapshot(ctx), theirs: m.openSession('t1', 60, 'image/png', 'b.png')}));
   const mine = await m.openSession('t1', 60, 'image/png', 'a.png');
-  const theirs = await settled(rival, 'quota:used:t1');
-  const opened = [mine, theirs].filter(u => u !== null);
+  const {seen, theirs} = await settled(rival, 'quota:used:t1');
+  const opened = [mine, await theirs].filter(u => u !== null);
   assert.equal(opened.length, 1, \`two 60-byte uploads against a 100-byte quota both opened (\${JSON.stringify(opened)}); quota:used:t1 is \${used(ctx)}. The quota check and the INCRBY must be one script\`);
+  assert(seen.reserved.length === 1 && Object.keys(seen.ttls).length === 1, \`right after quota:used:t1 grew, the reservations were \${JSON.stringify(seen.reserved)} and the sessions \${JSON.stringify(Object.keys(seen.ttls))}: the reservation and the session are written in the same script as the INCRBY\`);
   assert.equal(used(ctx), 60, 'quota:used:t1 after one 60-byte reservation');
   assert.deepStrictEqual(ctx.redis.zrange('quota:reservations:t1', 0, -1), opened, 'quota:reservations:t1 must hold the one upload that opened');
   assert.equal(await m.openSession('t1', 50, 'image/png', 'c.png'), null, 'a 50-byte upload with 40 bytes of quota left must not open');
   assert(used(ctx) === 60 && ctx.redis.keys('session:*').length === 1, \`a refused upload changed the quota (\${used(ctx)}) or left a session (\${JSON.stringify(ctx.redis.keys('session:*'))})\`);
+  assert.notEqual(await m.openSession('t1', 40, 'image/png', 'd.png'), null, 'a 40-byte upload with exactly 40 bytes of quota left must open');
+  assert.equal(used(ctx), 100, 'quota:used:t1 after filling the 100-byte quota');
 }
 
 export async function check_session_ttl(ctx) {
   const m = ctx.load('state');
+  const seen = ctx.redisAfter('quota:used:t1', () => snapshot(ctx).ttls);
   const uploadId = await m.openSession('t1', 10, 'image/png', 'a.png');
   assert(uploadId !== null, 'a 10-byte upload under the default quota must open');
+  const atOpen = (await settled(seen, 'quota:used:t1'))[\`session:\${uploadId}\`];
+  assert(atOpen !== undefined && atOpen >= 86000 && atOpen <= 86400, \`right after the reservation, session:\${uploadId} had TTL \${atOpen}: the session gets its expiry in the script that opens it, not in a later command\`);
   const ttl = Number(ctx.redis.ttl(\`session:\${uploadId}\`));
   assert(ttl >= 86000 && ttl <= 86400, \`session:\${uploadId} has TTL \${ttl}: an abandoned upload must expire after 86400 seconds, or its reservation is held forever\`);
+  ctx.clock.advance(3600);
   assert.equal(await m.ackPart(uploadId, 1, 4), 4, 'acknowledging part 1 (4 bytes) must answer 4');
-  assert(Number(ctx.redis.ttl(\`session:\${uploadId}\`)) > 0, "acknowledging a part removed the session's expiry");
+  const later = Number(ctx.redis.ttl(\`session:\${uploadId}\`));
+  assert(later > 0 && later <= 82800, \`an hour after it opened, acknowledging a part left session:\${uploadId} with TTL \${later}: the session expires 86400 seconds after it opens, a part does not extend it\`);
 }
 
 export async function check_ack_idempotent(ctx) {
@@ -967,6 +1016,12 @@ export async function check_ack_idempotent(ctx) {
   assert(session.actual_bytes === 10 && JSON.stringify(session.parts) === JSON.stringify({1: 4, 2: 6}), \`the session holds \${JSON.stringify(session)}, expected actual_bytes 10 and parts {1: 4, 2: 6}\`);
   assert.equal(await m.ackPart('up-404', 1, 4), -1, 'a part of an upload with no session must answer -1');
   assert.equal(Number(ctx.redis.exists('session:up-404')), 0, 'acknowledging a part of a gone session recreated it without an expiry');
+  const late = await m.openSession('t1', 10, 'image/png', 'b.png');
+  // The session's 24 hours run out while its part is being acknowledged.
+  const expired = ctx.redisAfter(\`session:\${late}\`, () => ctx.redis.del(\`session:\${late}\`));
+  const answer = await m.ackPart(late, 1, 4);
+  assert(expired.fired, \`ackPart never touched session:\${late}\`);
+  assert.equal(Number(ctx.redis.exists(\`session:\${late}\`)), 0, \`session:\${late} expired while part 1 was acknowledged and came back as \${JSON.stringify(ctx.redis.hgetall(\`session:\${late}\`))} with TTL \${ctx.redis.ttl(\`session:\${late}\`)} (ackPart answered \${answer}): the existence check and the count are one script\`);
 }
 
 export async function check_sweep_release(ctx) {
@@ -986,6 +1041,15 @@ export async function check_sweep_release(ctx) {
   const mine = await m.sweep('t1');
   const theirs = await settled(rival, \`session:\${late}\`);
   assert(mine + theirs === 100 && used(ctx) === 300, \`two sweepers released \${mine} and \${theirs} bytes of one 100-byte reservation; quota:used:t1 is \${used(ctx)}, expected 300\`);
+  const last = await m.openSession('t1', 100, 'image/png', 'd.png');
+  ctx.redis.del(\`session:\${last}\`);
+  // This time the other sweeper lands right after this one's next command on the reservations, if it has one.
+  const outer = ctx.redisAfter(\`session:\${last}\`, () => ctx.redisAfter('quota:reservations:t1', () => m.sweep('t1')));
+  const ours = await m.sweep('t1');
+  const inner = await settled(outer, \`session:\${last}\`);
+  if (inner.error !== undefined) throw inner.error;
+  const other = inner.fired ? await inner.result : 0;
+  assert(ours + other === 100 && used(ctx) === 300, \`two sweepers released \${ours} and \${other} bytes of one 100-byte reservation; quota:used:t1 is \${used(ctx)}, expected 300. Release only when your own ZREM removed the member\`);
 }
 `,
     go: `package main
@@ -997,15 +1061,15 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hBg = context.Background()
 
-func usedOf(ctx *harness.Ctx) int64 {
+func hUsed(ctx *harness.Ctx) int64 {
 	raw, _ := ctx.Redis.Get("quota:used:t1")
 	n, _ := strconv.ParseInt(raw, 10, 64)
 	return n
 }
 
-func reservationsOf(ctx *harness.Ctx) []string {
+func hReservations(ctx *harness.Ctx) []string {
 	var members []string
 	for _, z := range ctx.Redis.ZRangeWithScores("quota:reservations:t1", 0, -1) {
 		members = append(members, z.Member)
@@ -1013,143 +1077,211 @@ func reservationsOf(ctx *harness.Ctx) []string {
 	return members
 }
 
-func mustOpen(ctx *harness.Ctx, size int64, name string) string {
-	uploadID, err := openSession(stateBg, "t1", size, "image/png", name)
+// hSessionTTLs is every session key and its TTL at this instant.
+func hSessionTTLs(ctx *harness.Ctx) map[string]int64 {
+	ttls := map[string]int64{}
+	for _, key := range ctx.Redis.Keys("session:*") {
+		ttls[key] = ctx.Redis.TTL(key)
+	}
+	return ttls
+}
+
+func hOpen(ctx *harness.Ctx, size int64, name string) string {
+	uploadID, err := openSession(hBg, "t1", size, "image/png", name)
 	ctx.NoError(err, "openSession(t1, %d) failed", size)
 	return uploadID
 }
 
-func mustAck(ctx *harness.Ctx, uploadID string, n int, size int64) int64 {
-	actual, err := ackPart(stateBg, uploadID, n, size)
+func hAck(ctx *harness.Ctx, uploadID string, n int, size int64) int64 {
+	actual, err := ackPart(hBg, uploadID, n, size)
 	ctx.NoError(err, "ackPart(%s, %d, %d) failed", uploadID, n, size)
 	return actual
 }
 
-func mustSweep(ctx *harness.Ctx) int64 {
-	released, err := sweep(stateBg, "t1")
+func hSweep(ctx *harness.Ctx) int64 {
+	released, err := sweep(hBg, "t1")
 	ctx.NoError(err, "sweep(t1) failed")
 	return released
 }
 
 func CheckReserveAtomic(ctx *harness.Ctx) {
 	ctx.Redis.Set("quota:limit:t1", "100")
-	// A second upload of the same tenant lands while this one is reserving.
+	// A second upload of the same tenant lands while this one is reserving; first, what the reservation left.
+	var reserved []string
+	var sessionsSeen map[string]int64
 	rival := ctx.Redis.After("quota:used:t1", func() any {
-		uploadID, _ := openSession(stateBg, "t1", 60, "image/png", "b.png")
+		reserved, sessionsSeen = hReservations(ctx), hSessionTTLs(ctx)
+		uploadID, _ := openSession(hBg, "t1", 60, "image/png", "b.png")
 		return uploadID
 	})
-	mine := mustOpen(ctx, 60, "a.png")
+	mine := hOpen(ctx, 60, "a.png")
 	ctx.Assert(rival.Fired, "openSession never touched quota:used:t1")
+	ctx.NoError(rival.Err, "the rival upload failed")
 	var opened []string
 	for _, u := range []string{mine, rival.Result.(string)} {
 		if u != "" {
 			opened = append(opened, u)
 		}
 	}
-	ctx.Assert(len(opened) == 1, "two 60-byte uploads against a 100-byte quota both opened (%v); quota:used:t1 is %d. The quota check and the INCRBY must be one script", opened, usedOf(ctx))
-	ctx.Equal(usedOf(ctx), int64(60), "quota:used:t1 after one 60-byte reservation")
-	ctx.Equal(reservationsOf(ctx), opened, "quota:reservations:t1 must hold the one upload that opened")
-	ctx.Equal(mustOpen(ctx, 50, "c.png"), "", "a 50-byte upload with 40 bytes of quota left must not open; its upload id")
-	ctx.Assert(usedOf(ctx) == 60 && len(ctx.Redis.Keys("session:*")) == 1, "a refused upload changed the quota (%d) or left a session (%v)", usedOf(ctx), ctx.Redis.Keys("session:*"))
+	ctx.Assert(len(opened) == 1, "two 60-byte uploads against a 100-byte quota both opened (%v); quota:used:t1 is %d. The quota check and the INCRBY must be one script", opened, hUsed(ctx))
+	ctx.Assert(len(reserved) == 1 && len(sessionsSeen) == 1, "right after quota:used:t1 grew, the reservations were %v and the sessions %v: the reservation and the session are written in the same script as the INCRBY", reserved, sessionsSeen)
+	ctx.Equal(hUsed(ctx), int64(60), "quota:used:t1 after one 60-byte reservation")
+	ctx.Equal(hReservations(ctx), opened, "quota:reservations:t1 must hold the one upload that opened")
+	ctx.Equal(hOpen(ctx, 50, "c.png"), "", "a 50-byte upload with 40 bytes of quota left must not open; its upload id")
+	ctx.Assert(hUsed(ctx) == 60 && len(ctx.Redis.Keys("session:*")) == 1, "a refused upload changed the quota (%d) or left a session (%v)", hUsed(ctx), ctx.Redis.Keys("session:*"))
+	ctx.Assert(hOpen(ctx, 40, "d.png") != "", "a 40-byte upload with exactly 40 bytes of quota left must open")
+	ctx.Equal(hUsed(ctx), int64(100), "quota:used:t1 after filling the 100-byte quota")
 }
 
 func CheckSessionTtl(ctx *harness.Ctx) {
-	uploadID := mustOpen(ctx, 10, "a.png")
+	seen := ctx.Redis.After("quota:used:t1", func() any { return hSessionTTLs(ctx) })
+	uploadID := hOpen(ctx, 10, "a.png")
 	ctx.Assert(uploadID != "", "a 10-byte upload under the default quota must open")
+	ctx.Assert(seen.Fired && seen.Err == nil, "openSession never touched quota:used:t1 (%v)", seen.Err)
+	atOpen, ok := seen.Result.(map[string]int64)["session:"+uploadID]
+	ctx.Assert(ok && atOpen >= 86000 && atOpen <= 86400, "right after the reservation, session:%s had TTL %d (present: %v): the session gets its expiry in the script that opens it, not in a later command", uploadID, atOpen, ok)
 	ttl := ctx.Redis.TTL("session:" + uploadID)
 	ctx.Assert(ttl >= 86000 && ttl <= 86400, "session:%s has TTL %d: an abandoned upload must expire after 86400 seconds, or its reservation is held forever", uploadID, ttl)
-	ctx.Equal(mustAck(ctx, uploadID, 1, 4), int64(4), "acknowledging part 1 (4 bytes)")
-	ctx.Assert(ctx.Redis.TTL("session:"+uploadID) > 0, "acknowledging a part removed the session's expiry")
+	ctx.Clock.Advance(3600)
+	ctx.Equal(hAck(ctx, uploadID, 1, 4), int64(4), "acknowledging part 1 (4 bytes)")
+	later := ctx.Redis.TTL("session:" + uploadID)
+	ctx.Assert(later > 0 && later <= 82800, "an hour after it opened, acknowledging a part left session:%s with TTL %d: the session expires 86400 seconds after it opens, a part does not extend it", uploadID, later)
 }
 
 func CheckAckIdempotent(ctx *harness.Ctx) {
-	uploadID := mustOpen(ctx, 10, "a.png")
-	ctx.Equal(mustAck(ctx, uploadID, 1, 4), int64(4), "acknowledging part 1 (4 bytes)")
-	ctx.Equal(mustAck(ctx, uploadID, 1, 4), int64(4), "a retried part 1 must not be counted again (count a part only when its field is new); actual bytes")
-	ctx.Equal(mustAck(ctx, uploadID, 2, 6), int64(10), "part 2 (6 bytes) after part 1; actual bytes")
-	s, err := findSession(stateBg, uploadID)
+	uploadID := hOpen(ctx, 10, "a.png")
+	ctx.Equal(hAck(ctx, uploadID, 1, 4), int64(4), "acknowledging part 1 (4 bytes)")
+	ctx.Equal(hAck(ctx, uploadID, 1, 4), int64(4), "a retried part 1 must not be counted again (count a part only when its field is new); actual bytes")
+	ctx.Equal(hAck(ctx, uploadID, 2, 6), int64(10), "part 2 (6 bytes) after part 1; actual bytes")
+	s, err := findSession(hBg, uploadID)
 	ctx.NoError(err, "findSession failed")
 	ctx.Assert(s != nil && s.ActualBytes == 10 && len(s.Parts) == 2 && s.Parts[1] == 4 && s.Parts[2] == 6, "the session holds %+v, expected actual bytes 10 and parts {1: 4, 2: 6}", s)
-	ctx.Equal(mustAck(ctx, "up-404", 1, 4), int64(-1), "a part of an upload with no session")
+	ctx.Equal(hAck(ctx, "up-404", 1, 4), int64(-1), "a part of an upload with no session")
 	ctx.Equal(ctx.Redis.Exists("session:up-404"), int64(0), "acknowledging a part of a gone session must not recreate it; session:up-404 exists")
+	late := hOpen(ctx, 10, "b.png")
+	// The session's 24 hours run out while its part is being acknowledged.
+	expired := ctx.Redis.After("session:"+late, func() any { return ctx.Redis.Del("session:" + late) })
+	answer, _ := ackPart(hBg, late, 1, 4)
+	ctx.Assert(expired.Fired, "ackPart never touched session:%s", late)
+	ctx.Assert(ctx.Redis.Exists("session:"+late) == 0, "session:%s expired while part 1 was acknowledged and came back as %v with TTL %d (ackPart answered %d): the existence check and the count are one script", late, ctx.Redis.HGetAll("session:"+late), ctx.Redis.TTL("session:"+late), answer)
 }
 
 func CheckSweepRelease(ctx *harness.Ctx) {
 	ctx.Redis.Set("quota:limit:t1", "1000")
-	gone := mustOpen(ctx, 400, "a.png")
-	live := mustOpen(ctx, 300, "b.png")
+	gone := hOpen(ctx, 400, "a.png")
+	live := hOpen(ctx, 300, "b.png")
 	ctx.Redis.Del("session:" + gone) // its 24 hours ran out
-	ctx.Equal(mustSweep(ctx), int64(400), "the sweep must release the 400 bytes of the expired upload; released")
-	ctx.Equal(usedOf(ctx), int64(300), "quota:used:t1 after the sweep")
-	ctx.Equal(reservationsOf(ctx), []string{live}, "the reservations after the sweep")
-	again := mustSweep(ctx)
-	ctx.Assert(again == 0 && usedOf(ctx) == 300, "a second sweep released %d bytes and left quota:used:t1 at %d: the expired reservation was released twice", again, usedOf(ctx))
-	late := mustOpen(ctx, 100, "c.png")
+	ctx.Equal(hSweep(ctx), int64(400), "the sweep must release the 400 bytes of the expired upload; released")
+	ctx.Equal(hUsed(ctx), int64(300), "quota:used:t1 after the sweep")
+	ctx.Equal(hReservations(ctx), []string{live}, "the reservations after the sweep")
+	again := hSweep(ctx)
+	ctx.Assert(again == 0 && hUsed(ctx) == 300, "a second sweep released %d bytes and left quota:used:t1 at %d: the expired reservation was released twice", again, hUsed(ctx))
+	late := hOpen(ctx, 100, "c.png")
 	ctx.Redis.Del("session:" + late)
 	// Two sweepers find the same expired upload.
 	rival := ctx.Redis.After("session:"+late, func() any {
-		released, _ := sweep(stateBg, "t1")
+		released, _ := sweep(hBg, "t1")
 		return released
 	})
-	mine := mustSweep(ctx)
+	mine := hSweep(ctx)
 	ctx.Assert(rival.Fired, "the sweep never looked at session:%s", late)
 	theirs := rival.Result.(int64)
-	ctx.Assert(mine+theirs == 100 && usedOf(ctx) == 300, "two sweepers released %d and %d bytes of one 100-byte reservation; quota:used:t1 is %d, expected 300", mine, theirs, usedOf(ctx))
+	ctx.Assert(mine+theirs == 100 && hUsed(ctx) == 300, "two sweepers released %d and %d bytes of one 100-byte reservation; quota:used:t1 is %d, expected 300", mine, theirs, hUsed(ctx))
+	last := hOpen(ctx, 100, "d.png")
+	ctx.Redis.Del("session:" + last)
+	// This time the other sweeper lands right after this one's next command on the reservations, if it has one.
+	var other int64
+	outer := ctx.Redis.After("session:"+last, func() any {
+		ctx.Redis.After("quota:reservations:t1", func() any {
+			other, _ = sweep(hBg, "t1")
+			return other
+		})
+		return nil
+	})
+	ours := hSweep(ctx)
+	ctx.Assert(outer.Fired && outer.Err == nil, "the sweep never looked at session:%s (%v)", last, outer.Err)
+	ctx.Assert(ours+other == 100 && hUsed(ctx) == 300, "two sweepers released %d and %d bytes of one 100-byte reservation; quota:used:t1 is %d, expected 300. Release only when your own ZREM removed the member", ours, other, hUsed(ctx))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
 
 namespace {
 
-long long usedOf(harness::Ctx& ctx) { return std::stoll(ctx.Redis.Get("quota:used:t1").value_or("0")); }
+long long hUsed(harness::Ctx& ctx) { return std::stoll(ctx.Redis.Get("quota:used:t1").value_or("0")); }
 
-std::vector<std::string> reservationsOf(harness::Ctx& ctx) {
+std::vector<std::string> hReservations(harness::Ctx& ctx) {
   std::vector<std::string> members;
   for (const auto& z : ctx.Redis.ZRangeWithScores("quota:reservations:t1", 0, -1)) members.push_back(z.Member);
   return members;
 }
 
-std::string open(long long size, const std::string& name) { return openSession("t1", size, "image/png", name).value_or(""); }
+// Every session key and its TTL at this instant.
+std::map<std::string, long long> hSessionTtls(harness::Ctx& ctx) {
+  std::map<std::string, long long> ttls;
+  for (const std::string& key : ctx.Redis.Keys("session:*")) ttls[key] = ctx.Redis.TTL(key);
+  return ttls;
+}
+
+std::string hOpen(long long size, const std::string& name) { return openSession("t1", size, "image/png", name).value_or(""); }
 
 }  // namespace
 
 void CheckReserveAtomic(harness::Ctx& ctx) {
   ctx.Redis.Set("quota:limit:t1", "100");
-  // A second upload of the same tenant lands while this one is reserving.
+  // A second upload of the same tenant lands while this one is reserving; first, what the reservation left.
   bool fired = false;
   std::string theirs;
+  std::vector<std::string> reserved;
+  std::map<std::string, long long> sessions_seen;
   ctx.Redis.After("quota:used:t1", [&] {
     fired = true;
-    theirs = open(60, "b.png");
+    reserved = hReservations(ctx);
+    sessions_seen = hSessionTtls(ctx);
+    theirs = hOpen(60, "b.png");
   });
-  const std::string mine = open(60, "a.png");
+  const std::string mine = hOpen(60, "a.png");
   ctx.Assert(fired, "openSession never touched quota:used:t1");
   std::vector<std::string> opened;
   for (const std::string& u : {mine, theirs}) {
     if (!u.empty()) opened.push_back(u);
   }
-  ctx.Assert(opened.size() == 1, "two 60-byte uploads against a 100-byte quota both opened (%v); quota:used:t1 is %d. The quota check and the INCRBY must be one script", opened, usedOf(ctx));
-  ctx.Equal(usedOf(ctx), 60, "quota:used:t1 after one 60-byte reservation");
-  ctx.Equal(reservationsOf(ctx), opened, "quota:reservations:t1 must hold the one upload that opened");
-  ctx.Equal(open(50, "c.png"), "", "a 50-byte upload with 40 bytes of quota left must not open; its upload id");
-  ctx.Assert(usedOf(ctx) == 60 && ctx.Redis.Keys("session:*").size() == 1, "a refused upload changed the quota (%d) or left a session (%v)", usedOf(ctx), ctx.Redis.Keys("session:*"));
+  ctx.Assert(opened.size() == 1, "two 60-byte uploads against a 100-byte quota both opened (%v); quota:used:t1 is %d. The quota check and the INCRBY must be one script", opened, hUsed(ctx));
+  ctx.Assert(reserved.size() == 1 && sessions_seen.size() == 1, "right after quota:used:t1 grew, the reservations were %v and %d sessions existed: the reservation and the session are written in the same script as the INCRBY", reserved, sessions_seen.size());
+  ctx.Equal(hUsed(ctx), 60, "quota:used:t1 after one 60-byte reservation");
+  ctx.Equal(hReservations(ctx), opened, "quota:reservations:t1 must hold the one upload that opened");
+  ctx.Equal(hOpen(50, "c.png"), "", "a 50-byte upload with 40 bytes of quota left must not open; its upload id");
+  ctx.Assert(hUsed(ctx) == 60 && ctx.Redis.Keys("session:*").size() == 1, "a refused upload changed the quota (%d) or left a session (%v)", hUsed(ctx), ctx.Redis.Keys("session:*"));
+  ctx.Assert(!hOpen(40, "d.png").empty(), "a 40-byte upload with exactly 40 bytes of quota left must open");
+  ctx.Equal(hUsed(ctx), 100, "quota:used:t1 after filling the 100-byte quota");
 }
 
 void CheckSessionTtl(harness::Ctx& ctx) {
-  const std::string upload_id = open(10, "a.png");
+  bool fired = false;
+  std::map<std::string, long long> seen;
+  ctx.Redis.After("quota:used:t1", [&] {
+    fired = true;
+    seen = hSessionTtls(ctx);
+  });
+  const std::string upload_id = hOpen(10, "a.png");
   ctx.Assert(!upload_id.empty(), "a 10-byte upload under the default quota must open");
+  ctx.Assert(fired, "openSession never touched quota:used:t1");
+  const long long at_open = seen.count("session:" + upload_id) ? seen.at("session:" + upload_id) : -2;
+  ctx.Assert(at_open >= 86000 && at_open <= 86400, "right after the reservation, session:%s had TTL %d (-2: not written yet): the session gets its expiry in the script that opens it, not in a later command", upload_id, at_open);
   const long long ttl = ctx.Redis.TTL("session:" + upload_id);
   ctx.Assert(ttl >= 86000 && ttl <= 86400, "session:%s has TTL %d: an abandoned upload must expire after 86400 seconds, or its reservation is held forever", upload_id, ttl);
+  ctx.Clock.Advance(3600);
   ctx.Equal(ackPart(upload_id, 1, 4), 4, "acknowledging part 1 (4 bytes)");
-  ctx.Assert(ctx.Redis.TTL("session:" + upload_id) > 0, "acknowledging a part removed the session's expiry");
+  const long long later = ctx.Redis.TTL("session:" + upload_id);
+  ctx.Assert(later > 0 && later <= 82800, "an hour after it opened, acknowledging a part left session:%s with TTL %d: the session expires 86400 seconds after it opens, a part does not extend it", upload_id, later);
 }
 
 void CheckAckIdempotent(harness::Ctx& ctx) {
-  const std::string upload_id = open(10, "a.png");
+  const std::string upload_id = hOpen(10, "a.png");
   ctx.Equal(ackPart(upload_id, 1, 4), 4, "acknowledging part 1 (4 bytes)");
   ctx.Equal(ackPart(upload_id, 1, 4), 4, "a retried part 1 must not be counted again (count a part only when its field is new); actual bytes");
   ctx.Equal(ackPart(upload_id, 2, 6), 10, "part 2 (6 bytes) after part 1; actual bytes");
@@ -1157,19 +1289,29 @@ void CheckAckIdempotent(harness::Ctx& ctx) {
   ctx.Assert(s && s->actual_bytes == 10 && s->parts.size() == 2 && s->parts.at(1) == 4 && s->parts.at(2) == 6, "the session holds actual bytes %d and %d parts, expected 10 and parts {1: 4, 2: 6}", s ? s->actual_bytes : -1, s ? s->parts.size() : 0);
   ctx.Equal(ackPart("up-404", 1, 4), -1, "a part of an upload with no session");
   ctx.Equal(ctx.Redis.Exists("session:up-404"), 0, "acknowledging a part of a gone session must not recreate it; session:up-404 exists");
+  const std::string late = hOpen(10, "b.png");
+  // The session's 24 hours run out while its part is being acknowledged.
+  bool expired = false;
+  ctx.Redis.After("session:" + late, [&] {
+    expired = true;
+    ctx.Redis.Del("session:" + late);
+  });
+  const long long answer = ackPart(late, 1, 4);
+  ctx.Assert(expired, "ackPart never touched session:%s", late);
+  ctx.Assert(ctx.Redis.Exists("session:" + late) == 0, "session:%s expired while part 1 was acknowledged and came back with %d fields and TTL %d (ackPart answered %d): the existence check and the count are one script", late, ctx.Redis.HGetAll("session:" + late).size(), ctx.Redis.TTL("session:" + late), answer);
 }
 
 void CheckSweepRelease(harness::Ctx& ctx) {
   ctx.Redis.Set("quota:limit:t1", "1000");
-  const std::string gone = open(400, "a.png");
-  const std::string live = open(300, "b.png");
+  const std::string gone = hOpen(400, "a.png");
+  const std::string live = hOpen(300, "b.png");
   ctx.Redis.Del("session:" + gone);  // its 24 hours ran out
   ctx.Equal(sweep("t1"), 400, "the sweep must release the 400 bytes of the expired upload; released");
-  ctx.Equal(usedOf(ctx), 300, "quota:used:t1 after the sweep");
-  ctx.Equal(reservationsOf(ctx), {live}, "the reservations after the sweep");
+  ctx.Equal(hUsed(ctx), 300, "quota:used:t1 after the sweep");
+  ctx.Equal(hReservations(ctx), {live}, "the reservations after the sweep");
   const long long again = sweep("t1");
-  ctx.Assert(again == 0 && usedOf(ctx) == 300, "a second sweep released %d bytes and left quota:used:t1 at %d: the expired reservation was released twice", again, usedOf(ctx));
-  const std::string late = open(100, "c.png");
+  ctx.Assert(again == 0 && hUsed(ctx) == 300, "a second sweep released %d bytes and left quota:used:t1 at %d: the expired reservation was released twice", again, hUsed(ctx));
+  const std::string late = hOpen(100, "c.png");
   ctx.Redis.Del("session:" + late);
   // Two sweepers find the same expired upload.
   bool fired = false;
@@ -1180,7 +1322,19 @@ void CheckSweepRelease(harness::Ctx& ctx) {
   });
   const long long mine = sweep("t1");
   ctx.Assert(fired, "the sweep never looked at session:%s", late);
-  ctx.Assert(mine + theirs == 100 && usedOf(ctx) == 300, "two sweepers released %d and %d bytes of one 100-byte reservation; quota:used:t1 is %d, expected 300", mine, theirs, usedOf(ctx));
+  ctx.Assert(mine + theirs == 100 && hUsed(ctx) == 300, "two sweepers released %d and %d bytes of one 100-byte reservation; quota:used:t1 is %d, expected 300", mine, theirs, hUsed(ctx));
+  const std::string last = hOpen(100, "d.png");
+  ctx.Redis.Del("session:" + last);
+  // This time the other sweeper lands right after this one's next command on the reservations, if it has one.
+  bool looked = false;
+  long long other = 0;
+  ctx.Redis.After("session:" + last, [&] {
+    looked = true;
+    ctx.Redis.After("quota:reservations:t1", [&] { other = sweep("t1"); });
+  });
+  const long long ours = sweep("t1");
+  ctx.Assert(looked, "the sweep never looked at session:%s", last);
+  ctx.Assert(ours + other == 100 && hUsed(ctx) == 300, "two sweepers released %d and %d bytes of one 100-byte reservation; quota:used:t1 is %d, expected 300. Release only when your own ZREM removed the member", ours, other, hUsed(ctx));
 }
 `,
   },

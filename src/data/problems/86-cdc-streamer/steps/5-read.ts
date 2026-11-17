@@ -53,7 +53,7 @@ loses data, reads \`"ok"\` or a 503.
       id: 'tenant-scope',
       title: 'Answers only the owner of the subscription',
       detail:
-        '`X-Tenant-Id` is required (**401**) and a subscription of another tenant is **404**, so ids cannot be probed; the starter answers any caller.',
+        '`X-Tenant-Id` is required (**401**) and a subscription of another tenant is **404** with the same answer as an unknown id, so ids cannot be probed; the starter answers any caller.',
       match: {
         python: {all: [/x-tenant-id/i, /\[["']tenant["']\]\s*!=\s*tenant/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==\s*tenant/]},
@@ -79,7 +79,7 @@ loses data, reads \`"ok"\` or a 503.
       id: 'slot-health',
       title: 'Reports an inactive or lost slot as critical',
       detail:
-        'An inactive slot, a `NOT_FOUND` from `SlotStatus` and a `slot_lost` subscription all read `"critical"` with `slot_active` false; the starter looks at the lag number only and answers 503 for a dropped slot.',
+        'An inactive slot reads `"critical"` with its lag; a `NOT_FOUND` from `SlotStatus` and a `slot_lost` subscription read `"critical"` with `slot_active` false and `head_lsn` and `lag_bytes` null, and another `SlotStatus` failure does not read as a lost slot. The starter looks at the lag number only and answers 503 for a dropped slot.',
       match: {
         python: {all: [/StatusCode\.NOT_FOUND/, /not\s+state\.active/, /slot_lost/]},
         typescript: {all: [/status\.NOT_FOUND/, /!state\.active/, /slot_lost/]},
@@ -692,6 +692,7 @@ import cdc_streamer_pb2_grpc as pb_grpc
 from cdc import cursor, store
 
 FAR = 2 * 1024 * 1024 * 1024  # 2 GiB of WAL: critical whatever the threshold below 1 GiB
+CRITICAL = 512 * 1024 * 1024
 
 
 class Source(pb_grpc.SlotsServicer):
@@ -730,6 +731,8 @@ async def check_route(ctx):
     c, source = _setup(ctx)
     near = _subscription(source)
     far = _subscription(source, head=4000 + FAR, restart=1000)
+    below = _subscription(source, head=4000 + CRITICAL - 1, restart=1000)
+    above = _subscription(source, head=4000 + CRITICAL + 1, restart=1000)
     async with c:
         r = await _lag(c, near["id"])
         assert r.status_code == 200, f"GET /v1/subscriptions/{near['id']}/lag answered {r.status_code}: {r.text}"
@@ -738,6 +741,10 @@ async def check_route(ctx):
         r = await _lag(c, far["id"])
         body = r.json()
         assert body.get("lag_bytes") == FAR and body.get("state") == "critical", f"2 GiB behind the head the read answered {body}, expected lag_bytes {FAR} and state critical"
+        body = (await _lag(c, below["id"])).json()
+        assert body.get("lag_bytes") == CRITICAL - 1 and body.get("state") == "ok", f"one byte short of CRITICAL_LAG_BYTES (512 MiB) the read answered {body}, expected state ok"
+        body = (await _lag(c, above["id"])).json()
+        assert body.get("lag_bytes") == CRITICAL + 1 and body.get("state") == "critical", f"one byte past CRITICAL_LAG_BYTES (512 MiB) the read answered {body}, expected state critical"
         r = await _lag(c, "sub-99")
     assert r.status_code == 404, f"an unknown subscription answered {r.status_code}, expected 404"
 
@@ -748,6 +755,8 @@ async def check_tenant_scope(ctx):
     async with c:
         r = await _lag(c, sub["id"], tenant="globex")
         assert r.status_code == 404, f"globex read acme's {sub['id']} and got {r.status_code} {r.text}: another tenant's subscription must read as unknown (404)"
+        unknown = await _lag(c, "sub-99", tenant="globex")
+        assert r.text.replace(sub["id"], "{id}") == unknown.text.replace("sub-99", "{id}"), f"globex reading acme's {sub['id']} got {r.text}, an unknown id got {unknown.text}: the two answers must not tell an existing subscription from a missing one"
         r = await _lag(c, sub["id"], tenant=None)
         assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
         r = await _lag(c, sub["id"])
@@ -770,19 +779,27 @@ async def check_slot_health(ctx):
     dropped = _subscription(source, slot=False)
     halted = _subscription(source)
     store.set_status(halted["id"], "slot_lost")
+    flaky = _subscription(source)
     async with c:
         r = await _lag(c, idle["id"])
         body = r.json()
         assert body.get("slot_active") is False and body.get("state") == "critical", f"a slot no consumer holds read {body}: the database retains WAL for it until the disk fills. Expected state critical"
+        assert body.get("head_lsn") == 5000 and body.get("lag_bytes") == 1000, f"an inactive slot still exists and still has a lag: it read {body}, expected head_lsn 5000 and lag_bytes 1000"
         r = await _lag(c, dropped["id"])
         assert r.status_code == 200, f"a dropped slot answered {r.status_code} {r.text}: it is the state to page on, expected 200 with state critical"
         body = r.json()
-        assert body.get("state") == "critical" and body.get("slot_active") is False and body.get("lag_bytes") is None, f"a dropped slot read {body}, expected state critical, slot_active false and lag_bytes null"
+        assert body.get("state") == "critical" and body.get("slot_active") is False and body.get("lag_bytes") is None and body.get("head_lsn") is None, f"a dropped slot read {body}, expected state critical, slot_active false, head_lsn and lag_bytes null"
         r = await _lag(c, halted["id"])
-    body = r.json()
-    assert r.status_code == 200 and body.get("state") == "critical", f"a subscription the replicator marked slot_lost read {r.status_code} {body}, expected state critical"
+        body = r.json()
+        assert r.status_code == 200 and body.get("state") == "critical", f"a subscription the replicator marked slot_lost read {r.status_code} {body}, expected state critical"
+        assert body.get("slot_active") is False and body.get("lag_bytes") is None and body.get("head_lsn") is None, f"a subscription the replicator marked slot_lost read {body}: its slot is gone whatever SlotStatus says, expected slot_active false, head_lsn and lag_bytes null"
+        ctx.grpc.fail("SlotStatus", grpc.StatusCode.UNAVAILABLE)
+        r = await _lag(c, flaky["id"])
+    body = r.json() if r.status_code == 200 else {}
+    assert not (body.get("slot_active") is False and "lag_bytes" in body and body["lag_bytes"] is None), f"SlotStatus failed UNAVAILABLE and the read answered {r.status_code} {r.text}: an outage of the source is not a dropped slot, only NOT_FOUND is"
 `,
     typescript: `const FAR = 2 * 1024 * 1024 * 1024; // 2 GiB of WAL: critical whatever the threshold below 1 GiB
+const CRITICAL = 512 * 1024 * 1024;
 
 /** Slots by name: [head_lsn, restart_lsn, active]; a slot not listed was dropped. */
 function setup(ctx) {
@@ -813,12 +830,18 @@ export async function check_route(ctx) {
   const {subscription, lag} = setup(ctx);
   const near = await subscription();
   const far = await subscription({head: 4000 + FAR, restart: 1000});
+  const below = await subscription({head: 4000 + CRITICAL - 1, restart: 1000});
+  const above = await subscription({head: 4000 + CRITICAL + 1, restart: 1000});
   let r = await lag(near.id);
   assert.equal(r.status, 200, \`GET /v1/subscriptions/\${near.id}/lag answered \${r.status}: \${r.text}\`);
   const want = {subscription_id: near.id, confirmed_lsn: 4000, head_lsn: 5000, lag_bytes: 1000, slot_active: true, state: 'ok'};
   assert.deepStrictEqual(r.json(), want, \`the lag read answered \${r.text}, expected \${JSON.stringify(want)}\`);
   r = await lag(far.id);
   assert(r.json().lag_bytes === FAR && r.json().state === 'critical', \`2 GiB behind the head the read answered \${r.text}, expected lag_bytes \${FAR} and state critical\`);
+  r = await lag(below.id);
+  assert(r.json().lag_bytes === CRITICAL - 1 && r.json().state === 'ok', \`one byte short of CRITICAL_LAG_BYTES (512 MiB) the read answered \${r.text}, expected state ok\`);
+  r = await lag(above.id);
+  assert(r.json().lag_bytes === CRITICAL + 1 && r.json().state === 'critical', \`one byte past CRITICAL_LAG_BYTES (512 MiB) the read answered \${r.text}, expected state critical\`);
   r = await lag('sub-99');
   assert.equal(r.status, 404, \`an unknown subscription answered \${r.status}, expected 404\`);
 }
@@ -828,6 +851,8 @@ export async function check_tenant_scope(ctx) {
   const sub = await subscription();
   let r = await lag(sub.id, 'globex');
   assert.equal(r.status, 404, \`globex read acme's \${sub.id} and got \${r.status} \${r.text}: another tenant's subscription must read as unknown (404)\`);
+  const unknown = await lag('sub-99', 'globex');
+  assert.equal(r.text.replaceAll(sub.id, '{id}'), unknown.text.replaceAll('sub-99', '{id}'), \`globex reading acme's \${sub.id} got \${r.text}, an unknown id got \${unknown.text}: the two answers must not tell an existing subscription from a missing one\`);
   r = await lag(sub.id, null);
   assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
   r = await lag(sub.id);
@@ -849,14 +874,21 @@ export async function check_slot_health(ctx) {
   const dropped = await subscription({slot: false});
   const halted = await subscription();
   await store.setStatus(halted.id, 'slot_lost');
+  const flaky = await subscription();
   let r = await lag(idle.id);
   assert(r.json().slot_active === false && r.json().state === 'critical', \`a slot no consumer holds read \${r.text}: the database retains WAL for it until the disk fills. Expected state critical\`);
+  assert(r.json().head_lsn === 5000 && r.json().lag_bytes === 1000, \`an inactive slot still exists and still has a lag: it read \${r.text}, expected head_lsn 5000 and lag_bytes 1000\`);
   r = await lag(dropped.id);
   assert.equal(r.status, 200, \`a dropped slot answered \${r.status} \${r.text}: it is the state to page on, expected 200 with state critical\`);
   const body = r.json();
-  assert(body.state === 'critical' && body.slot_active === false && body.lag_bytes === null, \`a dropped slot read \${r.text}, expected state critical, slot_active false and lag_bytes null\`);
+  assert(body.state === 'critical' && body.slot_active === false && body.lag_bytes === null && body.head_lsn === null, \`a dropped slot read \${r.text}, expected state critical, slot_active false, head_lsn and lag_bytes null\`);
   r = await lag(halted.id);
   assert(r.status === 200 && r.json().state === 'critical', \`a subscription the replicator marked slot_lost read \${r.status} \${r.text}, expected state critical\`);
+  assert(r.json().slot_active === false && r.json().lag_bytes === null && r.json().head_lsn === null, \`a subscription the replicator marked slot_lost read \${r.text}: its slot is gone whatever SlotStatus says, expected slot_active false, head_lsn and lag_bytes null\`);
+  ctx.grpc.fail('SlotStatus', ctx.grpc.status.UNAVAILABLE);
+  r = await lag(flaky.id);
+  const flakyBody = r.status === 200 ? r.json() : {};
+  assert(!(flakyBody.slot_active === false && 'lag_bytes' in flakyBody && flakyBody.lag_bytes === null), \`SlotStatus failed UNAVAILABLE and the read answered \${r.status} \${r.text}: an outage of the source is not a dropped slot, only NOT_FOUND is\`);
 }
 `,
     go: `package main
@@ -864,6 +896,7 @@ export async function check_slot_health(ctx) {
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -875,22 +908,25 @@ import (
 	"leetbuild/harness"
 )
 
-const far = int64(2 * 1024 * 1024 * 1024) // 2 GiB of WAL: critical whatever the threshold below 1 GiB
+const (
+	hFar      = int64(2 * 1024 * 1024 * 1024) // 2 GiB of WAL: critical whatever the threshold below 1 GiB
+	hCritical = int64(512 * 1024 * 1024)
+)
 
 var lagBg = context.Background()
 
-type slotEntry struct {
+type hSlotEntry struct {
 	head, restart int64
 	active        bool
 }
 
-// statusPeer answers SlotStatus from slots; a slot not listed was dropped.
-type statusPeer struct {
+// hStatusPeer answers SlotStatus from slots; a slot not listed was dropped.
+type hStatusPeer struct {
 	pb.UnimplementedSlotsServer
-	slots map[string]slotEntry
+	slots map[string]hSlotEntry
 }
 
-func (s *statusPeer) SlotStatus(_ context.Context, req *pb.SlotStatusRequest) (*pb.SlotState, error) {
+func (s *hStatusPeer) SlotStatus(_ context.Context, req *pb.SlotStatusRequest) (*pb.SlotState, error) {
 	e, ok := s.slots[req.GetSlot()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "replication slot %q does not exist", req.GetSlot())
@@ -898,22 +934,22 @@ func (s *statusPeer) SlotStatus(_ context.Context, req *pb.SlotStatusRequest) (*
 	return &pb.SlotState{HeadLsn: e.head, RestartLsn: e.restart, Active: e.active}, nil
 }
 
-type lagWorld struct {
+type hLagWorld struct {
 	ctx    *harness.Ctx
-	source *statusPeer
+	source *hStatusPeer
 	c      *harness.HTTP
 }
 
-func lagSetup(ctx *harness.Ctx) *lagWorld {
-	source := &statusPeer{slots: map[string]slotEntry{}}
+func hLagSetup(ctx *harness.Ctx) *hLagWorld {
+	source := &hStatusPeer{slots: map[string]hSlotEntry{}}
 	pb.RegisterSlotsServer(ctx.GRPC.Server(""), source)
 	mux := http.NewServeMux()
 	register(mux)
-	return &lagWorld{ctx: ctx, source: source, c: ctx.HTTP(mux)}
+	return &hLagWorld{ctx: ctx, source: source, c: ctx.HTTP(mux)}
 }
 
 // subscribe creates an acme subscription whose slot is e (none when slot is false), confirmed at confirmed (none when < 0).
-func (w *lagWorld) subscribe(e slotEntry, confirmed int64, slot bool) *store.Subscription {
+func (w *hLagWorld) subscribe(e hSlotEntry, confirmed int64, slot bool) *store.Subscription {
 	sub, err := store.CreateSubscription(lagBg, "acme", "orders", []string{"id", "status"}, "warehouse-1")
 	w.ctx.NoError(err, "creating the subscription")
 	if slot {
@@ -926,63 +962,84 @@ func (w *lagWorld) subscribe(e slotEntry, confirmed int64, slot bool) *store.Sub
 	return sub
 }
 
-func (w *lagWorld) lag(id, tenant string) *harness.Response {
+func (w *hLagWorld) lag(id, tenant string) *harness.Response {
 	if tenant == "" {
 		return w.c.Get("/v1/subscriptions/" + id + "/lag")
 	}
 	return w.c.Get("/v1/subscriptions/"+id+"/lag", "X-Tenant-Id", tenant)
 }
 
-func body(r *harness.Response) map[string]any {
+func hBody(r *harness.Response) map[string]any {
 	out := map[string]any{}
 	r.Decode(&out)
 	return out
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	w := lagSetup(ctx)
-	near := w.subscribe(slotEntry{5000, 3000, true}, 4000, true)
-	farSub := w.subscribe(slotEntry{4000 + far, 1000, true}, 4000, true)
+	w := hLagSetup(ctx)
+	near := w.subscribe(hSlotEntry{5000, 3000, true}, 4000, true)
+	farSub := w.subscribe(hSlotEntry{4000 + hFar, 1000, true}, 4000, true)
 	r := w.lag(near.ID, "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/subscriptions/%s/lag (%s)", near.ID, r.Text())
 	want := map[string]any{"subscription_id": near.ID, "confirmed_lsn": 4000, "head_lsn": 5000, "lag_bytes": 1000, "slot_active": true, "state": "ok"}
-	ctx.Equal(body(r), want, "the lag read")
-	got := body(w.lag(farSub.ID, "acme"))
-	ctx.Assert(got["lag_bytes"] == float64(far) && got["state"] == "critical", "2 GiB behind the head the read answered %v, expected lag_bytes %d and state critical", got, far)
+	ctx.Equal(hBody(r), want, "the lag read")
+	got := hBody(w.lag(farSub.ID, "acme"))
+	ctx.Assert(got["lag_bytes"] == float64(hFar) && got["state"] == "critical", "2 GiB behind the head the read answered %v, expected lag_bytes %d and state critical", got, hFar)
+	below := w.subscribe(hSlotEntry{4000 + hCritical - 1, 1000, true}, 4000, true)
+	got = hBody(w.lag(below.ID, "acme"))
+	ctx.Assert(got["lag_bytes"] == float64(hCritical-1) && got["state"] == "ok", "one byte short of criticalLagBytes (512 MiB) the read answered %v, expected state ok", got)
+	above := w.subscribe(hSlotEntry{4000 + hCritical + 1, 1000, true}, 4000, true)
+	got = hBody(w.lag(above.ID, "acme"))
+	ctx.Assert(got["lag_bytes"] == float64(hCritical+1) && got["state"] == "critical", "one byte past criticalLagBytes (512 MiB) the read answered %v, expected state critical", got)
 	ctx.Equal(w.lag("sub-99", "acme").Status, 404, "an unknown subscription")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	w := lagSetup(ctx)
-	sub := w.subscribe(slotEntry{5000, 3000, true}, 4000, true)
+	w := hLagSetup(ctx)
+	sub := w.subscribe(hSlotEntry{5000, 3000, true}, 4000, true)
 	r := w.lag(sub.ID, "globex")
 	ctx.Equal(r.Status, 404, "globex read acme's %s (%s): another tenant's subscription must read as unknown", sub.ID, r.Text())
+	unknown := w.lag("sub-99", "globex")
+	ctx.Assert(strings.ReplaceAll(r.Text(), sub.ID, "{id}") == strings.ReplaceAll(unknown.Text(), "sub-99", "{id}"),
+		"globex reading acme's %s got %s, an unknown id got %s: the two answers must not tell an existing subscription from a missing one", sub.ID, r.Text(), unknown.Text())
 	ctx.Equal(w.lag(sub.ID, "").Status, 401, "a read without X-Tenant-Id")
 	ctx.Equal(w.lag(sub.ID, "acme").Status, 200, "acme reading its own subscription")
 }
 
 func CheckUnconfirmedLag(ctx *harness.Ctx) {
-	w := lagSetup(ctx)
-	sub := w.subscribe(slotEntry{1000 + far, 1000, true}, -1, true)
-	got := body(w.lag(sub.ID, "acme"))
-	ctx.Equal(got["lag_bytes"], float64(far), "a subscription that confirmed nothing is behind by everything since the slot's restart_lsn; lag_bytes")
+	w := hLagSetup(ctx)
+	sub := w.subscribe(hSlotEntry{1000 + hFar, 1000, true}, -1, true)
+	got := hBody(w.lag(sub.ID, "acme"))
+	ctx.Equal(got["lag_bytes"], float64(hFar), "a subscription that confirmed nothing is behind by everything since the slot's restart_lsn; lag_bytes")
 	ctx.Assert(got["confirmed_lsn"] == nil && got["state"] == "critical", "with nothing confirmed and 2 GiB retained the read answered %v, expected confirmed_lsn null and state critical", got)
 }
 
 func CheckSlotHealth(ctx *harness.Ctx) {
-	w := lagSetup(ctx)
-	idle := w.subscribe(slotEntry{5000, 3000, false}, 4000, true)
-	dropped := w.subscribe(slotEntry{}, 4000, false)
-	halted := w.subscribe(slotEntry{5000, 3000, true}, 4000, true)
+	w := hLagSetup(ctx)
+	idle := w.subscribe(hSlotEntry{5000, 3000, false}, 4000, true)
+	dropped := w.subscribe(hSlotEntry{}, 4000, false)
+	halted := w.subscribe(hSlotEntry{5000, 3000, true}, 4000, true)
 	ctx.NoError(store.SetStatus(lagBg, halted.ID, "slot_lost"), "marking the subscription slot_lost")
-	got := body(w.lag(idle.ID, "acme"))
+	flaky := w.subscribe(hSlotEntry{5000, 3000, true}, 4000, true)
+	got := hBody(w.lag(idle.ID, "acme"))
 	ctx.Assert(got["slot_active"] == false && got["state"] == "critical", "a slot no consumer holds read %v: the database retains WAL for it until the disk fills. Expected state critical", got)
+	ctx.Assert(got["head_lsn"] == float64(5000) && got["lag_bytes"] == float64(1000), "an inactive slot still exists and still has a lag: it read %v, expected head_lsn 5000 and lag_bytes 1000", got)
 	r := w.lag(dropped.ID, "acme")
 	ctx.Equal(r.Status, 200, "a dropped slot is the state to page on (%s); the status", r.Text())
-	got = body(r)
-	ctx.Assert(got["state"] == "critical" && got["slot_active"] == false && got["lag_bytes"] == nil, "a dropped slot read %v, expected state critical, slot_active false and lag_bytes null", got)
+	got = hBody(r)
+	ctx.Assert(got["state"] == "critical" && got["slot_active"] == false && got["lag_bytes"] == nil && got["head_lsn"] == nil, "a dropped slot read %v, expected state critical, slot_active false, head_lsn and lag_bytes null", got)
 	r = w.lag(halted.ID, "acme")
-	ctx.Assert(r.Status == 200 && body(r)["state"] == "critical", "a subscription the replicator marked slot_lost read %d %s, expected state critical", r.Status, r.Text())
+	got = hBody(r)
+	ctx.Assert(r.Status == 200 && got["state"] == "critical", "a subscription the replicator marked slot_lost read %d %s, expected state critical", r.Status, r.Text())
+	ctx.Assert(got["slot_active"] == false && got["lag_bytes"] == nil && got["head_lsn"] == nil, "a subscription the replicator marked slot_lost read %v: its slot is gone whatever SlotStatus says, expected slot_active false, head_lsn and lag_bytes null", got)
+	ctx.GRPC.Fail("SlotStatus", codes.Unavailable, "", 1, "")
+	r = w.lag(flaky.ID, "acme")
+	got = map[string]any{}
+	if r.Status == 200 {
+		got = hBody(r)
+	}
+	_, hasLag := got["lag_bytes"]
+	ctx.Assert(!(got["slot_active"] == false && hasLag && got["lag_bytes"] == nil), "SlotStatus failed UNAVAILABLE and the read answered %d %s: an outage of the source is not a dropped slot, only NOT_FOUND is", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -991,6 +1048,7 @@ func CheckSlotHealth(ctx *harness.Ctx) {
 
 #include <cstdint>
 #include <map>
+#include <regex>
 #include <string>
 #include <tuple>
 
@@ -1001,9 +1059,10 @@ func CheckSlotHealth(ctx *harness.Ctx) {
 namespace {
 
 constexpr int64_t kFar = 2LL * 1024 * 1024 * 1024;  // 2 GiB of WAL: critical whatever the threshold below 1 GiB
+constexpr int64_t kHarnessCritical = 512LL * 1024 * 1024;
 
 // Slots by name: head_lsn, restart_lsn, active; a slot not listed was dropped.
-class StatusPeer final : public cdcstream::Slots::Service {
+class HStatusPeer final : public cdcstream::Slots::Service {
  public:
   std::map<std::string, std::tuple<int64_t, int64_t, bool>> slots;
   grpc::Status SlotStatus(grpc::ServerContext*, const cdcstream::SlotStatusRequest* req, cdcstream::SlotState* out) override {
@@ -1016,35 +1075,35 @@ class StatusPeer final : public cdcstream::Slots::Service {
   }
 };
 
-struct LagWorld {
-  StatusPeer source;
+struct HLagWorld {
+  HStatusPeer source;
   httplib::Server svr;
 };
 
-LagWorld& lagSetup(harness::Ctx& ctx) {
-  static LagWorld* world = nullptr;
+HLagWorld& hLagSetup(harness::Ctx& ctx) {
+  static HLagWorld* world = nullptr;
   delete world;
-  world = new LagWorld;
+  world = new HLagWorld;
   ctx.GRPC.Server("")->RegisterService(&world->source);
   register_routes(world->svr);
   return *world;
 }
 
 // An acme subscription whose slot stands at (head, restart, active) unless slot is false, confirmed at confirmed (none when < 0).
-store::Subscription subscribe(LagWorld& w, int64_t head, int64_t restart, bool active, int64_t confirmed, bool slot = true) {
+store::Subscription hSubscribe(HLagWorld& w, int64_t head, int64_t restart, bool active, int64_t confirmed, bool slot = true) {
   const store::Subscription sub = store::createSubscription("acme", "orders", {"id", "status"}, "warehouse-1");
   if (slot) w.source.slots[sub.slot] = {head, restart, active};
   if (confirmed >= 0) cursor::confirm(sub.id, "orders", confirmed);
   return sub;
 }
 
-harness::Response lag(harness::Ctx& ctx, LagWorld& w, const std::string& id, const std::string& tenant = "acme") {
+harness::Response hLag(harness::Ctx& ctx, HLagWorld& w, const std::string& id, const std::string& tenant = "acme") {
   auto c = ctx.HTTP(w.svr);
   if (tenant.empty()) return c.Get("/v1/subscriptions/" + id + "/lag");
   return c.Get("/v1/subscriptions/" + id + "/lag", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json body(const harness::Response& r) {
+nlohmann::json hBody(const harness::Response& r) {
   const auto out = nlohmann::json::parse(r.Text(), nullptr, false);
   return out.is_object() ? out : nlohmann::json::object();
 }
@@ -1052,33 +1111,43 @@ nlohmann::json body(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  LagWorld& w = lagSetup(ctx);
-  const auto near = subscribe(w, 5000, 3000, true, 4000);
-  const auto far = subscribe(w, 4000 + kFar, 1000, true, 4000);
-  auto r = lag(ctx, w, near.id);
+  HLagWorld& w = hLagSetup(ctx);
+  const auto near = hSubscribe(w, 5000, 3000, true, 4000);
+  const auto far = hSubscribe(w, 4000 + kFar, 1000, true, 4000);
+  auto r = hLag(ctx, w, near.id);
   ctx.Equal(r.Status, 200, "GET /v1/subscriptions/%s/lag (%s)", near.id, r.Text());
   const nlohmann::json want = {{"subscription_id", near.id}, {"confirmed_lsn", 4000}, {"head_lsn", 5000},
                                {"lag_bytes", 1000},          {"slot_active", true},   {"state", "ok"}};
-  ctx.Equal(body(r), want, "the lag read");
-  const auto got = body(lag(ctx, w, far.id));
+  ctx.Equal(hBody(r), want, "the lag read");
+  auto got = hBody(hLag(ctx, w, far.id));
   ctx.Assert(got.value("lag_bytes", int64_t{0}) == kFar && got.value("state", "") == "critical",
              "2 GiB behind the head the read answered %s, expected lag_bytes %d and state critical", got.dump(), kFar);
-  ctx.Equal(lag(ctx, w, "sub-99").Status, 404, "an unknown subscription");
+  const auto below = hSubscribe(w, 4000 + kHarnessCritical - 1, 1000, true, 4000);
+  got = hBody(hLag(ctx, w, below.id));
+  ctx.Assert(got["lag_bytes"] == kHarnessCritical - 1 && got["state"] == "ok", "one byte short of kCriticalLagBytes (512 MiB) the read answered %s, expected state ok", got.dump());
+  const auto above = hSubscribe(w, 4000 + kHarnessCritical + 1, 1000, true, 4000);
+  got = hBody(hLag(ctx, w, above.id));
+  ctx.Assert(got["lag_bytes"] == kHarnessCritical + 1 && got["state"] == "critical", "one byte past kCriticalLagBytes (512 MiB) the read answered %s, expected state critical", got.dump());
+  ctx.Equal(hLag(ctx, w, "sub-99").Status, 404, "an unknown subscription");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  LagWorld& w = lagSetup(ctx);
-  const auto sub = subscribe(w, 5000, 3000, true, 4000);
-  const auto r = lag(ctx, w, sub.id, "globex");
+  HLagWorld& w = hLagSetup(ctx);
+  const auto sub = hSubscribe(w, 5000, 3000, true, 4000);
+  const auto r = hLag(ctx, w, sub.id, "globex");
   ctx.Equal(r.Status, 404, "globex read acme's %s (%s): another tenant's subscription must read as unknown", sub.id, r.Text());
-  ctx.Equal(lag(ctx, w, sub.id, "").Status, 401, "a read without X-Tenant-Id");
-  ctx.Equal(lag(ctx, w, sub.id).Status, 200, "acme reading its own subscription");
+  const auto unknown = hLag(ctx, w, "sub-99", "globex");
+  ctx.Assert(std::regex_replace(r.Text(), std::regex(sub.id), "{id}") == std::regex_replace(unknown.Text(), std::regex("sub-99"), "{id}"),
+             "globex reading acme's %s got %s, an unknown id got %s: the two answers must not tell an existing subscription from a missing one", sub.id, r.Text(),
+             unknown.Text());
+  ctx.Equal(hLag(ctx, w, sub.id, "").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(hLag(ctx, w, sub.id).Status, 200, "acme reading its own subscription");
 }
 
 void CheckUnconfirmedLag(harness::Ctx& ctx) {
-  LagWorld& w = lagSetup(ctx);
-  const auto sub = subscribe(w, 1000 + kFar, 1000, true, -1);
-  const auto got = body(lag(ctx, w, sub.id));
+  HLagWorld& w = hLagSetup(ctx);
+  const auto sub = hSubscribe(w, 1000 + kFar, 1000, true, -1);
+  const auto got = hBody(hLag(ctx, w, sub.id));
   ctx.Equal(got.value("lag_bytes", int64_t{0}), kFar,
             "a subscription that confirmed nothing is behind by everything since the slot's restart_lsn; lag_bytes");
   ctx.Assert(got.contains("confirmed_lsn") && got["confirmed_lsn"].is_null() && got.value("state", "") == "critical",
@@ -1086,21 +1155,32 @@ void CheckUnconfirmedLag(harness::Ctx& ctx) {
 }
 
 void CheckSlotHealth(harness::Ctx& ctx) {
-  LagWorld& w = lagSetup(ctx);
-  const auto idle = subscribe(w, 5000, 3000, false, 4000);
-  const auto dropped = subscribe(w, 0, 0, false, 4000, false);
-  const auto halted = subscribe(w, 5000, 3000, true, 4000);
+  HLagWorld& w = hLagSetup(ctx);
+  const auto idle = hSubscribe(w, 5000, 3000, false, 4000);
+  const auto dropped = hSubscribe(w, 0, 0, false, 4000, false);
+  const auto halted = hSubscribe(w, 5000, 3000, true, 4000);
   store::setStatus(halted.id, "slot_lost");
-  auto got = body(lag(ctx, w, idle.id));
+  const auto flaky = hSubscribe(w, 5000, 3000, true, 4000);
+  auto got = hBody(hLag(ctx, w, idle.id));
   ctx.Assert(got.value("slot_active", true) == false && got.value("state", "") == "critical",
              "a slot no consumer holds read %s: the database retains WAL for it until the disk fills. Expected state critical", got.dump());
-  auto r = lag(ctx, w, dropped.id);
+  ctx.Assert(got["head_lsn"] == 5000 && got["lag_bytes"] == 1000, "an inactive slot still exists and still has a lag: it read %s, expected head_lsn 5000 and lag_bytes 1000", got.dump());
+  auto r = hLag(ctx, w, dropped.id);
   ctx.Equal(r.Status, 200, "a dropped slot is the state to page on (%s); the status", r.Text());
-  got = body(r);
-  ctx.Assert(got.value("state", "") == "critical" && got.value("slot_active", true) == false && got.contains("lag_bytes") && got["lag_bytes"].is_null(),
-             "a dropped slot read %s, expected state critical, slot_active false and lag_bytes null", got.dump());
-  r = lag(ctx, w, halted.id);
-  ctx.Assert(r.Status == 200 && body(r).value("state", "") == "critical", "a subscription the replicator marked slot_lost read %d %s, expected state critical", r.Status, r.Text());
+  got = hBody(r);
+  ctx.Assert(got.value("state", "") == "critical" && got.value("slot_active", true) == false && got.contains("lag_bytes") && got["lag_bytes"].is_null() &&
+                 got.contains("head_lsn") && got["head_lsn"].is_null(),
+             "a dropped slot read %s, expected state critical, slot_active false, head_lsn and lag_bytes null", got.dump());
+  r = hLag(ctx, w, halted.id);
+  got = hBody(r);
+  ctx.Assert(r.Status == 200 && got.value("state", "") == "critical", "a subscription the replicator marked slot_lost read %d %s, expected state critical", r.Status, r.Text());
+  ctx.Assert(got["slot_active"] == false && got.contains("lag_bytes") && got["lag_bytes"].is_null() && got.contains("head_lsn") && got["head_lsn"].is_null(),
+             "a subscription the replicator marked slot_lost read %s: its slot is gone whatever SlotStatus says, expected slot_active false, head_lsn and lag_bytes null", got.dump());
+  ctx.GRPC.Fail("SlotStatus", grpc::StatusCode::UNAVAILABLE);
+  r = hLag(ctx, w, flaky.id);
+  got = r.Status == 200 ? hBody(r) : nlohmann::json::object();
+  ctx.Assert(!(got["slot_active"] == false && got.contains("lag_bytes") && got["lag_bytes"].is_null()),
+             "SlotStatus failed UNAVAILABLE and the read answered %d %s: an outage of the source is not a dropped slot, only NOT_FOUND is", r.Status, r.Text());
 }
 `,
   },

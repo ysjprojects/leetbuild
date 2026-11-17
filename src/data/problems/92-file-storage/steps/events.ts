@@ -65,7 +65,7 @@ a lost acknowledgement writes an event twice.
       id: 'no-filename',
       title: 'Carries ids, digest, type and size, never the filename',
       detail:
-        'The payload is built from `PAYLOAD_FIELDS` (`file_id`, `tenant`, `size`, `mime`, `digest`); copying the whole record puts the original filename, user text, into a topic that is retained and replicated.',
+        'Every payload, `finalized` and `deleted` alike, is built from `PAYLOAD_FIELDS` (`file_id`, `tenant`, `size`, `mime`, `digest`); copying the whole record puts the original filename, user text, into a topic that is retained and replicated.',
       match: {
         python: {all: [/PAYLOAD_FIELDS\s*=/, /for \w+ in PAYLOAD_FIELDS/], none: [/\*\*record/]},
         typescript: {all: [/PAYLOAD_FIELDS\s*=/, /PAYLOAD_FIELDS\.map\(/], none: [/\.\.\.record/]},
@@ -715,6 +715,11 @@ def check_no_filename(ctx):
     assert NAME.encode() not in raw and "name" not in payload, f"the event carries the original filename: {payload}. It is user text in a retained, replicated topic; keep it in the index"
     expected = {"type": "file.finalized", "file_id": record["file_id"], "tenant": "t1", "size": len(DATA), "mime": "image/png", "digest": record["digest"]}
     assert payload == expected, f"the finalized event is {payload}, expected exactly {expected}"
+    assert m.delete_file(record["file_id"]) is not None, f"deleting the committed file {record['file_id']} must answer its record"
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 2, f"a finalize and a delete left {len(records)} records on {TOPIC}"
+    deleted = _payload(records[1])
+    assert NAME.encode() not in records[1].value and deleted == {**expected, "type": "file.deleted"}, f"the deleted event is {deleted}, expected exactly {({**expected, 'type': 'file.deleted'})}: every event carries the same fields, never the filename"
 
 
 def check_delete_after_commit(ctx):
@@ -801,6 +806,12 @@ export async function check_no_filename(ctx) {
   const expected = {type: 'file.finalized', file_id: record.file_id, tenant: 't1', size: DATA.length, mime: 'image/png', digest: record.digest};
   const sorted = (o: object) => JSON.stringify(Object.fromEntries(Object.entries(o).sort()));
   assert.equal(sorted(p), sorted(expected), \`the finalized event is \${raw}, expected exactly \${JSON.stringify(expected)}\`);
+  assert((await e.m.deleteFile(record.file_id)) !== null, \`deleting the committed file \${record.file_id} must answer its record\`);
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 2, \`a finalize and a delete left \${records.length} records on \${TOPIC}\`);
+  const deletedRaw = records[1].value.toString();
+  const deleted = {...expected, type: 'file.deleted'};
+  assert(!deletedRaw.includes(NAME) && sorted(payload(records[1])) === sorted(deleted), \`the deleted event is \${deletedRaw}, expected exactly \${JSON.stringify(deleted)}: every event carries the same fields, never the filename\`);
 }
 
 export async function check_delete_after_commit(ctx) {
@@ -844,17 +855,17 @@ import (
 )
 
 const (
-	topic    = "file.event"
-	fileName = "passport-scan-2026.png"
+	hTopic    = "file.event"
+	hFileName = "passport-scan-2026.png"
 )
 
 var (
-	eventsBg = context.Background()
-	pngData  = append([]byte("\\x89PNG\\r\\n\\x1a\\n"), make([]byte, 24)...)
+	hBg  = context.Background()
+	hPng = append([]byte("\\x89PNG\\r\\n\\x1a\\n"), make([]byte, 24)...)
 )
 
-// finalized uploads one part and finalizes it; complete (step 3) stands in as a store that commits at once.
-func finalized(ctx *harness.Ctx) *store.File {
+// hFinalized uploads one part and finalizes it; complete (step 3) stands in as a store that commits at once.
+func hFinalized(ctx *harness.Ctx) *store.File {
 	complete = func(c context.Context, uploadID string) (*store.File, error) {
 		parts, err := store.StagedParts(c, uploadID)
 		if err != nil {
@@ -867,70 +878,76 @@ func finalized(ctx *harness.Ctx) *store.File {
 		sum := sha256.Sum256(data)
 		return store.CommitFile(c, uploadID, "objects/"+uploadID, hex.EncodeToString(sum[:]))
 	}
-	uploadID, err := sessions.OpenSession(eventsBg, "t1", int64(len(pngData)), "image/png", fileName)
+	uploadID, err := sessions.OpenSession(hBg, "t1", int64(len(hPng)), "image/png", hFileName)
 	ctx.NoError(err, "OpenSession failed")
-	store.StagePart(eventsBg, uploadID, 1, pngData)
-	sessions.AckPart(eventsBg, uploadID, 1, int64(len(pngData)))
-	record, err := finalize(eventsBg, uploadID)
+	store.StagePart(hBg, uploadID, 1, hPng)
+	sessions.AckPart(hBg, uploadID, 1, int64(len(hPng)))
+	record, err := finalize(hBg, uploadID)
 	ctx.NoError(err, "finalize(%s) failed", uploadID)
 	ctx.Assert(record != nil && record.State == "committed", "finalize must answer the committed record, got %+v", record)
 	return record
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayload(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func mustDelete(ctx *harness.Ctx, fileID string) *store.File {
-	record, err := deleteFile(eventsBg, fileID)
+func hDelete(ctx *harness.Ctx, fileID string) *store.File {
+	record, err := deleteFile(hBg, fileID)
 	ctx.NoError(err, "deleteFile(%s) failed", fileID)
 	return record
 }
 
 func CheckFileKey(ctx *harness.Ctx) {
-	fileID := finalized(ctx).FileID
-	ctx.Assert(mustDelete(ctx, fileID) != nil, "deleting the committed file %s must answer its record", fileID)
-	records := ctx.Kafka.Records(topic)
+	fileID := hFinalized(ctx).FileID
+	ctx.Assert(hDelete(ctx, fileID) != nil, "deleting the committed file %s must answer its record", fileID)
+	records := ctx.Kafka.Records(hTopic)
 	var types []string
 	for _, r := range records {
-		t, _ := payloadOf(ctx, r.Value)["type"].(string)
+		t, _ := hPayload(ctx, r.Value)["type"].(string)
 		types = append(types, t)
 	}
-	ctx.Equal(types, []string{"file.finalized", "file.deleted"}, "a finalize and a delete; the event types on %s", topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{fileID, fileID}, "the file's two events must be keyed by the file id (keyed by anything else, one file's lifecycle splits across partitions and a consumer can see the delete first)")
+	ctx.Equal(types, []string{"file.finalized", "file.deleted"}, "a finalize and a delete; the event types on %s", hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{fileID, fileID}, "the file's two events must be keyed by the file id (keyed by anything else, one file's lifecycle splits across partitions and a consumer can see the delete first)")
 	ctx.Assert(records[0].Partition == records[1].Partition, "%s's events landed on partitions %d and %d", fileID, records[0].Partition, records[1].Partition)
 }
 
 func CheckNoFilename(ctx *harness.Ctx) {
-	record := finalized(ctx)
-	raw := ctx.Kafka.Records(topic)[0].Value
-	p := payloadOf(ctx, raw)
+	record := hFinalized(ctx)
+	raw := ctx.Kafka.Records(hTopic)[0].Value
+	p := hPayload(ctx, raw)
 	_, named := p["name"]
-	ctx.Assert(!bytes.Contains(raw, []byte(fileName)) && !named, "the event carries the original filename: %s. It is user text in a retained, replicated topic; keep it in the index", raw)
-	expected := map[string]any{"type": "file.finalized", "file_id": record.FileID, "tenant": "t1", "size": float64(len(pngData)), "mime": "image/png", "digest": record.Digest}
+	ctx.Assert(!bytes.Contains(raw, []byte(hFileName)) && !named, "the event carries the original filename: %s. It is user text in a retained, replicated topic; keep it in the index", raw)
+	expected := map[string]any{"type": "file.finalized", "file_id": record.FileID, "tenant": "t1", "size": float64(len(hPng)), "mime": "image/png", "digest": record.Digest}
 	ctx.Equal(p, expected, "the finalized event must carry exactly the type, ids, size, mime and digest")
+	ctx.Assert(hDelete(ctx, record.FileID) != nil, "deleting the committed file %s must answer its record", record.FileID)
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 2, "a finalize and a delete; the records on %s", hTopic)
+	expected["type"] = "file.deleted"
+	ctx.Assert(!bytes.Contains(records[1].Value, []byte(hFileName)), "the deleted event carries the original filename: %s", records[1].Value)
+	ctx.Equal(hPayload(ctx, records[1].Value), expected, "every event carries the same fields, never the filename; the deleted event")
 }
 
 func CheckDeleteAfterCommit(ctx *harness.Ctx) {
-	fileID := finalized(ctx).FileID
+	fileID := hFinalized(ctx).FileID
 	// The moment the delete gives the bytes back to the quota, what is already on the topic.
-	atDelete := ctx.Redis.After("quota:used:t1", func() any { return len(ctx.Kafka.Records(topic)) })
-	ctx.Assert(mustDelete(ctx, fileID) != nil, "deleting the committed file %s must answer its record", fileID)
+	atDelete := ctx.Redis.After("quota:used:t1", func() any { return len(ctx.Kafka.Records(hTopic)) })
+	ctx.Assert(hDelete(ctx, fileID) != nil, "deleting the committed file %s must answer its record", fileID)
 	ctx.Assert(atDelete.Fired, "deleteFile never released the file's quota: it must go through store.DeleteFile")
 	ctx.Equal(atDelete.Result, 1, "when the delete happened the deleted event must not be out yet (delete, then emit); the records at the delete")
-	again := mustDelete(ctx, fileID)
-	ctx.Assert(again == nil && len(ctx.Kafka.Records(topic)) == 2, "deleting %s a second time answered %+v and left %d records: a delete that changed nothing must not be announced", fileID, again, len(ctx.Kafka.Records(topic)))
-	ctx.Assert(mustDelete(ctx, "f-404") == nil && len(ctx.Kafka.Records(topic)) == 2, "deleting a file that does not exist must answer nil and emit nothing")
+	again := hDelete(ctx, fileID)
+	ctx.Assert(again == nil && len(ctx.Kafka.Records(hTopic)) == 2, "deleting %s a second time answered %+v and left %d records: a delete that changed nothing must not be announced", fileID, again, len(ctx.Kafka.Records(hTopic)))
+	ctx.Assert(hDelete(ctx, "f-404") == nil && len(ctx.Kafka.Records(hTopic)) == 2, "deleting a file that does not exist must answer nil and emit nothing")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	fileID := finalized(ctx).FileID
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one finalize, the records on the topic")
-	mustDelete(ctx, fileID)
-	lost := ctx.Kafka.Failover(topic)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
+	fileID := hFinalized(ctx).FileID
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "one finalize, the records on the topic")
+	hDelete(ctx, fileID)
+	lost := ctx.Kafka.Failover(hTopic)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -952,11 +969,11 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "file.event";
-const std::string kName = "passport-scan-2026.png";
-const std::string kData = std::string("\\x89PNG\\r\\n\\x1a\\n", 8) + std::string(24, '\\0');
+const std::string hTopic = "file.event";
+const std::string hName = "passport-scan-2026.png";
+const std::string hData = std::string("\\x89PNG\\r\\n\\x1a\\n", 8) + std::string(24, '\\0');
 
-class ObjectStorePeer final : public stored::ObjectStore::Service {
+class HObjectStorePeer final : public stored::ObjectStore::Service {
  public:
   std::map<std::string, std::string> parts;
 
@@ -984,14 +1001,14 @@ class ObjectStorePeer final : public stored::ObjectStore::Service {
   }
 };
 
-store::File finalized(harness::Ctx& ctx) {
-  static ObjectStorePeer* peer = nullptr;
+store::File hFinalized(harness::Ctx& ctx) {
+  static HObjectStorePeer* peer = nullptr;
   delete peer;
-  peer = new ObjectStorePeer;
+  peer = new HObjectStorePeer;
   ctx.GRPC.Server("")->RegisterService(peer);
-  const std::string upload_id = sessions::openSession("t1", static_cast<long long>(kData.size()), "image/png", kName).value_or("");
-  store::stagePart(upload_id, 1, kData);
-  sessions::ackPart(upload_id, 1, static_cast<long long>(kData.size()));
+  const std::string upload_id = sessions::openSession("t1", static_cast<long long>(hData.size()), "image/png", hName).value_or("");
+  store::stagePart(upload_id, 1, hData);
+  sessions::ackPart(upload_id, 1, static_cast<long long>(hData.size()));
   try {
     const store::File record = finalize(upload_id);
     ctx.Equal(record.state, "committed", "finalize must answer the committed record; its state");
@@ -1001,7 +1018,7 @@ store::File finalized(harness::Ctx& ctx) {
   }
 }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayload(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -1012,46 +1029,53 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
 }  // namespace
 
 void CheckFileKey(harness::Ctx& ctx) {
-  const std::string file_id = finalized(ctx).file_id;
+  const std::string file_id = hFinalized(ctx).file_id;
   ctx.Assert(delete_file(file_id).has_value(), "deleting the committed file %s must answer its record", file_id);
-  const auto records = ctx.Kafka.Records(kTopic);
+  const auto records = ctx.Kafka.Records(hTopic);
   std::vector<std::string> types;
-  for (const auto& r : records) types.push_back(payloadOf(ctx, r).value("type", ""));
-  ctx.Equal(types, {"file.finalized", "file.deleted"}, "a finalize and a delete; the event types on %s", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {file_id, file_id}, "the file's two events must be keyed by the file id (keyed by anything else, one file's lifecycle splits across partitions and a consumer can see the delete first)");
+  for (const auto& r : records) types.push_back(hPayload(ctx, r).value("type", ""));
+  ctx.Equal(types, {"file.finalized", "file.deleted"}, "a finalize and a delete; the event types on %s", hTopic);
+  ctx.Equal(ctx.Kafka.Keys(hTopic), {file_id, file_id}, "the file's two events must be keyed by the file id (keyed by anything else, one file's lifecycle splits across partitions and a consumer can see the delete first)");
   ctx.Assert(records[0].Partition == records[1].Partition, "%s's events landed on partitions %d and %d", file_id, records[0].Partition, records[1].Partition);
 }
 
 void CheckNoFilename(harness::Ctx& ctx) {
-  const store::File record = finalized(ctx);
-  const auto first = ctx.Kafka.Records(kTopic)[0];
+  const store::File record = hFinalized(ctx);
+  const auto first = ctx.Kafka.Records(hTopic)[0];
   const std::string raw = first.Value.value_or("");
-  const json p = payloadOf(ctx, first);
-  ctx.Assert(raw.find(kName) == std::string::npos && !p.contains("name"), "the event carries the original filename: %s. It is user text in a retained, replicated topic; keep it in the index", raw);
-  const json expected = {{"type", "file.finalized"}, {"file_id", record.file_id}, {"tenant", "t1"}, {"size", kData.size()}, {"mime", "image/png"}, {"digest", record.digest}};
+  const json p = hPayload(ctx, first);
+  ctx.Assert(raw.find(hName) == std::string::npos && !p.contains("name"), "the event carries the original filename: %s. It is user text in a retained, replicated topic; keep it in the index", raw);
+  json expected = {{"type", "file.finalized"}, {"file_id", record.file_id}, {"tenant", "t1"}, {"size", hData.size()}, {"mime", "image/png"}, {"digest", record.digest}};
   ctx.Equal(p, expected, "the finalized event must carry exactly the type, ids, size, mime and digest");
+  ctx.Assert(delete_file(record.file_id).has_value(), "deleting the committed file %s must answer its record", record.file_id);
+  const auto records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 2, "a finalize and a delete; the records on %s", hTopic);
+  const std::string deleted_raw = records[1].Value.value_or("");
+  ctx.Assert(deleted_raw.find(hName) == std::string::npos, "the deleted event carries the original filename: %s", deleted_raw);
+  expected["type"] = "file.deleted";
+  ctx.Equal(hPayload(ctx, records[1]), expected, "every event carries the same fields, never the filename; the deleted event");
 }
 
 void CheckDeleteAfterCommit(harness::Ctx& ctx) {
-  const std::string file_id = finalized(ctx).file_id;
+  const std::string file_id = hFinalized(ctx).file_id;
   // The moment the delete gives the bytes back to the quota, what is already on the topic.
   int atDelete = -1;
-  ctx.Redis.After("quota:used:t1", [&] { atDelete = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
+  ctx.Redis.After("quota:used:t1", [&] { atDelete = static_cast<int>(ctx.Kafka.Records(hTopic).size()); });
   ctx.Assert(delete_file(file_id).has_value(), "deleting the committed file %s must answer its record", file_id);
   ctx.Assert(atDelete >= 0, "delete_file never released the file's quota: it must go through store::deleteFile");
   ctx.Equal(atDelete, 1, "when the delete happened the deleted event must not be out yet (delete, then emit); the records at the delete");
   const auto again = delete_file(file_id);
-  ctx.Assert(!again && ctx.Kafka.Records(kTopic).size() == 2, "deleting %s a second time left %d records: a delete that changed nothing must not be announced", file_id, ctx.Kafka.Records(kTopic).size());
-  ctx.Assert(!delete_file("f-404") && ctx.Kafka.Records(kTopic).size() == 2, "deleting a file that does not exist must answer nothing and emit nothing");
+  ctx.Assert(!again && ctx.Kafka.Records(hTopic).size() == 2, "deleting %s a second time left %d records: a delete that changed nothing must not be announced", file_id, ctx.Kafka.Records(hTopic).size());
+  ctx.Assert(!delete_file("f-404") && ctx.Kafka.Records(hTopic).size() == 2, "deleting a file that does not exist must answer nothing and emit nothing");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  const std::string file_id = finalized(ctx).file_id;
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one finalize whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
+  ctx.Kafka.LoseAcks(hTopic, 1);
+  const std::string file_id = hFinalized(ctx).file_id;
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "one finalize whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
   delete_file(file_id);
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  const int lost = ctx.Kafka.Failover(hTopic);
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

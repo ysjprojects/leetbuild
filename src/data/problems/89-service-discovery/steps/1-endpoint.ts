@@ -26,7 +26,8 @@ because the record has no expiry, whatever \`ttl_seconds\` says.
 - \`port\` is \`1..65535\` and \`heartbeat_interval\` \`2..60\` seconds, else **400**.
 - The address lies inside the deployment CIDR (\`registry.in_cidr\`), else **422**.
 - The hash, its expiry (\`TTL_INTERVALS * heartbeat_interval\` seconds) and the membership go in one
-  \`MULTI\` (\`pipeline(transaction=True)\`); a refused registration writes nothing.`,
+  \`MULTI\` (\`pipeline(transaction=True)\`), and a command that fails inside it is an error, not a
+  **201**; a refused registration writes nothing.`,
   sequence: {
     participants: ['Instance agent', 'Discovery API', 'deployment registry', 'Redis'],
     messages: [
@@ -58,7 +59,7 @@ because the record has no expiry, whatever \`ttl_seconds\` says.
       id: 'scope',
       title: 'Registers only into the services the caller is granted',
       detail:
-        'A request without `X-Client-Id` is **401** and a service outside `allowed_services(client_id)` is **403**, both before anything is written. The starter reads the header and registers into any service.',
+        'A request without `X-Client-Id` is **401** and a service outside `allowed_services(client_id)` is **403**, also for a caller that holds no grant at all, both before anything is written. The starter reads the header and registers into any service.',
       match: {
         python: {
           all: [/x-client-id/i, /status_code=401/, /registry\.allowed_services\(/, /status_code=403/],
@@ -106,7 +107,7 @@ because the record has no expiry, whatever \`ttl_seconds\` says.
       id: 'ttl',
       title: 'The record expires three heartbeat intervals after it is written',
       detail:
-        'The hash, its `EXPIRE` of `TTL_INTERVALS * heartbeat_interval` seconds and the `SADD` to the members set run in one MULTI (or through `register_instance`). The starter writes the hash without a TTL, so a crashed instance stays registered.',
+        'The hash, its `EXPIRE` of `TTL_INTERVALS * heartbeat_interval` seconds and the `SADD` to the members set run in one MULTI (or through `register_instance`): right after the first of them lands, the record already has its TTL and its membership. A command that fails inside the MULTI (a WRONGTYPE members key) must not answer 201. The starter writes the hash without a TTL, so a crashed instance stays registered.',
       match: {
         python: {all: [/\.expire\(|instances\.register_instance\(/, /\.pipeline\(|instances\.register_instance\(/]},
         typescript: {all: [/\.expire\(|instances\.registerInstance\(/, /\.multi\(\)|instances\.registerInstance\(/]},
@@ -318,7 +319,7 @@ app.post('/v1/instances', async (request, reply) => {
   const ttlSeconds = instances.TTL_INTERVALS * body.heartbeat_interval;
   const key = instances.recordKey(body.service, body.instance_id);
   // The record, its expiry and the membership land together: the TTL is the only failure detector.
-  await redis
+  const replies = await redis
     .multi()
     .hset(key, {
       address: body.address,
@@ -330,6 +331,11 @@ app.post('/v1/instances', async (request, reply) => {
     .expire(key, ttlSeconds)
     .sadd(instances.membersKey(body.service), body.instance_id)
     .exec();
+  // EXEC resolves even when one command failed (WRONGTYPE): the registration did not land.
+  const failed = (replies ?? []).find(([err]) => err !== null);
+  if (replies === null || failed !== undefined) {
+    return reply.code(500).send({error: \`the registration did not land: \${failed?.[0]?.message ?? 'transaction aborted'}\`});
+  }
   return reply.code(201).send({...body, metadata_version: metadataVersion, ttl_seconds: ttlSeconds, registered_by: clientId});
 });
 `,
@@ -638,8 +644,11 @@ object Api {
                 "metadata_version" -> body.metadataVersion.toString, "last_heartbeat" -> (System.currentTimeMillis() / 1000).toString).asJava)
               tx.expire(key, ttl.toLong)
               tx.sadd(Instances.membersKey(body.service), body.instanceId)
-              tx.exec()
-              complete(json(StatusCodes.Created, answer(body, ttl, clientId)))
+              // EXEC answers even when one command failed (WRONGTYPE): the registration did not land.
+              tx.exec().asScala.collectFirst { case e: Exception => e } match {
+                case Some(e) => complete(StatusCodes.InternalServerError -> s"the registration did not land: \${e.getMessage}")
+                case None => complete(json(StatusCodes.Created, answer(body, ttl, clientId)))
+              }
           }
         }
       }
@@ -740,7 +749,15 @@ void handle_register(const httplib::Request& req, httplib::Response& res) {
       {"last_heartbeat", std::to_string(instances::nowSeconds())}};
   // The record, its expiry and the membership land together: the TTL is the only failure detector.
   auto tx = redis.transaction();
-  tx.hset(key, fields.begin(), fields.end()).expire(key, std::chrono::seconds(ttl)).sadd(instances::membersKey(service), instance_id).exec();
+  auto replies = tx.hset(key, fields.begin(), fields.end()).expire(key, std::chrono::seconds(ttl)).sadd(instances::membersKey(service), instance_id).exec();
+  // EXEC answers even when one command failed (WRONGTYPE): the registration did not land.
+  for (std::size_t i = 0; i < replies.size(); ++i) {
+    try {
+      replies.get<long long>(i);
+    } catch (const sw::redis::ReplyError& e) {
+      return refuse(res, 500, std::string("the registration did not land: ") + e.what());
+    }
+  }
   body["ttl_seconds"] = ttl;
   body["registered_by"] = client_id;
   res.status = 201;
@@ -780,6 +797,9 @@ async def check_scope(ctx):
         r = await c.post("/v1/instances", json=rogue, headers=AGENT)
         assert r.status_code == 403, f"checkout-agent registering into payments answered {r.status_code}, expected 403: its grants name checkout only"
         _nothing_written(ctx, "payments", "payments-1", "checkout-agent has no grant for payments")
+        r = await c.post("/v1/instances", json=INSTANCE, headers={"X-Client-Id": "build-runner"})
+        assert r.status_code == 403, f"build-runner, which holds no grant at all, registering into checkout answered {r.status_code}, expected 403: a caller with no grants may register nowhere"
+        _nothing_written(ctx, "checkout", "checkout-3", "build-runner has no grant for checkout")
         r = await c.post("/v1/instances", json=INSTANCE, headers=AGENT)
     assert r.status_code == 201, f"checkout-agent registering checkout-3 into checkout answered {r.status_code}: {r.text}"
     assert ctx.redis.exists("sd:checkout:checkout-3") == 1, "a granted registration must write sd:checkout:checkout-3"
@@ -790,35 +810,58 @@ async def check_cidr(ctx):
         r = await c.post("/v1/instances", json={**INSTANCE, "service": "inventory", "instance_id": "inventory-1"}, headers=AGENT)
         assert r.status_code == 404, f"a registration into inventory, which has no deployment, answered {r.status_code}, expected 404"
         _nothing_written(ctx, "inventory", "inventory-1", "inventory has no deployment")
-        for address in ("10.5.0.9", "192.168.1.20", "laptop.local"):
+        for address in ("10.5.0.9", "10.40.2.7", "10.3.255.255", "192.168.1.20", "laptop.local"):
             r = await c.post("/v1/instances", json={**INSTANCE, "address": address}, headers=AGENT)
             assert r.status_code == 422, f"checkout-3 at {address}, outside checkout's CIDR 10.4.0.0/16, answered {r.status_code}, expected 422"
             _nothing_written(ctx, "checkout", "checkout-3", f"{address} is outside 10.4.0.0/16")
         r = await c.post("/v1/instances", json=INSTANCE, headers=AGENT)
-    assert r.status_code == 201, f"checkout-3 at 10.4.2.7, inside 10.4.0.0/16, answered {r.status_code}: {r.text}"
-    assert ctx.redis.hget("sd:checkout:checkout-3", "address") == "10.4.2.7", f"sd:checkout:checkout-3 holds {ctx.redis.hgetall('sd:checkout:checkout-3')}"
+        assert r.status_code == 201, f"checkout-3 at 10.4.2.7, inside 10.4.0.0/16, answered {r.status_code}: {r.text}"
+        assert ctx.redis.hget("sd:checkout:checkout-3", "address") == "10.4.2.7", f"sd:checkout:checkout-3 holds {ctx.redis.hgetall('sd:checkout:checkout-3')}"
+        r = await c.post("/v1/instances", json={**INSTANCE, "instance_id": "checkout-4", "address": "10.4.255.254"}, headers=AGENT)
+    assert r.status_code == 201, f"checkout-4 at 10.4.255.254, the last host of 10.4.0.0/16, answered {r.status_code}: {r.text}"
 
 
 async def check_ttl(ctx):
+    def snapshot():  # the instant the first command touching the record or the members set has run
+        return ctx.redis.ttl("sd:checkout:checkout-3"), bool(ctx.redis.sismember("sd:members:checkout", "checkout-3"))
+
+    probes = [ctx.redis_after("sd:checkout:checkout-3", snapshot), ctx.redis_after("sd:members:checkout", snapshot)]
     async with _api(ctx) as c:
         r = await c.post("/v1/instances", json=INSTANCE, headers=AGENT)
     assert r.status_code == 201, f"the registration answered {r.status_code}: {r.text}"
+    for probe in probes:
+        assert probe.fired, "the registration never wrote sd:checkout:checkout-3 and sd:members:checkout"
+        if probe.error is not None:
+            raise probe.error
+        ttl, member = probe.result
+        assert ttl > 0 and member, f"right after the registration's first write the record had TTL {ttl} and checkout-3 was {'' if member else 'not '}in sd:members:checkout: the hash, its EXPIRE and the SADD must land in one MULTI, or a crash between them leaves a record that never expires or a member with no record"
     assert r.json().get("ttl_seconds") == 15, f"ttl_seconds is {r.json().get('ttl_seconds')!r}, expected 3 intervals of 5 s = 15"
     ttl = ctx.redis.ttl("sd:checkout:checkout-3")
     assert 14 <= ttl <= 15, f"sd:checkout:checkout-3 has TTL {ttl}: the record must expire 15 s (3 heartbeat intervals) after it is written, or a crashed instance stays registered"
     assert ctx.redis.sismember("sd:members:checkout", "checkout-3"), "checkout-3 must be in sd:members:checkout"
     ctx.clock.advance(16)
     assert ctx.redis.exists("sd:checkout:checkout-3") == 0, "16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 still exists: a crashed instance stays routable"
+    ctx.redis.set("sd:members:checkout", "corrupt")  # the members set's SADD fails inside the MULTI (WRONGTYPE)
+    async with _api(ctx) as c:
+        try:
+            status = (await c.post("/v1/instances", json=INSTANCE, headers=AGENT)).status_code
+        except Exception:  # the handler raised: the caller sees a 500
+            status = 500
+    assert status != 201, "the SADD to sd:members:checkout failed inside the MULTI (WRONGTYPE) and the registration still answered 201: check the transaction's replies, an instance that is not a member is never listed"
 
 
 async def check_bounds(ctx):
     async with _api(ctx) as c:
-        for change, why in (({"port": 0}, "port 0"), ({"port": 70000}, "port 70000"), ({"heartbeat_interval": 1}, "a 1 s heartbeat interval"), ({"heartbeat_interval": 3600}, "a 3600 s heartbeat interval")):
+        for change, why in (({"port": 0}, "port 0"), ({"port": 65536}, "port 65536"), ({"heartbeat_interval": 1}, "a 1 s heartbeat interval"), ({"heartbeat_interval": 61}, "a 61 s heartbeat interval"), ({"heartbeat_interval": 3600}, "a 3600 s heartbeat interval")):
             r = await c.post("/v1/instances", json={**INSTANCE, **change}, headers=AGENT)
             assert r.status_code == 400, f"a registration with {why} answered {r.status_code}, expected 400"
             _nothing_written(ctx, "checkout", "checkout-3", f"the registration had {why}")
         r = await c.post("/v1/instances", json={**INSTANCE, "port": 65535, "heartbeat_interval": 60}, headers=AGENT)
-    assert r.status_code == 201, f"port 65535 with a 60 s interval is inside the bounds and answered {r.status_code}: {r.text}"
+        assert r.status_code == 201, f"port 65535 with a 60 s interval is inside the bounds and answered {r.status_code}: {r.text}"
+        assert 179 <= ctx.redis.ttl("sd:checkout:checkout-3") <= 180, f"a 60 s interval gives sd:checkout:checkout-3 TTL {ctx.redis.ttl('sd:checkout:checkout-3')}, expected 3 x 60 = 180"
+        r = await c.post("/v1/instances", json={**INSTANCE, "instance_id": "checkout-4", "port": 1, "heartbeat_interval": 2}, headers=AGENT)
+    assert r.status_code == 201, f"port 1 with a 2 s interval is inside the bounds and answered {r.status_code}: {r.text}"
+    assert 5 <= ctx.redis.ttl("sd:checkout:checkout-4") <= 6, f"a 2 s interval gives sd:checkout:checkout-4 TTL {ctx.redis.ttl('sd:checkout:checkout-4')}, expected 3 x 2 = 6"
 `,
     typescript: `const INSTANCE = {service: 'checkout', instance_id: 'checkout-3', address: '10.4.2.7', port: 8080, heartbeat_interval: 5, metadata_version: 12};
 const AGENT = {'X-Client-Id': 'checkout-agent'};
@@ -845,6 +888,9 @@ export async function check_scope(ctx) {
   r = await c.post('/v1/instances', {json: rogue, headers: AGENT});
   assert.equal(r.status, 403, \`checkout-agent registering into payments answered \${r.status}, expected 403: its grants name checkout only\`);
   nothingWritten(ctx, 'payments', 'payments-1', 'checkout-agent has no grant for payments');
+  r = await c.post('/v1/instances', {json: INSTANCE, headers: {'X-Client-Id': 'build-runner'}});
+  assert.equal(r.status, 403, \`build-runner, which holds no grant at all, registering into checkout answered \${r.status}, expected 403: a caller with no grants may register nowhere\`);
+  nothingWritten(ctx, 'checkout', 'checkout-3', 'build-runner has no grant for checkout');
   r = await c.post('/v1/instances', {json: INSTANCE, headers: AGENT});
   assert.equal(r.status, 201, \`checkout-agent registering checkout-3 into checkout answered \${r.status}: \${r.text}\`);
   assert.equal(ctx.redis.exists('sd:checkout:checkout-3'), 1, 'a granted registration must write sd:checkout:checkout-3');
@@ -855,7 +901,7 @@ export async function check_cidr(ctx) {
   let r = await c.post('/v1/instances', {json: {...INSTANCE, service: 'inventory', instance_id: 'inventory-1'}, headers: AGENT});
   assert.equal(r.status, 404, \`a registration into inventory, which has no deployment, answered \${r.status}, expected 404\`);
   nothingWritten(ctx, 'inventory', 'inventory-1', 'inventory has no deployment');
-  for (const address of ['10.5.0.9', '192.168.1.20', 'laptop.local']) {
+  for (const address of ['10.5.0.9', '10.40.2.7', '10.3.255.255', '192.168.1.20', 'laptop.local']) {
     r = await c.post('/v1/instances', {json: {...INSTANCE, address}, headers: AGENT});
     assert.equal(r.status, 422, \`checkout-3 at \${address}, outside checkout's CIDR 10.4.0.0/16, answered \${r.status}, expected 422\`);
     nothingWritten(ctx, 'checkout', 'checkout-3', address + ' is outside 10.4.0.0/16');
@@ -863,26 +909,41 @@ export async function check_cidr(ctx) {
   r = await c.post('/v1/instances', {json: INSTANCE, headers: AGENT});
   assert.equal(r.status, 201, \`checkout-3 at 10.4.2.7, inside 10.4.0.0/16, answered \${r.status}: \${r.text}\`);
   assert.equal(ctx.redis.hget('sd:checkout:checkout-3', 'address'), '10.4.2.7', 'sd:checkout:checkout-3 must hold the address 10.4.2.7');
+  r = await c.post('/v1/instances', {json: {...INSTANCE, instance_id: 'checkout-4', address: '10.4.255.254'}, headers: AGENT});
+  assert.equal(r.status, 201, \`checkout-4 at 10.4.255.254, the last host of 10.4.0.0/16, answered \${r.status}: \${r.text}\`);
 }
 
 export async function check_ttl(ctx) {
+  // The instant the first command touching the record or the members set has run.
+  const snapshot = (): [number, boolean] => [ctx.redis.ttl('sd:checkout:checkout-3'), ctx.redis.sismember('sd:members:checkout', 'checkout-3') === 1];
+  const probes = [ctx.redisAfter('sd:checkout:checkout-3', snapshot), ctx.redisAfter('sd:members:checkout', snapshot)];
   const c = api(ctx);
   const r = await c.post('/v1/instances', {json: INSTANCE, headers: AGENT});
   assert.equal(r.status, 201, \`the registration answered \${r.status}: \${r.text}\`);
+  for (const probe of probes) {
+    assert(probe.fired, 'the registration never wrote sd:checkout:checkout-3 and sd:members:checkout');
+    if (probe.error !== undefined) throw probe.error;
+    const [early, member] = probe.result as [number, boolean];
+    assert(early > 0 && member, \`right after the registration's first write the record had TTL \${early} and checkout-3 was \${member ? '' : 'not '}in sd:members:checkout: the hash, its EXPIRE and the SADD must land in one MULTI, or a crash between them leaves a record that never expires or a member with no record\`);
+  }
   assert.equal(r.json().ttl_seconds, 15, \`ttl_seconds is \${JSON.stringify(r.json().ttl_seconds)}, expected 3 intervals of 5 s = 15\`);
   const ttl = ctx.redis.ttl('sd:checkout:checkout-3');
   assert(14 <= ttl && ttl <= 15, \`sd:checkout:checkout-3 has TTL \${ttl}: the record must expire 15 s (3 heartbeat intervals) after it is written, or a crashed instance stays registered\`);
   assert.equal(ctx.redis.sismember('sd:members:checkout', 'checkout-3'), 1, 'checkout-3 must be in sd:members:checkout');
   ctx.clock.advance(16);
   assert.equal(ctx.redis.exists('sd:checkout:checkout-3'), 0, '16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 still exists: a crashed instance stays routable');
+  ctx.redis.set('sd:members:checkout', 'corrupt'); // the members set's SADD fails inside the MULTI (WRONGTYPE)
+  const failed = await c.post('/v1/instances', {json: INSTANCE, headers: AGENT});
+  assert.notEqual(failed.status, 201, "the SADD to sd:members:checkout failed inside the MULTI (WRONGTYPE) and the registration still answered 201: check the transaction's replies, an instance that is not a member is never listed");
 }
 
 export async function check_bounds(ctx) {
   const c = api(ctx);
   const cases: [Record<string, number>, string][] = [
     [{port: 0}, 'port 0'],
-    [{port: 70000}, 'port 70000'],
+    [{port: 65536}, 'port 65536'],
     [{heartbeat_interval: 1}, 'a 1 s heartbeat interval'],
+    [{heartbeat_interval: 61}, 'a 61 s heartbeat interval'],
     [{heartbeat_interval: 3600}, 'a 3600 s heartbeat interval'],
   ];
   for (const [change, why] of cases) {
@@ -890,8 +951,14 @@ export async function check_bounds(ctx) {
     assert.equal(r.status, 400, \`a registration with \${why} answered \${r.status}, expected 400\`);
     nothingWritten(ctx, 'checkout', 'checkout-3', 'the registration had ' + why);
   }
-  const r = await c.post('/v1/instances', {json: {...INSTANCE, port: 65535, heartbeat_interval: 60}, headers: AGENT});
+  let r = await c.post('/v1/instances', {json: {...INSTANCE, port: 65535, heartbeat_interval: 60}, headers: AGENT});
   assert.equal(r.status, 201, \`port 65535 with a 60 s interval is inside the bounds and answered \${r.status}: \${r.text}\`);
+  let ttl = ctx.redis.ttl('sd:checkout:checkout-3');
+  assert(179 <= ttl && ttl <= 180, \`a 60 s interval gives sd:checkout:checkout-3 TTL \${ttl}, expected 3 x 60 = 180\`);
+  r = await c.post('/v1/instances', {json: {...INSTANCE, instance_id: 'checkout-4', port: 1, heartbeat_interval: 2}, headers: AGENT});
+  assert.equal(r.status, 201, \`port 1 with a 2 s interval is inside the bounds and answered \${r.status}: \${r.text}\`);
+  ttl = ctx.redis.ttl('sd:checkout:checkout-4');
+  assert(5 <= ttl && ttl <= 6, \`a 2 s interval gives sd:checkout:checkout-4 TTL \${ttl}, expected 3 x 2 = 6\`);
 }
 `,
     go: `package main
@@ -902,9 +969,9 @@ import (
 	"leetbuild/harness"
 )
 
-var instance = map[string]any{"service": "checkout", "instance_id": "checkout-3", "address": "10.4.2.7", "port": 8080, "heartbeat_interval": 5, "metadata_version": 12}
+var sdInstance = map[string]any{"service": "checkout", "instance_id": "checkout-3", "address": "10.4.2.7", "port": 8080, "heartbeat_interval": 5, "metadata_version": 12}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func sdAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16")
 	ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16")
 	ctx.Redis.Do("SADD", "sd:grants:checkout-agent", "checkout")
@@ -913,9 +980,9 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func with(changes map[string]any) map[string]any {
+func sdWith(changes map[string]any) map[string]any {
 	out := map[string]any{}
-	for k, v := range instance {
+	for k, v := range sdInstance {
 		out[k] = v
 	}
 	for k, v := range changes {
@@ -924,49 +991,76 @@ func with(changes map[string]any) map[string]any {
 	return out
 }
 
-func register(c *harness.HTTP, body map[string]any) *harness.Response {
+func sdRegister(c *harness.HTTP, body map[string]any) *harness.Response {
 	return c.Post("/v1/instances", body, "X-Client-Id", "checkout-agent")
 }
 
-func nothingWritten(ctx *harness.Ctx, service, instanceID, why string) {
+func sdNothingWritten(ctx *harness.Ctx, service, instanceID, why string) {
 	key := "sd:" + service + ":" + instanceID
 	ctx.Equal(ctx.Redis.Exists(key), 0, "%s, yet %s was written: a refused registration must leave nothing a router can read; exists", why, key)
 	ctx.Assert(!ctx.Redis.SIsMember("sd:members:"+service, instanceID), "%s, yet %s was added to sd:members:%s", why, instanceID, service)
 }
 
+// sdSnapshot is the record's TTL and its membership at the instant a probe fired.
+type sdSnapshot struct {
+	ttl    int64
+	member bool
+}
+
 func CheckScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/instances", instance)
+	c := sdAPI(ctx)
+	r := c.Post("/v1/instances", sdInstance)
 	ctx.Equal(r.Status, 401, "a registration without X-Client-Id")
-	nothingWritten(ctx, "checkout", "checkout-3", "the caller was anonymous")
-	r = register(c, with(map[string]any{"service": "payments", "instance_id": "payments-1", "address": "10.9.0.4"}))
+	sdNothingWritten(ctx, "checkout", "checkout-3", "the caller was anonymous")
+	r = sdRegister(c, sdWith(map[string]any{"service": "payments", "instance_id": "payments-1", "address": "10.9.0.4"}))
 	ctx.Equal(r.Status, 403, "checkout-agent registering into payments (its grants name checkout only)")
-	nothingWritten(ctx, "payments", "payments-1", "checkout-agent has no grant for payments")
-	r = register(c, instance)
+	sdNothingWritten(ctx, "payments", "payments-1", "checkout-agent has no grant for payments")
+	r = c.Post("/v1/instances", sdInstance, "X-Client-Id", "build-runner")
+	ctx.Equal(r.Status, 403, "build-runner, which holds no grant at all, registering into checkout (a caller with no grants may register nowhere)")
+	sdNothingWritten(ctx, "checkout", "checkout-3", "build-runner has no grant for checkout")
+	r = sdRegister(c, sdInstance)
 	ctx.Equal(r.Status, 201, "checkout-agent registering checkout-3 into checkout (%s)", r.Text())
 	ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 1, "a granted registration must write sd:checkout:checkout-3; exists")
 }
 
 func CheckCidr(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := register(c, with(map[string]any{"service": "inventory", "instance_id": "inventory-1"}))
+	c := sdAPI(ctx)
+	r := sdRegister(c, sdWith(map[string]any{"service": "inventory", "instance_id": "inventory-1"}))
 	ctx.Equal(r.Status, 404, "a registration into inventory, which has no deployment")
-	nothingWritten(ctx, "inventory", "inventory-1", "inventory has no deployment")
-	for _, address := range []string{"10.5.0.9", "192.168.1.20", "laptop.local"} {
-		r = register(c, with(map[string]any{"address": address}))
+	sdNothingWritten(ctx, "inventory", "inventory-1", "inventory has no deployment")
+	for _, address := range []string{"10.5.0.9", "10.40.2.7", "10.3.255.255", "192.168.1.20", "laptop.local"} {
+		r = sdRegister(c, sdWith(map[string]any{"address": address}))
 		ctx.Equal(r.Status, 422, "checkout-3 at %s, outside checkout's CIDR 10.4.0.0/16", address)
-		nothingWritten(ctx, "checkout", "checkout-3", address+" is outside 10.4.0.0/16")
+		sdNothingWritten(ctx, "checkout", "checkout-3", address+" is outside 10.4.0.0/16")
 	}
-	r = register(c, instance)
+	r = sdRegister(c, sdInstance)
 	ctx.Equal(r.Status, 201, "checkout-3 at 10.4.2.7, inside 10.4.0.0/16 (%s)", r.Text())
 	address, _ := ctx.Redis.HGet("sd:checkout:checkout-3", "address")
 	ctx.Equal(address, "10.4.2.7", "the address in sd:checkout:checkout-3")
+	r = sdRegister(c, sdWith(map[string]any{"instance_id": "checkout-4", "address": "10.4.255.254"}))
+	ctx.Equal(r.Status, 201, "checkout-4 at 10.4.255.254, the last host of 10.4.0.0/16 (%s)", r.Text())
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := register(c, instance)
+	// The instant the first command touching the record or the members set has run.
+	snapshot := func() any {
+		return sdSnapshot{ttl: int64(ctx.Redis.TTL("sd:checkout:checkout-3")), member: ctx.Redis.SIsMember("sd:members:checkout", "checkout-3")}
+	}
+	recordProbe := ctx.Redis.After("sd:checkout:checkout-3", snapshot)
+	membersProbe := ctx.Redis.After("sd:members:checkout", snapshot)
+	c := sdAPI(ctx)
+	r := sdRegister(c, sdInstance)
 	ctx.Equal(r.Status, 201, "the registration (%s)", r.Text())
+	for _, probe := range []struct {
+		fired  bool
+		err    error
+		result any
+	}{{recordProbe.Fired, recordProbe.Err, recordProbe.Result}, {membersProbe.Fired, membersProbe.Err, membersProbe.Result}} {
+		ctx.Assert(probe.fired, "the registration never wrote sd:checkout:checkout-3 and sd:members:checkout")
+		ctx.NoError(probe.err, "the snapshot after the registration's first write")
+		early := probe.result.(sdSnapshot)
+		ctx.Assert(early.ttl > 0 && early.member, "right after the registration's first write the record had TTL %d and checkout-3 in sd:members:checkout was %v: the hash, its EXPIRE and the SADD must land in one MULTI, or a crash between them leaves a record that never expires or a member with no record", early.ttl, early.member)
+	}
 	var body struct {
 		TTLSeconds int \`json:"ttl_seconds"\`
 	}
@@ -977,26 +1071,36 @@ func CheckTtl(ctx *harness.Ctx) {
 	ctx.Assert(ctx.Redis.SIsMember("sd:members:checkout", "checkout-3"), "checkout-3 must be in sd:members:checkout")
 	ctx.Clock.Advance(16)
 	ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 0, "16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 must be gone, or a crashed instance stays routable; exists")
+	ctx.Redis.Set("sd:members:checkout", "corrupt") // the members set's SADD fails inside the MULTI (WRONGTYPE)
+	r = sdRegister(c, sdInstance)
+	ctx.Assert(r.Status != 201, "the SADD to sd:members:checkout failed inside the MULTI (WRONGTYPE) and the registration still answered 201: check the transaction's replies, an instance that is not a member is never listed")
 }
 
 func CheckBounds(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := sdAPI(ctx)
 	cases := []struct {
 		change map[string]any
 		why    string
 	}{
 		{map[string]any{"port": 0}, "port 0"},
-		{map[string]any{"port": 70000}, "port 70000"},
+		{map[string]any{"port": 65536}, "port 65536"},
 		{map[string]any{"heartbeat_interval": 1}, "a 1 s heartbeat interval"},
+		{map[string]any{"heartbeat_interval": 61}, "a 61 s heartbeat interval"},
 		{map[string]any{"heartbeat_interval": 3600}, "a 3600 s heartbeat interval"},
 	}
 	for _, tc := range cases {
-		r := register(c, with(tc.change))
+		r := sdRegister(c, sdWith(tc.change))
 		ctx.Equal(r.Status, 400, "a registration with %s", tc.why)
-		nothingWritten(ctx, "checkout", "checkout-3", "the registration had "+tc.why)
+		sdNothingWritten(ctx, "checkout", "checkout-3", "the registration had "+tc.why)
 	}
-	r := register(c, with(map[string]any{"port": 65535, "heartbeat_interval": 60}))
+	r := sdRegister(c, sdWith(map[string]any{"port": 65535, "heartbeat_interval": 60}))
 	ctx.Equal(r.Status, 201, "port 65535 with a 60 s interval is inside the bounds (%s)", r.Text())
+	ttl := ctx.Redis.TTL("sd:checkout:checkout-3")
+	ctx.Assert(179 <= ttl && ttl <= 180, "a 60 s interval gives sd:checkout:checkout-3 TTL %d, expected 3 x 60 = 180", ttl)
+	r = sdRegister(c, sdWith(map[string]any{"instance_id": "checkout-4", "port": 1, "heartbeat_interval": 2}))
+	ctx.Equal(r.Status, 201, "port 1 with a 2 s interval is inside the bounds (%s)", r.Text())
+	ttl = ctx.Redis.TTL("sd:checkout:checkout-4")
+	ctx.Assert(5 <= ttl && ttl <= 6, "a 2 s interval gives sd:checkout:checkout-4 TTL %d, expected 3 x 2 = 6", ttl)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1011,10 +1115,10 @@ func CheckBounds(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json kInstance = {{"service", "checkout"}, {"instance_id", "checkout-3"}, {"address", "10.4.2.7"},
-                                  {"port", 8080},          {"heartbeat_interval", 5},     {"metadata_version", 12}};
+const nlohmann::json kSdInstance = {{"service", "checkout"}, {"instance_id", "checkout-3"}, {"address", "10.4.2.7"},
+                                    {"port", 8080},          {"heartbeat_interval", 5},     {"metadata_version", 12}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP sdApi(harness::Ctx& ctx) {
   ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16");
   ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16");
   ctx.Redis.Do("SADD", "sd:grants:checkout-agent", "checkout");
@@ -1025,78 +1129,112 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json with(const nlohmann::json& changes) {
-  nlohmann::json out = kInstance;
+nlohmann::json sdWith(const nlohmann::json& changes) {
+  nlohmann::json out = kSdInstance;
   out.update(changes);
   return out;
 }
 
-harness::Response registerAs(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response sdRegister(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/v1/instances", body.dump(), "Content-Type", "application/json", "X-Client-Id", "checkout-agent");
 }
 
-void nothingWritten(harness::Ctx& ctx, const std::string& service, const std::string& instance_id, const std::string& why) {
+void sdNothingWritten(harness::Ctx& ctx, const std::string& service, const std::string& instance_id, const std::string& why) {
   const std::string key = "sd:" + service + ":" + instance_id;
   ctx.Equal(ctx.Redis.Exists(key), 0, "%s, yet %s was written: a refused registration must leave nothing a router can read; exists", why, key);
   ctx.Assert(!ctx.Redis.SIsMember("sd:members:" + service, instance_id), "%s, yet %s was added to sd:members:%s", why, instance_id, service);
 }
 
+// The record's TTL and its membership at the instant a probe fired.
+struct SdSnapshot {
+  bool fired = false;
+  long long ttl = 0;
+  bool member = false;
+};
+
 }  // namespace
 
 void CheckScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = c.Post("/v1/instances", kInstance.dump(), "Content-Type", "application/json");
+  auto c = sdApi(ctx);
+  auto r = c.Post("/v1/instances", kSdInstance.dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a registration without X-Client-Id");
-  nothingWritten(ctx, "checkout", "checkout-3", "the caller was anonymous");
-  r = registerAs(c, with({{"service", "payments"}, {"instance_id", "payments-1"}, {"address", "10.9.0.4"}}));
+  sdNothingWritten(ctx, "checkout", "checkout-3", "the caller was anonymous");
+  r = sdRegister(c, sdWith({{"service", "payments"}, {"instance_id", "payments-1"}, {"address", "10.9.0.4"}}));
   ctx.Equal(r.Status, 403, "checkout-agent registering into payments (its grants name checkout only)");
-  nothingWritten(ctx, "payments", "payments-1", "checkout-agent has no grant for payments");
-  r = registerAs(c, kInstance);
+  sdNothingWritten(ctx, "payments", "payments-1", "checkout-agent has no grant for payments");
+  r = c.Post("/v1/instances", kSdInstance.dump(), "Content-Type", "application/json", "X-Client-Id", "build-runner");
+  ctx.Equal(r.Status, 403, "build-runner, which holds no grant at all, registering into checkout (a caller with no grants may register nowhere)");
+  sdNothingWritten(ctx, "checkout", "checkout-3", "build-runner has no grant for checkout");
+  r = sdRegister(c, kSdInstance);
   ctx.Equal(r.Status, 201, "checkout-agent registering checkout-3 into checkout (%s)", r.Text());
   ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 1, "a granted registration must write sd:checkout:checkout-3; exists");
 }
 
 void CheckCidr(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = registerAs(c, with({{"service", "inventory"}, {"instance_id", "inventory-1"}}));
+  auto c = sdApi(ctx);
+  auto r = sdRegister(c, sdWith({{"service", "inventory"}, {"instance_id", "inventory-1"}}));
   ctx.Equal(r.Status, 404, "a registration into inventory, which has no deployment");
-  nothingWritten(ctx, "inventory", "inventory-1", "inventory has no deployment");
-  for (const std::string address : {"10.5.0.9", "192.168.1.20", "laptop.local"}) {
-    r = registerAs(c, with({{"address", address}}));
+  sdNothingWritten(ctx, "inventory", "inventory-1", "inventory has no deployment");
+  for (const std::string address : {"10.5.0.9", "10.40.2.7", "10.3.255.255", "192.168.1.20", "laptop.local"}) {
+    r = sdRegister(c, sdWith({{"address", address}}));
     ctx.Equal(r.Status, 422, "checkout-3 at %s, outside checkout's CIDR 10.4.0.0/16", address);
-    nothingWritten(ctx, "checkout", "checkout-3", address + " is outside 10.4.0.0/16");
+    sdNothingWritten(ctx, "checkout", "checkout-3", address + " is outside 10.4.0.0/16");
   }
-  r = registerAs(c, kInstance);
+  r = sdRegister(c, kSdInstance);
   ctx.Equal(r.Status, 201, "checkout-3 at 10.4.2.7, inside 10.4.0.0/16 (%s)", r.Text());
   ctx.Equal(ctx.Redis.HGet("sd:checkout:checkout-3", "address").value_or(""), "10.4.2.7", "the address in sd:checkout:checkout-3");
+  r = sdRegister(c, sdWith({{"instance_id", "checkout-4"}, {"address", "10.4.255.254"}}));
+  ctx.Equal(r.Status, 201, "checkout-4 at 10.4.255.254, the last host of 10.4.0.0/16 (%s)", r.Text());
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = registerAs(c, kInstance);
+  // The instant the first command touching the record or the members set has run.
+  std::vector<SdSnapshot> snapshots(2);
+  const std::vector<std::string> watched = {"sd:checkout:checkout-3", "sd:members:checkout"};
+  for (std::size_t i = 0; i < watched.size(); ++i) {
+    ctx.Redis.After(watched[i], [&ctx, &snapshots, i] {
+      snapshots[i] = {true, ctx.Redis.TTL("sd:checkout:checkout-3"), ctx.Redis.SIsMember("sd:members:checkout", "checkout-3")};
+    });
+  }
+  auto c = sdApi(ctx);
+  auto r = sdRegister(c, kSdInstance);
   ctx.Equal(r.Status, 201, "the registration (%s)", r.Text());
+  for (const auto& early : snapshots) {
+    ctx.Assert(early.fired, "the registration never wrote sd:checkout:checkout-3 and sd:members:checkout");
+    ctx.Assert(early.ttl > 0 && early.member, "right after the registration's first write the record had TTL %d and checkout-3 in sd:members:checkout was %v: the hash, its EXPIRE and the SADD must land in one MULTI, or a crash between them leaves a record that never expires or a member with no record", early.ttl, early.member);
+  }
   ctx.Equal(nlohmann::json::parse(r.Text()).value("ttl_seconds", 0L), 15, "ttl_seconds (3 intervals of 5 s)");
   const long long ttl = ctx.Redis.TTL("sd:checkout:checkout-3");
   ctx.Assert(14 <= ttl && ttl <= 15, "sd:checkout:checkout-3 has TTL %d: the record must expire 15 s (3 heartbeat intervals) after it is written, or a crashed instance stays registered", ttl);
   ctx.Assert(ctx.Redis.SIsMember("sd:members:checkout", "checkout-3"), "checkout-3 must be in sd:members:checkout");
   ctx.Clock.Advance(16);
   ctx.Equal(ctx.Redis.Exists("sd:checkout:checkout-3"), 0, "16 s after its only registration, with no heartbeat, sd:checkout:checkout-3 must be gone, or a crashed instance stays routable; exists");
+  ctx.Redis.Set("sd:members:checkout", "corrupt");  // the members set's SADD fails inside the MULTI (WRONGTYPE)
+  r = sdRegister(c, kSdInstance);
+  ctx.Assert(r.Status != 201, "the SADD to sd:members:checkout failed inside the MULTI (WRONGTYPE) and the registration still answered 201: check the transaction's replies, an instance that is not a member is never listed");
 }
 
 void CheckBounds(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = sdApi(ctx);
   const std::vector<std::pair<nlohmann::json, std::string>> cases = {
       {{{"port", 0}}, "port 0"},
-      {{{"port", 70000}}, "port 70000"},
+      {{{"port", 65536}}, "port 65536"},
       {{{"heartbeat_interval", 1}}, "a 1 s heartbeat interval"},
+      {{{"heartbeat_interval", 61}}, "a 61 s heartbeat interval"},
       {{{"heartbeat_interval", 3600}}, "a 3600 s heartbeat interval"}};
   for (const auto& [change, why] : cases) {
-    const auto r = registerAs(c, with(change));
+    const auto r = sdRegister(c, sdWith(change));
     ctx.Equal(r.Status, 400, "a registration with %s", why);
-    nothingWritten(ctx, "checkout", "checkout-3", "the registration had " + why);
+    sdNothingWritten(ctx, "checkout", "checkout-3", "the registration had " + why);
   }
-  const auto r = registerAs(c, with({{"port", 65535}, {"heartbeat_interval", 60}}));
+  auto r = sdRegister(c, sdWith({{"port", 65535}, {"heartbeat_interval", 60}}));
   ctx.Equal(r.Status, 201, "port 65535 with a 60 s interval is inside the bounds (%s)", r.Text());
+  long long ttl = ctx.Redis.TTL("sd:checkout:checkout-3");
+  ctx.Assert(179 <= ttl && ttl <= 180, "a 60 s interval gives sd:checkout:checkout-3 TTL %d, expected 3 x 60 = 180", ttl);
+  r = sdRegister(c, sdWith({{"instance_id", "checkout-4"}, {"port", 1}, {"heartbeat_interval", 2}}));
+  ctx.Equal(r.Status, 201, "port 1 with a 2 s interval is inside the bounds (%s)", r.Text());
+  ttl = ctx.Redis.TTL("sd:checkout:checkout-4");
+  ctx.Assert(5 <= ttl && ttl <= 6, "a 2 s interval gives sd:checkout:checkout-4 TTL %d, expected 3 x 2 = 6", ttl);
 }
 `,
   },

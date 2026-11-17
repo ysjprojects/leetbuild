@@ -694,10 +694,10 @@ func PutCase(ctx context.Context, c Case) {
 	})
 }
 
-// Audit appends one audited PAN read.
-func Audit(ctx context.Context, actor, scope, caseID string) {
+// Audit appends one audited PAN read; the error says the row was not written.
+func Audit(ctx context.Context, actor, scope, caseID string) error {
 	raw, _ := json.Marshal(AuditEntry{Actor: actor, Scope: scope, CaseID: caseID})
-	rdb.RPush(ctx, "audit:pan", string(raw))
+	return rdb.RPush(ctx, "audit:pan", string(raw)).Err()
 }
 
 // AuditLog is every audited PAN read, oldest first.

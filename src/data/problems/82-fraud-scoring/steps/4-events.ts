@@ -27,7 +27,7 @@ between the commit and the \`HINCRBY\` loses an alert for good.
 - The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\` with \`acks: -1\`; kafka-go
   has no idempotent producer, so the Go writer uses \`RequireAll\` and alerting tolerates a duplicate).
 - The consumer moves \`alerts:{account_ref}\` (\`HINCRBY\` the band, and \`fallback\` for a fallback
-  decision), then commits the offset.`,
+  decision), then commits the offset; a record whose counters fail to move is never committed.`,
   sequence: {
     participants: ['scorer', 'fraud.scored', 'Alerting consumer', 'Redis'],
     messages: [
@@ -77,7 +77,7 @@ between the commit and the \`HINCRBY\` loses an alert for good.
       id: 'band-and-marker',
       title: 'Carries the band and the fallback marker',
       detail:
-        "The payload carries the decision's `band`, `fallback` and `model_version`, so alerting can count declines and tell a rules decision during an outage from a model decision; the starter sends the raw score alone.",
+        "The payload is exactly the contract, with the decision's `score`, `band`, `fallback` and `model_version`, so alerting can count declines and tell a rules decision during an outage from a model decision; the starter sends the raw score alone.",
       match: {
         python: {all: [/["']band["']:\s*decision\[/, /["']fallback["']:\s*decision\[/]},
         typescript: {all: [/band:\s*decision\.band/, /fallback:\s*decision\.fallback/]},
@@ -103,7 +103,7 @@ between the commit and the \`HINCRBY\` loses an alert for good.
       id: 'counters-before-commit',
       title: 'The counters move before the offset is committed',
       detail:
-        'The consumer does its `HINCRBY`s on `alerts:{account_ref}` and only then commits, so a crash in between replays the record instead of losing the alert; the starter commits first.',
+        'The consumer does its `HINCRBY`s on `alerts:{account_ref}` and only then commits, so a crash in between replays the record instead of losing the alert, and a record whose `HINCRBY` fails (its counters key is not a hash) is not committed past; the starter commits first.',
       match: {
         python: {order: [/def run\(/, /hincrby\(/, /\.commit\(/]},
         typescript: {order: [/function run\(/, /hincrby\(/, /commitOffsets\(/]},
@@ -831,6 +831,8 @@ def check_band_and_marker(ctx):
     payload = _payload(ctx.kafka.records(TOPIC)[0])
     got = (payload.get("transaction_id"), payload.get("band"), payload.get("fallback"), payload.get("model_version"))
     assert got == ("tx-9", "review", True, "rules-7"), f"a rules decision during an outage must reach alerting as (transaction_id, band, fallback, model_version) = ('tx-9', 'review', True, 'rules-7'), the event is {payload}"
+    expected = {"transaction_id": "tx-9", "account_ref": "acct-1", "score": 0.45, "band": "review", "fallback": True, "model_version": "rules-7", "feature_version": "fx-3", "feature_digest": feature_digest(VECTOR)}
+    assert payload == expected, f"the event must be exactly the contract {expected}, got {payload}"
 
 
 def check_idempotent_acks(ctx):
@@ -845,18 +847,28 @@ def check_idempotent_acks(ctx):
 
 
 def check_counters_before_commit(ctx):
+    seeded = []
     for tx, band, fallback in (("tx-1", "decline", True), ("tx-2", "approve", False)):
         event = {**_decision(tx, band=band, fallback=fallback), "feature_digest": feature_digest(VECTOR)}
-        ctx.kafka.seed(TOPIC, key="acct-1", value=json.dumps(event))
+        seeded.append(ctx.kafka.seed(TOPIC, key="acct-1", value=json.dumps(event)))
+    # A third event, on the same partition, whose counters cannot move: alerts:acct-9 is not a hash.
+    poisoned = {**_decision("tx-3", account_ref="acct-9", band="decline"), "feature_digest": feature_digest(VECTOR)}
+    partition = seeded[0].partition
+    ctx.kafka.seed(TOPIC, key="acct-9", value=json.dumps(poisoned), partition=partition)
+    ctx.redis.set("alerts:acct-9", "not a hash")
     m = ctx.load("events")
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.hgetall("alerts:acct-1")))
-    ctx.drain(m.run)
+    try:
+        ctx.drain(m.run)
+    except Exception:
+        pass  # the counters for tx-3 failed: the consumer may stop there
     assert at_commit, "the alerting consumer never committed an offset"
     assert at_commit[0] == {"decline": "1", "fallback": "1"}, f"when the first offset was committed alerts:acct-1 held {at_commit[0]}: a crash right after that commit loses the alert. Move the counters (the band, and fallback), then commit"
     final = ctx.redis.hgetall("alerts:acct-1")
     assert final == {"decline": "1", "fallback": "1", "approve": "1"}, f"after both events alerts:acct-1 is {final}, expected decline 1, fallback 1, approve 1"
-    assert ctx.kafka.lag(GROUP, TOPIC) == 0, "every counted record must be committed"
+    committed = ctx.kafka.committed_offset(GROUP, TOPIC, partition)
+    assert committed == 2, f"the consumer committed offset {committed} on the partition: the two counted records must be committed (offset 2), and tx-3, whose HINCRBY failed (alerts:acct-9 is not a hash), must not be: a failed counter is redelivered, not committed past"
 `,
     typescript: `const TOPIC = 'fraud.scored';
 const GROUP = 'alerting';
@@ -910,6 +922,9 @@ export async function check_band_and_marker(ctx) {
   const p = payload(ctx.kafka.records(TOPIC)[0]);
   const got = [p.transaction_id, p.band, p.fallback, p.model_version];
   assert.deepStrictEqual(got, ['tx-9', 'review', true, 'rules-7'], \`a rules decision during an outage must reach alerting as (transaction_id, band, fallback, model_version) = (tx-9, review, true, rules-7), the event is \${JSON.stringify(p)}\`);
+  const {featureDigest} = ctx.load('/support/fraud/features.ts');
+  const expected = {transaction_id: 'tx-9', account_ref: 'acct-1', score: 0.45, band: 'review', fallback: true, model_version: 'rules-7', feature_version: 'fx-3', feature_digest: featureDigest(VECTOR)};
+  assert.deepStrictEqual(p, expected, \`the event must be exactly the contract \${JSON.stringify(expected)}, got \${JSON.stringify(p)}\`);
 }
 
 export async function check_idempotent_acks(ctx) {
@@ -925,18 +940,28 @@ export async function check_idempotent_acks(ctx) {
 
 export async function check_counters_before_commit(ctx) {
   const {featureDigest} = ctx.load('/support/fraud/features.ts');
+  const seeded = [];
   for (const [tx, band, fallback] of [['tx-1', 'decline', true], ['tx-2', 'approve', false]] as const) {
-    ctx.kafka.seed(TOPIC, {key: 'acct-1', value: JSON.stringify({...decision(tx, 'acct-1', band, fallback), feature_digest: featureDigest(VECTOR)})});
+    seeded.push(ctx.kafka.seed(TOPIC, {key: 'acct-1', value: JSON.stringify({...decision(tx, 'acct-1', band, fallback), feature_digest: featureDigest(VECTOR)})}));
   }
+  // A third event, on the same partition, whose counters cannot move: alerts:acct-9 is not a hash.
+  const partition = seeded[0].partition;
+  ctx.kafka.seed(TOPIC, {key: 'acct-9', value: JSON.stringify({...decision('tx-3', 'acct-9', 'decline'), feature_digest: featureDigest(VECTOR)}), partition});
+  ctx.redis.set('alerts:acct-9', 'not a hash');
   const m = ctx.load('events');
   const atCommit: Record<string, string>[] = [];
   ctx.kafka.onCommit(() => atCommit.push(ctx.redis.hgetall('alerts:acct-1')));
-  await ctx.drain(m.run());
+  try {
+    await ctx.drain(m.run());
+  } catch {
+    // the counters for tx-3 failed: the consumer may stop there
+  }
   assert(atCommit.length > 0, 'the alerting consumer never committed an offset');
   assert.deepStrictEqual(atCommit[0], {decline: '1', fallback: '1'}, \`when the first offset was committed alerts:acct-1 held \${JSON.stringify(atCommit[0])}: a crash right after that commit loses the alert. Move the counters (the band, and fallback), then commit\`);
   const final = ctx.redis.hgetall('alerts:acct-1');
   assert.deepStrictEqual(final, {decline: '1', fallback: '1', approve: '1'}, \`after both events alerts:acct-1 is \${JSON.stringify(final)}, expected decline 1, fallback 1, approve 1\`);
-  assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, 'every counted record must be committed');
+  const committed = ctx.kafka.committedOffset(GROUP, TOPIC, partition);
+  assert.equal(committed, 2, \`the consumer committed offset \${committed} on the partition: the two counted records must be committed (offset 2), and tx-3, whose HINCRBY failed (alerts:acct-9 is not a hash), must not be: a failed counter is redelivered, not committed past\`);
 }
 `,
     go: `package main
@@ -953,12 +978,12 @@ import (
 )
 
 var (
-	eventsBg     = context.Background()
-	eventsVector = features.Features{AccountAgeDays: 400, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 0}
-	contract     = map[string]bool{"transaction_id": true, "account_ref": true, "score": true, "band": true, "fallback": true, "model_version": true, "feature_version": true, "feature_digest": true}
+	harnessBg       = context.Background()
+	harnessVector   = features.Features{AccountAgeDays: 400, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 0}
+	harnessContract = map[string]bool{"transaction_id": true, "account_ref": true, "score": true, "band": true, "fallback": true, "model_version": true, "feature_version": true, "feature_digest": true}
 )
 
-func decisionFor(tx, accountRef, band string, fallback bool) store.Decision {
+func harnessDecision(tx, accountRef, band string, fallback bool) store.Decision {
 	d := store.Decision{TransactionID: tx, AccountRef: accountRef, Score: 0.05, Band: band, Fallback: fallback, ModelVersion: "fm-2026-11", FeatureVersion: "fx-3"}
 	if fallback {
 		d.Score, d.ModelVersion = 0.45, "rules-7"
@@ -966,21 +991,26 @@ func decisionFor(tx, accountRef, band string, fallback bool) store.Decision {
 	return d
 }
 
-func mustPublish(ctx *harness.Ctx, d store.Decision) {
-	_, err := publishScored(eventsBg, d, eventsVector)
+func harnessEvent(d store.Decision) map[string]any {
+	return map[string]any{"transaction_id": d.TransactionID, "account_ref": d.AccountRef, "score": d.Score, "band": d.Band, "fallback": d.Fallback,
+		"model_version": d.ModelVersion, "feature_version": d.FeatureVersion, "feature_digest": features.FeatureDigest(harnessVector)}
+}
+
+func harnessPublish(ctx *harness.Ctx, d store.Decision) {
+	_, err := publishScored(harnessBg, d, harnessVector)
 	ctx.NoError(err, "publishScored(%s) failed", d.TransactionID)
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func harnessPayload(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
 func CheckAccountKey(ctx *harness.Ctx) {
-	mustPublish(ctx, decisionFor("tx-1", "acct-1", "approve", false))
-	mustPublish(ctx, decisionFor("tx-2", "acct-1", "approve", false))
-	mustPublish(ctx, decisionFor("tx-3", "acct-2", "approve", false))
+	harnessPublish(ctx, harnessDecision("tx-1", "acct-1", "approve", false))
+	harnessPublish(ctx, harnessDecision("tx-2", "acct-1", "approve", false))
+	harnessPublish(ctx, harnessDecision("tx-3", "acct-2", "approve", false))
 	records := ctx.Kafka.Records("fraud.scored")
 	ctx.Equal(len(records), 3, "three decisions must produce three records on fraud.scored; the records")
 	keys := ctx.Kafka.Keys("fraud.scored")
@@ -996,48 +1026,57 @@ func CheckAccountKey(ctx *harness.Ctx) {
 }
 
 func CheckDigestNotFeatures(ctx *harness.Ctx) {
-	mustPublish(ctx, decisionFor("tx-1", "acct-1", "approve", false))
-	p := payloadOf(ctx, ctx.Kafka.Records("fraud.scored")[0].Value)
+	harnessPublish(ctx, harnessDecision("tx-1", "acct-1", "approve", false))
+	p := harnessPayload(ctx, ctx.Kafka.Records("fraud.scored")[0].Value)
 	var extra []string
 	for k := range p {
-		if !contract[k] {
+		if !harnessContract[k] {
 			extra = append(extra, k)
 		}
 	}
 	sort.Strings(extra)
 	ctx.Assert(len(extra) == 0, "the event carries %q: %v. The topic is retained and replicated; carry feature_digest, not the vector", extra, p)
-	ctx.Equal(p["feature_digest"], features.FeatureDigest(eventsVector), "feature_digest must be features.FeatureDigest of the vector")
+	ctx.Equal(p["feature_digest"], features.FeatureDigest(harnessVector), "feature_digest must be features.FeatureDigest of the vector")
 	ctx.Equal(p["feature_version"], "fx-3", "the event must carry the vector's feature_version")
 }
 
 func CheckBandAndMarker(ctx *harness.Ctx) {
-	mustPublish(ctx, decisionFor("tx-9", "acct-1", "review", true))
-	p := payloadOf(ctx, ctx.Kafka.Records("fraud.scored")[0].Value)
+	d := harnessDecision("tx-9", "acct-1", "review", true)
+	harnessPublish(ctx, d)
+	p := harnessPayload(ctx, ctx.Kafka.Records("fraud.scored")[0].Value)
 	ctx.Assert(p["transaction_id"] == "tx-9" && p["band"] == "review" && p["fallback"] == true && p["model_version"] == "rules-7",
 		"a rules decision during an outage must reach alerting as (transaction_id, band, fallback, model_version) = (tx-9, review, true, rules-7), the event is %v", p)
+	var expected map[string]any
+	raw, _ := json.Marshal(harnessEvent(d))
+	json.Unmarshal(raw, &expected)
+	ctx.Equal(p, expected, "the event must be exactly the contract")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	mustPublish(ctx, decisionFor("tx-1", "acct-1", "approve", false))
+	harnessPublish(ctx, harnessDecision("tx-1", "acct-1", "approve", false))
 	ctx.Equal(len(ctx.Kafka.Records("fraud.scored")), 1, "one decision, the records on the topic")
-	mustPublish(ctx, decisionFor("tx-2", "acct-1", "approve", false))
+	harnessPublish(ctx, harnessDecision("tx-2", "acct-1", "approve", false))
 	lost := ctx.Kafka.Failover("fraud.scored")
 	ctx.Equal(len(ctx.Kafka.Records("fraud.scored")), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 
 func CheckCountersBeforeCommit(ctx *harness.Ctx) {
-	for _, d := range []store.Decision{decisionFor("tx-1", "acct-1", "decline", true), decisionFor("tx-2", "acct-1", "approve", false)} {
-		event := map[string]any{"transaction_id": d.TransactionID, "account_ref": d.AccountRef, "score": d.Score, "band": d.Band, "fallback": d.Fallback,
-			"model_version": d.ModelVersion, "feature_version": d.FeatureVersion, "feature_digest": features.FeatureDigest(eventsVector)}
-		ctx.Kafka.Seed("fraud.scored", "acct-1", event)
+	var seeded []harness.KafkaRecord
+	for _, d := range []store.Decision{harnessDecision("tx-1", "acct-1", "decline", true), harnessDecision("tx-2", "acct-1", "approve", false)} {
+		seeded = append(seeded, ctx.Kafka.Seed("fraud.scored", "acct-1", harnessEvent(d)))
 	}
+	// A third event, on the same partition, whose counters cannot move: alerts:acct-9 is not a hash.
+	partition := seeded[0].Partition
+	ctx.Kafka.SeedPartition("fraud.scored", partition, "acct-9", harnessEvent(harnessDecision("tx-3", "acct-9", "decline", false)))
+	ctx.Redis.Set("alerts:acct-9", "not a hash")
 	var atCommit []map[string]string
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.HGetAll("alerts:acct-1")) })
-	ctx.Drain(func() { run(eventsBg) })
+	ctx.Drain(func() { run(harnessBg) })
 	ctx.Assert(len(atCommit) > 0, "the alerting consumer never committed an offset")
 	ctx.Equal(atCommit[0], map[string]string{"decline": "1", "fallback": "1"}, "a crash right after the first commit must not lose the alert: move the counters (the band, and fallback), then commit; alerts:acct-1 at the first commit")
 	ctx.Equal(ctx.Redis.HGetAll("alerts:acct-1"), map[string]string{"decline": "1", "fallback": "1", "approve": "1"}, "after both events, alerts:acct-1")
-	ctx.Equal(ctx.Kafka.Lag("alerting", "fraud.scored"), 0, "every counted record must be committed; the lag")
+	ctx.Equal(ctx.Kafka.CommittedOffset("alerting", "fraud.scored", partition), int64(2),
+		"the two counted records must be committed (offset 2), and tx-3, whose HIncrBy failed (alerts:acct-9 is not a hash), must not be: a failed counter is redelivered, not committed past; the committed offset")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1052,10 +1091,10 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const features::Features kVector{features::kFeatureVersion, 400, 0, 4200};
-const std::set<std::string> kContract = {"transaction_id", "account_ref", "score", "band", "fallback", "model_version", "feature_version", "feature_digest"};
+const features::Features kHarnessVector{features::kFeatureVersion, 400, 0, 4200};
+const std::set<std::string> kHarnessContract = {"transaction_id", "account_ref", "score", "band", "fallback", "model_version", "feature_version", "feature_digest"};
 
-nlohmann::json decisionFor(const std::string& tx, const std::string& account_ref, const std::string& band, bool fallback) {
+nlohmann::json harnessDecision(const std::string& tx, const std::string& account_ref, const std::string& band, bool fallback) {
   return {{"transaction_id", tx},
           {"account_ref", account_ref},
           {"score", fallback ? 0.45 : 0.05},
@@ -1065,7 +1104,7 @@ nlohmann::json decisionFor(const std::string& tx, const std::string& account_ref
           {"feature_version", "fx-3"}};
 }
 
-nlohmann::json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+nlohmann::json harnessPayload(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   const auto p = nlohmann::json::parse(record.Value.value_or(""), nullptr, false);
   ctx.Assert(p.is_object(), "the record's value is not a JSON object: %s", record.Value.value_or(""));
   return p;
@@ -1074,9 +1113,9 @@ nlohmann::json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) 
 }  // namespace
 
 void CheckAccountKey(harness::Ctx& ctx) {
-  publishScored(decisionFor("tx-1", "acct-1", "approve", false), kVector);
-  publishScored(decisionFor("tx-2", "acct-1", "approve", false), kVector);
-  publishScored(decisionFor("tx-3", "acct-2", "approve", false), kVector);
+  publishScored(harnessDecision("tx-1", "acct-1", "approve", false), kHarnessVector);
+  publishScored(harnessDecision("tx-2", "acct-1", "approve", false), kHarnessVector);
+  publishScored(harnessDecision("tx-3", "acct-2", "approve", false), kHarnessVector);
   const auto records = ctx.Kafka.Records("fraud.scored");
   ctx.Equal(records.size(), 3, "three decisions must produce three records on fraud.scored; the records");
   ctx.Equal(ctx.Kafka.Keys("fraud.scored"), {"acct-1", "acct-1", "acct-2"}, "records must be keyed by account_ref (keyed by anything else, one account's decisions scatter across partitions)");
@@ -1084,47 +1123,62 @@ void CheckAccountKey(harness::Ctx& ctx) {
 }
 
 void CheckDigestNotFeatures(harness::Ctx& ctx) {
-  publishScored(decisionFor("tx-1", "acct-1", "approve", false), kVector);
-  const auto p = payloadOf(ctx, ctx.Kafka.Records("fraud.scored")[0]);
+  publishScored(harnessDecision("tx-1", "acct-1", "approve", false), kHarnessVector);
+  const auto p = harnessPayload(ctx, ctx.Kafka.Records("fraud.scored")[0]);
   std::vector<std::string> extra;
   for (const auto& [key, _] : p.items()) {
-    if (!kContract.count(key)) extra.push_back(key);
+    if (!kHarnessContract.count(key)) extra.push_back(key);
   }
   ctx.Assert(extra.empty(), "the event carries %q: %s. The topic is retained and replicated; carry feature_digest, not the vector", extra, p.dump());
-  ctx.Equal(p.value("feature_digest", ""), features::featureDigest(kVector), "feature_digest must be features::featureDigest of the vector");
+  ctx.Equal(p.value("feature_digest", ""), features::featureDigest(kHarnessVector), "feature_digest must be features::featureDigest of the vector");
   ctx.Equal(p.value("feature_version", ""), "fx-3", "the event must carry the vector's feature_version");
 }
 
 void CheckBandAndMarker(harness::Ctx& ctx) {
-  publishScored(decisionFor("tx-9", "acct-1", "review", true), kVector);
-  const auto p = payloadOf(ctx, ctx.Kafka.Records("fraud.scored")[0]);
+  publishScored(harnessDecision("tx-9", "acct-1", "review", true), kHarnessVector);
+  const auto p = harnessPayload(ctx, ctx.Kafka.Records("fraud.scored")[0]);
   ctx.Assert(p.value("transaction_id", "") == "tx-9" && p.value("band", "") == "review" && p.value("fallback", false) && p.value("model_version", "") == "rules-7",
              "a rules decision during an outage must reach alerting as (transaction_id, band, fallback, model_version) = (tx-9, review, true, rules-7), the event is %s", p.dump());
+  auto expected = harnessDecision("tx-9", "acct-1", "review", true);
+  expected["feature_digest"] = features::featureDigest(kHarnessVector);
+  ctx.Assert(p == expected, "the event must be exactly the contract %s, got %s", expected.dump(), p.dump());
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks("fraud.scored", 1);
-  publishScored(decisionFor("tx-1", "acct-1", "approve", false), kVector);
+  publishScored(harnessDecision("tx-1", "acct-1", "approve", false), kHarnessVector);
   ctx.Equal(ctx.Kafka.Records("fraud.scored").size(), 1,
             "one decision whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
-  publishScored(decisionFor("tx-2", "acct-1", "approve", false), kVector);
+  publishScored(harnessDecision("tx-2", "acct-1", "approve", false), kHarnessVector);
   const int lost = ctx.Kafka.Failover("fraud.scored");
   ctx.Equal(ctx.Kafka.Records("fraud.scored").size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 
 void CheckCountersBeforeCommit(harness::Ctx& ctx) {
-  for (auto event : {decisionFor("tx-1", "acct-1", "decline", true), decisionFor("tx-2", "acct-1", "approve", false)}) {
-    event["feature_digest"] = features::featureDigest(kVector);
-    ctx.Kafka.Seed("fraud.scored", "acct-1", event);
+  std::vector<harness::KafkaRecord> seeded;
+  for (auto event : {harnessDecision("tx-1", "acct-1", "decline", true), harnessDecision("tx-2", "acct-1", "approve", false)}) {
+    event["feature_digest"] = features::featureDigest(kHarnessVector);
+    seeded.push_back(ctx.Kafka.Seed("fraud.scored", "acct-1", event));
   }
+  // A third event, on the same partition, whose counters cannot move: alerts:acct-9 is not a hash.
+  const int partition = seeded[0].Partition;
+  auto poisoned = harnessDecision("tx-3", "acct-9", "decline", false);
+  poisoned["feature_digest"] = features::featureDigest(kHarnessVector);
+  ctx.Kafka.SeedPartition("fraud.scored", partition, "acct-9", poisoned);
+  ctx.Redis.Set("alerts:acct-9", "not a hash");
   std::vector<std::map<std::string, std::string>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.HGetAll("alerts:acct-1")); });
-  ctx.Drain([] { run(); });
+  try {
+    ctx.Drain([] { run(); });
+  } catch (const std::exception&) {
+    // the counters for tx-3 failed: the consumer may stop there
+  }
   ctx.Assert(!atCommit.empty(), "the alerting consumer never committed an offset");
   ctx.Equal(atCommit[0], std::map<std::string, std::string>{{"decline", "1"}, {"fallback", "1"}},
             "a crash right after the first commit must not lose the alert: move the counters (the band, and fallback), then commit; alerts:acct-1 at the first commit");
   ctx.Equal(ctx.Redis.HGetAll("alerts:acct-1"), std::map<std::string, std::string>{{"decline", "1"}, {"fallback", "1"}, {"approve", "1"}}, "after both events, alerts:acct-1");
-  ctx.Equal(ctx.Kafka.Lag("alerting", "fraud.scored"), 0, "every counted record must be committed; the lag");
+  ctx.Equal(ctx.Kafka.CommittedOffset("alerting", "fraud.scored", partition), 2,
+            "the two counted records must be committed (offset 2), and tx-3, whose hincrby failed (alerts:acct-9 is not a hash), must not be: a failed counter is redelivered, not committed past; the committed offset");
 }
 `,
   },

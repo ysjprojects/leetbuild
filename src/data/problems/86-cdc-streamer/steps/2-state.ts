@@ -22,9 +22,10 @@ changes again.
 
 - The cursor lives without expiry.
 - One key per table: \`cdc:cursor:{subscription_id}:{table}\`, built by \`cursor_key\`.
-- \`confirm\` never moves the cursor back and reports whether it moved: compare and set in one Lua
-  script (\`register_script\`, \`defineCommand\`, \`redis.NewScript\`, \`eval\`). A GET followed by a SET
-  loses to a replica that writes between the two.`,
+- \`confirm\` never moves the cursor back and reports whether it moved (an LSN at or below the stored
+  one does not move it; LSNs compare as numbers): compare and set in one Lua script
+  (\`register_script\`, \`defineCommand\`, \`redis.NewScript\`, \`eval\`). A GET followed by a SET loses to
+  a replica that writes between the two.`,
   sequence: {
     participants: ['Replicator', 'Sink', 'Redis'],
     messages: [
@@ -79,7 +80,7 @@ changes again.
       id: 'monotonic',
       title: 'Never moves the cursor back, atomically',
       detail:
-        '`confirm` compares and sets in one Lua script and reports whether the cursor moved, so a retried batch or a racing replica cannot lower it; the starter overwrites whatever is there.',
+        '`confirm` compares and sets in one Lua script and reports whether the cursor moved, so a retried batch, a repeated LSN or a racing replica cannot lower it, and LSNs compare as numbers (1000 is past 300); the starter overwrites whatever is there.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /tonumber/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /tonumber/]},
@@ -414,6 +415,9 @@ def check_durable_cursor(ctx):
     assert ttl == -1, f"{key} expires in {ttl} s: a table quiet for longer forgets where its sink stopped. Write the cursor without expiry"
     ctx.clock.advance(3 * 24 * 3600)
     assert m.load_cursor(SUB, "orders") == 120, f"three quiet days later load_cursor gives {m.load_cursor(SUB, 'orders')!r}, expected 120"
+    assert m.confirm(SUB, "orders", 130) is True, "confirming 130 after 120 must move the cursor"
+    ttl = ctx.redis.ttl(key)
+    assert ttl == -1, f"after a later confirmation {key} expires in {ttl} s: write the cursor without expiry on every confirmation"
 
 
 def check_per_table_key(ctx):
@@ -431,12 +435,16 @@ def check_monotonic(ctx):
     moved = m.confirm(SUB, "orders", 150)
     assert m.load_cursor(SUB, "orders") == 200, f"a late confirmation of 150 (a retried batch) moved the cursor back to {m.load_cursor(SUB, 'orders')}: the sink gets every change after 150 again"
     assert moved is False, f"a confirmation that did not move the cursor returned {moved!r}, expected False"
+    again = m.confirm(SUB, "orders", 200)
+    assert again is False, f"confirming 200 again, where the cursor already is, returned {again!r}: the cursor did not move, expected False"
     key = m.cursor_key(SUB, "orders")
     # Another replica confirms 300 right after this confirm's first command reached Redis.
     probe = ctx.redis_after(key, lambda: ctx.redis.set(key, 300))
     m.confirm(SUB, "orders", 250)
     assert probe.fired, f"confirm(250) never touched {key}"
     assert m.load_cursor(SUB, "orders") == 300, f"a replica confirmed 300 while confirm(250) was running and the cursor ended at {m.load_cursor(SUB, 'orders')}: compare and set in one Lua script"
+    moved = m.confirm(SUB, "orders", 1000)
+    assert moved is True and m.load_cursor(SUB, "orders") == 1000, f"confirming 1000 after 300 returned {moved!r} and left the cursor at {m.load_cursor(SUB, 'orders')}: compare the LSNs as numbers, not as text"
 `,
     typescript: `const SUB = 'sub-1';
 
@@ -456,6 +464,9 @@ export async function check_durable_cursor(ctx) {
   assert.equal(ttl, -1, \`\${key} expires in \${ttl} s: a table quiet for longer forgets where its sink stopped. Write the cursor without expiry\`);
   ctx.clock.advance(3 * 24 * 3600 * 1000);
   assert.equal(await m.loadCursor(SUB, 'orders'), 120, 'three quiet days later, loadCursor');
+  assert.equal(await m.confirm(SUB, 'orders', 130), true, 'confirming 130 after 120 must move the cursor');
+  const later = ctx.redis.ttl(key);
+  assert.equal(later, -1, \`after a later confirmation \${key} expires in \${later} s: write the cursor without expiry on every confirmation\`);
 }
 
 export async function check_per_table_key(ctx) {
@@ -474,6 +485,8 @@ export async function check_monotonic(ctx) {
   const after = await m.loadCursor(SUB, 'orders');
   assert.equal(after, 200, \`a late confirmation of 150 (a retried batch) moved the cursor back to \${after}: the sink gets every change after 150 again\`);
   assert.equal(moved, false, 'a confirmation that did not move the cursor must resolve false');
+  const again = await m.confirm(SUB, 'orders', 200);
+  assert.equal(again, false, \`confirming 200 again, where the cursor already is, resolved \${again}: the cursor did not move, expected false\`);
   const key = m.cursorKey(SUB, 'orders');
   // Another replica confirms 300 right after this confirm's first command reached Redis.
   const probe = ctx.redisAfter(key, () => ctx.redis.set(key, '300'));
@@ -481,6 +494,9 @@ export async function check_monotonic(ctx) {
   assert(probe.fired, \`confirm(250) never touched \${key}\`);
   const final = await m.loadCursor(SUB, 'orders');
   assert.equal(final, 300, \`a replica confirmed 300 while confirm(250) was running and the cursor ended at \${final}: compare and set in one Lua script\`);
+  const big = await m.confirm(SUB, 'orders', 1000);
+  const atBig = await m.loadCursor(SUB, 'orders');
+  assert(big === true && atBig === 1000, \`confirming 1000 after 300 resolved \${big} and left the cursor at \${atBig}: compare the LSNs as numbers, not as text\`);
 }
 `,
     go: `package main
@@ -491,65 +507,71 @@ import (
 	"leetbuild/harness"
 )
 
-const sub = "sub-1"
+const hSub = "sub-1"
 
-var bg = context.Background()
+var hBg = context.Background()
 
-func load(ctx *harness.Ctx, table string) (int64, bool) {
-	lsn, ok, err := loadCursor(bg, sub, table)
-	ctx.NoError(err, "loadCursor(%s, %s) failed", sub, table)
+func hLoad(ctx *harness.Ctx, table string) (int64, bool) {
+	lsn, ok, err := loadCursor(hBg, hSub, table)
+	ctx.NoError(err, "loadCursor(%s, %s) failed", hSub, table)
 	return lsn, ok
 }
 
 func mustConfirm(ctx *harness.Ctx, table string, lsn int64) bool {
-	moved, err := confirm(bg, sub, table, lsn)
-	ctx.NoError(err, "confirm(%s, %s, %d) failed", sub, table, lsn)
+	moved, err := confirm(hBg, hSub, table, lsn)
+	ctx.NoError(err, "confirm(%s, %s, %d) failed", hSub, table, lsn)
 	return moved
 }
 
 func CheckConfirmLoad(ctx *harness.Ctx) {
-	_, ok := load(ctx, "orders")
+	_, ok := hLoad(ctx, "orders")
 	ctx.Assert(!ok, "before any confirmation loadCursor must report no cursor")
 	ctx.Equal(mustConfirm(ctx, "orders", 120), true, "the first confirmation must move the cursor; moved")
-	lsn, ok := load(ctx, "orders")
+	lsn, ok := hLoad(ctx, "orders")
 	ctx.Assert(ok && lsn == 120, "after confirming 120 loadCursor gave %d (found %t)", lsn, ok)
-	_, ok, _ = loadCursor(bg, "sub-2", "orders")
+	_, ok, _ = loadCursor(hBg, "sub-2", "orders")
 	ctx.Assert(!ok, "another subscription must not see sub-1's cursor")
 }
 
 func CheckDurableCursor(ctx *harness.Ctx) {
 	mustConfirm(ctx, "orders", 120)
-	key := cursorKey(sub, "orders")
+	key := cursorKey(hSub, "orders")
 	ttl := ctx.Redis.TTL(key)
 	ctx.Equal(ttl, int64(-1), "%s has an expiry: a table quiet for longer forgets where its sink stopped. Write the cursor without expiry; the TTL", key)
 	ctx.Clock.Advance(3 * 24 * 3600)
-	lsn, ok := load(ctx, "orders")
+	lsn, ok := hLoad(ctx, "orders")
 	ctx.Assert(ok && lsn == 120, "three quiet days later loadCursor gives %d (found %t), expected 120", lsn, ok)
+	ctx.Equal(mustConfirm(ctx, "orders", 130), true, "confirming 130 after 120 must move the cursor; moved")
+	ctx.Equal(ctx.Redis.TTL(key), int64(-1), "after a later confirmation %s has an expiry: write the cursor without expiry on every confirmation; the TTL", key)
 }
 
 func CheckPerTableKey(ctx *harness.Ctx) {
 	mustConfirm(ctx, "orders", 120)
 	mustConfirm(ctx, "customers", 80)
-	orders, _ := load(ctx, "orders")
-	customers, _ := load(ctx, "customers")
+	orders, _ := hLoad(ctx, "orders")
+	customers, _ := hLoad(ctx, "customers")
 	ctx.Assert(orders == 120 && customers == 80, "after confirming orders at 120 and customers at 80 the cursors are %d and %d: the two tables share one position, so one resumes from the other's LSN", orders, customers)
-	value, _ := ctx.Redis.Get("cdc:cursor:" + sub + ":orders")
-	ctx.Equal(value, "120", "the orders cursor must live at cdc:cursor:%s:orders (Redis holds %q)", sub, ctx.Redis.Keys("cdc:cursor:*"))
+	value, _ := ctx.Redis.Get("cdc:cursor:" + hSub + ":orders")
+	ctx.Equal(value, "120", "the orders cursor must live at cdc:cursor:%s:orders (Redis holds %q)", hSub, ctx.Redis.Keys("cdc:cursor:*"))
 }
 
 func CheckMonotonic(ctx *harness.Ctx) {
 	ctx.Equal(mustConfirm(ctx, "orders", 200), true, "confirming 200 on a new cursor must move it; moved")
 	moved := mustConfirm(ctx, "orders", 150)
-	lsn, _ := load(ctx, "orders")
+	lsn, _ := hLoad(ctx, "orders")
 	ctx.Equal(lsn, int64(200), "a late confirmation of 150 (a retried batch) must not move the cursor back, or the sink gets every change after 150 again; the cursor")
 	ctx.Equal(moved, false, "a confirmation that did not move the cursor; moved")
-	key := cursorKey(sub, "orders")
+	ctx.Equal(mustConfirm(ctx, "orders", 200), false, "confirming 200 again, where the cursor already is, did not move it; moved")
+	key := cursorKey(hSub, "orders")
 	// Another replica confirms 300 right after this confirm's first command reached Redis.
 	probe := ctx.Redis.After(key, func() any { return ctx.Redis.Set(key, 300) })
 	mustConfirm(ctx, "orders", 250)
 	ctx.Assert(probe.Fired, "confirm(250) never touched %s", key)
-	lsn, _ = load(ctx, "orders")
+	lsn, _ = hLoad(ctx, "orders")
 	ctx.Equal(lsn, int64(300), "a replica confirmed 300 while confirm(250) was running: compare and set in one Lua script; the cursor")
+	moved = mustConfirm(ctx, "orders", 1000)
+	lsn, _ = hLoad(ctx, "orders")
+	ctx.Assert(moved && lsn == 1000, "confirming 1000 after 300 reported moved=%t and left the cursor at %d: compare the LSNs as numbers, not as text", moved, lsn)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -577,6 +599,8 @@ void CheckDurableCursor(harness::Ctx& ctx) {
   ctx.Equal(ctx.Redis.TTL(key), -1, "%s has an expiry: a table quiet for longer forgets where its sink stopped. Write the cursor without expiry; the TTL", key);
   ctx.Clock.Advance(3 * 24 * 3600);
   ctx.Equal(loadCursor(kSub, "orders"), std::optional<int64_t>(120), "three quiet days later, loadCursor");
+  ctx.Equal(confirm(kSub, "orders", 130), true, "confirming 130 after 120 must move the cursor; moved");
+  ctx.Equal(ctx.Redis.TTL(key), -1, "after a later confirmation %s has an expiry: write the cursor without expiry on every confirmation; the TTL", key);
 }
 
 void CheckPerTableKey(harness::Ctx& ctx) {
@@ -596,6 +620,7 @@ void CheckMonotonic(harness::Ctx& ctx) {
   ctx.Equal(loadCursor(kSub, "orders"), std::optional<int64_t>(200),
             "a late confirmation of 150 (a retried batch) must not move the cursor back, or the sink gets every change after 150 again; the cursor");
   ctx.Equal(moved, false, "a confirmation that did not move the cursor; moved");
+  ctx.Equal(confirm(kSub, "orders", 200), false, "confirming 200 again, where the cursor already is, did not move it; moved");
   const std::string key = cursorKey(kSub, "orders");
   // Another replica confirms 300 right after this confirm's first command reached Redis.
   bool fired = false;
@@ -607,6 +632,9 @@ void CheckMonotonic(harness::Ctx& ctx) {
   ctx.Assert(fired, "confirm(250) never touched %s", key);
   ctx.Equal(loadCursor(kSub, "orders"), std::optional<int64_t>(300),
             "a replica confirmed 300 while confirm(250) was running: compare and set in one Lua script; the cursor");
+  const bool big = confirm(kSub, "orders", 1000);
+  const auto at = loadCursor(kSub, "orders").value_or(0);
+  ctx.Assert(big && at == 1000, "confirming 1000 after 300 reported moved=%v and left the cursor at %d: compare the LSNs as numbers, not as text", big, at);
 }
 `,
   },

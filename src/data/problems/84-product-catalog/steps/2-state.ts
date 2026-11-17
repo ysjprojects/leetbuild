@@ -42,7 +42,7 @@ pointer; and two regions can serve two versions of one product.
       id: 'no-field-swap',
       title: 'Writes the whole snapshot under its own key',
       detail:
-        'The version is written as one value under `snapshot_key`/`snapshotKey` (`SET`), not as per-field `HSET`s into a hash every version shares; per-field writes are what tear a product in half for a concurrent reader.',
+        'The version is written as one value under `snapshot_key`/`snapshotKey` (`SET`), not as per-field `HSET`s into a hash every version shares; per-field writes are what tear a product in half for a concurrent reader. A read that lands at any point of the publish, including right after the pointer moved, finds one whole version.',
       match: {
         python: {all: [/def snapshot_key/, /\.set\(\s*snapshot_key\(/], none: [/\bhset\b/i]},
         typescript: {all: [/snapshotKey\s*=|function snapshotKey/, /\.set\(\s*snapshotKey\(/], none: [/\bhset\b/i]},
@@ -87,7 +87,7 @@ pointer; and two regions can serve two versions of one product.
       id: 'cas-swap',
       title: 'Moves the pointer only when it still holds the expected version',
       detail:
-        'The swap is one Lua script (`EVAL`/`register_script`/`NewScript`) that compares the pointer with the expected version (`ARGV[2]`) before setting it; a plain `SET` of the pointer lets a publish that lost a race overwrite the winner.',
+        'The swap is one Lua script (`EVAL`/`register_script`/`NewScript`) that compares the pointer with the expected version (`ARGV[2]`) before setting it; a plain `SET` of the pointer lets a publish that lost a race overwrite the winner. Of two publishes that expected the same version, exactly one moves the pointer, wherever the other lands; a publish that expected nothing published loses once a version is live.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]GET['"]/, /ARGV\[2\]/],
@@ -527,6 +527,7 @@ def _settled(probe, what):
 
 
 def _whole(seen, when):
+    assert seen is not None, f"a read {when} found no snapshot: the pointer named a version whose snapshot was not written yet"
     assert seen in (V1, V2), f"a read {when} saw {seen}: a mix of version 1 and version 2. A reader must see one whole version"
 
 
@@ -537,10 +538,12 @@ def check_no_field_swap(ctx):
     # A storefront read lands while the publish of version 2 is writing: it must see one whole version.
     shared = ctx.redis_after("catalog:p-1", lambda: m.read_published("p-1"))
     versioned = ctx.redis_after("catalog:p-1:v2", lambda: m.read_published("p-1"))
+    pointer = ctx.redis_after("catalog:p-1:published", lambda: m.read_published("p-1"))
     assert m.publish_snapshot("p-1", 2, V2, 1) is True, "publishing version 2 over version 1 (expected 1) must move the pointer"
     for probe in (shared, versioned):
         if probe.fired:
             _whole(_settled(probe, "the key"), "during the publish")
+    _whole(_settled(pointer, "catalog:p-1:published"), "right after the pointer moved")
     assert ctx.redis.type("catalog:p-1") == "none", f"catalog:p-1 is a {ctx.redis.type('catalog:p-1')}: the fields of every version share one hash, so a reader can see two versions in one response. Write the whole version under catalog:p-1:v2"
     raw = ctx.redis.get("catalog:p-1:v2")
     assert raw is not None and json.loads(raw) == V2, f"catalog:p-1:v2 holds {raw!r}, expected the whole version 2 as one JSON document"
@@ -581,10 +584,25 @@ def check_cas_swap(ctx):
     v9 = {**V2, "version": 9, "title": "Kettle, 9 L"}
     rival = ctx.redis_after("catalog:p-1:v4", lambda: m.publish_snapshot("p-1", 9, v9, 2))
     v4 = {**V2, "version": 4, "title": "Kettle, 4 L"}
-    lost = m.publish_snapshot("p-1", 4, v4, 2)
-    assert _settled(rival, "catalog:p-1:v4") is True, "the rival publish must move the pointer to 9"
-    assert lost is False, "the publish that lost the race must report False"
-    assert m.read_published("p-1") == v9, f"the storefront serves {m.read_published('p-1')} after the race, expected version 9"
+    moved = m.publish_snapshot("p-1", 4, v4, 2)
+    rival_moved = _settled(rival, "catalog:p-1:v4")
+    assert rival_moved != moved, f"two publishes that both expected version 2 raced: the rival reported {rival_moved}, this one {moved}. Exactly one may move the pointer"
+    winner = v9 if rival_moved else v4
+    assert m.read_published("p-1") == winner, f"the storefront serves {m.read_published('p-1')} after the race, expected the winner, version {winner['version']}"
+    # A rival lands right after this publish touched the pointer: a check made outside the script is stale by then.
+    current = winner["version"]
+    v11 = {**V2, "version": 11, "title": "Kettle, 11 L"}
+    rival = ctx.redis_after("catalog:p-1:published", lambda: m.publish_snapshot("p-1", 11, v11, current))
+    v10 = {**V2, "version": 10, "title": "Kettle, 10 L"}
+    moved = m.publish_snapshot("p-1", 10, v10, current)
+    rival_moved = _settled(rival, "catalog:p-1:published")
+    assert rival_moved != moved, f"two publishes that both expected version {current} raced on the pointer: the rival reported {rival_moved}, this one {moved}. Exactly one may move the pointer: compare and set in one script"
+    winner = v11 if rival_moved else v10
+    assert m.read_published("p-1") == winner, f"the storefront serves {m.read_published('p-1')} after the race, expected the winner, version {winner['version']}"
+    # expected None means nothing is published yet; once a version is live such a publish lost.
+    late = m.publish_snapshot("p-1", 12, {**V2, "version": 12, "title": "Kettle, 12 L"}, None)
+    assert late is False, "a publish that expected nothing published while a version is live must not move the pointer and must report False"
+    assert m.read_published("p-1") == winner, f"the storefront serves {m.read_published('p-1')} after a publish that expected nothing published, expected version {winner['version']}"
 `,
     typescript: `const V1 = {version: 1, product_id: 'p-1', title: 'Kettle', price_cents: 3499, tax_class: 'standard'};
 const V2 = {version: 2, product_id: 'p-1', title: 'Kettle, 2 L', price_cents: 3999, tax_class: 'standard'};
@@ -595,9 +613,13 @@ async function settled(probe, what: string) {
   return await probe.result;
 }
 
+/** The snapshot as JSON with its keys sorted: a read may rebuild the document in any key order. */
+const canonical = (snapshot: object): string => JSON.stringify(snapshot, Object.keys(snapshot).sort());
+
 function whole(seen, when: string): void {
-  const text = JSON.stringify(seen);
-  assert(text === JSON.stringify(V1) || text === JSON.stringify(V2), \`a read \${when} saw \${text}: a mix of version 1 and version 2. A reader must see one whole version\`);
+  assert(seen !== null && seen !== undefined, \`a read \${when} found no snapshot: the pointer named a version whose snapshot was not written yet\`);
+  const text = canonical(seen);
+  assert(text === canonical(V1) || text === canonical(V2), \`a read \${when} saw \${JSON.stringify(seen)}: a mix of version 1 and version 2. A reader must see one whole version\`);
 }
 
 export async function check_no_field_swap(ctx) {
@@ -607,11 +629,13 @@ export async function check_no_field_swap(ctx) {
   // A storefront read lands while the publish of version 2 is writing: it must see one whole version.
   const shared = ctx.redisAfter('catalog:p-1', () => m.readPublished('p-1'));
   const versioned = ctx.redisAfter('catalog:p-1:v2', () => m.readPublished('p-1'));
+  const pointer = ctx.redisAfter('catalog:p-1:published', () => m.readPublished('p-1'));
   assert.equal(await m.publishSnapshot('p-1', 2, V2, 1), true, 'publishing version 2 over version 1 (expected 1) must move the pointer');
   for (const probe of [shared, versioned]) if (probe.fired) whole(await settled(probe, 'the key'), 'during the publish');
+  whole(await settled(pointer, 'catalog:p-1:published'), 'right after the pointer moved');
   assert.equal(ctx.redis.type('catalog:p-1'), 'none', \`catalog:p-1 is a \${ctx.redis.type('catalog:p-1')}: the fields of every version share one hash, so a reader can see two versions in one response. Write the whole version under catalog:p-1:v2\`);
   const raw = ctx.redis.get('catalog:p-1:v2');
-  assert(raw !== null && JSON.stringify(JSON.parse(raw)) === JSON.stringify(V2), \`catalog:p-1:v2 holds \${JSON.stringify(raw)}, expected the whole version 2 as one JSON document\`);
+  assert(raw !== null && canonical(JSON.parse(raw)) === canonical(V2), \`catalog:p-1:v2 holds \${JSON.stringify(raw)}, expected the whole version 2 as one JSON document\`);
   assert.deepStrictEqual(await m.readPublished('p-1'), V2, 'after the second publish readPublished must give version 2');
 }
 
@@ -629,7 +653,8 @@ export async function check_single_read(ctx) {
   const m = ctx.load('state');
   await m.publishSnapshot('p-1', 1, V1, null);
   // Version 2 is published right after the read resolved the pointer: the read must still answer one whole version.
-  const rival = ctx.redisAfter('catalog:p-1:published', () => m.publishSnapshot('p-1', 2, V2, 1));
+  // Its first command lands before the read's next one, so the rival leads with the fields a torn read shows.
+  const rival = ctx.redisAfter('catalog:p-1:published', () => m.publishSnapshot('p-1', 2, {title: V2.title, ...V2}, 1));
   const seen = await m.readPublished('p-1');
   assert.equal(await settled(rival, 'catalog:p-1:published'), true, 'the publish of version 2 that landed during the read must move the pointer');
   whole(seen, 'racing a publish');
@@ -646,12 +671,27 @@ export async function check_cas_swap(ctx) {
   assert.deepStrictEqual(await m.readPublished('p-1'), V2, 'the storefront must serve version 2 after a stale publish');
   // Another publisher wins the race between this publish's snapshot write and its swap.
   const v9 = {...V2, version: 9, title: 'Kettle, 9 L'};
-  const rival = ctx.redisAfter('catalog:p-1:v4', () => m.publishSnapshot('p-1', 9, v9, 2));
+  let rival = ctx.redisAfter('catalog:p-1:v4', () => m.publishSnapshot('p-1', 9, v9, 2));
   const v4 = {...V2, version: 4, title: 'Kettle, 4 L'};
-  const lost = await m.publishSnapshot('p-1', 4, v4, 2);
-  assert.equal(await settled(rival, 'catalog:p-1:v4'), true, 'the rival publish must move the pointer to 9');
-  assert.equal(lost, false, 'the publish that lost the race must report false');
-  assert.deepStrictEqual(await m.readPublished('p-1'), v9, 'the storefront must serve version 9 after the race');
+  let moved = await m.publishSnapshot('p-1', 4, v4, 2);
+  let rivalMoved = await settled(rival, 'catalog:p-1:v4');
+  assert(rivalMoved !== moved, \`two publishes that both expected version 2 raced: the rival reported \${rivalMoved}, this one \${moved}. Exactly one may move the pointer\`);
+  let winner = rivalMoved ? v9 : v4;
+  assert.deepStrictEqual(await m.readPublished('p-1'), winner, \`the storefront must serve the winner, version \${winner.version}, after the race\`);
+  // A rival lands right after this publish touched the pointer: a check made outside the script is stale by then.
+  const current = winner.version;
+  const v11 = {...V2, version: 11, title: 'Kettle, 11 L'};
+  rival = ctx.redisAfter('catalog:p-1:published', () => m.publishSnapshot('p-1', 11, v11, current));
+  const v10 = {...V2, version: 10, title: 'Kettle, 10 L'};
+  moved = await m.publishSnapshot('p-1', 10, v10, current);
+  rivalMoved = await settled(rival, 'catalog:p-1:published');
+  assert(rivalMoved !== moved, \`two publishes that both expected version \${current} raced on the pointer: the rival reported \${rivalMoved}, this one \${moved}. Exactly one may move the pointer: compare and set in one script\`);
+  winner = rivalMoved ? v11 : v10;
+  assert.deepStrictEqual(await m.readPublished('p-1'), winner, \`the storefront must serve the winner, version \${winner.version}, after the race\`);
+  // null expected means nothing is published yet; once a version is live such a publish lost.
+  const late = await m.publishSnapshot('p-1', 12, {...V2, version: 12, title: 'Kettle, 12 L'}, null);
+  assert.equal(late, false, 'a publish that expected nothing published while a version is live must not move the pointer and must report false');
+  assert.deepStrictEqual(await m.readPublished('p-1'), winner, \`the storefront must serve version \${winner.version} after a publish that expected nothing published\`);
 }
 `,
     go: `package main
@@ -666,12 +706,12 @@ import (
 )
 
 var (
-	stateBg = context.Background()
-	v1      = map[string]any{"version": 1, "product_id": "p-1", "title": "Kettle", "price_cents": 3499, "tax_class": "standard"}
-	v2      = map[string]any{"version": 2, "product_id": "p-1", "title": "Kettle, 2 L", "price_cents": 3999, "tax_class": "standard"}
+	hStateBg = context.Background()
+	hV1      = map[string]any{"version": 1, "product_id": "p-1", "title": "Kettle", "price_cents": 3499, "tax_class": "standard"}
+	hV2      = map[string]any{"version": 2, "product_id": "p-1", "title": "Kettle, 2 L", "price_cents": 3999, "tax_class": "standard"}
 )
 
-func variant(base map[string]any, version int, title string) map[string]any {
+func hVariant(base map[string]any, version int, title string) map[string]any {
 	out := map[string]any{}
 	for k, v := range base {
 		out[k] = v
@@ -681,54 +721,87 @@ func variant(base map[string]any, version int, title string) map[string]any {
 	return out
 }
 
-// same compares two snapshots as JSON documents (keys sorted, numbers by value).
-func same(a, b map[string]any) bool {
+// hSame compares two snapshots as JSON documents (keys sorted, numbers by value).
+func hSame(a, b map[string]any) bool {
 	x, _ := json.Marshal(a)
 	y, _ := json.Marshal(b)
 	return string(x) == string(y)
 }
 
-func mustPublish(ctx *harness.Ctx, version int, snapshot map[string]any, expected int) bool {
-	moved, err := publishSnapshot(stateBg, "p-1", version, snapshot, expected)
+func hMustPublish(ctx *harness.Ctx, version int, snapshot map[string]any, expected int) bool {
+	moved, err := publishSnapshot(hStateBg, "p-1", version, snapshot, expected)
 	ctx.NoError(err, "publishSnapshot(p-1, %d, …, %d) failed", version, expected)
 	return moved
 }
 
-func mustRead(ctx *harness.Ctx) map[string]any {
-	snapshot, err := readPublished(stateBg, "p-1")
+func hMustRead(ctx *harness.Ctx) map[string]any {
+	snapshot, err := readPublished(hStateBg, "p-1")
 	ctx.NoError(err, "readPublished(p-1) failed")
 	return snapshot
 }
 
-func whole(ctx *harness.Ctx, seen map[string]any, when string) {
-	ctx.Assert(same(seen, v1) || same(seen, v2), "a read %s saw %v: a mix of version 1 and version 2. A reader must see one whole version", when, seen)
+func hWhole(ctx *harness.Ctx, seen map[string]any, when string) {
+	ctx.Assert(seen != nil, "a read %s found no snapshot: the pointer named a version whose snapshot was not written yet", when)
+	ctx.Assert(hSame(seen, hV1) || hSame(seen, hV2), "a read %s saw %v: a mix of version 1 and version 2. A reader must see one whole version", when, seen)
+}
+
+// hRace publishes version mine (expecting current) while a rival publishing version rival (also
+// expecting current) lands right after the first command that touches key: exactly one may win,
+// and the storefront then serves the winner. It returns the winner's version.
+func hRace(ctx *harness.Ctx, key string, mine, rival, current int) int {
+	rivalSnapshot := hVariant(hV2, rival, fmt.Sprintf("Kettle, %d L", rival))
+	probe := ctx.Redis.After(key, func() any {
+		moved, err := publishSnapshot(hStateBg, "p-1", rival, rivalSnapshot, current)
+		ctx.NoError(err, "the rival publish failed")
+		return moved
+	})
+	mineSnapshot := hVariant(hV2, mine, fmt.Sprintf("Kettle, %d L", mine))
+	moved := hMustPublish(ctx, mine, mineSnapshot, current)
+	ctx.Assert(probe.Fired, "nothing touched %s", key)
+	ctx.Assert(probe.Err == nil, "the rival publish failed: %v", probe.Err)
+	rivalMoved, _ := probe.Result.(bool)
+	ctx.Assert(rivalMoved != moved, "two publishes that both expected version %d raced after %s: the rival reported %v, this one %v. Exactly one may move the pointer: compare and set in one script", current, key, rivalMoved, moved)
+	winner, snapshot := mine, mineSnapshot
+	if rivalMoved {
+		winner, snapshot = rival, rivalSnapshot
+	}
+	served := hMustRead(ctx)
+	ctx.Assert(hSame(served, snapshot), "the storefront serves %v after the race, expected the winner, version %d", served, winner)
+	return winner
 }
 
 func CheckNoFieldSwap(ctx *harness.Ctx) {
-	ctx.Equal(mustPublish(ctx, 1, v1, 0), true, "the first publish (nothing published yet, expected 0) must move the pointer; moved")
-	ctx.Equal(mustRead(ctx), v1, "after publishing version 1, readPublished")
+	ctx.Equal(hMustPublish(ctx, 1, hV1, 0), true, "the first publish (nothing published yet, expected 0) must move the pointer; moved")
+	ctx.Equal(hMustRead(ctx), hV1, "after publishing version 1, readPublished")
 	// A storefront read lands while the publish of version 2 is writing: it must see one whole version.
 	var seen []map[string]any
 	for _, key := range []string{"catalog:p-1", "catalog:p-1:v2"} {
 		ctx.Redis.After(key, func() any {
-			snapshot, _ := readPublished(stateBg, "p-1")
+			snapshot, _ := readPublished(hStateBg, "p-1")
 			seen = append(seen, snapshot)
 			return nil
 		})
 	}
-	ctx.Equal(mustPublish(ctx, 2, v2, 1), true, "publishing version 2 over version 1 (expected 1) must move the pointer; moved")
+	pointer := ctx.Redis.After("catalog:p-1:published", func() any {
+		snapshot, _ := readPublished(hStateBg, "p-1")
+		return snapshot
+	})
+	ctx.Equal(hMustPublish(ctx, 2, hV2, 1), true, "publishing version 2 over version 1 (expected 1) must move the pointer; moved")
 	for _, s := range seen {
-		whole(ctx, s, "during the publish")
+		hWhole(ctx, s, "during the publish")
 	}
+	ctx.Assert(pointer.Fired, "nothing touched catalog:p-1:published")
+	afterSwap, _ := pointer.Result.(map[string]any)
+	hWhole(ctx, afterSwap, "right after the pointer moved")
 	ctx.Equal(ctx.Redis.Type("catalog:p-1"), "none", "catalog:p-1 exists: the fields of every version share one hash, so a reader can see two versions in one response. Write the whole version under catalog:p-1:v2; its type")
 	raw, ok := ctx.Redis.Get("catalog:p-1:v2")
 	var stored map[string]any
-	ctx.Assert(ok && json.Unmarshal([]byte(raw), &stored) == nil && same(stored, v2), "catalog:p-1:v2 holds %q, expected the whole version 2 as one JSON document", raw)
-	ctx.Equal(mustRead(ctx), v2, "after the second publish, readPublished")
+	ctx.Assert(ok && json.Unmarshal([]byte(raw), &stored) == nil && hSame(stored, hV2), "catalog:p-1:v2 holds %q, expected the whole version 2 as one JSON document", raw)
+	ctx.Equal(hMustRead(ctx), hV2, "after the second publish, readPublished")
 }
 
 func CheckOnePointer(ctx *harness.Ctx) {
-	mustPublish(ctx, 1, v1, 0)
+	hMustPublish(ctx, 1, hV1, 0)
 	keys := ctx.Redis.Keys("catalog:p-1*")
 	pointer, _ := ctx.Redis.Get("catalog:p-1:published")
 	ctx.Equal(pointer, "1", "catalog:p-1:published must hold the published version 1 (keys: %q)", keys)
@@ -743,41 +816,37 @@ func CheckOnePointer(ctx *harness.Ctx) {
 }
 
 func CheckSingleRead(ctx *harness.Ctx) {
-	mustPublish(ctx, 1, v1, 0)
+	hMustPublish(ctx, 1, hV1, 0)
 	// Version 2 is published right after the read resolved the pointer: the read must still answer one whole version.
 	rival := ctx.Redis.After("catalog:p-1:published", func() any {
-		moved, err := publishSnapshot(stateBg, "p-1", 2, v2, 1)
+		moved, err := publishSnapshot(hStateBg, "p-1", 2, hV2, 1)
 		ctx.NoError(err, "the rival publish failed")
 		return moved
 	})
-	seen := mustRead(ctx)
+	seen := hMustRead(ctx)
 	ctx.Assert(rival.Fired, "nothing touched catalog:p-1:published")
 	ctx.Assert(rival.Err == nil, "the rival publish failed: %v", rival.Err)
 	ctx.Equal(rival.Result, true, "the publish of version 2 that landed during the read must move the pointer; moved")
-	whole(ctx, seen, "racing a publish")
-	ctx.Equal(mustRead(ctx), v2, "after the race, readPublished")
+	hWhole(ctx, seen, "racing a publish")
+	ctx.Equal(hMustRead(ctx), hV2, "after the race, readPublished")
 }
 
 func CheckCasSwap(ctx *harness.Ctx) {
-	ctx.Equal(mustPublish(ctx, 1, v1, 0), true, "the first publish must move the pointer; moved")
-	ctx.Equal(mustPublish(ctx, 2, v2, 1), true, "a publish that expected version 1 while 1 is published must move the pointer; moved")
-	ctx.Equal(mustPublish(ctx, 3, variant(v2, 3, "Kettle, 3 L"), 1), false, "a publish that expected version 1 while 2 is published lost the race: the pointer must not move; moved")
+	ctx.Equal(hMustPublish(ctx, 1, hV1, 0), true, "the first publish must move the pointer; moved")
+	ctx.Equal(hMustPublish(ctx, 2, hV2, 1), true, "a publish that expected version 1 while 1 is published must move the pointer; moved")
+	ctx.Equal(hMustPublish(ctx, 3, hVariant(hV2, 3, "Kettle, 3 L"), 1), false, "a publish that expected version 1 while 2 is published lost the race: the pointer must not move; moved")
 	pointer, _ := ctx.Redis.Get("catalog:p-1:published")
 	ctx.Equal(pointer, "2", "catalog:p-1:published after a stale publish")
-	ctx.Equal(mustRead(ctx), v2, "the storefront after a stale publish")
-	// Another publisher wins the race between this publish's snapshot write and its swap.
-	v9 := variant(v2, 9, "Kettle, 9 L")
-	rival := ctx.Redis.After("catalog:p-1:v4", func() any {
-		moved, err := publishSnapshot(stateBg, "p-1", 9, v9, 2)
-		ctx.NoError(err, "the rival publish failed")
-		return moved
-	})
-	lost := mustPublish(ctx, 4, variant(v2, 4, "Kettle, 4 L"), 2)
-	ctx.Assert(rival.Fired, "nothing touched catalog:p-1:v4")
-	ctx.Assert(rival.Err == nil, "the rival publish failed: %v", rival.Err)
-	ctx.Equal(rival.Result, true, "the rival publish must move the pointer to 9; moved")
-	ctx.Equal(lost, false, "the publish that lost the race must report false; moved")
-	ctx.Equal(mustRead(ctx), v9, "the storefront after the race")
+	ctx.Equal(hMustRead(ctx), hV2, "the storefront after a stale publish")
+	// Another publisher lands between this publish's snapshot write and its swap.
+	current := hRace(ctx, "catalog:p-1:v4", 4, 9, 2)
+	// A rival lands right after this publish touched the pointer: a check made outside the script is stale by then.
+	current = hRace(ctx, "catalog:p-1:published", 10, 11, current)
+	// expected 0 means nothing is published yet; once a version is live such a publish lost.
+	live := hMustRead(ctx)
+	ctx.Equal(hMustPublish(ctx, 12, hVariant(hV2, 12, "Kettle, 12 L"), 0), false, "a publish that expected nothing published (0) while a version is live must not move the pointer; moved")
+	served := hMustRead(ctx)
+	ctx.Assert(hSame(served, live), "the storefront serves %v after a publish that expected nothing published, expected version %d", served, current)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -796,33 +865,34 @@ namespace {
 const json kV1 = {{"version", 1}, {"product_id", "p-1"}, {"title", "Kettle"}, {"price_cents", 3499}, {"tax_class", "standard"}};
 const json kV2 = {{"version", 2}, {"product_id", "p-1"}, {"title", "Kettle, 2 L"}, {"price_cents", 3999}, {"tax_class", "standard"}};
 
-json variant(const json& base, long version, const std::string& title) {
+json hVariant(const json& base, long version, const std::string& title) {
   json out = base;
   out["version"] = version;
   out["title"] = title;
   return out;
 }
 
-json mustRead(harness::Ctx& ctx) {
+json hMustRead(harness::Ctx& ctx) {
   const auto snapshot = readPublished("p-1");
   ctx.Assert(snapshot.has_value(), "readPublished(p-1) gave nothing while a version is published");
   return *snapshot;
 }
 
-void whole(harness::Ctx& ctx, const json& seen, const std::string& when) {
-  ctx.Assert(seen == kV1 || seen == kV2, "a read %s saw %s: a mix of version 1 and version 2. A reader must see one whole version", when, seen.dump());
+void hWhole(harness::Ctx& ctx, const std::optional<json>& seen, const std::string& when) {
+  ctx.Assert(seen.has_value(), "a read %s found no snapshot: the pointer named a version whose snapshot was not written yet", when);
+  ctx.Assert(*seen == kV1 || *seen == kV2, "a read %s saw %s: a mix of version 1 and version 2. A reader must see one whole version", when, seen->dump());
 }
 
 // A probe's outcome: whether it fired, what the call returned, what it threw.
-struct Rival {
+struct HRival {
   bool fired = false;
   bool moved = false;
   std::optional<json> seen;
   std::optional<std::string> err;
 };
 
-std::shared_ptr<Rival> rivalPublish(harness::Ctx& ctx, const std::string& key, long version, json snapshot, long expected) {
-  auto out = std::make_shared<Rival>();
+std::shared_ptr<HRival> hRivalPublish(harness::Ctx& ctx, const std::string& key, long version, json snapshot, long expected) {
+  auto out = std::make_shared<HRival>();
   ctx.Redis.After(key, [out, version, snapshot, expected] {
     out->fired = true;
     try {
@@ -834,8 +904,8 @@ std::shared_ptr<Rival> rivalPublish(harness::Ctx& ctx, const std::string& key, l
   return out;
 }
 
-std::shared_ptr<Rival> rivalRead(harness::Ctx& ctx, const std::string& key) {
-  auto out = std::make_shared<Rival>();
+std::shared_ptr<HRival> hRivalRead(harness::Ctx& ctx, const std::string& key) {
+  auto out = std::make_shared<HRival>();
   ctx.Redis.After(key, [out] {
     out->fired = true;
     try {
@@ -847,29 +917,47 @@ std::shared_ptr<Rival> rivalRead(harness::Ctx& ctx, const std::string& key) {
   return out;
 }
 
-void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
+void hSettled(harness::Ctx& ctx, const HRival& r, const std::string& what) {
   ctx.Assert(r.fired, "nothing touched %s", what);
   ctx.Assert(!r.err, "the parallel call failed: %s", r.err.value_or(""));
+}
+
+// Publishes version mine (expecting current) while a rival publishing version rival (also expecting
+// current) lands right after the first command that touches key: exactly one may win, and the
+// storefront then serves the winner. Returns the winner's version.
+long hRace(harness::Ctx& ctx, const std::string& key, long mine, long rival, long current) {
+  const json rival_snapshot = hVariant(kV2, rival, "Kettle, " + std::to_string(rival) + " L");
+  const json mine_snapshot = hVariant(kV2, mine, "Kettle, " + std::to_string(mine) + " L");
+  const auto probe = hRivalPublish(ctx, key, rival, rival_snapshot, current);
+  const bool moved = publishSnapshot("p-1", mine, mine_snapshot, current);
+  hSettled(ctx, *probe, key);
+  ctx.Assert(probe->moved != moved, "two publishes that both expected version %v raced after %s: the rival reported %v, this one %v. Exactly one may move the pointer: compare and set in one script", current, key, probe->moved, moved);
+  const json served = hMustRead(ctx);
+  ctx.Assert(served == (probe->moved ? rival_snapshot : mine_snapshot), "the storefront serves %s after the race, expected the winner, version %v", served.dump(), probe->moved ? rival : mine);
+  return probe->moved ? rival : mine;
 }
 
 }  // namespace
 
 void CheckNoFieldSwap(harness::Ctx& ctx) {
   ctx.Equal(publishSnapshot("p-1", 1, kV1, 0), true, "the first publish (nothing published yet, expected 0) must move the pointer; moved");
-  ctx.Equal(mustRead(ctx), kV1, "after publishing version 1, readPublished");
+  ctx.Equal(hMustRead(ctx), kV1, "after publishing version 1, readPublished");
   // A storefront read lands while the publish of version 2 is writing: it must see one whole version.
-  const auto shared = rivalRead(ctx, "catalog:p-1");
-  const auto versioned = rivalRead(ctx, "catalog:p-1:v2");
+  const auto shared = hRivalRead(ctx, "catalog:p-1");
+  const auto versioned = hRivalRead(ctx, "catalog:p-1:v2");
+  const auto pointer = hRivalRead(ctx, "catalog:p-1:published");
   ctx.Equal(publishSnapshot("p-1", 2, kV2, 1), true, "publishing version 2 over version 1 (expected 1) must move the pointer; moved");
   for (const auto& probe : {shared, versioned}) {
     if (!probe->fired) continue;
-    settled(ctx, *probe, "the key");
-    if (probe->seen) whole(ctx, *probe->seen, "during the publish");
+    hSettled(ctx, *probe, "the key");
+    hWhole(ctx, probe->seen, "during the publish");
   }
+  hSettled(ctx, *pointer, "catalog:p-1:published");
+  hWhole(ctx, pointer->seen, "right after the pointer moved");
   ctx.Equal(ctx.Redis.Type("catalog:p-1"), "none", "catalog:p-1 exists: the fields of every version share one hash, so a reader can see two versions in one response. Write the whole version under catalog:p-1:v2; its type");
   const auto raw = ctx.Redis.Get("catalog:p-1:v2");
   ctx.Assert(raw && json::parse(*raw) == kV2, "catalog:p-1:v2 holds %q, expected the whole version 2 as one JSON document", raw.value_or(""));
-  ctx.Equal(mustRead(ctx), kV2, "after the second publish, readPublished");
+  ctx.Equal(hMustRead(ctx), kV2, "after the second publish, readPublished");
 }
 
 void CheckOnePointer(harness::Ctx& ctx) {
@@ -887,28 +975,28 @@ void CheckOnePointer(harness::Ctx& ctx) {
 void CheckSingleRead(harness::Ctx& ctx) {
   publishSnapshot("p-1", 1, kV1, 0);
   // Version 2 is published right after the read resolved the pointer: the read must still answer one whole version.
-  const auto rival = rivalPublish(ctx, "catalog:p-1:published", 2, kV2, 1);
-  const json seen = mustRead(ctx);
-  settled(ctx, *rival, "catalog:p-1:published");
+  const auto rival = hRivalPublish(ctx, "catalog:p-1:published", 2, kV2, 1);
+  const json seen = hMustRead(ctx);
+  hSettled(ctx, *rival, "catalog:p-1:published");
   ctx.Equal(rival->moved, true, "the publish of version 2 that landed during the read must move the pointer; moved");
-  whole(ctx, seen, "racing a publish");
-  ctx.Equal(mustRead(ctx), kV2, "after the race, readPublished");
+  hWhole(ctx, seen, "racing a publish");
+  ctx.Equal(hMustRead(ctx), kV2, "after the race, readPublished");
 }
 
 void CheckCasSwap(harness::Ctx& ctx) {
   ctx.Equal(publishSnapshot("p-1", 1, kV1, 0), true, "the first publish must move the pointer; moved");
   ctx.Equal(publishSnapshot("p-1", 2, kV2, 1), true, "a publish that expected version 1 while 1 is published must move the pointer; moved");
-  ctx.Equal(publishSnapshot("p-1", 3, variant(kV2, 3, "Kettle, 3 L"), 1), false, "a publish that expected version 1 while 2 is published lost the race: the pointer must not move; moved");
+  ctx.Equal(publishSnapshot("p-1", 3, hVariant(kV2, 3, "Kettle, 3 L"), 1), false, "a publish that expected version 1 while 2 is published lost the race: the pointer must not move; moved");
   ctx.Equal(ctx.Redis.Get("catalog:p-1:published"), std::optional<std::string>("2"), "catalog:p-1:published after a stale publish");
-  ctx.Equal(mustRead(ctx), kV2, "the storefront after a stale publish");
-  // Another publisher wins the race between this publish's snapshot write and its swap.
-  const json v9 = variant(kV2, 9, "Kettle, 9 L");
-  const auto rival = rivalPublish(ctx, "catalog:p-1:v4", 9, v9, 2);
-  const bool lost = publishSnapshot("p-1", 4, variant(kV2, 4, "Kettle, 4 L"), 2);
-  settled(ctx, *rival, "catalog:p-1:v4");
-  ctx.Equal(rival->moved, true, "the rival publish must move the pointer to 9; moved");
-  ctx.Equal(lost, false, "the publish that lost the race must report false; moved");
-  ctx.Equal(mustRead(ctx), v9, "the storefront after the race");
+  ctx.Equal(hMustRead(ctx), kV2, "the storefront after a stale publish");
+  // Another publisher lands between this publish's snapshot write and its swap.
+  long current = hRace(ctx, "catalog:p-1:v4", 4, 9, 2);
+  // A rival lands right after this publish touched the pointer: a check made outside the script is stale by then.
+  current = hRace(ctx, "catalog:p-1:published", 10, 11, current);
+  // expected 0 means nothing is published yet; once a version is live such a publish lost.
+  const json live = hMustRead(ctx);
+  ctx.Equal(publishSnapshot("p-1", 12, hVariant(kV2, 12, "Kettle, 12 L"), 0), false, "a publish that expected nothing published (0) while a version is live must not move the pointer; moved");
+  ctx.Assert(hMustRead(ctx) == live, "the storefront serves %s after a publish that expected nothing published, expected version %v", hMustRead(ctx).dump(), current);
 }
 `,
   },

@@ -25,14 +25,14 @@ service Media   { rpc ValidateRendition(RenditionRequest) returns (Rendition); }
 service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); }  // FAILED_PRECONDITION: rejected
 \`\`\`
 
-- Every call carries a **\`DEADLINE_S\` = 5 s** deadline.
+- Every call carries its own **\`DEADLINE_S\` = 5 s** deadline.
 - Every rendition in \`RENDITIONS\` is validated; one that is \`NOT_FOUND\` raises \`PublishHeld\` and
   nothing is published.
 - The pricing status decides: \`FAILED_PRECONDITION\` is \`PricingRejected\`, terminal for this draft;
   \`DEADLINE_EXCEEDED\` or \`UNAVAILABLE\` is \`ValidationUnavailable\`, which the caller may retry.
 - A rejection is remembered per product under \`draft_fingerprint(product_id, draft)\`: a replay of
-  the same draft raises \`PricingRejected\` without a call; a changed draft, or a look-alike draft of
-  another product, is validated.
+  the same draft raises \`PricingRejected\` without a call; a changed draft (a new price or tax class,
+  even in the same version), or a look-alike draft of another product, is validated.
 - Validation runs before \`publish_snapshot\`, so a held or rejected draft leaves the pointer alone.`,
   sequence: {
     participants: ['Catalog API', 'Media service', 'Pricing service', 'Redis pointer'],
@@ -55,7 +55,7 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
       id: 'deadline',
       title: 'Every validation call carries a 5-second deadline',
       detail:
-        'Both the media and the pricing call are made with `DEADLINE_S` (5 s); the starter gives media eight seconds and pricing none, so one stuck dependency holds the publish open.',
+        'Both the media and the pricing call are made with `DEADLINE_S` (5 s), each call its own full deadline (three slow renditions in a row still fit); the starter gives media eight seconds and pricing none, so one stuck dependency holds the publish open.',
       match: {
         python: {
           all: [
@@ -105,7 +105,7 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
       id: 'pricing-terminal',
       title: 'A rejection is terminal, a deadline is retryable',
       detail:
-        '`FAILED_PRECONDITION` from pricing raises `PricingRejected`; `DEADLINE_EXCEEDED` or `UNAVAILABLE` raises `ValidationUnavailable`; neither is retried in place. The starter retries any error, sleeping between attempts, then publishes anyway.',
+        '`FAILED_PRECONDITION` from pricing raises `PricingRejected`; `DEADLINE_EXCEEDED` or `UNAVAILABLE` raises `ValidationUnavailable`, and the same draft publishes once pricing answers; neither is retried in place. The starter retries any error, sleeping between attempts, then publishes anyway.',
       match: {
         python: {
           all: [/FAILED_PRECONDITION/, /raise PricingRejected/, /raise ValidationUnavailable/],
@@ -186,7 +186,7 @@ service Pricing { rpc ValidatePricing(PricingRequest) returns (PricingVerdict); 
       id: 'draft-fingerprint',
       title: 'Remembers a rejection per product and draft',
       detail:
-        'The rejected draft is fingerprinted with its product id (`draft_fingerprint(product_id, draft)`) and remembered in `rejected` keyed by the product, so a replay raises without a call while a changed draft, or another product with the same fields, is validated.',
+        'The rejected draft is fingerprinted with its product id (`draft_fingerprint(product_id, draft)`) and remembered in `rejected` keyed by the product, so a replay raises without a call while a changed draft (a new price or tax class, even in the same version), or another product with the same fields, is validated.',
       match: {
         python: {
           all: [/def draft_fingerprint\(\s*product_id/, /rejected\.get\(\s*product_id|rejected\[\s*product_id\s*\]/],
@@ -992,12 +992,24 @@ def check_deadline(ctx):
         for call in calls:
             assert call.timeout is not None, f"a {method} call carries no deadline: a stalled dependency would hold the publish open"
             assert 4.5 <= call.timeout <= 5.5, f"a {method} call carries a {call.timeout} s deadline, expected DEADLINE_S = 5"
+    # Each call has its own full deadline: three renditions of 2 s each fit, one budget shared by all of them does not.
+    ctx.grpc.set_latency("ValidateRendition", 2.0)
+    before = len(ctx.grpc.calls_to("ValidateRendition"))
+    v2 = {**DRAFT, "version": 2}
+    try:
+        moved = m.validate_and_publish("p-1", v2, 1)
+    except Exception as exc:
+        raise AssertionError(f"with every rendition answering in 2 s, inside its own 5 s deadline, validate_and_publish raised {type(exc).__name__}: {exc}. Every call carries a full DEADLINE_S, not what is left of one shared budget") from None
+    assert moved is True, "with every rendition answering in 2 s the draft must be published"
+    for call in ctx.grpc.calls_to("ValidateRendition")[before:]:
+        assert call.timeout is not None and 4.5 <= call.timeout <= 5.5, f"a ValidateRendition call made after slower ones carries a {call.timeout} s deadline: every call carries a full DEADLINE_S = 5"
+    ctx.grpc.set_latency("ValidateRendition", 0.0)
     ctx.grpc.set_latency("ValidatePricing", 10.0)
     before = len(ctx.grpc.calls_to("ValidatePricing"))
-    v2 = {**DRAFT, "version": 2}
-    _raises(m, m.ValidationUnavailable, v2, "pricing slower than the deadline")
+    v3 = {**DRAFT, "version": 3}
+    _raises(m, m.ValidationUnavailable, v3, "pricing slower than the deadline")
     assert len(ctx.grpc.calls_to("ValidatePricing")) == before + 1, "a deadline is reported to the caller, not retried in place"
-    assert read_published("p-1")["version"] == 1, f"a publish that timed out on pricing moved the pointer to {read_published('p-1')}"
+    assert read_published("p-1")["version"] == 2, f"a publish that timed out on pricing moved the pointer to {read_published('p-1')}"
 
 
 def check_renditions_required(ctx):
@@ -1022,7 +1034,12 @@ def check_pricing_terminal(ctx):
     ctx.grpc.set_latency("ValidatePricing", 10.0)
     _raises(m, m.ValidationUnavailable, None, "with pricing slower than the deadline")
     ctx.grpc.set_latency("ValidatePricing", 0.0)
-    assert m.validate_and_publish("p-1", DRAFT, None) is True, "a deadline is retryable: once pricing answers again the same draft must be published"
+    ctx.grpc.fail("ValidatePricing", grpc.StatusCode.UNAVAILABLE, "pricing is restarting")
+    before = len(ctx.grpc.calls_to("ValidatePricing"))
+    _raises(m, m.ValidationUnavailable, None, "with pricing UNAVAILABLE")
+    assert len(ctx.grpc.calls_to("ValidatePricing")) == before + 1, "UNAVAILABLE is reported to the caller, not retried in place"
+    assert read_published("p-1") is None, f"a draft pricing could not validate went live: {read_published('p-1')}"
+    assert m.validate_and_publish("p-1", DRAFT, None) is True, "a deadline or UNAVAILABLE is retryable and says nothing about the draft: once pricing answers again the same draft must be published"
 
 
 def check_hold_back(ctx):
@@ -1049,10 +1066,22 @@ def check_draft_fingerprint(ctx):
     _raises(m, m.PricingRejected, lookalike, "with a look-alike draft of another product")
     assert len(ctx.grpc.calls_to("ValidatePricing")) == 2, "a look-alike draft of another product is a different draft: pricing must be asked about it"
     assert read_published("p-2") is None, "the look-alike draft of p-2 must not be published"
-    fixed = {**BAD, "version": 2, "tax_class": "standard"}
-    assert m.validate_and_publish("p-1", fixed, None) is True, "a changed draft of the rejected product must be validated and published"
+    fixed = {**BAD, "tax_class": "standard"}
+    _publishes(m, fixed, "the same draft version with its tax class corrected is a changed draft: it must be validated and published")
     assert len(ctx.grpc.calls_to("ValidatePricing")) == 3, "the changed draft must be sent to pricing"
-    assert read_published("p-1") == fixed, f"the storefront serves {read_published('p-1')}, expected the corrected version 2"
+    assert read_published("p-1") == fixed, f"the storefront serves {read_published('p-1')}, expected the corrected draft"
+    unpriced = {**DRAFT, "product_id": "p-3", "price_cents": 0}
+    _raises(m, m.PricingRejected, unpriced, "with a price of 0")
+    _publishes(m, {**unpriced, "price_cents": 3499}, "a draft whose price changed after a rejection is a changed draft: it must be validated and published")
+    assert len(ctx.grpc.calls_to("ValidatePricing")) == 5, "the draft with its price changed must be sent to pricing"
+
+
+def _publishes(m, draft, why):
+    try:
+        moved = m.validate_and_publish(draft["product_id"], draft, None)
+    except Exception as exc:
+        raise AssertionError(f"{why}; validate_and_publish raised {type(exc).__name__}: {exc}") from None
+    assert moved is True, f"{why}; validate_and_publish returned {moved!r}"
 `,
     typescript: `const DRAFT = {product_id: 'p-1', version: 1, title: 'Kettle', price_cents: 3499, tax_class: 'standard'};
 const BAD = {...DRAFT, tax_class: 'none'};
@@ -1091,6 +1120,16 @@ async function raises(m, exc, draft, why: string): Promise<void> {
   assert.fail(\`\${why}: validateAndPublish returned \${moved} instead of throwing \${exc.name}\`);
 }
 
+async function publishes(m, draft, why: string): Promise<void> {
+  let moved;
+  try {
+    moved = await m.validateAndPublish(draft.product_id, draft, null);
+  } catch (e) {
+    assert.fail(\`\${why}; validateAndPublish threw \${(e as Error).constructor.name}: \${(e as Error).message}\`);
+  }
+  assert.equal(moved, true, \`\${why}; validateAndPublish returned \${moved}\`);
+}
+
 export async function check_deadline(ctx) {
   const {m, readPublished} = client(ctx);
   assert.equal(await m.validateAndPublish('p-1', DRAFT, null), true, 'with both services healthy the draft must be published');
@@ -1102,11 +1141,24 @@ export async function check_deadline(ctx) {
       assert(4.5 <= call.timeout && call.timeout <= 5.5, \`a \${method} call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 5000\`);
     }
   }
+  // Each call has its own full deadline: three renditions of 2 s each fit, one budget shared by all of them does not.
+  ctx.grpc.setLatency('ValidateRendition', 2.0);
+  let before = ctx.grpc.callsTo('ValidateRendition').length;
+  let moved;
+  try {
+    moved = await m.validateAndPublish('p-1', {...DRAFT, version: 2}, 1);
+  } catch (e) {
+    assert.fail(\`with every rendition answering in 2 s, inside its own 5 s deadline, validateAndPublish threw \${(e as Error).constructor.name}: \${(e as Error).message}. Every call carries a full DEADLINE_MS, not what is left of one shared budget\`);
+  }
+  assert.equal(moved, true, 'with every rendition answering in 2 s the draft must be published');
+  for (const call of ctx.grpc.callsTo('ValidateRendition').slice(before))
+    assert(call.timeout !== null && 4.5 <= call.timeout && call.timeout <= 5.5, \`a ValidateRendition call made after slower ones carries a \${call.timeout} s deadline: every call carries a full DEADLINE_MS = 5000\`);
+  ctx.grpc.setLatency('ValidateRendition', 0);
   ctx.grpc.setLatency('ValidatePricing', 10.0);
-  const before = ctx.grpc.callsTo('ValidatePricing').length;
-  await raises(m, m.ValidationUnavailable, {...DRAFT, version: 2}, 'pricing slower than the deadline');
+  before = ctx.grpc.callsTo('ValidatePricing').length;
+  await raises(m, m.ValidationUnavailable, {...DRAFT, version: 3}, 'pricing slower than the deadline');
   assert.equal(ctx.grpc.callsTo('ValidatePricing').length, before + 1, 'a deadline is reported to the caller, not retried in place');
-  assert.equal((await readPublished('p-1')).version, 1, 'a publish that timed out on pricing moved the pointer');
+  assert.equal((await readPublished('p-1')).version, 2, 'a publish that timed out on pricing moved the pointer');
 }
 
 export async function check_renditions_required(ctx) {
@@ -1131,7 +1183,12 @@ export async function check_pricing_terminal(ctx) {
   ctx.grpc.setLatency('ValidatePricing', 10.0);
   await raises(m, m.ValidationUnavailable, DRAFT, 'with pricing slower than the deadline');
   ctx.grpc.setLatency('ValidatePricing', 0);
-  assert.equal(await m.validateAndPublish('p-1', DRAFT, null), true, 'a deadline is retryable: once pricing answers again the same draft must be published');
+  ctx.grpc.fail('ValidatePricing', ctx.grpc.status.UNAVAILABLE, 'pricing is restarting');
+  const before = ctx.grpc.callsTo('ValidatePricing').length;
+  await raises(m, m.ValidationUnavailable, DRAFT, 'with pricing UNAVAILABLE');
+  assert.equal(ctx.grpc.callsTo('ValidatePricing').length, before + 1, 'UNAVAILABLE is reported to the caller, not retried in place');
+  assert.equal(await readPublished('p-1'), null, 'a draft pricing could not validate went live');
+  assert.equal(await m.validateAndPublish('p-1', DRAFT, null), true, 'a deadline or UNAVAILABLE is retryable and says nothing about the draft: once pricing answers again the same draft must be published');
 }
 
 export async function check_hold_back(ctx) {
@@ -1157,10 +1214,14 @@ export async function check_draft_fingerprint(ctx) {
   await raises(m, m.PricingRejected, {...BAD, product_id: 'p-2'}, 'with a look-alike draft of another product');
   assert.equal(ctx.grpc.callsTo('ValidatePricing').length, 2, 'a look-alike draft of another product is a different draft: pricing must be asked about it');
   assert.equal(await readPublished('p-2'), null, 'the look-alike draft of p-2 must not be published');
-  const fixed = {...BAD, version: 2, tax_class: 'standard'};
-  assert.equal(await m.validateAndPublish('p-1', fixed, null), true, 'a changed draft of the rejected product must be validated and published');
+  const fixed = {...BAD, tax_class: 'standard'};
+  await publishes(m, fixed, 'the same draft version with its tax class corrected is a changed draft: it must be validated and published');
   assert.equal(ctx.grpc.callsTo('ValidatePricing').length, 3, 'the changed draft must be sent to pricing');
-  assert.deepStrictEqual(await readPublished('p-1'), fixed, 'the storefront must serve the corrected version 2');
+  assert.deepStrictEqual(await readPublished('p-1'), fixed, 'the storefront must serve the corrected draft');
+  const unpriced = {...DRAFT, product_id: 'p-3', price_cents: 0};
+  await raises(m, m.PricingRejected, unpriced, 'with a price of 0');
+  await publishes(m, {...unpriced, price_cents: 3499}, 'a draft whose price changed after a rejection is a changed draft: it must be validated and published');
+  assert.equal(ctx.grpc.callsTo('ValidatePricing').length, 5, 'the draft with its price changed must be sent to pricing');
 }
 `,
     go: `package main
@@ -1183,51 +1244,51 @@ import (
 )
 
 var (
-	clientBg = context.Background()
-	draft    = store.Row{ProductID: "p-1", Version: 1, Status: "draft", Title: "Kettle", PriceCents: 3499, TaxClass: "standard"}
-	bad      = store.Row{ProductID: "p-1", Version: 1, Status: "draft", Title: "Kettle", PriceCents: 3499, TaxClass: "none"}
+	hClientBg = context.Background()
+	hDraft    = store.Row{ProductID: "p-1", Version: 1, Status: "draft", Title: "Kettle", PriceCents: 3499, TaxClass: "standard"}
+	hBad      = store.Row{ProductID: "p-1", Version: 1, Status: "draft", Title: "Kettle", PriceCents: 3499, TaxClass: "none"}
 )
 
-// mediaPeer has every rendition of every product ready, except those in missing ("product/rendition").
-type mediaPeer struct {
+// hMediaPeer has every rendition of every product ready, except those in missing ("product/rendition").
+type hMediaPeer struct {
 	pb.UnimplementedMediaServer
 	missing map[string]bool
 }
 
-func (m *mediaPeer) ValidateRendition(_ context.Context, req *pb.RenditionRequest) (*pb.Rendition, error) {
+func (m *hMediaPeer) ValidateRendition(_ context.Context, req *pb.RenditionRequest) (*pb.Rendition, error) {
 	if m.missing[req.GetProductId()+"/"+req.GetRendition()] {
 		return nil, status.Errorf(codes.NotFound, "rendition %s of %s is not produced", req.GetRendition(), req.GetProductId())
 	}
 	return &pb.Rendition{Rendition: req.GetRendition(), Url: fmt.Sprintf("https://img/%s/%d/%s.jpg", req.GetProductId(), req.GetVersion(), req.GetRendition())}, nil
 }
 
-// pricingPeer's price list has every tax class but none.
-type pricingPeer struct {
+// hPricingPeer's price list has every tax class but none.
+type hPricingPeer struct {
 	pb.UnimplementedPricingServer
 }
 
-func (pricingPeer) ValidatePricing(_ context.Context, req *pb.PricingRequest) (*pb.PricingVerdict, error) {
+func (hPricingPeer) ValidatePricing(_ context.Context, req *pb.PricingRequest) (*pb.PricingVerdict, error) {
 	if req.GetTaxClass() == "none" || req.GetPriceCents() <= 0 {
 		return nil, status.Errorf(codes.FailedPrecondition, "tax class %q is not in the price list", req.GetTaxClass())
 	}
 	return &pb.PricingVerdict{PriceList: "2026-q4"}, nil
 }
 
-func client(ctx *harness.Ctx) *mediaPeer {
-	media := &mediaPeer{missing: map[string]bool{}}
+func hServe(ctx *harness.Ctx) *hMediaPeer {
+	media := &hMediaPeer{missing: map[string]bool{}}
 	pb.RegisterMediaServer(ctx.GRPC.Server(""), media)
-	pb.RegisterPricingServer(ctx.GRPC.Server(""), pricingPeer{})
+	pb.RegisterPricingServer(ctx.GRPC.Server(""), hPricingPeer{})
 	return media
 }
 
-func published(ctx *harness.Ctx, productID string) map[string]any {
-	s, err := snapshot.ReadPublished(clientBg, productID)
+func hPublished(ctx *harness.Ctx, productID string) map[string]any {
+	s, err := snapshot.ReadPublished(hClientBg, productID)
 	ctx.NoError(err, "ReadPublished(%s) failed", productID)
 	return s
 }
 
-func publishedVersion(ctx *harness.Ctx, productID string) int {
-	s := published(ctx, productID)
+func hPublishedVersion(ctx *harness.Ctx, productID string) int {
+	s := hPublished(ctx, productID)
 	if s == nil {
 		return 0
 	}
@@ -1235,19 +1296,19 @@ func publishedVersion(ctx *harness.Ctx, productID string) int {
 	return int(v)
 }
 
-func mustMove(ctx *harness.Ctx, d store.Row, expected int, why string) {
-	moved, err := validateAndPublish(clientBg, d.ProductID, d, expected)
+func hMustMove(ctx *harness.Ctx, d store.Row, expected int, why string) {
+	moved, err := validateAndPublish(hClientBg, d.ProductID, d, expected)
 	ctx.NoError(err, "%s: validateAndPublish failed", why)
 	ctx.Equal(moved, true, "%s: the pointer must move; moved", why)
 }
 
-func mustFail(ctx *harness.Ctx, d store.Row, target error, why string) {
-	moved, err := validateAndPublish(clientBg, d.ProductID, d, 0)
+func hMustFail(ctx *harness.Ctx, d store.Row, target error, why string) {
+	moved, err := validateAndPublish(hClientBg, d.ProductID, d, 0)
 	ctx.Assert(err != nil, "%s: validateAndPublish returned %v instead of an error wrapping %v", why, moved, target)
 	ctx.ErrorIs(err, target, "%s: validateAndPublish returned %v", why, err)
 }
 
-func with(d store.Row, version int, title, taxClass string) store.Row {
+func hWith(d store.Row, version int, title, taxClass string) store.Row {
 	d.Version = version
 	if title != "" {
 		d.Title = title
@@ -1259,8 +1320,8 @@ func with(d store.Row, version int, title, taxClass string) store.Row {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	mustMove(ctx, draft, 0, "with both services healthy")
+	hServe(ctx)
+	hMustMove(ctx, hDraft, 0, "with both services healthy")
 	for _, method := range []string{"ValidateRendition", "ValidatePricing"} {
 		calls := ctx.GRPC.CallsTo(method, "")
 		ctx.Assert(len(calls) > 0, "no %s call was made", method)
@@ -1269,17 +1330,27 @@ func CheckDeadline(ctx *harness.Ctx) {
 			ctx.Assert(4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "a %s call carries a %v deadline, expected 5 s", method, call.Timeout)
 		}
 	}
+	// Each call has its own full deadline: three renditions of 2 s each fit, one budget shared by all of them does not.
+	ctx.GRPC.SetLatency("ValidateRendition", 2.0, "")
+	before := len(ctx.GRPC.CallsTo("ValidateRendition", ""))
+	moved, err := validateAndPublish(hClientBg, "p-1", hWith(hDraft, 2, "", ""), 1)
+	ctx.NoError(err, "with every rendition answering in 2 s, inside its own 5 s deadline, validateAndPublish failed: every call carries a full deadline, not what is left of one shared budget")
+	ctx.Equal(moved, true, "with every rendition answering in 2 s the draft must be published; moved")
+	for _, call := range ctx.GRPC.CallsTo("ValidateRendition", "")[before:] {
+		ctx.Assert(call.HasDeadline() && 4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "a ValidateRendition call made after slower ones carries a %v deadline: every call carries a full 5 s", call.Timeout)
+	}
+	ctx.GRPC.SetLatency("ValidateRendition", 0, "")
 	ctx.GRPC.SetLatency("ValidatePricing", 10.0, "")
-	before := len(ctx.GRPC.CallsTo("ValidatePricing", ""))
-	mustFail(ctx, with(draft, 2, "", ""), ErrValidationUnavailable, "pricing slower than the deadline")
+	before = len(ctx.GRPC.CallsTo("ValidatePricing", ""))
+	hMustFail(ctx, hWith(hDraft, 3, "", ""), ErrValidationUnavailable, "pricing slower than the deadline")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), before+1, "a deadline is reported to the caller, not retried in place; pricing calls")
-	ctx.Equal(publishedVersion(ctx, "p-1"), 1, "a publish that timed out on pricing must leave the pointer; the published version")
+	ctx.Equal(hPublishedVersion(ctx, "p-1"), 2, "a publish that timed out on pricing must leave the pointer; the published version")
 }
 
 func CheckRenditionsRequired(ctx *harness.Ctx) {
-	media := client(ctx)
+	media := hServe(ctx)
 	media.missing["p-1/card"] = true
-	mustFail(ctx, draft, ErrPublishHeld, "with the card rendition not produced")
+	hMustFail(ctx, hDraft, ErrPublishHeld, "with the card rendition not produced")
 	asked := map[string]bool{}
 	for _, c := range ctx.GRPC.CallsTo("ValidateRendition", "") {
 		asked[c.Request.(*pb.RenditionRequest).GetRendition()] = true
@@ -1292,54 +1363,67 @@ func CheckRenditionsRequired(ctx *harness.Ctx) {
 	want := append([]string{}, renditions...)
 	sort.Strings(want)
 	ctx.Equal(names, want, "the media service must be asked for every rendition in renditions; asked")
-	ctx.Assert(published(ctx, "p-1") == nil, "a version missing its card rendition went live: %v", published(ctx, "p-1"))
+	ctx.Assert(hPublished(ctx, "p-1") == nil, "a version missing its card rendition went live: %v", hPublished(ctx, "p-1"))
 	delete(media.missing, "p-1/card")
-	mustMove(ctx, draft, 0, "once every rendition is produced")
-	ctx.Equal(publishedVersion(ctx, "p-1"), 1, "the published version")
+	hMustMove(ctx, hDraft, 0, "once every rendition is produced")
+	ctx.Equal(hPublishedVersion(ctx, "p-1"), 1, "the published version")
 }
 
 func CheckPricingTerminal(ctx *harness.Ctx) {
-	client(ctx)
-	mustFail(ctx, bad, ErrPricingRejected, "with a tax class the price list rejects")
+	hServe(ctx)
+	hMustFail(ctx, hBad, ErrPricingRejected, "with a tax class the price list rejects")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), 1, "a rejection is terminal, not retried; the pricing calls for one rejected draft")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a rejection must not be slept on and retried; the sleeps")
-	ctx.Assert(published(ctx, "p-1") == nil, "a draft pricing rejected went live: %v", published(ctx, "p-1"))
+	ctx.Assert(hPublished(ctx, "p-1") == nil, "a draft pricing rejected went live: %v", hPublished(ctx, "p-1"))
 	ctx.GRPC.SetLatency("ValidatePricing", 10.0, "")
-	mustFail(ctx, draft, ErrValidationUnavailable, "with pricing slower than the deadline")
+	hMustFail(ctx, hDraft, ErrValidationUnavailable, "with pricing slower than the deadline")
 	ctx.GRPC.SetLatency("ValidatePricing", 0, "")
-	mustMove(ctx, draft, 0, "a deadline is retryable: once pricing answers again the same draft")
+	ctx.GRPC.Fail("ValidatePricing", codes.Unavailable, "pricing is restarting", 1, "")
+	before := len(ctx.GRPC.CallsTo("ValidatePricing", ""))
+	hMustFail(ctx, hDraft, ErrValidationUnavailable, "with pricing UNAVAILABLE")
+	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), before+1, "UNAVAILABLE is reported to the caller, not retried in place; pricing calls")
+	ctx.Assert(hPublished(ctx, "p-1") == nil, "a draft pricing could not validate went live: %v", hPublished(ctx, "p-1"))
+	hMustMove(ctx, hDraft, 0, "a deadline or UNAVAILABLE is retryable and says nothing about the draft: once pricing answers again the same draft")
 }
 
 func CheckHoldBack(ctx *harness.Ctx) {
-	media := client(ctx)
-	mustMove(ctx, draft, 0, "a valid draft")
-	v2 := with(draft, 2, "Kettle, 2 L", "")
+	media := hServe(ctx)
+	hMustMove(ctx, hDraft, 0, "a valid draft")
+	v2 := hWith(hDraft, 2, "Kettle, 2 L", "")
 	media.missing["p-1/thumb"] = true
-	mustFail(ctx, v2, ErrPublishHeld, "with the thumb rendition of version 2 not produced")
-	ctx.Equal(publishedVersion(ctx, "p-1"), 1, "a held version 2 must not move the pointer; the published version")
+	hMustFail(ctx, v2, ErrPublishHeld, "with the thumb rendition of version 2 not produced")
+	ctx.Equal(hPublishedVersion(ctx, "p-1"), 1, "a held version 2 must not move the pointer; the published version")
 	delete(media.missing, "p-1/thumb")
-	mustFail(ctx, with(v2, 2, "", "none"), ErrPricingRejected, "with version 2 priced in a tax class the price list rejects")
-	ctx.Equal(publishedVersion(ctx, "p-1"), 1, "a rejected version 2 must not move the pointer; the published version")
-	mustMove(ctx, v2, 1, "the corrected version 2")
-	ctx.Equal(publishedVersion(ctx, "p-1"), 2, "the published version")
-	ctx.Equal(published(ctx, "p-1")["title"], "Kettle, 2 L", "the published title")
+	hMustFail(ctx, hWith(v2, 2, "", "none"), ErrPricingRejected, "with version 2 priced in a tax class the price list rejects")
+	ctx.Equal(hPublishedVersion(ctx, "p-1"), 1, "a rejected version 2 must not move the pointer; the published version")
+	hMustMove(ctx, v2, 1, "the corrected version 2")
+	ctx.Equal(hPublishedVersion(ctx, "p-1"), 2, "the published version")
+	ctx.Equal(hPublished(ctx, "p-1")["title"], "Kettle, 2 L", "the published title")
 }
 
 func CheckDraftFingerprint(ctx *harness.Ctx) {
-	client(ctx)
-	mustFail(ctx, bad, ErrPricingRejected, "with a tax class the price list rejects")
+	hServe(ctx)
+	hMustFail(ctx, hBad, ErrPricingRejected, "with a tax class the price list rejects")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), 1, "the first attempt makes one pricing call; the calls")
-	mustFail(ctx, bad, ErrPricingRejected, "replaying the rejected draft")
+	hMustFail(ctx, hBad, ErrPricingRejected, "replaying the rejected draft")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), 1, "a replay of the rejected draft must not call pricing again (the rejection is terminal until the draft changes); the calls")
-	lookalike := bad
+	lookalike := hBad
 	lookalike.ProductID = "p-2"
-	mustFail(ctx, lookalike, ErrPricingRejected, "with a look-alike draft of another product")
+	hMustFail(ctx, lookalike, ErrPricingRejected, "with a look-alike draft of another product")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), 2, "a look-alike draft of another product is a different draft: pricing must be asked about it; the calls")
-	ctx.Assert(published(ctx, "p-2") == nil, "the look-alike draft of p-2 must not be published")
-	fixed := with(bad, 2, "", "standard")
-	mustMove(ctx, fixed, 0, "a changed draft of the rejected product")
+	ctx.Assert(hPublished(ctx, "p-2") == nil, "the look-alike draft of p-2 must not be published")
+	fixed := hWith(hBad, 1, "", "standard")
+	hMustMove(ctx, fixed, 0, "the same draft version with its tax class corrected is a changed draft: it must be validated and published")
 	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), 3, "the changed draft must be sent to pricing; the calls")
-	ctx.Equal(publishedVersion(ctx, "p-1"), 2, "the published version")
+	ctx.Equal(hPublished(ctx, "p-1")["tax_class"], "standard", "the published tax class")
+	unpriced := hDraft
+	unpriced.ProductID = "p-3"
+	unpriced.PriceCents = 0
+	hMustFail(ctx, unpriced, ErrPricingRejected, "with a price of 0")
+	priced := unpriced
+	priced.PriceCents = 3499
+	hMustMove(ctx, priced, 0, "a draft whose price changed after a rejection is a changed draft: it must be validated and published")
+	ctx.Equal(len(ctx.GRPC.CallsTo("ValidatePricing", "")), 5, "the draft with its price changed must be sent to pricing; the calls")
 	_ = errors.Is
 }
 `,
@@ -1353,11 +1437,11 @@ func CheckDraftFingerprint(ctx *harness.Ctx) {
 
 namespace {
 
-const store::Row kDraft{"p-1", 1, "draft", "Kettle", 3499, "standard"};
-const store::Row kBad{"p-1", 1, "draft", "Kettle", 3499, "none"};
+const store::Row kHDraft{"p-1", 1, "draft", "Kettle", 3499, "standard"};
+const store::Row kHBad{"p-1", 1, "draft", "Kettle", 3499, "none"};
 
 // Every rendition of every product is ready, except those in missing ("product/rendition").
-class MediaPeer final : public catalog::Media::Service {
+class HMediaPeer final : public catalog::Media::Service {
  public:
   std::set<std::string> missing;
   grpc::Status ValidateRendition(grpc::ServerContext*, const catalog::RenditionRequest* req, catalog::Rendition* out) override {
@@ -1371,7 +1455,7 @@ class MediaPeer final : public catalog::Media::Service {
 };
 
 // The price list has every tax class but none.
-class PricingPeer final : public catalog::Pricing::Service {
+class HPricingPeer final : public catalog::Pricing::Service {
  public:
   grpc::Status ValidatePricing(grpc::ServerContext*, const catalog::PricingRequest* req, catalog::PricingVerdict* out) override {
     if (req->tax_class() == "none" || req->price_cents() <= 0) {
@@ -1382,34 +1466,48 @@ class PricingPeer final : public catalog::Pricing::Service {
   }
 };
 
-struct Peers {
-  MediaPeer media;
-  PricingPeer pricing;
+struct HPeers {
+  HMediaPeer media;
+  HPricingPeer pricing;
 };
 
-MediaPeer& client(harness::Ctx& ctx) {
-  static Peers* peers = nullptr;
+// Every check runs in one process, so whatever the code under test remembers outlives a check: each
+// check works on product ids of its own ("c3/p-1"), and a rejection remembered by an earlier check
+// cannot answer for a later one.
+std::string hRound;
+
+std::string hId(const std::string& product_id) { return hRound + product_id; }
+
+store::Row hRow(store::Row d) {
+  d.product_id = hId(d.product_id);
+  return d;
+}
+
+HMediaPeer& hServe(harness::Ctx& ctx) {
+  static HPeers* peers = nullptr;
+  static int round = 0;
   delete peers;
-  peers = new Peers;
+  peers = new HPeers;
   ctx.GRPC.Server("")->RegisterService(&peers->media);
   ctx.GRPC.Server("")->RegisterService(&peers->pricing);
-  rejected.clear();
+  hRound = "c" + std::to_string(++round) + "/";
   return peers->media;
 }
 
-long publishedVersion(const std::string& product_id) {
-  const auto s = snapshot::readPublished(product_id);
+long hPublishedVersion(const std::string& product_id) {
+  const auto s = snapshot::readPublished(hId(product_id));
   return s ? s->value("version", 0L) : 0L;
 }
 
-store::Row with(store::Row d, long version, const std::string& title, const std::string& tax_class) {
+store::Row hWith(store::Row d, long version, const std::string& title, const std::string& tax_class) {
   d.version = version;
   if (!title.empty()) d.title = title;
   if (!tax_class.empty()) d.tax_class = tax_class;
   return d;
 }
 
-void mustMove(harness::Ctx& ctx, const store::Row& d, long expected, const std::string& why) {
+void hMustMove(harness::Ctx& ctx, const store::Row& row, long expected, const std::string& why) {
+  const store::Row d = hRow(row);
   bool moved = false;
   try {
     moved = validateAndPublish(d.product_id, d, expected);
@@ -1420,7 +1518,8 @@ void mustMove(harness::Ctx& ctx, const store::Row& d, long expected, const std::
 }
 
 template <class E>
-void mustThrow(harness::Ctx& ctx, const store::Row& d, const std::string& expected, const std::string& why) {
+void hMustThrow(harness::Ctx& ctx, const store::Row& row, const std::string& expected, const std::string& why) {
+  const store::Row d = hRow(row);
   bool moved = false;
   try {
     moved = validateAndPublish(d.product_id, d, 0);
@@ -1435,8 +1534,8 @@ void mustThrow(harness::Ctx& ctx, const store::Row& d, const std::string& expect
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  mustMove(ctx, kDraft, 0, "with both services healthy");
+  hServe(ctx);
+  hMustMove(ctx, kHDraft, 0, "with both services healthy");
   for (const std::string method : {"ValidateRendition", "ValidatePricing"}) {
     const auto calls = ctx.GRPC.CallsTo(method);
     ctx.Assert(!calls.empty(), "no %s call was made", method);
@@ -1445,70 +1544,92 @@ void CheckDeadline(harness::Ctx& ctx) {
       ctx.Assert(4.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 5.5, "a %s call carries a %v s deadline, expected kDeadline = 5 s", method, call.TimeoutSeconds());
     }
   }
+  // Each call has its own full deadline: three renditions of 2 s each fit, one budget shared by all of them does not.
+  ctx.GRPC.SetLatency("ValidateRendition", 2.0);
+  size_t before = ctx.GRPC.CallsTo("ValidateRendition").size();
+  hMustMove(ctx, hWith(kHDraft, 2, "", ""), 1, "with every rendition answering in 2 s, inside its own 5 s deadline (every call carries a full kDeadline, not what is left of one shared budget)");
+  const auto calls = ctx.GRPC.CallsTo("ValidateRendition");
+  for (size_t i = before; i < calls.size(); ++i) {
+    ctx.Assert(calls[i].HasDeadline() && 4.5 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 5.5, "a ValidateRendition call made after slower ones carries a %v s deadline: every call carries a full kDeadline = 5 s", calls[i].TimeoutSeconds());
+  }
+  ctx.GRPC.SetLatency("ValidateRendition", 0);
   ctx.GRPC.SetLatency("ValidatePricing", 10.0);
-  const size_t before = ctx.GRPC.CallsTo("ValidatePricing").size();
-  mustThrow<ValidationUnavailable>(ctx, with(kDraft, 2, "", ""), "ValidationUnavailable", "pricing slower than the deadline");
+  before = ctx.GRPC.CallsTo("ValidatePricing").size();
+  hMustThrow<ValidationUnavailable>(ctx, hWith(kHDraft, 3, "", ""), "ValidationUnavailable", "pricing slower than the deadline");
   ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), before + 1, "a deadline is reported to the caller, not retried in place; pricing calls");
-  ctx.Equal(publishedVersion("p-1"), 1, "a publish that timed out on pricing must leave the pointer; the published version");
+  ctx.Equal(hPublishedVersion("p-1"), 2, "a publish that timed out on pricing must leave the pointer; the published version");
 }
 
 void CheckRenditionsRequired(harness::Ctx& ctx) {
-  MediaPeer& media = client(ctx);
-  media.missing.insert("p-1/card");
-  mustThrow<PublishHeld>(ctx, kDraft, "PublishHeld", "with the card rendition not produced");
+  HMediaPeer& media = hServe(ctx);
+  media.missing.insert(hId("p-1") + "/card");
+  hMustThrow<PublishHeld>(ctx, kHDraft, "PublishHeld", "with the card rendition not produced");
   std::set<std::string> asked;
   for (const auto& c : ctx.GRPC.CallsTo("ValidateRendition")) asked.insert(c.Request<catalog::RenditionRequest>().rendition());
   std::vector<std::string> want(kRenditions.begin(), kRenditions.end());
   std::sort(want.begin(), want.end());
   ctx.Equal(std::vector<std::string>(asked.begin(), asked.end()), want, "the media service must be asked for every rendition in kRenditions; asked");
-  ctx.Equal(publishedVersion("p-1"), 0, "a version missing its card rendition went live; the published version");
+  ctx.Equal(hPublishedVersion("p-1"), 0, "a version missing its card rendition went live; the published version");
   media.missing.clear();
-  mustMove(ctx, kDraft, 0, "once every rendition is produced");
-  ctx.Equal(publishedVersion("p-1"), 1, "the published version");
+  hMustMove(ctx, kHDraft, 0, "once every rendition is produced");
+  ctx.Equal(hPublishedVersion("p-1"), 1, "the published version");
 }
 
 void CheckPricingTerminal(harness::Ctx& ctx) {
-  client(ctx);
-  mustThrow<PricingRejected>(ctx, kBad, "PricingRejected", "with a tax class the price list rejects");
+  hServe(ctx);
+  hMustThrow<PricingRejected>(ctx, kHBad, "PricingRejected", "with a tax class the price list rejects");
   ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), 1, "a rejection is terminal, not retried; the pricing calls for one rejected draft");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a rejection must not be slept on and retried; the sleeps");
-  ctx.Equal(publishedVersion("p-1"), 0, "a draft pricing rejected went live; the published version");
+  ctx.Equal(hPublishedVersion("p-1"), 0, "a draft pricing rejected went live; the published version");
   ctx.GRPC.SetLatency("ValidatePricing", 10.0);
-  mustThrow<ValidationUnavailable>(ctx, kDraft, "ValidationUnavailable", "with pricing slower than the deadline");
+  hMustThrow<ValidationUnavailable>(ctx, kHDraft, "ValidationUnavailable", "with pricing slower than the deadline");
   ctx.GRPC.SetLatency("ValidatePricing", 0);
-  mustMove(ctx, kDraft, 0, "a deadline is retryable: once pricing answers again the same draft");
+  ctx.GRPC.Fail("ValidatePricing", grpc::StatusCode::UNAVAILABLE, "pricing is restarting");
+  const size_t before = ctx.GRPC.CallsTo("ValidatePricing").size();
+  hMustThrow<ValidationUnavailable>(ctx, kHDraft, "ValidationUnavailable", "with pricing UNAVAILABLE");
+  ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), before + 1, "UNAVAILABLE is reported to the caller, not retried in place; pricing calls");
+  ctx.Equal(hPublishedVersion("p-1"), 0, "a draft pricing could not validate went live; the published version");
+  hMustMove(ctx, kHDraft, 0, "a deadline or UNAVAILABLE is retryable and says nothing about the draft: once pricing answers again the same draft");
 }
 
 void CheckHoldBack(harness::Ctx& ctx) {
-  MediaPeer& media = client(ctx);
-  mustMove(ctx, kDraft, 0, "a valid draft");
-  const store::Row v2 = with(kDraft, 2, "Kettle, 2 L", "");
-  media.missing.insert("p-1/thumb");
-  mustThrow<PublishHeld>(ctx, v2, "PublishHeld", "with the thumb rendition of version 2 not produced");
-  ctx.Equal(publishedVersion("p-1"), 1, "a held version 2 must not move the pointer; the published version");
+  HMediaPeer& media = hServe(ctx);
+  hMustMove(ctx, kHDraft, 0, "a valid draft");
+  const store::Row v2 = hWith(kHDraft, 2, "Kettle, 2 L", "");
+  media.missing.insert(hId("p-1") + "/thumb");
+  hMustThrow<PublishHeld>(ctx, v2, "PublishHeld", "with the thumb rendition of version 2 not produced");
+  ctx.Equal(hPublishedVersion("p-1"), 1, "a held version 2 must not move the pointer; the published version");
   media.missing.clear();
-  mustThrow<PricingRejected>(ctx, with(v2, 2, "", "none"), "PricingRejected", "with version 2 priced in a tax class the price list rejects");
-  ctx.Equal(publishedVersion("p-1"), 1, "a rejected version 2 must not move the pointer; the published version");
-  mustMove(ctx, v2, 1, "the corrected version 2");
-  ctx.Equal(publishedVersion("p-1"), 2, "the published version");
-  ctx.Equal(snapshot::readPublished("p-1")->value("title", ""), "Kettle, 2 L", "the published title");
+  hMustThrow<PricingRejected>(ctx, hWith(v2, 2, "", "none"), "PricingRejected", "with version 2 priced in a tax class the price list rejects");
+  ctx.Equal(hPublishedVersion("p-1"), 1, "a rejected version 2 must not move the pointer; the published version");
+  hMustMove(ctx, v2, 1, "the corrected version 2");
+  ctx.Equal(hPublishedVersion("p-1"), 2, "the published version");
+  ctx.Equal(snapshot::readPublished(hId("p-1"))->value("title", ""), "Kettle, 2 L", "the published title");
 }
 
 void CheckDraftFingerprint(harness::Ctx& ctx) {
-  client(ctx);
-  mustThrow<PricingRejected>(ctx, kBad, "PricingRejected", "with a tax class the price list rejects");
+  hServe(ctx);
+  hMustThrow<PricingRejected>(ctx, kHBad, "PricingRejected", "with a tax class the price list rejects");
   ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), 1, "the first attempt makes one pricing call; the calls");
-  mustThrow<PricingRejected>(ctx, kBad, "PricingRejected", "replaying the rejected draft");
+  hMustThrow<PricingRejected>(ctx, kHBad, "PricingRejected", "replaying the rejected draft");
   ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), 1, "a replay of the rejected draft must not call pricing again (the rejection is terminal until the draft changes); the calls");
-  store::Row lookalike = kBad;
+  store::Row lookalike = kHBad;
   lookalike.product_id = "p-2";
-  mustThrow<PricingRejected>(ctx, lookalike, "PricingRejected", "with a look-alike draft of another product");
+  hMustThrow<PricingRejected>(ctx, lookalike, "PricingRejected", "with a look-alike draft of another product");
   ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), 2, "a look-alike draft of another product is a different draft: pricing must be asked about it; the calls");
-  ctx.Equal(publishedVersion("p-2"), 0, "the look-alike draft of p-2 must not be published; its published version");
-  const store::Row fixed = with(kBad, 2, "", "standard");
-  mustMove(ctx, fixed, 0, "a changed draft of the rejected product");
+  ctx.Equal(hPublishedVersion("p-2"), 0, "the look-alike draft of p-2 must not be published; its published version");
+  const store::Row fixed = hWith(kHBad, 1, "", "standard");
+  hMustMove(ctx, fixed, 0, "the same draft version with its tax class corrected is a changed draft: it must be validated and published");
   ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), 3, "the changed draft must be sent to pricing; the calls");
-  ctx.Equal(publishedVersion("p-1"), 2, "the published version");
+  ctx.Equal(snapshot::readPublished(hId("p-1"))->value("tax_class", ""), "standard", "the published tax class");
+  store::Row unpriced = kHDraft;
+  unpriced.product_id = "p-3";
+  unpriced.price_cents = 0;
+  hMustThrow<PricingRejected>(ctx, unpriced, "PricingRejected", "with a price of 0");
+  store::Row priced = unpriced;
+  priced.price_cents = 3499;
+  hMustMove(ctx, priced, 0, "a draft whose price changed after a rejection is a changed draft: it must be validated and published");
+  ctx.Equal(ctx.GRPC.CallsTo("ValidatePricing").size(), 5, "the draft with its price changed must be sent to pricing; the calls");
 }
 `,
   },

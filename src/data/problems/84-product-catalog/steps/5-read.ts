@@ -18,8 +18,9 @@ keeps a rolled-back version for ten minutes; and nothing in the response says wh
 so the CDN cannot tell two versions apart.
 
 - \`published_view(product_id)\` reads the published snapshot (\`read_published\`, step 2, provided as
-  \`catalog.snapshot\`); \`draft_view(product_id)\` reads the draft row (\`store.draft_of\`). The default
-  read is the published view; a missing published version is **404**.
+  \`catalog.snapshot\`), the version the pointer names even after a rollback moved it back;
+  \`draft_view(product_id)\` reads the draft row (\`store.draft_of\`). The default read is the
+  published view; a missing published version is **404**.
 - The draft is served only with \`?scope=draft\` (\`PREVIEW_SCOPE\`), with \`Cache-Control: private,
   max-age=0\`.
 - The storefront read answers \`Cache-Control: public, max-age=30\` (\`MAX_AGE_S\`), so the CDN shares
@@ -69,7 +70,7 @@ so the CDN cannot tell two versions apart.
       id: 'published-only',
       title: 'Storefront reads resolve the published version',
       detail:
-        'The default read goes through `published_view`/`publishedView`, which reads the published snapshot, and the draft only through `draft_view`/`draftView`; nothing serves the latest row whatever its status.',
+        'The default read goes through `published_view`/`publishedView`, which reads the published snapshot the pointer names (after a rollback moves the pointer back, that older version), and the draft only through `draft_view`/`draftView`; nothing serves the latest row whatever its status.',
       match: {
         python: {
           all: [/def published_view/, /def draft_view/, /read_published\(/, /store\.draft_of\(/],
@@ -120,7 +121,7 @@ so the CDN cannot tell two versions apart.
       id: 'max-age',
       title: 'A shared, short max-age for the storefront',
       detail:
-        'The storefront read answers `Cache-Control: public, max-age=30` (`MAX_AGE_S`): `public` lets the CDN share it, 30 seconds bounds how long a rollback stays invisible. `private` would defeat the CDN; 600 would keep a rolled-back product for ten minutes.',
+        'The storefront read answers `Cache-Control: public, max-age=30` (`MAX_AGE_S`), with no `s-maxage` longer than that: `public` lets the CDN share it, 30 seconds bounds how long a rollback stays invisible. `private` would defeat the CDN; 600 would keep a rolled-back product for ten minutes.',
       match: {
         python: {
           all: [/MAX_AGE_S\s*=\s*30\b/, /public, max-age=/],
@@ -525,6 +526,12 @@ def _publish_v2(product_id):
     publish_snapshot(product_id, 2, {name: v2[name] for name in SNAPSHOT_FIELDS}, 1)
 
 
+def _roll_back_to_v1(product_id):
+    """The pointer moves back to version 1; the versions store still names version 2 as published."""
+    v1 = store.version(product_id, 1)
+    publish_snapshot(product_id, 1, {name: v1[name] for name in SNAPSHOT_FIELDS}, 2)
+
+
 def _directives(r):
     return {d.strip() for d in r.headers.get("cache-control", "").split(",") if d.strip()}
 
@@ -546,7 +553,11 @@ async def check_published_only(ctx):
         assert body.get("version") == 1 and body.get("title") == "Kettle", f"the storefront got {body}: version 2 is a draft a merchandiser is still typing. Serve the published snapshot"
         fresh = store.create("Toaster")["product_id"]
         r = await c.get(f"/v1/products/{fresh}")
-    assert r.status_code == 404, f"a product with no published version answered {r.status_code} {r.text}, expected 404"
+        assert r.status_code == 404, f"a product with no published version answered {r.status_code} {r.text}, expected 404"
+        _publish_v2(product_id)
+        _roll_back_to_v1(product_id)
+        r = await c.get(f"/v1/products/{product_id}")
+    assert r.status_code == 200 and r.json().get("version") == 1 and r.json().get("title") == "Kettle", f"after a rollback moved the published pointer back to version 1 the storefront got {r.status_code} {r.text}: the published view is the snapshot the pointer names"
 
 
 async def check_cache_version(ctx):
@@ -579,6 +590,8 @@ async def check_max_age(ctx):
     directives = _directives(r)
     assert "private" not in directives, f"the storefront answered Cache-Control {r.headers.get('cache-control')!r}: private forbids the CDN to share it"
     assert "public" in directives and "max-age=30" in directives, f"the storefront answered Cache-Control {r.headers.get('cache-control')!r}, expected public, max-age=30 so a rollback reaches shoppers within 30 s"
+    shared = [d for d in directives if d.startswith("s-maxage=")]
+    assert all(d.split("=", 1)[1].strip().isdigit() and int(d.split("=", 1)[1]) <= 30 for d in shared), f"the storefront answered Cache-Control {r.headers.get('cache-control')!r}: s-maxage overrides max-age for the CDN, so a rollback would wait it out"
 `,
     typescript: `const SNAPSHOT_FIELDS = ['product_id', 'version', 'title', 'price_cents', 'tax_class'];
 
@@ -594,7 +607,9 @@ async function catalog(ctx) {
   await publishSnapshot(productId, 1, snapshotOf(await store.promote(productId, 1)), null);
   await store.writeDraft(productId, {title: 'Kettle, 2 L'});
   const publishV2 = async () => publishSnapshot(productId, 2, snapshotOf(await store.promote(productId, 2)), 1);
-  return {c: ctx.client(m.app), store, productId, publishV2};
+  // The pointer moves back to version 1; the versions store still names version 2 as published.
+  const rollBackToV1 = async () => publishSnapshot(productId, 1, snapshotOf(await store.version(productId, 1)), 2);
+  return {c: ctx.client(m.app), store, productId, publishV2, rollBackToV1};
 }
 
 const directives = r => new Set((r.headers['cache-control'] ?? '').split(',').map(d => d.trim()).filter(d => d !== ''));
@@ -607,7 +622,7 @@ export async function check_route(ctx) {
 }
 
 export async function check_published_only(ctx) {
-  const {c, store, productId} = await catalog(ctx);
+  const {c, store, productId, publishV2, rollBackToV1} = await catalog(ctx);
   let r = await c.get(\`/v1/products/\${productId}\`);
   assert.equal(r.status, 200, \`GET /v1/products/\${productId} answered \${r.status}: \${r.text}\`);
   const body = r.json();
@@ -615,6 +630,10 @@ export async function check_published_only(ctx) {
   const {product_id: fresh} = await store.create('Toaster');
   r = await c.get(\`/v1/products/\${fresh}\`);
   assert.equal(r.status, 404, \`a product with no published version answered \${r.status} \${r.text}, expected 404\`);
+  await publishV2();
+  await rollBackToV1();
+  r = await c.get(\`/v1/products/\${productId}\`);
+  assert(r.status === 200 && r.json().version === 1 && r.json().title === 'Kettle', \`after a rollback moved the published pointer back to version 1 the storefront got \${r.status} \${r.text}: the published view is the snapshot the pointer names\`);
 }
 
 export async function check_cache_version(ctx) {
@@ -644,6 +663,8 @@ export async function check_max_age(ctx) {
   const d = directives(r);
   assert(!d.has('private'), \`the storefront answered Cache-Control \${JSON.stringify(r.headers['cache-control'])}: private forbids the CDN to share it\`);
   assert(d.has('public') && d.has('max-age=30'), \`the storefront answered Cache-Control \${JSON.stringify(r.headers['cache-control'])}, expected public, max-age=30 so a rollback reaches shoppers within 30 s\`);
+  const shared = [...d].filter(x => x.startsWith('s-maxage='));
+  assert(shared.every(x => /^s-maxage=\\d+$/.test(x) && Number(x.slice('s-maxage='.length)) <= 30), \`the storefront answered Cache-Control \${JSON.stringify(r.headers['cache-control'])}: s-maxage overrides max-age for the CDN, so a rollback would wait it out\`);
 }
 `,
     go: `package main
@@ -651,6 +672,7 @@ export async function check_max_age(ctx) {
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"catalog/snapshot"
@@ -659,28 +681,33 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func snapshotOf(row *store.Row) map[string]any {
+func hSnapshotOf(row *store.Row) map[string]any {
 	return map[string]any{"product_id": row.ProductID, "version": row.Version, "title": row.Title, "price_cents": row.PriceCents, "tax_class": row.TaxClass}
 }
 
-// catalog is a product with version 1 published and version 2 as a draft with a new title.
-func catalog(ctx *harness.Ctx) (*harness.HTTP, string) {
+// hCatalog is a product with version 1 published and version 2 as a draft with a new title.
+func hCatalog(ctx *harness.Ctx) (*harness.HTTP, string) {
 	mux := http.NewServeMux()
 	register(mux)
-	productID := store.Create(readBg, "Kettle").ProductID
-	store.WriteDraft(readBg, productID, store.Fields{"price_cents": 3499, "tax_class": "standard"})
-	snapshot.PublishSnapshot(readBg, productID, 1, snapshotOf(store.Promote(readBg, productID, 1)), 0)
-	store.WriteDraft(readBg, productID, store.Fields{"title": "Kettle, 2 L"})
+	productID := store.Create(hReadBg, "Kettle").ProductID
+	store.WriteDraft(hReadBg, productID, store.Fields{"price_cents": 3499, "tax_class": "standard"})
+	snapshot.PublishSnapshot(hReadBg, productID, 1, hSnapshotOf(store.Promote(hReadBg, productID, 1)), 0)
+	store.WriteDraft(hReadBg, productID, store.Fields{"title": "Kettle, 2 L"})
 	return ctx.HTTP(mux), productID
 }
 
-func publishV2(productID string) {
-	snapshot.PublishSnapshot(readBg, productID, 2, snapshotOf(store.Promote(readBg, productID, 2)), 1)
+func hPublishV2(productID string) {
+	snapshot.PublishSnapshot(hReadBg, productID, 2, hSnapshotOf(store.Promote(hReadBg, productID, 2)), 1)
 }
 
-func directives(r *harness.Response) map[string]bool {
+// hRollBackToV1 moves the pointer back to version 1; the versions store still names version 2 as published.
+func hRollBackToV1(productID string) {
+	snapshot.PublishSnapshot(hReadBg, productID, 1, hSnapshotOf(store.Version(hReadBg, productID, 1)), 2)
+}
+
+func hDirectives(r *harness.Response) map[string]bool {
 	out := map[string]bool{}
 	for _, d := range strings.Split(r.Header.Get("Cache-Control"), ",") {
 		if d = strings.TrimSpace(d); d != "" {
@@ -690,58 +717,68 @@ func directives(r *harness.Response) map[string]bool {
 	return out
 }
 
-func body(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	m, _ := r.JSON().(map[string]any)
 	ctx.Assert(m != nil, "the response body is not a JSON object: %s", r.Text())
 	return m
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, productID := catalog(ctx)
+	c, productID := hCatalog(ctx)
 	r := c.Get("/v1/products/" + productID)
 	ctx.Equal(r.Status, 200, "GET /v1/products/%s (%s)", productID, r.Text())
 	ctx.Assert(r.Header.Get("Cache-Control") != "" && r.Header.Get("ETag") != "", "the response carries no Cache-Control / ETag: %v", r.Header)
 }
 
 func CheckPublishedOnly(ctx *harness.Ctx) {
-	c, productID := catalog(ctx)
+	c, productID := hCatalog(ctx)
 	r := c.Get("/v1/products/" + productID)
 	ctx.Equal(r.Status, 200, "GET /v1/products/%s (%s)", productID, r.Text())
-	b := body(ctx, r)
+	b := hBody(ctx, r)
 	ctx.Assert(b["version"] == float64(1) && b["title"] == "Kettle", "the storefront got %s: version 2 is a draft a merchandiser is still typing. Serve the published snapshot", r.Text())
-	fresh := store.Create(readBg, "Toaster").ProductID
+	fresh := store.Create(hReadBg, "Toaster").ProductID
 	r = c.Get("/v1/products/" + fresh)
 	ctx.Equal(r.Status, 404, "a product with no published version (%s)", r.Text())
+	hPublishV2(productID)
+	hRollBackToV1(productID)
+	r = c.Get("/v1/products/" + productID)
+	ctx.Assert(r.Status == 200 && hBody(ctx, r)["version"] == float64(1) && hBody(ctx, r)["title"] == "Kettle", "after a rollback moved the published pointer back to version 1 the storefront got %d %s: the published view is the snapshot the pointer names", r.Status, r.Text())
 }
 
 func CheckCacheVersion(ctx *harness.Ctx) {
-	c, productID := catalog(ctx)
+	c, productID := hCatalog(ctx)
 	r := c.Get("/v1/products/" + productID)
 	ctx.Equal(r.Header.Get("ETag"), \`"1"\`, "ETag must be the published version in quotes")
 	ctx.Equal(r.Header.Get("X-Catalog-Version"), "1", "X-Catalog-Version")
-	publishV2(productID)
+	hPublishV2(productID)
 	r = c.Get("/v1/products/" + productID)
 	ctx.Assert(r.Header.Get("ETag") == \`"2"\` && r.Header.Get("X-Catalog-Version") == "2", "after publishing version 2 the headers still say ETag %q, X-Catalog-Version %q: the CDN cannot tell the versions apart", r.Header.Get("ETag"), r.Header.Get("X-Catalog-Version"))
 }
 
 func CheckPreviewScope(ctx *harness.Ctx) {
-	c, productID := catalog(ctx)
+	c, productID := hCatalog(ctx)
 	preview := c.Get("/v1/products/" + productID + "?scope=draft")
 	ctx.Equal(preview.Status, 200, "the preview (%s)", preview.Text())
-	b := body(ctx, preview)
+	b := hBody(ctx, preview)
 	ctx.Assert(b["version"] == float64(2) && b["title"] == "Kettle, 2 L", "?scope=draft must answer the draft (version 2), got %s", preview.Text())
-	d := directives(preview)
+	d := hDirectives(preview)
 	ctx.Assert(d["private"] && d["max-age=0"], "a preview answered Cache-Control %q: a draft must not sit in a shared cache (private, max-age=0)", preview.Header.Get("Cache-Control"))
 	other := c.Get("/v1/products/" + productID + "?scope=latest")
-	ctx.Assert(other.Status == 200 && body(ctx, other)["version"] == float64(1), "a scope other than draft answered %d %s: only scope=draft reaches the draft", other.Status, other.Text())
+	ctx.Assert(other.Status == 200 && hBody(ctx, other)["version"] == float64(1), "a scope other than draft answered %d %s: only scope=draft reaches the draft", other.Status, other.Text())
 }
 
 func CheckMaxAge(ctx *harness.Ctx) {
-	c, productID := catalog(ctx)
+	c, productID := hCatalog(ctx)
 	r := c.Get("/v1/products/" + productID)
-	d := directives(r)
+	d := hDirectives(r)
 	ctx.Assert(!d["private"], "the storefront answered Cache-Control %q: private forbids the CDN to share it", r.Header.Get("Cache-Control"))
 	ctx.Assert(d["public"] && d["max-age=30"], "the storefront answered Cache-Control %q, expected public, max-age=30 so a rollback reaches shoppers within 30 s", r.Header.Get("Cache-Control"))
+	for directive := range d {
+		if strings.HasPrefix(directive, "s-maxage=") {
+			seconds, err := strconv.Atoi(strings.TrimPrefix(directive, "s-maxage="))
+			ctx.Assert(err == nil && seconds <= 30, "the storefront answered Cache-Control %q: s-maxage overrides max-age for the CDN, so a rollback would wait it out", r.Header.Get("Cache-Control"))
+		}
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -756,33 +793,38 @@ using json = nlohmann::json;
 
 namespace {
 
-json snapshotOf(const store::Row& row) {
+json hSnapshotOf(const store::Row& row) {
   return json{{"product_id", row.product_id}, {"version", row.version}, {"title", row.title}, {"price_cents", row.price_cents}, {"tax_class", row.tax_class}};
 }
 
-struct Catalog {
+struct HCatalog {
   harness::HTTP c;
   std::string product_id;
 };
 
 // A product with version 1 published and version 2 as a draft with a new title.
-Catalog catalog(harness::Ctx& ctx) {
+HCatalog hCatalog(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
   register_routes(*svr);
   const std::string product_id = store::create("Kettle").product_id;
   store::writeDraft(product_id, json{{"price_cents", 3499}, {"tax_class", "standard"}});
-  snapshot::publishSnapshot(product_id, 1, snapshotOf(store::promote(product_id, 1)), 0);
+  snapshot::publishSnapshot(product_id, 1, hSnapshotOf(store::promote(product_id, 1)), 0);
   store::writeDraft(product_id, json{{"title", "Kettle, 2 L"}});
   return {ctx.HTTP(*svr), product_id};
 }
 
-void publishV2(const std::string& product_id) {
-  snapshot::publishSnapshot(product_id, 2, snapshotOf(store::promote(product_id, 2)), 1);
+void hPublishV2(const std::string& product_id) {
+  snapshot::publishSnapshot(product_id, 2, hSnapshotOf(store::promote(product_id, 2)), 1);
 }
 
-std::set<std::string> directives(const harness::Response& r) {
+// The pointer moves back to version 1; the versions store still names version 2 as published.
+void hRollBackToV1(const std::string& product_id) {
+  snapshot::publishSnapshot(product_id, 1, hSnapshotOf(*store::version(product_id, 1)), 2);
+}
+
+std::set<std::string> hDirectives(const harness::Response& r) {
   std::set<std::string> out;
   std::stringstream in(r.HeaderValue("Cache-Control"));
   std::string d;
@@ -797,14 +839,14 @@ std::set<std::string> directives(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto [c, product_id] = catalog(ctx);
+  auto [c, product_id] = hCatalog(ctx);
   const auto r = c.Get("/v1/products/" + product_id);
   ctx.Equal(r.Status, 200, "GET /v1/products/%s (%s)", product_id, r.Text());
   ctx.Assert(!r.HeaderValue("Cache-Control").empty() && !r.HeaderValue("ETag").empty(), "the response carries no Cache-Control / ETag");
 }
 
 void CheckPublishedOnly(harness::Ctx& ctx) {
-  auto [c, product_id] = catalog(ctx);
+  auto [c, product_id] = hCatalog(ctx);
   auto r = c.Get("/v1/products/" + product_id);
   ctx.Equal(r.Status, 200, "GET /v1/products/%s (%s)", product_id, r.Text());
   const json body = json::parse(r.Text());
@@ -812,36 +854,48 @@ void CheckPublishedOnly(harness::Ctx& ctx) {
   const std::string fresh = store::create("Toaster").product_id;
   r = c.Get("/v1/products/" + fresh);
   ctx.Equal(r.Status, 404, "a product with no published version (%s)", r.Text());
+  hPublishV2(product_id);
+  hRollBackToV1(product_id);
+  r = c.Get("/v1/products/" + product_id);
+  const json rolled = r.Status == 200 ? json::parse(r.Text()) : json::object();
+  ctx.Assert(r.Status == 200 && rolled.value("version", 0L) == 1 && rolled.value("title", "") == "Kettle", "after a rollback moved the published pointer back to version 1 the storefront got %d %s: the published view is the snapshot the pointer names", r.Status, r.Text());
 }
 
 void CheckCacheVersion(harness::Ctx& ctx) {
-  auto [c, product_id] = catalog(ctx);
+  auto [c, product_id] = hCatalog(ctx);
   auto r = c.Get("/v1/products/" + product_id);
   ctx.Equal(r.HeaderValue("ETag"), "\\"1\\"", "ETag must be the published version in quotes");
   ctx.Equal(r.HeaderValue("X-Catalog-Version"), "1", "X-Catalog-Version");
-  publishV2(product_id);
+  hPublishV2(product_id);
   r = c.Get("/v1/products/" + product_id);
   ctx.Assert(r.HeaderValue("ETag") == "\\"2\\"" && r.HeaderValue("X-Catalog-Version") == "2", "after publishing version 2 the headers still say ETag %q, X-Catalog-Version %q: the CDN cannot tell the versions apart", r.HeaderValue("ETag"), r.HeaderValue("X-Catalog-Version"));
 }
 
 void CheckPreviewScope(harness::Ctx& ctx) {
-  auto [c, product_id] = catalog(ctx);
+  auto [c, product_id] = hCatalog(ctx);
   const auto preview = c.Get("/v1/products/" + product_id + "?scope=draft");
   ctx.Equal(preview.Status, 200, "the preview (%s)", preview.Text());
   const json body = json::parse(preview.Text());
   ctx.Assert(body.value("version", 0L) == 2 && body.value("title", "") == "Kettle, 2 L", "?scope=draft must answer the draft (version 2), got %s", preview.Text());
-  const auto d = directives(preview);
+  const auto d = hDirectives(preview);
   ctx.Assert(d.count("private") && d.count("max-age=0"), "a preview answered Cache-Control %q: a draft must not sit in a shared cache (private, max-age=0)", preview.HeaderValue("Cache-Control"));
   const auto other = c.Get("/v1/products/" + product_id + "?scope=latest");
   ctx.Assert(other.Status == 200 && json::parse(other.Text()).value("version", 0L) == 1, "a scope other than draft answered %d %s: only scope=draft reaches the draft", other.Status, other.Text());
 }
 
 void CheckMaxAge(harness::Ctx& ctx) {
-  auto [c, product_id] = catalog(ctx);
+  auto [c, product_id] = hCatalog(ctx);
   const auto r = c.Get("/v1/products/" + product_id);
-  const auto d = directives(r);
+  const auto d = hDirectives(r);
   ctx.Assert(!d.count("private"), "the storefront answered Cache-Control %q: private forbids the CDN to share it", r.HeaderValue("Cache-Control"));
   ctx.Assert(d.count("public") && d.count("max-age=30"), "the storefront answered Cache-Control %q, expected public, max-age=30 so a rollback reaches shoppers within 30 s", r.HeaderValue("Cache-Control"));
+  const std::string prefix = "s-maxage=";
+  for (const auto& directive : d) {
+    if (directive.rfind(prefix, 0) != 0) continue;
+    const std::string value = directive.substr(prefix.size());
+    const bool digits = !value.empty() && value.find_first_not_of("0123456789") == std::string::npos;
+    ctx.Assert(digits && value.size() < 6 && std::stol(value) <= 30, "the storefront answered Cache-Control %q: s-maxage overrides max-age for the CDN, so a rollback would wait it out", r.HeaderValue("Cache-Control"));
+  }
 }
 `,
   },

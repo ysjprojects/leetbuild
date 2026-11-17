@@ -23,11 +23,11 @@ refuses every time costs three round trips and still ends approved.
 service Model { rpc Score(ScoreRequest) returns (ScoreReply); }  // INVALID_ARGUMENT: refused vector
 \`\`\`
 
-- Every attempt carries a **300 ms** deadline (\`DEADLINE_S\`).
+- Every attempt, a retry included, carries its own full **300 ms** deadline (\`DEADLINE_S\`).
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` (\`RETRYABLE\`) are retried; \`INVALID_ARGUMENT\` raises
   \`InvalidFeatures\` at once.
-- When the attempts run out, answer the rules verdict: \`rules_score(features)\` from
-  \`fraud.features\`, \`fallback: True\`, \`model_version: RULES_VERSION\`.
+- When the attempts run out, or the model answers any other error, answer the rules verdict:
+  \`rules_score(features)\` from \`fraud.features\`, \`fallback: True\`, \`model_version: RULES_VERSION\`.
 - A fallback score is raised to at least \`RULES_MIN_SCORE\` (0.45): a degraded decision lands in
   review or decline, never in approve.`,
   sequence: {
@@ -46,7 +46,7 @@ service Model { rpc Score(ScoreRequest) returns (ScoreReply); }  // INVALID_ARGU
       id: 'deadline',
       title: 'Every attempt carries a 300 ms deadline',
       detail:
-        'Each `Score` call is made with `DEADLINE_S` (300 ms), so a stalled model costs at most three short attempts before the rules answer; the starter passes no deadline.',
+        'Each `Score` call is made with its own full `DEADLINE_S` (300 ms), retries included, and a timed-out attempt is retried, so a stalled model costs three short attempts before the rules answer; the starter passes no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0?\.3\b/, /Score\([^)\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*300\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -59,7 +59,7 @@ service Model { rpc Score(ScoreRequest) returns (ScoreReply); }  // INVALID_ARGU
       id: 'retry-policy',
       title: 'Retries UNAVAILABLE, stops at INVALID_ARGUMENT',
       detail:
-        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; `INVALID_ARGUMENT` raises `InvalidFeatures` after one call, because every attempt would be refused the same way. The starter retries whatever fails.',
+        'Only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; `INVALID_ARGUMENT` raises `InvalidFeatures` after one call, because every attempt would be refused the same way, and any other error (`INTERNAL`, `PERMISSION_DENIED`, `UNIMPLEMENTED`) ends the attempts after one call with the rules verdict. The starter retries whatever fails.',
       match: {
         python: {all: [/RETRYABLE/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /INVALID_ARGUMENT/, /raise InvalidFeatures/]},
         typescript: {
@@ -564,6 +564,10 @@ def check_deadline(ctx):
     waited = ctx.clock.time() - started
     assert waited <= 1.0, f"with the model stalled for 5 s one score took {waited:.2f} s: three attempts of 300 ms must end within 1 s"
     assert verdict.get("fallback") is True, f"a model that never answers in time must end in the rules verdict, got {verdict}"
+    stalled = ctx.grpc.calls_to("Score")[1:]
+    assert len(stalled) == 3, f"a model that never answers in time was asked {len(stalled)} time(s): DEADLINE_EXCEEDED is retryable, so a stall costs MAX_ATTEMPTS (3) attempts"
+    timeouts = [call.timeout for call in stalled]
+    assert all(t is not None and 0.25 <= t <= 0.35 for t in timeouts), f"the three attempts against a stalled model carried deadlines {timeouts} s: each attempt carries its own full DEADLINE_S (0.3 s), not what is left of the first one's"
 
 
 def check_retry_policy(ctx):
@@ -580,6 +584,16 @@ def check_retry_policy(ctx):
     assert got is None, f"the model refuses a vector at fx-2 with INVALID_ARGUMENT, and score_transaction answered {got}: raise InvalidFeatures"
     calls = len(ctx.grpc.calls_to("Score")) - 3
     assert calls == 1, f"a refused vector was sent {calls} times: INVALID_ARGUMENT is terminal, every attempt is refused the same way"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNIMPLEMENTED):
+        before = len(ctx.grpc.calls_to("Score"))
+        ctx.grpc.fail("Score", code)
+        try:
+            verdict = m.score_transaction(ESTABLISHED)
+        except Exception as exc:
+            raise AssertionError(f"the model answered {code.name} once and score_transaction raised {exc!r}: an error that is not retryable ends the attempts with the rules verdict") from exc
+        calls = len(ctx.grpc.calls_to("Score")) - before
+        assert calls == 1, f"the model answered {code.name} and was asked {calls} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert verdict.get("fallback") is True and verdict.get("model_version") == RULES_VERSION, f"the model answered {code.name}, and the verdict was {verdict}: an error that is not retryable ends the attempts with the rules verdict"
 
 
 def check_rules_fallback(ctx):
@@ -622,6 +636,10 @@ export async function check_deadline(ctx) {
   const waited = (ctx.clock.now() - started) / 1000;
   assert(waited <= 1.0, \`with the model stalled for 5 s one score took \${waited} s: three attempts of 300 ms must end within 1 s\`);
   assert.equal(verdict.fallback, true, \`a model that never answers in time must end in the rules verdict, got \${JSON.stringify(verdict)}\`);
+  const stalled = ctx.grpc.callsTo('Score').slice(1);
+  assert.equal(stalled.length, 3, \`a model that never answers in time was asked \${stalled.length} time(s): DEADLINE_EXCEEDED is retryable, so a stall costs MAX_ATTEMPTS (3) attempts\`);
+  const timeouts = stalled.map(call => call.timeout);
+  assert(timeouts.every(t => t !== null && 0.25 <= t && t <= 0.35), \`the three attempts against a stalled model carried deadlines \${JSON.stringify(timeouts)} s: each attempt carries its own full DEADLINE_MS (300 ms), not what is left of the first one's\`);
 }
 
 export async function check_retry_policy(ctx) {
@@ -639,6 +657,19 @@ export async function check_retry_policy(ctx) {
   assert.equal(got, null, \`the model refuses a vector at fx-2 with INVALID_ARGUMENT, and scoreTransaction answered \${JSON.stringify(got)}: throw InvalidFeatures\`);
   calls = ctx.grpc.callsTo('Score').length - 3;
   assert.equal(calls, 1, \`a refused vector was sent \${calls} times: INVALID_ARGUMENT is terminal, every attempt is refused the same way\`);
+  for (const code of ['INTERNAL', 'PERMISSION_DENIED', 'UNIMPLEMENTED']) {
+    const before = ctx.grpc.callsTo('Score').length;
+    ctx.grpc.fail('Score', ctx.grpc.status[code]);
+    let answered;
+    try {
+      answered = await m.scoreTransaction(ESTABLISHED);
+    } catch (e) {
+      assert.fail(\`the model answered \${code} once and scoreTransaction threw \${(e as Error).message}: an error that is not retryable ends the attempts with the rules verdict\`);
+    }
+    calls = ctx.grpc.callsTo('Score').length - before;
+    assert.equal(calls, 1, \`the model answered \${code} and was asked \${calls} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert(answered.fallback === true && answered.model_version === 'rules-7', \`the model answered \${code}, and the verdict was \${JSON.stringify(answered)}: an error that is not retryable ends the attempts with the rules verdict\`);
+  }
 }
 
 export async function check_rules_fallback(ctx) {
@@ -677,24 +708,24 @@ import (
 )
 
 var (
-	clientBg    = context.Background()
-	established = features.Features{AccountAgeDays: 400, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 0}
-	risky       = features.Features{AccountAgeDays: 12, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 2}
+	harnessBg          = context.Background()
+	harnessEstablished = features.Features{AccountAgeDays: 400, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 0}
+	harnessRisky       = features.Features{AccountAgeDays: 12, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 2}
 )
 
-func serveModel(ctx *harness.Ctx) {
+func harnessServeModel(ctx *harness.Ctx) {
 	pbmodel.RegisterModelServer(ctx.GRPC.Server(""), riskmodel.Peer{})
 }
 
-func mustScore(ctx *harness.Ctx, f features.Features, why string) verdict {
-	v, err := scoreTransaction(clientBg, f)
+func harnessScore(ctx *harness.Ctx, f features.Features, why string) verdict {
+	v, err := scoreTransaction(harnessBg, f)
 	ctx.NoError(err, "%s: scoreTransaction failed", why)
 	return v
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveModel(ctx)
-	v := mustScore(ctx, established, "with the model healthy")
+	harnessServeModel(ctx)
+	v := harnessScore(ctx, harnessEstablished, "with the model healthy")
 	ctx.Assert(!v.Fallback && v.ModelVersion == riskmodel.ModelVersion, "with the model healthy the verdict must be the model's, got %+v", v)
 	for _, call := range ctx.GRPC.CallsTo("Score", "") {
 		ctx.Assert(call.HasDeadline(), "a Score call carries no deadline: a stalled model holds the payment open")
@@ -702,38 +733,52 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Score", 5.0, "")
 	started := ctx.Clock.Now()
-	v = mustScore(ctx, established, "with the model stalled")
+	v = harnessScore(ctx, harnessEstablished, "with the model stalled")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 1.0, "with the model stalled for 5 s one score took %v s: three attempts of 300 ms must end within 1 s", waited)
 	ctx.Assert(v.Fallback, "a model that never answers in time must end in the rules verdict, got %+v", v)
+	stalled := ctx.GRPC.CallsTo("Score", "")[1:]
+	ctx.Equal(len(stalled), 3, "a model that never answers in time: DeadlineExceeded is retryable, so a stall costs maxAttempts (3) attempts; the calls")
+	for _, call := range stalled {
+		ctx.Assert(call.HasDeadline() && 250*time.Millisecond <= call.Timeout && call.Timeout <= 350*time.Millisecond,
+			"an attempt against a stalled model carried a %v deadline: each attempt carries its own full 300 ms, not what is left of the first one's", call.Timeout)
+	}
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	serveModel(ctx)
+	harnessServeModel(ctx)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "", 2, "")
-	v := mustScore(ctx, established, "two UNAVAILABLE answers then a healthy model")
+	v := harnessScore(ctx, harnessEstablished, "two UNAVAILABLE answers then a healthy model")
 	calls := len(ctx.GRPC.CallsTo("Score", ""))
 	ctx.Assert(calls == 3 && !v.Fallback, "two UNAVAILABLE answers then a healthy model must give the model's verdict on the third attempt, got %+v after %d calls", v, calls)
-	refused := established
+	refused := harnessEstablished
 	refused.FeatureVersion = "fx-2"
-	got, err := scoreTransaction(clientBg, refused)
+	got, err := scoreTransaction(harnessBg, refused)
 	ctx.Assert(errors.Is(err, errInvalidFeatures), "the model refuses a vector at fx-2 with InvalidArgument, and scoreTransaction answered %+v, %v: return errInvalidFeatures", got, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", ""))-3, 1, "a refused vector must be sent once: InvalidArgument is terminal, every attempt is refused the same way; the calls")
+	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.Unimplemented} {
+		before := len(ctx.GRPC.CallsTo("Score", ""))
+		ctx.GRPC.Fail("Score", code, "", 1, "")
+		answered, err := scoreTransaction(harnessBg, harnessEstablished)
+		ctx.NoError(err, "the model answered %v once: an error that is not retryable ends the attempts with the rules verdict, but scoreTransaction failed", code)
+		ctx.Equal(len(ctx.GRPC.CallsTo("Score", ""))-before, 1, "the model answered "+code.String()+": only Unavailable and DeadlineExceeded are retried; the calls")
+		ctx.Assert(answered.Fallback && answered.ModelVersion == features.RulesVersion, "the model answered %v, and the verdict was %+v: an error that is not retryable ends the attempts with the rules verdict", code, answered)
+	}
 }
 
 func CheckRulesFallback(ctx *harness.Ctx) {
-	serveModel(ctx)
+	harnessServeModel(ctx)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "", 3, "")
-	v := mustScore(ctx, risky, "with the model unavailable")
-	expected := verdict{Score: features.RulesScore(risky), Band: "decline", Fallback: true, ModelVersion: features.RulesVersion}
+	v := harnessScore(ctx, harnessRisky, "with the model unavailable")
+	expected := verdict{Score: features.RulesScore(harnessRisky), Band: "decline", Fallback: true, ModelVersion: features.RulesVersion}
 	ctx.Assert(v == expected, "with the model unavailable on all three attempts the verdict was %+v: answer the rules engine's verdict %+v, not a zero", v, expected)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 3, "an outage must cost exactly maxAttempts (3) calls; the calls")
 }
 
 func CheckRulesBand(ctx *harness.Ctx) {
-	serveModel(ctx)
+	harnessServeModel(ctx)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "", 3, "")
-	v := mustScore(ctx, established, "with the model unavailable")
+	v := harnessScore(ctx, harnessEstablished, "with the model unavailable")
 	ctx.Assert(v.Fallback && v.Band != "approve", "during an outage the rules approved a transaction (%+v): a fallback decision must never approve", v)
 	ctx.Assert(math.Abs(v.Score-0.45) < 1e-9 && v.Band == "review", "a clean account during an outage must score rulesMinScore (0.45) in review, got %+v", v)
 }
@@ -742,23 +787,24 @@ func CheckRulesBand(ctx *harness.Ctx) {
 
 #include <cmath>
 #include <string>
+#include <utility>
 
 #include "fraud/risk_model.h"
 #include "fraud_scoring.grpc.pb.h"
 
 namespace {
 
-const features::Features kEstablished{features::kFeatureVersion, 400, 0, 4200};
-const features::Features kRisky{features::kFeatureVersion, 12, 2, 4200};
+const features::Features kHarnessEstablished{features::kFeatureVersion, 400, 0, 4200};
+const features::Features kHarnessRisky{features::kFeatureVersion, 12, 2, 4200};
 
-void serveModel(harness::Ctx& ctx) {
+void harnessServeModel(harness::Ctx& ctx) {
   static riskmodel::Peer* peer = nullptr;
   delete peer;
   peer = new riskmodel::Peer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-Verdict mustScore(harness::Ctx& ctx, const features::Features& fx, const std::string& why) {
+Verdict harnessScore(harness::Ctx& ctx, const features::Features& fx, const std::string& why) {
   try {
     return scoreTransaction(fx);
   } catch (const std::exception& e) {
@@ -769,8 +815,8 @@ Verdict mustScore(harness::Ctx& ctx, const features::Features& fx, const std::st
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveModel(ctx);
-  Verdict v = mustScore(ctx, kEstablished, "with the model healthy");
+  harnessServeModel(ctx);
+  Verdict v = harnessScore(ctx, kHarnessEstablished, "with the model healthy");
   ctx.Assert(!v.fallback && v.model_version == riskmodel::kModelVersion, "with the model healthy the verdict must be the model's, got %s fallback %t", v.model_version, v.fallback);
   for (const auto& call : ctx.GRPC.CallsTo("Score")) {
     ctx.Assert(call.HasDeadline(), "a Score call carries no deadline: a stalled model holds the payment open");
@@ -778,19 +824,25 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Score", 5.0);
   const auto started = ctx.Clock.Now();
-  v = mustScore(ctx, kEstablished, "with the model stalled");
+  v = harnessScore(ctx, kHarnessEstablished, "with the model stalled");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 1.0, "with the model stalled for 5 s one score took %v s: three attempts of 300 ms must end within 1 s", waited);
   ctx.Assert(v.fallback, "a model that never answers in time must end in the rules verdict");
+  const auto calls = ctx.GRPC.CallsTo("Score");
+  ctx.Equal(calls.size(), 4, "a model that never answers in time: DEADLINE_EXCEEDED is retryable, so a stall costs kMaxAttempts (3) attempts after the healthy one; the calls");
+  for (size_t i = 1; i < calls.size(); i++) {
+    ctx.Assert(calls[i].HasDeadline() && 0.25 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 0.35,
+               "an attempt against a stalled model carried a %v s deadline: each attempt carries its own full kDeadline (300 ms), not what is left of the first one's", calls[i].TimeoutSeconds());
+  }
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  serveModel(ctx);
+  harnessServeModel(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "", 2);
-  const Verdict v = mustScore(ctx, kEstablished, "two UNAVAILABLE answers then a healthy model");
+  const Verdict v = harnessScore(ctx, kHarnessEstablished, "two UNAVAILABLE answers then a healthy model");
   const size_t calls = ctx.GRPC.CallsTo("Score").size();
   ctx.Assert(calls == 3 && !v.fallback, "two UNAVAILABLE answers then a healthy model must give the model's verdict on the third attempt, got fallback %t after %d calls", v.fallback, calls);
-  features::Features refused = kEstablished;
+  features::Features refused = kHarnessEstablished;
   refused.feature_version = "fx-2";
   bool threw = false;
   std::string answered;
@@ -801,22 +853,32 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   }
   ctx.Assert(threw, "the model refuses a vector at fx-2 with INVALID_ARGUMENT, and scoreTransaction answered %s: throw InvalidFeatures", answered);
   ctx.Equal(ctx.GRPC.CallsTo("Score").size() - 3, 1, "a refused vector must be sent once: INVALID_ARGUMENT is terminal, every attempt is refused the same way; the calls");
+  const std::pair<grpc::StatusCode, const char*> terminal[] = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::UNIMPLEMENTED, "UNIMPLEMENTED"}};
+  for (const auto& [code, name] : terminal) {
+    const size_t before = ctx.GRPC.CallsTo("Score").size();
+    ctx.GRPC.Fail("Score", code, "", 1);
+    const Verdict got = harnessScore(ctx, kHarnessEstablished, std::string("the model answered ") + name + " once: an error that is not retryable ends the attempts with the rules verdict");
+    ctx.Equal(ctx.GRPC.CallsTo("Score").size() - before, 1, "the model answered %s: only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls", name);
+    ctx.Assert(got.fallback && got.model_version == features::kRulesVersion,
+               "the model answered %s, and the verdict was band %s fallback %t model %s: an error that is not retryable ends the attempts with the rules verdict", name, got.band, got.fallback, got.model_version);
+  }
 }
 
 void CheckRulesFallback(harness::Ctx& ctx) {
-  serveModel(ctx);
+  harnessServeModel(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "", 3);
-  const Verdict v = mustScore(ctx, kRisky, "with the model unavailable");
-  ctx.Assert(v.score == features::rulesScore(kRisky) && v.band == "decline" && v.fallback && v.model_version == features::kRulesVersion,
+  const Verdict v = harnessScore(ctx, kHarnessRisky, "with the model unavailable");
+  ctx.Assert(v.score == features::rulesScore(kHarnessRisky) && v.band == "decline" && v.fallback && v.model_version == features::kRulesVersion,
              "with the model unavailable on all three attempts the verdict was score %v band %s fallback %t model %s: answer the rules engine's verdict (score %v, decline, fallback, %s), not a zero",
-             v.score, v.band, v.fallback, v.model_version, features::rulesScore(kRisky), features::kRulesVersion);
+             v.score, v.band, v.fallback, v.model_version, features::rulesScore(kHarnessRisky), features::kRulesVersion);
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 3, "an outage must cost exactly kMaxAttempts (3) calls; the calls");
 }
 
 void CheckRulesBand(harness::Ctx& ctx) {
-  serveModel(ctx);
+  harnessServeModel(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "", 3);
-  const Verdict v = mustScore(ctx, kEstablished, "with the model unavailable");
+  const Verdict v = harnessScore(ctx, kHarnessEstablished, "with the model unavailable");
   ctx.Assert(v.fallback && v.band != "approve", "during an outage the rules approved a transaction (score %v, band %s): a fallback decision must never approve", v.score, v.band);
   ctx.Assert(std::abs(v.score - 0.45) < 1e-9 && v.band == "review", "a clean account during an outage must score kRulesMinScore (0.45) in review, got %v %s", v.score, v.band);
 }

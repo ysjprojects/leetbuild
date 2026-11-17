@@ -242,7 +242,7 @@ export async function registerInstance(
 ): Promise<number> {
   const ttl = TTL_INTERVALS * heartbeatInterval;
   const key = recordKey(service, instanceId);
-  await redis
+  const replies = await redis
     .multi()
     .hset(key, {
       address,
@@ -254,6 +254,9 @@ export async function registerInstance(
     .expire(key, ttl)
     .sadd(membersKey(service), instanceId)
     .exec();
+  // EXEC resolves even when one command failed (WRONGTYPE): raise it, as redis-py does.
+  const failed = (replies ?? []).find(([err]) => err !== null);
+  if (failed !== undefined) throw failed[0];
   return ttl;
 }
 
@@ -663,7 +666,9 @@ inline long registerInstance(const std::string& service, const std::string& inst
       {"metadata_version", std::to_string(metadata_version)},
       {"last_heartbeat", std::to_string(nowSeconds())}};
   auto tx = client().transaction();
-  tx.hset(key, fields.begin(), fields.end()).expire(key, std::chrono::seconds(ttl)).sadd(membersKey(service), instance_id).exec();
+  auto replies = tx.hset(key, fields.begin(), fields.end()).expire(key, std::chrono::seconds(ttl)).sadd(membersKey(service), instance_id).exec();
+  // EXEC answers even when one command failed (WRONGTYPE): get throws its ReplyError, as redis-py raises.
+  for (std::size_t i = 0; i < replies.size(); ++i) replies.get<long long>(i);
   return ttl;
 }
 
@@ -828,7 +833,8 @@ object Instances {
     tx.hset(key, fields.asJava)
     tx.expire(key, ttl.toLong)
     tx.sadd(membersKey(service), instanceId)
-    tx.exec()
+    // EXEC answers even when one command failed (WRONGTYPE): raise it, as redis-py does.
+    tx.exec().asScala.collectFirst { case e: Exception => e }.foreach(e => throw e)
     ttl
   }
 

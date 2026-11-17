@@ -72,7 +72,7 @@ retrying; and the dashboard and the alert disagree about the same numbers.
       id: 'window-expiry',
       title: 'Each window expires after its first write',
       detail:
-        'The script sets `EXPIRE` on the card key (`ATTEMPT_WINDOW_S`) when it is created and on the device key (`DEVICE_WINDOW_S`) when it has no TTL yet, so an hour later the card starts from one again.',
+        'The script sets `EXPIRE` on the card key (`ATTEMPT_WINDOW_S`) when it is created and on the device key (`DEVICE_WINDOW_S`) when it has no TTL yet, so both keys carry a TTL from the moment they exist and a window closes a fixed time after its first write: an hour later the card starts from one again, however busy it was.',
       match: {
         python: {all: [/ATTEMPT_WINDOW_S/, /DEVICE_WINDOW_S/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/ATTEMPT_WINDOW_S/, /DEVICE_WINDOW_S/, /redis\.call\(\s*['"]EXPIRE['"]/]},
@@ -711,27 +711,35 @@ def _state(ctx):
 def check_atomic_script(ctx):
     m = _state(ctx)
     seen = ctx.redis_after("vel:card:c-1", lambda: (ctx.redis.get("vel:card:c-1"), ctx.redis.exists("vel:device:d-1")))
+    device_seen = ctx.redis_after("vel:device:d-1", lambda: ctx.redis.get("vel:card:c-1"))
     got = m.record_attempt("c-1", "d-1", "acct-1")
     assert seen.fired, "record_attempt never touched vel:card:c-1"
     assert seen.result in ((None, 0), ("1", 1)), f"right after vel:card:c-1 moved, a concurrent reader saw the card at {seen.result[0]!r} with vel:device:d-1 {'present' if seen.result[1] else 'absent'}: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script"
+    assert device_seen.fired, "record_attempt never touched vel:device:d-1"
+    assert device_seen.result == "1", f"right after vel:device:d-1 moved, a concurrent reader saw vel:card:c-1 at {device_seen.result!r}: the device moved in one command and the card in another, and a reader or a crash lands between them. Move both in one Lua script"
     assert (got["card_attempts"], got["device_accounts"]) == (1, 1), f"the first attempt must count 1 on the card and 1 account on the device, got {got}"
 
 
 def check_window_expiry(ctx):
     m = _state(ctx)
+    created = ctx.redis_after("vel:card:c-1", lambda: (ctx.redis.ttl("vel:card:c-1"), ctx.redis.ttl("vel:device:d-1")))
     for _ in range(3):
         m.record_attempt("c-1", "d-1", "acct-1")
+    assert created.fired and created.result[0] > 0 and created.result[1] > 0, f"right after the first attempt was counted, vel:card:c-1 and vel:device:d-1 had TTLs {created.result}: a window created without its expiry lives forever if the process dies before the next command. Set the TTL in the script that creates the key"
     ttl = ctx.redis.ttl("vel:card:c-1")
     assert 0 < ttl <= 3600, f"vel:card:c-1 has TTL {ttl}: the card window must expire ATTEMPT_WINDOW_S (3600 s) after its first write"
     ttl = ctx.redis.ttl("vel:device:d-1")
     assert 3600 < ttl <= 86400, f"vel:device:d-1 has TTL {ttl}: the device window must expire DEVICE_WINDOW_S (86400 s) after its first write"
-    ctx.clock.advance(3601)
+    ctx.clock.advance(1800)
+    got = m.record_attempt("c-1", "d-1", "acct-1")
+    assert got["card_attempts"] == 4, f"half an hour in, the card must count its fourth attempt, got {got['card_attempts']}"
+    ctx.clock.advance(1801)
     got = m.record_attempt("c-1", "d-1", "acct-2")
-    assert got["card_attempts"] == 1, f"an hour after its first attempt the card still counts {got['card_attempts']} attempts: the window never closes, so a busy card stays flagged"
+    assert got["card_attempts"] == 1, f"an hour after its first attempt the card still counts {got['card_attempts']} attempts: the window must close an hour after its first write, not slide with every attempt, or a busy card stays flagged"
     assert got["device_accounts"] == 2, f"inside the day the device must count acct-1 and acct-2, got {got['device_accounts']}"
-    ctx.clock.advance(86400)
+    ctx.clock.advance(82800)
     got = m.record_attempt("c-1", "d-1", "acct-3")
-    assert got["device_accounts"] == 1, f"a day later the device still counts {got['device_accounts']} accounts: its window must expire"
+    assert got["device_accounts"] == 1, f"a day after its first write the device still counts {got['device_accounts']} accounts: its window must expire a day after its first write, not slide with later writes"
 
 
 def check_count_before_model(ctx):
@@ -769,8 +777,11 @@ def check_shared_rules(ctx):
     snapshot = m.velocity_snapshot("c-1", "d-0")
     assert snapshot.get("flags") == ["card_attempts_per_hour"], f"six attempts on c-1 must flag card_attempts_per_hour (VELOCITY_RULES: 5), the snapshot is {snapshot}"
     assert m.should_alert(snapshot), f"the snapshot flags card_attempts_per_hour but should_alert says no: the alert reads other thresholds than VELOCITY_RULES ({snapshot})"
-    for account in ("acct-2", "acct-3", "acct-4", "acct-5"):
+    for account in ("acct-2", "acct-3", "acct-4"):
         m.record_attempt("c-9", "d-7", account)
+    snapshot = m.velocity_snapshot("c-9", "d-7")
+    assert snapshot.get("flags") == [] and not m.should_alert(snapshot), f"three accounts on d-7 is the limit, not over it: the snapshot {snapshot} and should_alert ({m.should_alert(snapshot)}) must both say no"
+    m.record_attempt("c-9", "d-7", "acct-5")
     snapshot = m.velocity_snapshot("c-9", "d-7")
     assert snapshot.get("flags") == ["device_accounts_per_day"] and m.should_alert(snapshot), f"four accounts on d-7 must flag device_accounts_per_day (VELOCITY_RULES: 3) and alert, the snapshot is {snapshot}, should_alert {m.should_alert(snapshot)}"
 `,
@@ -785,27 +796,35 @@ function state(ctx) {
 export async function check_atomic_script(ctx) {
   const m = state(ctx);
   const seen = ctx.redisAfter('vel:card:c-1', () => [ctx.redis.get('vel:card:c-1'), ctx.redis.exists('vel:device:d-1')]);
+  const deviceSeen = ctx.redisAfter('vel:device:d-1', () => ctx.redis.get('vel:card:c-1'));
   const got = await m.recordAttempt('c-1', 'd-1', 'acct-1');
   assert(seen.fired, 'recordAttempt never touched vel:card:c-1');
   const [card, device] = seen.result;
   assert((card === null && device === 0) || (card === '1' && device === 1), \`right after vel:card:c-1 moved, a concurrent reader saw the card at \${JSON.stringify(card)} with vel:device:d-1 \${device ? 'present' : 'absent'}: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script\`);
+  assert(deviceSeen.fired, 'recordAttempt never touched vel:device:d-1');
+  assert.equal(deviceSeen.result, '1', \`right after vel:device:d-1 moved, a concurrent reader saw vel:card:c-1 at \${JSON.stringify(deviceSeen.result)}: the device moved in one command and the card in another, and a reader or a crash lands between them. Move both in one Lua script\`);
   assert(got.card_attempts === 1 && got.device_accounts === 1, \`the first attempt must count 1 on the card and 1 account on the device, got \${JSON.stringify(got)}\`);
 }
 
 export async function check_window_expiry(ctx) {
   const m = state(ctx);
+  const created = ctx.redisAfter('vel:card:c-1', () => [ctx.redis.ttl('vel:card:c-1'), ctx.redis.ttl('vel:device:d-1')]);
   for (let i = 0; i < 3; i++) await m.recordAttempt('c-1', 'd-1', 'acct-1');
+  assert(created.fired && created.result[0] > 0 && created.result[1] > 0, \`right after the first attempt was counted, vel:card:c-1 and vel:device:d-1 had TTLs \${JSON.stringify(created.result)}: a window created without its expiry lives forever if the process dies before the next command. Set the TTL in the script that creates the key\`);
   let ttl = ctx.redis.ttl('vel:card:c-1');
   assert(0 < ttl && ttl <= 3600, \`vel:card:c-1 has TTL \${ttl}: the card window must expire ATTEMPT_WINDOW_S (3600 s) after its first write\`);
   ttl = ctx.redis.ttl('vel:device:d-1');
   assert(3600 < ttl && ttl <= 86400, \`vel:device:d-1 has TTL \${ttl}: the device window must expire DEVICE_WINDOW_S (86400 s) after its first write\`);
-  ctx.clock.advance(3601);
-  let got = await m.recordAttempt('c-1', 'd-1', 'acct-2');
-  assert.equal(got.card_attempts, 1, \`an hour after its first attempt the card still counts \${got.card_attempts} attempts: the window never closes, so a busy card stays flagged\`);
+  ctx.clock.advance(1800);
+  let got = await m.recordAttempt('c-1', 'd-1', 'acct-1');
+  assert.equal(got.card_attempts, 4, \`half an hour in, the card must count its fourth attempt, got \${got.card_attempts}\`);
+  ctx.clock.advance(1801);
+  got = await m.recordAttempt('c-1', 'd-1', 'acct-2');
+  assert.equal(got.card_attempts, 1, \`an hour after its first attempt the card still counts \${got.card_attempts} attempts: the window must close an hour after its first write, not slide with every attempt, or a busy card stays flagged\`);
   assert.equal(got.device_accounts, 2, \`inside the day the device must count acct-1 and acct-2, got \${got.device_accounts}\`);
-  ctx.clock.advance(86400);
+  ctx.clock.advance(82800);
   got = await m.recordAttempt('c-1', 'd-1', 'acct-3');
-  assert.equal(got.device_accounts, 1, \`a day later the device still counts \${got.device_accounts} accounts: its window must expire\`);
+  assert.equal(got.device_accounts, 1, \`a day after its first write the device still counts \${got.device_accounts} accounts: its window must expire a day after its first write, not slide with later writes\`);
 }
 
 export async function check_count_before_model(ctx) {
@@ -842,7 +861,10 @@ export async function check_shared_rules(ctx) {
   snapshot = await m.velocitySnapshot('c-1', 'd-0');
   assert.deepStrictEqual(snapshot.flags, ['card_attempts_per_hour'], \`six attempts on c-1 must flag card_attempts_per_hour (VELOCITY_RULES: 5), the snapshot is \${JSON.stringify(snapshot)}\`);
   assert(m.shouldAlert(snapshot), \`the snapshot flags card_attempts_per_hour but shouldAlert says no: the alert reads other thresholds than VELOCITY_RULES (\${JSON.stringify(snapshot)})\`);
-  for (const account of ['acct-2', 'acct-3', 'acct-4', 'acct-5']) await m.recordAttempt('c-9', 'd-7', account);
+  for (const account of ['acct-2', 'acct-3', 'acct-4']) await m.recordAttempt('c-9', 'd-7', account);
+  snapshot = await m.velocitySnapshot('c-9', 'd-7');
+  assert((snapshot.flags ?? []).length === 0 && !m.shouldAlert(snapshot), \`three accounts on d-7 is the limit, not over it: the snapshot \${JSON.stringify(snapshot)} and shouldAlert must both say no\`);
+  await m.recordAttempt('c-9', 'd-7', 'acct-5');
   snapshot = await m.velocitySnapshot('c-9', 'd-7');
   assert(JSON.stringify(snapshot.flags) === '["device_accounts_per_day"]' && m.shouldAlert(snapshot), \`four accounts on d-7 must flag device_accounts_per_day (VELOCITY_RULES: 3) and alert, the snapshot is \${JSON.stringify(snapshot)}\`);
 }
@@ -863,93 +885,110 @@ import (
 )
 
 var (
-	stateBg     = context.Background()
-	stateVector = features.Features{AccountAgeDays: 400, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 0}
+	harnessBg     = context.Background()
+	harnessVector = features.Features{AccountAgeDays: 400, AmountCents: 4200, FeatureVersion: features.FeatureVersion, PriorChargebacks: 0}
 )
 
-func serveModel(ctx *harness.Ctx) {
+func harnessServeModel(ctx *harness.Ctx) {
 	pb.RegisterModelServer(ctx.GRPC.Server(""), riskmodel.Peer{})
 }
 
-func mustRecord(ctx *harness.Ctx, cardRef, deviceID, accountRef string) velocity {
-	v, err := recordAttempt(stateBg, cardRef, deviceID, accountRef)
+func harnessRecord(ctx *harness.Ctx, cardRef, deviceID, accountRef string) velocity {
+	v, err := recordAttempt(harnessBg, cardRef, deviceID, accountRef)
 	ctx.NoError(err, "recordAttempt(%s, %s, %s) failed", cardRef, deviceID, accountRef)
 	return v
 }
 
-func mustSnapshot(ctx *harness.Ctx, cardRef, deviceID string) velocity {
-	v, err := velocitySnapshot(stateBg, cardRef, deviceID)
+func harnessSnapshot(ctx *harness.Ctx, cardRef, deviceID string) velocity {
+	v, err := velocitySnapshot(harnessBg, cardRef, deviceID)
 	ctx.NoError(err, "velocitySnapshot(%s, %s) failed", cardRef, deviceID)
 	return v
 }
 
 func CheckAtomicScript(ctx *harness.Ctx) {
-	serveModel(ctx)
+	harnessServeModel(ctx)
 	seen := ctx.Redis.After("vel:card:c-1", func() any {
 		card, _ := ctx.Redis.Get("vel:card:c-1")
 		return fmt.Sprintf("%s/%d", card, ctx.Redis.Exists("vel:device:d-1"))
 	})
-	got := mustRecord(ctx, "c-1", "d-1", "acct-1")
+	deviceSeen := ctx.Redis.After("vel:device:d-1", func() any {
+		card, _ := ctx.Redis.Get("vel:card:c-1")
+		return card
+	})
+	got := harnessRecord(ctx, "c-1", "d-1", "acct-1")
 	ctx.Assert(seen.Fired, "recordAttempt never touched vel:card:c-1")
 	ctx.Assert(seen.Result == "/0" || seen.Result == "1/1", "right after vel:card:c-1 moved, a concurrent reader saw card/device-exists %v: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script", seen.Result)
+	ctx.Assert(deviceSeen.Fired, "recordAttempt never touched vel:device:d-1")
+	ctx.Assert(deviceSeen.Result == "1", "right after vel:device:d-1 moved, a concurrent reader saw vel:card:c-1 at %q: the device moved in one command and the card in another, and a reader or a crash lands between them. Move both in one Lua script", deviceSeen.Result)
 	ctx.Assert(got.CardAttempts == 1 && got.DeviceAccounts == 1, "the first attempt must count 1 on the card and 1 account on the device, got %+v", got)
 }
 
 func CheckWindowExpiry(ctx *harness.Ctx) {
-	serveModel(ctx)
+	harnessServeModel(ctx)
+	created := ctx.Redis.After("vel:card:c-1", func() any {
+		return [2]int64{int64(ctx.Redis.TTL("vel:card:c-1")), int64(ctx.Redis.TTL("vel:device:d-1"))}
+	})
 	for i := 0; i < 3; i++ {
-		mustRecord(ctx, "c-1", "d-1", "acct-1")
+		harnessRecord(ctx, "c-1", "d-1", "acct-1")
 	}
+	ttls, _ := created.Result.([2]int64)
+	ctx.Assert(created.Fired && ttls[0] > 0 && ttls[1] > 0, "right after the first attempt was counted, vel:card:c-1 and vel:device:d-1 had TTLs %v: a window created without its expiry lives forever if the process dies before the next command. Set the TTL in the script that creates the key", ttls)
 	ttl := ctx.Redis.TTL("vel:card:c-1")
 	ctx.Assert(0 < ttl && ttl <= 3600, "vel:card:c-1 has TTL %d: the card window must expire attemptWindowSeconds (3600 s) after its first write", ttl)
 	ttl = ctx.Redis.TTL("vel:device:d-1")
 	ctx.Assert(3600 < ttl && ttl <= 86400, "vel:device:d-1 has TTL %d: the device window must expire deviceWindowSeconds (86400 s) after its first write", ttl)
-	ctx.Clock.Advance(3601)
-	got := mustRecord(ctx, "c-1", "d-1", "acct-2")
-	ctx.Equal(got.CardAttempts, 1, "an hour after its first attempt the card window must start over (it never closes, so a busy card stays flagged); the attempts")
+	ctx.Clock.Advance(1800)
+	got := harnessRecord(ctx, "c-1", "d-1", "acct-1")
+	ctx.Equal(got.CardAttempts, 4, "half an hour in, the card must count its fourth attempt; the attempts")
+	ctx.Clock.Advance(1801)
+	got = harnessRecord(ctx, "c-1", "d-1", "acct-2")
+	ctx.Equal(got.CardAttempts, 1, "an hour after its first attempt the card window must start over (it must close an hour after its first write, not slide with every attempt, or a busy card stays flagged); the attempts")
 	ctx.Equal(got.DeviceAccounts, 2, "inside the day the device must count acct-1 and acct-2; the accounts")
-	ctx.Clock.Advance(86400)
-	got = mustRecord(ctx, "c-1", "d-1", "acct-3")
-	ctx.Equal(got.DeviceAccounts, 1, "a day later the device window must start over; the accounts")
+	ctx.Clock.Advance(82800)
+	got = harnessRecord(ctx, "c-1", "d-1", "acct-3")
+	ctx.Equal(got.DeviceAccounts, 1, "a day after its first write the device window must start over, not slide with later writes; the accounts")
 }
 
 func CheckCountBeforeModel(ctx *harness.Ctx) {
-	serveModel(ctx)
-	verdict, v, err := scoreWithVelocity(stateBg, stateVector, "c-1", "d-1", "acct-1")
+	harnessServeModel(ctx)
+	verdict, v, err := scoreWithVelocity(harnessBg, harnessVector, "c-1", "d-1", "acct-1")
 	ctx.NoError(err, "a first attempt failed")
 	ctx.Assert(verdict.Band == "approve" && v.CardAttempts == 1, "a first attempt must be scored and counted, got %+v %+v", verdict, v)
-	refused := stateVector
+	refused := harnessVector
 	refused.FeatureVersion = "fx-2"
-	_, _, err = scoreWithVelocity(stateBg, refused, "c-1", "d-1", "acct-1")
+	_, _, err = scoreWithVelocity(harnessBg, refused, "c-1", "d-1", "acct-1")
 	ctx.Assert(errors.Is(err, model.ErrInvalidFeatures), "the model refuses a vector at fx-2 with InvalidArgument: scoreWithVelocity must return model.ErrInvalidFeatures, got %v", err)
 	attempts, _ := ctx.Redis.Get("vel:card:c-1")
 	ctx.Equal(attempts, "2", "after two attempts, one the model refused, an attempt the model did not score must still be counted (record it before calling the model); vel:card:c-1")
 }
 
 func CheckDistinctAccounts(ctx *harness.Ctx) {
-	serveModel(ctx)
-	mustRecord(ctx, "c-1", "d-1", "acct-1")
-	mustRecord(ctx, "c-2", "d-1", "acct-1")
-	got := mustRecord(ctx, "c-3", "d-1", "acct-2")
+	harnessServeModel(ctx)
+	harnessRecord(ctx, "c-1", "d-1", "acct-1")
+	harnessRecord(ctx, "c-2", "d-1", "acct-1")
+	got := harnessRecord(ctx, "c-3", "d-1", "acct-2")
 	ctx.Equal(got.DeviceAccounts, 2, "three attempts by two accounts on device d-1: the device window counts distinct accounts, not attempts; the accounts")
-	ctx.Equal(mustSnapshot(ctx, "c-3", "d-1").DeviceAccounts, 2, "velocitySnapshot's accounts on d-1")
+	ctx.Equal(harnessSnapshot(ctx, "c-3", "d-1").DeviceAccounts, 2, "velocitySnapshot's accounts on d-1")
 }
 
 func CheckSharedRules(ctx *harness.Ctx) {
-	serveModel(ctx)
+	harnessServeModel(ctx)
 	for i := 0; i < 5; i++ {
-		mustRecord(ctx, "c-1", fmt.Sprintf("d-%d", i), "acct-1")
+		harnessRecord(ctx, "c-1", fmt.Sprintf("d-%d", i), "acct-1")
 	}
-	snapshot := mustSnapshot(ctx, "c-1", "d-0")
+	snapshot := harnessSnapshot(ctx, "c-1", "d-0")
 	ctx.Assert(len(snapshot.Flags) == 0 && !shouldAlert(snapshot), "five attempts is the limit, not over it: the snapshot %+v and shouldAlert must both say no", snapshot)
-	mustRecord(ctx, "c-1", "d-0", "acct-1")
-	snapshot = mustSnapshot(ctx, "c-1", "d-0")
+	harnessRecord(ctx, "c-1", "d-0", "acct-1")
+	snapshot = harnessSnapshot(ctx, "c-1", "d-0")
 	ctx.Assert(len(snapshot.Flags) == 1 && snapshot.Flags[0] == "card_attempts_per_hour", "six attempts on c-1 must flag card_attempts_per_hour (velocityRules: 5), the snapshot is %+v", snapshot)
 	ctx.Assert(shouldAlert(snapshot), "the snapshot flags card_attempts_per_hour but shouldAlert says no: the alert reads other thresholds than velocityRules (%+v)", snapshot)
-	for _, account := range []string{"acct-2", "acct-3", "acct-4", "acct-5"} {
-		mustRecord(ctx, "c-9", "d-7", account)
+	for _, account := range []string{"acct-2", "acct-3", "acct-4"} {
+		harnessRecord(ctx, "c-9", "d-7", account)
 	}
-	snapshot = mustSnapshot(ctx, "c-9", "d-7")
+	snapshot = harnessSnapshot(ctx, "c-9", "d-7")
+	ctx.Assert(len(snapshot.Flags) == 0 && !shouldAlert(snapshot), "three accounts on d-7 is the limit, not over it: the snapshot %+v and shouldAlert must both say no", snapshot)
+	harnessRecord(ctx, "c-9", "d-7", "acct-5")
+	snapshot = harnessSnapshot(ctx, "c-9", "d-7")
 	ctx.Assert(len(snapshot.Flags) == 1 && snapshot.Flags[0] == "device_accounts_per_day" && shouldAlert(snapshot), "four accounts on d-7 must flag device_accounts_per_day (velocityRules: 3) and alert, the snapshot is %+v", snapshot)
 }
 `,
@@ -958,15 +997,16 @@ func CheckSharedRules(ctx *harness.Ctx) {
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 
 #include "fraud/risk_model.h"
 #include "fraud_scoring.grpc.pb.h"
 
 namespace {
 
-const features::Features kVector{features::kFeatureVersion, 400, 0, 4200};
+const features::Features kHarnessVector{features::kFeatureVersion, 400, 0, 4200};
 
-void serveModel(harness::Ctx& ctx) {
+void harnessServeModel(harness::Ctx& ctx) {
   static riskmodel::Peer* peer = nullptr;
   delete peer;
   peer = new riskmodel::Peer;
@@ -976,40 +1016,55 @@ void serveModel(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckAtomicScript(harness::Ctx& ctx) {
-  serveModel(ctx);
+  harnessServeModel(ctx);
   auto seen = std::make_shared<std::optional<std::string>>();
   ctx.Redis.After("vel:card:c-1", [&ctx, seen] {
     *seen = ctx.Redis.Get("vel:card:c-1").value_or("") + "/" + std::to_string(ctx.Redis.Exists("vel:device:d-1"));
   });
+  auto deviceSeen = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After("vel:device:d-1", [&ctx, deviceSeen] { *deviceSeen = ctx.Redis.Get("vel:card:c-1").value_or(""); });
   const Velocity got = recordAttempt("c-1", "d-1", "acct-1");
   ctx.Assert(seen->has_value(), "recordAttempt never touched vel:card:c-1");
   ctx.Assert(**seen == "/0" || **seen == "1/1",
              "right after vel:card:c-1 moved, a concurrent reader saw card/device-exists %s: the two windows move in two commands, and a reader or a crash lands between them. Move both in one Lua script",
              **seen);
+  ctx.Assert(deviceSeen->has_value(), "recordAttempt never touched vel:device:d-1");
+  ctx.Assert(**deviceSeen == "1",
+             "right after vel:device:d-1 moved, a concurrent reader saw vel:card:c-1 at %q: the device moved in one command and the card in another, and a reader or a crash lands between them. Move both in one Lua script",
+             **deviceSeen);
   ctx.Assert(got.card_attempts == 1 && got.device_accounts == 1, "the first attempt must count 1 on the card and 1 account on the device, got %d and %d", got.card_attempts, got.device_accounts);
 }
 
 void CheckWindowExpiry(harness::Ctx& ctx) {
-  serveModel(ctx);
+  harnessServeModel(ctx);
+  auto created = std::make_shared<std::optional<std::pair<long long, long long>>>();
+  ctx.Redis.After("vel:card:c-1", [&ctx, created] { *created = std::make_pair(ctx.Redis.TTL("vel:card:c-1"), ctx.Redis.TTL("vel:device:d-1")); });
   for (int i = 0; i < 3; i++) recordAttempt("c-1", "d-1", "acct-1");
+  const auto [cardTTL, deviceTTL] = created->value_or(std::make_pair(-2LL, -2LL));
+  ctx.Assert(cardTTL > 0 && deviceTTL > 0,
+             "right after the first attempt was counted, vel:card:c-1 and vel:device:d-1 had TTLs %d and %d: a window created without its expiry lives forever if the process dies before the next command. Set the TTL in the script that creates the key",
+             cardTTL, deviceTTL);
   long long ttl = ctx.Redis.TTL("vel:card:c-1");
   ctx.Assert(0 < ttl && ttl <= 3600, "vel:card:c-1 has TTL %d: the card window must expire kAttemptWindowSeconds (3600 s) after its first write", ttl);
   ttl = ctx.Redis.TTL("vel:device:d-1");
   ctx.Assert(3600 < ttl && ttl <= 86400, "vel:device:d-1 has TTL %d: the device window must expire kDeviceWindowSeconds (86400 s) after its first write", ttl);
-  ctx.Clock.Advance(3601);
-  Velocity got = recordAttempt("c-1", "d-1", "acct-2");
-  ctx.Equal(got.card_attempts, 1, "an hour after its first attempt the card window must start over (it never closes, so a busy card stays flagged); the attempts");
+  ctx.Clock.Advance(1800);
+  Velocity got = recordAttempt("c-1", "d-1", "acct-1");
+  ctx.Equal(got.card_attempts, 4, "half an hour in, the card must count its fourth attempt; the attempts");
+  ctx.Clock.Advance(1801);
+  got = recordAttempt("c-1", "d-1", "acct-2");
+  ctx.Equal(got.card_attempts, 1, "an hour after its first attempt the card window must start over (it must close an hour after its first write, not slide with every attempt, or a busy card stays flagged); the attempts");
   ctx.Equal(got.device_accounts, 2, "inside the day the device must count acct-1 and acct-2; the accounts");
-  ctx.Clock.Advance(86400);
+  ctx.Clock.Advance(82800);
   got = recordAttempt("c-1", "d-1", "acct-3");
-  ctx.Equal(got.device_accounts, 1, "a day later the device window must start over; the accounts");
+  ctx.Equal(got.device_accounts, 1, "a day after its first write the device window must start over, not slide with later writes; the accounts");
 }
 
 void CheckCountBeforeModel(harness::Ctx& ctx) {
-  serveModel(ctx);
-  const auto [verdict, v] = scoreWithVelocity(kVector, "c-1", "d-1", "acct-1");
+  harnessServeModel(ctx);
+  const auto [verdict, v] = scoreWithVelocity(kHarnessVector, "c-1", "d-1", "acct-1");
   ctx.Assert(verdict.band == "approve" && v.card_attempts == 1, "a first attempt must be scored and counted, got band %s and %d attempts", verdict.band, v.card_attempts);
-  features::Features refused = kVector;
+  features::Features refused = kHarnessVector;
   refused.feature_version = "fx-2";
   bool threw = false;
   try {
@@ -1023,7 +1078,7 @@ void CheckCountBeforeModel(harness::Ctx& ctx) {
 }
 
 void CheckDistinctAccounts(harness::Ctx& ctx) {
-  serveModel(ctx);
+  harnessServeModel(ctx);
   recordAttempt("c-1", "d-1", "acct-1");
   recordAttempt("c-2", "d-1", "acct-1");
   const Velocity got = recordAttempt("c-3", "d-1", "acct-2");
@@ -1032,7 +1087,7 @@ void CheckDistinctAccounts(harness::Ctx& ctx) {
 }
 
 void CheckSharedRules(harness::Ctx& ctx) {
-  serveModel(ctx);
+  harnessServeModel(ctx);
   for (int i = 0; i < 5; i++) recordAttempt("c-1", "d-" + std::to_string(i), "acct-1");
   Velocity snapshot = velocitySnapshot("c-1", "d-0");
   ctx.Assert(snapshot.flags.empty() && !shouldAlert(snapshot), "five attempts is the limit, not over it: the snapshot flags %q and shouldAlert must both say no", snapshot.flags);
@@ -1040,7 +1095,10 @@ void CheckSharedRules(harness::Ctx& ctx) {
   snapshot = velocitySnapshot("c-1", "d-0");
   ctx.Equal(snapshot.flags, std::vector<std::string>{"card_attempts_per_hour"}, "six attempts on c-1 must flag card_attempts_per_hour (kVelocityRules: 5); the flags");
   ctx.Assert(shouldAlert(snapshot), "the snapshot flags card_attempts_per_hour but shouldAlert says no: the alert reads other thresholds than kVelocityRules");
-  for (const std::string account : {"acct-2", "acct-3", "acct-4", "acct-5"}) recordAttempt("c-9", "d-7", account);
+  for (const std::string account : {"acct-2", "acct-3", "acct-4"}) recordAttempt("c-9", "d-7", account);
+  snapshot = velocitySnapshot("c-9", "d-7");
+  ctx.Assert(snapshot.flags.empty() && !shouldAlert(snapshot), "three accounts on d-7 is the limit, not over it: the snapshot flags %q and shouldAlert must both say no", snapshot.flags);
+  recordAttempt("c-9", "d-7", "acct-5");
   snapshot = velocitySnapshot("c-9", "d-7");
   ctx.Assert(snapshot.flags == std::vector<std::string>{"device_accounts_per_day"} && shouldAlert(snapshot),
              "four accounts on d-7 must flag device_accounts_per_day (kVelocityRules: 3) and alert, the flags are %q", snapshot.flags);

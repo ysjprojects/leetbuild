@@ -19,13 +19,14 @@ number. It serves the demo and hides four flaws.
 guessing an id, the body carries the full card number, a header the client sets unlocks it again,
 and the raw-card tool leaves no trace.
 
-- Read the case with \`store.case_of(tenant, case_id)\`, the tenant taken from \`X-Tenant-Id\`
-  (missing: **401**); a foreign case is **404**, like a missing one.
-- The body carries \`card_ref: mask_card(pan)\`, \`MASK_PREFIX\` (\`****\`) plus the last four digits,
-  and no card number for any caller.
+- Read the case with \`store.case_of(tenant, case_id)\`, the tenant taken from \`X-Tenant-Id\` and
+  nowhere else (missing: **401**); a foreign case is **404** with the same body as a missing one.
+- The body carries \`card_ref: mask_card(pan)\`, \`MASK_PREFIX\` (\`****\`) plus the last four digits
+  whatever the card's length, and no card number for any caller.
 - No header changes what the read returns.
 - \`audited_pan\` reads through \`store.case_of\` and writes \`store.audit(actor, PAN_SCOPE, case_id)\`
-  before returning the PAN; a foreign case returns None and leaves no row.`,
+  before returning the PAN; a foreign case returns None and leaves no row, and a PAN whose audit row
+  could not be written is not returned.`,
   sequence: {
     participants: ['Review console', 'scorer', 'Redis', 'Audit log'],
     messages: [
@@ -59,7 +60,7 @@ and the raw-card tool leaves no trace.
       id: 'tenant-scope',
       title: 'A foreign case is 404',
       detail:
-        "Every lookup goes through `case_of(tenant, case_id)` with the caller's `X-Tenant-Id`, so another tenant's case answers **404** like a missing one; the starter reads by id alone.",
+        "Every lookup goes through `case_of(tenant, case_id)` with the caller's `X-Tenant-Id` (no other source of the tenant), so another tenant's case answers **404** with the same body as a missing one; the starter reads by id alone.",
       match: {
         python: {all: [/store\.case_of\(\s*tenant/, /\b404\b/, /\b401\b/], none: [/store\.load_case\(/]},
         typescript: {all: [/caseOf\(\s*tenant/, /\b404\b/, /\b401\b/], none: [/loadCase\(/]},
@@ -75,7 +76,7 @@ and the raw-card tool leaves no trace.
       id: 'masking',
       title: 'The card is masked in the response builder',
       detail:
-        '`case_view` answers `card_ref: mask_card(pan)` (`MASK_PREFIX` plus the last four digits) and no `card_number`; the starter copies the full number into every body.',
+        '`case_view` answers `card_ref: mask_card(pan)` (`MASK_PREFIX` plus the last four digits, for a 19-digit card as for a 16-digit one) and no `card_number`; the starter copies the full number into every body.',
       match: {
         python: {all: [/def mask_card\(/, /MASK_PREFIX/, /mask_card\(case/], none: [/card_number/]},
         typescript: {
@@ -104,7 +105,7 @@ and the raw-card tool leaves no trace.
       id: 'audited-tool',
       title: 'Raw card data only through an audited read',
       detail:
-        "`audited_pan` resolves the case for the tenant and writes `store.audit(actor, PAN_SCOPE, case_id)` before it returns the PAN; a foreign case gets nothing. The starter returns any case's PAN and writes no audit row.",
+        "`audited_pan` resolves the case for the tenant and writes `store.audit(actor, PAN_SCOPE, case_id)` before it returns the PAN; a foreign case gets nothing, and when the audit row cannot be written the PAN is not returned. The starter returns any case's PAN and writes no audit row.",
       match: {
         python: {all: [/PAN_SCOPE/], order: [/def audited_pan\(/, /store\.case_of\(/, /store\.audit\(/]},
         typescript: {all: [/PAN_SCOPE/], order: [/function auditedPan\(/, /caseOf\(/, /audit\(actor/]},
@@ -405,13 +406,15 @@ func getCase(rw http.ResponseWriter, r *http.Request) {
 }
 
 // auditedPan is the raw card number for the review tooling, and whether there is one: scoped to
-// the tenant, one audit row per read.
+// the tenant, one audit row per read, and no PAN when the row could not be written.
 func auditedPan(ctx context.Context, actor, tenant, caseID string) (string, bool) {
 	c := store.CaseOf(ctx, tenant, caseID)
 	if c == nil {
 		return "", false
 	}
-	store.Audit(ctx, actor, panScope, caseID)
+	if err := store.Audit(ctx, actor, panScope, caseID); err != nil {
+		return "", false
+	}
 	return c.Pan, true
 }
 
@@ -616,11 +619,15 @@ CASE_1 = {"case_id": "case-1", "tenant": "t-1", "transaction_id": "tx-1", "accou
           "signals": ["prior_chargebacks", "new_account"], "card_attempts": 6, "device_accounts": 2, "pan": "4111111111114242"}
 CASE_2 = {"case_id": "case-2", "tenant": "t-2", "transaction_id": "tx-2", "account_ref": "acct-5", "score": 0.45, "band": "review",
           "signals": ["fallback"], "card_attempts": 1, "device_accounts": 1, "pan": "5500000000005100"}
+# A 19-digit card: the mask keeps the last four digits whatever the length.
+CASE_3 = {"case_id": "case-3", "tenant": "t-1", "transaction_id": "tx-3", "account_ref": "acct-9", "score": 0.5, "band": "review",
+          "signals": ["velocity"], "card_attempts": 2, "device_accounts": 1, "pan": "6011000990139420123"}
 
 
 def _seed():
     store.put_case(CASE_1)
     store.put_case(CASE_2)
+    store.put_case(CASE_3)
 
 
 def _read(ctx):
@@ -643,10 +650,13 @@ async def check_tenant_scope(ctx):
         foreign = await c.get("/v1/cases/case-1", headers={"X-Tenant-Id": "t-2"})
         missing = await c.get("/v1/cases/case-404", headers={"X-Tenant-Id": "t-2"})
         anonymous = await c.get("/v1/cases/case-1")
+        by_query = await c.get("/v1/cases/case-1?tenant=t-1&tenant_id=t-1")
     assert foreign.status_code == 404, f"tenant t-2 reading t-1's case answered {foreign.status_code}: {foreign.text}. A foreign case must be 404, like a missing one"
     assert "decline" not in foreign.text and "4242" not in foreign.text, f"the 404 for a foreign case leaks its content: {foreign.text}"
     assert missing.status_code == 404, f"a missing case answered {missing.status_code}"
+    assert foreign.text.replace("case-1", "<id>") == missing.text.replace("case-404", "<id>"), f"a foreign case answered {foreign.text} and a missing one {missing.text}: the difference tells a caller which ids exist in other tenants. Answer both the same"
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert by_query.status_code == 401, f"a read without X-Tenant-Id but with ?tenant=t-1 answered {by_query.status_code}: {by_query.text}. The tenant comes from the X-Tenant-Id header only, expected 401"
 
 
 async def check_masking(ctx):
@@ -655,6 +665,10 @@ async def check_masking(ctx):
     assert r.status_code == 200, f"GET /v1/cases/case-1 answered {r.status_code}: {r.text}"
     assert CASE_1["pan"] not in r.text, f"the case body carries the full card number: {r.text}. Mask it in case_view"
     assert r.json().get("card_ref") == "****4242", f"card_ref must be MASK_PREFIX plus the last four digits (****4242), got {r.json().get('card_ref')!r}"
+    async with _read(ctx) as c:
+        long_card = await c.get("/v1/cases/case-3", headers={"X-Tenant-Id": "t-1"})
+    assert long_card.status_code == 200 and CASE_3["pan"] not in long_card.text, f"GET /v1/cases/case-3 answered {long_card.status_code}: {long_card.text}"
+    assert long_card.json().get("card_ref") == "****0123", f"case-3's card has 19 digits: card_ref must be MASK_PREFIX plus its last four (****0123), got {long_card.json().get('card_ref')!r}"
 
 
 async def check_role_header(ctx):
@@ -674,16 +688,27 @@ def check_audited_tool(ctx):
     foreign = m.audited_pan("analyst-7", "t-2", "case-1")
     assert foreign is None, f"audited_pan for another tenant's case returned {foreign!r}: scope it with store.case_of"
     assert len(store.audit_log()) == 1, f"a refused read must not add a row, the audit log is {store.audit_log()}"
+    ctx.redis.delete("audit:pan")
+    ctx.redis.set("audit:pan", "not a list")
+    try:
+        unaudited = m.audited_pan("analyst-7", "t-1", "case-1")
+    except Exception:
+        unaudited = None
+    assert unaudited is None, f"the audit row could not be written (audit:pan is not a list) and audited_pan still returned {unaudited!r}: a PAN read that leaves no trace must not return the PAN"
 `,
     typescript: `const CASE_1 = {case_id: 'case-1', tenant: 't-1', transaction_id: 'tx-1', account_ref: 'acct-9', score: 0.82, band: 'decline',
   signals: ['prior_chargebacks', 'new_account'], card_attempts: 6, device_accounts: 2, pan: '4111111111114242'};
 const CASE_2 = {case_id: 'case-2', tenant: 't-2', transaction_id: 'tx-2', account_ref: 'acct-5', score: 0.45, band: 'review',
   signals: ['fallback'], card_attempts: 1, device_accounts: 1, pan: '5500000000005100'};
+// A 19-digit card: the mask keeps the last four digits whatever the length.
+const CASE_3 = {case_id: 'case-3', tenant: 't-1', transaction_id: 'tx-3', account_ref: 'acct-9', score: 0.5, band: 'review',
+  signals: ['velocity'], card_attempts: 2, device_accounts: 1, pan: '6011000990139420123'};
 
 async function seed(ctx) {
   const store = ctx.load('/support/fraud/store.ts');
   await store.putCase(CASE_1);
   await store.putCase(CASE_2);
+  await store.putCase(CASE_3);
   return store;
 }
 
@@ -704,10 +729,13 @@ export async function check_tenant_scope(ctx) {
   const foreign = await c.get('/v1/cases/case-1', {headers: {'X-Tenant-Id': 't-2'}});
   const missing = await c.get('/v1/cases/case-404', {headers: {'X-Tenant-Id': 't-2'}});
   const anonymous = await c.get('/v1/cases/case-1');
+  const byQuery = await c.get('/v1/cases/case-1?tenant=t-1&tenant_id=t-1');
   assert.equal(foreign.status, 404, \`tenant t-2 reading t-1's case answered \${foreign.status}: \${foreign.text}. A foreign case must be 404, like a missing one\`);
   assert(!foreign.text.includes('decline') && !foreign.text.includes('4242'), \`the 404 for a foreign case leaks its content: \${foreign.text}\`);
   assert.equal(missing.status, 404, \`a missing case answered \${missing.status}\`);
+  assert.equal(foreign.text.replaceAll('case-1', '<id>'), missing.text.replaceAll('case-404', '<id>'), \`a foreign case answered \${foreign.text} and a missing one \${missing.text}: the difference tells a caller which ids exist in other tenants. Answer both the same\`);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(byQuery.status, 401, \`a read without X-Tenant-Id but with ?tenant=t-1 answered \${byQuery.status}: \${byQuery.text}. The tenant comes from the X-Tenant-Id header only, expected 401\`);
 }
 
 export async function check_masking(ctx) {
@@ -717,6 +745,9 @@ export async function check_masking(ctx) {
   assert.equal(r.status, 200, \`GET /v1/cases/case-1 answered \${r.status}: \${r.text}\`);
   assert(!r.text.includes(CASE_1.pan), \`the case body carries the full card number: \${r.text}. Mask it in caseView\`);
   assert.equal(r.json().card_ref, '****4242', \`card_ref must be MASK_PREFIX plus the last four digits (****4242), got \${JSON.stringify(r.json().card_ref)}\`);
+  const longCard = await c.get('/v1/cases/case-3', {headers: {'X-Tenant-Id': 't-1'}});
+  assert(longCard.status === 200 && !longCard.text.includes(CASE_3.pan), \`GET /v1/cases/case-3 answered \${longCard.status}: \${longCard.text}\`);
+  assert.equal(longCard.json().card_ref, '****0123', \`case-3's card has 19 digits: card_ref must be MASK_PREFIX plus its last four (****0123), got \${JSON.stringify(longCard.json().card_ref)}\`);
 }
 
 export async function check_role_header(ctx) {
@@ -737,6 +768,15 @@ export async function check_audited_tool(ctx) {
   const foreign = await m.auditedPan('analyst-7', 't-2', 'case-1');
   assert.equal(foreign, null, \`auditedPan for another tenant's case returned \${JSON.stringify(foreign)}: scope it with caseOf\`);
   assert.equal((await store.auditLog()).length, 1, 'a refused read must not add an audit row');
+  ctx.redis.del('audit:pan');
+  ctx.redis.set('audit:pan', 'not a list');
+  let unaudited = null;
+  try {
+    unaudited = await m.auditedPan('analyst-7', 't-1', 'case-1');
+  } catch {
+    unaudited = null;
+  }
+  assert.equal(unaudited, null, \`the audit row could not be written (audit:pan is not a list) and auditedPan still returned \${JSON.stringify(unaudited)}: a PAN read that leaves no trace must not return the PAN\`);
 }
 `,
     go: `package main
@@ -752,27 +792,31 @@ import (
 )
 
 var (
-	readBg = context.Background()
-	case1  = store.Case{CaseID: "case-1", Tenant: "t-1", TransactionID: "tx-1", AccountRef: "acct-9", Score: 0.82, Band: "decline",
+	harnessBg    = context.Background()
+	harnessCase1 = store.Case{CaseID: "case-1", Tenant: "t-1", TransactionID: "tx-1", AccountRef: "acct-9", Score: 0.82, Band: "decline",
 		Signals: []string{"prior_chargebacks", "new_account"}, CardAttempts: 6, DeviceAccounts: 2, Pan: "4111111111114242"}
-	case2 = store.Case{CaseID: "case-2", Tenant: "t-2", TransactionID: "tx-2", AccountRef: "acct-5", Score: 0.45, Band: "review",
+	harnessCase2 = store.Case{CaseID: "case-2", Tenant: "t-2", TransactionID: "tx-2", AccountRef: "acct-5", Score: 0.45, Band: "review",
 		Signals: []string{"fallback"}, CardAttempts: 1, DeviceAccounts: 1, Pan: "5500000000005100"}
+	// A 19-digit card: the mask keeps the last four digits whatever the length.
+	harnessCase3 = store.Case{CaseID: "case-3", Tenant: "t-1", TransactionID: "tx-3", AccountRef: "acct-9", Score: 0.5, Band: "review",
+		Signals: []string{"velocity"}, CardAttempts: 2, DeviceAccounts: 1, Pan: "6011000990139420123"}
 )
 
-func seedCases() {
-	store.PutCase(readBg, case1)
-	store.PutCase(readBg, case2)
+func harnessSeedCases() {
+	store.PutCase(harnessBg, harnessCase1)
+	store.PutCase(harnessBg, harnessCase2)
+	store.PutCase(harnessBg, harnessCase3)
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
-	seedCases()
+func harnessReadAPI(ctx *harness.Ctx) *harness.HTTP {
+	harnessSeedCases()
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 func CheckRouteParam(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessReadAPI(ctx)
 	r := c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "GET /v1/cases/case-1 for its own tenant (%s)", r.Text())
 	var body struct {
@@ -789,83 +833,105 @@ func CheckRouteParam(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessReadAPI(ctx)
 	foreign := c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-2")
 	missing := c.Get("/v1/cases/case-404", "X-Tenant-Id", "t-2")
 	anonymous := c.Get("/v1/cases/case-1")
+	byQuery := c.Get("/v1/cases/case-1?tenant=t-1&tenant_id=t-1")
 	ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's case must be 404, like a missing one (%s)", foreign.Text())
 	ctx.Assert(!strings.Contains(foreign.Text(), "decline") && !strings.Contains(foreign.Text(), "4242"), "the 404 for a foreign case leaks its content: %s", foreign.Text())
 	ctx.Equal(missing.Status, 404, "a missing case")
+	ctx.Assert(strings.ReplaceAll(foreign.Text(), "case-1", "<id>") == strings.ReplaceAll(missing.Text(), "case-404", "<id>"),
+		"a foreign case answered %q and a missing one %q: the difference tells a caller which ids exist in other tenants. Answer both the same", foreign.Text(), missing.Text())
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(byQuery.Status, 401, "a read without X-Tenant-Id but with ?tenant=t-1 (the tenant comes from the X-Tenant-Id header only)")
 }
 
 func CheckMasking(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessReadAPI(ctx)
 	r := c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "GET /v1/cases/case-1 (%s)", r.Text())
-	ctx.Assert(!strings.Contains(r.Text(), case1.Pan), "the case body carries the full card number: %s. Mask it in caseView", r.Text())
+	ctx.Assert(!strings.Contains(r.Text(), harnessCase1.Pan), "the case body carries the full card number: %s. Mask it in caseView", r.Text())
 	var body struct {
 		CardRef string \`json:"card_ref"\`
 	}
 	r.Decode(&body)
 	ctx.Equal(body.CardRef, "****4242", "card_ref must be maskPrefix plus the last four digits")
+	longCard := c.Get("/v1/cases/case-3", "X-Tenant-Id", "t-1")
+	ctx.Assert(longCard.Status == 200 && !strings.Contains(longCard.Text(), harnessCase3.Pan), "GET /v1/cases/case-3 answered %d: %s", longCard.Status, longCard.Text())
+	body.CardRef = ""
+	longCard.Decode(&body)
+	ctx.Equal(body.CardRef, "****0123", "case-3's card has 19 digits: card_ref must be maskPrefix plus its last four")
 }
 
 func CheckRoleHeader(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessReadAPI(ctx)
 	r := c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-1", "X-Role", "admin")
 	ctx.Equal(r.Status, 200, "GET /v1/cases/case-1 with X-Role: admin (%s)", r.Text())
-	ctx.Assert(!strings.Contains(r.Text(), case1.Pan), "a caller who sent X-Role: admin got the card number: %s. The client writes that header; raw card data goes through auditedPan only", r.Text())
+	ctx.Assert(!strings.Contains(r.Text(), harnessCase1.Pan), "a caller who sent X-Role: admin got the card number: %s. The client writes that header; raw card data goes through auditedPan only", r.Text())
 }
 
 func CheckAuditedTool(ctx *harness.Ctx) {
-	seedCases()
-	pan, ok := auditedPan(readBg, "analyst-7", "t-1", "case-1")
-	ctx.Assert(ok && pan == case1.Pan, "auditedPan for the case's own tenant returned %q, %v; expected the PAN", pan, ok)
-	log := store.AuditLog(readBg)
+	harnessSeedCases()
+	pan, ok := auditedPan(harnessBg, "analyst-7", "t-1", "case-1")
+	ctx.Assert(ok && pan == harnessCase1.Pan, "auditedPan for the case's own tenant returned %q, %v; expected the PAN", pan, ok)
+	log := store.AuditLog(harnessBg)
 	ctx.Assert(len(log) == 1 && log[0] == store.AuditEntry{Actor: "analyst-7", Scope: "pan:read", CaseID: "case-1"},
 		"reading a PAN must write one audit row (actor, panScope, case_id) first, the audit log is %+v", log)
-	foreign, ok := auditedPan(readBg, "analyst-7", "t-2", "case-1")
+	foreign, ok := auditedPan(harnessBg, "analyst-7", "t-2", "case-1")
 	ctx.Assert(!ok && foreign == "", "auditedPan for another tenant's case returned %q: scope it with store.CaseOf", foreign)
-	ctx.Equal(len(store.AuditLog(readBg)), 1, "a refused read must not add an audit row; the rows")
+	ctx.Equal(len(store.AuditLog(harnessBg)), 1, "a refused read must not add an audit row; the rows")
+	ctx.Redis.Do("DEL", "audit:pan")
+	ctx.Redis.Set("audit:pan", "not a list")
+	unaudited, ok := auditedPan(harnessBg, "analyst-7", "t-1", "case-1")
+	ctx.Assert(!ok && unaudited == "", "the audit row could not be written (audit:pan is not a list) and auditedPan still returned %q: a PAN read that leaves no trace must not return the PAN", unaudited)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
 
 #include "fraud/store.h"
 
 namespace {
 
-const store::Case kCase1{"case-1", "t-1", "tx-1", "acct-9", 0.82, "decline", {"prior_chargebacks", "new_account"}, 6, 2, "4111111111114242"};
-const store::Case kCase2{"case-2", "t-2", "tx-2", "acct-5", 0.45, "review", {"fallback"}, 1, 1, "5500000000005100"};
+const store::Case kHarnessCase1{"case-1", "t-1", "tx-1", "acct-9", 0.82, "decline", {"prior_chargebacks", "new_account"}, 6, 2, "4111111111114242"};
+const store::Case kHarnessCase2{"case-2", "t-2", "tx-2", "acct-5", 0.45, "review", {"fallback"}, 1, 1, "5500000000005100"};
+// A 19-digit card: the mask keeps the last four digits whatever the length.
+const store::Case kHarnessCase3{"case-3", "t-1", "tx-3", "acct-9", 0.5, "review", {"velocity"}, 2, 1, "6011000990139420123"};
 
-void seedCases() {
-  store::putCase(kCase1);
-  store::putCase(kCase2);
+void harnessSeedCases() {
+  store::putCase(kHarnessCase1);
+  store::putCase(kHarnessCase2);
+  store::putCase(kHarnessCase3);
 }
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP harnessReadAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
-  seedCases();
+  harnessSeedCases();
   register_routes(*svr);
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json harnessBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+
+std::string harnessReplaceAll(std::string text, const std::string& from, const std::string& to) {
+  for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) text.replace(at, from.size(), to);
+  return text;
+}
 
 }  // namespace
 
 void CheckRouteParam(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
+  auto c = harnessReadAPI(ctx);
   const auto r = c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-1");
   ctx.Equal(r.Status, 200, "GET /v1/cases/case-1 for its own tenant (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = harnessBody(r);
   const nlohmann::json velocity = {{"card_attempts", 6}, {"device_accounts", 2}};
   ctx.Assert(body.is_object() && body.value("case_id", "") == "case-1" && body.value("score", 0.0) == 0.82 && body.value("band", "") == "decline" &&
                  body.value("signals", nlohmann::json::array()) == nlohmann::json({"prior_chargebacks", "new_account"}) && body.value("velocity", nlohmann::json()) == velocity,
@@ -873,42 +939,60 @@ void CheckRouteParam(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
+  auto c = harnessReadAPI(ctx);
   const auto foreign = c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-2");
   const auto missing = c.Get("/v1/cases/case-404", "X-Tenant-Id", "t-2");
   const auto anonymous = c.Get("/v1/cases/case-1");
+  const auto byQuery = c.Get("/v1/cases/case-1?tenant=t-1&tenant_id=t-1");
   ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's case must be 404, like a missing one (%s)", foreign.Text());
   ctx.Assert(foreign.Text().find("decline") == std::string::npos && foreign.Text().find("4242") == std::string::npos, "the 404 for a foreign case leaks its content: %s", foreign.Text());
   ctx.Equal(missing.Status, 404, "a missing case");
+  ctx.Assert(harnessReplaceAll(foreign.Text(), "case-1", "<id>") == harnessReplaceAll(missing.Text(), "case-404", "<id>"),
+             "a foreign case answered %q and a missing one %q: the difference tells a caller which ids exist in other tenants. Answer both the same", foreign.Text(), missing.Text());
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(byQuery.Status, 401, "a read without X-Tenant-Id but with ?tenant=t-1 (the tenant comes from the X-Tenant-Id header only)");
 }
 
 void CheckMasking(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
+  auto c = harnessReadAPI(ctx);
   const auto r = c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-1");
   ctx.Equal(r.Status, 200, "GET /v1/cases/case-1 (%s)", r.Text());
-  ctx.Assert(r.Text().find(kCase1.pan) == std::string::npos, "the case body carries the full card number: %s. Mask it in caseView", r.Text());
-  ctx.Equal(bodyOf(r).value("card_ref", ""), "****4242", "card_ref must be kMaskPrefix plus the last four digits");
+  ctx.Assert(r.Text().find(kHarnessCase1.pan) == std::string::npos, "the case body carries the full card number: %s. Mask it in caseView", r.Text());
+  ctx.Equal(harnessBody(r).value("card_ref", ""), "****4242", "card_ref must be kMaskPrefix plus the last four digits");
+  const auto longCard = c.Get("/v1/cases/case-3", "X-Tenant-Id", "t-1");
+  ctx.Assert(longCard.Status == 200 && longCard.Text().find(kHarnessCase3.pan) == std::string::npos, "GET /v1/cases/case-3 answered %d: %s", longCard.Status, longCard.Text());
+  const auto longBody = harnessBody(longCard);
+  ctx.Equal(longBody.is_object() ? longBody.value("card_ref", "") : "", "****0123", "case-3's card has 19 digits: card_ref must be kMaskPrefix plus its last four");
 }
 
 void CheckRoleHeader(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
+  auto c = harnessReadAPI(ctx);
   const auto r = c.Get("/v1/cases/case-1", "X-Tenant-Id", "t-1", "X-Role", "admin");
   ctx.Equal(r.Status, 200, "GET /v1/cases/case-1 with X-Role: admin (%s)", r.Text());
-  ctx.Assert(r.Text().find(kCase1.pan) == std::string::npos,
+  ctx.Assert(r.Text().find(kHarnessCase1.pan) == std::string::npos,
              "a caller who sent X-Role: admin got the card number: %s. The client writes that header; raw card data goes through auditedPan only", r.Text());
 }
 
 void CheckAuditedTool(harness::Ctx& ctx) {
-  seedCases();
+  harnessSeedCases();
   const auto pan = auditedPan("analyst-7", "t-1", "case-1");
-  ctx.Equal(pan, std::optional<std::string>(kCase1.pan), "auditedPan for the case's own tenant must return the PAN");
+  ctx.Equal(pan, std::optional<std::string>(kHarnessCase1.pan), "auditedPan for the case's own tenant must return the PAN");
   const auto log = store::auditLog();
   ctx.Assert(log.size() == 1 && log[0].actor == "analyst-7" && log[0].scope == "pan:read" && log[0].case_id == "case-1",
              "reading a PAN must write one audit row (actor, kPanScope, case_id) first, the audit log has %d row(s)", log.size());
   const auto foreign = auditedPan("analyst-7", "t-2", "case-1");
   ctx.Assert(!foreign, "auditedPan for another tenant's case returned %s: scope it with store::caseOf", foreign.value_or(""));
   ctx.Equal(store::auditLog().size(), 1, "a refused read must not add an audit row; the rows");
+  ctx.Redis.Del("audit:pan");
+  ctx.Redis.Set("audit:pan", "not a list");
+  std::optional<std::string> unaudited;
+  try {
+    unaudited = auditedPan("analyst-7", "t-1", "case-1");
+  } catch (const std::exception&) {
+    unaudited.reset();
+  }
+  ctx.Assert(!unaudited, "the audit row could not be written (audit:pan is not a list) and auditedPan still returned %s: a PAN read that leaves no trace must not return the PAN",
+             unaudited.value_or(""));
 }
 `,
   },

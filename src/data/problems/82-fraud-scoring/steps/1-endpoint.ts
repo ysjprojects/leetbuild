@@ -71,7 +71,7 @@ transaction.
       id: 'account-404',
       title: 'An unknown account is 404 before any model call',
       detail:
-        'The account is read (`store.get_account`) before anything else; a miss answers **404**, calls no model and stores no decision.',
+        'The account is read (`store.get_account`) before anything else; a miss answers **404**, even for a transaction id already in the store, calls no model and stores no decision.',
       match: {
         python: {
           all: [/store\.get_account\(/, /\b404\b/],
@@ -90,7 +90,7 @@ transaction.
       id: 'replay-dedupe',
       title: 'A replayed transaction id answers the stored decision',
       detail:
-        '`store.get_decision(transaction_id)` is read before the model is called and answers a replay; only a first sighting is scored and saved.',
+        '`store.get_decision(transaction_id)` is read before the model is called and answers a replay, including a decision stored before this process started; only a first sighting is scored and saved.',
       match: {
         python: {all: [/store\.get_decision\(/], order: [/store\.get_decision\(/, /model\.score_transaction\(/]},
         typescript: {all: [/getDecision\(body/], order: [/getDecision\(body/, /scoreTransaction\(/]},
@@ -488,6 +488,8 @@ from fraud.risk_model import ModelPeer
 
 ESTABLISHED = {"account_ref": "acct-1", "tenant": "t-1", "age_days": 400, "chargebacks": 0}
 RISKY = {"account_ref": "acct-9", "tenant": "t-1", "age_days": 12, "chargebacks": 2}
+# A decision another replica stored before this process started.
+EARLIER = {"transaction_id": "tx-8", "account_ref": "acct-1", "score": 0.55, "band": "review", "fallback": True, "model_version": "rules-7", "feature_version": "fx-3"}
 
 
 def _api(ctx):
@@ -513,7 +515,7 @@ async def check_route(ctx):
 
 async def check_server_features(ctx):
     async with _api(ctx) as c:
-        r = await _score(c, "tx-7", account_ref="acct-9", features={"feature_version": "fx-3", "account_age_days": 3650, "prior_chargebacks": 0}, declared_risk=0.01)
+        r = await _score(c, "tx-7", account_ref="acct-9", features={"feature_version": "fx-1", "account_age_days": 3650, "prior_chargebacks": 0}, declared_risk=0.01)
     assert r.status_code == 200, f"POST /v1/scores for acct-9 answered {r.status_code}: {r.text}"
     calls = ctx.grpc.calls_to("Score")
     assert len(calls) == 1, f"one transaction must cost one model call, it cost {len(calls)}"
@@ -526,15 +528,19 @@ async def check_server_features(ctx):
 
 
 async def check_account_404(ctx):
+    store.save_decision(EARLIER)
     async with _api(ctx) as c:
         r = await _score(c, "tx-3", account_ref="acct-404")
+        replayed = await _score(c, "tx-8", account_ref="acct-404")
     assert r.status_code == 404, f"an account the scorer has never seen answered {r.status_code}: {r.text}, expected 404"
     calls = len(ctx.grpc.calls_to("Score"))
     assert calls == 0, f"the model was asked {calls} time(s) about an unknown account: look the account up before any model work"
     assert store.get_decision("tx-3") is None, f"a decision was stored for an unknown account: {store.get_decision('tx-3')}"
+    assert replayed.status_code == 404, f"an unknown account posting a transaction_id already in the store answered {replayed.status_code}: {replayed.text}, expected 404: look the account up before anything else"
 
 
 async def check_replay_dedupe(ctx):
+    store.save_decision(EARLIER)
     async with _api(ctx) as c:
         first = await _score(c, "tx-5")
         assert first.status_code == 200, f"the first POST answered {first.status_code}: {first.text}"
@@ -543,8 +549,11 @@ async def check_replay_dedupe(ctx):
         calls = len(ctx.grpc.calls_to("Score"))
         assert calls == 1, f"a retried transaction_id was scored again ({calls} model calls): answer store.get_decision before calling the model"
         other = await _score(c, "tx-6")
-    assert other.status_code == 200 and len(ctx.grpc.calls_to("Score")) == 2, "a new transaction_id must be scored"
+        earlier = await _score(c, "tx-8")
+    assert other.status_code == 200 and len(ctx.grpc.calls_to("Score")) >= 2, "a new transaction_id must be scored"
     assert store.get_decision("tx-5") == first.json(), f"the stored decision for tx-5 is {store.get_decision('tx-5')}, the scorer answered {first.json()}"
+    assert earlier.status_code == 200 and earlier.json() == EARLIER, f"tx-8 was decided before this process started (store.get_decision answers {EARLIER}), the scorer answered {earlier.text}: a replay is answered from the store, not from this process's memory"
+    assert len(ctx.grpc.calls_to("Score")) == 2, "a transaction_id already in the store was scored again"
 `,
     typescript: `function api(ctx) {
   const {modelPeer} = ctx.load('/support/fraud/risk_model.ts');
@@ -556,7 +565,11 @@ async def check_replay_dedupe(ctx):
 async function seed(store): Promise<void> {
   await store.putAccount({account_ref: 'acct-1', tenant: 't-1', age_days: 400, chargebacks: 0});
   await store.putAccount({account_ref: 'acct-9', tenant: 't-1', age_days: 12, chargebacks: 2});
+  // A decision another replica stored before this process started.
+  await store.saveDecision(EARLIER);
 }
+
+const EARLIER = {transaction_id: 'tx-8', account_ref: 'acct-1', score: 0.55, band: 'review', fallback: true, model_version: 'rules-7', feature_version: 'fx-3'};
 
 const score = (c, tx: string, accountRef = 'acct-1', extra = {}) =>
   c.post('/v1/scores', {json: {transaction_id: tx, account_ref: accountRef, amount_cents: 4200, ...extra}});
@@ -575,7 +588,7 @@ export async function check_route(ctx) {
 export async function check_server_features(ctx) {
   const {store, c} = api(ctx);
   await seed(store);
-  const r = await score(c, 'tx-7', 'acct-9', {features: {feature_version: 'fx-3', account_age_days: 3650, prior_chargebacks: 0}, declared_risk: 0.01});
+  const r = await score(c, 'tx-7', 'acct-9', {features: {feature_version: 'fx-1', account_age_days: 3650, prior_chargebacks: 0}, declared_risk: 0.01});
   assert.equal(r.status, 200, \`POST /v1/scores for acct-9 answered \${r.status}: \${r.text}\`);
   const calls = ctx.grpc.callsTo('Score');
   assert.equal(calls.length, 1, 'one transaction must cost one model call');
@@ -595,6 +608,8 @@ export async function check_account_404(ctx) {
   const calls = ctx.grpc.callsTo('Score').length;
   assert.equal(calls, 0, \`the model was asked \${calls} time(s) about an unknown account: look the account up before any model work\`);
   assert.equal(await store.getDecision('tx-3'), null, 'a decision was stored for an unknown account');
+  const replayed = await score(c, 'tx-8', 'acct-404');
+  assert.equal(replayed.status, 404, \`an unknown account posting a transaction_id already in the store answered \${replayed.status}: \${replayed.text}, expected 404: look the account up before anything else\`);
 }
 
 export async function check_replay_dedupe(ctx) {
@@ -609,6 +624,10 @@ export async function check_replay_dedupe(ctx) {
   const other = await score(c, 'tx-6');
   assert(other.status === 200 && ctx.grpc.callsTo('Score').length === 2, 'a new transaction_id must be scored');
   assert.deepStrictEqual(await store.getDecision('tx-5'), first.json(), 'the stored decision for tx-5 must be what the scorer answered');
+  const earlier = await score(c, 'tx-8');
+  assert(earlier.status === 200, \`the POST for tx-8 answered \${earlier.status}: \${earlier.text}\`);
+  assert.deepStrictEqual(earlier.json(), EARLIER, \`tx-8 was decided before this process started (getDecision answers \${JSON.stringify(EARLIER)}), the scorer answered \${earlier.text}: a replay is answered from the store, not from this process's memory\`);
+  assert.equal(ctx.grpc.callsTo('Score').length, 2, 'a transaction_id already in the store was scored again');
 }
 `,
     go: `package main
@@ -624,18 +643,22 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var harnessBg = context.Background()
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+// harnessEarlier is a decision another replica stored before this process started.
+var harnessEarlier = store.Decision{TransactionID: "tx-8", AccountRef: "acct-1", Score: 0.55, Band: "review", Fallback: true, ModelVersion: "rules-7", FeatureVersion: "fx-3"}
+
+func harnessAPI(ctx *harness.Ctx) *harness.HTTP {
 	pb.RegisterModelServer(ctx.GRPC.Server(""), riskmodel.Peer{})
-	store.PutAccount(apiBg, store.Account{AccountRef: "acct-1", Tenant: "t-1", AgeDays: 400, Chargebacks: 0})
-	store.PutAccount(apiBg, store.Account{AccountRef: "acct-9", Tenant: "t-1", AgeDays: 12, Chargebacks: 2})
+	store.PutAccount(harnessBg, store.Account{AccountRef: "acct-1", Tenant: "t-1", AgeDays: 400, Chargebacks: 0})
+	store.PutAccount(harnessBg, store.Account{AccountRef: "acct-9", Tenant: "t-1", AgeDays: 12, Chargebacks: 2})
+	store.SaveDecision(harnessBg, harnessEarlier)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func askScore(c *harness.HTTP, tx, accountRef string, extra map[string]any) *harness.Response {
+func harnessAskScore(c *harness.HTTP, tx, accountRef string, extra map[string]any) *harness.Response {
 	body := map[string]any{"transaction_id": tx, "account_ref": accountRef, "amount_cents": 4200}
 	for k, v := range extra {
 		body[k] = v
@@ -643,24 +666,24 @@ func askScore(c *harness.HTTP, tx, accountRef string, extra map[string]any) *har
 	return c.Post("/v1/scores", body)
 }
 
-func decisionIn(r *harness.Response) store.Decision {
+func harnessDecisionIn(r *harness.Response) store.Decision {
 	var d store.Decision
 	r.Decode(&d)
 	return d
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := askScore(c, "tx-1", "acct-1", nil)
+	c := harnessAPI(ctx)
+	r := harnessAskScore(c, "tx-1", "acct-1", nil)
 	ctx.Equal(r.Status, 200, "POST /v1/scores for acct-1 (%s)", r.Text())
-	d := decisionIn(r)
+	d := harnessDecisionIn(r)
 	ctx.Assert(d.TransactionID == "tx-1" && (d.Band == "approve" || d.Band == "review" || d.Band == "decline"), "the decision must carry the transaction id and a band, got %s", r.Text())
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 1, "one transaction must cost one model call; the calls")
 }
 
 func CheckServerFeatures(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := askScore(c, "tx-7", "acct-9", map[string]any{"features": map[string]any{"feature_version": "fx-3", "account_age_days": 3650, "prior_chargebacks": 0}, "declared_risk": 0.01})
+	c := harnessAPI(ctx)
+	r := harnessAskScore(c, "tx-7", "acct-9", map[string]any{"features": map[string]any{"feature_version": "fx-1", "account_age_days": 3650, "prior_chargebacks": 0}, "declared_risk": 0.01})
 	ctx.Equal(r.Status, 200, "POST /v1/scores for acct-9 (%s)", r.Text())
 	calls := ctx.GRPC.CallsTo("Score", "")
 	ctx.Equal(len(calls), 1, "one transaction must cost one model call; the calls")
@@ -668,30 +691,35 @@ func CheckServerFeatures(ctx *harness.Ctx) {
 	ctx.Assert(sent.GetFeatureVersion() == "fx-3" && sent.GetAccountAgeDays() == 12 && sent.GetPriorChargebacks() == 2 && sent.GetAmountCents() == 4200,
 		"the model was asked about feature_version %q, age %d, chargebacks %d, amount %d: the numbers the caller sent. acct-9 is 12 days old with 2 chargebacks: derive the vector from the account store",
 		sent.GetFeatureVersion(), sent.GetAccountAgeDays(), sent.GetPriorChargebacks(), sent.GetAmountCents())
-	d := decisionIn(r)
+	d := harnessDecisionIn(r)
 	ctx.Equal(d.Band, "decline", "acct-9 with its real history must be declined; the band")
 	ctx.Equal(d.FeatureVersion, "fx-3", "the decision must carry FeatureVersion")
 }
 
 func CheckAccount404(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := askScore(c, "tx-3", "acct-404", nil)
+	c := harnessAPI(ctx)
+	r := harnessAskScore(c, "tx-3", "acct-404", nil)
 	ctx.Equal(r.Status, 404, "an account the scorer has never seen (%s)", r.Text())
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 0, "the model was asked about an unknown account: look the account up before any model work; the calls")
-	ctx.Assert(store.GetDecision(apiBg, "tx-3") == nil, "a decision was stored for an unknown account: %+v", store.GetDecision(apiBg, "tx-3"))
+	ctx.Assert(store.GetDecision(harnessBg, "tx-3") == nil, "a decision was stored for an unknown account: %+v", store.GetDecision(harnessBg, "tx-3"))
+	replayed := harnessAskScore(c, "tx-8", "acct-404", nil)
+	ctx.Equal(replayed.Status, 404, "an unknown account posting a transaction_id already in the store (%s): look the account up before anything else", replayed.Text())
 }
 
 func CheckReplayDedupe(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := askScore(c, "tx-5", "acct-1", nil)
+	c := harnessAPI(ctx)
+	first := harnessAskScore(c, "tx-5", "acct-1", nil)
 	ctx.Equal(first.Status, 200, "the first POST (%s)", first.Text())
-	replay := askScore(c, "tx-5", "acct-1", nil)
-	ctx.Assert(replay.Status == 200 && decisionIn(replay) == decisionIn(first), "a replay must answer the stored decision: first %s, replay %s", first.Text(), replay.Text())
+	replay := harnessAskScore(c, "tx-5", "acct-1", nil)
+	ctx.Assert(replay.Status == 200 && harnessDecisionIn(replay) == harnessDecisionIn(first), "a replay must answer the stored decision: first %s, replay %s", first.Text(), replay.Text())
 	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 1, "a retried transaction_id was scored again: answer store.GetDecision before calling the model; the calls")
-	other := askScore(c, "tx-6", "acct-1", nil)
+	other := harnessAskScore(c, "tx-6", "acct-1", nil)
 	ctx.Assert(other.Status == 200 && len(ctx.GRPC.CallsTo("Score", "")) == 2, "a new transaction_id must be scored")
-	stored := store.GetDecision(apiBg, "tx-5")
-	ctx.Assert(stored != nil && *stored == decisionIn(first), "the stored decision for tx-5 is %+v, the scorer answered %s", stored, first.Text())
+	stored := store.GetDecision(harnessBg, "tx-5")
+	ctx.Assert(stored != nil && *stored == harnessDecisionIn(first), "the stored decision for tx-5 is %+v, the scorer answered %s", stored, first.Text())
+	earlier := harnessAskScore(c, "tx-8", "acct-1", nil)
+	ctx.Assert(earlier.Status == 200 && harnessDecisionIn(earlier) == harnessEarlier, "tx-8 was decided before this process started (store.GetDecision answers %+v), the scorer answered %s: a replay is answered from the store, not from this process's memory", harnessEarlier, earlier.Text())
+	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 2, "a transaction_id already in the store was scored again; the calls")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -706,7 +734,11 @@ func CheckReplayDedupe(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+// A decision another replica stored before this process started.
+const nlohmann::json kHarnessEarlier = {{"transaction_id", "tx-8"}, {"account_ref", "acct-1"}, {"score", 0.55}, {"band", "review"},
+                                        {"fallback", true}, {"model_version", "rules-7"}, {"feature_version", "fx-3"}};
+
+harness::HTTP harnessAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   static riskmodel::Peer* peer = nullptr;
   delete svr;
@@ -716,26 +748,27 @@ harness::HTTP api(harness::Ctx& ctx) {
   ctx.GRPC.Server("")->RegisterService(peer);
   store::putAccount({"acct-1", "t-1", 400, 0});
   store::putAccount({"acct-9", "t-1", 12, 2});
+  store::saveDecision(kHarnessEarlier);
   register_routes(*svr);
   return ctx.HTTP(*svr);
 }
 
-harness::Response askScore(harness::HTTP& c, const std::string& tx, const std::string& account_ref,
-                           const nlohmann::json& extra = nlohmann::json::object()) {
+harness::Response harnessAskScore(harness::HTTP& c, const std::string& tx, const std::string& account_ref,
+                                  const nlohmann::json& extra = nlohmann::json::object()) {
   nlohmann::json body = {{"transaction_id", tx}, {"account_ref", account_ref}, {"amount_cents", 4200}};
   body.update(extra);
   return c.Post("/v1/scores", body.dump(), "Content-Type", "application/json");
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json harnessBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = askScore(c, "tx-1", "acct-1");
+  auto c = harnessAPI(ctx);
+  const auto r = harnessAskScore(c, "tx-1", "acct-1");
   ctx.Equal(r.Status, 200, "POST /v1/scores for acct-1 (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = harnessBody(r);
   const std::string band = body.is_object() ? body.value("band", "") : "";
   ctx.Assert(body.is_object() && body.value("transaction_id", "") == "tx-1" && (band == "approve" || band == "review" || band == "decline"),
              "the decision must carry the transaction id and a band, got %s", r.Text());
@@ -743,9 +776,9 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckServerFeatures(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = askScore(c, "tx-7", "acct-9",
-                          {{"features", {{"feature_version", "fx-3"}, {"account_age_days", 3650}, {"prior_chargebacks", 0}}}, {"declared_risk", 0.01}});
+  auto c = harnessAPI(ctx);
+  const auto r = harnessAskScore(c, "tx-7", "acct-9",
+                                 {{"features", {{"feature_version", "fx-1"}, {"account_age_days", 3650}, {"prior_chargebacks", 0}}}, {"declared_risk", 0.01}});
   ctx.Equal(r.Status, 200, "POST /v1/scores for acct-9 (%s)", r.Text());
   const auto calls = ctx.GRPC.CallsTo("Score");
   ctx.Equal(calls.size(), 1, "one transaction must cost one model call; the calls");
@@ -753,30 +786,37 @@ void CheckServerFeatures(harness::Ctx& ctx) {
   ctx.Assert(sent.feature_version() == "fx-3" && sent.account_age_days() == 12 && sent.prior_chargebacks() == 2 && sent.amount_cents() == 4200,
              "the model was asked about feature_version %q, age %d, chargebacks %d, amount %d: the numbers the caller sent. acct-9 is 12 days old with 2 chargebacks: derive the vector from the account store",
              sent.feature_version(), sent.account_age_days(), sent.prior_chargebacks(), sent.amount_cents());
-  const auto body = bodyOf(r);
+  const auto body = harnessBody(r);
   ctx.Equal(body.value("band", ""), "decline", "acct-9 with its real history must be declined; the band");
   ctx.Equal(body.value("feature_version", ""), "fx-3", "the decision must carry kFeatureVersion");
 }
 
 void CheckAccount404(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = askScore(c, "tx-3", "acct-404");
+  auto c = harnessAPI(ctx);
+  const auto r = harnessAskScore(c, "tx-3", "acct-404");
   ctx.Equal(r.Status, 404, "an account the scorer has never seen (%s)", r.Text());
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 0, "the model was asked about an unknown account: look the account up before any model work; the calls");
   ctx.Assert(!store::getDecision("tx-3"), "a decision was stored for an unknown account");
+  const auto replayed = harnessAskScore(c, "tx-8", "acct-404");
+  ctx.Equal(replayed.Status, 404, "an unknown account posting a transaction_id already in the store (%s): look the account up before anything else", replayed.Text());
 }
 
 void CheckReplayDedupe(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = askScore(c, "tx-5", "acct-1");
+  auto c = harnessAPI(ctx);
+  const auto first = harnessAskScore(c, "tx-5", "acct-1");
   ctx.Equal(first.Status, 200, "the first POST (%s)", first.Text());
-  const auto replay = askScore(c, "tx-5", "acct-1");
-  ctx.Assert(replay.Status == 200 && bodyOf(replay) == bodyOf(first), "a replay must answer the stored decision: first %s, replay %s", first.Text(), replay.Text());
+  const auto replay = harnessAskScore(c, "tx-5", "acct-1");
+  ctx.Assert(replay.Status == 200 && harnessBody(replay) == harnessBody(first), "a replay must answer the stored decision: first %s, replay %s", first.Text(), replay.Text());
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 1, "a retried transaction_id was scored again: answer store::getDecision before calling the model; the calls");
-  const auto other = askScore(c, "tx-6", "acct-1");
+  const auto other = harnessAskScore(c, "tx-6", "acct-1");
   ctx.Assert(other.Status == 200 && ctx.GRPC.CallsTo("Score").size() == 2, "a new transaction_id must be scored");
   const auto stored = store::getDecision("tx-5");
-  ctx.Assert(stored && *stored == bodyOf(first), "the stored decision for tx-5 is %s, the scorer answered %s", stored ? stored->dump() : "nothing", first.Text());
+  ctx.Assert(stored && *stored == harnessBody(first), "the stored decision for tx-5 is %s, the scorer answered %s", stored ? stored->dump() : "nothing", first.Text());
+  const auto earlier = harnessAskScore(c, "tx-8", "acct-1");
+  ctx.Assert(earlier.Status == 200 && harnessBody(earlier) == kHarnessEarlier,
+             "tx-8 was decided before this process started (store::getDecision answers %s), the scorer answered %s: a replay is answered from the store, not from this process's memory",
+             kHarnessEarlier.dump(), earlier.Text());
+  ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 2, "a transaction_id already in the store was scored again; the calls");
 }
 `,
   },

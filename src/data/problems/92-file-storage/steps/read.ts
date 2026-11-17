@@ -12,7 +12,8 @@ export const readStep: Step = {
 **Starting point.** The starter registers \`GET /v1/files/{file_id}\`: it requires \`X-Tenant-Id\`,
 looks the file up with \`store.find_file\`, answers \`{file_id, url}\` with the CDN path
 \`{CDN}/f/{file_id}\`, and produces a \`download_issued\` record (file id and tenant) to \`file.audit\`
-before answering. It serves the demo and hides three flaws.
+before answering, failing the request when the record is not delivered. It serves the demo and hides
+three flaws.
 
 **Failure mode the checks target.** A tenant who guesses an id downloads another tenant's file, or one
 that was deleted; the link works for whoever holds it, a browser history or a proxy log included, with
@@ -23,7 +24,8 @@ no end; and the audit trail says which tenant asked but not who.
 - The URL is \`store.sign_url(file_id, tenant, expires_at)\` with \`expires_at\` = now +
   \`URL_TTL_S\` (600 s); the response carries \`expires_at\`.
 - \`X-User-Id\` is required (**401** without it), and the audit record carries it as \`user\`, with
-  \`expires_at\`, delivered before the URL is returned.`,
+  \`expires_at\`, delivered before the URL is returned: a record the broker refuses or never
+  acknowledges means no URL.`,
   sequence: {
     participants: ['Client', 'Download API', 'Redis', 'file.audit', 'CDN'],
     messages: [
@@ -89,7 +91,7 @@ no end; and the audit trail says which tenant asked but not who.
       id: 'audit-requester',
       title: 'Audits who asked for the link',
       detail:
-        '`X-User-Id` is required (**401** without it) and the `download_issued` record carries it as `user`; a trail that names only the tenant cannot say which person a leaked link was issued to.',
+        '`X-User-Id` is required (**401** without it) and the `download_issued` record carries it as `user`, delivered before the link leaves, so a broker that refuses or stalls the record gets no link out; a trail that names only the tenant cannot say which person a leaked link was issued to.',
       match: {
         python: {all: [/x-user-id/i, /["']user["']\s*:\s*user\b/]},
         typescript: {all: [/x-user-id/i, /\buser(\s*:\s*user)?\s*[,}]/]},
@@ -116,11 +118,6 @@ producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": Tr
 app = FastAPI()
 
 
-def on_delivery(err, msg) -> None:
-    if err is not None:
-        log.warning("audit record not delivered: %s", err)
-
-
 @app.get("/v1/files/{file_id}")
 async def download_link(file_id: str, request: Request) -> dict:
     tenant = request.headers.get("x-tenant-id", "")
@@ -132,8 +129,16 @@ async def download_link(file_id: str, request: Request) -> dict:
         raise HTTPException(status_code=404, detail="no such file")
     url = f"{store.CDN}/f/{file_id}"
     audit = {"event": "download_issued", "file_id": file_id, "tenant": tenant}
+    failures = []
+
+    def on_delivery(err, msg) -> None:
+        if err is not None:
+            failures.append(err)
+
     producer.produce(AUDIT_TOPIC, key=file_id, value=json.dumps(audit), on_delivery=on_delivery)
-    producer.flush(5.0)
+    if producer.flush(5.0) > 0 or failures:
+        log.warning("audit record for %s not delivered: %s", file_id, failures or "timed out")
+        raise HTTPException(status_code=503, detail="the issuance could not be audited")
     return {"file_id": file_id, "url": url}
 `,
       solution: `import json
@@ -153,11 +158,6 @@ producer = Producer({"bootstrap.servers": "kafka:9092", "enable.idempotence": Tr
 app = FastAPI()
 
 
-def on_delivery(err, msg) -> None:
-    if err is not None:
-        log.warning("audit record not delivered: %s", err)
-
-
 @app.get("/v1/files/{file_id}")
 async def download_link(file_id: str, request: Request) -> dict:
     tenant = request.headers.get("x-tenant-id", "")
@@ -171,8 +171,17 @@ async def download_link(file_id: str, request: Request) -> dict:
     expires_at = int(time.time()) + URL_TTL_S
     url = store.sign_url(file_id, tenant, expires_at)
     audit = {"event": "download_issued", "file_id": file_id, "tenant": tenant, "user": user, "expires_at": expires_at}
+    failures = []
+
+    def on_delivery(err, msg) -> None:
+        if err is not None:
+            failures.append(err)
+
     producer.produce(AUDIT_TOPIC, key=file_id, value=json.dumps(audit), on_delivery=on_delivery)
-    producer.flush(5.0)  # the issuance is on the trail before the link leaves
+    # The issuance is on the trail before the link leaves: no record, no link.
+    if producer.flush(5.0) > 0 or failures:
+        log.warning("audit record for %s not delivered: %s", file_id, failures or "timed out")
+        raise HTTPException(status_code=503, detail="the issuance could not be audited")
     return {"file_id": file_id, "url": url, "expires_at": expires_at}
 `,
     },
@@ -447,8 +456,11 @@ const std::string kAuditTopic = "file.audit";
 
 class LogFailures : public RdKafka::DeliveryReportCb {
  public:
+  int failed = 0;
   void dr_cb(RdKafka::Message& message) override {
-    if (message.err() != RdKafka::ERR_NO_ERROR) std::cerr << "audit record not delivered: " << message.errstr() << "\\n";
+    if (message.err() == RdKafka::ERR_NO_ERROR) return;
+    failed++;
+    std::cerr << "audit record not delivered: " << message.errstr() << "\\n";
   }
 };
 
@@ -483,9 +495,14 @@ void download_link(const httplib::Request& req, httplib::Response& res) {
   }
   const std::string url = store::kCdn + "/f/" + file_id;
   const std::string audit = json{{"event", "download_issued"}, {"file_id", file_id}, {"tenant", tenant}}.dump();
+  const int failed_before = delivery_log.failed;
   producer->produce(kAuditTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(audit.data()),
                     audit.size(), file_id.c_str(), file_id.size(), 0, nullptr);
-  producer->flush(5000);
+  if (producer->flush(5000) != RdKafka::ERR_NO_ERROR || delivery_log.failed != failed_before) {
+    res.status = 503;
+    res.set_content("the issuance could not be audited", "text/plain");
+    return;
+  }
   res.set_content(json{{"file_id", file_id}, {"url", url}}.dump(), "application/json");
 }
 
@@ -511,8 +528,11 @@ constexpr std::chrono::seconds kUrlTtl{600};
 
 class LogFailures : public RdKafka::DeliveryReportCb {
  public:
+  int failed = 0;
   void dr_cb(RdKafka::Message& message) override {
-    if (message.err() != RdKafka::ERR_NO_ERROR) std::cerr << "audit record not delivered: " << message.errstr() << "\\n";
+    if (message.err() == RdKafka::ERR_NO_ERROR) return;
+    failed++;
+    std::cerr << "audit record not delivered: " << message.errstr() << "\\n";
   }
 };
 
@@ -550,10 +570,15 @@ void download_link(const httplib::Request& req, httplib::Response& res) {
   const std::string url = store::signUrl(file_id, tenant, expires_at);
   const std::string audit =
       json{{"event", "download_issued"}, {"file_id", file_id}, {"tenant", tenant}, {"user", user}, {"expires_at", expires_at}}.dump();
-  // The issuance is on the trail before the link leaves.
+  // The issuance is on the trail before the link leaves: no record, no link.
+  const int failed_before = delivery_log.failed;
   producer->produce(kAuditTopic, RdKafka::Topic::PARTITION_UA, RdKafka::Producer::RK_MSG_COPY, const_cast<char*>(audit.data()),
                     audit.size(), file_id.c_str(), file_id.size(), 0, nullptr);
-  producer->flush(5000);
+  if (producer->flush(5000) != RdKafka::ERR_NO_ERROR || delivery_log.failed != failed_before) {
+    res.status = 503;
+    res.set_content("the issuance could not be audited", "text/plain");
+    return;
+  }
   res.set_content(json{{"file_id", file_id}, {"url", url}, {"expires_at", expires_at}}.dump(), "application/json");
 }
 
@@ -630,12 +655,18 @@ async def check_audit_requester(ctx):
         assert anonymous.status_code == 401, f"a request without X-User-Id answered {anonymous.status_code}, expected 401: a link nobody can be named for cannot be audited"
         assert _audits(ctx) == [], f"a refused request was audited: {_audits(ctx)}"
         r = await c.get("/v1/files/f-1", headers=HEADERS)
-    assert r.status_code == 200, f"GET /v1/files/f-1 answered {r.status_code}: {r.text}"
-    audits = _audits(ctx)
-    assert len(audits) == 1 and ctx.kafka.records(AUDIT)[0].key == b"f-1", f"one issuance must leave one {AUDIT} record keyed by the file id, got {audits}"
-    audit = audits[0]
-    assert audit.get("user") == "u-7", f"the audit record is {audit}: it must name the requesting user (u-7) as user"
-    assert audit.get("event") == "download_issued" and audit.get("tenant") == "t1" and audit.get("expires_at") == r.json().get("expires_at"), f"the audit record is {audit}, expected download_issued for t1 with the link's expires_at"
+        assert r.status_code == 200, f"GET /v1/files/f-1 answered {r.status_code}: {r.text}"
+        audits = _audits(ctx)
+        assert len(audits) == 1 and ctx.kafka.records(AUDIT)[0].key == b"f-1", f"one issuance must leave one {AUDIT} record keyed by the file id, got {audits}"
+        audit = audits[0]
+        assert audit.get("user") == "u-7", f"the audit record is {audit}: it must name the requesting user (u-7) as user"
+        assert audit.get("event") == "download_issued" and audit.get("tenant") == "t1" and audit.get("expires_at") == r.json().get("expires_at"), f"the audit record is {audit}, expected download_issued for t1 with the link's expires_at"
+        ctx.kafka.fail_next(AUDIT)
+        failed = await c.get("/v1/files/f-1", headers=HEADERS)
+        assert failed.status_code >= 500 and "sig=" not in failed.text, f"the audit record was refused by the broker and the request answered {failed.status_code}: {failed.text}. No record on the trail, no link"
+        ctx.kafka.stall(AUDIT)
+        stalled = await c.get("/v1/files/f-1", headers=HEADERS)
+        assert stalled.status_code >= 500 and "sig=" not in stalled.text, f"with {AUDIT} stalled the request answered {stalled.status_code}: {stalled.text}. A link leaves only once its audit record is delivered"
 `,
     typescript: `const AUDIT = 'file.audit';
 const HEADERS = {'X-Tenant-Id': 't1', 'X-User-Id': 'u-7'};
@@ -699,6 +730,12 @@ export async function check_audit_requester(ctx) {
   assert(trail.length === 1 && ctx.kafka.records(AUDIT)[0].key?.toString() === 'f-1', \`one issuance must leave one \${AUDIT} record keyed by the file id, got \${JSON.stringify(trail)}\`);
   assert.equal(trail[0].user, 'u-7', \`the audit record is \${JSON.stringify(trail[0])}: it must name the requesting user (u-7) as user\`);
   assert(trail[0].event === 'download_issued' && trail[0].tenant === 't1' && trail[0].expires_at === r.json().expires_at, \`the audit record is \${JSON.stringify(trail[0])}, expected download_issued for t1 with the link's expires_at\`);
+  ctx.kafka.failNext(AUDIT);
+  const failed = await c.get('/v1/files/f-1', {headers: HEADERS});
+  assert(failed.status >= 500 && !failed.text.includes('sig='), \`the audit record was refused by the broker and the request answered \${failed.status}: \${failed.text}. No record on the trail, no link\`);
+  ctx.kafka.stall(AUDIT);
+  const stalled = await c.get('/v1/files/f-1', {headers: HEADERS});
+  assert(stalled.status >= 500 && !stalled.text.includes('sig='), \`with \${AUDIT} stalled the request answered \${stalled.status}: \${stalled.text}. A link leaves only once its audit record is delivered\`);
 }
 `,
     go: `package main
@@ -713,9 +750,9 @@ import (
 	"leetbuild/harness"
 )
 
-const audit = "file.audit"
+const hAudit = "file.audit"
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	for _, f := range [][3]string{{"f-1", "t1", "committed"}, {"f-2", "t2", "committed"}, {"f-3", "t1", "deleted"}} {
 		n := f[0][2:]
 		ctx.Redis.Do("HSET", "file:"+f[0], "file_id", f[0], "upload_id", "up-"+n, "tenant", f[1], "name", "scan.png", "mime", "image/png",
@@ -726,15 +763,15 @@ func readAPI(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-type link struct {
+type hLink struct {
 	FileID    string \`json:"file_id"\`
 	URL       string \`json:"url"\`
 	ExpiresAt int64  \`json:"expires_at"\`
 }
 
-func audits(ctx *harness.Ctx) []map[string]any {
+func hAudits(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, r := range ctx.Kafka.Records(audit) {
+	for _, r := range ctx.Kafka.Records(hAudit) {
 		var a map[string]any
 		json.Unmarshal(r.Value, &a)
 		out = append(out, a)
@@ -743,30 +780,30 @@ func audits(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	r := c.Get("/v1/files/f-1", "X-Tenant-Id", "t1", "X-User-Id", "u-7")
 	ctx.Equal(r.Status, 200, "GET /v1/files/f-1 as its tenant (%s)", r.Text())
-	var body link
+	var body hLink
 	r.Decode(&body)
 	ctx.Assert(body.FileID == "f-1" && strings.HasPrefix(body.URL, store.CDN+"/f/f-1"), "the answer must carry file_id f-1 and a CDN URL for it, got %s", r.Text())
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	ctx.Equal(c.Get("/v1/files/f-2", "X-Tenant-Id", "t1", "X-User-Id", "u-7").Status, 404, "tenant t1 asked for t2's file f-2: another tenant's file is 404, like a missing one")
 	ctx.Equal(c.Get("/v1/files/f-3", "X-Tenant-Id", "t1", "X-User-Id", "u-7").Status, 404, "a deleted file")
 	ctx.Equal(c.Get("/v1/files/f-404", "X-Tenant-Id", "t1", "X-User-Id", "u-7").Status, 404, "a missing file")
 	ctx.Equal(c.Get("/v1/files/f-1").Status, 401, "a request without X-Tenant-Id")
-	for _, a := range audits(ctx) {
+	for _, a := range hAudits(ctx) {
 		ctx.Assert(a["file_id"] != "f-2" && a["file_id"] != "f-3", "a refused request was audited as an issuance: %v", a)
 	}
 }
 
 func CheckSignedExpiry(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	r := c.Get("/v1/files/f-1", "X-Tenant-Id", "t1", "X-User-Id", "u-7")
 	ctx.Equal(r.Status, 200, "GET /v1/files/f-1 (%s)", r.Text())
-	var body link
+	var body hLink
 	r.Decode(&body)
 	now := ctx.Clock.Time().Unix()
 	grant := store.VerifyURL(body.URL, now)
@@ -778,17 +815,23 @@ func CheckSignedExpiry(ctx *harness.Ctx) {
 }
 
 func CheckAuditRequester(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	ctx.Equal(c.Get("/v1/files/f-1", "X-Tenant-Id", "t1").Status, 401, "a request without X-User-Id (a link nobody can be named for cannot be audited)")
-	ctx.Equal(len(audits(ctx)), 0, "a refused request must not be audited; the audit records")
+	ctx.Equal(len(hAudits(ctx)), 0, "a refused request must not be audited; the audit records")
 	r := c.Get("/v1/files/f-1", "X-Tenant-Id", "t1", "X-User-Id", "u-7")
 	ctx.Equal(r.Status, 200, "GET /v1/files/f-1 (%s)", r.Text())
-	var body link
+	var body hLink
 	r.Decode(&body)
-	trail := audits(ctx)
-	ctx.Assert(len(trail) == 1 && len(ctx.Kafka.Keys(audit)) == 1 && ctx.Kafka.Keys(audit)[0] == "f-1", "one issuance must leave one %s record keyed by the file id, got %v", audit, trail)
+	trail := hAudits(ctx)
+	ctx.Assert(len(trail) == 1 && len(ctx.Kafka.Keys(hAudit)) == 1 && ctx.Kafka.Keys(hAudit)[0] == "f-1", "one issuance must leave one %s record keyed by the file id, got %v", hAudit, trail)
 	ctx.Equal(trail[0]["user"], "u-7", "the audit record must name the requesting user as user (%v)", trail[0])
 	ctx.Assert(trail[0]["event"] == "download_issued" && trail[0]["tenant"] == "t1" && trail[0]["expires_at"] == float64(body.ExpiresAt), "the audit record is %v, expected download_issued for t1 with the link's expires_at", trail[0])
+	ctx.Kafka.FailNext(hAudit, 1)
+	failed := c.Get("/v1/files/f-1", "X-Tenant-Id", "t1", "X-User-Id", "u-7")
+	ctx.Assert(failed.Status >= 500 && !strings.Contains(failed.Text(), "sig="), "the audit record was refused by the broker and the request answered %d: %s. No record on the trail, no link", failed.Status, failed.Text())
+	ctx.Kafka.Stall(hAudit)
+	stalled := c.Get("/v1/files/f-1", "X-Tenant-Id", "t1", "X-User-Id", "u-7")
+	ctx.Assert(stalled.Status >= 500 && !strings.Contains(stalled.Text(), "sig="), "with %s stalled the request answered %d: %s. A link leaves only once its audit record is delivered", hAudit, stalled.Status, stalled.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -806,9 +849,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kAudit = "file.audit";
+const std::string hAudit = "file.audit";
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   for (const auto& f : std::vector<std::array<std::string, 3>>{{"f-1", "t1", "committed"}, {"f-2", "t2", "committed"}, {"f-3", "t1", "deleted"}}) {
     const std::string n = f[0].substr(2);
     ctx.Redis.Do("HSET", "file:" + f[0], "file_id", f[0], "upload_id", "up-" + n, "tenant", f[1], "name", "scan.png", "mime", "image/png",
@@ -821,64 +864,70 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-long long nowS() { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
+long long hNow() { return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count(); }
 
-std::vector<json> audits(harness::Ctx& ctx) {
+std::vector<json> hAudits(harness::Ctx& ctx) {
   std::vector<json> out;
-  for (const auto& r : ctx.Kafka.Records(kAudit)) out.push_back(json::parse(r.Value.value_or("{}"), nullptr, false));
+  for (const auto& r : ctx.Kafka.Records(hAudit)) out.push_back(json::parse(r.Value.value_or("{}"), nullptr, false));
   return out;
 }
 
-harness::Response get(harness::HTTP& c, const std::string& file_id) { return c.Get("/v1/files/" + file_id, "X-Tenant-Id", "t1", "X-User-Id", "u-7"); }
+harness::Response hGet(harness::HTTP& c, const std::string& file_id) { return c.Get("/v1/files/" + file_id, "X-Tenant-Id", "t1", "X-User-Id", "u-7"); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto r = get(c, "f-1");
+  auto c = hReadApi(ctx);
+  const auto r = hGet(c, "f-1");
   ctx.Equal(r.Status, 200, "GET /v1/files/f-1 as its tenant (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.value("file_id", "") == "f-1" && body.value("url", "").rfind(store::kCdn + "/f/f-1", 0) == 0, "the answer must carry file_id f-1 and a CDN URL for it, got %s", r.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  ctx.Equal(get(c, "f-2").Status, 404, "tenant t1 asked for t2's file f-2: another tenant's file is 404, like a missing one");
-  ctx.Equal(get(c, "f-3").Status, 404, "a deleted file");
-  ctx.Equal(get(c, "f-404").Status, 404, "a missing file");
+  auto c = hReadApi(ctx);
+  ctx.Equal(hGet(c, "f-2").Status, 404, "tenant t1 asked for t2's file f-2: another tenant's file is 404, like a missing one");
+  ctx.Equal(hGet(c, "f-3").Status, 404, "a deleted file");
+  ctx.Equal(hGet(c, "f-404").Status, 404, "a missing file");
   ctx.Equal(c.Get("/v1/files/f-1").Status, 401, "a request without X-Tenant-Id");
-  for (const json& a : audits(ctx)) {
+  for (const json& a : hAudits(ctx)) {
     ctx.Assert(a.value("file_id", "") != "f-2" && a.value("file_id", "") != "f-3", "a refused request was audited as an issuance: %s", a.dump());
   }
 }
 
 void CheckSignedExpiry(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto r = get(c, "f-1");
+  auto c = hReadApi(ctx);
+  const auto r = hGet(c, "f-1");
   ctx.Equal(r.Status, 200, "GET /v1/files/f-1 (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
   const std::string url = body.value("url", "");
-  const long long now = nowS();
+  const long long now = hNow();
   const auto grant = store::verifyUrl(url, now);
   ctx.Assert(grant.has_value(), "the CDN refuses %s: it is not signed. Use store::signUrl so the link expires and is bound to the tenant", url);
   ctx.Assert(grant->file_id == "f-1" && grant->tenant == "t1", "the URL grants %s for %s, expected f-1 for t1", grant->file_id, grant->tenant);
   ctx.Assert(grant->expires_at == now + 600 && body.value("expires_at", 0LL) == now + 600, "the URL expires at %d (answered %d), expected now + 600 = %d", grant->expires_at, body.value("expires_at", 0LL), now + 600);
   ctx.Clock.Advance(601);
-  ctx.Assert(!store::verifyUrl(url, nowS()), "ten minutes later the CDN still honours the URL");
+  ctx.Assert(!store::verifyUrl(url, hNow()), "ten minutes later the CDN still honours the URL");
 }
 
 void CheckAuditRequester(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   ctx.Equal(c.Get("/v1/files/f-1", "X-Tenant-Id", "t1").Status, 401, "a request without X-User-Id (a link nobody can be named for cannot be audited)");
-  ctx.Equal(audits(ctx).size(), 0, "a refused request must not be audited; the audit records");
-  const auto r = get(c, "f-1");
+  ctx.Equal(hAudits(ctx).size(), 0, "a refused request must not be audited; the audit records");
+  const auto r = hGet(c, "f-1");
   ctx.Equal(r.Status, 200, "GET /v1/files/f-1 (%s)", r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
-  const auto trail = audits(ctx);
-  ctx.Assert(trail.size() == 1 && ctx.Kafka.Keys(kAudit) == std::vector<std::string>{"f-1"}, "one issuance must leave one %s record keyed by the file id, got %d", kAudit, trail.size());
+  const auto trail = hAudits(ctx);
+  ctx.Assert(trail.size() == 1 && ctx.Kafka.Keys(hAudit) == std::vector<std::string>{"f-1"}, "one issuance must leave one %s record keyed by the file id, got %d", hAudit, trail.size());
   ctx.Equal(trail[0].value("user", ""), "u-7", "the audit record must name the requesting user as user (%s)", trail[0].dump());
   ctx.Assert(trail[0].value("event", "") == "download_issued" && trail[0].value("tenant", "") == "t1" && trail[0].value("expires_at", 0LL) == body.value("expires_at", -1LL),
              "the audit record is %s, expected download_issued for t1 with the link's expires_at", trail[0].dump());
+  ctx.Kafka.FailNext(hAudit, 1);
+  const auto failed = hGet(c, "f-1");
+  ctx.Assert(failed.Status >= 500 && failed.Text().find("sig=") == std::string::npos, "the audit record was refused by the broker and the request answered %d: %s. No record on the trail, no link", failed.Status, failed.Text());
+  ctx.Kafka.Stall(hAudit);
+  const auto stalled = hGet(c, "f-1");
+  ctx.Assert(stalled.Status >= 500 && stalled.Text().find("sig=") == std::string::npos, "with %s stalled the request answered %d: %s. A link leaves only once its audit record is delivered", hAudit, stalled.Status, stalled.Text());
 }
 `,
   },

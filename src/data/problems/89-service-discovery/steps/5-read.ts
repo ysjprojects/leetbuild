@@ -19,12 +19,12 @@ router asking for a mistyped service gets a healthy-looking empty list and drain
 member whose record lapsed is returned with no address; and an instance nobody has probed yet is
 routed to, while on-call cannot see why checkout is down to two instances.
 
-- The caller presents \`X-Scope\`, a comma-separated list that contains \`INTERNAL_SCOPE\`
-  (\`discovery.internal\`); otherwise **403**.
+- The caller presents \`X-Scope\`, a comma-separated list (with or without spaces) that contains
+  \`INTERNAL_SCOPE\` (\`discovery.internal\`); otherwise **403**, before anything else is looked up.
 - A service with no deployment (\`registry.deployment_cidr\` is None) is **404**.
 - \`instances\` holds only members with a live record and a \`SERVING\` verdict, each with
   \`instance_id\`, \`address\`, \`port\`, \`metadata_version\` and \`last_heartbeat\`.
-- Every other member is in \`excluded\` as \`{"instance_id", "reason"}\`: \`expired\` (no record),
+- Every other member is in \`excluded\`, once, as \`{"instance_id", "reason"}\`: \`expired\` (no record),
   \`unhealthy\` (\`NOT_SERVING\`) or \`unprobed\` (no verdict yet).`,
   sequence: {
     participants: ['Router', 'Discovery API', 'deployment registry', 'Redis'],
@@ -61,7 +61,7 @@ routed to, while on-call cannot see why checkout is down to two instances.
       id: 'scope',
       title: 'Listing instances requires the internal scope',
       detail:
-        '`X-Scope` is split on commas and must contain `INTERNAL_SCOPE`; anything else answers **403**. The starter serves the full target list to any caller that can reach the port.',
+        '`X-Scope` is split on commas (with or without spaces) and must contain `INTERNAL_SCOPE`; anything else answers **403**, checked before the service lookup so an unscoped caller learns nothing about which services exist. The starter serves the full target list to any caller that can reach the port.',
       match: {
         python: {all: [/INTERNAL_SCOPE/, /status_code=403/, /\.split\(\s*["'],["']\s*\)/]},
         typescript: {all: [/INTERNAL_SCOPE/, /code\(403\)/, /\.split\(\s*['"],['"]\s*\)/]},
@@ -100,7 +100,7 @@ routed to, while on-call cannot see why checkout is down to two instances.
       id: 'healthy-only',
       title: 'Only SERVING instances are routable, and every exclusion has a reason',
       detail:
-        'An instance is routable only with a `SERVING` verdict; `NOT_SERVING` is excluded as `unhealthy` and a missing verdict as `unprobed`. The starter routes to unprobed instances and drops the unhealthy ones without saying so.',
+        'An instance is routable only with a `SERVING` verdict; `NOT_SERVING` is excluded as `unhealthy` and a missing verdict as `unprobed`, and `excluded` lists each excluded member once and never a routable one. The starter routes to unprobed instances and drops the unhealthy ones without saying so.',
       match: {
         python: {all: [/!=\s*["']SERVING["']|==\s*["']SERVING["']/, /["']unhealthy["']/, /["']unprobed["']/]},
         typescript: {all: [/!==\s*['"]SERVING['"]|===\s*['"]SERVING['"]/, /['"]unhealthy['"]/, /['"]unprobed['"]/]},
@@ -549,6 +549,10 @@ async def check_scope(ctx):
         for headers, why in (({}, "no X-Scope"), ({"X-Scope": "metrics.read"}, "X-Scope metrics.read"), ({"X-Scope": "discovery.internal.readonly"}, "X-Scope discovery.internal.readonly")):
             r = await c.get("/v1/services/checkout/instances", headers=headers)
             assert r.status_code == 403, f"a caller with {why} listed checkout's instances ({r.status_code}): the list is a set of targets, gated behind discovery.internal"
+        r = await c.get("/v1/services/checkuot/instances")
+        assert r.status_code == 403, f"a caller with no X-Scope asking for checkuot answered {r.status_code}, expected 403: the scope is checked before anything about the service is revealed"
+        r = await c.get("/v1/services/checkout/instances", headers={"X-Scope": "discovery.internal,metrics.read"})
+        assert r.status_code == 200, f"a caller with X-Scope discovery.internal,metrics.read (no spaces, internal first) answered {r.status_code}: {r.text}"
         r = await c.get("/v1/services/checkout/instances", headers=INTERNAL)
     assert r.status_code == 200, f"a caller whose X-Scope list contains discovery.internal answered {r.status_code}: {r.text}"
 
@@ -580,6 +584,8 @@ async def check_healthy_only(ctx):
     assert entry.get("address") == "10.4.2.1" and entry.get("port") == 8080 and entry.get("metadata_version") == 7 and isinstance(entry.get("last_heartbeat"), int), f"checkout-1 came back as {entry}, expected its address, port, metadata_version and last_heartbeat"
     assert excluded.get("checkout-2") == "unhealthy", f"checkout-2 answered NOT_SERVING and excluded holds {excluded}, expected it with reason unhealthy"
     assert excluded.get("checkout-3") == "unprobed", f"checkout-3 has no verdict yet and excluded holds {excluded}, expected it with reason unprobed"
+    listed = sorted(e.get("instance_id") for e in body.get("excluded", []))
+    assert listed == ["checkout-2", "checkout-3", "checkout-4"], f"excluded lists {listed}, expected each excluded member once (checkout-2, checkout-3, checkout-4) and never the routable checkout-1"
 `,
     typescript: `const INTERNAL = {'X-Scope': 'metrics.read, discovery.internal'};
 
@@ -620,7 +626,11 @@ export async function check_scope(ctx) {
     const r = await c.get('/v1/services/checkout/instances', {headers});
     assert.equal(r.status, 403, \`a caller with \${why} listed checkout's instances (\${r.status}): the list is a set of targets, gated behind discovery.internal\`);
   }
-  const r = await c.get('/v1/services/checkout/instances', {headers: INTERNAL});
+  let r = await c.get('/v1/services/checkuot/instances');
+  assert.equal(r.status, 403, \`a caller with no X-Scope asking for checkuot answered \${r.status}, expected 403: the scope is checked before anything about the service is revealed\`);
+  r = await c.get('/v1/services/checkout/instances', {headers: {'X-Scope': 'discovery.internal,metrics.read'}});
+  assert.equal(r.status, 200, \`a caller with X-Scope discovery.internal,metrics.read (no spaces, internal first) answered \${r.status}: \${r.text}\`);
+  r = await c.get('/v1/services/checkout/instances', {headers: INTERNAL});
   assert.equal(r.status, 200, \`a caller whose X-Scope list contains discovery.internal answered \${r.status}: \${r.text}\`);
 }
 
@@ -648,6 +658,8 @@ export async function check_healthy_only(ctx) {
   assert(entry.address === '10.4.2.1' && entry.port === 8080 && entry.metadata_version === 7 && Number.isInteger(entry.last_heartbeat), \`checkout-1 came back as \${JSON.stringify(entry)}, expected its address, port, metadata_version and last_heartbeat\`);
   assert.equal(excluded['checkout-2'], 'unhealthy', \`checkout-2 answered NOT_SERVING and excluded holds \${JSON.stringify(excluded)}, expected it with reason unhealthy\`);
   assert.equal(excluded['checkout-3'], 'unprobed', \`checkout-3 has no verdict yet and excluded holds \${JSON.stringify(excluded)}, expected it with reason unprobed\`);
+  const listed = (body.excluded ?? []).map(e => e.instance_id).sort();
+  assert.deepEqual(listed, ['checkout-2', 'checkout-3', 'checkout-4'], \`excluded lists \${JSON.stringify(listed)}, expected each excluded member once (checkout-2, checkout-3, checkout-4) and never the routable checkout-1\`);
 }
 `,
     go: `package main
@@ -656,18 +668,19 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 
 	"discovery/instances"
 
 	"leetbuild/harness"
 )
 
-type listingBody struct {
-	Instances []map[string]any  \`json:"instances"\`
+type readListingBody struct {
+	Instances []map[string]any    \`json:"instances"\`
 	Excluded  []map[string]string \`json:"excluded"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func readAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16")
 	ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16")
 	mux := http.NewServeMux()
@@ -675,8 +688,8 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-// fleet: checkout-1 SERVING, checkout-2 NOT_SERVING, checkout-3 never probed, checkout-4's record lapsed before the sweep ran.
-func fleet(ctx *harness.Ctx) {
+// readFleet: checkout-1 SERVING, checkout-2 NOT_SERVING, checkout-3 never probed, checkout-4's record lapsed before the sweep ran.
+func readFleet(ctx *harness.Ctx) {
 	for n := 1; n <= 4; n++ {
 		_, err := instances.RegisterInstance(context.Background(), "checkout", fmt.Sprintf("checkout-%d", n), fmt.Sprintf("10.4.2.%d", n), 8080, 5, 7)
 		ctx.NoError(err, "registering checkout-%d", n)
@@ -687,10 +700,10 @@ func fleet(ctx *harness.Ctx) {
 	ctx.Redis.Del("sd:checkout:checkout-4")
 }
 
-func listing(ctx *harness.Ctx, c *harness.HTTP) (listingBody, []string, map[string]string) {
+func readListing(ctx *harness.Ctx, c *harness.HTTP) (readListingBody, []string, map[string]string) {
 	r := c.Get("/v1/services/checkout/instances", "X-Scope", "metrics.read, discovery.internal")
 	ctx.Equal(r.Status, 200, "GET /v1/services/checkout/instances with the internal scope (%s)", r.Text())
-	var body listingBody
+	var body readListingBody
 	r.Decode(&body)
 	routed := []string{}
 	for _, i := range body.Instances {
@@ -705,24 +718,28 @@ func listing(ctx *harness.Ctx, c *harness.HTTP) (listingBody, []string, map[stri
 }
 
 func CheckScope(ctx *harness.Ctx) {
-	fleet(ctx)
-	c := api(ctx)
+	readFleet(ctx)
+	c := readAPI(ctx)
 	r := c.Get("/v1/services/checkout/instances")
 	ctx.Equal(r.Status, 403, "a caller with no X-Scope listed checkout's instances: the list is a set of targets, gated behind discovery.internal")
 	for _, scope := range []string{"metrics.read", "discovery.internal.readonly"} {
 		r = c.Get("/v1/services/checkout/instances", "X-Scope", scope)
 		ctx.Equal(r.Status, 403, "a caller with X-Scope %s listed checkout's instances: the list is a set of targets, gated behind discovery.internal", scope)
 	}
+	r = c.Get("/v1/services/checkuot/instances")
+	ctx.Equal(r.Status, 403, "a caller with no X-Scope asking for checkuot (the scope is checked before anything about the service is revealed)")
+	r = c.Get("/v1/services/checkout/instances", "X-Scope", "discovery.internal,metrics.read")
+	ctx.Equal(r.Status, 200, "a caller with X-Scope discovery.internal,metrics.read, no spaces and internal first (%s)", r.Text())
 	r = c.Get("/v1/services/checkout/instances", "X-Scope", "metrics.read, discovery.internal")
 	ctx.Equal(r.Status, 200, "a caller whose X-Scope list contains discovery.internal (%s)", r.Text())
 }
 
 func CheckUnknownService(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := readAPI(ctx)
 	r := c.Get("/v1/services/checkuot/instances", "X-Scope", "discovery.internal")
 	ctx.Equal(r.Status, 404, "a mistyped service name (an empty 200 looks like a healthy service with no capacity)")
 	r = c.Get("/v1/services/payments/instances", "X-Scope", "discovery.internal")
-	var body listingBody
+	var body readListingBody
 	if r.Status == 200 {
 		r.Decode(&body)
 	}
@@ -730,8 +747,8 @@ func CheckUnknownService(ctx *harness.Ctx) {
 }
 
 func CheckExpired(ctx *harness.Ctx) {
-	fleet(ctx)
-	body, routed, excluded := listing(ctx, api(ctx))
+	readFleet(ctx)
+	body, routed, excluded := readListing(ctx, readAPI(ctx))
 	for _, id := range routed {
 		ctx.Assert(id != "checkout-4", "checkout-4's record lapsed and it was returned as routable: %v. A router would dial an instance with no address", body.Instances)
 	}
@@ -743,20 +760,27 @@ func CheckExpired(ctx *harness.Ctx) {
 }
 
 func CheckHealthyOnly(ctx *harness.Ctx) {
-	fleet(ctx)
-	body, routed, excluded := listing(ctx, api(ctx))
+	readFleet(ctx)
+	body, routed, excluded := readListing(ctx, readAPI(ctx))
 	ctx.Equal(routed, []string{"checkout-1"}, "the routable instances (checkout-2 is NOT_SERVING and checkout-3 was never probed)")
 	entry := body.Instances[0]
 	_, stamped := entry["last_heartbeat"].(float64)
 	ctx.Assert(entry["address"] == "10.4.2.1" && entry["port"] == float64(8080) && entry["metadata_version"] == float64(7) && stamped, "checkout-1 came back as %v, expected its address, port, metadata_version and last_heartbeat", entry)
 	ctx.Equal(excluded["checkout-2"], "unhealthy", "checkout-2 answered NOT_SERVING (excluded holds %v); its reason", excluded)
 	ctx.Equal(excluded["checkout-3"], "unprobed", "checkout-3 has no verdict yet (excluded holds %v); its reason", excluded)
+	listed := []string{}
+	for _, e := range body.Excluded {
+		listed = append(listed, e["instance_id"])
+	}
+	sort.Strings(listed)
+	ctx.Equal(listed, []string{"checkout-2", "checkout-3", "checkout-4"}, "excluded must list each excluded member once and never the routable checkout-1")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -765,7 +789,7 @@ func CheckHealthyOnly(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP readApi(harness::Ctx& ctx) {
   ctx.Redis.Set("sd:deploy:checkout", "10.4.0.0/16");
   ctx.Redis.Set("sd:deploy:payments", "10.9.0.0/16");
   static httplib::Server* svr = nullptr;
@@ -776,7 +800,7 @@ harness::HTTP api(harness::Ctx& ctx) {
 }
 
 // checkout-1 SERVING, checkout-2 NOT_SERVING, checkout-3 never probed, checkout-4's record lapsed before the sweep ran.
-void fleet(harness::Ctx& ctx) {
+void readFleet(harness::Ctx& ctx) {
   for (int n = 1; n <= 4; n++) {
     instances::registerInstance("checkout", "checkout-" + std::to_string(n), "10.4.2." + std::to_string(n), 8080, 5, 7);
   }
@@ -786,23 +810,23 @@ void fleet(harness::Ctx& ctx) {
   ctx.Redis.Del("sd:checkout:checkout-4");
 }
 
-struct Listing {
+struct ReadListing {
   nlohmann::json body;
   std::vector<std::string> routed;
   std::map<std::string, std::string> excluded;
 };
 
-Listing listing(harness::Ctx& ctx, harness::HTTP c) {
+ReadListing readListing(harness::Ctx& ctx, harness::HTTP c) {
   const auto r = c.Get("/v1/services/checkout/instances", "X-Scope", "metrics.read, discovery.internal");
   ctx.Equal(r.Status, 200, "GET /v1/services/checkout/instances with the internal scope (%s)", r.Text());
-  Listing out{nlohmann::json::parse(r.Text(), nullptr, false), {}, {}};
+  ReadListing out{nlohmann::json::parse(r.Text(), nullptr, false), {}, {}};
   ctx.Assert(out.body.is_object(), "the listing is not a JSON object: %s", r.Text());
   for (const auto& i : out.body.value("instances", nlohmann::json::array())) out.routed.push_back(i.value("instance_id", ""));
   for (const auto& e : out.body.value("excluded", nlohmann::json::array())) out.excluded[e.value("instance_id", "")] = e.value("reason", "");
   return out;
 }
 
-std::string reasonOf(const Listing& l, const std::string& instance_id) {
+std::string readReasonOf(const ReadListing& l, const std::string& instance_id) {
   const auto it = l.excluded.find(instance_id);
   return it == l.excluded.end() ? "" : it->second;
 }
@@ -810,20 +834,24 @@ std::string reasonOf(const Listing& l, const std::string& instance_id) {
 }  // namespace
 
 void CheckScope(harness::Ctx& ctx) {
-  fleet(ctx);
-  auto c = api(ctx);
+  readFleet(ctx);
+  auto c = readApi(ctx);
   auto r = c.Get("/v1/services/checkout/instances");
   ctx.Equal(r.Status, 403, "a caller with no X-Scope listed checkout's instances: the list is a set of targets, gated behind discovery.internal");
   for (const std::string scope : {"metrics.read", "discovery.internal.readonly"}) {
     r = c.Get("/v1/services/checkout/instances", "X-Scope", scope);
     ctx.Equal(r.Status, 403, "a caller with X-Scope %s listed checkout's instances: the list is a set of targets, gated behind discovery.internal", scope);
   }
+  r = c.Get("/v1/services/checkuot/instances");
+  ctx.Equal(r.Status, 403, "a caller with no X-Scope asking for checkuot (the scope is checked before anything about the service is revealed)");
+  r = c.Get("/v1/services/checkout/instances", "X-Scope", "discovery.internal,metrics.read");
+  ctx.Equal(r.Status, 200, "a caller with X-Scope discovery.internal,metrics.read, no spaces and internal first (%s)", r.Text());
   r = c.Get("/v1/services/checkout/instances", "X-Scope", "metrics.read, discovery.internal");
   ctx.Equal(r.Status, 200, "a caller whose X-Scope list contains discovery.internal (%s)", r.Text());
 }
 
 void CheckUnknownService(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = readApi(ctx);
   auto r = c.Get("/v1/services/checkuot/instances", "X-Scope", "discovery.internal");
   ctx.Equal(r.Status, 404, "a mistyped service name (an empty 200 looks like a healthy service with no capacity)");
   r = c.Get("/v1/services/payments/instances", "X-Scope", "discovery.internal");
@@ -833,27 +861,31 @@ void CheckUnknownService(harness::Ctx& ctx) {
 }
 
 void CheckExpired(harness::Ctx& ctx) {
-  fleet(ctx);
-  const Listing l = listing(ctx, api(ctx));
+  readFleet(ctx);
+  const ReadListing l = readListing(ctx, readApi(ctx));
   for (const auto& id : l.routed) {
     ctx.Assert(id != "checkout-4", "checkout-4's record lapsed and it was returned as routable: %s. A router would dial an instance with no address", l.body.dump());
   }
-  ctx.Equal(reasonOf(l, "checkout-4"), "expired", "checkout-4 has no record; its reason in excluded");
+  ctx.Equal(readReasonOf(l, "checkout-4"), "expired", "checkout-4 has no record; its reason in excluded");
   for (const auto& entry : l.body.value("instances", nlohmann::json::array())) {
     ctx.Assert(!entry.value("address", "").empty(), "an instance came back without an address: %s", entry.dump());
   }
 }
 
 void CheckHealthyOnly(harness::Ctx& ctx) {
-  fleet(ctx);
-  const Listing l = listing(ctx, api(ctx));
+  readFleet(ctx);
+  const ReadListing l = readListing(ctx, readApi(ctx));
   ctx.Equal(l.routed, {"checkout-1"}, "the routable instances (checkout-2 is NOT_SERVING and checkout-3 was never probed)");
   const auto& entry = l.body["instances"][0];
   ctx.Assert(entry.value("address", "") == "10.4.2.1" && entry.value("port", 0L) == 8080 && entry.value("metadata_version", 0L) == 7 &&
                  entry.contains("last_heartbeat") && entry["last_heartbeat"].is_number_integer(),
              "checkout-1 came back as %s, expected its address, port, metadata_version and last_heartbeat", entry.dump());
-  ctx.Equal(reasonOf(l, "checkout-2"), "unhealthy", "checkout-2 answered NOT_SERVING; its reason in excluded");
-  ctx.Equal(reasonOf(l, "checkout-3"), "unprobed", "checkout-3 has no verdict yet; its reason in excluded");
+  ctx.Equal(readReasonOf(l, "checkout-2"), "unhealthy", "checkout-2 answered NOT_SERVING; its reason in excluded");
+  ctx.Equal(readReasonOf(l, "checkout-3"), "unprobed", "checkout-3 has no verdict yet; its reason in excluded");
+  std::vector<std::string> listed;
+  for (const auto& e : l.body.value("excluded", nlohmann::json::array())) listed.push_back(e.value("instance_id", ""));
+  std::sort(listed.begin(), listed.end());
+  ctx.Equal(listed, {"checkout-2", "checkout-3", "checkout-4"}, "excluded must list each excluded member once and never the routable checkout-1");
 }
 `,
   },

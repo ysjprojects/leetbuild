@@ -58,7 +58,7 @@ confirmed; and any tenant can read another tenant's purge by its id.
       id: 'tenant-scope',
       title: 'Another tenant’s purge is 404',
       detail:
-        'The record’s tenant is compared with `X-Tenant-Id`, and a mismatch answers **404**, so the endpoint never confirms that another tenant’s purge exists. The starter returns any purge to anyone who knows its id.',
+        'The record’s tenant is compared with `X-Tenant-Id`, and a mismatch answers **404** with the same body as an unknown id, so the endpoint never confirms that another tenant’s purge exists. The starter returns any purge to anyone who knows its id.',
       match: {
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant/]},
@@ -649,6 +649,7 @@ async def check_tenant_scope(ctx):
     assert foreign.status_code == 404, f"tenant t2 read t1's purge {purge_id}: {foreign.status_code} {foreign.text}. Another tenant's purge must be 404"
     assert DOMAIN not in foreign.text, f"the answer to another tenant names the domain: {foreign.text}"
     assert unknown.status_code == 404, f"an unknown purge answered {unknown.status_code}"
+    assert foreign.text.replace(purge_id, "{id}") == unknown.text.replace("pg-404", "{id}"), f"another tenant's purge answered {foreign.text}, an unknown id {unknown.text}: the two must be indistinguishable, or the answer confirms the purge exists"
 
 
 async def check_status_derive(ctx):
@@ -667,7 +668,11 @@ async def check_status_derive(ctx):
         broken = _seed(("/a", "/b["))
         records.set_outcomes(broken, {"/a": "propagated", "/b[": "invalid_pattern"})
         partial = (await _read(c, broken)).json()
+        refused = _seed(("/a", "/hot"))
+        records.set_outcomes(refused, {"/a": "accepted", "/hot": "failed"})
+        failed = (await _read(c, refused)).json()
     assert partial.get("status") == "partially_failed", f"a purge with an invalid pattern reads {partial.get('status')!r}, expected partially_failed"
+    assert failed.get("status") == "partially_failed", f"a purge with a failed path reads {failed.get('status')!r}, expected partially_failed"
 
 
 async def check_failed_visible(ctx):
@@ -683,13 +688,13 @@ async def check_propagated_at(ctx):
     t = int(ctx.clock.time())
     purge_id = _seed()
     records.set_outcomes(purge_id, {"/pricing": "accepted", "/img/logo.png": "accepted"})
-    records.confirm(purge_id, "/pricing", t + 30)
+    records.confirm(purge_id, "/pricing", t + 95)
     async with _api(ctx) as c:
         half = (await _read(c, purge_id)).json()
         assert half.get("propagated_at") is None, f"one of two paths confirmed and propagated_at is {half.get('propagated_at')!r}: it must be null until every edge confirmed"
-        records.confirm(purge_id, "/img/logo.png", t + 95)
+        records.confirm(purge_id, "/img/logo.png", t + 40)  # its edges reported earlier, the confirmation arrived later
         done = (await _read(c, purge_id)).json()
-    assert done.get("propagated_at") == t + 95, f"propagated_at is {done.get('propagated_at')!r}, but the last path was confirmed at {t + 95} (accepted at {done.get('accepted_at')})"
+    assert done.get("propagated_at") == t + 95, f"propagated_at is {done.get('propagated_at')!r}, but the paths were confirmed at {t + 95} and {t + 40}: it is the latest confirmation time (accepted at {done.get('accepted_at')})"
 `,
     typescript: `const DOMAIN = 'shop.example.com';
 
@@ -721,7 +726,9 @@ export async function check_tenant_scope(ctx) {
   const foreign = await read(c, purgeId, 't2');
   assert.equal(foreign.status, 404, \`tenant t2 read t1's purge \${purgeId}: \${foreign.status} \${foreign.text}. Another tenant's purge must be 404\`);
   assert(!foreign.text.includes(DOMAIN), \`the answer to another tenant names the domain: \${foreign.text}\`);
-  assert.equal((await read(c, 'pg-404', 't2')).status, 404, 'an unknown purge must be 404');
+  const unknown = await read(c, 'pg-404', 't2');
+  assert.equal(unknown.status, 404, 'an unknown purge must be 404');
+  assert.equal(foreign.text.replaceAll(purgeId, '{id}'), unknown.text.replaceAll('pg-404', '{id}'), \`another tenant's purge answered \${foreign.text}, an unknown id \${unknown.text}: the two must be indistinguishable, or the answer confirms the purge exists\`);
 }
 
 export async function check_status_derive(ctx) {
@@ -741,6 +748,10 @@ export async function check_status_derive(ctx) {
   await records.setOutcomes(broken, {'/a': 'propagated', '/b[': 'invalid_pattern'});
   const partial = (await read(c, broken)).json();
   assert.equal(partial.status, 'partially_failed', \`a purge with an invalid pattern reads \${partial.status}, expected partially_failed\`);
+  const refused = await seed(['/a', '/hot']);
+  await records.setOutcomes(refused, {'/a': 'accepted', '/hot': 'failed'});
+  const failed = (await read(c, refused)).json();
+  assert.equal(failed.status, 'partially_failed', \`a purge with a failed path reads \${failed.status}, expected partially_failed\`);
 }
 
 export async function check_failed_visible(ctx) {
@@ -757,12 +768,12 @@ export async function check_propagated_at(ctx) {
   const t = Math.floor(ctx.clock.now() / 1000);
   const purgeId = await seed();
   await records.setOutcomes(purgeId, {'/pricing': 'accepted', '/img/logo.png': 'accepted'});
-  await records.confirm(purgeId, '/pricing', t + 30);
+  await records.confirm(purgeId, '/pricing', t + 95);
   const half = (await read(c, purgeId)).json();
   assert.equal(half.propagated_at, null, \`one of two paths confirmed and propagated_at is \${half.propagated_at}: it must be null until every edge confirmed\`);
-  await records.confirm(purgeId, '/img/logo.png', t + 95);
+  await records.confirm(purgeId, '/img/logo.png', t + 40); // its edges reported earlier, the confirmation arrived later
   const done = (await read(c, purgeId)).json();
-  assert.equal(done.propagated_at, t + 95, \`propagated_at is \${done.propagated_at}, but the last path was confirmed at \${t + 95} (accepted at \${done.accepted_at})\`);
+  assert.equal(done.propagated_at, t + 95, \`propagated_at is \${done.propagated_at}, but the paths were confirmed at \${t + 95} and \${t + 40}: it is the latest confirmation time (accepted at \${done.accepted_at})\`);
 }
 `,
     go: `package main
@@ -777,21 +788,21 @@ import (
 	"leetbuild/harness"
 )
 
-const readDomain = "shop.example.com"
+const hReadDomain = "shop.example.com"
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func seedPurge(tenant string, paths ...string) string {
-	return records.Create(readBg, tenant, readDomain, paths).PurgeID
+func hSeedPurge(tenant string, paths ...string) string {
+	return records.Create(hReadBg, tenant, hReadDomain, paths).PurgeID
 }
 
-type readBody struct {
+type hReadBody struct {
 	PurgeID      string            \`json:"purge_id"\`
 	Domain       string            \`json:"domain"\`
 	Status       string            \`json:"status"\`
@@ -800,14 +811,14 @@ type readBody struct {
 	PropagatedAt *int64            \`json:"propagated_at"\`
 }
 
-func readPurge(c *harness.HTTP, purgeID, tenant string) (*harness.Response, readBody) {
+func hReadPurge(c *harness.HTTP, purgeID, tenant string) (*harness.Response, hReadBody) {
 	var r *harness.Response
 	if tenant == "" {
 		r = c.Get("/v1/purges/" + purgeID)
 	} else {
 		r = c.Get("/v1/purges/"+purgeID, "X-Tenant-Id", tenant)
 	}
-	var body readBody
+	var body hReadBody
 	if r.Status == 200 {
 		r.Decode(&body)
 	}
@@ -815,71 +826,76 @@ func readPurge(c *harness.HTTP, purgeID, tenant string) (*harness.Response, read
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	purgeID := seedPurge("t1", "/pricing", "/img/logo.png")
-	r, body := readPurge(c, purgeID, "t1")
+	c := hReadAPI(ctx)
+	purgeID := hSeedPurge("t1", "/pricing", "/img/logo.png")
+	r, body := hReadPurge(c, purgeID, "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/purges/%s (%s)", purgeID, r.Text())
-	ctx.Assert(body.PurgeID == purgeID && body.Domain == readDomain, "the read answered %s", r.Text())
+	ctx.Assert(body.PurgeID == purgeID && body.Domain == hReadDomain, "the read answered %s", r.Text())
 	ctx.Equal(body.Status, "accepted", "a purge waiting for the provider; its status")
-	ctx.Equal(body.AcceptedAt, records.Get(readBg, purgeID).AcceptedAt, "accepted_at, against the record")
-	missing, _ := readPurge(c, "pg-404", "t1")
+	ctx.Equal(body.AcceptedAt, records.Get(hReadBg, purgeID).AcceptedAt, "accepted_at, against the record")
+	missing, _ := hReadPurge(c, "pg-404", "t1")
 	ctx.Equal(missing.Status, 404, "an unknown purge")
-	anonymous, _ := readPurge(c, purgeID, "")
+	anonymous, _ := hReadPurge(c, purgeID, "")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	purgeID := seedPurge("t1", "/pricing", "/img/logo.png")
-	foreign, _ := readPurge(c, purgeID, "t2")
+	c := hReadAPI(ctx)
+	purgeID := hSeedPurge("t1", "/pricing", "/img/logo.png")
+	foreign, _ := hReadPurge(c, purgeID, "t2")
 	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's purge %s (%s): another tenant's purge must be 404", purgeID, foreign.Text())
-	ctx.Assert(!strings.Contains(foreign.Text(), readDomain), "the answer to another tenant names the domain: %s", foreign.Text())
-	unknown, _ := readPurge(c, "pg-404", "t2")
+	ctx.Assert(!strings.Contains(foreign.Text(), hReadDomain), "the answer to another tenant names the domain: %s", foreign.Text())
+	unknown, _ := hReadPurge(c, "pg-404", "t2")
 	ctx.Equal(unknown.Status, 404, "an unknown purge")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), purgeID, "{id}"), strings.ReplaceAll(unknown.Text(), "pg-404", "{id}"), "another tenant's purge and an unknown id must answer alike, or the answer confirms the purge exists; the body")
 }
 
 func CheckStatusDerive(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	t := ctx.Clock.Now() / 1000
-	purgeID := seedPurge("t1", "/pricing", "/img/logo.png")
-	records.SetOutcomes(readBg, purgeID, map[string]string{"/pricing": "accepted", "/img/logo.png": "accepted"})
-	_, accepted := readPurge(c, purgeID, "t1")
+	purgeID := hSeedPurge("t1", "/pricing", "/img/logo.png")
+	records.SetOutcomes(hReadBg, purgeID, map[string]string{"/pricing": "accepted", "/img/logo.png": "accepted"})
+	_, accepted := hReadPurge(c, purgeID, "t1")
 	ctx.Equal(accepted.Status, "accepted", "the provider accepted both paths and no edge confirmed yet: acceptance is not propagation; the status")
-	records.Confirm(readBg, purgeID, "/pricing", t+30)
-	_, half := readPurge(c, purgeID, "t1")
+	records.Confirm(hReadBg, purgeID, "/pricing", t+30)
+	_, half := hReadPurge(c, purgeID, "t1")
 	ctx.Equal(half.Status, "accepted", "one of two paths confirmed; the status")
-	records.Confirm(readBg, purgeID, "/img/logo.png", t+60)
-	_, done := readPurge(c, purgeID, "t1")
+	records.Confirm(hReadBg, purgeID, "/img/logo.png", t+60)
+	_, done := hReadPurge(c, purgeID, "t1")
 	ctx.Equal(done.Status, "propagated", "every path confirmed; the status")
-	broken := seedPurge("t1", "/a", "/b[")
-	records.SetOutcomes(readBg, broken, map[string]string{"/a": "propagated", "/b[": "invalid_pattern"})
-	_, partial := readPurge(c, broken, "t1")
+	broken := hSeedPurge("t1", "/a", "/b[")
+	records.SetOutcomes(hReadBg, broken, map[string]string{"/a": "propagated", "/b[": "invalid_pattern"})
+	_, partial := hReadPurge(c, broken, "t1")
 	ctx.Equal(partial.Status, "partially_failed", "a purge with an invalid pattern; its status")
+	refused := hSeedPurge("t1", "/a", "/hot")
+	records.SetOutcomes(hReadBg, refused, map[string]string{"/a": "accepted", "/hot": "failed"})
+	_, failed := hReadPurge(c, refused, "t1")
+	ctx.Equal(failed.Status, "partially_failed", "a purge with a failed path; its status")
 }
 
 func CheckFailedVisible(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	purgeID := seedPurge("t1", "/pricing", "/b[", "/hot")
+	c := hReadAPI(ctx)
+	purgeID := hSeedPurge("t1", "/pricing", "/b[", "/hot")
 	outcomes := map[string]string{"/pricing": "accepted", "/b[": "invalid_pattern", "/hot": "failed"}
-	records.SetOutcomes(readBg, purgeID, outcomes)
-	_, body := readPurge(c, purgeID, "t1")
+	records.SetOutcomes(hReadBg, purgeID, outcomes)
+	_, body := hReadPurge(c, purgeID, "t1")
 	ctx.Equal(body.Outcomes, outcomes, "the refused paths are the ones an operator has to fix; the outcomes in the response")
 }
 
 func CheckPropagatedAt(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	t := ctx.Clock.Now() / 1000
-	purgeID := seedPurge("t1", "/pricing", "/img/logo.png")
-	records.SetOutcomes(readBg, purgeID, map[string]string{"/pricing": "accepted", "/img/logo.png": "accepted"})
-	records.Confirm(readBg, purgeID, "/pricing", t+30)
-	_, half := readPurge(c, purgeID, "t1")
-	ctx.Assert(half.PropagatedAt == nil, "one of two paths confirmed and propagated_at is %d: it must be null until every edge confirmed", deref(half.PropagatedAt))
-	records.Confirm(readBg, purgeID, "/img/logo.png", t+95)
-	_, done := readPurge(c, purgeID, "t1")
-	ctx.Assert(done.PropagatedAt != nil && *done.PropagatedAt == t+95, "propagated_at is %d, but the last path was confirmed at %d (accepted at %d)", deref(done.PropagatedAt), t+95, done.AcceptedAt)
+	purgeID := hSeedPurge("t1", "/pricing", "/img/logo.png")
+	records.SetOutcomes(hReadBg, purgeID, map[string]string{"/pricing": "accepted", "/img/logo.png": "accepted"})
+	records.Confirm(hReadBg, purgeID, "/pricing", t+95)
+	_, half := hReadPurge(c, purgeID, "t1")
+	ctx.Assert(half.PropagatedAt == nil, "one of two paths confirmed and propagated_at is %d: it must be null until every edge confirmed", hDeref(half.PropagatedAt))
+	records.Confirm(hReadBg, purgeID, "/img/logo.png", t+40) // its edges reported earlier, the confirmation arrived later
+	_, done := hReadPurge(c, purgeID, "t1")
+	ctx.Assert(done.PropagatedAt != nil && *done.PropagatedAt == t+95, "propagated_at is %d, but the paths were confirmed at %d and %d: it is the latest confirmation time (accepted at %d)", hDeref(done.PropagatedAt), t+95, t+40, done.AcceptedAt)
 }
 
-func deref(v *int64) int64 {
+func hDeref(v *int64) int64 {
 	if v == nil {
 		return 0
 	}
@@ -898,9 +914,9 @@ func deref(v *int64) int64 {
 
 namespace {
 
-const std::string kReadDomain = "shop.example.com";
+const std::string kHReadDomain = "shop.example.com";
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP hReadAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -908,81 +924,91 @@ harness::HTTP readAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string seedPurge(const std::vector<std::string>& paths) { return records::create("t1", kReadDomain, paths).purge_id; }
+std::string hSeedPurge(const std::vector<std::string>& paths) { return records::create("t1", kHReadDomain, paths).purge_id; }
 
-harness::Response readPurge(harness::HTTP& c, const std::string& purge_id, const std::string& tenant = "t1") {
+harness::Response hReadPurge(harness::HTTP& c, const std::string& purge_id, const std::string& tenant = "t1") {
   if (tenant.empty()) return c.Get("/v1/purges/" + purge_id);
   return c.Get("/v1/purges/" + purge_id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::string text(const nlohmann::json& j, const std::string& field) {
+std::string hText(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+std::string hReplaceAll(std::string s, const std::string& from, const std::string& to) {
+  for (size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size())) s.replace(at, from.size(), to);
+  return s;
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string purge_id = seedPurge({"/pricing", "/img/logo.png"});
-  const auto r = readPurge(c, purge_id);
+  auto c = hReadAPI(ctx);
+  const std::string purge_id = hSeedPurge({"/pricing", "/img/logo.png"});
+  const auto r = hReadPurge(c, purge_id);
   ctx.Equal(r.Status, 200, "GET /v1/purges/%s (%s)", purge_id, r.Text());
-  const auto body = bodyOf(r);
-  ctx.Assert(text(body, "purge_id") == purge_id && text(body, "domain") == kReadDomain, "the read answered %s", r.Text());
-  ctx.Equal(text(body, "status"), "accepted", "a purge waiting for the provider; its status");
+  const auto body = hBodyOf(r);
+  ctx.Assert(hText(body, "purge_id") == purge_id && hText(body, "domain") == kHReadDomain, "the read answered %s", r.Text());
+  ctx.Equal(hText(body, "status"), "accepted", "a purge waiting for the provider; its status");
   ctx.Equal(body.value("accepted_at", 0LL), records::get(purge_id)->accepted_at, "accepted_at, against the record");
-  ctx.Equal(readPurge(c, "pg-404").Status, 404, "an unknown purge");
-  ctx.Equal(readPurge(c, purge_id, "").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(hReadPurge(c, "pg-404").Status, 404, "an unknown purge");
+  ctx.Equal(hReadPurge(c, purge_id, "").Status, 401, "a read without X-Tenant-Id");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string purge_id = seedPurge({"/pricing", "/img/logo.png"});
-  const auto foreign = readPurge(c, purge_id, "t2");
+  auto c = hReadAPI(ctx);
+  const std::string purge_id = hSeedPurge({"/pricing", "/img/logo.png"});
+  const auto foreign = hReadPurge(c, purge_id, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's purge %s (%s): another tenant's purge must be 404", purge_id, foreign.Text());
-  ctx.Assert(foreign.Text().find(kReadDomain) == std::string::npos, "the answer to another tenant names the domain: %s", foreign.Text());
-  ctx.Equal(readPurge(c, "pg-404", "t2").Status, 404, "an unknown purge");
+  ctx.Assert(foreign.Text().find(kHReadDomain) == std::string::npos, "the answer to another tenant names the domain: %s", foreign.Text());
+  const auto unknown = hReadPurge(c, "pg-404", "t2");
+  ctx.Equal(unknown.Status, 404, "an unknown purge");
+  ctx.Equal(hReplaceAll(foreign.Text(), purge_id, "{id}"), hReplaceAll(unknown.Text(), "pg-404", "{id}"), "another tenant's purge and an unknown id must answer alike, or the answer confirms the purge exists; the body");
 }
 
 void CheckStatusDerive(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
+  auto c = hReadAPI(ctx);
   const long long t = ctx.Clock.Now() / 1000;
-  const std::string purge_id = seedPurge({"/pricing", "/img/logo.png"});
+  const std::string purge_id = hSeedPurge({"/pricing", "/img/logo.png"});
   records::setOutcomes(purge_id, {{"/pricing", "accepted"}, {"/img/logo.png", "accepted"}});
-  ctx.Equal(text(bodyOf(readPurge(c, purge_id)), "status"), "accepted", "the provider accepted both paths and no edge confirmed yet: acceptance is not propagation; the status");
+  ctx.Equal(hText(hBodyOf(hReadPurge(c, purge_id)), "status"), "accepted", "the provider accepted both paths and no edge confirmed yet: acceptance is not propagation; the status");
   records::confirm(purge_id, "/pricing", t + 30);
-  ctx.Equal(text(bodyOf(readPurge(c, purge_id)), "status"), "accepted", "one of two paths confirmed; the status");
+  ctx.Equal(hText(hBodyOf(hReadPurge(c, purge_id)), "status"), "accepted", "one of two paths confirmed; the status");
   records::confirm(purge_id, "/img/logo.png", t + 60);
-  ctx.Equal(text(bodyOf(readPurge(c, purge_id)), "status"), "propagated", "every path confirmed; the status");
-  const std::string broken = seedPurge({"/a", "/b["});
+  ctx.Equal(hText(hBodyOf(hReadPurge(c, purge_id)), "status"), "propagated", "every path confirmed; the status");
+  const std::string broken = hSeedPurge({"/a", "/b["});
   records::setOutcomes(broken, {{"/a", "propagated"}, {"/b[", "invalid_pattern"}});
-  ctx.Equal(text(bodyOf(readPurge(c, broken)), "status"), "partially_failed", "a purge with an invalid pattern; its status");
+  ctx.Equal(hText(hBodyOf(hReadPurge(c, broken)), "status"), "partially_failed", "a purge with an invalid pattern; its status");
+  const std::string refused = hSeedPurge({"/a", "/hot"});
+  records::setOutcomes(refused, {{"/a", "accepted"}, {"/hot", "failed"}});
+  ctx.Equal(hText(hBodyOf(hReadPurge(c, refused)), "status"), "partially_failed", "a purge with a failed path; its status");
 }
 
 void CheckFailedVisible(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const std::string purge_id = seedPurge({"/pricing", "/b[", "/hot"});
+  auto c = hReadAPI(ctx);
+  const std::string purge_id = hSeedPurge({"/pricing", "/b[", "/hot"});
   const std::map<std::string, std::string> outcomes = {{"/pricing", "accepted"}, {"/b[", "invalid_pattern"}, {"/hot", "failed"}};
   records::setOutcomes(purge_id, outcomes);
-  const auto body = bodyOf(readPurge(c, purge_id));
+  const auto body = hBodyOf(hReadPurge(c, purge_id));
   ctx.Equal(body.is_object() && body.contains("outcomes") ? body["outcomes"] : nlohmann::json(), nlohmann::json(outcomes),
             "the refused paths are the ones an operator has to fix; the outcomes in the response");
 }
 
 void CheckPropagatedAt(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
+  auto c = hReadAPI(ctx);
   const long long t = ctx.Clock.Now() / 1000;
-  const std::string purge_id = seedPurge({"/pricing", "/img/logo.png"});
+  const std::string purge_id = hSeedPurge({"/pricing", "/img/logo.png"});
   records::setOutcomes(purge_id, {{"/pricing", "accepted"}, {"/img/logo.png", "accepted"}});
-  records::confirm(purge_id, "/pricing", t + 30);
-  const auto half = bodyOf(readPurge(c, purge_id));
+  records::confirm(purge_id, "/pricing", t + 95);
+  const auto half = hBodyOf(hReadPurge(c, purge_id));
   ctx.Assert(half.is_object() && half.contains("propagated_at") && half["propagated_at"].is_null(), "one of two paths confirmed and propagated_at is %s: it must be null until every edge confirmed",
              half.is_object() && half.contains("propagated_at") ? half["propagated_at"].dump() : "missing");
-  records::confirm(purge_id, "/img/logo.png", t + 95);
-  const auto done = bodyOf(readPurge(c, purge_id));
+  records::confirm(purge_id, "/img/logo.png", t + 40);  // its edges reported earlier, the confirmation arrived later
+  const auto done = hBodyOf(hReadPurge(c, purge_id));
   const long long at = done.is_object() && done.contains("propagated_at") && done["propagated_at"].is_number() ? done["propagated_at"].get<long long>() : 0;
-  ctx.Assert(at == t + 95, "propagated_at is %d, but the last path was confirmed at %d (accepted at %d)", at, t + 95, done.value("accepted_at", 0LL));
+  ctx.Assert(at == t + 95, "propagated_at is %d, but the paths were confirmed at %d and %d: it is the latest confirmation time (accepted at %d)", at, t + 95, t + 40, done.value("accepted_at", 0LL));
 }
 `,
   },

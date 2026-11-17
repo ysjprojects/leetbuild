@@ -716,12 +716,18 @@ def check_outbox_on_failure(ctx):
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == SHOP and row.get("payload", {}).get("path") == "/pricing", f"the outbox row is {row}, expected the topic, the key {SHOP} and the event"
     assert sent == 0, f"publish_outcomes counted {sent} acknowledged events after a failed delivery, expected 0"
+    ctx.kafka.fail_next(TOPIC, 1)  # one delivery fails: whatever was not acknowledged is parked, and only that
+    sent = m.publish_outcomes("pg-3", SHOP, {"/x": "accepted", "/y": "accepted"})
+    parked = [row.get("payload", {}).get("path") for row in records.outbox() if row.get("payload", {}).get("purge_id") == "pg-3"]
+    delivered = [event.get("path") for event in (json.loads(record.value) for record in ctx.kafka.records(TOPIC)) if event.get("purge_id") == "pg-3"]
+    assert len(parked) >= 1 and sorted(parked + delivered) == ["/x", "/y"], f"a delivery failed: the outbox holds {parked} for pg-3 and the topic {delivered}, expected every unacknowledged event parked and only those"
+    assert sent == len(delivered), f"publish_outcomes counted {sent} acknowledged events, the broker acknowledged {len(delivered)}"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     sent = m.publish_outcomes("pg-2", SHOP, {"/a": "accepted", "/b": "accepted"})
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_outcomes waited {waited:.0f} s for a broker that does not answer: wait for the acknowledgements at most 2 s"
-    parked = sorted(row.get("payload", {}).get("path") for row in records.outbox()[1:])
+    assert waited <= 2.5, f"publish_outcomes waited {waited:.1f} s for a broker that does not answer: wait for the acknowledgements at most 2 s in all"
+    parked = sorted(row.get("payload", {}).get("path") for row in records.outbox() if row.get("payload", {}).get("purge_id") == "pg-2")
     assert parked == ["/a", "/b"], f"no acknowledgement within the window and the outbox holds {parked} for pg-2, expected /a and /b"
     assert sent == 0, f"publish_outcomes counted {sent} acknowledged events without an acknowledgement, expected 0"
 `,
@@ -798,13 +804,19 @@ export async function check_outbox_on_failure(ctx) {
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the purge never reaches the projector\`);
   assert(rows[0].topic === TOPIC && rows[0].key === SHOP && rows[0].payload?.path === '/pricing', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key \${SHOP} and the event\`);
   assert.equal(sent, 0, \`publishOutcomes counted \${sent} acknowledged events after a failed delivery, expected 0\`);
+  ctx.kafka.failNext(TOPIC, 1); // one delivery fails: whatever was not acknowledged is parked, and only that
+  sent = await m.publishOutcomes('pg-3', SHOP, {'/x': 'accepted', '/y': 'accepted'});
+  await settle();
+  let parked = outboxRows(ctx).filter(row => row.payload?.purge_id === 'pg-3').map(row => row.payload?.path);
+  const delivered = (ctx.kafka.values(TOPIC) as string[]).map(v => JSON.parse(v)).filter(e => e.purge_id === 'pg-3').map(e => e.path);
+  assert(parked.length >= 1 && JSON.stringify([...parked, ...delivered].sort()) === '["/x","/y"]', \`a delivery failed: the outbox holds \${JSON.stringify(parked)} for pg-3 and the topic \${JSON.stringify(delivered)}, expected every unacknowledged event parked and only those\`);
+  assert.equal(sent, delivered.length, \`publishOutcomes counted \${sent} acknowledged events, the broker acknowledged \${delivered.length}\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   sent = await m.publishOutcomes('pg-2', SHOP, {'/a': 'accepted', '/b': 'accepted'});
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishOutcomes waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the acknowledgements at most 2 s\`);
-  rows = outboxRows(ctx);
-  const parked = rows.slice(1).map(row => row.payload?.path).sort();
+  assert(waited <= 2.5, \`publishOutcomes waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the acknowledgements at most 2 s in all\`);
+  parked = outboxRows(ctx).filter(row => row.payload?.purge_id === 'pg-2').map(row => row.payload?.path).sort();
   assert.deepEqual(parked, ['/a', '/b'], \`no acknowledgement within the window and the outbox holds \${JSON.stringify(parked)} for pg-2, expected /a and /b\`);
   assert.equal(sent, 0, \`publishOutcomes counted \${sent} acknowledged events without an acknowledgement, expected 0\`);
 }
@@ -816,6 +828,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"sort"
 
 	"purge/records"
@@ -824,26 +837,26 @@ import (
 )
 
 const (
-	eventsTopic = "cdn.purged"
-	eventsShop  = "shop.example.com"
+	hEventsTopic = "cdn.purged"
+	hEventsShop  = "shop.example.com"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func eventsSha(path string) string {
+func hEventsSha(path string) string {
 	sum := sha256.Sum256([]byte(path))
 	return hex.EncodeToString(sum[:])
 }
 
-func eventsPublish(ctx *harness.Ctx, purgeID, domain string, outcomes map[string]string) int {
-	n, err := publishOutcomes(eventsBg, purgeID, domain, outcomes)
+func hEventsPublish(ctx *harness.Ctx, purgeID, domain string, outcomes map[string]string) int {
+	n, err := publishOutcomes(hEventsBg, purgeID, domain, outcomes)
 	ctx.NoError(err, "publishOutcomes(%s) failed", purgeID)
 	return n
 }
 
-func eventsValues(ctx *harness.Ctx) []map[string]any {
+func hEventsValues(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, text := range ctx.Kafka.Values(eventsTopic) {
+	for _, text := range ctx.Kafka.Values(hEventsTopic) {
 		var event map[string]any
 		ctx.NoError(json.Unmarshal([]byte(text), &event), "an event must be JSON, got %s", text)
 		out = append(out, event)
@@ -851,7 +864,20 @@ func eventsValues(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func idsOf(events []map[string]any) []string {
+// hEventsParked lists the paths the outbox holds for the purge, sorted.
+func hEventsParked(ctx *harness.Ctx, purgeID string) []string {
+	var parked []string
+	for _, row := range records.Outbox(hEventsBg) {
+		if row.Payload["purge_id"] == purgeID {
+			path, _ := row.Payload["path"].(string)
+			parked = append(parked, path)
+		}
+	}
+	sort.Strings(parked)
+	return parked
+}
+
+func hIdsOf(events []map[string]any) []string {
 	var ids []string
 	for _, e := range events {
 		id, _ := e["event_id"].(string)
@@ -862,73 +888,82 @@ func idsOf(events []map[string]any) []string {
 }
 
 func CheckDomainKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, "pg-1", eventsShop, map[string]string{"/pricing": "accepted", "/img/logo.png": "accepted"})
-	eventsPublish(ctx, "pg-2", "blog.example.com", map[string]string{"/": "accepted"})
-	eventsPublish(ctx, "pg-3", eventsShop, map[string]string{"/pricing": "failed"})
+	hEventsPublish(ctx, "pg-1", hEventsShop, map[string]string{"/pricing": "accepted", "/img/logo.png": "accepted"})
+	hEventsPublish(ctx, "pg-2", "blog.example.com", map[string]string{"/": "accepted"})
+	hEventsPublish(ctx, "pg-3", hEventsShop, map[string]string{"/pricing": "failed"})
 	ctx.Settle()
-	found := ctx.Kafka.Records(eventsTopic)
-	keys := ctx.Kafka.Keys(eventsTopic)
-	events := eventsValues(ctx)
+	found := ctx.Kafka.Records(hEventsTopic)
+	keys := ctx.Kafka.Keys(hEventsTopic)
+	events := hEventsValues(ctx)
 	ctx.Equal(len(found), 4, "three purges with four paths must produce four records on cdn.purged; the records")
 	partitions := map[int]bool{}
 	for i, event := range events {
 		ctx.Equal(keys[i], event["domain"], "the key decides the partition, and one domain's purges must stay in order; the key of an event of %v", event["domain"])
-		if keys[i] == eventsShop {
+		if keys[i] == hEventsShop {
 			partitions[int(found[i].Partition)] = true
 		}
 	}
-	ctx.Equal(len(partitions), 1, "the events of %s must share one partition, or the projector can apply pg-3 before pg-1; the partitions", eventsShop)
+	ctx.Equal(len(partitions), 1, "the events of %s must share one partition, or the projector can apply pg-3 before pg-1; the partitions", hEventsShop)
 }
 
 func CheckEventId(ctx *harness.Ctx) {
 	outcomes := map[string]string{"/pricing": "accepted", "/img/logo.png": "failed"}
-	eventsPublish(ctx, "pg-1", eventsShop, outcomes)
-	eventsPublish(ctx, "pg-1", eventsShop, outcomes) // the worker restarted and published the purge again
+	hEventsPublish(ctx, "pg-1", hEventsShop, outcomes)
+	hEventsPublish(ctx, "pg-1", hEventsShop, outcomes) // the worker restarted and published the purge again
 	ctx.Settle()
-	events := eventsValues(ctx)
+	events := hEventsValues(ctx)
 	ctx.Equal(len(events), 4, "two publishes of two paths must produce four events; the events")
-	first, again := idsOf(events[:2]), idsOf(events[2:])
+	first, again := hIdsOf(events[:2]), hIdsOf(events[2:])
 	ctx.Equal(again, first, "the republished purge must carry the same event ids, or the projector cannot tell the copies apart; the ids")
-	expected := []string{"pg-1:" + eventsSha("/img/logo.png"), "pg-1:" + eventsSha("/pricing")}
+	expected := []string{"pg-1:" + hEventsSha("/img/logo.png"), "pg-1:" + hEventsSha("/pricing")}
 	sort.Strings(expected)
 	ctx.Equal(first, expected, "the event ids must be {purge_id}:{sha256(path)}")
 	for _, event := range events[:2] {
 		path, _ := event["path"].(string)
-		ctx.Assert(event["outcome"] == outcomes[path] && event["path_digest"] == eventsSha(path), "the event %v must carry its path, path_digest and outcome", event)
+		ctx.Assert(event["outcome"] == outcomes[path] && event["path_digest"] == hEventsSha(path), "the event %v must carry its path, path_digest and outcome", event)
 	}
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, "pg-1", eventsShop, map[string]string{"/pricing": "accepted"})
+	ctx.Kafka.LoseAcks(hEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hEventsPublish(ctx, "pg-1", hEventsShop, map[string]string{"/pricing": "accepted"})
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	eventsPublish(ctx, "pg-2", eventsShop, map[string]string{"/about": "accepted"})
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hEventsPublish(ctx, "pg-2", hEventsShop, map[string]string{"/about": "accepted"})
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	sent := eventsPublish(ctx, "pg-1", eventsShop, map[string]string{"/pricing": "accepted"})
+	ctx.Kafka.FailNext(hEventsTopic, 1)
+	sent := hEventsPublish(ctx, "pg-1", hEventsShop, map[string]string{"/pricing": "accepted"})
 	ctx.Settle()
-	rows := records.Outbox(eventsBg)
+	rows := records.Outbox(hEventsBg)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the purge never reaches the projector; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == eventsShop && rows[0].Payload["path"] == "/pricing", "the outbox row is %+v, expected the topic, the key %s and the event", rows[0], eventsShop)
+	ctx.Assert(rows[0].Topic == hEventsTopic && rows[0].Key == hEventsShop && rows[0].Payload["path"] == "/pricing", "the outbox row is %+v, expected the topic, the key %s and the event", rows[0], hEventsShop)
 	ctx.Equal(sent, 0, "publishOutcomes' count of acknowledged events after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
-	before := ctx.Clock.Now()
-	sent = eventsPublish(ctx, "pg-2", eventsShop, map[string]string{"/a": "accepted", "/b": "accepted"})
-	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishOutcomes waited %.0f s for a broker that does not answer: wait for the acknowledgements at most 2 s", waited)
-	var parked []string
-	for _, row := range records.Outbox(eventsBg)[1:] {
-		path, _ := row.Payload["path"].(string)
-		parked = append(parked, path)
+	ctx.Kafka.FailNext(hEventsTopic, 1) // one delivery fails: whatever was not acknowledged is parked, and only that
+	sent = hEventsPublish(ctx, "pg-3", hEventsShop, map[string]string{"/x": "accepted", "/y": "accepted"})
+	ctx.Settle()
+	parked := hEventsParked(ctx, "pg-3")
+	var delivered []string
+	for _, event := range hEventsValues(ctx) {
+		if event["purge_id"] == "pg-3" {
+			path, _ := event["path"].(string)
+			delivered = append(delivered, path)
+		}
 	}
-	sort.Strings(parked)
-	ctx.Equal(parked, []string{"/a", "/b"}, "no acknowledgement within the window: the outbox rows for pg-2")
+	both := append(append([]string{}, parked...), delivered...)
+	sort.Strings(both)
+	ctx.Assert(len(parked) >= 1 && fmt.Sprint(both) == "[/x /y]", "a delivery failed: the outbox holds %v for pg-3 and the topic %v, expected every unacknowledged event parked and only those", parked, delivered)
+	ctx.Equal(sent, len(delivered), "publishOutcomes' count of acknowledged events against the broker's")
+	ctx.Kafka.Stall(hEventsTopic) // the broker stops answering
+	before := ctx.Clock.Now()
+	sent = hEventsPublish(ctx, "pg-2", hEventsShop, map[string]string{"/a": "accepted", "/b": "accepted"})
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 2.5, "publishOutcomes waited %.1f s for a broker that does not answer: wait for the acknowledgements at most 2 s in all", waited)
+	ctx.Equal(hEventsParked(ctx, "pg-2"), []string{"/a", "/b"}, "no acknowledgement within the window: the outbox rows for pg-2")
 	ctx.Equal(sent, 0, "publishOutcomes' count of acknowledged events without an acknowledgement")
 }
 `,
@@ -948,10 +983,10 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "cdn.purged";
-const std::string kEventsShop = "shop.example.com";
+const std::string kHEventsTopic = "cdn.purged";
+const std::string kHEventsShop = "shop.example.com";
 
-std::string eventsSha(const std::string& path) {
+std::string hEventsSha(const std::string& path) {
   unsigned char md[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(path.data()), path.size(), md);
   char hex[2 * SHA256_DIGEST_LENGTH + 1];
@@ -959,19 +994,29 @@ std::string eventsSha(const std::string& path) {
   return std::string(hex, 2 * SHA256_DIGEST_LENGTH);
 }
 
-std::string text(const nlohmann::json& j, const std::string& field) {
+std::string hText(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
-std::vector<nlohmann::json> eventsValues(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsValues(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
-  for (const auto& value : ctx.Kafka.Values(kEventsTopic)) out.push_back(nlohmann::json::parse(value, nullptr, false));
+  for (const auto& value : ctx.Kafka.Values(kHEventsTopic)) out.push_back(nlohmann::json::parse(value, nullptr, false));
   return out;
 }
 
-std::vector<std::string> idsOf(const std::vector<nlohmann::json>& events, size_t from, size_t to) {
+// The paths the outbox holds for the purge, sorted.
+std::vector<std::string> hEventsParked(const std::string& purge_id) {
+  std::vector<std::string> parked;
+  for (const auto& row : records::outbox()) {
+    if (row.contains("payload") && hText(row["payload"], "purge_id") == purge_id) parked.push_back(hText(row["payload"], "path"));
+  }
+  std::sort(parked.begin(), parked.end());
+  return parked;
+}
+
+std::vector<std::string> hIdsOf(const std::vector<nlohmann::json>& events, size_t from, size_t to) {
   std::vector<std::string> ids;
-  for (size_t i = from; i < to && i < events.size(); i++) ids.push_back(text(events[i], "event_id"));
+  for (size_t i = from; i < to && i < events.size(); i++) ids.push_back(hText(events[i], "event_id"));
   std::sort(ids.begin(), ids.end());
   return ids;
 }
@@ -979,71 +1024,80 @@ std::vector<std::string> idsOf(const std::vector<nlohmann::json>& events, size_t
 }  // namespace
 
 void CheckDomainKey(harness::Ctx& ctx) {
-  publishOutcomes("pg-1", kEventsShop, {{"/pricing", "accepted"}, {"/img/logo.png", "accepted"}});
+  publishOutcomes("pg-1", kHEventsShop, {{"/pricing", "accepted"}, {"/img/logo.png", "accepted"}});
   publishOutcomes("pg-2", "blog.example.com", {{"/", "accepted"}});
-  publishOutcomes("pg-3", kEventsShop, {{"/pricing", "failed"}});
+  publishOutcomes("pg-3", kHEventsShop, {{"/pricing", "failed"}});
   ctx.Settle();
-  const auto found = ctx.Kafka.Records(kEventsTopic);
-  const auto keys = ctx.Kafka.Keys(kEventsTopic);
-  const auto events = eventsValues(ctx);
+  const auto found = ctx.Kafka.Records(kHEventsTopic);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopic);
+  const auto events = hEventsValues(ctx);
   ctx.Equal(found.size(), 4, "three purges with four paths must produce four records on cdn.purged; the records");
   std::set<int> partitions;
   for (size_t i = 0; i < events.size(); i++) {
-    ctx.Equal(keys[i], text(events[i], "domain"), "the key decides the partition, and one domain's purges must stay in order; the key of an event of %s", text(events[i], "domain"));
-    if (keys[i] == kEventsShop) partitions.insert(found[i].Partition);
+    ctx.Equal(keys[i], hText(events[i], "domain"), "the key decides the partition, and one domain's purges must stay in order; the key of an event of %s", hText(events[i], "domain"));
+    if (keys[i] == kHEventsShop) partitions.insert(found[i].Partition);
   }
   ctx.Equal(partitions.size(), 1, "the events of shop.example.com must share one partition, or the projector can apply pg-3 before pg-1; the partitions");
 }
 
 void CheckEventId(harness::Ctx& ctx) {
   const std::map<std::string, std::string> outcomes = {{"/pricing", "accepted"}, {"/img/logo.png", "failed"}};
-  publishOutcomes("pg-1", kEventsShop, outcomes);
-  publishOutcomes("pg-1", kEventsShop, outcomes);  // the worker restarted and published the purge again
+  publishOutcomes("pg-1", kHEventsShop, outcomes);
+  publishOutcomes("pg-1", kHEventsShop, outcomes);  // the worker restarted and published the purge again
   ctx.Settle();
-  const auto events = eventsValues(ctx);
+  const auto events = hEventsValues(ctx);
   ctx.Equal(events.size(), 4, "two publishes of two paths must produce four events; the events");
-  const auto first = idsOf(events, 0, 2);
-  ctx.Equal(idsOf(events, 2, 4), first, "the republished purge must carry the same event ids, or the projector cannot tell the copies apart; the ids");
-  std::vector<std::string> expected = {"pg-1:" + eventsSha("/img/logo.png"), "pg-1:" + eventsSha("/pricing")};
+  const auto first = hIdsOf(events, 0, 2);
+  ctx.Equal(hIdsOf(events, 2, 4), first, "the republished purge must carry the same event ids, or the projector cannot tell the copies apart; the ids");
+  std::vector<std::string> expected = {"pg-1:" + hEventsSha("/img/logo.png"), "pg-1:" + hEventsSha("/pricing")};
   std::sort(expected.begin(), expected.end());
   ctx.Equal(first, expected, "the event ids must be {purge_id}:{sha256(path)}");
   for (size_t i = 0; i < 2 && i < events.size(); i++) {
-    const std::string path = text(events[i], "path");
-    ctx.Assert(outcomes.count(path) && text(events[i], "outcome") == outcomes.at(path) && text(events[i], "path_digest") == eventsSha(path),
+    const std::string path = hText(events[i], "path");
+    ctx.Assert(outcomes.count(path) && hText(events[i], "outcome") == outcomes.at(path) && hText(events[i], "path_digest") == hEventsSha(path),
                "the event %s must carry its path, path_digest and outcome", events[i].dump());
   }
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishOutcomes("pg-1", kEventsShop, {{"/pricing", "accepted"}});
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishOutcomes("pg-1", kHEventsShop, {{"/pricing", "accepted"}});
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishOutcomes("pg-2", kEventsShop, {{"/about", "accepted"}});
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  publishOutcomes("pg-2", kHEventsShop, {{"/about", "accepted"}});
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  int sent = publishOutcomes("pg-1", kEventsShop, {{"/pricing", "accepted"}});
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  int sent = publishOutcomes("pg-1", kHEventsShop, {{"/pricing", "accepted"}});
   ctx.Settle();
   auto rows = records::outbox();
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the purge never reaches the projector; the rows");
-  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == kEventsShop && text(rows[0]["payload"], "path") == "/pricing",
+  ctx.Assert(hText(rows[0], "topic") == kHEventsTopic && hText(rows[0], "key") == kHEventsShop && hText(rows[0]["payload"], "path") == "/pricing",
              "the outbox row is %s, expected the topic, the key shop.example.com and the event", rows[0].dump());
   ctx.Equal(sent, 0, "publishOutcomes' count of acknowledged events after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.FailNext(kHEventsTopic, 1);  // one delivery fails: whatever was not acknowledged is parked, and only that
+  sent = publishOutcomes("pg-3", kHEventsShop, {{"/x", "accepted"}, {"/y", "accepted"}});
+  ctx.Settle();
+  const auto parked = hEventsParked("pg-3");
+  std::vector<std::string> delivered;
+  for (const auto& event : hEventsValues(ctx)) {
+    if (hText(event, "purge_id") == "pg-3") delivered.push_back(hText(event, "path"));
+  }
+  std::vector<std::string> both = parked;
+  both.insert(both.end(), delivered.begin(), delivered.end());
+  std::sort(both.begin(), both.end());
+  ctx.Assert(!parked.empty() && both == std::vector<std::string>{"/x", "/y"}, "a delivery failed: the outbox holds %q for pg-3 and the topic %q, expected every unacknowledged event parked and only those", parked, delivered);
+  ctx.Equal(sent, static_cast<int>(delivered.size()), "publishOutcomes' count of acknowledged events against the broker's");
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  sent = publishOutcomes("pg-2", kEventsShop, {{"/a", "accepted"}, {"/b", "accepted"}});
+  sent = publishOutcomes("pg-2", kHEventsShop, {{"/a", "accepted"}, {"/b", "accepted"}});
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishOutcomes waited %.0f s for a broker that does not answer: wait for the acknowledgements at most 2 s", waited);
-  rows = records::outbox();
-  std::vector<std::string> parked;
-  for (size_t i = 1; i < rows.size(); i++) parked.push_back(text(rows[i]["payload"], "path"));
-  std::sort(parked.begin(), parked.end());
-  ctx.Equal(parked, std::vector<std::string>{"/a", "/b"}, "no acknowledgement within the window: the outbox rows for pg-2");
+  ctx.Assert(waited <= 2.5, "publishOutcomes waited %.1f s for a broker that does not answer: wait for the acknowledgements at most 2 s in all", waited);
+  ctx.Equal(hEventsParked("pg-2"), std::vector<std::string>{"/a", "/b"}, "no acknowledgement within the window: the outbox rows for pg-2");
   ctx.Equal(sent, 0, "publishOutcomes' count of acknowledged events without an acknowledgement");
 }
 `,

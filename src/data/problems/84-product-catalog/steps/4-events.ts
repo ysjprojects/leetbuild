@@ -86,7 +86,7 @@ acknowledgement gets the record twice.
       id: 'no-draft-values',
       title: 'Carries changed field names, never draft values',
       detail:
-        'The payload carries the names of the fields that changed (`changed_fields`) and no value from the draft: the topic is retained and replicated, so a price written there outlives every retention rule the draft has.',
+        'The payload carries the sorted names of the fields that changed (`changed_fields`, whatever order the caller passed) and no value from the draft anywhere in the record, nested or under another name: the topic is retained and replicated, so a price written there outlives every retention rule the draft has.',
       match: {
         python: {
           all: [/changed_fields/],
@@ -759,12 +759,21 @@ def check_event_types(ctx):
 
 def check_no_draft_values(ctx):
     m = ctx.load("events")
-    _publish(m, DRAFT, None, ["price_cents", "title"])
-    payload = _payload(ctx.kafka.records(TOPIC)[0])
+    _publish(m, DRAFT, None, ["title", "price_cents"])
+    m.record_event("hold", "p-1", "kitchen", V2, ["title", "tax_class"], published_version=1)
+    records = ctx.kafka.records(TOPIC)
+    assert len(records) == 2, f"a publish and a hold produced {len(records)} records on {TOPIC}, expected 2"
+    payload = _payload(records[0])
     for name, value in (("price_cents", 3499), ("title", "Kettle"), ("tax_class", "standard")):
         assert name not in payload, f"the event carries the draft's {name}: {payload}. The topic is retained and replicated; carry the names of the changed fields, not their values"
         assert value not in payload.values(), f"the event carries the draft's {name} ({value!r}) under another name: {payload}"
-    assert payload.get("changed_fields") == ["price_cents", "title"], f"changed_fields must be the sorted names of the changed fields, got {payload.get('changed_fields')!r}"
+    for record in records:
+        text = record.value.decode() if isinstance(record.value, bytes) else str(record.value)
+        for value in ("3499", "Kettle", "standard"):
+            assert value not in text, f"the record {text} carries a value of the draft ({value}), nested or under another name: carry the names of the changed fields only"
+    assert payload.get("changed_fields") == ["price_cents", "title"], f"changed_fields must be the sorted names of the changed fields (given title, price_cents), got {payload.get('changed_fields')!r}"
+    held = _payload(records[1]).get("changed_fields")
+    assert held == ["tax_class", "title"], f"the hold's changed_fields must be the sorted names (given title, tax_class), got {held!r}"
 
 
 def check_commit_before_produce(ctx):
@@ -844,13 +853,23 @@ export async function check_event_types(ctx) {
 
 export async function check_no_draft_values(ctx) {
   const {m} = events(ctx);
-  await publish(m, DRAFT, null, ['price_cents', 'title']);
-  const p = payload(ctx.kafka.records(TOPIC)[0]);
+  await publish(m, DRAFT, null, ['title', 'price_cents']);
+  await m.recordEvent('hold', 'p-1', 'kitchen', V2, ['title', 'tax_class'], 1);
+  const records = ctx.kafka.records(TOPIC);
+  assert.equal(records.length, 2, \`a publish and a hold produced \${records.length} records on \${TOPIC}, expected 2\`);
+  const p = payload(records[0]);
   for (const [name, value] of [['price_cents', 3499], ['title', 'Kettle'], ['tax_class', 'standard']] as const) {
     assert(!(name in p), \`the event carries the draft's \${name}: \${JSON.stringify(p)}. The topic is retained and replicated; carry the names of the changed fields, not their values\`);
     assert(!Object.values(p).includes(value), \`the event carries the draft's \${name} (\${JSON.stringify(value)}) under another name: \${JSON.stringify(p)}\`);
   }
-  assert.deepStrictEqual(p.changed_fields, ['price_cents', 'title'], \`changed_fields must be the sorted names of the changed fields, got \${JSON.stringify(p.changed_fields)}\`);
+  for (const record of records) {
+    const text = record.value.toString();
+    for (const value of ['3499', 'Kettle', 'standard'])
+      assert(!text.includes(value), \`the record \${text} carries a value of the draft (\${value}), nested or under another name: carry the names of the changed fields only\`);
+  }
+  assert.deepStrictEqual(p.changed_fields, ['price_cents', 'title'], \`changed_fields must be the sorted names of the changed fields (given title, price_cents), got \${JSON.stringify(p.changed_fields)}\`);
+  const held = payload(records[1]).changed_fields;
+  assert.deepStrictEqual(held, ['tax_class', 'title'], \`the hold's changed_fields must be the sorted names (given title, tax_class), got \${JSON.stringify(held)}\`);
 }
 
 export async function check_commit_before_produce(ctx) {
@@ -892,95 +911,101 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "catalog.event"
+const hTopic = "catalog.event"
 
 var (
-	eventsBg = context.Background()
-	draft1   = store.Row{ProductID: "p-1", Version: 1, Status: "draft", Title: "Kettle", PriceCents: 3499, TaxClass: "standard"}
-	draft2   = store.Row{ProductID: "p-1", Version: 2, Status: "draft", Title: "Kettle, 2 L", PriceCents: 3499, TaxClass: "standard"}
+	hEventsBg = context.Background()
+	hDraft1   = store.Row{ProductID: "p-1", Version: 1, Status: "draft", Title: "Kettle", PriceCents: 3499, TaxClass: "standard"}
+	hDraft2   = store.Row{ProductID: "p-1", Version: 2, Status: "draft", Title: "Kettle, 2 L", PriceCents: 3499, TaxClass: "standard"}
 )
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func mustPublish(ctx *harness.Ctx, d store.Row, expected int, changed []string) map[string]any {
-	event, err := publish(eventsBg, d.ProductID, d, "kitchen", expected, changed)
+func hMustPublish(ctx *harness.Ctx, d store.Row, expected int, changed []string) map[string]any {
+	event, err := publish(hEventsBg, d.ProductID, d, "kitchen", expected, changed)
 	ctx.NoError(err, "publishing version %d (expected %d) failed", d.Version, expected)
 	ctx.Assert(event != nil, "publishing version %d (expected %d) must move the pointer and answer the event", d.Version, expected)
 	return event
 }
 
-func mustRecord(ctx *harness.Ctx, kind string, d store.Row, changed []string, publishedVersion int) map[string]any {
-	event, err := recordEvent(eventsBg, kind, "p-1", "kitchen", d, changed, publishedVersion)
+func hMustRecord(ctx *harness.Ctx, kind string, d store.Row, changed []string, publishedVersion int) map[string]any {
+	event, err := recordEvent(hEventsBg, kind, "p-1", "kitchen", d, changed, publishedVersion)
 	ctx.NoError(err, "recordEvent(%q) failed", kind)
 	return event
 }
 
 func CheckProductKey(ctx *harness.Ctx) {
-	mustPublish(ctx, draft1, 0, []string{"title", "price_cents", "tax_class"})
-	mustPublish(ctx, draft2, 1, []string{"title"})
-	mustRecord(ctx, "rollback", draft1, nil, 1)
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 3, "three events must produce three records on %s; the records", topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{"p-1", "p-1", "p-1"}, "records must be keyed by the product id (keyed by anything else, one product's events scatter across partitions)")
+	hMustPublish(ctx, hDraft1, 0, []string{"title", "price_cents", "tax_class"})
+	hMustPublish(ctx, hDraft2, 1, []string{"title"})
+	hMustRecord(ctx, "rollback", hDraft1, nil, 1)
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 3, "three events must produce three records on %s; the records", hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{"p-1", "p-1", "p-1"}, "records must be keyed by the product id (keyed by anything else, one product's events scatter across partitions)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "p-1's events landed on partitions %d, %d, %d: one product's history must stay on one partition, in order", records[0].Partition, records[1].Partition, records[2].Partition)
 }
 
 func CheckEventTypes(ctx *harness.Ctx) {
-	published := mustPublish(ctx, draft1, 0, []string{"title"})
-	held := mustRecord(ctx, "hold", draft2, []string{"title"}, 1)
-	rolled := mustRecord(ctx, "rollback", draft1, nil, 2)
+	published := hMustPublish(ctx, hDraft1, 0, []string{"title"})
+	held := hMustRecord(ctx, "hold", hDraft2, []string{"title"}, 1)
+	rolled := hMustRecord(ctx, "rollback", hDraft1, nil, 2)
 	var types []string
-	for _, r := range ctx.Kafka.Records(topic) {
-		t, _ := payloadOf(ctx, r.Value)["type"].(string)
+	for _, r := range ctx.Kafka.Records(hTopic) {
+		t, _ := hPayloadOf(ctx, r.Value)["type"].(string)
 		types = append(types, t)
 	}
 	ctx.Equal(types, []string{"catalog.publish", "catalog.hold", "catalog.rollback"}, "the three events' types")
 	ctx.Assert(published["version"] == 1 && published["published_version"] == 1, "the publish event must carry version 1 as version and published_version, got %v", published)
 	ctx.Assert(held["version"] == 2 && held["published_version"] == 1, "a hold of version 2 while 1 is live must carry version 2 and published_version 1, got %v", held)
 	ctx.Assert(rolled["product_id"] == "p-1" && rolled["category"] == "kitchen", "the event must carry product_id and category, got %v", rolled)
-	_, err := recordEvent(eventsBg, "archive", "p-1", "kitchen", draft1, nil, 0)
+	_, err := recordEvent(hEventsBg, "archive", "p-1", "kitchen", hDraft1, nil, 0)
 	ctx.Assert(err != nil, "an unknown kind (archive) must be refused, not forwarded as the event type")
 }
 
 func CheckNoDraftValues(ctx *harness.Ctx) {
-	mustPublish(ctx, draft1, 0, []string{"price_cents", "title"})
-	p := payloadOf(ctx, ctx.Kafka.Records(topic)[0].Value)
+	hMustPublish(ctx, hDraft1, 0, []string{"title", "price_cents"})
+	hMustRecord(ctx, "hold", hDraft2, []string{"title", "tax_class"}, 1)
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 2, "a publish and a hold must produce two records on %s; the records", hTopic)
+	p := hPayloadOf(ctx, records[0].Value)
 	for _, name := range []string{"price_cents", "title", "tax_class"} {
 		_, present := p[name]
 		ctx.Assert(!present, "the event carries the draft's %s: %v. The topic is retained and replicated; carry the names of the changed fields, not their values", name, p)
 	}
-	text := string(ctx.Kafka.Records(topic)[0].Value)
-	ctx.Assert(!strings.Contains(text, "3499") && !strings.Contains(text, "Kettle") && !strings.Contains(text, "standard"), "the event carries a draft value under another name: %s", text)
-	ctx.Equal(p["changed_fields"], []any{"price_cents", "title"}, "changed_fields must be the sorted names of the changed fields")
+	for _, r := range records {
+		text := string(r.Value)
+		ctx.Assert(!strings.Contains(text, "3499") && !strings.Contains(text, "Kettle") && !strings.Contains(text, "standard"), "the record %s carries a value of the draft, nested or under another name: carry the names of the changed fields only", text)
+	}
+	ctx.Equal(p["changed_fields"], []any{"price_cents", "title"}, "changed_fields must be the sorted names of the changed fields (given title, price_cents)")
+	ctx.Equal(hPayloadOf(ctx, records[1].Value)["changed_fields"], []any{"tax_class", "title"}, "the hold's changed_fields must be the sorted names (given title, tax_class)")
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
 	// The moment the pointer moves, what is already on the topic.
-	atCommit := ctx.Redis.After("catalog:p-1:published", func() any { return len(ctx.Kafka.Records(topic)) })
-	mustPublish(ctx, draft1, 0, []string{"title"})
+	atCommit := ctx.Redis.After("catalog:p-1:published", func() any { return len(ctx.Kafka.Records(hTopic)) })
+	hMustPublish(ctx, hDraft1, 0, []string{"title"})
 	ctx.Assert(atCommit.Fired, "publish never moved catalog:p-1:published")
 	ctx.Equal(atCommit.Result, 0, "when the pointer moved the topic already held records: the event described a version the catalog had not committed. Commit the snapshot, then produce; records at the commit")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after the publish, the records on the topic")
-	s, err := snapshot.ReadPublished(eventsBg, "p-1")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "after the publish, the records on the topic")
+	s, err := snapshot.ReadPublished(hEventsBg, "p-1")
 	ctx.NoError(err, "ReadPublished failed")
 	ctx.Equal(s["version"], 1, "the storefront's published version")
-	before := len(ctx.Kafka.Records(topic))
-	stale, err := publish(eventsBg, "p-1", draft2, "kitchen", 7, []string{"title"})
+	before := len(ctx.Kafka.Records(hTopic))
+	stale, err := publish(hEventsBg, "p-1", hDraft2, "kitchen", 7, []string{"title"})
 	ctx.NoError(err, "a stale publish must not fail")
 	ctx.Assert(stale == nil, "a publish whose expected version is stale must not move the pointer and must answer nil, got %v", stale)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), before, "a publish that did not move the pointer must not produce an event; the records")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), before, "a publish that did not move the pointer must not produce an event; the records")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	mustPublish(ctx, draft1, 0, []string{"title"})
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one publish, the records on the topic")
-	mustPublish(ctx, draft2, 1, []string{"title"})
-	lost := ctx.Kafka.Failover(topic)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
+	hMustPublish(ctx, hDraft1, 0, []string{"title"})
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "one publish, the records on the topic")
+	hMustPublish(ctx, hDraft2, 1, []string{"title"})
+	lost := ctx.Kafka.Failover(hTopic)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -996,11 +1021,11 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "catalog.event";
-const store::Row kDraft1{"p-1", 1, "draft", "Kettle", 3499, "standard"};
-const store::Row kDraft2{"p-1", 2, "draft", "Kettle, 2 L", 3499, "standard"};
+const std::string kHTopic = "catalog.event";
+const store::Row kHDraft1{"p-1", 1, "draft", "Kettle", 3499, "standard"};
+const store::Row kHDraft2{"p-1", 2, "draft", "Kettle, 2 L", 3499, "standard"};
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -1008,7 +1033,7 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   }
 }
 
-json mustPublish(harness::Ctx& ctx, const store::Row& d, long expected, const std::vector<std::string>& changed) {
+json hMustPublish(harness::Ctx& ctx, const store::Row& d, long expected, const std::vector<std::string>& changed) {
   std::optional<json> event;
   try {
     event = publish(d.product_id, d, "kitchen", expected, changed);
@@ -1022,23 +1047,23 @@ json mustPublish(harness::Ctx& ctx, const store::Row& d, long expected, const st
 }  // namespace
 
 void CheckProductKey(harness::Ctx& ctx) {
-  mustPublish(ctx, kDraft1, 0, {"title", "price_cents", "tax_class"});
-  mustPublish(ctx, kDraft2, 1, {"title"});
-  record_event("rollback", "p-1", "kitchen", kDraft1, {}, 1);
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three events must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"p-1", "p-1", "p-1"}, "records must be keyed by the product id (keyed by anything else, one product's events scatter across partitions)");
+  hMustPublish(ctx, kHDraft1, 0, {"title", "price_cents", "tax_class"});
+  hMustPublish(ctx, kHDraft2, 1, {"title"});
+  record_event("rollback", "p-1", "kitchen", kHDraft1, {}, 1);
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 3, "three events must produce three records on %s; the records", kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"p-1", "p-1", "p-1"}, "records must be keyed by the product id (keyed by anything else, one product's events scatter across partitions)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "p-1's events landed on partitions %d, %d, %d: one product's history must stay on one partition, in order",
              records[0].Partition, records[1].Partition, records[2].Partition);
 }
 
 void CheckEventTypes(harness::Ctx& ctx) {
-  const json published = mustPublish(ctx, kDraft1, 0, {"title"});
-  const json held = record_event("hold", "p-1", "kitchen", kDraft2, {"title"}, 1);
-  const json rolled = record_event("rollback", "p-1", "kitchen", kDraft1, {}, 2);
+  const json published = hMustPublish(ctx, kHDraft1, 0, {"title"});
+  const json held = record_event("hold", "p-1", "kitchen", kHDraft2, {"title"}, 1);
+  const json rolled = record_event("rollback", "p-1", "kitchen", kHDraft1, {}, 2);
   std::vector<std::string> types;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) types.push_back(payloadOf(ctx, r).value("type", ""));
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) types.push_back(hPayloadOf(ctx, r).value("type", ""));
   ctx.Equal(types, {"catalog.publish", "catalog.hold", "catalog.rollback"}, "the three events' types");
   ctx.Assert(published.value("version", 0L) == 1 && published.value("published_version", 0L) == 1,
              "the publish event must carry version 1 as version and published_version, got %s", published.dump());
@@ -1048,7 +1073,7 @@ void CheckEventTypes(harness::Ctx& ctx) {
              "the event must carry product_id and category, got %s", rolled.dump());
   bool refused = false;
   try {
-    record_event("archive", "p-1", "kitchen", kDraft1, {});
+    record_event("archive", "p-1", "kitchen", kHDraft1, {});
   } catch (const std::exception&) {
     refused = true;
   }
@@ -1056,42 +1081,47 @@ void CheckEventTypes(harness::Ctx& ctx) {
 }
 
 void CheckNoDraftValues(harness::Ctx& ctx) {
-  mustPublish(ctx, kDraft1, 0, {"price_cents", "title"});
-  const auto record = ctx.Kafka.Records(kTopic)[0];
-  const json p = payloadOf(ctx, record);
+  hMustPublish(ctx, kHDraft1, 0, {"title", "price_cents"});
+  record_event("hold", "p-1", "kitchen", kHDraft2, {"title", "tax_class"}, 1);
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 2, "a publish and a hold must produce two records on %s; the records", kHTopic);
+  const json p = hPayloadOf(ctx, records[0]);
   for (const std::string name : {"price_cents", "title", "tax_class"}) {
     ctx.Assert(!p.contains(name), "the event carries the draft's %s: %s. The topic is retained and replicated; carry the names of the changed fields, not their values", name, p.dump());
   }
-  const std::string text = record.Value.value_or("");
-  ctx.Assert(text.find("3499") == std::string::npos && text.find("Kettle") == std::string::npos && text.find("standard") == std::string::npos,
-             "the event carries a draft value under another name: %s", text);
-  ctx.Equal(p.value("changed_fields", std::vector<std::string>{}), {"price_cents", "title"}, "changed_fields must be the sorted names of the changed fields");
+  for (const auto& record : records) {
+    const std::string text = record.Value.value_or("");
+    ctx.Assert(text.find("3499") == std::string::npos && text.find("Kettle") == std::string::npos && text.find("standard") == std::string::npos,
+               "the record %s carries a value of the draft, nested or under another name: carry the names of the changed fields only", text);
+  }
+  ctx.Equal(p.value("changed_fields", std::vector<std::string>{}), {"price_cents", "title"}, "changed_fields must be the sorted names of the changed fields (given title, price_cents)");
+  ctx.Equal(hPayloadOf(ctx, records[1]).value("changed_fields", std::vector<std::string>{}), {"tax_class", "title"}, "the hold's changed_fields must be the sorted names (given title, tax_class)");
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
   // The moment the pointer moves, what is already on the topic.
   int atCommit = -1;
-  ctx.Redis.After("catalog:p-1:published", [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  mustPublish(ctx, kDraft1, 0, {"title"});
+  ctx.Redis.After("catalog:p-1:published", [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kHTopic).size()); });
+  hMustPublish(ctx, kHDraft1, 0, {"title"});
   ctx.Assert(atCommit >= 0, "publish never moved catalog:p-1:published");
   ctx.Equal(atCommit, 0, "when the pointer moved the topic already held records: the event described a version the catalog had not committed. Commit the snapshot, then produce; records at the commit");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after the publish, the records on the topic");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "after the publish, the records on the topic");
   const auto s = snapshot::readPublished("p-1");
   ctx.Assert(s && s->value("version", 0L) == 1, "the storefront must serve version 1");
-  const size_t before = ctx.Kafka.Records(kTopic).size();
-  const auto stale = publish("p-1", kDraft2, "kitchen", 7, {"title"});
+  const size_t before = ctx.Kafka.Records(kHTopic).size();
+  const auto stale = publish("p-1", kHDraft2, "kitchen", 7, {"title"});
   ctx.Assert(!stale, "a publish whose expected version is stale must not move the pointer and must answer nothing");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), before, "a publish that did not move the pointer must not produce an event; the records");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), before, "a publish that did not move the pointer must not produce an event; the records");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  mustPublish(ctx, kDraft1, 0, {"title"});
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1,
+  ctx.Kafka.LoseAcks(kHTopic, 1);
+  hMustPublish(ctx, kHDraft1, 0, {"title"});
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1,
             "one publish whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
-  mustPublish(ctx, kDraft2, 1, {"title"});
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  hMustPublish(ctx, kHDraft2, 1, {"title"});
+  const int lost = ctx.Kafka.Failover(kHTopic);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

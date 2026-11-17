@@ -648,6 +648,10 @@ async def check_sensitive_columns(ctx):
         assert r.status_code == 201, f"a subscription to customers naming no columns answered {r.status_code}: {r.text}"
         columns = r.json().get("columns")
         assert columns == ["id", "name", "country"], f"with no columns named the subscription streams {columns}: the default must leave out the sensitive email column"
+        r = await c.post("/v1/subscriptions", json={"table": "invoices", "sink": "crm"}, headers=_headers(key="k-4"))
+        assert r.status_code == 201, f"a subscription to invoices naming no columns answered {r.status_code}: {r.text}"
+        columns = r.json().get("columns")
+        assert columns == ["id", "order_id", "amount_cents"], f"with no columns named the invoices subscription streams {columns}: the default must leave out every column sensitive_columns names (invoices.tax_id)"
         r = await c.post("/v1/subscriptions", json={"table": "orders", "columns": ["id", "nope"], "sink": "crm"}, headers=_headers(key="k-3"))
     assert r.status_code == 400, f"a column the table does not have answered {r.status_code}, expected 400"
 
@@ -659,6 +663,7 @@ async def check_idempotent_create(ctx):
         replay = await c.post("/v1/subscriptions", json=ORDERS, headers=_headers(key="k-1"))
         assert replay.status_code in (200, 201), f"a replay answered {replay.status_code}: {replay.text}"
         assert replay.json().get("id") == first.json().get("id"), f"a retry with the same Idempotency-Key created {replay.json().get('id')} next to {first.json().get('id')}: a second slot over the same table"
+        assert replay.json() == first.json(), f"a replay answered {replay.json()}, expected the subscription the first attempt created: {first.json()}"
         assert len(_subscriptions(ctx)) == 1, f"after a create and its replay Redis holds {_subscriptions(ctx)}, expected one subscription"
         other = await c.post("/v1/subscriptions", json=ORDERS, headers=_headers(tenant="globex", key="k-1"))
         assert other.status_code == 201 and other.json().get("id") != first.json().get("id"), f"globex reusing acme's key k-1 must get its own subscription, got {other.status_code} {other.text}"
@@ -714,6 +719,9 @@ export async function check_sensitive_columns(ctx) {
   r = await c.post('/v1/subscriptions', {json: {table: 'customers', sink: 'crm'}, headers: headers('acme', 'k-2')});
   assert.equal(r.status, 201, \`a subscription to customers naming no columns answered \${r.status}: \${r.text}\`);
   assert.deepStrictEqual(r.json().columns, ['id', 'name', 'country'], \`with no columns named the subscription streams \${JSON.stringify(r.json().columns)}: the default must leave out the sensitive email column\`);
+  r = await c.post('/v1/subscriptions', {json: {table: 'invoices', sink: 'crm'}, headers: headers('acme', 'k-4')});
+  assert.equal(r.status, 201, \`a subscription to invoices naming no columns answered \${r.status}: \${r.text}\`);
+  assert.deepStrictEqual(r.json().columns, ['id', 'order_id', 'amount_cents'], \`with no columns named the invoices subscription streams \${JSON.stringify(r.json().columns)}: the default must leave out every column sensitiveColumns names (invoices.tax_id)\`);
   r = await c.post('/v1/subscriptions', {json: {table: 'orders', columns: ['id', 'nope'], sink: 'crm'}, headers: headers('acme', 'k-3')});
   assert.equal(r.status, 400, \`a column the table does not have answered \${r.status}, expected 400\`);
 }
@@ -725,6 +733,7 @@ export async function check_idempotent_create(ctx) {
   const replay = await c.post('/v1/subscriptions', {json: ORDERS, headers: headers('acme', 'k-1')});
   assert(replay.status === 200 || replay.status === 201, \`a replay answered \${replay.status}: \${replay.text}\`);
   assert.equal(replay.json().id, first.json().id, \`a retry with the same Idempotency-Key created \${replay.json().id} next to \${first.json().id}: a second slot over the same table\`);
+  assert.deepStrictEqual(replay.json(), first.json(), \`a replay answered \${replay.text}, expected the subscription the first attempt created: \${first.text}\`);
   assert.equal(subscriptions(ctx).length, 1, \`after a create and its replay Redis holds \${JSON.stringify(subscriptions(ctx))}, expected one subscription\`);
   const other = await c.post('/v1/subscriptions', {json: ORDERS, headers: headers('globex', 'k-1')});
   assert(other.status === 201 && other.json().id !== first.json().id, \`globex reusing acme's key k-1 must get its own subscription, got \${other.status} \${other.text}\`);
@@ -744,15 +753,15 @@ import (
 	"leetbuild/harness"
 )
 
-var orders = map[string]any{"table": "orders", "columns": []string{"id", "status"}, "sink": "warehouse-1"}
+var hOrders = map[string]any{"table": "orders", "columns": []string{"id", "status"}, "sink": "warehouse-1"}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func headers(tenant, key string) []string {
+func hHeaders(tenant, key string) []string {
 	var out []string
 	if tenant != "" {
 		out = append(out, "X-Tenant-Id", tenant)
@@ -763,7 +772,7 @@ func headers(tenant, key string) []string {
 	return out
 }
 
-type created struct {
+type hCreated struct {
 	ID      string   \`json:"id"\`
 	Tenant  string   \`json:"tenant"\`
 	Table   string   \`json:"table"\`
@@ -773,63 +782,67 @@ type created struct {
 	Status  string   \`json:"status"\`
 }
 
-func decode(r *harness.Response) created {
-	var body created
+func hDecode(r *harness.Response) hCreated {
+	var body hCreated
 	r.Decode(&body)
 	return body
 }
 
-func subscriptions(ctx *harness.Ctx) []string { return ctx.Redis.Keys("cdc:sub:sub-*") }
+func hSubscriptions(ctx *harness.Ctx) []string { return ctx.Redis.Keys("cdc:sub:sub-*") }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/subscriptions", orders, headers("acme", "k-1")...)
+	c := hAPI(ctx)
+	r := c.Post("/v1/subscriptions", hOrders, hHeaders("acme", "k-1")...)
 	ctx.Equal(r.Status, 201, "POST /v1/subscriptions (%s)", r.Text())
-	body := decode(r)
+	body := hDecode(r)
 	ctx.Assert(body.Tenant == "acme" && body.Table == "orders" && strings.Join(body.Columns, ",") == "id,status" && body.Sink == "warehouse-1" && body.Status == "active",
 		"the create answered %s, expected the acme subscription to orders (id, status) into warehouse-1, active", r.Text())
 	stored := store.FindSubscription(context.Background(), body.ID)
 	ctx.Assert(stored != nil && stored.Slot == body.Slot && stored.Tenant == body.Tenant, "the response %s is not the subscription the store holds (%+v)", r.Text(), stored)
-	r = c.Post("/v1/subscriptions", orders, headers("", "k-2")...)
+	r = c.Post("/v1/subscriptions", hOrders, hHeaders("", "k-2")...)
 	ctx.Equal(r.Status, 401, "a create without X-Tenant-Id")
 }
 
 func CheckApprovedTable(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/subscriptions", map[string]any{"table": "auth_users", "columns": []string{"id"}, "sink": "warehouse-1"}, headers("acme", "k-1")...)
+	c := hAPI(ctx)
+	r := c.Post("/v1/subscriptions", map[string]any{"table": "auth_users", "columns": []string{"id"}, "sink": "warehouse-1"}, hHeaders("acme", "k-1")...)
 	ctx.Equal(r.Status, 403, "acme asked to stream auth_users: the table exists in the source, but it is not on acme's list")
-	ctx.Equal(len(subscriptions(ctx)), 0, "a refused create left subscriptions behind (%q); the subscriptions", subscriptions(ctx))
-	r = c.Post("/v1/subscriptions", map[string]any{"table": "customers", "sink": "crm"}, headers("globex", "k-2")...)
+	ctx.Equal(len(hSubscriptions(ctx)), 0, "a refused create left subscriptions behind (%q); the subscriptions", hSubscriptions(ctx))
+	r = c.Post("/v1/subscriptions", map[string]any{"table": "customers", "sink": "crm"}, hHeaders("globex", "k-2")...)
 	ctx.Equal(r.Status, 403, "globex asked for customers, which only acme may stream")
-	r = c.Post("/v1/subscriptions", map[string]any{"table": "customers", "columns": []string{"id", "name"}, "sink": "crm"}, headers("acme", "k-3")...)
+	r = c.Post("/v1/subscriptions", map[string]any{"table": "customers", "columns": []string{"id", "name"}, "sink": "crm"}, hHeaders("acme", "k-3")...)
 	ctx.Equal(r.Status, 201, "acme asked for customers, which is on its list (%s)", r.Text())
-	ctx.Equal(len(subscriptions(ctx)), 1, "one approved create must leave one subscription (%q); the subscriptions", subscriptions(ctx))
+	ctx.Equal(len(hSubscriptions(ctx)), 1, "one approved create must leave one subscription (%q); the subscriptions", hSubscriptions(ctx))
 }
 
 func CheckSensitiveColumns(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/subscriptions", map[string]any{"table": "customers", "columns": []string{"id", "email"}, "sink": "crm"}, headers("acme", "k-1")...)
+	c := hAPI(ctx)
+	r := c.Post("/v1/subscriptions", map[string]any{"table": "customers", "columns": []string{"id", "email"}, "sink": "crm"}, hHeaders("acme", "k-1")...)
 	ctx.Equal(r.Status, 400, "a subscription asking for customers.email (a sensitive column)")
 	ctx.Assert(strings.Contains(r.Text(), "email"), "the 400 must name the sensitive column, got %s", r.Text())
-	ctx.Equal(len(subscriptions(ctx)), 0, "a refused create left subscriptions behind (%q); the subscriptions", subscriptions(ctx))
-	r = c.Post("/v1/subscriptions", map[string]any{"table": "customers", "sink": "crm"}, headers("acme", "k-2")...)
+	ctx.Equal(len(hSubscriptions(ctx)), 0, "a refused create left subscriptions behind (%q); the subscriptions", hSubscriptions(ctx))
+	r = c.Post("/v1/subscriptions", map[string]any{"table": "customers", "sink": "crm"}, hHeaders("acme", "k-2")...)
 	ctx.Equal(r.Status, 201, "a subscription to customers naming no columns (%s)", r.Text())
-	ctx.Equal(decode(r).Columns, []string{"id", "name", "country"}, "with no columns named the default must leave out the sensitive email column; the columns")
-	r = c.Post("/v1/subscriptions", map[string]any{"table": "orders", "columns": []string{"id", "nope"}, "sink": "crm"}, headers("acme", "k-3")...)
+	ctx.Equal(hDecode(r).Columns, []string{"id", "name", "country"}, "with no columns named the default must leave out the sensitive email column; the columns")
+	r = c.Post("/v1/subscriptions", map[string]any{"table": "invoices", "sink": "crm"}, hHeaders("acme", "k-4")...)
+	ctx.Equal(r.Status, 201, "a subscription to invoices naming no columns (%s)", r.Text())
+	ctx.Equal(hDecode(r).Columns, []string{"id", "order_id", "amount_cents"}, "with no columns named the default must leave out every column SensitiveColumns names (invoices.tax_id); the columns")
+	r = c.Post("/v1/subscriptions", map[string]any{"table": "orders", "columns": []string{"id", "nope"}, "sink": "crm"}, hHeaders("acme", "k-3")...)
 	ctx.Equal(r.Status, 400, "a column the table does not have")
 }
 
 func CheckIdempotentCreate(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := c.Post("/v1/subscriptions", orders, headers("acme", "k-1")...)
+	c := hAPI(ctx)
+	first := c.Post("/v1/subscriptions", hOrders, hHeaders("acme", "k-1")...)
 	ctx.Equal(first.Status, 201, "the first create (%s)", first.Text())
-	replay := c.Post("/v1/subscriptions", orders, headers("acme", "k-1")...)
+	replay := c.Post("/v1/subscriptions", hOrders, hHeaders("acme", "k-1")...)
 	ctx.Assert(replay.Status == 200 || replay.Status == 201, "a replay answered %d: %s", replay.Status, replay.Text())
-	ctx.Equal(decode(replay).ID, decode(first).ID, "a retry with the same Idempotency-Key must answer the first subscription, not open a second slot; the id")
-	ctx.Equal(len(subscriptions(ctx)), 1, "after a create and its replay Redis holds %q; the subscriptions", subscriptions(ctx))
-	other := c.Post("/v1/subscriptions", orders, headers("globex", "k-1")...)
-	ctx.Assert(other.Status == 201 && decode(other).ID != decode(first).ID, "globex reusing acme's key k-1 must get its own subscription, got %d %s", other.Status, other.Text())
-	missing := c.Post("/v1/subscriptions", orders, headers("acme", "")...)
+	ctx.Equal(hDecode(replay).ID, hDecode(first).ID, "a retry with the same Idempotency-Key must answer the first subscription, not open a second slot; the id")
+	ctx.Equal(hDecode(replay), hDecode(first), "a replay must answer the subscription the first attempt created; the replay")
+	ctx.Equal(len(hSubscriptions(ctx)), 1, "after a create and its replay Redis holds %q; the subscriptions", hSubscriptions(ctx))
+	other := c.Post("/v1/subscriptions", hOrders, hHeaders("globex", "k-1")...)
+	ctx.Assert(other.Status == 201 && hDecode(other).ID != hDecode(first).ID, "globex reusing acme's key k-1 must get its own subscription, got %d %s", other.Status, other.Text())
+	missing := c.Post("/v1/subscriptions", hOrders, hHeaders("acme", "")...)
 	ctx.Equal(missing.Status, 400, "a create without Idempotency-Key")
 }
 `,
@@ -846,7 +859,7 @@ namespace {
 
 const std::string kOrders = R"({"table": "orders", "columns": ["id", "status"], "sink": "warehouse-1"})";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -854,76 +867,81 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response create(harness::HTTP& c, const std::string& body, const std::string& tenant, const std::string& key) {
+harness::Response hCreate(harness::HTTP& c, const std::string& body, const std::string& tenant, const std::string& key) {
   std::vector<std::string> headers = {"Content-Type", "application/json"};
   if (!tenant.empty()) headers.insert(headers.end(), {"X-Tenant-Id", tenant});
   if (!key.empty()) headers.insert(headers.end(), {"Idempotency-Key", key});
   return c.Send("POST", "/v1/subscriptions", body, headers);
 }
 
-nlohmann::json parse(const harness::Response& r) {
+nlohmann::json hParse(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-size_t subscriptions(harness::Ctx& ctx) { return ctx.Redis.Keys("cdc:sub:sub-*").size(); }
+size_t hSubscriptions(harness::Ctx& ctx) { return ctx.Redis.Keys("cdc:sub:sub-*").size(); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = create(c, kOrders, "acme", "k-1");
+  auto c = hApi(ctx);
+  auto r = hCreate(c, kOrders, "acme", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/subscriptions (%s)", r.Text());
-  const auto body = parse(r);
+  const auto body = hParse(r);
   ctx.Assert(body.value("tenant", "") == "acme" && body.value("table", "") == "orders" &&
                  body.value("columns", nlohmann::json()) == nlohmann::json({"id", "status"}) && body.value("sink", "") == "warehouse-1" &&
                  body.value("status", "") == "active",
              "the create answered %s, expected the acme subscription to orders (id, status) into warehouse-1, active", r.Text());
   const auto stored = store::findSubscription(body.value("id", ""));
   ctx.Assert(stored && store::toJson(*stored) == body, "the response %s is not the subscription the store holds", r.Text());
-  r = create(c, kOrders, "", "k-2");
+  r = hCreate(c, kOrders, "", "k-2");
   ctx.Equal(r.Status, 401, "a create without X-Tenant-Id");
 }
 
 void CheckApprovedTable(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = create(c, R"({"table": "auth_users", "columns": ["id"], "sink": "warehouse-1"})", "acme", "k-1");
+  auto c = hApi(ctx);
+  auto r = hCreate(c, R"({"table": "auth_users", "columns": ["id"], "sink": "warehouse-1"})", "acme", "k-1");
   ctx.Equal(r.Status, 403, "acme asked to stream auth_users: the table exists in the source, but it is not on acme's list");
-  ctx.Equal(subscriptions(ctx), 0, "a refused create left subscriptions behind; the subscriptions");
-  r = create(c, R"({"table": "customers", "sink": "crm"})", "globex", "k-2");
+  ctx.Equal(hSubscriptions(ctx), 0, "a refused create left subscriptions behind; the subscriptions");
+  r = hCreate(c, R"({"table": "customers", "sink": "crm"})", "globex", "k-2");
   ctx.Equal(r.Status, 403, "globex asked for customers, which only acme may stream");
-  r = create(c, R"({"table": "customers", "columns": ["id", "name"], "sink": "crm"})", "acme", "k-3");
+  r = hCreate(c, R"({"table": "customers", "columns": ["id", "name"], "sink": "crm"})", "acme", "k-3");
   ctx.Equal(r.Status, 201, "acme asked for customers, which is on its list (%s)", r.Text());
-  ctx.Equal(subscriptions(ctx), 1, "one approved create must leave one subscription; the subscriptions");
+  ctx.Equal(hSubscriptions(ctx), 1, "one approved create must leave one subscription; the subscriptions");
 }
 
 void CheckSensitiveColumns(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = create(c, R"({"table": "customers", "columns": ["id", "email"], "sink": "crm"})", "acme", "k-1");
+  auto c = hApi(ctx);
+  auto r = hCreate(c, R"({"table": "customers", "columns": ["id", "email"], "sink": "crm"})", "acme", "k-1");
   ctx.Equal(r.Status, 400, "a subscription asking for customers.email (a sensitive column)");
   ctx.Assert(r.Text().find("email") != std::string::npos, "the 400 must name the sensitive column, got %s", r.Text());
-  ctx.Equal(subscriptions(ctx), 0, "a refused create left subscriptions behind; the subscriptions");
-  r = create(c, R"({"table": "customers", "sink": "crm"})", "acme", "k-2");
+  ctx.Equal(hSubscriptions(ctx), 0, "a refused create left subscriptions behind; the subscriptions");
+  r = hCreate(c, R"({"table": "customers", "sink": "crm"})", "acme", "k-2");
   ctx.Equal(r.Status, 201, "a subscription to customers naming no columns (%s)", r.Text());
-  ctx.Equal(parse(r).value("columns", nlohmann::json()), nlohmann::json({"id", "name", "country"}),
+  ctx.Equal(hParse(r).value("columns", nlohmann::json()), nlohmann::json({"id", "name", "country"}),
             "with no columns named the default must leave out the sensitive email column; the columns");
-  r = create(c, R"({"table": "orders", "columns": ["id", "nope"], "sink": "crm"})", "acme", "k-3");
+  r = hCreate(c, R"({"table": "invoices", "sink": "crm"})", "acme", "k-4");
+  ctx.Equal(r.Status, 201, "a subscription to invoices naming no columns (%s)", r.Text());
+  ctx.Equal(hParse(r).value("columns", nlohmann::json()), nlohmann::json({"id", "order_id", "amount_cents"}),
+            "with no columns named the default must leave out every column sensitiveColumns names (invoices.tax_id); the columns");
+  r = hCreate(c, R"({"table": "orders", "columns": ["id", "nope"], "sink": "crm"})", "acme", "k-3");
   ctx.Equal(r.Status, 400, "a column the table does not have");
 }
 
 void CheckIdempotentCreate(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = create(c, kOrders, "acme", "k-1");
+  auto c = hApi(ctx);
+  const auto first = hCreate(c, kOrders, "acme", "k-1");
   ctx.Equal(first.Status, 201, "the first create (%s)", first.Text());
-  const auto replay = create(c, kOrders, "acme", "k-1");
+  const auto replay = hCreate(c, kOrders, "acme", "k-1");
   ctx.Assert(replay.Status == 200 || replay.Status == 201, "a replay answered %d: %s", replay.Status, replay.Text());
-  ctx.Equal(parse(replay).value("id", ""), parse(first).value("id", ""),
+  ctx.Equal(hParse(replay).value("id", ""), hParse(first).value("id", ""),
             "a retry with the same Idempotency-Key must answer the first subscription, not open a second slot; the id");
-  ctx.Equal(subscriptions(ctx), 1, "after a create and its replay; the subscriptions");
-  const auto other = create(c, kOrders, "globex", "k-1");
-  ctx.Assert(other.Status == 201 && parse(other).value("id", "") != parse(first).value("id", ""),
+  ctx.Assert(hParse(replay) == hParse(first), "a replay answered %s, expected the subscription the first attempt created: %s", replay.Text(), first.Text());
+  ctx.Equal(hSubscriptions(ctx), 1, "after a create and its replay; the subscriptions");
+  const auto other = hCreate(c, kOrders, "globex", "k-1");
+  ctx.Assert(other.Status == 201 && hParse(other).value("id", "") != hParse(first).value("id", ""),
              "globex reusing acme's key k-1 must get its own subscription, got %d %s", other.Status, other.Text());
-  const auto missing = create(c, kOrders, "acme", "");
+  const auto missing = hCreate(c, kOrders, "acme", "");
   ctx.Equal(missing.Status, 400, "a create without Idempotency-Key");
 }
 `,

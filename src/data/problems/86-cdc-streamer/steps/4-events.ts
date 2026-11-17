@@ -21,8 +21,8 @@ acknowledgement writes a change twice.
 
 - Key every record by \`row_key(table, pk)\` (\`"orders:42"\`).
 - Carry \`before_digest\` and \`after_digest\` (\`store.digest\` of the row text) instead of the rows.
-- Wait for the delivery reports, at most \`ACK_TIMEOUT_S\` (5 s); a failed or missing report returns
-  \`False\`.
+- Wait for the batch's delivery reports, at most \`ACK_TIMEOUT_S\` (5 s) for the whole batch; a failed or
+  missing report returns \`False\`, and each batch answers for its own reports.
 - Produce with \`enable.idempotence\` and \`acks=all\` (KafkaJS \`idempotent: true\` with \`acks: -1\`; the
   Go starter uses confluent-kafka-go, which has an idempotent producer).`,
   sequence: {
@@ -75,7 +75,7 @@ acknowledgement writes a change twice.
       id: 'delivery-report',
       title: 'Returns true only once the broker has every record',
       detail:
-        'The delivery reports are awaited for at most 5 s (`ACK_TIMEOUT_S`) and any failure, or a report still missing, returns false; the starter returns true as soon as the records are enqueued.',
+        'The delivery reports are awaited for at most 5 s (`ACK_TIMEOUT_S`) for the whole batch, and any failure, or a report still missing, returns false; the next batch the broker takes returns true again. The starter returns true as soon as the records are enqueued.',
       match: {
         python: {all: [/on_delivery/, /flush\(\s*ACK_TIMEOUT_S\s*\)/], none: [/except KafkaException/]},
         typescript: {all: [/await producer\.send\(/, /timeout:\s*ACK_TIMEOUT_MS/], none: [/\.catch\(/]},
@@ -628,8 +628,9 @@ def check_digests(ctx):
     m.publish_batch(_batch(301, [("customers", "9", "update", ADA_BEFORE, ADA_AFTER), ("customers", "10", "insert", "", LIN)]))
     values = ctx.kafka.values(TOPIC)
     assert len(values) == 2, f"a batch of two changes produced {len(values)} records"
+    for text in (v.decode() for v in values):
+        assert "example.com" not in text and "example.org" not in text, f"the event carries the row's values: {text}. A retained, replicated topic now holds every email address"
     text = values[0].decode()
-    assert "example.com" not in text and "example.org" not in text, f"the event carries the row's values: {text}. A retained, replicated topic now holds every email address"
     event = json.loads(text)
     assert event.get("before_digest") == store.digest(ADA_BEFORE) and event.get("after_digest") == store.digest(ADA_AFTER), f"the event is {event}, expected before_digest and after_digest = store.digest of the row text"
     want = {"lsn": 301, "table": "customers", "pk": "9", "op": "update", "batch_id": "cdc_sub_1@301"}
@@ -644,12 +645,14 @@ def check_delivery_report(ctx):
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_batch(_batch(202, [ORDER_7, ORDER_42_GONE]))
     assert ok is False, f"the broker failed a record of the batch and publish_batch returned {ok!r}: step 3 confirms the cursor past a change no sink will see"
+    ok = m.publish_batch(_batch(204, [ORDER_7]))
+    assert ok is True, f"after a failed batch the next batch the broker took returned {ok!r}: each batch answers for its own delivery reports"
     ctx.kafka.stall(TOPIC)
     before = ctx.clock.time()
-    ok = m.publish_batch(_batch(204, [ORDER_7]))
+    ok = m.publish_batch(_batch(205, [ORDER_7, ORDER_42_GONE]))
     waited = ctx.clock.time() - before
     assert ok is False, f"with the broker not answering publish_batch returned {ok!r}, expected False"
-    assert waited <= 10, f"publish_batch waited {waited:.0f} s for a broker that does not answer: wait at most ACK_TIMEOUT_S"
+    assert waited <= 6, f"publish_batch waited {waited:.0f} s for a broker that does not answer a batch of two records: wait at most ACK_TIMEOUT_S (5 s) for the whole batch"
 
 
 def check_idempotent_acks(ctx):
@@ -706,7 +709,7 @@ export async function check_digests(ctx) {
   await settle();
   const values = ctx.kafka.values(TOPIC);
   assert.equal(values.length, 2, \`a batch of two changes produced \${values.length} records\`);
-  assert(!values[0].includes('example.com') && !values[0].includes('example.org'), \`the event carries the row's values: \${values[0]}. A retained, replicated topic now holds every email address\`);
+  for (const value of values) assert(!value.includes('example.com') && !value.includes('example.org'), \`the event carries the row's values: \${value}. A retained, replicated topic now holds every email address\`);
   const event = JSON.parse(values[0]);
   assert(event.before_digest === digest(ADA_BEFORE) && event.after_digest === digest(ADA_AFTER), \`the event is \${values[0]}, expected before_digest and after_digest = digest of the row text\`);
   const want = {lsn: 301, table: 'customers', pk: '9', op: 'update', batch_id: 'cdc_sub_1@301'};
@@ -722,12 +725,14 @@ export async function check_delivery_report(ctx) {
   let ok = await m.publishBatch(batch(202, [ORDER_7, ORDER_42_GONE]));
   await settle();
   assert.equal(ok, false, \`the broker failed a record of the batch and publishBatch resolved \${ok}: step 3 confirms the cursor past a change no sink will see\`);
+  ok = await m.publishBatch(batch(204, [ORDER_7]));
+  assert.equal(ok, true, \`after a failed batch the next batch the broker took resolved \${ok}: each batch answers for its own delivery reports\`);
   ctx.kafka.stall(TOPIC);
   const before = ctx.clock.now();
-  ok = await m.publishBatch(batch(204, [ORDER_7]));
+  ok = await m.publishBatch(batch(205, [ORDER_7, ORDER_42_GONE]));
   const waited = (ctx.clock.now() - before) / 1000;
   assert.equal(ok, false, \`with the broker not answering publishBatch resolved \${ok}, expected false\`);
-  assert(waited <= 10, \`publishBatch waited \${waited.toFixed(0)} s for a broker that does not answer: wait at most ACK_TIMEOUT_MS\`);
+  assert(waited <= 6, \`publishBatch waited \${waited.toFixed(0)} s for a broker that does not answer a batch of two records: wait at most ACK_TIMEOUT_MS (5 s) for the whole batch\`);
 }
 
 export async function check_idempotent_acks(ctx) {
@@ -761,7 +766,7 @@ const (
 	eventsTopic = "cdc.change"
 	adaBefore   = \`{"id":9,"name":"Ada","email":"ada@example.com","country":"FR"}\`
 	adaAfter    = \`{"id":9,"name":"Ada","email":"ada@example.org","country":"FR"}\`
-	lin         = \`{"id":10,"name":"Lin","email":"lin@example.com","country":"SG"}\`
+	hLin        = \`{"id":10,"name":"Lin","email":"lin@example.com","country":"SG"}\`
 )
 
 var (
@@ -770,7 +775,7 @@ var (
 	order42Gone = []string{"orders", "42", "delete", \`{"id":42,"status":"paid"}\`, ""}
 )
 
-func batchOf(firstLsn int64, changes ...[]string) *pb.Batch {
+func hBatchOf(firstLsn int64, changes ...[]string) *pb.Batch {
 	b := &pb.Batch{BatchId: fmt.Sprintf("cdc_sub_1@%d", firstLsn), FirstLsn: firstLsn, LastLsn: firstLsn + int64(len(changes)) - 1}
 	for i, c := range changes {
 		b.Changes = append(b.Changes, &pb.Change{Lsn: firstLsn + int64(i), Table: c[0], Pk: c[1], Op: c[2], Before: c[3], After: c[4]})
@@ -779,8 +784,8 @@ func batchOf(firstLsn int64, changes ...[]string) *pb.Batch {
 }
 
 func CheckRowKey(ctx *harness.Ctx) {
-	ctx.Equal(publishBatch(batchOf(201, order42, order7)), true, "a batch the broker took must return true; publishBatch")
-	ctx.Equal(publishBatch(batchOf(203, order42Gone)), true, "a batch the broker took must return true; publishBatch")
+	ctx.Equal(publishBatch(hBatchOf(201, order42, order7)), true, "a batch the broker took must return true; publishBatch")
+	ctx.Equal(publishBatch(hBatchOf(203, order42Gone)), true, "a batch the broker took must return true; publishBatch")
 	ctx.Settle()
 	records := ctx.Kafka.Records(eventsTopic)
 	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"orders:42", "orders:7", "orders:42"}, "the records must be keyed table:pk; the keys")
@@ -788,11 +793,13 @@ func CheckRowKey(ctx *harness.Ctx) {
 }
 
 func CheckDigests(ctx *harness.Ctx) {
-	publishBatch(batchOf(301, []string{"customers", "9", "update", adaBefore, adaAfter}, []string{"customers", "10", "insert", "", lin}))
+	publishBatch(hBatchOf(301, []string{"customers", "9", "update", adaBefore, adaAfter}, []string{"customers", "10", "insert", "", hLin}))
 	ctx.Settle()
 	values := ctx.Kafka.Values(eventsTopic)
 	ctx.Equal(len(values), 2, "a batch of two changes; the records")
-	ctx.Assert(!strings.Contains(values[0], "example.com") && !strings.Contains(values[0], "example.org"), "the event carries the row's values: %s. A retained, replicated topic now holds every email address", values[0])
+	for _, value := range values {
+		ctx.Assert(!strings.Contains(value, "example.com") && !strings.Contains(value, "example.org"), "the event carries the row's values: %s. A retained, replicated topic now holds every email address", value)
+	}
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
 	ctx.Assert(event["before_digest"] == store.Digest(adaBefore) && event["after_digest"] == store.Digest(adaAfter), "the event is %s, expected before_digest and after_digest = store.Digest of the row text", values[0])
@@ -800,29 +807,30 @@ func CheckDigests(ctx *harness.Ctx) {
 		"the event is %s, expected lsn 301, table customers, pk 9, op update and batch_id cdc_sub_1@301 beside the digests", values[0])
 	var insert map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[1]), &insert), "the event must be JSON")
-	ctx.Assert(insert["before_digest"] == "" && insert["after_digest"] == store.Digest(lin), "an insert has no row before it: expected before_digest \\"\\", got %s", values[1])
+	ctx.Assert(insert["before_digest"] == "" && insert["after_digest"] == store.Digest(hLin), "an insert has no row before it: expected before_digest \\"\\", got %s", values[1])
 }
 
 func CheckDeliveryReport(ctx *harness.Ctx) {
-	ctx.Equal(publishBatch(batchOf(201, order42)), true, "a batch the broker took must return true; publishBatch")
+	ctx.Equal(publishBatch(hBatchOf(201, order42)), true, "a batch the broker took must return true; publishBatch")
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := publishBatch(batchOf(202, order7, order42Gone))
+	ok := publishBatch(hBatchOf(202, order7, order42Gone))
 	ctx.Settle()
 	ctx.Equal(ok, false, "the broker failed a record of the batch: returning true makes step 3 confirm the cursor past a change no sink will see; publishBatch")
+	ctx.Equal(publishBatch(hBatchOf(204, order7)), true, "after a failed batch the next batch the broker took must return true, each batch answers for its own delivery reports; publishBatch")
 	ctx.Kafka.Stall(eventsTopic)
 	before := ctx.Clock.Now()
-	ok = publishBatch(batchOf(204, order7))
+	ok = publishBatch(hBatchOf(205, order7, order42Gone))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Equal(ok, false, "with the broker not answering; publishBatch")
-	ctx.Assert(waited <= 10, "publishBatch waited %.0f s for a broker that does not answer: wait at most ackTimeout", waited)
+	ctx.Assert(waited <= 6, "publishBatch waited %.0f s for a broker that does not answer a batch of two records: wait at most ackTimeout (5 s) for the whole batch", waited)
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	publishBatch(batchOf(201, order42))
+	publishBatch(hBatchOf(201, order42))
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the change twice (enable.idempotence); the records")
-	publishBatch(batchOf(202, order7))
+	publishBatch(hBatchOf(202, order7))
 	ctx.Settle()
 	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a change (acks=all waits for every in-sync replica); the records")
@@ -842,17 +850,17 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 
 namespace {
 
-using Row = std::array<std::string, 5>;
+using HRow = std::array<std::string, 5>;
 
 const std::string kEventsTopic = "cdc.change";
 const std::string kAdaBefore = R"({"id":9,"name":"Ada","email":"ada@example.com","country":"FR"})";
 const std::string kAdaAfter = R"({"id":9,"name":"Ada","email":"ada@example.org","country":"FR"})";
 const std::string kLin = R"({"id":10,"name":"Lin","email":"lin@example.com","country":"SG"})";
-const Row kOrder42 = {"orders", "42", "update", R"({"id":42,"status":"new"})", R"({"id":42,"status":"paid"})"};
-const Row kOrder7 = {"orders", "7", "insert", "", R"({"id":7,"status":"new"})"};
-const Row kOrder42Gone = {"orders", "42", "delete", R"({"id":42,"status":"paid"})", ""};
+const HRow kOrder42 = {"orders", "42", "update", R"({"id":42,"status":"new"})", R"({"id":42,"status":"paid"})"};
+const HRow kOrder7 = {"orders", "7", "insert", "", R"({"id":7,"status":"new"})"};
+const HRow kOrder42Gone = {"orders", "42", "delete", R"({"id":42,"status":"paid"})", ""};
 
-cdcstream::Batch batchOf(int64_t first_lsn, const std::vector<Row>& changes) {
+cdcstream::Batch hBatchOf(int64_t first_lsn, const std::vector<HRow>& changes) {
   cdcstream::Batch b;
   b.set_batch_id("cdc_sub_1@" + std::to_string(first_lsn));
   b.set_first_lsn(first_lsn);
@@ -869,7 +877,7 @@ cdcstream::Batch batchOf(int64_t first_lsn, const std::vector<Row>& changes) {
   return b;
 }
 
-nlohmann::json parse(harness::Ctx& ctx, const std::string& text) {
+nlohmann::json hParse(harness::Ctx& ctx, const std::string& text) {
   const auto event = nlohmann::json::parse(text, nullptr, false);
   ctx.Assert(event.is_object(), "the event must be a JSON object, got %s", text);
   return event;
@@ -878,8 +886,8 @@ nlohmann::json parse(harness::Ctx& ctx, const std::string& text) {
 }  // namespace
 
 void CheckRowKey(harness::Ctx& ctx) {
-  ctx.Equal(publishBatch(batchOf(201, {kOrder42, kOrder7})), true, "a batch the broker took must return true; publishBatch");
-  ctx.Equal(publishBatch(batchOf(203, {kOrder42Gone})), true, "a batch the broker took must return true; publishBatch");
+  ctx.Equal(publishBatch(hBatchOf(201, {kOrder42, kOrder7})), true, "a batch the broker took must return true; publishBatch");
+  ctx.Equal(publishBatch(hBatchOf(203, {kOrder42Gone})), true, "a batch the broker took must return true; publishBatch");
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kEventsTopic);
   ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"orders:42", "orders:7", "orders:42"}, "the records must be keyed table:pk; the keys");
@@ -888,44 +896,47 @@ void CheckRowKey(harness::Ctx& ctx) {
 }
 
 void CheckDigests(harness::Ctx& ctx) {
-  publishBatch(batchOf(301, {{"customers", "9", "update", kAdaBefore, kAdaAfter}, {"customers", "10", "insert", "", kLin}}));
+  publishBatch(hBatchOf(301, {{"customers", "9", "update", kAdaBefore, kAdaAfter}, {"customers", "10", "insert", "", kLin}}));
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 2, "a batch of two changes; the records");
-  ctx.Assert(values[0].find("example.com") == std::string::npos && values[0].find("example.org") == std::string::npos,
-             "the event carries the row's values: %s. A retained, replicated topic now holds every email address", values[0]);
-  const auto event = parse(ctx, values[0]);
+  for (const auto& value : values)
+    ctx.Assert(value.find("example.com") == std::string::npos && value.find("example.org") == std::string::npos,
+               "the event carries the row's values: %s. A retained, replicated topic now holds every email address", value);
+  const auto event = hParse(ctx, values[0]);
   ctx.Assert(event.value("before_digest", "") == store::digest(kAdaBefore) && event.value("after_digest", "") == store::digest(kAdaAfter),
              "the event is %s, expected before_digest and after_digest = store::digest of the row text", values[0]);
   ctx.Assert(event.value("lsn", 0L) == 301 && event.value("table", "") == "customers" && event.value("pk", "") == "9" && event.value("op", "") == "update" &&
                  event.value("batch_id", "") == "cdc_sub_1@301",
              "the event is %s, expected lsn 301, table customers, pk 9, op update and batch_id cdc_sub_1@301 beside the digests", values[0]);
-  const auto insert = parse(ctx, values[1]);
+  const auto insert = hParse(ctx, values[1]);
   ctx.Assert(insert.contains("before_digest") && insert.value("before_digest", "x").empty() && insert.value("after_digest", "") == store::digest(kLin),
              "an insert has no row before it: expected before_digest \\"\\", got %s", values[1]);
 }
 
 void CheckDeliveryReport(harness::Ctx& ctx) {
-  ctx.Equal(publishBatch(batchOf(201, {kOrder42})), true, "a batch the broker took must return true; publishBatch");
+  ctx.Equal(publishBatch(hBatchOf(201, {kOrder42})), true, "a batch the broker took must return true; publishBatch");
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishBatch(batchOf(202, {kOrder7, kOrder42Gone}));
+  bool ok = publishBatch(hBatchOf(202, {kOrder7, kOrder42Gone}));
   ctx.Settle();
   ctx.Equal(ok, false, "the broker failed a record of the batch: returning true makes step 3 confirm the cursor past a change no sink will see; publishBatch");
+  ctx.Equal(publishBatch(hBatchOf(204, {kOrder7})), true,
+            "after a failed batch the next batch the broker took must return true, each batch answers for its own delivery reports; publishBatch");
   ctx.Kafka.Stall(kEventsTopic);
   const int64_t before = ctx.Clock.Now();
-  ok = publishBatch(batchOf(204, {kOrder7}));
+  ok = publishBatch(hBatchOf(205, {kOrder7, kOrder42Gone}));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Equal(ok, false, "with the broker not answering; publishBatch");
-  ctx.Assert(waited <= 10, "publishBatch waited %.0f s for a broker that does not answer: wait at most kAckTimeoutMs", waited);
+  ctx.Assert(waited <= 6, "publishBatch waited %.0f s for a broker that does not answer a batch of two records: wait at most kAckTimeoutMs (5 s) for the whole batch", waited);
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishBatch(batchOf(201, {kOrder42}));
+  publishBatch(hBatchOf(201, {kOrder42}));
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the change twice (enable.idempotence); the records");
-  publishBatch(batchOf(202, {kOrder7}));
+  publishBatch(hBatchOf(202, {kOrder7}));
   ctx.Settle();
   ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a change (acks=all waits for every in-sync replica); the records");

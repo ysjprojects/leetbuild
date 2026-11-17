@@ -21,10 +21,10 @@ the sweep announced the instance expired, so the agent heartbeats into a record 
 lagging replica's older \`metadata_version\` rolls a rollout back; and the expiry ignores the interval
 the instance just promised.
 
-- The existence check, the version comparison, the write and the expiry run as one Lua script
-  (\`register_script\`), so nothing lands between them.
-- A \`metadata_version\` below the stored one answers \`stale\` and writes nothing; an equal or higher
-  one renews.
+- The existence check, the version comparison, the write (including \`last_heartbeat\`) and the
+  expiry run as one Lua script (\`register_script\`), so nothing lands between them.
+- Versions compare as numbers. A \`metadata_version\` below the stored one answers \`stale\` and
+  writes nothing, not even the expiry; an equal or higher one renews.
 - The expiry is \`TTL_INTERVALS * heartbeat_interval\` seconds from this heartbeat
   (\`instances.TTL_INTERVALS\`).`,
   sequence: {
@@ -52,7 +52,7 @@ the instance just promised.
       id: 'atomic-renew',
       title: 'Existence, write and expiry are one script',
       detail:
-        'The renewal runs in one Lua script (`register_script`, `defineCommand`, `NewScript`, `eval`) that reads the record, writes it and sets its `EXPIRE`; there is no client-side `EXISTS`, `HSET` or `EXPIRE` on the path. The starter sends three commands, so a record that lapses between them is written back.',
+        "The renewal runs in one Lua script (`register_script`, `defineCommand`, `NewScript`, `eval`) that reads the record, writes it (`last_heartbeat` stamped with this heartbeat's time) and sets its `EXPIRE`; there is no client-side `EXISTS`, `HSET` or `EXPIRE` on the path. The starter sends three commands, so a record that lapses between them is written back.",
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]EXPIRE['"]/],
@@ -80,7 +80,7 @@ the instance just promised.
       id: 'version-guard',
       title: 'An older metadata version is refused',
       detail:
-        'Inside the script the incoming `metadata_version` is compared with the stored one (`tonumber`), and a lower one returns `stale` without writing. The starter overwrites the version with whatever arrives.',
+        'Inside the script the incoming `metadata_version` is compared with the stored one as a number (`tonumber`: 9 is below 15, 100 is above it), and a lower one returns `stale` without writing anything, the TTL included. The starter overwrites the version with whatever arrives.',
       match: {
         python: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
         typescript: {all: [/tonumber\(/, /return\s+['"]stale['"]/]},
@@ -463,18 +463,22 @@ def check_atomic_renew(ctx):
     assert again == "gone", f"a heartbeat for a lapsed record answered {again!r}, expected gone so the agent re-registers"
     assert ctx.redis.exists(KEY) == 0, f"a heartbeat recreated the lapsed record {ctx.redis.hgetall(KEY)}: only registration may create one"
     instances.register_instance("checkout", "checkout-3", "10.4.2.7", 8080, 5, 13)
+    ctx.clock.advance(3)
     renewed = m.heartbeat("checkout", "checkout-3", "10.4.2.8", 8081, 13, 5)
     assert renewed == "renewed", f"a heartbeat for a live record answered {renewed!r}, expected renewed"
     record = ctx.redis.hgetall(KEY)
     assert record.get("address") == "10.4.2.8" and record.get("port") == "8081", f"the renewal must write the new address and port, the record is {record}"
+    assert record.get("last_heartbeat") == str(int(ctx.clock.time())), f"a heartbeat 3 s after the registration left last_heartbeat at {record.get('last_heartbeat')}, expected the heartbeat's time {int(ctx.clock.time())}"
 
 
 def check_version_guard(ctx):
     m = _registered(ctx, version=13)
+    ctx.clock.advance(6)  # 9 s left on the record
     stale = m.heartbeat("checkout", "checkout-3", "10.4.9.9", 8080, 12, 5)
     assert stale == "stale", f"a heartbeat with metadata_version 12 under a stored 13 answered {stale!r}, expected stale"
     record = ctx.redis.hgetall(KEY)
     assert record.get("metadata_version") == "13" and record.get("address") == "10.4.2.7", f"a lagging replica's version 12 rolled the record back to {record}"
+    assert ctx.redis.ttl(KEY) <= 9, f"a stale heartbeat renewed the record's TTL to {ctx.redis.ttl(KEY)} s: stale writes nothing, or a lagging replica keeps a dead instance's record alive"
     same = m.heartbeat("checkout", "checkout-3", "10.4.2.7", 8080, 13, 5)
     assert same == "renewed", f"a heartbeat with the stored version 13 answered {same!r}, expected renewed"
     # Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
@@ -483,6 +487,11 @@ def check_version_guard(ctx):
     _settled(rival, KEY)
     record = ctx.redis.hgetall(KEY)
     assert record.get("metadata_version") == "15" and record.get("address") == "10.4.3.3", f"version 15 landed while version 14 was in flight and the record ends at {record}: the comparison and the write must be one script"
+    for version, expected in ((9, "stale"), (100, "renewed")):  # versions compare as numbers, not strings
+        stored = ctx.redis.hget(KEY, "metadata_version")
+        got = m.heartbeat("checkout", "checkout-3", "10.4.4.4", 8080, version, 5)
+        assert got == expected, f"a heartbeat with metadata_version {version} over a stored {stored} answered {got!r}, expected {expected}: compare the versions as numbers"
+    assert ctx.redis.hget(KEY, "metadata_version") == "100", f"after version 100 the record holds metadata_version {ctx.redis.hget(KEY, 'metadata_version')}"
 
 
 def check_expiry_derived(ctx):
@@ -528,18 +537,23 @@ export async function check_atomic_renew(ctx) {
   assert.equal(again, 'gone', \`a heartbeat for a lapsed record answered \${JSON.stringify(again)}, expected gone so the agent re-registers\`);
   assert.equal(ctx.redis.exists(KEY), 0, 'a heartbeat recreated the lapsed record: only registration may create one');
   await instances.registerInstance('checkout', 'checkout-3', '10.4.2.7', 8080, 5, 13);
+  ctx.clock.advance(3);
   const renewed = await m.heartbeat('checkout', 'checkout-3', '10.4.2.8', 8081, 13, 5);
   assert.equal(renewed, 'renewed', \`a heartbeat for a live record answered \${JSON.stringify(renewed)}, expected renewed\`);
   const record = ctx.redis.hgetall(KEY);
   assert(record.address === '10.4.2.8' && record.port === '8081', \`the renewal must write the new address and port, the record is \${JSON.stringify(record)}\`);
+  const now = String(Math.floor(ctx.clock.now() / 1000));
+  assert.equal(record.last_heartbeat, now, \`a heartbeat 3 s after the registration left last_heartbeat at \${record.last_heartbeat}, expected the heartbeat's time \${now}\`);
 }
 
 export async function check_version_guard(ctx) {
   const {m} = await registered(ctx, 13);
+  ctx.clock.advance(6); // 9 s left on the record
   const stale = await m.heartbeat('checkout', 'checkout-3', '10.4.9.9', 8080, 12, 5);
   assert.equal(stale, 'stale', \`a heartbeat with metadata_version 12 under a stored 13 answered \${JSON.stringify(stale)}, expected stale\`);
   let record = ctx.redis.hgetall(KEY);
   assert(record.metadata_version === '13' && record.address === '10.4.2.7', \`a lagging replica's version 12 rolled the record back to \${JSON.stringify(record)}\`);
+  assert(ctx.redis.ttl(KEY) <= 9, \`a stale heartbeat renewed the record's TTL to \${ctx.redis.ttl(KEY)} s: stale writes nothing, or a lagging replica keeps a dead instance's record alive\`);
   const same = await m.heartbeat('checkout', 'checkout-3', '10.4.2.7', 8080, 13, 5);
   assert.equal(same, 'renewed', \`a heartbeat with the stored version 13 answered \${JSON.stringify(same)}, expected renewed\`);
   // Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
@@ -548,6 +562,13 @@ export async function check_version_guard(ctx) {
   await settled(rival, KEY);
   record = ctx.redis.hgetall(KEY);
   assert(record.metadata_version === '15' && record.address === '10.4.3.3', \`version 15 landed while version 14 was in flight and the record ends at \${JSON.stringify(record)}: the comparison and the write must be one script\`);
+  // Versions compare as numbers, not strings.
+  for (const [version, expected] of [[9, 'stale'], [100, 'renewed']] as const) {
+    const stored = ctx.redis.hget(KEY, 'metadata_version');
+    const got = await m.heartbeat('checkout', 'checkout-3', '10.4.4.4', 8080, version, 5);
+    assert.equal(got, expected, \`a heartbeat with metadata_version \${version} over a stored \${stored} answered \${JSON.stringify(got)}, expected \${expected}: compare the versions as numbers\`);
+  }
+  assert.equal(ctx.redis.hget(KEY, 'metadata_version'), '100', 'after version 100 the record must hold metadata_version 100');
 }
 
 export async function check_expiry_derived(ctx) {
@@ -568,6 +589,7 @@ export async function check_expiry_derived(ctx) {
 
 import (
 	"context"
+	"strconv"
 
 	"discovery/instances"
 
@@ -578,67 +600,83 @@ const stateKey = "sd:checkout:checkout-3"
 
 var stateBg = context.Background()
 
-func registered(ctx *harness.Ctx, version, interval int) {
+func stateRegistered(ctx *harness.Ctx, version, interval int) {
 	_, err := instances.RegisterInstance(stateBg, "checkout", "checkout-3", "10.4.2.7", 8080, interval, version)
 	ctx.NoError(err, "registering checkout-3")
 }
 
-func beat(ctx *harness.Ctx, address string, port, version, interval int) string {
+func stateBeat(ctx *harness.Ctx, address string, port, version, interval int) string {
 	result, err := heartbeat(stateBg, "checkout", "checkout-3", address, port, version, interval)
 	ctx.NoError(err, "heartbeat(checkout, checkout-3, %s, %d, %d, %d) failed", address, port, version, interval)
 	return result
 }
 
 func CheckAtomicRenew(ctx *harness.Ctx) {
-	registered(ctx, 13, 5)
+	stateRegistered(ctx, 13, 5)
 	// The record expires and the sweep drops the member, right as the heartbeat lands.
 	probe := ctx.Redis.After(stateKey, func() any {
 		ctx.Redis.Del(stateKey)
 		ctx.Redis.Do("SREM", "sd:members:checkout", "checkout-3")
 		return nil
 	})
-	first := beat(ctx, "10.4.2.7", 8080, 13, 5)
+	first := stateBeat(ctx, "10.4.2.7", 8080, 13, 5)
 	ctx.Assert(probe.Fired, "the heartbeat never touched %s", stateKey)
 	ctx.Assert(first == "gone" || first == "renewed", "the heartbeat answered %q", first)
 	ctx.Equal(ctx.Redis.Exists(stateKey), 0, "the record lapsed while the heartbeat was renewing it, and the heartbeat wrote it back (%v): an instance outside sd:members:checkout that no read lists. The existence check and the write must be one script; exists", ctx.Redis.HGetAll(stateKey))
-	ctx.Equal(beat(ctx, "10.4.2.7", 8080, 13, 5), "gone", "a heartbeat for a lapsed record must answer gone so the agent re-registers")
+	ctx.Equal(stateBeat(ctx, "10.4.2.7", 8080, 13, 5), "gone", "a heartbeat for a lapsed record must answer gone so the agent re-registers")
 	ctx.Equal(ctx.Redis.Exists(stateKey), 0, "a heartbeat recreated the lapsed record: only registration may create one; exists")
-	registered(ctx, 13, 5)
-	ctx.Equal(beat(ctx, "10.4.2.8", 8081, 13, 5), "renewed", "a heartbeat for a live record")
+	stateRegistered(ctx, 13, 5)
+	ctx.Clock.Advance(3)
+	ctx.Equal(stateBeat(ctx, "10.4.2.8", 8081, 13, 5), "renewed", "a heartbeat for a live record")
 	record := ctx.Redis.HGetAll(stateKey)
 	ctx.Assert(record["address"] == "10.4.2.8" && record["port"] == "8081", "the renewal must write the new address and port, the record is %v", record)
+	now := strconv.FormatInt(int64(ctx.Clock.Now())/1000, 10)
+	ctx.Equal(record["last_heartbeat"], now, "a heartbeat 3 s after the registration must stamp last_heartbeat with its own time")
 }
 
 func CheckVersionGuard(ctx *harness.Ctx) {
-	registered(ctx, 13, 5)
-	ctx.Equal(beat(ctx, "10.4.9.9", 8080, 12, 5), "stale", "a heartbeat with metadata_version 12 under a stored 13")
+	stateRegistered(ctx, 13, 5)
+	ctx.Clock.Advance(6) // 9 s left on the record
+	ctx.Equal(stateBeat(ctx, "10.4.9.9", 8080, 12, 5), "stale", "a heartbeat with metadata_version 12 under a stored 13")
 	record := ctx.Redis.HGetAll(stateKey)
 	ctx.Assert(record["metadata_version"] == "13" && record["address"] == "10.4.2.7", "a lagging replica's version 12 rolled the record back to %v", record)
-	ctx.Equal(beat(ctx, "10.4.2.7", 8080, 13, 5), "renewed", "a heartbeat with the stored version 13")
+	ttl := ctx.Redis.TTL(stateKey)
+	ctx.Assert(ttl <= 9, "a stale heartbeat renewed the record's TTL to %d s: stale writes nothing, or a lagging replica keeps a dead instance's record alive", ttl)
+	ctx.Equal(stateBeat(ctx, "10.4.2.7", 8080, 13, 5), "renewed", "a heartbeat with the stored version 13")
 	// Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
 	rival := ctx.Redis.After(stateKey, func() any {
 		result, err := heartbeat(stateBg, "checkout", "checkout-3", "10.4.3.3", 8080, 15, 5)
 		ctx.NoError(err, "the rival heartbeat failed")
 		return result
 	})
-	beat(ctx, "10.4.2.8", 8080, 14, 5)
+	stateBeat(ctx, "10.4.2.8", 8080, 14, 5)
 	ctx.Assert(rival.Fired, "the heartbeat never touched %s", stateKey)
 	ctx.Assert(rival.Err == nil, "the rival heartbeat failed: %v", rival.Err)
 	record = ctx.Redis.HGetAll(stateKey)
 	ctx.Assert(record["metadata_version"] == "15" && record["address"] == "10.4.3.3", "version 15 landed while version 14 was in flight and the record ends at %v: the comparison and the write must be one script", record)
+	// Versions compare as numbers, not strings.
+	for _, tc := range []struct {
+		version  int
+		expected string
+	}{{9, "stale"}, {100, "renewed"}} {
+		stored, _ := ctx.Redis.HGet(stateKey, "metadata_version")
+		ctx.Equal(stateBeat(ctx, "10.4.4.4", 8080, tc.version, 5), tc.expected, "a heartbeat with metadata_version %d over a stored %s (compare the versions as numbers)", tc.version, stored)
+	}
+	stored, _ := ctx.Redis.HGet(stateKey, "metadata_version")
+	ctx.Equal(stored, "100", "the record's metadata_version after version 100")
 }
 
 func CheckExpiryDerived(ctx *harness.Ctx) {
-	registered(ctx, 13, 5)
-	ctx.Equal(beat(ctx, "10.4.2.7", 8080, 13, 2), "renewed", "a heartbeat for a live record")
+	stateRegistered(ctx, 13, 5)
+	ctx.Equal(stateBeat(ctx, "10.4.2.7", 8080, 13, 2), "renewed", "a heartbeat for a live record")
 	ttl := ctx.Redis.TTL(stateKey)
 	ctx.Assert(5 <= ttl && ttl <= 6, "after a heartbeat promising a 2 s interval the record's TTL is %d, expected 3 x 2 = 6 s", ttl)
 	interval, _ := ctx.Redis.HGet(stateKey, "heartbeat_interval")
 	ctx.Equal(interval, "2", "the record must store the interval the heartbeat promised")
 	ctx.Clock.Advance(7)
 	ctx.Equal(ctx.Redis.Exists(stateKey), 0, "7 s after a heartbeat promising 2 s intervals the record must be gone (three missed heartbeats); exists")
-	registered(ctx, 13, 5)
-	beat(ctx, "10.4.2.7", 8080, 13, 20)
+	stateRegistered(ctx, 13, 5)
+	stateBeat(ctx, "10.4.2.7", 8080, 13, 20)
 	ttl = ctx.Redis.TTL(stateKey)
 	ctx.Assert(59 <= ttl && ttl <= 60, "after a heartbeat promising a 20 s interval the record's TTL is %d, expected 3 x 20 = 60 s", ttl)
 }
@@ -649,58 +687,65 @@ func CheckExpiryDerived(ctx *harness.Ctx) {
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "discovery/instances.h"
 
 namespace {
 
-const std::string kKey = "sd:checkout:checkout-3";
+const std::string kStateKey = "sd:checkout:checkout-3";
 
-void registered(long version, long interval) { instances::registerInstance("checkout", "checkout-3", "10.4.2.7", 8080, interval, version); }
+void stateRegistered(long version, long interval) { instances::registerInstance("checkout", "checkout-3", "10.4.2.7", 8080, interval, version); }
 
-std::string beat(const std::string& address, long port, long version, long interval) {
+std::string stateBeat(const std::string& address, long port, long version, long interval) {
   return heartbeat("checkout", "checkout-3", address, port, version, interval);
 }
 
-std::string field(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kKey, name).value_or(""); }
+std::string stateField(harness::Ctx& ctx, const std::string& name) { return ctx.Redis.HGet(kStateKey, name).value_or(""); }
 
-std::string shown(harness::Ctx& ctx) {
+std::string stateShown(harness::Ctx& ctx) {
   std::string out;
-  for (const auto& [name, value] : ctx.Redis.HGetAll(kKey)) out += name + "=" + value + " ";
+  for (const auto& [name, value] : ctx.Redis.HGetAll(kStateKey)) out += name + "=" + value + " ";
   return out;
 }
 
 }  // namespace
 
 void CheckAtomicRenew(harness::Ctx& ctx) {
-  registered(13, 5);
+  stateRegistered(13, 5);
   bool fired = false;
   // The record expires and the sweep drops the member, right as the heartbeat lands.
-  ctx.Redis.After(kKey, [&] {
+  ctx.Redis.After(kStateKey, [&] {
     fired = true;
-    ctx.Redis.Del(kKey);
+    ctx.Redis.Del(kStateKey);
     ctx.Redis.Do("SREM", "sd:members:checkout", "checkout-3");
   });
-  const std::string first = beat("10.4.2.7", 8080, 13, 5);
-  ctx.Assert(fired, "the heartbeat never touched %s", kKey);
+  const std::string first = stateBeat("10.4.2.7", 8080, 13, 5);
+  ctx.Assert(fired, "the heartbeat never touched %s", kStateKey);
   ctx.Assert(first == "gone" || first == "renewed", "the heartbeat answered %q", first);
-  ctx.Equal(ctx.Redis.Exists(kKey), 0, "the record lapsed while the heartbeat was renewing it, and the heartbeat wrote it back (%s): an instance outside sd:members:checkout that no read lists. The existence check and the write must be one script; exists", shown(ctx));
-  ctx.Equal(beat("10.4.2.7", 8080, 13, 5), "gone", "a heartbeat for a lapsed record must answer gone so the agent re-registers");
-  ctx.Equal(ctx.Redis.Exists(kKey), 0, "a heartbeat recreated the lapsed record: only registration may create one; exists");
-  registered(13, 5);
-  ctx.Equal(beat("10.4.2.8", 8081, 13, 5), "renewed", "a heartbeat for a live record");
-  ctx.Assert(field(ctx, "address") == "10.4.2.8" && field(ctx, "port") == "8081", "the renewal must write the new address and port, the record is %s", shown(ctx));
+  ctx.Equal(ctx.Redis.Exists(kStateKey), 0, "the record lapsed while the heartbeat was renewing it, and the heartbeat wrote it back (%s): an instance outside sd:members:checkout that no read lists. The existence check and the write must be one script; exists", stateShown(ctx));
+  ctx.Equal(stateBeat("10.4.2.7", 8080, 13, 5), "gone", "a heartbeat for a lapsed record must answer gone so the agent re-registers");
+  ctx.Equal(ctx.Redis.Exists(kStateKey), 0, "a heartbeat recreated the lapsed record: only registration may create one; exists");
+  stateRegistered(13, 5);
+  ctx.Clock.Advance(3);
+  ctx.Equal(stateBeat("10.4.2.8", 8081, 13, 5), "renewed", "a heartbeat for a live record");
+  ctx.Assert(stateField(ctx, "address") == "10.4.2.8" && stateField(ctx, "port") == "8081", "the renewal must write the new address and port, the record is %s", stateShown(ctx));
+  ctx.Equal(stateField(ctx, "last_heartbeat"), std::to_string(ctx.Clock.Now() / 1000), "a heartbeat 3 s after the registration must stamp last_heartbeat with its own time");
 }
 
 void CheckVersionGuard(harness::Ctx& ctx) {
-  registered(13, 5);
-  ctx.Equal(beat("10.4.9.9", 8080, 12, 5), "stale", "a heartbeat with metadata_version 12 under a stored 13");
-  ctx.Assert(field(ctx, "metadata_version") == "13" && field(ctx, "address") == "10.4.2.7", "a lagging replica's version 12 rolled the record back to %s", shown(ctx));
-  ctx.Equal(beat("10.4.2.7", 8080, 13, 5), "renewed", "a heartbeat with the stored version 13");
+  stateRegistered(13, 5);
+  ctx.Clock.Advance(6);  // 9 s left on the record
+  ctx.Equal(stateBeat("10.4.9.9", 8080, 12, 5), "stale", "a heartbeat with metadata_version 12 under a stored 13");
+  ctx.Assert(stateField(ctx, "metadata_version") == "13" && stateField(ctx, "address") == "10.4.2.7", "a lagging replica's version 12 rolled the record back to %s", stateShown(ctx));
+  const long long left = ctx.Redis.TTL(kStateKey);
+  ctx.Assert(left <= 9, "a stale heartbeat renewed the record's TTL to %d s: stale writes nothing, or a lagging replica keeps a dead instance's record alive", left);
+  ctx.Equal(stateBeat("10.4.2.7", 8080, 13, 5), "renewed", "a heartbeat with the stored version 13");
   // Version 15 lands while the version 14 heartbeat is in flight: the record must end at 15.
   auto fired = std::make_shared<bool>(false);
   auto err = std::make_shared<std::optional<std::string>>();
-  ctx.Redis.After(kKey, [fired, err] {
+  ctx.Redis.After(kStateKey, [fired, err] {
     *fired = true;
     try {
       heartbeat("checkout", "checkout-3", "10.4.3.3", 8080, 15, 5);
@@ -708,23 +753,29 @@ void CheckVersionGuard(harness::Ctx& ctx) {
       *err = e.what();
     }
   });
-  beat("10.4.2.8", 8080, 14, 5);
-  ctx.Assert(*fired, "the heartbeat never touched %s", kKey);
+  stateBeat("10.4.2.8", 8080, 14, 5);
+  ctx.Assert(*fired, "the heartbeat never touched %s", kStateKey);
   ctx.Assert(!*err, "the rival heartbeat failed: %s", err->value_or(""));
-  ctx.Assert(field(ctx, "metadata_version") == "15" && field(ctx, "address") == "10.4.3.3", "version 15 landed while version 14 was in flight and the record ends at %s: the comparison and the write must be one script", shown(ctx));
+  ctx.Assert(stateField(ctx, "metadata_version") == "15" && stateField(ctx, "address") == "10.4.3.3", "version 15 landed while version 14 was in flight and the record ends at %s: the comparison and the write must be one script", stateShown(ctx));
+  // Versions compare as numbers, not strings.
+  for (const auto& [version, expected] : std::vector<std::pair<long, std::string>>{{9, "stale"}, {100, "renewed"}}) {
+    const std::string stored = stateField(ctx, "metadata_version");
+    ctx.Equal(stateBeat("10.4.4.4", 8080, version, 5), expected, "a heartbeat with metadata_version %d over a stored %s (compare the versions as numbers)", version, stored);
+  }
+  ctx.Equal(stateField(ctx, "metadata_version"), "100", "the record's metadata_version after version 100");
 }
 
 void CheckExpiryDerived(harness::Ctx& ctx) {
-  registered(13, 5);
-  ctx.Equal(beat("10.4.2.7", 8080, 13, 2), "renewed", "a heartbeat for a live record");
-  long long ttl = ctx.Redis.TTL(kKey);
+  stateRegistered(13, 5);
+  ctx.Equal(stateBeat("10.4.2.7", 8080, 13, 2), "renewed", "a heartbeat for a live record");
+  long long ttl = ctx.Redis.TTL(kStateKey);
   ctx.Assert(5 <= ttl && ttl <= 6, "after a heartbeat promising a 2 s interval the record's TTL is %d, expected 3 x 2 = 6 s", ttl);
-  ctx.Equal(field(ctx, "heartbeat_interval"), "2", "the record must store the interval the heartbeat promised");
+  ctx.Equal(stateField(ctx, "heartbeat_interval"), "2", "the record must store the interval the heartbeat promised");
   ctx.Clock.Advance(7);
-  ctx.Equal(ctx.Redis.Exists(kKey), 0, "7 s after a heartbeat promising 2 s intervals the record must be gone (three missed heartbeats); exists");
-  registered(13, 5);
-  beat("10.4.2.7", 8080, 13, 20);
-  ttl = ctx.Redis.TTL(kKey);
+  ctx.Equal(ctx.Redis.Exists(kStateKey), 0, "7 s after a heartbeat promising 2 s intervals the record must be gone (three missed heartbeats); exists");
+  stateRegistered(13, 5);
+  stateBeat("10.4.2.7", 8080, 13, 20);
+  ttl = ctx.Redis.TTL(kStateKey);
   ctx.Assert(59 <= ttl && ttl <= 60, "after a heartbeat promising a 20 s interval the record's TTL is %d, expected 3 x 20 = 60 s", ttl);
 }
 `,

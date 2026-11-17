@@ -25,7 +25,8 @@ and retries its publish mints a second version.
   **422** with a body naming the missing field.
 - A publish carries an \`Idempotency-Key\`; a missing key is **400**. Look the \`(product, key)\` up in
   \`store.publish_result\` before promoting, answer the recorded result on a replay, and record the
-  result (\`store.record_publish\`) once the draft is promoted.`,
+  result (\`store.record_publish\`) once the draft is promoted. A rejected publish records nothing,
+  and the same key on another product is a different publish.`,
   sequence: {
     participants: ['Admin', 'Catalog API', 'versions store'],
     messages: [
@@ -70,7 +71,7 @@ and retries its publish mints a second version.
       id: 'required-fields',
       title: 'A publish missing a required field is 422 naming it',
       detail:
-        'The required fields are declared (`REQUIRED_FIELDS`) and checked on the draft before the promote: a missing one answers **422** with the name of the field in the body.',
+        'The required fields are declared (`REQUIRED_FIELDS`) and checked on the draft before the promote: a missing one answers **422** with the name of that field in the body (not the fields that are set). A retry under the same key once the field is set publishes: a 422 is not recorded.',
       match: {
         python: {all: [/REQUIRED_FIELDS/, /\b422\b/, /missing/]},
         typescript: {all: [/REQUIRED_FIELDS/, /\b422\b/, /missing/]},
@@ -83,7 +84,7 @@ and retries its publish mints a second version.
       id: 'publish-idempotency',
       title: 'Keys a publish by (product, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is read from the request (a missing one is 400) and the recorded result is looked up (`publish_result`/`publishResult`) before the promote; a replay answers the recorded version, and a fresh publish records its result.',
+        '`Idempotency-Key` is read from the request (a missing one is 400) and the recorded result is looked up (`publish_result`/`publishResult`) before the promote; a replay answers the recorded version, a fresh publish records its result, and the record is keyed by the product and the key: the same key on another product publishes that product.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.publish_result\(/, /store\.record_publish\(/, /\b400\b/],
@@ -728,9 +729,12 @@ async def check_required_fields(ctx):
         await c.patch(f"/v1/products/{product_id}", json={"price_cents": 3499})
         r = await _publish(c, product_id, "k-2")
         assert r.status_code == 422 and "tax_class" in r.text, f"with the price set and the tax class unset the publish answered {r.status_code} {r.text}, expected 422 naming tax_class"
+        assert "price_cents" not in r.text, f"the 422 must name the field that is missing, not every required one: with the price set it answered {r.text}"
         await c.patch(f"/v1/products/{product_id}", json={"tax_class": "standard"})
-        r = await _publish(c, product_id, "k-3")
-    assert r.status_code == 200, f"with every required field set the publish answered {r.status_code}: {r.text}"
+        r = await _publish(c, product_id, "k-2")
+    assert r.status_code == 200 and r.json().get("status") == "published", f"a retry of a rejected publish (same Idempotency-Key) after every required field was set answered {r.status_code}: {r.text}. Only a promoted publish is recorded"
+    published = store.published_of(product_id)
+    assert published is not None and published["version"] == 1, f"a retry of a rejected publish (same Idempotency-Key) after every required field was set published nothing: the store holds {published}"
 
 
 async def check_publish_idempotency(ctx):
@@ -748,7 +752,12 @@ async def check_publish_idempotency(ctx):
         fresh = await _publish(c, product_id, "k-2")
         assert fresh.status_code == 200 and fresh.json().get("version") == 2, f"a publish with a new key must promote the new draft (version 2), got {fresh.status_code} {fresh.text}"
         none = await c.post(f"/v1/products/{product_id}/publish")
-    assert none.status_code == 400, f"a publish without Idempotency-Key answered {none.status_code}, expected 400"
+        assert none.status_code == 400, f"a publish without Idempotency-Key answered {none.status_code}, expected 400"
+        other = await _create(c, "Teapot")
+        await c.patch(f"/v1/products/{other}", json=FULL)
+        r = await _publish(c, other, "k-1")
+    assert r.status_code == 200 and r.json().get("product_id") == other and r.json().get("version") == 1, f"another product's first publish with the key k-1 answered {r.status_code} {r.text}: the record is keyed by (product, key)"
+    assert store.published_of(other) is not None, "another product's publish with a key already used on a different product published nothing"
 `,
     typescript: `const FULL = {price_cents: 3499, tax_class: 'standard'};
 
@@ -805,9 +814,12 @@ export async function check_required_fields(ctx) {
   await c.patch(\`/v1/products/\${productId}\`, {json: {price_cents: 3499}});
   r = await publish(c, productId, 'k-2');
   assert(r.status === 422 && r.text.includes('tax_class'), \`with the price set and the tax class unset the publish answered \${r.status} \${r.text}, expected 422 naming tax_class\`);
+  assert(!r.text.includes('price_cents'), \`the 422 must name the field that is missing, not every required one: with the price set it answered \${r.text}\`);
   await c.patch(\`/v1/products/\${productId}\`, {json: {tax_class: 'standard'}});
-  r = await publish(c, productId, 'k-3');
-  assert.equal(r.status, 200, \`with every required field set the publish answered \${r.status}: \${r.text}\`);
+  r = await publish(c, productId, 'k-2');
+  assert(r.status === 200 && r.json().status === 'published', \`a retry of a rejected publish (same Idempotency-Key) after every required field was set answered \${r.status}: \${r.text}. Only a promoted publish is recorded\`);
+  const published = await store.publishedOf(productId);
+  assert(published !== null && published.version === 1, \`a retry of a rejected publish (same Idempotency-Key) after every required field was set published nothing: the store holds \${JSON.stringify(published)}\`);
 }
 
 export async function check_publish_idempotency(ctx) {
@@ -826,6 +838,11 @@ export async function check_publish_idempotency(ctx) {
   assert(fresh.status === 200 && fresh.json().version === 2, \`a publish with a new key must promote the new draft (version 2), got \${fresh.status} \${fresh.text}\`);
   const none = await c.post(\`/v1/products/\${productId}/publish\`);
   assert.equal(none.status, 400, \`a publish without Idempotency-Key answered \${none.status}, expected 400\`);
+  const other = await create(c, 'Teapot');
+  await c.patch(\`/v1/products/\${other}\`, {json: FULL});
+  const r = await publish(c, other, 'k-1');
+  assert(r.status === 200 && r.json().product_id === other && r.json().version === 1, \`another product's first publish with the key k-1 answered \${r.status} \${r.text}: the record is keyed by (product, key)\`);
+  assert.notEqual(await store.publishedOf(other), null, "another product's publish with a key already used on a different product published nothing");
 }
 `,
     go: `package main
@@ -840,16 +857,16 @@ import (
 	"leetbuild/harness"
 )
 
-var full = map[string]any{"price_cents": 3499, "tax_class": "standard"}
+var hFull = map[string]any{"price_cents": 3499, "tax_class": "standard"}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func create(ctx *harness.Ctx, c *harness.HTTP) string {
-	r := c.Post("/v1/products", map[string]string{"title": "Kettle"})
+func hCreate(ctx *harness.Ctx, c *harness.HTTP, title string) string {
+	r := c.Post("/v1/products", map[string]string{"title": title})
 	ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/products answered %d: %s", r.Status, r.Text())
 	var body struct {
 		ProductID string \`json:"product_id"\`
@@ -860,36 +877,35 @@ func create(ctx *harness.Ctx, c *harness.HTTP) string {
 	return body.ProductID
 }
 
-func publish(c *harness.HTTP, productID, key string) *harness.Response {
+func hPublish(c *harness.HTTP, productID, key string) *harness.Response {
 	return c.Post("/v1/products/"+productID+"/publish", nil, "Idempotency-Key", key)
 }
 
-func versionOf(ctx *harness.Ctx, r *harness.Response) int {
+func hVersionOf(r *harness.Response) int {
 	var body struct {
-		Version int    \`json:"version"\`
-		Status  string \`json:"status"\`
+		Version int \`json:"version"\`
 	}
 	r.Decode(&body)
 	return body.Version
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	productID := create(ctx, c)
-	r := c.Patch("/v1/products/"+productID, full)
+	c := hAPI(ctx)
+	productID := hCreate(ctx, c, "Kettle")
+	r := c.Patch("/v1/products/"+productID, hFull)
 	ctx.Equal(r.Status, 200, "PATCH /v1/products/%s (%s)", productID, r.Text())
-	r = publish(c, productID, "k-1")
+	r = hPublish(c, productID, "k-1")
 	ctx.Equal(r.Status, 200, "POST /v1/products/%s/publish (%s)", productID, r.Text())
-	ctx.Assert(strings.Contains(r.Text(), \`"published"\`) && versionOf(ctx, r) == 1, "the publish must answer version 1 as published, got %s", r.Text())
+	ctx.Assert(strings.Contains(r.Text(), \`"published"\`) && hVersionOf(r) == 1, "the publish must answer version 1 as published, got %s", r.Text())
 	published := store.PublishedOf(context.Background(), productID)
 	ctx.Assert(published != nil && published.Version == 1, "after the publish the store holds published version %v", published)
 }
 
 func CheckDraftWrite(ctx *harness.Ctx) {
-	c := api(ctx)
-	productID := create(ctx, c)
-	c.Patch("/v1/products/"+productID, full)
-	publish(c, productID, "k-1")
+	c := hAPI(ctx)
+	productID := hCreate(ctx, c, "Kettle")
+	c.Patch("/v1/products/"+productID, hFull)
+	hPublish(c, productID, "k-1")
 	r := c.Patch("/v1/products/"+productID, map[string]string{"title": "Kettle, 2 L"})
 	ctx.Equal(r.Status, 200, "an edit after a publish (%s)", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), \`"draft"\`), "an edit must answer a draft, got %s", r.Text())
@@ -901,36 +917,44 @@ func CheckDraftWrite(ctx *harness.Ctx) {
 }
 
 func CheckRequiredFields(ctx *harness.Ctx) {
-	c := api(ctx)
-	productID := create(ctx, c)
-	r := publish(c, productID, "k-1")
+	c := hAPI(ctx)
+	productID := hCreate(ctx, c, "Kettle")
+	r := hPublish(c, productID, "k-1")
 	ctx.Equal(r.Status, 422, "a publish with no price and no tax class")
 	ctx.Assert(strings.Contains(r.Text(), "price_cents"), "the 422 must name the missing field (price_cents), got %s", r.Text())
 	ctx.Assert(store.PublishedOf(context.Background(), productID) == nil, "nothing may be published with required fields unset")
 	c.Patch("/v1/products/"+productID, map[string]any{"price_cents": 3499})
-	r = publish(c, productID, "k-2")
+	r = hPublish(c, productID, "k-2")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "tax_class"), "with the price set and the tax class unset the publish answered %d %s, expected 422 naming tax_class", r.Status, r.Text())
+	ctx.Assert(!strings.Contains(r.Text(), "price_cents"), "the 422 must name the field that is missing, not every required one: with the price set it answered %s", r.Text())
 	c.Patch("/v1/products/"+productID, map[string]any{"tax_class": "standard"})
-	r = publish(c, productID, "k-3")
-	ctx.Equal(r.Status, 200, "with every required field set the publish (%s)", r.Text())
+	r = hPublish(c, productID, "k-2")
+	ctx.Assert(r.Status == 200 && strings.Contains(r.Text(), \`"published"\`), "a retry of a rejected publish (same Idempotency-Key) after every required field was set answered %d %s. Only a promoted publish is recorded", r.Status, r.Text())
+	published := store.PublishedOf(context.Background(), productID)
+	ctx.Assert(published != nil && published.Version == 1, "a retry of a rejected publish (same Idempotency-Key) after every required field was set published nothing: the store holds %+v", published)
 }
 
 func CheckPublishIdempotency(ctx *harness.Ctx) {
-	c := api(ctx)
-	productID := create(ctx, c)
-	c.Patch("/v1/products/"+productID, full)
-	first := publish(c, productID, "k-1")
+	c := hAPI(ctx)
+	productID := hCreate(ctx, c, "Kettle")
+	c.Patch("/v1/products/"+productID, hFull)
+	first := hPublish(c, productID, "k-1")
 	ctx.Equal(first.Status, 200, "the first publish (%s)", first.Text())
-	replay := publish(c, productID, "k-1")
-	ctx.Assert(replay.Status == 200 && versionOf(ctx, replay) == versionOf(ctx, first), "a replay of the same Idempotency-Key must answer the same result: first %s, replay %s", first.Text(), replay.Text())
+	replay := hPublish(c, productID, "k-1")
+	ctx.Assert(replay.Status == 200 && hVersionOf(replay) == hVersionOf(first), "a replay of the same Idempotency-Key must answer the same result: first %s, replay %s", first.Text(), replay.Text())
 	c.Patch("/v1/products/"+productID, map[string]string{"title": "Kettle, 2 L"})
-	late := publish(c, productID, "k-1")
-	ctx.Equal(versionOf(ctx, late), 1, "a retry of the first publish after an edit must answer the recorded result for (product, key), not mint a version; the version")
+	late := hPublish(c, productID, "k-1")
+	ctx.Equal(hVersionOf(late), 1, "a retry of the first publish after an edit must answer the recorded result for (product, key), not mint a version; the version")
 	ctx.Equal(store.PublishedOf(context.Background(), productID).Version, 1, "the retry promoted the new draft; the published version")
-	fresh := publish(c, productID, "k-2")
-	ctx.Assert(fresh.Status == 200 && versionOf(ctx, fresh) == 2, "a publish with a new key must promote the new draft (version 2), got %d %s", fresh.Status, fresh.Text())
+	fresh := hPublish(c, productID, "k-2")
+	ctx.Assert(fresh.Status == 200 && hVersionOf(fresh) == 2, "a publish with a new key must promote the new draft (version 2), got %d %s", fresh.Status, fresh.Text())
 	none := c.Post("/v1/products/"+productID+"/publish", nil)
 	ctx.Equal(none.Status, 400, "a publish without Idempotency-Key")
+	other := hCreate(ctx, c, "Teapot")
+	c.Patch("/v1/products/"+other, hFull)
+	r := hPublish(c, other, "k-1")
+	ctx.Assert(r.Status == 200 && strings.Contains(r.Text(), \`"\`+other+\`"\`) && hVersionOf(r) == 1, "another product's first publish with the key k-1 answered %d %s: the record is keyed by (product, key)", r.Status, r.Text())
+	ctx.Assert(store.PublishedOf(context.Background(), other) != nil, "another product's publish with a key already used on a different product published nothing")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -939,9 +963,9 @@ func CheckPublishIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kFull = R"({"price_cents": 3499, "tax_class": "standard"})";
+const std::string kHFull = R"({"price_cents": 3499, "tax_class": "standard"})";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -949,39 +973,39 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string create(harness::Ctx& ctx, harness::HTTP& c) {
-  const auto r = c.Post("/v1/products", R"({"title": "Kettle"})", "Content-Type", "application/json");
+std::string hCreate(harness::Ctx& ctx, harness::HTTP& c, const std::string& title) {
+  const auto r = c.Post("/v1/products", nlohmann::json{{"title", title}}.dump(), "Content-Type", "application/json");
   ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/products answered %d: %s", r.Status, r.Text());
   const auto body = nlohmann::json::parse(r.Text());
   ctx.Equal(body.value("status", ""), "draft", "a new product must be a draft (%s)", r.Text());
   return body.value("product_id", "");
 }
 
-harness::Response publish(harness::HTTP& c, const std::string& product_id, const std::string& key) {
+harness::Response hPublish(harness::HTTP& c, const std::string& product_id, const std::string& key) {
   return c.Post("/v1/products/" + product_id + "/publish", "", "Idempotency-Key", key);
 }
 
-long versionOf(const harness::Response& r) { return nlohmann::json::parse(r.Text()).value("version", 0L); }
+long hVersionOf(const harness::Response& r) { return nlohmann::json::parse(r.Text()).value("version", 0L); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string product_id = create(ctx, c);
-  auto r = c.Patch("/v1/products/" + product_id, kFull, "Content-Type", "application/json");
+  auto c = hApi(ctx);
+  const std::string product_id = hCreate(ctx, c, "Kettle");
+  auto r = c.Patch("/v1/products/" + product_id, kHFull, "Content-Type", "application/json");
   ctx.Equal(r.Status, 200, "PATCH /v1/products/%s (%s)", product_id, r.Text());
-  r = publish(c, product_id, "k-1");
+  r = hPublish(c, product_id, "k-1");
   ctx.Equal(r.Status, 200, "POST /v1/products/%s/publish (%s)", product_id, r.Text());
-  ctx.Assert(r.Text().find("published") != std::string::npos && versionOf(r) == 1, "the publish must answer version 1 as published, got %s", r.Text());
+  ctx.Assert(r.Text().find("published") != std::string::npos && hVersionOf(r) == 1, "the publish must answer version 1 as published, got %s", r.Text());
   const auto published = store::publishedOf(product_id);
   ctx.Assert(published && published->version == 1, "after the publish the store holds published version %v", published ? published->version : 0L);
 }
 
 void CheckDraftWrite(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string product_id = create(ctx, c);
-  c.Patch("/v1/products/" + product_id, kFull, "Content-Type", "application/json");
-  publish(c, product_id, "k-1");
+  auto c = hApi(ctx);
+  const std::string product_id = hCreate(ctx, c, "Kettle");
+  c.Patch("/v1/products/" + product_id, kHFull, "Content-Type", "application/json");
+  hPublish(c, product_id, "k-1");
   const auto r = c.Patch("/v1/products/" + product_id, R"({"title": "Kettle, 2 L"})", "Content-Type", "application/json");
   ctx.Equal(r.Status, 200, "an edit after a publish (%s)", r.Text());
   ctx.Assert(r.Text().find("draft") != std::string::npos, "an edit must answer a draft, got %s", r.Text());
@@ -993,36 +1017,44 @@ void CheckDraftWrite(harness::Ctx& ctx) {
 }
 
 void CheckRequiredFields(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string product_id = create(ctx, c);
-  auto r = publish(c, product_id, "k-1");
+  auto c = hApi(ctx);
+  const std::string product_id = hCreate(ctx, c, "Kettle");
+  auto r = hPublish(c, product_id, "k-1");
   ctx.Equal(r.Status, 422, "a publish with no price and no tax class");
   ctx.Assert(r.Text().find("price_cents") != std::string::npos, "the 422 must name the missing field (price_cents), got %s", r.Text());
   ctx.Assert(!store::publishedOf(product_id), "nothing may be published with required fields unset");
   c.Patch("/v1/products/" + product_id, R"({"price_cents": 3499})", "Content-Type", "application/json");
-  r = publish(c, product_id, "k-2");
+  r = hPublish(c, product_id, "k-2");
   ctx.Assert(r.Status == 422 && r.Text().find("tax_class") != std::string::npos, "with the price set and the tax class unset the publish answered %d %s, expected 422 naming tax_class", r.Status, r.Text());
+  ctx.Assert(r.Text().find("price_cents") == std::string::npos, "the 422 must name the field that is missing, not every required one: with the price set it answered %s", r.Text());
   c.Patch("/v1/products/" + product_id, R"({"tax_class": "standard"})", "Content-Type", "application/json");
-  r = publish(c, product_id, "k-3");
-  ctx.Equal(r.Status, 200, "with every required field set the publish (%s)", r.Text());
+  r = hPublish(c, product_id, "k-2");
+  ctx.Assert(r.Status == 200 && r.Text().find("\\"published\\"") != std::string::npos, "a retry of a rejected publish (same Idempotency-Key) after every required field was set answered %d %s. Only a promoted publish is recorded", r.Status, r.Text());
+  const auto published = store::publishedOf(product_id);
+  ctx.Assert(published && published->version == 1, "a retry of a rejected publish (same Idempotency-Key) after every required field was set published nothing: the store holds version %v", published ? published->version : 0L);
 }
 
 void CheckPublishIdempotency(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string product_id = create(ctx, c);
-  c.Patch("/v1/products/" + product_id, kFull, "Content-Type", "application/json");
-  const auto first = publish(c, product_id, "k-1");
+  auto c = hApi(ctx);
+  const std::string product_id = hCreate(ctx, c, "Kettle");
+  c.Patch("/v1/products/" + product_id, kHFull, "Content-Type", "application/json");
+  const auto first = hPublish(c, product_id, "k-1");
   ctx.Equal(first.Status, 200, "the first publish (%s)", first.Text());
-  const auto replay = publish(c, product_id, "k-1");
-  ctx.Assert(replay.Status == 200 && versionOf(replay) == versionOf(first), "a replay of the same Idempotency-Key must answer the same result: first %s, replay %s", first.Text(), replay.Text());
+  const auto replay = hPublish(c, product_id, "k-1");
+  ctx.Assert(replay.Status == 200 && hVersionOf(replay) == hVersionOf(first), "a replay of the same Idempotency-Key must answer the same result: first %s, replay %s", first.Text(), replay.Text());
   c.Patch("/v1/products/" + product_id, R"({"title": "Kettle, 2 L"})", "Content-Type", "application/json");
-  const auto late = publish(c, product_id, "k-1");
-  ctx.Equal(versionOf(late), 1, "a retry of the first publish after an edit must answer the recorded result for (product, key), not mint a version; the version");
+  const auto late = hPublish(c, product_id, "k-1");
+  ctx.Equal(hVersionOf(late), 1, "a retry of the first publish after an edit must answer the recorded result for (product, key), not mint a version; the version");
   ctx.Equal(store::publishedOf(product_id)->version, 1, "the retry promoted the new draft; the published version");
-  const auto fresh = publish(c, product_id, "k-2");
-  ctx.Assert(fresh.Status == 200 && versionOf(fresh) == 2, "a publish with a new key must promote the new draft (version 2), got %d %s", fresh.Status, fresh.Text());
+  const auto fresh = hPublish(c, product_id, "k-2");
+  ctx.Assert(fresh.Status == 200 && hVersionOf(fresh) == 2, "a publish with a new key must promote the new draft (version 2), got %d %s", fresh.Status, fresh.Text());
   const auto none = c.Post("/v1/products/" + product_id + "/publish", "");
   ctx.Equal(none.Status, 400, "a publish without Idempotency-Key");
+  const std::string other = hCreate(ctx, c, "Teapot");
+  c.Patch("/v1/products/" + other, kHFull, "Content-Type", "application/json");
+  const auto r = hPublish(c, other, "k-1");
+  ctx.Assert(r.Status == 200 && nlohmann::json::parse(r.Text()).value("product_id", "") == other && hVersionOf(r) == 1, "another product's first publish with the key k-1 answered %d %s: the record is keyed by (product, key)", r.Status, r.Text());
+  ctx.Assert(store::publishedOf(other).has_value(), "another product's publish with a key already used on a different product published nothing");
 }
 `,
   },

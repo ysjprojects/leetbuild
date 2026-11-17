@@ -49,7 +49,7 @@ failed commit leaves a file in the index whose object does not exist.
       id: 'deadline',
       title: 'Every object-store call carries a 15-second deadline',
       detail:
-        '`PutChunk` and `CommitMultipart` are called with `DEADLINE_S` (15 s); without one, a store that stops answering holds the finalize, and the client waiting on it, open indefinitely.',
+        '`PutChunk` and `CommitMultipart` are called with `DEADLINE_S` (15 s), a full one on every attempt of a retried part; without one, a store that stops answering holds the finalize, and the client waiting on it, open indefinitely.',
       match: {
         python: {
           all: [
@@ -682,17 +682,23 @@ WHOLE = hashlib.sha256(b"".join(PARTS)).hexdigest()
 
 
 class ObjectStore(file_storage_pb2_grpc.ObjectStoreServicer):
-    """Keeps parts per upload; a part in fail_once fails UNAVAILABLE on its first write."""
+    """Keeps parts per upload; a part in fail_once fails UNAVAILABLE on its first write, one in stall_once after 10 s."""
 
-    def __init__(self):
+    def __init__(self, clock):
+        self.clock = clock
         self.parts = {}
         self.fail_once = set()
+        self.stall_once = set()
 
     def PutChunk(self, request, context):
         key = (request.upload_id, request.part)
         if key in self.fail_once:
             self.fail_once.discard(key)
             context.abort(grpc.StatusCode.UNAVAILABLE, "connection reset by peer")
+        if key in self.stall_once:
+            self.stall_once.discard(key)
+            self.clock.advance(10)
+            context.abort(grpc.StatusCode.UNAVAILABLE, "connection reset by peer after 10 s")
         if request.sha256 and request.sha256 != hashlib.sha256(request.data).hexdigest():
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "sha256 does not match the part")
         deduped = bool(request.sha256) and key in self.parts and hashlib.sha256(self.parts[key]).hexdigest() == request.sha256
@@ -708,7 +714,7 @@ class ObjectStore(file_storage_pb2_grpc.ObjectStoreServicer):
 
 
 def _client(ctx):
-    peer = ObjectStore()
+    peer = ObjectStore(ctx.clock)
     ctx.grpc.serve(file_storage_pb2_grpc.add_ObjectStoreServicer_to_server, peer)
     return ctx.load("client"), peer
 
@@ -729,8 +735,19 @@ def _fails(m, upload_id, why):
     raise AssertionError(f"{why}: complete returned {record} instead of raising")
 
 
+def _completes(m, upload_id, why):
+    try:
+        return m.complete(upload_id)
+    except grpc.RpcError as exc:
+        raise AssertionError(f"{why}, complete raised {exc.code().name}: {exc.details()}") from None
+
+
+def _sent_since(ctx, before):
+    return [c.request.part for c in ctx.grpc.calls_to("PutChunk")[before:]]
+
+
 def check_deadline(ctx):
-    m, _ = _client(ctx)
+    m, peer = _client(ctx)
     upload_id = _staged()
     m.complete(upload_id)
     for method in ("PutChunk", "CommitMultipart"):
@@ -739,6 +756,14 @@ def check_deadline(ctx):
         for call in calls:
             assert call.timeout is not None, f"a {method} call carries no deadline: a stalled object store would hold the finalize open"
             assert 14 <= call.timeout <= 16, f"a {method} call carries a {call.timeout} s deadline, expected DEADLINE_S = 15"
+    slow = _staged()
+    peer.stall_once.add((slow, 2))
+    before = len(ctx.grpc.calls_to("PutChunk"))
+    m.complete(slow)
+    retried = ctx.grpc.calls_to("PutChunk")[before:]
+    assert [c.request.part for c in retried] == [1, 2, 2, 3], f"with part 2 failing UNAVAILABLE after 10 s the parts were sent in the order {[c.request.part for c in retried]}, expected [1, 2, 2, 3]"
+    for call in retried:
+        assert call.timeout is not None and 14 <= call.timeout <= 16, f"part {call.request.part} was sent with a {call.timeout} s deadline after part 2's first attempt took 10 s: every attempt carries its own DEADLINE_S, not what is left of one shared deadline"
     stalled = _staged()
     ctx.grpc.set_latency("PutChunk", 60.0)
     _fails(m, stalled, "with the object store taking 60 s per part")
@@ -770,6 +795,29 @@ def check_retry_in_place(ctx):
     tries = len(ctx.grpc.calls_to("PutChunk")) - before
     assert tries == 1, f"a part rejected INVALID_ARGUMENT was sent {tries} times: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry"
     assert ctx.clock.sleeps <= 1, f"the client slept {ctx.clock.sleeps} times: one backoff for the one retryable failure"
+    for code in (grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED):
+        terminal = _staged()
+        ctx.grpc.fail("PutChunk", code, "part rejected", times=1)
+        before = len(ctx.grpc.calls_to("PutChunk"))
+        _fails(m, terminal, f"with part 1 rejected {code.name}")
+        tries = len(ctx.grpc.calls_to("PutChunk")) - before
+        assert tries == 1, f"a part rejected {code.name} was sent {tries} times: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry"
+    timed_out = _staged()
+    ctx.grpc.fail("PutChunk", grpc.StatusCode.DEADLINE_EXCEEDED, "deadline exceeded", times=1)
+    before = len(ctx.grpc.calls_to("PutChunk"))
+    _completes(m, timed_out, "with part 1 failing DEADLINE_EXCEEDED once (a retryable status)")
+    assert _sent_since(ctx, before) == [1, 1, 2, 3], f"with part 1 failing DEADLINE_EXCEEDED once the parts were sent in the order {_sent_since(ctx, before)}, expected [1, 1, 2, 3]: DEADLINE_EXCEEDED is retried"
+    third = _staged()
+    ctx.grpc.fail("PutChunk", grpc.StatusCode.UNAVAILABLE, "connection reset by peer", times=2)
+    before = len(ctx.grpc.calls_to("PutChunk"))
+    _completes(m, third, "with part 1 failing UNAVAILABLE twice (ATTEMPTS = 3 tries)")
+    assert _sent_since(ctx, before) == [1, 1, 1, 2, 3], f"with part 1 failing UNAVAILABLE twice the parts were sent in the order {_sent_since(ctx, before)}, expected [1, 1, 1, 2, 3]: ATTEMPTS = 3 tries"
+    exhausted = _staged()
+    ctx.grpc.fail("PutChunk", grpc.StatusCode.UNAVAILABLE, "connection reset by peer", times=3)
+    before = len(ctx.grpc.calls_to("PutChunk"))
+    _fails(m, exhausted, "with part 1 failing UNAVAILABLE three times")
+    assert _sent_since(ctx, before) == [1, 1, 1], f"with part 1 failing UNAVAILABLE three times the parts were sent in the order {_sent_since(ctx, before)}, expected [1, 1, 1]: give up after ATTEMPTS = 3 tries"
+    assert store.find_file(store.file_id_for(exhausted)) is None, "an upload whose part 1 never reached the store was indexed as a file"
 
 
 def check_commit_gate(ctx):
@@ -794,16 +842,21 @@ const PARTS = [
 const sha = (data: Uint8Array): string => createHash('sha256').update(data).digest('hex') as string;
 const WHOLE = sha(Buffer.concat(PARTS));
 
-/** Keeps parts per upload; a part in failOnce fails UNAVAILABLE on its first write. */
+/** Keeps parts per upload; a part in failOnce fails UNAVAILABLE on its first write, one in stallOnce after 10 s. */
 function client(ctx) {
   const pkg = ctx.proto('file_storage.proto');
   const parts = new Map<string, Buffer>();
   const failOnce = new Set<string>();
+  const stallOnce = new Set<string>();
   ctx.grpc.serve(pkg.stored.ObjectStore.service, {
     PutChunk(call, callback) {
       const {upload_id, part, data, sha256} = call.request;
       const key = \`\${upload_id}/\${part}\`;
       if (failOnce.delete(key)) return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'connection reset by peer'});
+      if (stallOnce.delete(key)) {
+        ctx.clock.advance(10);
+        return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'connection reset by peer after 10 s'});
+      }
       if (sha256 && sha256 !== sha(data)) return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: 'sha256 does not match the part'});
       const deduped = Boolean(sha256) && parts.has(key) && sha(parts.get(key) as Buffer) === sha256;
       parts.set(key, Buffer.from(data));
@@ -818,7 +871,7 @@ function client(ctx) {
       callback(null, {object_key: \`objects/\${upload_id}\`, digest: sha(data), size: data.length});
     },
   });
-  return {m: ctx.load('client'), failOnce, store: ctx.load('/support/files/store.ts'), sessions: ctx.load('/support/files/sessions.ts')};
+  return {m: ctx.load('client'), failOnce, stallOnce, store: ctx.load('/support/files/store.ts'), sessions: ctx.load('/support/files/sessions.ts')};
 }
 
 async function staged(store, sessions): Promise<string> {
@@ -840,8 +893,18 @@ async function fails(m, uploadId: string, why: string): Promise<void> {
   assert.fail(\`\${why}: complete returned \${JSON.stringify(record)} instead of throwing\`);
 }
 
+async function completes(m, uploadId: string, why: string) {
+  try {
+    return await m.complete(uploadId);
+  } catch (error) {
+    assert.fail(\`\${why}, complete threw \${(error as Error).message}\`);
+  }
+}
+
+const sentSince = (ctx, before: number): number[] => ctx.grpc.callsTo('PutChunk').slice(before).map(c => c.request.part);
+
 export async function check_deadline(ctx) {
-  const {m, store, sessions} = client(ctx);
+  const {m, stallOnce, store, sessions} = client(ctx);
   await m.complete(await staged(store, sessions));
   for (const method of ['PutChunk', 'CommitMultipart']) {
     const calls = ctx.grpc.callsTo(method);
@@ -850,6 +913,15 @@ export async function check_deadline(ctx) {
       assert(call.timeout !== null, \`a \${method} call carries no deadline: a stalled object store would hold the finalize open\`);
       assert(call.timeout >= 14 && call.timeout <= 16, \`a \${method} call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 15000\`);
     }
+  }
+  const slow = await staged(store, sessions);
+  stallOnce.add(\`\${slow}/2\`);
+  const before = ctx.grpc.callsTo('PutChunk').length;
+  await m.complete(slow);
+  const retried = ctx.grpc.callsTo('PutChunk').slice(before);
+  assert.deepStrictEqual(retried.map(c => c.request.part), [1, 2, 2, 3], 'with part 2 failing UNAVAILABLE after 10 s the parts must be sent in the order [1, 2, 2, 3]');
+  for (const call of retried) {
+    assert(call.timeout !== null && call.timeout >= 14 && call.timeout <= 16, \`part \${call.request.part} was sent with a \${call.timeout} s deadline after part 2's first attempt took 10 s: every attempt carries its own DEADLINE_MS, not what is left of one shared deadline\`);
   }
   const stalled = await staged(store, sessions);
   ctx.grpc.setLatency('PutChunk', 60.0);
@@ -882,6 +954,30 @@ export async function check_retry_in_place(ctx) {
   const tries = ctx.grpc.callsTo('PutChunk').length - before;
   assert.equal(tries, 1, \`a part rejected INVALID_ARGUMENT was sent \${tries} times: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry\`);
   assert(ctx.clock.sleeps <= 1, \`the client slept \${ctx.clock.sleeps} times: one backoff for the one retryable failure\`);
+  for (const code of ['FAILED_PRECONDITION', 'PERMISSION_DENIED', 'INTERNAL', 'RESOURCE_EXHAUSTED']) {
+    const terminal = await staged(store, sessions);
+    ctx.grpc.fail('PutChunk', ctx.grpc.status[code], 'part rejected', 1);
+    const from = ctx.grpc.callsTo('PutChunk').length;
+    await fails(m, terminal, \`with part 1 rejected \${code}\`);
+    const sent = ctx.grpc.callsTo('PutChunk').length - from;
+    assert.equal(sent, 1, \`a part rejected \${code} was sent \${sent} times: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry\`);
+  }
+  const timedOut = await staged(store, sessions);
+  ctx.grpc.fail('PutChunk', ctx.grpc.status.DEADLINE_EXCEEDED, 'deadline exceeded', 1);
+  let from = ctx.grpc.callsTo('PutChunk').length;
+  await completes(m, timedOut, 'with part 1 failing DEADLINE_EXCEEDED once (a retryable status)');
+  assert.deepStrictEqual(sentSince(ctx, from), [1, 1, 2, 3], \`with part 1 failing DEADLINE_EXCEEDED once the parts were sent in the order \${JSON.stringify(sentSince(ctx, from))}, expected [1, 1, 2, 3]: DEADLINE_EXCEEDED is retried\`);
+  const third = await staged(store, sessions);
+  ctx.grpc.fail('PutChunk', ctx.grpc.status.UNAVAILABLE, 'connection reset by peer', 2);
+  from = ctx.grpc.callsTo('PutChunk').length;
+  await completes(m, third, 'with part 1 failing UNAVAILABLE twice (ATTEMPTS = 3 tries)');
+  assert.deepStrictEqual(sentSince(ctx, from), [1, 1, 1, 2, 3], \`with part 1 failing UNAVAILABLE twice the parts were sent in the order \${JSON.stringify(sentSince(ctx, from))}, expected [1, 1, 1, 2, 3]: ATTEMPTS = 3 tries\`);
+  const exhausted = await staged(store, sessions);
+  ctx.grpc.fail('PutChunk', ctx.grpc.status.UNAVAILABLE, 'connection reset by peer', 3);
+  from = ctx.grpc.callsTo('PutChunk').length;
+  await fails(m, exhausted, 'with part 1 failing UNAVAILABLE three times');
+  assert.deepStrictEqual(sentSince(ctx, from), [1, 1, 1], \`with part 1 failing UNAVAILABLE three times the parts were sent in the order \${JSON.stringify(sentSince(ctx, from))}, expected [1, 1, 1]: give up after ATTEMPTS = 3 tries\`);
+  assert.equal(await store.findFile(store.fileIdFor(exhausted)), null, 'an upload whose part 1 never reached the store was indexed as a file');
 }
 
 export async function check_commit_gate(ctx) {
@@ -918,12 +1014,12 @@ import (
 )
 
 var (
-	clientBg = context.Background()
-	parts    = [][]byte{append([]byte("\\x89PNG\\r\\n\\x1a\\n"), make([]byte, 24)...), seq(32), bytes.Repeat([]byte("tail"), 4)}
-	whole    = hexSum(bytes.Join(parts, nil))
+	hBg    = context.Background()
+	hParts = [][]byte{append([]byte("\\x89PNG\\r\\n\\x1a\\n"), make([]byte, 24)...), hSeq(32), bytes.Repeat([]byte("tail"), 4)}
+	hWhole = hHexSum(bytes.Join(hParts, nil))
 )
 
-func seq(n int) []byte {
+func hSeq(n int) []byte {
 	out := make([]byte, n)
 	for i := range out {
 		out[i] = byte(i)
@@ -931,33 +1027,40 @@ func seq(n int) []byte {
 	return out
 }
 
-func hexSum(data []byte) string {
+func hHexSum(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
-// objectStore keeps parts per upload; a part in failOnce fails UNAVAILABLE on its first write.
-type objectStore struct {
+// hObjectStore keeps parts per upload; a part in failOnce fails UNAVAILABLE on its first write, one in stallOnce after 10 s.
+type hObjectStore struct {
 	pb.UnimplementedObjectStoreServer
-	parts    map[string][]byte
-	failOnce map[string]bool
+	clock     *harness.Clock
+	parts     map[string][]byte
+	failOnce  map[string]bool
+	stallOnce map[string]bool
 }
 
-func (s *objectStore) PutChunk(_ context.Context, req *pb.PutChunkRequest) (*pb.PutChunkReply, error) {
+func (s *hObjectStore) PutChunk(_ context.Context, req *pb.PutChunkRequest) (*pb.PutChunkReply, error) {
 	key := fmt.Sprintf("%s/%d", req.GetUploadId(), req.GetPart())
 	if s.failOnce[key] {
 		delete(s.failOnce, key)
 		return nil, status.Error(codes.Unavailable, "connection reset by peer")
 	}
-	if req.GetSha256() != "" && req.GetSha256() != hexSum(req.GetData()) {
+	if s.stallOnce[key] {
+		delete(s.stallOnce, key)
+		s.clock.Advance(10)
+		return nil, status.Error(codes.Unavailable, "connection reset by peer after 10 s")
+	}
+	if req.GetSha256() != "" && req.GetSha256() != hHexSum(req.GetData()) {
 		return nil, status.Error(codes.InvalidArgument, "sha256 does not match the part")
 	}
 	previous, seen := s.parts[key]
 	s.parts[key] = append([]byte{}, req.GetData()...)
-	return &pb.PutChunkReply{Part: req.GetPart(), Deduped: req.GetSha256() != "" && seen && hexSum(previous) == req.GetSha256()}, nil
+	return &pb.PutChunkReply{Part: req.GetPart(), Deduped: req.GetSha256() != "" && seen && hHexSum(previous) == req.GetSha256()}, nil
 }
 
-func (s *objectStore) CommitMultipart(_ context.Context, req *pb.CommitRequest) (*pb.CommitReply, error) {
+func (s *hObjectStore) CommitMultipart(_ context.Context, req *pb.CommitRequest) (*pb.CommitReply, error) {
 	var data []byte
 	for _, n := range req.GetParts() {
 		part, ok := s.parts[fmt.Sprintf("%s/%d", req.GetUploadId(), n)]
@@ -966,44 +1069,53 @@ func (s *objectStore) CommitMultipart(_ context.Context, req *pb.CommitRequest) 
 		}
 		data = append(data, part...)
 	}
-	return &pb.CommitReply{ObjectKey: "objects/" + req.GetUploadId(), Digest: hexSum(data), Size: int64(len(data))}, nil
+	return &pb.CommitReply{ObjectKey: "objects/" + req.GetUploadId(), Digest: hHexSum(data), Size: int64(len(data))}, nil
 }
 
-func objectPeer(ctx *harness.Ctx) *objectStore {
-	peer := &objectStore{parts: map[string][]byte{}, failOnce: map[string]bool{}}
+func hObjectPeer(ctx *harness.Ctx) *hObjectStore {
+	peer := &hObjectStore{clock: ctx.Clock, parts: map[string][]byte{}, failOnce: map[string]bool{}, stallOnce: map[string]bool{}}
 	pb.RegisterObjectStoreServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func staged(ctx *harness.Ctx) string {
+func hStaged(ctx *harness.Ctx) string {
 	var total int64
-	for _, p := range parts {
+	for _, p := range hParts {
 		total += int64(len(p))
 	}
-	uploadID, err := sessions.OpenSession(clientBg, "t1", total, "image/png", "holiday.png")
+	uploadID, err := sessions.OpenSession(hBg, "t1", total, "image/png", "holiday.png")
 	ctx.NoError(err, "OpenSession failed")
-	for i, data := range parts {
-		store.StagePart(clientBg, uploadID, i+1, data)
-		sessions.AckPart(clientBg, uploadID, i+1, int64(len(data)))
+	for i, data := range hParts {
+		store.StagePart(hBg, uploadID, i+1, data)
+		sessions.AckPart(hBg, uploadID, i+1, int64(len(data)))
 	}
 	return uploadID
 }
 
-func mustComplete(ctx *harness.Ctx, uploadID string) *store.File {
-	f, err := complete(clientBg, uploadID)
-	ctx.NoError(err, "complete(%s) failed", uploadID)
-	ctx.Assert(f != nil, "complete(%s) returned no file", uploadID)
+func hComplete(ctx *harness.Ctx, uploadID, why string) *store.File {
+	f, err := complete(hBg, uploadID)
+	ctx.NoError(err, "%s: complete(%s) failed", why, uploadID)
+	ctx.Assert(f != nil, "%s: complete(%s) returned no file", why, uploadID)
 	return f
 }
 
-func mustFail(ctx *harness.Ctx, uploadID, why string) {
-	f, err := complete(clientBg, uploadID)
+func hFail(ctx *harness.Ctx, uploadID, why string) {
+	f, err := complete(hBg, uploadID)
 	ctx.Assert(err != nil, "%s: complete returned %+v instead of an error", why, f)
 }
 
+// hSentSince is the part numbers of the PutChunk calls after the first before.
+func hSentSince(ctx *harness.Ctx, before int) []int32 {
+	sent := []int32{}
+	for _, call := range ctx.GRPC.CallsTo("PutChunk", "")[before:] {
+		sent = append(sent, call.Request.(*pb.PutChunkRequest).GetPart())
+	}
+	return sent
+}
+
 func CheckDeadline(ctx *harness.Ctx) {
-	objectPeer(ctx)
-	mustComplete(ctx, staged(ctx))
+	peer := hObjectPeer(ctx)
+	hComplete(ctx, hStaged(ctx), "with a healthy object store")
 	for _, method := range []string{"PutChunk", "CommitMultipart"} {
 		calls := ctx.GRPC.CallsTo(method, "")
 		ctx.Assert(len(calls) > 0, "no %s call was made", method)
@@ -1012,53 +1124,81 @@ func CheckDeadline(ctx *harness.Ctx) {
 			ctx.Assert(14*time.Second <= call.Timeout && call.Timeout <= 16*time.Second, "a %s call carries a %v deadline, expected 15 s", method, call.Timeout)
 		}
 	}
-	stalled := staged(ctx)
+	slow := hStaged(ctx)
+	peer.stallOnce[slow+"/2"] = true
+	before := len(ctx.GRPC.CallsTo("PutChunk", ""))
+	hComplete(ctx, slow, "with part 2 failing UNAVAILABLE after 10 s")
+	retried := ctx.GRPC.CallsTo("PutChunk", "")[before:]
+	ctx.Equal(hSentSince(ctx, before), []int32{1, 2, 2, 3}, "with part 2 failing UNAVAILABLE after 10 s, the parts sent")
+	for _, call := range retried {
+		ctx.Assert(call.HasDeadline() && 14*time.Second <= call.Timeout && call.Timeout <= 16*time.Second, "part %d was sent with a %v deadline after part 2's first attempt took 10 s: every attempt carries its own 15 s deadline, not what is left of one shared deadline", call.Request.(*pb.PutChunkRequest).GetPart(), call.Timeout)
+	}
+	stalled := hStaged(ctx)
 	ctx.GRPC.SetLatency("PutChunk", 60.0, "")
-	mustFail(ctx, stalled, "with the object store taking 60 s per part")
-	ctx.Assert(store.FindFile(clientBg, store.FileIDFor(stalled)) == nil, "an upload whose parts timed out was indexed as a file")
+	hFail(ctx, stalled, "with the object store taking 60 s per part")
+	ctx.Assert(store.FindFile(hBg, store.FileIDFor(stalled)) == nil, "an upload whose parts timed out was indexed as a file")
 }
 
 func CheckChunkHash(ctx *harness.Ctx) {
-	objectPeer(ctx)
-	f := mustComplete(ctx, staged(ctx))
+	hObjectPeer(ctx)
+	f := hComplete(ctx, hStaged(ctx), "with a healthy object store")
 	for _, call := range ctx.GRPC.CallsTo("PutChunk", "") {
 		req := call.Request.(*pb.PutChunkRequest)
-		ctx.Equal(req.GetSha256(), hexSum(req.GetData()), "part %d must carry the SHA-256 of its bytes (without it the store cannot verify the part or dedupe a retry); its sha256", req.GetPart())
+		ctx.Equal(req.GetSha256(), hHexSum(req.GetData()), "part %d must carry the SHA-256 of its bytes (without it the store cannot verify the part or dedupe a retry); its sha256", req.GetPart())
 	}
-	ctx.Equal(f.Digest, whole, "the file must be indexed with the object's digest")
+	ctx.Equal(f.Digest, hWhole, "the file must be indexed with the object's digest")
 }
 
 func CheckRetryInPlace(ctx *harness.Ctx) {
-	peer := objectPeer(ctx)
-	uploadID := staged(ctx)
+	peer := hObjectPeer(ctx)
+	uploadID := hStaged(ctx)
 	peer.failOnce[uploadID+"/2"] = true
-	f := mustComplete(ctx, uploadID)
-	var sent []int32
-	for _, call := range ctx.GRPC.CallsTo("PutChunk", "") {
-		sent = append(sent, call.Request.(*pb.PutChunkRequest).GetPart())
-	}
-	ctx.Equal(sent, []int32{1, 2, 2, 3}, "with part 2 failing once UNAVAILABLE, retry the part that failed and not the upload; the parts sent")
-	ctx.Assert(f.Digest == whole && store.FindFile(clientBg, f.FileID) != nil, "the retried upload must be committed and indexed, got %+v", f)
-	refused := staged(ctx)
+	f := hComplete(ctx, uploadID, "with part 2 failing once UNAVAILABLE")
+	ctx.Equal(hSentSince(ctx, 0), []int32{1, 2, 2, 3}, "with part 2 failing once UNAVAILABLE, retry the part that failed and not the upload; the parts sent")
+	ctx.Assert(f.Digest == hWhole && store.FindFile(hBg, f.FileID) != nil, "the retried upload must be committed and indexed, got %+v", f)
+	refused := hStaged(ctx)
 	ctx.GRPC.Fail("PutChunk", codes.InvalidArgument, "part rejected", 1, "")
 	before := len(ctx.GRPC.CallsTo("PutChunk", ""))
-	mustFail(ctx, refused, "with part 1 rejected INVALID_ARGUMENT")
+	hFail(ctx, refused, "with part 1 rejected INVALID_ARGUMENT")
 	ctx.Equal(len(ctx.GRPC.CallsTo("PutChunk", ""))-before, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry; the sends of a part rejected INVALID_ARGUMENT")
 	ctx.Assert(ctx.Clock.Sleeps() <= 1, "the client slept %d times: one backoff for the one retryable failure", ctx.Clock.Sleeps())
+	for _, code := range []codes.Code{codes.FailedPrecondition, codes.PermissionDenied, codes.Internal, codes.ResourceExhausted} {
+		terminal := hStaged(ctx)
+		ctx.GRPC.Fail("PutChunk", code, "part rejected", 1, "")
+		before = len(ctx.GRPC.CallsTo("PutChunk", ""))
+		hFail(ctx, terminal, "with part 1 rejected "+code.String())
+		ctx.Equal(len(ctx.GRPC.CallsTo("PutChunk", ""))-before, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry; the sends of a part rejected %v", code)
+	}
+	timedOut := hStaged(ctx)
+	ctx.GRPC.Fail("PutChunk", codes.DeadlineExceeded, "deadline exceeded", 1, "")
+	before = len(ctx.GRPC.CallsTo("PutChunk", ""))
+	hComplete(ctx, timedOut, "with part 1 failing DEADLINE_EXCEEDED once (a retryable status)")
+	ctx.Equal(hSentSince(ctx, before), []int32{1, 1, 2, 3}, "with part 1 failing DEADLINE_EXCEEDED once (it is retried), the parts sent")
+	third := hStaged(ctx)
+	ctx.GRPC.Fail("PutChunk", codes.Unavailable, "connection reset by peer", 2, "")
+	before = len(ctx.GRPC.CallsTo("PutChunk", ""))
+	hComplete(ctx, third, "with part 1 failing UNAVAILABLE twice (ATTEMPTS = 3 tries)")
+	ctx.Equal(hSentSince(ctx, before), []int32{1, 1, 1, 2, 3}, "with part 1 failing UNAVAILABLE twice (3 tries), the parts sent")
+	exhausted := hStaged(ctx)
+	ctx.GRPC.Fail("PutChunk", codes.Unavailable, "connection reset by peer", 3, "")
+	before = len(ctx.GRPC.CallsTo("PutChunk", ""))
+	hFail(ctx, exhausted, "with part 1 failing UNAVAILABLE three times")
+	ctx.Equal(hSentSince(ctx, before), []int32{1, 1, 1}, "with part 1 failing UNAVAILABLE three times (give up after 3 tries), the parts sent")
+	ctx.Assert(store.FindFile(hBg, store.FileIDFor(exhausted)) == nil, "an upload whose part 1 never reached the store was indexed as a file")
 }
 
 func CheckCommitGate(ctx *harness.Ctx) {
-	objectPeer(ctx)
-	uploadID := staged(ctx)
+	hObjectPeer(ctx)
+	uploadID := hStaged(ctx)
 	fileID := store.FileIDFor(uploadID)
 	ctx.GRPC.Fail("CommitMultipart", codes.Unavailable, "store restarting", 1, "")
-	mustFail(ctx, uploadID, "with CommitMultipart failing UNAVAILABLE")
-	ctx.Assert(store.FindFile(clientBg, fileID) == nil, "the commit failed and file:%s was indexed anyway: readers find a file whose object does not exist", fileID)
-	s, _ := sessions.FindSession(clientBg, uploadID)
+	hFail(ctx, uploadID, "with CommitMultipart failing UNAVAILABLE")
+	ctx.Assert(store.FindFile(hBg, fileID) == nil, "the commit failed and file:%s was indexed anyway: readers find a file whose object does not exist", fileID)
+	s, _ := sessions.FindSession(hBg, uploadID)
 	ctx.Assert(s != nil, "a failed commit dropped the session: the upload can no longer be finished")
-	f := mustComplete(ctx, uploadID)
-	ctx.Assert(f.ObjectKey == "objects/"+uploadID && f.Digest == whole, "the index must record the object key and digest CommitMultipart answered, got %+v", f)
-	ctx.Equal(store.FindFile(clientBg, fileID).State, "committed", "after a successful retry, the file's state")
+	f := hComplete(ctx, uploadID, "retrying after the failed commit")
+	ctx.Assert(f.ObjectKey == "objects/"+uploadID && f.Digest == hWhole, "the index must record the object key and digest CommitMultipart answered, got %+v", f)
+	ctx.Equal(store.FindFile(hBg, fileID).State, "committed", "after a successful retry, the file's state")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1077,15 +1217,15 @@ func CheckCommitGate(ctx *harness.Ctx) {
 
 namespace {
 
-std::string sequence32() {
+std::string hSequence32() {
   std::string out;
   for (int i = 0; i < 32; i++) out += static_cast<char>(i);
   return out;
 }
 
-const std::vector<std::string> kParts = {std::string("\\x89PNG\\r\\n\\x1a\\n", 8) + std::string(24, '\\0'), sequence32(), "tailtailtailtail"};
+const std::vector<std::string> hParts = {std::string("\\x89PNG\\r\\n\\x1a\\n", 8) + std::string(24, '\\0'), hSequence32(), "tailtailtailtail"};
 
-std::string sha(const std::string& data) {
+std::string hSha(const std::string& data) {
   unsigned char digest[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), digest);
   std::string hex;
@@ -1097,20 +1237,26 @@ std::string sha(const std::string& data) {
   return hex;
 }
 
-std::string wholeDigest() { return sha(kParts[0] + kParts[1] + kParts[2]); }
+std::string hWhole() { return hSha(hParts[0] + hParts[1] + hParts[2]); }
 
-// Keeps parts per upload; a part in fail_once fails UNAVAILABLE on its first write.
-class ObjectStorePeer final : public stored::ObjectStore::Service {
+// Keeps parts per upload; a part in fail_once fails UNAVAILABLE on its first write, one in stall_once after 10 s.
+class HObjectStorePeer final : public stored::ObjectStore::Service {
  public:
+  explicit HObjectStorePeer(harness::Clock& clock) : clock_(clock) {}
   std::map<std::string, std::string> parts;
   std::set<std::string> fail_once;
+  std::set<std::string> stall_once;
 
   grpc::Status PutChunk(grpc::ServerContext*, const stored::PutChunkRequest* req, stored::PutChunkReply* reply) override {
     const std::string key = req->upload_id() + "/" + std::to_string(req->part());
     if (fail_once.erase(key)) return grpc::Status(grpc::StatusCode::UNAVAILABLE, "connection reset by peer");
-    if (!req->sha256().empty() && req->sha256() != sha(req->data())) return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "sha256 does not match the part");
+    if (stall_once.erase(key)) {
+      clock_.Advance(10);
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "connection reset by peer after 10 s");
+    }
+    if (!req->sha256().empty() && req->sha256() != hSha(req->data())) return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "sha256 does not match the part");
     const auto previous = parts.find(key);
-    reply->set_deduped(!req->sha256().empty() && previous != parts.end() && sha(previous->second) == req->sha256());
+    reply->set_deduped(!req->sha256().empty() && previous != parts.end() && hSha(previous->second) == req->sha256());
     parts[key] = req->data();
     reply->set_part(req->part());
     return grpc::Status::OK;
@@ -1124,40 +1270,43 @@ class ObjectStorePeer final : public stored::ObjectStore::Service {
       data += part->second;
     }
     reply->set_object_key("objects/" + req->upload_id());
-    reply->set_digest(sha(data));
+    reply->set_digest(hSha(data));
     reply->set_size(static_cast<long long>(data.size()));
     return grpc::Status::OK;
   }
+
+ private:
+  harness::Clock& clock_;
 };
 
-ObjectStorePeer& objectPeer(harness::Ctx& ctx) {
-  static ObjectStorePeer* peer = nullptr;
+HObjectStorePeer& hObjectPeer(harness::Ctx& ctx) {
+  static HObjectStorePeer* peer = nullptr;
   delete peer;
-  peer = new ObjectStorePeer;
+  peer = new HObjectStorePeer(ctx.Clock);
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-std::string staged() {
+std::string hStaged() {
   long long total = 0;
-  for (const auto& p : kParts) total += static_cast<long long>(p.size());
+  for (const auto& p : hParts) total += static_cast<long long>(p.size());
   const std::string upload_id = sessions::openSession("t1", total, "image/png", "holiday.png").value_or("");
-  for (size_t i = 0; i < kParts.size(); i++) {
-    store::stagePart(upload_id, static_cast<int>(i + 1), kParts[i]);
-    sessions::ackPart(upload_id, static_cast<int>(i + 1), static_cast<long long>(kParts[i].size()));
+  for (size_t i = 0; i < hParts.size(); i++) {
+    store::stagePart(upload_id, static_cast<int>(i + 1), hParts[i]);
+    sessions::ackPart(upload_id, static_cast<int>(i + 1), static_cast<long long>(hParts[i].size()));
   }
   return upload_id;
 }
 
-store::File mustComplete(harness::Ctx& ctx, const std::string& upload_id) {
+store::File hComplete(harness::Ctx& ctx, const std::string& upload_id, const std::string& why) {
   try {
     return complete(upload_id);
   } catch (const std::exception& e) {
-    ctx.Fatalf("complete(%s) threw %s: %s", upload_id, harness::CurrentExceptionType(), e.what());
+    ctx.Fatalf("%s: complete(%s) threw %s: %s", why, upload_id, harness::CurrentExceptionType(), e.what());
   }
 }
 
-void mustFail(harness::Ctx& ctx, const std::string& upload_id, const std::string& why) {
+void hFail(harness::Ctx& ctx, const std::string& upload_id, const std::string& why) {
   try {
     complete(upload_id);
   } catch (const std::exception&) {
@@ -1166,11 +1315,19 @@ void mustFail(harness::Ctx& ctx, const std::string& upload_id, const std::string
   ctx.Fatalf("%s: complete returned a file instead of throwing", why);
 }
 
+// The part numbers of the PutChunk calls after the first before.
+std::vector<int> hSentSince(harness::Ctx& ctx, size_t before) {
+  std::vector<int> sent;
+  const auto calls = ctx.GRPC.CallsTo("PutChunk");
+  for (size_t i = before; i < calls.size(); i++) sent.push_back(calls[i].Request<stored::PutChunkRequest>().part());
+  return sent;
+}
+
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  objectPeer(ctx);
-  mustComplete(ctx, staged());
+  HObjectStorePeer& peer = hObjectPeer(ctx);
+  hComplete(ctx, hStaged(), "with a healthy object store");
   for (const std::string method : {"PutChunk", "CommitMultipart"}) {
     const auto calls = ctx.GRPC.CallsTo(method);
     ctx.Assert(!calls.empty(), "no %s call was made", method);
@@ -1179,49 +1336,85 @@ void CheckDeadline(harness::Ctx& ctx) {
       ctx.Assert(14 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 16, "a %s call carries a %v s deadline, expected kDeadline = 15 s", method, call.TimeoutSeconds());
     }
   }
-  const std::string stalled = staged();
+  const std::string slow = hStaged();
+  peer.stall_once.insert(slow + "/2");
+  const size_t before = ctx.GRPC.CallsTo("PutChunk").size();
+  hComplete(ctx, slow, "with part 2 failing UNAVAILABLE after 10 s");
+  ctx.Equal(hSentSince(ctx, before), {1, 2, 2, 3}, "with part 2 failing UNAVAILABLE after 10 s, the parts sent");
+  const auto calls = ctx.GRPC.CallsTo("PutChunk");
+  for (size_t i = before; i < calls.size(); i++) {
+    ctx.Assert(calls[i].HasDeadline() && 14 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 16, "part %d was sent with a %v s deadline after part 2's first attempt took 10 s: every attempt carries its own kDeadline, not what is left of one shared deadline", calls[i].Request<stored::PutChunkRequest>().part(), calls[i].TimeoutSeconds());
+  }
+  const std::string stalled = hStaged();
   ctx.GRPC.SetLatency("PutChunk", 60.0);
-  mustFail(ctx, stalled, "with the object store taking 60 s per part");
+  hFail(ctx, stalled, "with the object store taking 60 s per part");
   ctx.Assert(!store::findFile(store::fileIdFor(stalled)), "an upload whose parts timed out was indexed as a file");
 }
 
 void CheckChunkHash(harness::Ctx& ctx) {
-  objectPeer(ctx);
-  const store::File f = mustComplete(ctx, staged());
+  hObjectPeer(ctx);
+  const store::File f = hComplete(ctx, hStaged(), "with a healthy object store");
   for (const auto& call : ctx.GRPC.CallsTo("PutChunk")) {
     const auto& req = call.Request<stored::PutChunkRequest>();
-    ctx.Equal(req.sha256(), sha(req.data()), "part %d must carry the SHA-256 of its bytes (without it the store cannot verify the part or dedupe a retry); its sha256", req.part());
+    ctx.Equal(req.sha256(), hSha(req.data()), "part %d must carry the SHA-256 of its bytes (without it the store cannot verify the part or dedupe a retry); its sha256", req.part());
   }
-  ctx.Equal(f.digest, wholeDigest(), "the file must be indexed with the object's digest");
+  ctx.Equal(f.digest, hWhole(), "the file must be indexed with the object's digest");
 }
 
 void CheckRetryInPlace(harness::Ctx& ctx) {
-  ObjectStorePeer& peer = objectPeer(ctx);
-  const std::string upload_id = staged();
+  HObjectStorePeer& peer = hObjectPeer(ctx);
+  const std::string upload_id = hStaged();
   peer.fail_once.insert(upload_id + "/2");
-  const store::File f = mustComplete(ctx, upload_id);
-  std::vector<int> sent;
-  for (const auto& call : ctx.GRPC.CallsTo("PutChunk")) sent.push_back(call.Request<stored::PutChunkRequest>().part());
-  ctx.Equal(sent, {1, 2, 2, 3}, "with part 2 failing once UNAVAILABLE, retry the part that failed and not the upload; the parts sent");
-  ctx.Assert(f.digest == wholeDigest() && store::findFile(f.file_id).has_value(), "the retried upload must be committed and indexed (digest %s)", f.digest);
-  const std::string refused = staged();
+  const store::File f = hComplete(ctx, upload_id, "with part 2 failing once UNAVAILABLE");
+  ctx.Equal(hSentSince(ctx, 0), {1, 2, 2, 3}, "with part 2 failing once UNAVAILABLE, retry the part that failed and not the upload; the parts sent");
+  ctx.Assert(f.digest == hWhole() && store::findFile(f.file_id).has_value(), "the retried upload must be committed and indexed (digest %s)", f.digest);
+  const std::string refused = hStaged();
   ctx.GRPC.Fail("PutChunk", grpc::StatusCode::INVALID_ARGUMENT, "part rejected", 1);
-  const size_t before = ctx.GRPC.CallsTo("PutChunk").size();
-  mustFail(ctx, refused, "with part 1 rejected INVALID_ARGUMENT");
+  size_t before = ctx.GRPC.CallsTo("PutChunk").size();
+  hFail(ctx, refused, "with part 1 rejected INVALID_ARGUMENT");
   ctx.Equal(ctx.GRPC.CallsTo("PutChunk").size() - before, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry; the sends of a part rejected INVALID_ARGUMENT");
   ctx.Assert(ctx.Clock.Sleeps() <= 1, "the client slept %d times: one backoff for the one retryable failure", ctx.Clock.Sleeps());
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal_codes = {
+      {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+  };
+  for (const auto& [code, name] : terminal_codes) {
+    const std::string terminal = hStaged();
+    ctx.GRPC.Fail("PutChunk", code, "part rejected", 1);
+    before = ctx.GRPC.CallsTo("PutChunk").size();
+    hFail(ctx, terminal, "with part 1 rejected " + name);
+    ctx.Equal(ctx.GRPC.CallsTo("PutChunk").size() - before, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are worth a retry; the sends of a part rejected %s", name);
+  }
+  const std::string timed_out = hStaged();
+  ctx.GRPC.Fail("PutChunk", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1);
+  before = ctx.GRPC.CallsTo("PutChunk").size();
+  hComplete(ctx, timed_out, "with part 1 failing DEADLINE_EXCEEDED once (a retryable status)");
+  ctx.Equal(hSentSince(ctx, before), {1, 1, 2, 3}, "with part 1 failing DEADLINE_EXCEEDED once (it is retried), the parts sent");
+  const std::string third = hStaged();
+  ctx.GRPC.Fail("PutChunk", grpc::StatusCode::UNAVAILABLE, "connection reset by peer", 2);
+  before = ctx.GRPC.CallsTo("PutChunk").size();
+  hComplete(ctx, third, "with part 1 failing UNAVAILABLE twice (kAttempts = 3 tries)");
+  ctx.Equal(hSentSince(ctx, before), {1, 1, 1, 2, 3}, "with part 1 failing UNAVAILABLE twice (3 tries), the parts sent");
+  const std::string exhausted = hStaged();
+  ctx.GRPC.Fail("PutChunk", grpc::StatusCode::UNAVAILABLE, "connection reset by peer", 3);
+  before = ctx.GRPC.CallsTo("PutChunk").size();
+  hFail(ctx, exhausted, "with part 1 failing UNAVAILABLE three times");
+  ctx.Equal(hSentSince(ctx, before), {1, 1, 1}, "with part 1 failing UNAVAILABLE three times (give up after 3 tries), the parts sent");
+  ctx.Assert(!store::findFile(store::fileIdFor(exhausted)), "an upload whose part 1 never reached the store was indexed as a file");
 }
 
 void CheckCommitGate(harness::Ctx& ctx) {
-  objectPeer(ctx);
-  const std::string upload_id = staged();
+  hObjectPeer(ctx);
+  const std::string upload_id = hStaged();
   const std::string file_id = store::fileIdFor(upload_id);
   ctx.GRPC.Fail("CommitMultipart", grpc::StatusCode::UNAVAILABLE, "store restarting", 1);
-  mustFail(ctx, upload_id, "with CommitMultipart failing UNAVAILABLE");
+  hFail(ctx, upload_id, "with CommitMultipart failing UNAVAILABLE");
   ctx.Assert(!store::findFile(file_id), "the commit failed and file:%s was indexed anyway: readers find a file whose object does not exist", file_id);
   ctx.Assert(sessions::findSession(upload_id).has_value(), "a failed commit dropped the session: the upload can no longer be finished");
-  const store::File f = mustComplete(ctx, upload_id);
-  ctx.Assert(f.object_key == "objects/" + upload_id && f.digest == wholeDigest(), "the index must record the object key and digest CommitMultipart answered, got %s and %s", f.object_key, f.digest);
+  const store::File f = hComplete(ctx, upload_id, "retrying after the failed commit");
+  ctx.Assert(f.object_key == "objects/" + upload_id && f.digest == hWhole(), "the index must record the object key and digest CommitMultipart answered, got %s and %s", f.object_key, f.digest);
   ctx.Equal(store::findFile(file_id)->state, "committed", "after a successful retry, the file's state");
 }
 `,

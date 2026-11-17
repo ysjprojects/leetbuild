@@ -85,7 +85,7 @@ client declares zero bytes, or 4 KiB and then sends far more; and an executable 
       id: 'declared-size',
       title: 'Bounds the declaration and holds the parts to it',
       detail:
-        'The declared size is checked against 1 and `MAX_UPLOAD_BYTES` before a session opens (**413**), and a part that would take the session past its `declared_size` is refused with **413** before it is staged.',
+        'The declared size is held to 1 through `MAX_UPLOAD_BYTES`, both included, before a session opens (**413**), and a part that would take the session past its `declared_size` is refused with **413** before it is staged; a retried part is measured without its earlier count.',
       match: {
         python: {all: [/store\.MAX_UPLOAD_BYTES/, /session\[["']declared_size["']\]/]},
         typescript: {all: [/store\.MAX_UPLOAD_BYTES/, /session\.declared_size/]},
@@ -98,7 +98,7 @@ client declares zero bytes, or 4 KiB and then sends far more; and an executable 
       id: 'mime-sniff',
       title: 'Allowlists the declared type and sniffs the bytes',
       detail:
-        'A declared mime outside `ALLOWED_MIME` is **415**, and part 1 is sniffed (`sniff_mime`) and refused with **415** when its bytes are not the declared type.',
+        'A declared mime outside `ALLOWED_MIME` is **415**, and part 1, whenever it arrives, is sniffed (`sniff_mime`) and refused with **415** when its bytes are not the declared type, even if they are another accepted type.',
       match: {
         python: {all: [/store\.ALLOWED_MIME/, /store\.sniff_mime\(/, /status_code\s*=\s*415/]},
         typescript: {all: [/store\.ALLOWED_MIME/, /store\.sniffMime\(/, /code\(\s*415\s*\)/]},
@@ -719,6 +719,7 @@ void register_routes(httplib::Server& svr) {
 
 PNG = b"\\x89PNG\\r\\n\\x1a\\n" + bytes(24)  # 32 bytes that sniff as image/png
 EXE = b"MZ\\x90\\x00" + bytes(28)  # 32 bytes of a Windows executable
+PDF = b"%PDF-1.7" + bytes(24)  # 32 bytes of an accepted type that is not a PNG
 
 
 def _api(ctx):
@@ -779,6 +780,9 @@ async def check_declared_size(ctx):
             r = await _open(c, size=size)
             assert r.status_code == 413, f"a declared size of {size} answered {r.status_code}, expected 413 (1 to 5 GiB)"
         assert ctx.redis.keys("session:*") == [], f"a refused declaration opened {ctx.redis.keys('session:*')}"
+        for size in (1, store.MAX_UPLOAD_BYTES):
+            r = await _open(c, size=size)
+            assert r.status_code == 201, f"a declared size of {size} is within 1 to 5 GiB and answered {r.status_code}: {r.text}"
         upload_id = await _opened(c, size=40)
         assert (await _put(c, upload_id, 1, PNG)).status_code == 200, "part 1 (32 of 40 declared bytes) must be accepted"
         over = await _put(c, upload_id, 2, bytes(16))
@@ -788,6 +792,8 @@ async def check_declared_size(ctx):
         assert fits.status_code == 200 and _actual(upload_id) == 40, f"an 8-byte part 2 fits the declaration and answered {fits.status_code} {fits.text}"
         retry = await _put(c, upload_id, 2, bytes(8))
         assert retry.status_code == 200, f"a retried part 2 replaces its earlier count and must be accepted, got {retry.status_code}: {retry.text}"
+        grown = await _put(c, upload_id, 2, bytes(9))
+        assert grown.status_code == 413, f"part 2 retried with 9 bytes would take a 40-byte upload to 41 bytes and answered {grown.status_code}, expected 413"
 
 
 async def check_mime_sniff(ctx):
@@ -799,11 +805,21 @@ async def check_mime_sniff(ctx):
         exe = await _put(c, upload_id, 1, EXE)
         assert exe.status_code == 415, f"an executable sent as part 1 of an image/png upload answered {exe.status_code}, expected 415: sniff the leading bytes"
         assert store.staged_parts(upload_id) == [] and _actual(upload_id) == 0, "the refused executable was staged or counted"
+        pdf = await _put(c, upload_id, 1, PDF)
+        assert pdf.status_code == 415, f"a PDF sent as part 1 of an image/png upload answered {pdf.status_code}, expected 415: the bytes must be the declared type"
+        assert store.staged_parts(upload_id) == [], "the refused PDF was staged"
         png = await _put(c, upload_id, 1, PNG)
         assert png.status_code == 200, f"real PNG bytes answered {png.status_code}: {png.text}"
+        later = await _opened(c)
+        second = await _put(c, later, 2, bytes(32))
+        assert second.status_code == 200, f"part 2 sent before part 1 answered {second.status_code}: {second.text}; only part 1 is sniffed"
+        exe_late = await _put(c, later, 1, EXE)
+        assert exe_late.status_code == 415, f"an executable sent as part 1 after part 2 answered {exe_late.status_code}, expected 415: part 1 is sniffed whenever it arrives"
+        assert [n for n, _ in store.staged_parts(later)] == [2], "the late executable part 1 was staged"
 `,
     typescript: `const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(24)]);
 const EXE = Buffer.concat([Buffer.from([0x4d, 0x5a, 0x90, 0x00]), Buffer.alloc(28)]);
+const PDF = Buffer.concat([Buffer.from('%PDF-1.7'), Buffer.alloc(24)]); // an accepted type that is not a PNG
 
 function api(ctx) {
   return {
@@ -864,6 +880,10 @@ export async function check_declared_size(ctx) {
     assert.equal(r.status, 413, \`a declared size of \${size} answered \${r.status}, expected 413 (1 to 5 GiB)\`);
   }
   assert.deepStrictEqual(ctx.redis.keys('session:*'), [], 'a refused declaration opened a session');
+  for (const size of [1, store.MAX_UPLOAD_BYTES]) {
+    const r = await open(c, {size});
+    assert.equal(r.status, 201, \`a declared size of \${size} is within 1 to 5 GiB and answered \${r.status}: \${r.text}\`);
+  }
   const uploadId = await opened(c, 40);
   assert.equal((await put(c, uploadId, 1, PNG)).status, 200, 'part 1 (32 of 40 declared bytes) must be accepted');
   const over = await put(c, uploadId, 2, Buffer.alloc(16));
@@ -873,6 +893,8 @@ export async function check_declared_size(ctx) {
   assert(fits.status === 200 && (await actual(sessions, uploadId)) === 40, \`an 8-byte part 2 fits the declaration and answered \${fits.status} \${fits.text}\`);
   const retry = await put(c, uploadId, 2, Buffer.alloc(8));
   assert.equal(retry.status, 200, \`a retried part 2 replaces its earlier count and must be accepted, got \${retry.status}: \${retry.text}\`);
+  const grown = await put(c, uploadId, 2, Buffer.alloc(9));
+  assert.equal(grown.status, 413, \`part 2 retried with 9 bytes would take a 40-byte upload to 41 bytes and answered \${grown.status}, expected 413\`);
 }
 
 export async function check_mime_sniff(ctx) {
@@ -884,8 +906,17 @@ export async function check_mime_sniff(ctx) {
   const exe = await put(c, uploadId, 1, EXE);
   assert.equal(exe.status, 415, \`an executable sent as part 1 of an image/png upload answered \${exe.status}, expected 415: sniff the leading bytes\`);
   assert((await store.stagedParts(uploadId)).length === 0 && (await actual(sessions, uploadId)) === 0, 'the refused executable was staged or counted');
+  const pdf = await put(c, uploadId, 1, PDF);
+  assert.equal(pdf.status, 415, \`a PDF sent as part 1 of an image/png upload answered \${pdf.status}, expected 415: the bytes must be the declared type\`);
+  assert.equal((await store.stagedParts(uploadId)).length, 0, 'the refused PDF was staged');
   const png = await put(c, uploadId, 1, PNG);
   assert.equal(png.status, 200, \`real PNG bytes answered \${png.status}: \${png.text}\`);
+  const later = await opened(c);
+  const second = await put(c, later, 2, Buffer.alloc(32));
+  assert.equal(second.status, 200, \`part 2 sent before part 1 answered \${second.status}: \${second.text}; only part 1 is sniffed\`);
+  const exeLate = await put(c, later, 1, EXE);
+  assert.equal(exeLate.status, 415, \`an executable sent as part 1 after part 2 answered \${exeLate.status}, expected 415: part 1 is sniffed whenever it arrives\`);
+  assert.deepStrictEqual((await store.stagedParts(later)).map(([n]) => n), [2], 'the late executable part 1 was staged');
 }
 `,
     go: `package main
@@ -903,18 +934,19 @@ import (
 )
 
 var (
-	apiBg = context.Background()
-	png   = append([]byte("\\x89PNG\\r\\n\\x1a\\n"), make([]byte, 24)...)
-	exe   = append([]byte("MZ\\x90\\x00"), make([]byte, 28)...)
+	hBg  = context.Background()
+	hPng = append([]byte("\\x89PNG\\r\\n\\x1a\\n"), make([]byte, 24)...)
+	hExe = append([]byte("MZ\\x90\\x00"), make([]byte, 28)...)
+	hPdf = append([]byte("%PDF-1.7"), make([]byte, 24)...) // an accepted type that is not a PNG
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func open(c *harness.HTTP, tenant string, size int64, mime string) *harness.Response {
+func hOpen(c *harness.HTTP, tenant string, size int64, mime string) *harness.Response {
 	body := map[string]any{"size": size, "mime": mime, "name": "holiday.png"}
 	if tenant == "" {
 		return c.Post("/v1/files", body)
@@ -922,8 +954,8 @@ func open(c *harness.HTTP, tenant string, size int64, mime string) *harness.Resp
 	return c.Post("/v1/files", body, "X-Tenant-Id", tenant)
 }
 
-func opened(ctx *harness.Ctx, c *harness.HTTP, size int64) string {
-	r := open(c, "t1", size, "image/png")
+func hOpened(ctx *harness.Ctx, c *harness.HTTP, size int64) string {
+	r := hOpen(c, "t1", size, "image/png")
 	ctx.Equal(r.Status, 201, "POST /v1/files (size %d) (%s)", size, r.Text())
 	var body struct {
 		UploadID string \`json:"upload_id"\`
@@ -932,12 +964,12 @@ func opened(ctx *harness.Ctx, c *harness.HTTP, size int64) string {
 	return body.UploadID
 }
 
-func put(c *harness.HTTP, uploadID string, n int, data []byte, tenant string) *harness.Response {
+func hPut(c *harness.HTTP, uploadID string, n int, data []byte, tenant string) *harness.Response {
 	return c.Put(fmt.Sprintf("/v1/uploads/%s/parts/%d", uploadID, n), data, "X-Tenant-Id", tenant, "Content-Type", "application/octet-stream")
 }
 
-func actualOf(ctx *harness.Ctx, uploadID string) int64 {
-	s, err := sessions.FindSession(apiBg, uploadID)
+func hActual(ctx *harness.Ctx, uploadID string) int64 {
+	s, err := sessions.FindSession(hBg, uploadID)
 	ctx.NoError(err, "FindSession(%s) failed", uploadID)
 	if s == nil {
 		return -1
@@ -945,13 +977,13 @@ func actualOf(ctx *harness.Ctx, uploadID string) int64 {
 	return s.ActualBytes
 }
 
-func stagedOf(ctx *harness.Ctx, uploadID string) []store.Part {
-	parts, err := store.StagedParts(apiBg, uploadID)
+func hStaged(ctx *harness.Ctx, uploadID string) []store.Part {
+	parts, err := store.StagedParts(hBg, uploadID)
 	ctx.NoError(err, "StagedParts(%s) failed", uploadID)
 	return parts
 }
 
-func answered(r *harness.Response) int64 {
+func hAnswered(r *harness.Response) int64 {
 	var body struct {
 		ActualBytes int64 \`json:"actual_bytes"\`
 	}
@@ -960,8 +992,8 @@ func answered(r *harness.Response) int64 {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := open(c, "t1", 64, "image/png")
+	c := hAPI(ctx)
+	r := hOpen(c, "t1", 64, "image/png")
 	ctx.Equal(r.Status, 201, "POST /v1/files (%s)", r.Text())
 	var body struct {
 		UploadID     string \`json:"upload_id"\`
@@ -969,53 +1001,67 @@ func CheckRoute(ctx *harness.Ctx) {
 	}
 	r.Decode(&body)
 	ctx.Assert(body.UploadID != "" && body.DeclaredSize == 64, "the upload must answer upload_id and declared_size 64, got %s", r.Text())
-	first := put(c, body.UploadID, 1, png, "t1")
-	ctx.Assert(first.Status == 200 && answered(first) == 32, "part 1 (32 bytes) answered %d %s, expected 200 with actual_bytes 32", first.Status, first.Text())
-	second := put(c, body.UploadID, 2, make([]byte, 32), "t1")
-	ctx.Assert(second.Status == 200 && answered(second) == 64, "part 2 (32 bytes) answered %d %s, expected 200 with actual_bytes 64", second.Status, second.Text())
-	staged := stagedOf(ctx, body.UploadID)
-	ctx.Assert(len(staged) == 2 && bytes.Equal(staged[0].Data, png) && len(staged[1].Data) == 32, "the staged parts are %d, expected parts 1 and 2 of 32 bytes", len(staged))
+	first := hPut(c, body.UploadID, 1, hPng, "t1")
+	ctx.Assert(first.Status == 200 && hAnswered(first) == 32, "part 1 (32 bytes) answered %d %s, expected 200 with actual_bytes 32", first.Status, first.Text())
+	second := hPut(c, body.UploadID, 2, make([]byte, 32), "t1")
+	ctx.Assert(second.Status == 200 && hAnswered(second) == 64, "part 2 (32 bytes) answered %d %s, expected 200 with actual_bytes 64", second.Status, second.Text())
+	staged := hStaged(ctx, body.UploadID)
+	ctx.Assert(len(staged) == 2 && bytes.Equal(staged[0].Data, hPng) && len(staged[1].Data) == 32, "the staged parts are %d, expected parts 1 and 2 of 32 bytes", len(staged))
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	ctx.Equal(open(c, "", 64, "image/png").Status, 401, "POST /v1/files without X-Tenant-Id")
-	uploadID := opened(ctx, c, 64)
-	foreign := put(c, uploadID, 1, png, "t2")
+	c := hAPI(ctx)
+	ctx.Equal(hOpen(c, "", 64, "image/png").Status, 401, "POST /v1/files without X-Tenant-Id")
+	uploadID := hOpened(ctx, c, 64)
+	foreign := hPut(c, uploadID, 1, hPng, "t2")
 	ctx.Equal(foreign.Status, 403, "tenant t2 sent a part of t1's upload %s: an upload id is not a credential", uploadID)
-	ctx.Assert(len(stagedOf(ctx, uploadID)) == 0 && actualOf(ctx, uploadID) == 0, "t2's part was staged or counted (actual_bytes %d)", actualOf(ctx, uploadID))
-	own := put(c, uploadID, 1, png, "t1")
+	ctx.Assert(len(hStaged(ctx, uploadID)) == 0 && hActual(ctx, uploadID) == 0, "t2's part was staged or counted (actual_bytes %d)", hActual(ctx, uploadID))
+	own := hPut(c, uploadID, 1, hPng, "t1")
 	ctx.Equal(own.Status, 200, "t1's own part (%s)", own.Text())
 }
 
 func CheckDeclaredSize(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	ctx.Redis.Set("quota:limit:t1", fmt.Sprint(int64(10)<<30)) // room beyond the 5 GiB cap
 	for _, size := range []int64{0, -5, store.MaxUploadBytes + 1} {
-		r := open(c, "t1", size, "image/png")
+		r := hOpen(c, "t1", size, "image/png")
 		ctx.Equal(r.Status, 413, "a declared size of %d must be refused (1 to 5 GiB)", size)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("session:*")), 0, "a refused declaration must not open a session; the sessions")
-	uploadID := opened(ctx, c, 40)
-	ctx.Equal(put(c, uploadID, 1, png, "t1").Status, 200, "part 1 (32 of 40 declared bytes)")
-	over := put(c, uploadID, 2, make([]byte, 16), "t1")
+	for _, size := range []int64{1, store.MaxUploadBytes} {
+		r := hOpen(c, "t1", size, "image/png")
+		ctx.Equal(r.Status, 201, "a declared size of %d is within 1 to 5 GiB (%s)", size, r.Text())
+	}
+	uploadID := hOpened(ctx, c, 40)
+	ctx.Equal(hPut(c, uploadID, 1, hPng, "t1").Status, 200, "part 1 (32 of 40 declared bytes)")
+	over := hPut(c, uploadID, 2, make([]byte, 16), "t1")
 	ctx.Equal(over.Status, 413, "part 2 would take a 40-byte upload to 48 bytes")
-	ctx.Assert(actualOf(ctx, uploadID) == 32 && len(stagedOf(ctx, uploadID)) == 1, "the refused part was staged or counted (actual_bytes %d)", actualOf(ctx, uploadID))
-	fits := put(c, uploadID, 2, make([]byte, 8), "t1")
-	ctx.Assert(fits.Status == 200 && actualOf(ctx, uploadID) == 40, "an 8-byte part 2 fits the declaration and answered %d %s", fits.Status, fits.Text())
-	retry := put(c, uploadID, 2, make([]byte, 8), "t1")
+	ctx.Assert(hActual(ctx, uploadID) == 32 && len(hStaged(ctx, uploadID)) == 1, "the refused part was staged or counted (actual_bytes %d)", hActual(ctx, uploadID))
+	fits := hPut(c, uploadID, 2, make([]byte, 8), "t1")
+	ctx.Assert(fits.Status == 200 && hActual(ctx, uploadID) == 40, "an 8-byte part 2 fits the declaration and answered %d %s", fits.Status, fits.Text())
+	retry := hPut(c, uploadID, 2, make([]byte, 8), "t1")
 	ctx.Equal(retry.Status, 200, "a retried part 2 replaces its earlier count and must be accepted (%s)", retry.Text())
+	grown := hPut(c, uploadID, 2, make([]byte, 9), "t1")
+	ctx.Equal(grown.Status, 413, "part 2 retried with 9 bytes would take a 40-byte upload to 41 bytes")
 }
 
 func CheckMimeSniff(ctx *harness.Ctx) {
-	c := api(ctx)
-	ctx.Equal(open(c, "t1", 64, "application/x-msdownload").Status, 415, "a declared mime of application/x-msdownload")
+	c := hAPI(ctx)
+	ctx.Equal(hOpen(c, "t1", 64, "application/x-msdownload").Status, 415, "a declared mime of application/x-msdownload")
 	ctx.Equal(len(ctx.Redis.Keys("session:*")), 0, "a refused mime must not open a session; the sessions")
-	uploadID := opened(ctx, c, 64)
-	ctx.Equal(put(c, uploadID, 1, exe, "t1").Status, 415, "an executable sent as part 1 of an image/png upload (sniff the leading bytes)")
-	ctx.Assert(len(stagedOf(ctx, uploadID)) == 0 && actualOf(ctx, uploadID) == 0, "the refused executable was staged or counted")
-	pngPart := put(c, uploadID, 1, png, "t1")
+	uploadID := hOpened(ctx, c, 64)
+	ctx.Equal(hPut(c, uploadID, 1, hExe, "t1").Status, 415, "an executable sent as part 1 of an image/png upload (sniff the leading bytes)")
+	ctx.Assert(len(hStaged(ctx, uploadID)) == 0 && hActual(ctx, uploadID) == 0, "the refused executable was staged or counted")
+	ctx.Equal(hPut(c, uploadID, 1, hPdf, "t1").Status, 415, "a PDF sent as part 1 of an image/png upload (the bytes must be the declared type)")
+	ctx.Equal(len(hStaged(ctx, uploadID)), 0, "the refused PDF must not be staged; the staged parts")
+	pngPart := hPut(c, uploadID, 1, hPng, "t1")
 	ctx.Equal(pngPart.Status, 200, "real PNG bytes (%s)", pngPart.Text())
+	later := hOpened(ctx, c, 64)
+	second := hPut(c, later, 2, make([]byte, 32), "t1")
+	ctx.Equal(second.Status, 200, "part 2 sent before part 1; only part 1 is sniffed (%s)", second.Text())
+	ctx.Equal(hPut(c, later, 1, hExe, "t1").Status, 415, "an executable sent as part 1 after part 2 (part 1 is sniffed whenever it arrives)")
+	staged := hStaged(ctx, later)
+	ctx.Assert(len(staged) == 1 && staged[0].N == 2, "the late executable part 1 was staged (%d parts)", len(staged))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1027,10 +1073,11 @@ func CheckMimeSniff(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kPng = std::string("\\x89PNG\\r\\n\\x1a\\n", 8) + std::string(24, '\\0');
-const std::string kExe = std::string("MZ\\x90\\0", 4) + std::string(28, '\\0');
+const std::string hPng = std::string("\\x89PNG\\r\\n\\x1a\\n", 8) + std::string(24, '\\0');
+const std::string hExe = std::string("MZ\\x90\\0", 4) + std::string(28, '\\0');
+const std::string hPdf = std::string("%PDF-1.7") + std::string(24, '\\0');  // an accepted type that is not a PNG
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1038,82 +1085,95 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response open(harness::HTTP& c, const std::string& tenant, long long size, const std::string& mime) {
+harness::Response hOpen(harness::HTTP& c, const std::string& tenant, long long size, const std::string& mime) {
   const std::string body = nlohmann::json{{"size", size}, {"mime", mime}, {"name", "holiday.png"}}.dump();
   if (tenant.empty()) return c.Post("/v1/files", body, "Content-Type", "application/json");
   return c.Post("/v1/files", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-std::string opened(harness::Ctx& ctx, harness::HTTP& c, long long size) {
-  const auto r = open(c, "t1", size, "image/png");
+std::string hOpened(harness::Ctx& ctx, harness::HTTP& c, long long size) {
+  const auto r = hOpen(c, "t1", size, "image/png");
   ctx.Equal(r.Status, 201, "POST /v1/files (size %d) (%s)", size, r.Text());
   return nlohmann::json::parse(r.Text()).value("upload_id", "");
 }
 
-harness::Response put(harness::HTTP& c, const std::string& upload_id, int n, const std::string& data, const std::string& tenant = "t1") {
+harness::Response hPut(harness::HTTP& c, const std::string& upload_id, int n, const std::string& data, const std::string& tenant = "t1") {
   return c.Put("/v1/uploads/" + upload_id + "/parts/" + std::to_string(n), data, "X-Tenant-Id", tenant, "Content-Type", "application/octet-stream");
 }
 
-long long actualOf(const std::string& upload_id) {
+long long hActual(const std::string& upload_id) {
   const auto s = sessions::findSession(upload_id);
   return s ? s->actual_bytes : -1;
 }
 
-long long answered(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false).value("actual_bytes", -1LL); }
+long long hAnswered(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false).value("actual_bytes", -1LL); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = open(c, "t1", 64, "image/png");
+  auto c = hApi(ctx);
+  const auto r = hOpen(c, "t1", 64, "image/png");
   ctx.Equal(r.Status, 201, "POST /v1/files (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text());
   const std::string upload_id = body.value("upload_id", "");
   ctx.Assert(!upload_id.empty() && body.value("declared_size", 0LL) == 64, "the upload must answer upload_id and declared_size 64, got %s", r.Text());
-  const auto first = put(c, upload_id, 1, kPng);
-  ctx.Assert(first.Status == 200 && answered(first) == 32, "part 1 (32 bytes) answered %d %s, expected 200 with actual_bytes 32", first.Status, first.Text());
-  const auto second = put(c, upload_id, 2, std::string(32, '\\0'));
-  ctx.Assert(second.Status == 200 && answered(second) == 64, "part 2 (32 bytes) answered %d %s, expected 200 with actual_bytes 64", second.Status, second.Text());
+  const auto first = hPut(c, upload_id, 1, hPng);
+  ctx.Assert(first.Status == 200 && hAnswered(first) == 32, "part 1 (32 bytes) answered %d %s, expected 200 with actual_bytes 32", first.Status, first.Text());
+  const auto second = hPut(c, upload_id, 2, std::string(32, '\\0'));
+  ctx.Assert(second.Status == 200 && hAnswered(second) == 64, "part 2 (32 bytes) answered %d %s, expected 200 with actual_bytes 64", second.Status, second.Text());
   const auto staged = store::stagedParts(upload_id);
-  ctx.Assert(staged.size() == 2 && staged[0].second == kPng && staged[1].second.size() == 32, "the staged parts are %d, expected parts 1 and 2 of 32 bytes", staged.size());
+  ctx.Assert(staged.size() == 2 && staged[0].second == hPng && staged[1].second.size() == 32, "the staged parts are %d, expected parts 1 and 2 of 32 bytes", staged.size());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  ctx.Equal(open(c, "", 64, "image/png").Status, 401, "POST /v1/files without X-Tenant-Id");
-  const std::string upload_id = opened(ctx, c, 64);
-  ctx.Equal(put(c, upload_id, 1, kPng, "t2").Status, 403, "tenant t2 sent a part of t1's upload %s: an upload id is not a credential", upload_id);
-  ctx.Assert(store::stagedParts(upload_id).empty() && actualOf(upload_id) == 0, "t2's part was staged or counted (actual_bytes %d)", actualOf(upload_id));
-  const auto own = put(c, upload_id, 1, kPng);
+  auto c = hApi(ctx);
+  ctx.Equal(hOpen(c, "", 64, "image/png").Status, 401, "POST /v1/files without X-Tenant-Id");
+  const std::string upload_id = hOpened(ctx, c, 64);
+  ctx.Equal(hPut(c, upload_id, 1, hPng, "t2").Status, 403, "tenant t2 sent a part of t1's upload %s: an upload id is not a credential", upload_id);
+  ctx.Assert(store::stagedParts(upload_id).empty() && hActual(upload_id) == 0, "t2's part was staged or counted (actual_bytes %d)", hActual(upload_id));
+  const auto own = hPut(c, upload_id, 1, hPng);
   ctx.Equal(own.Status, 200, "t1's own part (%s)", own.Text());
 }
 
 void CheckDeclaredSize(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   ctx.Redis.Set("quota:limit:t1", std::to_string(10LL << 30));  // room beyond the 5 GiB cap
   for (const long long size : {0LL, -5LL, store::kMaxUploadBytes + 1}) {
-    ctx.Equal(open(c, "t1", size, "image/png").Status, 413, "a declared size of %d must be refused (1 to 5 GiB)", size);
+    ctx.Equal(hOpen(c, "t1", size, "image/png").Status, 413, "a declared size of %d must be refused (1 to 5 GiB)", size);
   }
   ctx.Equal(ctx.Redis.Keys("session:*").size(), 0, "a refused declaration must not open a session; the sessions");
-  const std::string upload_id = opened(ctx, c, 40);
-  ctx.Equal(put(c, upload_id, 1, kPng).Status, 200, "part 1 (32 of 40 declared bytes)");
-  ctx.Equal(put(c, upload_id, 2, std::string(16, '\\0')).Status, 413, "part 2 would take a 40-byte upload to 48 bytes");
-  ctx.Assert(actualOf(upload_id) == 32 && store::stagedParts(upload_id).size() == 1, "the refused part was staged or counted (actual_bytes %d)", actualOf(upload_id));
-  const auto fits = put(c, upload_id, 2, std::string(8, '\\0'));
-  ctx.Assert(fits.Status == 200 && actualOf(upload_id) == 40, "an 8-byte part 2 fits the declaration and answered %d %s", fits.Status, fits.Text());
-  const auto retry = put(c, upload_id, 2, std::string(8, '\\0'));
+  for (const long long size : {1LL, store::kMaxUploadBytes}) {
+    const auto r = hOpen(c, "t1", size, "image/png");
+    ctx.Equal(r.Status, 201, "a declared size of %d is within 1 to 5 GiB (%s)", size, r.Text());
+  }
+  const std::string upload_id = hOpened(ctx, c, 40);
+  ctx.Equal(hPut(c, upload_id, 1, hPng).Status, 200, "part 1 (32 of 40 declared bytes)");
+  ctx.Equal(hPut(c, upload_id, 2, std::string(16, '\\0')).Status, 413, "part 2 would take a 40-byte upload to 48 bytes");
+  ctx.Assert(hActual(upload_id) == 32 && store::stagedParts(upload_id).size() == 1, "the refused part was staged or counted (actual_bytes %d)", hActual(upload_id));
+  const auto fits = hPut(c, upload_id, 2, std::string(8, '\\0'));
+  ctx.Assert(fits.Status == 200 && hActual(upload_id) == 40, "an 8-byte part 2 fits the declaration and answered %d %s", fits.Status, fits.Text());
+  const auto retry = hPut(c, upload_id, 2, std::string(8, '\\0'));
   ctx.Equal(retry.Status, 200, "a retried part 2 replaces its earlier count and must be accepted (%s)", retry.Text());
+  ctx.Equal(hPut(c, upload_id, 2, std::string(9, '\\0')).Status, 413, "part 2 retried with 9 bytes would take a 40-byte upload to 41 bytes");
 }
 
 void CheckMimeSniff(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  ctx.Equal(open(c, "t1", 64, "application/x-msdownload").Status, 415, "a declared mime of application/x-msdownload");
+  auto c = hApi(ctx);
+  ctx.Equal(hOpen(c, "t1", 64, "application/x-msdownload").Status, 415, "a declared mime of application/x-msdownload");
   ctx.Equal(ctx.Redis.Keys("session:*").size(), 0, "a refused mime must not open a session; the sessions");
-  const std::string upload_id = opened(ctx, c, 64);
-  ctx.Equal(put(c, upload_id, 1, kExe).Status, 415, "an executable sent as part 1 of an image/png upload (sniff the leading bytes)");
-  ctx.Assert(store::stagedParts(upload_id).empty() && actualOf(upload_id) == 0, "the refused executable was staged or counted");
-  const auto png = put(c, upload_id, 1, kPng);
+  const std::string upload_id = hOpened(ctx, c, 64);
+  ctx.Equal(hPut(c, upload_id, 1, hExe).Status, 415, "an executable sent as part 1 of an image/png upload (sniff the leading bytes)");
+  ctx.Assert(store::stagedParts(upload_id).empty() && hActual(upload_id) == 0, "the refused executable was staged or counted");
+  ctx.Equal(hPut(c, upload_id, 1, hPdf).Status, 415, "a PDF sent as part 1 of an image/png upload (the bytes must be the declared type)");
+  ctx.Equal(store::stagedParts(upload_id).size(), 0, "the refused PDF must not be staged; the staged parts");
+  const auto png = hPut(c, upload_id, 1, hPng);
   ctx.Equal(png.Status, 200, "real PNG bytes (%s)", png.Text());
+  const std::string later = hOpened(ctx, c, 64);
+  const auto second = hPut(c, later, 2, std::string(32, '\\0'));
+  ctx.Equal(second.Status, 200, "part 2 sent before part 1; only part 1 is sniffed (%s)", second.Text());
+  ctx.Equal(hPut(c, later, 1, hExe).Status, 415, "an executable sent as part 1 after part 2 (part 1 is sniffed whenever it arrives)");
+  const auto staged = store::stagedParts(later);
+  ctx.Assert(staged.size() == 1 && staged[0].first == 2, "the late executable part 1 was staged (%d parts)", staged.size());
 }
 `,
   },

@@ -75,7 +75,7 @@ duplicates and they are never purged.
       id: 'budget-window',
       title: 'The budget belongs to a five-minute window and expires with it',
       detail:
-        'The budget key carries the window (`purge:budget:{domain}:{window}`), expires, and a refusal’s `retry_after` is the time left in the window; after it the domain can purge again. The starter’s one counter only grows.',
+        'The budget key carries the window (`purge:budget:{domain}:{window}`), gets its expiry in the script that creates it, and a refusal’s `retry_after` is the time left in the window; after it the domain can purge again. The starter’s one counter only grows.',
       match: {
         python: {all: [/purge:budget:\{domain\}:\{window\}/, /'EXPIRE'/, /%\s*WINDOW_S/]},
         typescript: {all: [/purge:budget:\$\{domain\}:\$\{window\}/, /'EXPIRE'/, /%\s*WINDOW_S/]},
@@ -689,8 +689,10 @@ def check_atomic_reserve(ctx):
 
 def check_dedupe_window(ctx):
     m = ctx.load("state")
+    seen_ttl = ctx.redis_after(SEEN, lambda: ctx.redis.ttl(SEEN))
     first = m.reserve(DOMAIN, ["/pricing", "/img/logo.png"])
     assert first["allowed"] and first["new_paths"] == ["/pricing", "/img/logo.png"], f"a first reservation answered {first}"
+    assert _settled(seen_ttl, SEEN) != -1, f"{SEEN} had no TTL right after the command that marked it: the mark and its 600 s expiry belong to one command"
     again = m.reserve(DOMAIN, ["/pricing", "/about"])
     assert again["new_paths"] == ["/about"] and again["duplicates"] == ["/pricing"], f"/pricing again within ten minutes answered {again}: it is a duplicate, /about is new"
     ttl = ctx.redis.ttl(SEEN)
@@ -702,7 +704,11 @@ def check_dedupe_window(ctx):
 
 def check_budget_window(ctx):
     m = ctx.load("state")
+    ctx.clock.advance((200 - int(ctx.clock.time()) % 300) % 300)  # 100 s before a window ends: retry_after is not the whole window
+    budget_ttls = ctx.redis_after(f"purge:seen:{DOMAIN}:/p/0", lambda: {key: ctx.redis.ttl(key) for key in ctx.redis.keys(f"purge:budget:{DOMAIN}*")})
     full = m.reserve(DOMAIN, [f"/p/{i}" for i in range(1000)])
+    ttls = _settled(budget_ttls, f"purge:seen:{DOMAIN}:/p/0")
+    assert -1 not in ttls.values(), f"right after the reservation's script the budget keys had TTLs {ttls}: the charge and its EXPIRE belong in one script, or a crash between them leaves a counter that only grows"
     assert full["allowed"] and full["remaining"] == 0, f"1000 new paths in an empty window answered allowed={full['allowed']} remaining={full['remaining']}"
     refused = m.reserve(DOMAIN, ["/one-more"])
     expected = 300 - int(ctx.clock.time()) % 300
@@ -749,8 +755,10 @@ export async function check_atomic_reserve(ctx) {
 
 export async function check_dedupe_window(ctx) {
   const m = ctx.load('state');
+  const seenTtl = ctx.redisAfter(SEEN, () => ctx.redis.ttl(SEEN));
   const first = await m.reserve(DOMAIN, ['/pricing', '/img/logo.png']);
   assert(first.allowed && JSON.stringify(first.new_paths) === JSON.stringify(['/pricing', '/img/logo.png']), \`a first reservation answered \${JSON.stringify(first)}\`);
+  assert.notEqual(await settled(seenTtl, SEEN), -1, \`\${SEEN} had no TTL right after the command that marked it: the mark and its 600 s expiry belong to one command\`);
   const again = await m.reserve(DOMAIN, ['/pricing', '/about']);
   assert(JSON.stringify(again.new_paths) === '["/about"]' && JSON.stringify(again.duplicates) === '["/pricing"]', \`/pricing again within ten minutes answered \${JSON.stringify(again)}: it is a duplicate, /about is new\`);
   const ttl = ctx.redis.ttl(SEEN);
@@ -762,7 +770,12 @@ export async function check_dedupe_window(ctx) {
 
 export async function check_budget_window(ctx) {
   const m = ctx.load('state');
+  ctx.clock.advance((200 - (Math.floor(ctx.clock.now() / 1000) % 300) + 300) % 300); // 100 s before a window ends: retry_after is not the whole window
+  const firstSeen = \`purge:seen:\${DOMAIN}:/p/0\`;
+  const budgetTtls = ctx.redisAfter(firstSeen, () => (ctx.redis.keys(\`purge:budget:\${DOMAIN}*\`) as string[]).map(key => [key, ctx.redis.ttl(key)]));
   const full = await m.reserve(DOMAIN, Array.from({length: 1000}, (_, i) => \`/p/\${i}\`));
+  const ttls = (await settled(budgetTtls, firstSeen)) as [string, number][];
+  assert(ttls.every(([, ttl]) => ttl !== -1), \`right after the reservation's script the budget keys had TTLs \${JSON.stringify(ttls)}: the charge and its EXPIRE belong in one script, or a crash between them leaves a counter that only grows\`);
   assert(full.allowed && full.remaining === 0, \`1000 new paths in an empty window answered allowed=\${full.allowed} remaining=\${full.remaining}\`);
   const refused = await m.reserve(DOMAIN, ['/one-more']);
   const expected = 300 - (Math.floor(ctx.clock.now() / 1000) % 300);
@@ -796,20 +809,20 @@ import (
 	"leetbuild/harness"
 )
 
-const stateDomain = "shop.example.com"
+const hStateDomain = "shop.example.com"
 
 var (
-	stateBg   = context.Background()
-	stateSeen = "purge:seen:" + stateDomain + ":/pricing"
+	hStateBg   = context.Background()
+	hStateSeen = "purge:seen:" + hStateDomain + ":/pricing"
 )
 
-func mustReserve(ctx *harness.Ctx, paths []string) Reservation {
-	res, err := reserve(stateBg, stateDomain, paths)
-	ctx.NoError(err, "reserve(%s, %d paths) failed", stateDomain, len(paths))
+func hMustReserve(ctx *harness.Ctx, paths []string) Reservation {
+	res, err := reserve(hStateBg, hStateDomain, paths)
+	ctx.NoError(err, "reserve(%s, %d paths) failed", hStateDomain, len(paths))
 	return res
 }
 
-func numberedPaths(n int) []string {
+func hNumberedPaths(n int) []string {
 	out := make([]string, n)
 	for i := range out {
 		out[i] = fmt.Sprintf("/p/%d", i)
@@ -817,9 +830,9 @@ func numberedPaths(n int) []string {
 	return out
 }
 
-func budgetUsed(ctx *harness.Ctx) int {
+func hBudgetUsed(ctx *harness.Ctx) int {
 	used := 0
-	for _, key := range ctx.Redis.Keys("purge:budget:" + stateDomain + "*") {
+	for _, key := range ctx.Redis.Keys("purge:budget:" + hStateDomain + "*") {
 		raw, _ := ctx.Redis.Get(key)
 		n, _ := strconv.Atoi(raw)
 		used += n
@@ -829,13 +842,13 @@ func budgetUsed(ctx *harness.Ctx) int {
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
 	// A second replica reserves the same path right after this reservation's first command on it.
-	rival := ctx.Redis.After(stateSeen, func() any {
-		res, err := reserve(stateBg, stateDomain, []string{"/pricing"})
+	rival := ctx.Redis.After(hStateSeen, func() any {
+		res, err := reserve(hStateBg, hStateDomain, []string{"/pricing"})
 		ctx.NoError(err, "the rival reservation failed")
 		return res
 	})
-	mine := mustReserve(ctx, []string{"/pricing"})
-	ctx.Assert(rival.Fired, "nothing touched %s", stateSeen)
+	mine := hMustReserve(ctx, []string{"/pricing"})
+	ctx.Assert(rival.Fired, "nothing touched %s", hStateSeen)
 	theirs := rival.Result.(Reservation)
 	won := 0
 	for _, res := range []Reservation{mine, theirs} {
@@ -844,46 +857,62 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(won == 1, "two concurrent reservations of /pricing answered %+v and %+v: %d of them won the path. The check and the mark must run in one script", mine, theirs, won)
-	ctx.Equal(budgetUsed(ctx), 1, "one path reserved once must charge the budget once; the budget used")
+	ctx.Equal(hBudgetUsed(ctx), 1, "one path reserved once must charge the budget once; the budget used")
 }
 
 func CheckDedupeWindow(ctx *harness.Ctx) {
-	first := mustReserve(ctx, []string{"/pricing", "/img/logo.png"})
+	seenTTL := ctx.Redis.After(hStateSeen, func() any { return ctx.Redis.TTL(hStateSeen) })
+	first := hMustReserve(ctx, []string{"/pricing", "/img/logo.png"})
 	ctx.Assert(first.Allowed && fmt.Sprint(first.NewPaths) == "[/pricing /img/logo.png]", "a first reservation answered %+v", first)
-	again := mustReserve(ctx, []string{"/pricing", "/about"})
+	ctx.Assert(seenTTL.Fired, "nothing touched %s", hStateSeen)
+	ctx.Assert(fmt.Sprint(seenTTL.Result) != "-1", "%s had no TTL right after the command that marked it: the mark and its 600 s expiry belong to one command", hStateSeen)
+	again := hMustReserve(ctx, []string{"/pricing", "/about"})
 	ctx.Assert(fmt.Sprint(again.NewPaths) == "[/about]" && fmt.Sprint(again.Duplicates) == "[/pricing]", "/pricing again within ten minutes answered %+v: it is a duplicate, /about is new", again)
-	ttl := ctx.Redis.TTL(stateSeen)
-	ctx.Assert(0 < ttl && ttl <= 600, "%s has TTL %d, expected the 600 s dedupe window: without it a path purged once is a duplicate forever", stateSeen, ttl)
+	ttl := ctx.Redis.TTL(hStateSeen)
+	ctx.Assert(0 < ttl && ttl <= 600, "%s has TTL %d, expected the 600 s dedupe window: without it a path purged once is a duplicate forever", hStateSeen, ttl)
 	ctx.Clock.Advance(601)
-	later := mustReserve(ctx, []string{"/pricing"})
+	later := hMustReserve(ctx, []string{"/pricing"})
 	ctx.Assert(fmt.Sprint(later.NewPaths) == "[/pricing]", "/pricing eleven minutes later answered %+v: the dedupe window is over and the path must be purged again", later)
 }
 
 func CheckBudgetWindow(ctx *harness.Ctx) {
-	full := mustReserve(ctx, numberedPaths(1000))
+	ctx.Clock.Advance(float64((200 - (ctx.Clock.Now()/1000)%300 + 300) % 300)) // 100 s before a window ends: retry_after is not the whole window
+	firstSeen := "purge:seen:" + hStateDomain + ":/p/0"
+	budgetTTLs := ctx.Redis.After(firstSeen, func() any {
+		ttls := map[string]int64{}
+		for _, key := range ctx.Redis.Keys("purge:budget:" + hStateDomain + "*") {
+			ttls[key] = ctx.Redis.TTL(key)
+		}
+		return ttls
+	})
+	full := hMustReserve(ctx, hNumberedPaths(1000))
+	ctx.Assert(budgetTTLs.Fired, "nothing touched %s", firstSeen)
+	for key, ttl := range budgetTTLs.Result.(map[string]int64) {
+		ctx.Assert(ttl != -1, "right after the reservation's script the budget key %s had no TTL: the charge and its EXPIRE belong in one script, or a crash between them leaves a counter that only grows", key)
+	}
 	ctx.Assert(full.Allowed && full.Remaining == 0, "1000 new paths in an empty window answered allowed=%v remaining=%d", full.Allowed, full.Remaining)
-	refused := mustReserve(ctx, []string{"/one-more"})
+	refused := hMustReserve(ctx, []string{"/one-more"})
 	expected := 300 - (ctx.Clock.Now()/1000)%300
 	ctx.Assert(!refused.Allowed, "a path past the budget of 1000 answered %+v", refused)
 	diff := refused.RetryAfter - int64(expected)
 	ctx.Assert(diff >= -1 && diff <= 1, "retry_after is %d, but the window ends in %d s: a client told to wait the wrong time retries into another refusal", refused.RetryAfter, expected)
-	keys := ctx.Redis.Keys("purge:budget:" + stateDomain + "*")
+	keys := ctx.Redis.Keys("purge:budget:" + hStateDomain + "*")
 	ctx.Assert(len(keys) > 0, "no budget key was written")
 	for _, key := range keys {
 		ctx.Assert(ctx.Redis.TTL(key) > 0, "the budget key %s has TTL %d: a counter without expiry only grows", key, ctx.Redis.TTL(key))
 	}
 	ctx.Clock.Advance(float64(expected))
-	after := mustReserve(ctx, []string{"/one-more"})
+	after := hMustReserve(ctx, []string{"/one-more"})
 	ctx.Assert(after.Allowed && fmt.Sprint(after.NewPaths) == "[/one-more]", "after the window reset the domain was refused again: %+v. The budget key must belong to its window", after)
 }
 
 func CheckRefusalClean(ctx *harness.Ctx) {
-	mustReserve(ctx, numberedPaths(999))
-	refused := mustReserve(ctx, []string{"/pricing", "/about"})
+	hMustReserve(ctx, hNumberedPaths(999))
+	refused := hMustReserve(ctx, []string{"/pricing", "/about"})
 	ctx.Assert(!refused.Allowed, "two new paths with one left in the budget answered %+v", refused)
 	ctx.Equal(refused.Remaining, int64(1), "a refused reservation must not spend the budget; the remaining it reports")
-	ctx.Equal(ctx.Redis.Exists(stateSeen), 0, "the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged; the seen key")
-	one := mustReserve(ctx, []string{"/pricing"})
+	ctx.Equal(ctx.Redis.Exists(hStateSeen), 0, "the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged; the seen key")
+	one := hMustReserve(ctx, []string{"/pricing"})
 	ctx.Assert(one.Allowed && fmt.Sprint(one.NewPaths) == "[/pricing]", "the one path the budget still holds answered %+v", one)
 }
 `,
@@ -897,79 +926,95 @@ func CheckRefusalClean(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kStateDomain = "shop.example.com";
-const std::string kSeen = "purge:seen:shop.example.com:/pricing";
+const std::string kHStateDomain = "shop.example.com";
+const std::string kHSeen = "purge:seen:shop.example.com:/pricing";
 
-std::vector<std::string> numberedPaths(int n) {
+std::vector<std::string> hNumberedPaths(int n) {
   std::vector<std::string> out;
   for (int i = 0; i < n; i++) out.push_back("/p/" + std::to_string(i));
   return out;
 }
 
-long long budgetUsed(harness::Ctx& ctx) {
+long long hBudgetUsed(harness::Ctx& ctx) {
   long long used = 0;
-  for (const auto& key : ctx.Redis.Keys("purge:budget:" + kStateDomain + "*")) {
+  for (const auto& key : ctx.Redis.Keys("purge:budget:" + kHStateDomain + "*")) {
     const auto raw = ctx.Redis.Get(key);
     if (raw) used += std::stoll(*raw);
   }
   return used;
 }
 
-bool only(const std::vector<std::string>& paths, const std::vector<std::string>& want) { return paths == want; }
+bool hOnly(const std::vector<std::string>& paths, const std::vector<std::string>& want) { return paths == want; }
 
 }  // namespace
 
 void CheckAtomicReserve(harness::Ctx& ctx) {
   // A second replica reserves the same path right after this reservation's first command on it.
   auto theirs = std::make_shared<std::optional<Reservation>>();
-  ctx.Redis.After(kSeen, [theirs] { *theirs = reserve(kStateDomain, {"/pricing"}); });
-  const Reservation mine = reserve(kStateDomain, {"/pricing"});
-  ctx.Assert(theirs->has_value(), "nothing touched %s", kSeen);
+  ctx.Redis.After(kHSeen, [theirs] { *theirs = reserve(kHStateDomain, {"/pricing"}); });
+  const Reservation mine = reserve(kHStateDomain, {"/pricing"});
+  ctx.Assert(theirs->has_value(), "nothing touched %s", kHSeen);
   int won = 0;
   for (const Reservation& res : std::vector<Reservation>{mine, theirs->value()}) {
-    if (only(res.new_paths, {"/pricing"})) won++;
+    if (hOnly(res.new_paths, {"/pricing"})) won++;
   }
   ctx.Assert(won == 1, "two concurrent reservations of /pricing: %d of them won the path, so it is purged %d times. The check and the mark must run in one script", won, won);
-  ctx.Equal(budgetUsed(ctx), 1, "one path reserved once must charge the budget once; the budget used");
+  ctx.Equal(hBudgetUsed(ctx), 1, "one path reserved once must charge the budget once; the budget used");
 }
 
 void CheckDedupeWindow(harness::Ctx& ctx) {
-  const Reservation first = reserve(kStateDomain, {"/pricing", "/img/logo.png"});
-  ctx.Assert(first.allowed && only(first.new_paths, {"/pricing", "/img/logo.png"}), "a first reservation must find both paths new");
-  const Reservation again = reserve(kStateDomain, {"/pricing", "/about"});
-  ctx.Assert(only(again.new_paths, {"/about"}) && only(again.duplicates, {"/pricing"}), "/pricing again within ten minutes is a duplicate and /about is new; new paths %q, duplicates %q", again.new_paths, again.duplicates);
-  const long long ttl = ctx.Redis.TTL(kSeen);
-  ctx.Assert(0 < ttl && ttl <= 600, "%s has TTL %d, expected the 600 s dedupe window: without it a path purged once is a duplicate forever", kSeen, ttl);
+  auto seenTtl = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After(kHSeen, [&ctx, seenTtl] { *seenTtl = ctx.Redis.TTL(kHSeen); });
+  const Reservation first = reserve(kHStateDomain, {"/pricing", "/img/logo.png"});
+  ctx.Assert(first.allowed && hOnly(first.new_paths, {"/pricing", "/img/logo.png"}), "a first reservation must find both paths new");
+  ctx.Assert(seenTtl->has_value(), "nothing touched %s", kHSeen);
+  ctx.Assert(seenTtl->value() != -1, "%s had no TTL right after the command that marked it: the mark and its 600 s expiry belong to one command", kHSeen);
+  const Reservation again = reserve(kHStateDomain, {"/pricing", "/about"});
+  ctx.Assert(hOnly(again.new_paths, {"/about"}) && hOnly(again.duplicates, {"/pricing"}), "/pricing again within ten minutes is a duplicate and /about is new; new paths %q, duplicates %q", again.new_paths, again.duplicates);
+  const long long ttl = ctx.Redis.TTL(kHSeen);
+  ctx.Assert(0 < ttl && ttl <= 600, "%s has TTL %d, expected the 600 s dedupe window: without it a path purged once is a duplicate forever", kHSeen, ttl);
   ctx.Clock.Advance(601);
-  const Reservation later = reserve(kStateDomain, {"/pricing"});
-  ctx.Assert(only(later.new_paths, {"/pricing"}), "/pricing eleven minutes later answered new paths %q: the dedupe window is over and the path must be purged again", later.new_paths);
+  const Reservation later = reserve(kHStateDomain, {"/pricing"});
+  ctx.Assert(hOnly(later.new_paths, {"/pricing"}), "/pricing eleven minutes later answered new paths %q: the dedupe window is over and the path must be purged again", later.new_paths);
 }
 
 void CheckBudgetWindow(harness::Ctx& ctx) {
-  const Reservation full = reserve(kStateDomain, numberedPaths(1000));
+  ctx.Clock.Advance(static_cast<double>((200 - (ctx.Clock.Now() / 1000) % 300 + 300) % 300));  // 100 s before a window ends: retry_after is not the whole window
+  const std::string firstSeen = "purge:seen:" + kHStateDomain + ":/p/0";
+  auto budgetTtls = std::make_shared<std::optional<std::vector<std::pair<std::string, long long>>>>();
+  ctx.Redis.After(firstSeen, [&ctx, budgetTtls] {
+    std::vector<std::pair<std::string, long long>> ttls;
+    for (const auto& key : ctx.Redis.Keys("purge:budget:" + kHStateDomain + "*")) ttls.emplace_back(key, ctx.Redis.TTL(key));
+    *budgetTtls = ttls;
+  });
+  const Reservation full = reserve(kHStateDomain, hNumberedPaths(1000));
+  ctx.Assert(budgetTtls->has_value(), "nothing touched %s", firstSeen);
+  for (const auto& [key, ttl] : budgetTtls->value()) {
+    ctx.Assert(ttl != -1, "right after the reservation's script the budget key %s had no TTL: the charge and its EXPIRE belong in one script, or a crash between them leaves a counter that only grows", key);
+  }
   ctx.Assert(full.allowed && full.remaining == 0, "1000 new paths in an empty window answered allowed=%t remaining=%d", full.allowed, full.remaining);
-  const Reservation refused = reserve(kStateDomain, {"/one-more"});
+  const Reservation refused = reserve(kHStateDomain, {"/one-more"});
   const long long expected = 300 - (ctx.Clock.Now() / 1000) % 300;
   ctx.Assert(!refused.allowed, "a path past the budget of 1000 was allowed");
   ctx.Assert(std::llabs(refused.retry_after - expected) <= 1, "retry_after is %d, but the window ends in %d s: a client told to wait the wrong time retries into another refusal", refused.retry_after, expected);
-  const auto keys = ctx.Redis.Keys("purge:budget:" + kStateDomain + "*");
+  const auto keys = ctx.Redis.Keys("purge:budget:" + kHStateDomain + "*");
   ctx.Assert(!keys.empty(), "no budget key was written");
   for (const auto& key : keys) {
     ctx.Assert(ctx.Redis.TTL(key) > 0, "the budget key %s has TTL %d: a counter without expiry only grows", key, ctx.Redis.TTL(key));
   }
   ctx.Clock.Advance(static_cast<double>(expected));
-  const Reservation after = reserve(kStateDomain, {"/one-more"});
-  ctx.Assert(after.allowed && only(after.new_paths, {"/one-more"}), "after the window reset the domain was refused again (allowed=%t). The budget key must belong to its window", after.allowed);
+  const Reservation after = reserve(kHStateDomain, {"/one-more"});
+  ctx.Assert(after.allowed && hOnly(after.new_paths, {"/one-more"}), "after the window reset the domain was refused again (allowed=%t). The budget key must belong to its window", after.allowed);
 }
 
 void CheckRefusalClean(harness::Ctx& ctx) {
-  reserve(kStateDomain, numberedPaths(999));
-  const Reservation refused = reserve(kStateDomain, {"/pricing", "/about"});
+  reserve(kHStateDomain, hNumberedPaths(999));
+  const Reservation refused = reserve(kHStateDomain, {"/pricing", "/about"});
   ctx.Assert(!refused.allowed, "two new paths with one left in the budget were allowed");
   ctx.Equal(refused.remaining, 1, "a refused reservation must not spend the budget; the remaining it reports");
-  ctx.Equal(ctx.Redis.Exists(kSeen), 0, "the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged; the seen key");
-  const Reservation one = reserve(kStateDomain, {"/pricing"});
-  ctx.Assert(one.allowed && only(one.new_paths, {"/pricing"}), "the one path the budget still holds must be reserved (allowed=%t)", one.allowed);
+  ctx.Equal(ctx.Redis.Exists(kHSeen), 0, "the refused reservation marked /pricing as purged: its retry reports it as a duplicate and the path is never purged; the seen key");
+  const Reservation one = reserve(kHStateDomain, {"/pricing"});
+  ctx.Assert(one.allowed && hOnly(one.new_paths, {"/pricing"}), "the one path the budget still holds must be reserved (allowed=%t)", one.allowed);
 }
 `,
   },

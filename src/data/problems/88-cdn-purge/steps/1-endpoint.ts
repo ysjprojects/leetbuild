@@ -87,7 +87,7 @@ purge twice.
       id: 'blast-radius',
       title: 'Gates wildcards behind purge:wildcard and /* behind purge:domain',
       detail:
-        'A pattern with `*` needs `purge:wildcard` in `X-Purge-Scope`, the whole-domain `/*` needs `purge:domain`, and a request without the scope is **403** before anything is queued. The starter queues `/*` from any token.',
+        'A path with `*` anywhere in it needs `purge:wildcard` in `X-Purge-Scope`, a request that includes the whole-domain `/*` needs `purge:domain`, a scope counts only as a whole comma-separated entry, and a request without the scope is **403** before anything is queued. The starter queues `/*` from any token.',
       match: {
         python: {
           all: [
@@ -732,8 +732,14 @@ async def check_blast_radius(ctx):
     async with _api(ctx) as c:
         plain = await _purge(c, ["/img/*"], key="k-1")
         weak = await _purge(c, ["/*"], key="k-2", scope="purge:wildcard")
+        mid = await _purge(c, ["/img/*.png"], key="k-5")
+        mixed = await _purge(c, ["/pricing", "/*"], key="k-6", scope="purge:wildcard")
+        lookalike = await _purge(c, ["/*"], key="k-7", scope="purge:domain:read")
         assert plain.status_code == 403, f"/img/* without X-Purge-Scope answered {plain.status_code}, expected 403: a normal token fans a wildcard out to every edge"
         assert weak.status_code == 403, f"/* with only purge:wildcard answered {weak.status_code}, expected 403: the whole domain needs purge:domain"
+        assert mid.status_code == 403, f"/img/*.png without X-Purge-Scope answered {mid.status_code}, expected 403: a * anywhere in the path is a wildcard"
+        assert mixed.status_code == 403, f"/pricing and /* with only purge:wildcard answered {mixed.status_code}, expected 403: a request that includes /* needs purge:domain"
+        assert lookalike.status_code == 403, f"/* with the scope purge:domain:read answered {lookalike.status_code}, expected 403: a scope counts only as a whole comma-separated entry"
         assert records.queued() == [], f"a wildcard without its scope was queued: {records.queued()}"
         scoped = await _purge(c, ["/img/*"], key="k-3", scope="purge:read, purge:wildcard")
         domain = await _purge(c, ["/*"], key="k-4", scope="purge:domain")
@@ -809,8 +815,14 @@ export async function check_blast_radius(ctx) {
   const {c, records} = await api(ctx);
   const plain = await purge(c, ['/img/*'], 'k-1');
   const weak = await purge(c, ['/*'], 'k-2', {scope: 'purge:wildcard'});
+  const mid = await purge(c, ['/img/*.png'], 'k-5');
+  const mixed = await purge(c, ['/pricing', '/*'], 'k-6', {scope: 'purge:wildcard'});
+  const lookalike = await purge(c, ['/*'], 'k-7', {scope: 'purge:domain:read'});
   assert.equal(plain.status, 403, \`/img/* without X-Purge-Scope answered \${plain.status}, expected 403: a normal token fans a wildcard out to every edge\`);
   assert.equal(weak.status, 403, \`/* with only purge:wildcard answered \${weak.status}, expected 403: the whole domain needs purge:domain\`);
+  assert.equal(mid.status, 403, \`/img/*.png without X-Purge-Scope answered \${mid.status}, expected 403: a * anywhere in the path is a wildcard\`);
+  assert.equal(mixed.status, 403, \`/pricing and /* with only purge:wildcard answered \${mixed.status}, expected 403: a request that includes /* needs purge:domain\`);
+  assert.equal(lookalike.status, 403, \`/* with the scope purge:domain:read answered \${lookalike.status}, expected 403: a scope counts only as a whole comma-separated entry\`);
   assert.deepEqual(await records.queued(), [], 'a wildcard without its scope was queued');
   const scoped = await purge(c, ['/img/*'], 'k-3', {scope: 'purge:read, purge:wildcard'});
   const domain = await purge(c, ['/*'], 'k-4', {scope: 'purge:domain'});
@@ -843,19 +855,19 @@ import (
 	"leetbuild/harness"
 )
 
-const apiDomain = "shop.example.com"
+const hAPIDomain = "shop.example.com"
 
-var apiBg = context.Background()
+var hBg = context.Background()
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	records.AddDomain(apiBg, "t1", apiDomain)
-	records.AddDomain(apiBg, "t2", "rival.example.com")
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
+	records.AddDomain(hBg, "t1", hAPIDomain)
+	records.AddDomain(hBg, "t2", "rival.example.com")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func purgeReq(c *harness.HTTP, paths []string, key, tenant, domain, scope string) *harness.Response {
+func hPurgeReq(c *harness.HTTP, paths []string, key, tenant, domain, scope string) *harness.Response {
 	headers := []string{"X-Tenant-Id", tenant, "Idempotency-Key", key}
 	if scope != "" {
 		headers = append(headers, "X-Purge-Scope", scope)
@@ -863,7 +875,7 @@ func purgeReq(c *harness.HTTP, paths []string, key, tenant, domain, scope string
 	return c.Post("/v1/purges", map[string]any{"domain": domain, "paths": paths, "reason": "deploy 412"}, headers...)
 }
 
-func numbered(n int) []string {
+func hNumbered(n int) []string {
 	out := make([]string, n)
 	for i := range out {
 		out[i] = fmt.Sprintf("/p/%d", i)
@@ -871,14 +883,14 @@ func numbered(n int) []string {
 	return out
 }
 
-type acceptedBody struct {
+type hAcceptedBody struct {
 	PurgeID string \`json:"purge_id"\`
 	Status  string \`json:"status"\`
 	Domain  string \`json:"domain"\`
 }
 
-func decodeAccepted(r *harness.Response) acceptedBody {
-	var body acceptedBody
+func hDecodeAccepted(r *harness.Response) hAcceptedBody {
+	var body hAcceptedBody
 	if r.Status == 202 {
 		r.Decode(&body)
 	}
@@ -886,65 +898,71 @@ func decodeAccepted(r *harness.Response) acceptedBody {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := purgeReq(c, []string{"/pricing", "/img/logo.png"}, "k-1", "t1", apiDomain, "")
+	c := hAPI(ctx)
+	r := hPurgeReq(c, []string{"/pricing", "/img/logo.png"}, "k-1", "t1", hAPIDomain, "")
 	ctx.Equal(r.Status, 202, "POST /v1/purges (%s)", r.Text())
-	body := decodeAccepted(r)
-	ctx.Assert(body.Status == "accepted" && body.Domain == apiDomain, "the 202 must say accepted for %s, got %s", apiDomain, r.Text())
-	stored := records.Get(apiBg, body.PurgeID)
+	body := hDecodeAccepted(r)
+	ctx.Assert(body.Status == "accepted" && body.Domain == hAPIDomain, "the 202 must say accepted for %s, got %s", hAPIDomain, r.Text())
+	stored := records.Get(hBg, body.PurgeID)
 	ctx.Assert(stored != nil, "the 202 names purge %q but no record exists", body.PurgeID)
 	ctx.Equal(stored.Paths, []string{"/pricing", "/img/logo.png"}, "the record's paths")
-	ctx.Equal(records.Queued(apiBg), []string{stored.PurgeID}, "the purge must be queued for the provider client once; the queue")
+	ctx.Equal(records.Queued(hBg), []string{stored.PurgeID}, "the purge must be queued for the provider client once; the queue")
 }
 
 func CheckDomainOwnership(ctx *harness.Ctx) {
-	c := api(ctx)
-	anonymous := c.Post("/v1/purges", map[string]any{"domain": apiDomain, "paths": []string{"/pricing"}}, "Idempotency-Key", "k-0")
-	foreign := purgeReq(c, []string{"/pricing"}, "k-1", "t1", "rival.example.com", "")
+	c := hAPI(ctx)
+	anonymous := c.Post("/v1/purges", map[string]any{"domain": hAPIDomain, "paths": []string{"/pricing"}}, "Idempotency-Key", "k-0")
+	foreign := hPurgeReq(c, []string{"/pricing"}, "k-1", "t1", "rival.example.com", "")
 	ctx.Equal(anonymous.Status, 401, "a purge without X-Tenant-Id")
 	ctx.Equal(foreign.Status, 403, "tenant t1 purging rival.example.com (owned by t2): any tenant can purge any customer's domain")
-	ctx.Equal(len(records.Queued(apiBg)), 0, "a purge of another tenant's domain must not be queued; the queued purges")
+	ctx.Equal(len(records.Queued(hBg)), 0, "a purge of another tenant's domain must not be queued; the queued purges")
 }
 
 func CheckPathCap(ctx *harness.Ctx) {
-	c := api(ctx)
-	flood := purgeReq(c, numbered(501), "k-1", "t1", apiDomain, "")
-	empty := purgeReq(c, []string{}, "k-2", "t1", apiDomain, "")
-	bare := purgeReq(c, []string{"pricing"}, "k-3", "t1", apiDomain, "")
+	c := hAPI(ctx)
+	flood := hPurgeReq(c, hNumbered(501), "k-1", "t1", hAPIDomain, "")
+	empty := hPurgeReq(c, []string{}, "k-2", "t1", hAPIDomain, "")
+	bare := hPurgeReq(c, []string{"pricing"}, "k-3", "t1", hAPIDomain, "")
 	ctx.Equal([]int{flood.Status, empty.Status, bare.Status}, []int{400, 400, 400}, "501 paths, no paths and a path without a leading / must each be 400; the statuses")
-	ctx.Equal(len(records.Queued(apiBg)), 0, "a rejected purge must not be queued; the queued purges")
-	repeated := purgeReq(c, []string{"/a", "/b", "/a"}, "k-4", "t1", apiDomain, "")
-	full := purgeReq(c, numbered(500), "k-5", "t1", apiDomain, "")
+	ctx.Equal(len(records.Queued(hBg)), 0, "a rejected purge must not be queued; the queued purges")
+	repeated := hPurgeReq(c, []string{"/a", "/b", "/a"}, "k-4", "t1", hAPIDomain, "")
+	full := hPurgeReq(c, hNumbered(500), "k-5", "t1", hAPIDomain, "")
 	ctx.Equal(repeated.Status, 202, "a purge of /a, /b, /a (%s)", repeated.Text())
-	stored := records.Get(apiBg, decodeAccepted(repeated).PurgeID)
+	stored := records.Get(hBg, hDecodeAccepted(repeated).PurgeID)
 	ctx.Assert(stored != nil, "the purge of /a, /b, /a has no record")
 	ctx.Equal(stored.Paths, []string{"/a", "/b"}, "a purge of /a, /b, /a: duplicates collapse to their first occurrence; the recorded paths")
 	ctx.Equal(full.Status, 202, "exactly 500 paths")
 }
 
 func CheckBlastRadius(ctx *harness.Ctx) {
-	c := api(ctx)
-	plain := purgeReq(c, []string{"/img/*"}, "k-1", "t1", apiDomain, "")
-	weak := purgeReq(c, []string{"/*"}, "k-2", "t1", apiDomain, "purge:wildcard")
+	c := hAPI(ctx)
+	plain := hPurgeReq(c, []string{"/img/*"}, "k-1", "t1", hAPIDomain, "")
+	weak := hPurgeReq(c, []string{"/*"}, "k-2", "t1", hAPIDomain, "purge:wildcard")
+	mid := hPurgeReq(c, []string{"/img/*.png"}, "k-5", "t1", hAPIDomain, "")
+	mixed := hPurgeReq(c, []string{"/pricing", "/*"}, "k-6", "t1", hAPIDomain, "purge:wildcard")
+	lookalike := hPurgeReq(c, []string{"/*"}, "k-7", "t1", hAPIDomain, "purge:domain:read")
 	ctx.Equal(plain.Status, 403, "/img/* without X-Purge-Scope: a normal token fans a wildcard out to every edge")
 	ctx.Equal(weak.Status, 403, "/* with only purge:wildcard: the whole domain needs purge:domain")
-	ctx.Equal(len(records.Queued(apiBg)), 0, "a wildcard without its scope must not be queued; the queued purges")
-	scoped := purgeReq(c, []string{"/img/*"}, "k-3", "t1", apiDomain, "purge:read, purge:wildcard")
-	domain := purgeReq(c, []string{"/*"}, "k-4", "t1", apiDomain, "purge:domain")
+	ctx.Equal(mid.Status, 403, "/img/*.png without X-Purge-Scope: a * anywhere in the path is a wildcard")
+	ctx.Equal(mixed.Status, 403, "/pricing and /* with only purge:wildcard: a request that includes /* needs purge:domain")
+	ctx.Equal(lookalike.Status, 403, "/* with the scope purge:domain:read: a scope counts only as a whole comma-separated entry")
+	ctx.Equal(len(records.Queued(hBg)), 0, "a wildcard without its scope must not be queued; the queued purges")
+	scoped := hPurgeReq(c, []string{"/img/*"}, "k-3", "t1", hAPIDomain, "purge:read, purge:wildcard")
+	domain := hPurgeReq(c, []string{"/*"}, "k-4", "t1", hAPIDomain, "purge:domain")
 	ctx.Equal(scoped.Status, 202, "/img/* with purge:wildcard (%s)", scoped.Text())
 	ctx.Equal(domain.Status, 202, "/* with purge:domain (%s)", domain.Text())
 }
 
 func CheckIdempotentReplay(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := purgeReq(c, []string{"/pricing"}, "k-1", "t1", apiDomain, "")
-	replay := purgeReq(c, []string{"/pricing"}, "k-1", "t1", apiDomain, "")
+	c := hAPI(ctx)
+	first := hPurgeReq(c, []string{"/pricing"}, "k-1", "t1", hAPIDomain, "")
+	replay := hPurgeReq(c, []string{"/pricing"}, "k-1", "t1", hAPIDomain, "")
 	ctx.Assert(first.Status == 202 && replay.Status == 202, "the purge and its replay answered %d, %d", first.Status, replay.Status)
-	ctx.Equal(decodeAccepted(replay).PurgeID, decodeAccepted(first).PurgeID, "the replay of Idempotency-Key k-1 must answer the original purge, not create one; the purge id")
-	ctx.Equal(len(records.Queued(apiBg)), 1, "one purge and its replay must queue one purge for the provider; the queued purges")
-	other := purgeReq(c, []string{"/pricing"}, "k-1", "t2", "rival.example.com", "")
-	ctx.Assert(other.Status == 202 && decodeAccepted(other).PurgeID != decodeAccepted(first).PurgeID, "tenant t2's key k-1 answered t1's purge: keys belong to a tenant (%s)", other.Text())
-	missing := c.Post("/v1/purges", map[string]any{"domain": apiDomain, "paths": []string{"/pricing"}}, "X-Tenant-Id", "t1")
+	ctx.Equal(hDecodeAccepted(replay).PurgeID, hDecodeAccepted(first).PurgeID, "the replay of Idempotency-Key k-1 must answer the original purge, not create one; the purge id")
+	ctx.Equal(len(records.Queued(hBg)), 1, "one purge and its replay must queue one purge for the provider; the queued purges")
+	other := hPurgeReq(c, []string{"/pricing"}, "k-1", "t2", "rival.example.com", "")
+	ctx.Assert(other.Status == 202 && hDecodeAccepted(other).PurgeID != hDecodeAccepted(first).PurgeID, "tenant t2's key k-1 answered t1's purge: keys belong to a tenant (%s)", other.Text())
+	missing := c.Post("/v1/purges", map[string]any{"domain": hAPIDomain, "paths": []string{"/pricing"}}, "X-Tenant-Id", "t1")
 	ctx.Equal(missing.Status, 400, "a purge without Idempotency-Key")
 }
 `,
@@ -959,10 +977,10 @@ func CheckIdempotentReplay(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kApiDomain = "shop.example.com";
+const std::string kHApiDomain = "shop.example.com";
 
-harness::HTTP api(harness::Ctx& ctx) {
-  records::addDomain("t1", kApiDomain);
+harness::HTTP hApi(harness::Ctx& ctx) {
+  records::addDomain("t1", kHApiDomain);
   records::addDomain("t2", "rival.example.com");
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -971,20 +989,20 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response purgeReq(harness::HTTP& c, const std::vector<std::string>& paths, const std::string& key, const std::string& tenant = "t1",
-                           const std::string& domain = kApiDomain, const std::string& scope = "") {
+harness::Response hPurgeReq(harness::HTTP& c, const std::vector<std::string>& paths, const std::string& key, const std::string& tenant = "t1",
+                           const std::string& domain = kHApiDomain, const std::string& scope = "") {
   const std::string body = nlohmann::json{{"domain", domain}, {"paths", paths}, {"reason", "deploy 412"}}.dump();
   if (scope.empty()) return c.Post("/v1/purges", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
   return c.Post("/v1/purges", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key, "X-Purge-Scope", scope);
 }
 
-std::vector<std::string> numbered(int n) {
+std::vector<std::string> hNumbered(int n) {
   std::vector<std::string> out;
   for (int i = 0; i < n; i++) out.push_back("/p/" + std::to_string(i));
   return out;
 }
 
-std::string field(const harness::Response& r, const std::string& name) {
+std::string hField(const harness::Response& r, const std::string& name) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains(name) && body[name].is_string() ? body[name].get<std::string>() : "";
 }
@@ -992,64 +1010,70 @@ std::string field(const harness::Response& r, const std::string& name) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = purgeReq(c, {"/pricing", "/img/logo.png"}, "k-1");
+  auto c = hApi(ctx);
+  const auto r = hPurgeReq(c, {"/pricing", "/img/logo.png"}, "k-1");
   ctx.Equal(r.Status, 202, "POST /v1/purges (%s)", r.Text());
-  ctx.Assert(field(r, "status") == "accepted" && field(r, "domain") == kApiDomain, "the 202 must say accepted for %s, got %s", kApiDomain, r.Text());
-  const auto stored = records::get(field(r, "purge_id"));
-  ctx.Assert(stored.has_value(), "the 202 names purge %q but no record exists", field(r, "purge_id"));
+  ctx.Assert(hField(r, "status") == "accepted" && hField(r, "domain") == kHApiDomain, "the 202 must say accepted for %s, got %s", kHApiDomain, r.Text());
+  const auto stored = records::get(hField(r, "purge_id"));
+  ctx.Assert(stored.has_value(), "the 202 names purge %q but no record exists", hField(r, "purge_id"));
   ctx.Equal(stored->paths, std::vector<std::string>{"/pricing", "/img/logo.png"}, "the record's paths");
   ctx.Equal(records::queued(), std::vector<std::string>{stored->purge_id}, "the purge must be queued for the provider client once; the queue");
 }
 
 void CheckDomainOwnership(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto anonymous = c.Post("/v1/purges", R"({"domain": "shop.example.com", "paths": ["/pricing"]})", "Content-Type", "application/json", "Idempotency-Key", "k-0");
-  const auto foreign = purgeReq(c, {"/pricing"}, "k-1", "t1", "rival.example.com");
+  const auto foreign = hPurgeReq(c, {"/pricing"}, "k-1", "t1", "rival.example.com");
   ctx.Equal(anonymous.Status, 401, "a purge without X-Tenant-Id");
   ctx.Equal(foreign.Status, 403, "tenant t1 purging rival.example.com (owned by t2): any tenant can purge any customer's domain");
   ctx.Equal(records::queued().size(), 0, "a purge of another tenant's domain must not be queued; the queued purges");
 }
 
 void CheckPathCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto flood = purgeReq(c, numbered(501), "k-1");
-  const auto empty = purgeReq(c, {}, "k-2");
-  const auto bare = purgeReq(c, {"pricing"}, "k-3");
+  auto c = hApi(ctx);
+  const auto flood = hPurgeReq(c, hNumbered(501), "k-1");
+  const auto empty = hPurgeReq(c, {}, "k-2");
+  const auto bare = hPurgeReq(c, {"pricing"}, "k-3");
   ctx.Equal(std::vector<int>{flood.Status, empty.Status, bare.Status}, std::vector<int>{400, 400, 400},
             "501 paths, no paths and a path without a leading / must each be 400; the statuses");
   ctx.Equal(records::queued().size(), 0, "a rejected purge must not be queued; the queued purges");
-  const auto repeated = purgeReq(c, {"/a", "/b", "/a"}, "k-4");
-  const auto full = purgeReq(c, numbered(500), "k-5");
+  const auto repeated = hPurgeReq(c, {"/a", "/b", "/a"}, "k-4");
+  const auto full = hPurgeReq(c, hNumbered(500), "k-5");
   ctx.Equal(repeated.Status, 202, "a purge of /a, /b, /a (%s)", repeated.Text());
-  const auto stored = records::get(field(repeated, "purge_id"));
+  const auto stored = records::get(hField(repeated, "purge_id"));
   ctx.Assert(stored.has_value(), "the purge of /a, /b, /a has no record");
   ctx.Equal(stored->paths, std::vector<std::string>{"/a", "/b"}, "a purge of /a, /b, /a: duplicates collapse to their first occurrence; the recorded paths");
   ctx.Equal(full.Status, 202, "exactly 500 paths");
 }
 
 void CheckBlastRadius(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto plain = purgeReq(c, {"/img/*"}, "k-1");
-  const auto weak = purgeReq(c, {"/*"}, "k-2", "t1", kApiDomain, "purge:wildcard");
+  auto c = hApi(ctx);
+  const auto plain = hPurgeReq(c, {"/img/*"}, "k-1");
+  const auto weak = hPurgeReq(c, {"/*"}, "k-2", "t1", kHApiDomain, "purge:wildcard");
+  const auto mid = hPurgeReq(c, {"/img/*.png"}, "k-5");
+  const auto mixed = hPurgeReq(c, {"/pricing", "/*"}, "k-6", "t1", kHApiDomain, "purge:wildcard");
+  const auto lookalike = hPurgeReq(c, {"/*"}, "k-7", "t1", kHApiDomain, "purge:domain:read");
   ctx.Equal(plain.Status, 403, "/img/* without X-Purge-Scope: a normal token fans a wildcard out to every edge");
   ctx.Equal(weak.Status, 403, "/* with only purge:wildcard: the whole domain needs purge:domain");
+  ctx.Equal(mid.Status, 403, "/img/*.png without X-Purge-Scope: a * anywhere in the path is a wildcard");
+  ctx.Equal(mixed.Status, 403, "/pricing and /* with only purge:wildcard: a request that includes /* needs purge:domain");
+  ctx.Equal(lookalike.Status, 403, "/* with the scope purge:domain:read: a scope counts only as a whole comma-separated entry");
   ctx.Equal(records::queued().size(), 0, "a wildcard without its scope must not be queued; the queued purges");
-  const auto scoped = purgeReq(c, {"/img/*"}, "k-3", "t1", kApiDomain, "purge:read, purge:wildcard");
-  const auto domain = purgeReq(c, {"/*"}, "k-4", "t1", kApiDomain, "purge:domain");
+  const auto scoped = hPurgeReq(c, {"/img/*"}, "k-3", "t1", kHApiDomain, "purge:read, purge:wildcard");
+  const auto domain = hPurgeReq(c, {"/*"}, "k-4", "t1", kHApiDomain, "purge:domain");
   ctx.Equal(scoped.Status, 202, "/img/* with purge:wildcard (%s)", scoped.Text());
   ctx.Equal(domain.Status, 202, "/* with purge:domain (%s)", domain.Text());
 }
 
 void CheckIdempotentReplay(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = purgeReq(c, {"/pricing"}, "k-1");
-  const auto replay = purgeReq(c, {"/pricing"}, "k-1");
+  auto c = hApi(ctx);
+  const auto first = hPurgeReq(c, {"/pricing"}, "k-1");
+  const auto replay = hPurgeReq(c, {"/pricing"}, "k-1");
   ctx.Assert(first.Status == 202 && replay.Status == 202, "the purge and its replay answered %d, %d", first.Status, replay.Status);
-  ctx.Equal(field(replay, "purge_id"), field(first, "purge_id"), "the replay of Idempotency-Key k-1 must answer the original purge, not create one; the purge id");
+  ctx.Equal(hField(replay, "purge_id"), hField(first, "purge_id"), "the replay of Idempotency-Key k-1 must answer the original purge, not create one; the purge id");
   ctx.Equal(records::queued().size(), 1, "one purge and its replay must queue one purge for the provider; the queued purges");
-  const auto other = purgeReq(c, {"/pricing"}, "k-1", "t2", "rival.example.com");
-  ctx.Assert(other.Status == 202 && field(other, "purge_id") != field(first, "purge_id"), "tenant t2's key k-1 answered t1's purge: keys belong to a tenant (%s)", other.Text());
+  const auto other = hPurgeReq(c, {"/pricing"}, "k-1", "t2", "rival.example.com");
+  ctx.Assert(other.Status == 202 && hField(other, "purge_id") != hField(first, "purge_id"), "tenant t2's key k-1 answered t1's purge: keys belong to a tenant (%s)", other.Text());
   const auto missing = c.Post("/v1/purges", R"({"domain": "shop.example.com", "paths": ["/pricing"]})", "Content-Type", "application/json", "X-Tenant-Id", "t1");
   ctx.Equal(missing.Status, 400, "a purge without Idempotency-Key");
 }

@@ -70,7 +70,7 @@ a broker that lost an acknowledgement gets the event twice; and a delivery that 
       id: 'real-expiry',
       title: 'Expired is published once the record is gone, once',
       detail:
-        'The sweep claims a member in one script (`EXISTS` on the record, then `SREM` from the members set) and publishes only when the claim returns 1. The starter reads the TTL and announces an instance that still has seconds left.',
+        'The sweep claims a member in one script (`EXISTS` on the record, then `SREM` from the members set) and publishes an `expired` event for that service only when the claim returns 1, so an instance that re-registers right as the sweep finds its record gone stays a member. The starter reads the TTL and announces an instance that still has seconds left.',
       match: {
         python: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/r\.ttl\(/]},
         typescript: {all: [/['"]EXISTS['"]/, /['"]SREM['"]/], none: [/redis\.ttl\(/]},
@@ -96,7 +96,7 @@ a broker that lost an acknowledgement gets the event twice; and a delivery that 
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the service and the event, and the call returns false. The starter only catches the errors `produce` raises locally, so a failed delivery vanishes.',
+        'A broker that acknowledges within 2 s is a success with no outbox row. A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the service and the event, and the call returns false after waiting no longer than that. The starter only catches the errors `produce` raises locally, so a failed delivery vanishes.',
       match: {
         python: {
           all: [/outbox\.write\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -787,12 +787,23 @@ def check_real_expiry(ctx):
     ctx.clock.advance(7)
     expired = m.sweep_expired("checkout")
     assert sorted(expired) == ["checkout-1"], f"7 s in, only checkout-1's record has lapsed and the sweep announced {expired}: checkout-2 has 2 s left and is alive"
-    events = [json.loads(r.value) for r in ctx.kafka.records(TOPIC)]
-    assert [(e.get("kind"), e.get("instance_id")) for e in events] == [("expired", "checkout-1")], f"the sweep produced {events}, expected one expired event for checkout-1"
+    records = ctx.kafka.records(TOPIC)
+    events = [json.loads(r.value) for r in records]
+    assert [(e.get("kind"), e.get("service"), e.get("instance_id")) for e in events] == [("expired", "checkout", "checkout-1")], f"the sweep produced {events}, expected one expired event for checkout-1 of service checkout"
+    assert records[0].key == b"checkout", f"the expired event is keyed {records[0].key!r}, expected the service checkout"
     members = sorted(ctx.redis.smembers("sd:members:checkout"))
     assert members == ["checkout-2", "checkout-3"], f"sd:members:checkout holds {members} after the sweep, expected the live checkout-2 and checkout-3"
     again = m.sweep_expired("checkout")
     assert again == [] and len(ctx.kafka.records(TOPIC)) == 1, f"a second sweep announced {again}: an expiry is announced once"
+    # 10 s in, checkout-2's record lapsed; its agent re-registers right as the sweep finds the record gone.
+    ctx.clock.advance(3)
+    back = ctx.redis_after("sd:checkout:checkout-2", lambda: instances.register_instance("checkout", "checkout-2", "10.4.2.2", 8080, 3, 2))
+    m.sweep_expired("checkout")
+    assert back.fired, "the sweep never looked at sd:checkout:checkout-2"
+    if back.error is not None:
+        raise back.error
+    members = sorted(ctx.redis.smembers("sd:members:checkout"))
+    assert members == ["checkout-2", "checkout-3"], f"checkout-2 re-registered right after the sweep checked its record, and sd:members:checkout holds {members}: the existence check and the SREM must be one script, or the sweep drops a live instance"
 
 
 def check_acks_idempotent(ctx):
@@ -807,6 +818,9 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ctx.kafka.stall(TOPIC, seconds=1)  # the broker answers 1 s late, inside the 2 s window
+    ok = m.publish_event(_event("checkout-0"))
+    assert ok is True and _outbox(ctx) == [] and len(ctx.kafka.records(TOPIC)) == 1, f"the broker acknowledged after 1 s, inside the 2 s window: publish_event returned {ok!r}, the topic holds {len(ctx.kafka.records(TOPIC))} records and the outbox {_outbox(ctx)}, expected True, one record and no row. Wait up to ACK_TIMEOUT_S for the delivery report"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_event(_event("checkout-1"))
     rows = _outbox(ctx)
@@ -817,7 +831,7 @@ def check_outbox_on_failure(ctx):
     before = ctx.clock.time()
     ok = m.publish_event(_event("checkout-2"))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_event waited {waited:.0f} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_event waited {waited:.1f} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("instance_id") == "checkout-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_event returned {ok!r} without a delivery report, expected False"
@@ -859,12 +873,26 @@ export async function check_real_expiry(ctx) {
   await settle();
   assert.deepEqual([...expired].sort(), ['checkout-1'], \`7 s in, only checkout-1's record has lapsed and the sweep announced \${JSON.stringify(expired)}: checkout-2 has 2 s left and is alive\`);
   const events = ctx.kafka.values(TOPIC).map(v => JSON.parse(v));
-  assert.deepEqual(events.map(e => [e.kind, e.instance_id]), [['expired', 'checkout-1']], \`the sweep produced \${JSON.stringify(events)}, expected one expired event for checkout-1\`);
+  assert.deepEqual(events.map(e => [e.kind, e.service, e.instance_id]), [['expired', 'checkout', 'checkout-1']], \`the sweep produced \${JSON.stringify(events)}, expected one expired event for checkout-1 of service checkout\`);
+  assert.deepEqual(ctx.kafka.keys(TOPIC), ['checkout'], \`the expired event is keyed \${JSON.stringify(ctx.kafka.keys(TOPIC))}, expected the service checkout\`);
   const members = (ctx.redis.smembers('sd:members:checkout') as string[]).sort();
   assert.deepEqual(members, ['checkout-2', 'checkout-3'], \`sd:members:checkout holds \${JSON.stringify(members)} after the sweep, expected the live checkout-2 and checkout-3\`);
   const again = await m.sweepExpired('checkout');
   await settle();
   assert(again.length === 0 && ctx.kafka.records(TOPIC).length === 1, \`a second sweep announced \${JSON.stringify(again)}: an expiry is announced once\`);
+  // 10 s in, checkout-2's record lapsed; its agent re-registers right as the sweep finds the record gone.
+  ctx.clock.advance(3);
+  const back = ctx.redisAfter('sd:checkout:checkout-2', () => {
+    ctx.redis.hset('sd:checkout:checkout-2', {address: '10.4.2.2', port: '8080', heartbeat_interval: '3', metadata_version: '2', last_heartbeat: String(Math.floor(ctx.clock.now() / 1000))});
+    ctx.redis.expire('sd:checkout:checkout-2', 9);
+    ctx.redis.sadd('sd:members:checkout', 'checkout-2');
+  });
+  await m.sweepExpired('checkout');
+  await settle();
+  assert(back.fired, 'the sweep never looked at sd:checkout:checkout-2');
+  if (back.error !== undefined) throw back.error;
+  const after = (ctx.redis.smembers('sd:members:checkout') as string[]).sort();
+  assert.deepEqual(after, ['checkout-2', 'checkout-3'], \`checkout-2 re-registered right after the sweep checked its record, and sd:members:checkout holds \${JSON.stringify(after)}: the existence check and the SREM must be one script, or the sweep drops a live instance\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -881,8 +909,12 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  ctx.kafka.stall(TOPIC, 1); // the broker answers 1 s late, inside the 2 s window
+  let ok = await m.publishEvent(event('checkout-0'));
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0 && ctx.kafka.records(TOPIC).length === 1, \`the broker acknowledged after 1 s, inside the 2 s window: publishEvent resolved \${JSON.stringify(ok)}, the topic holds \${ctx.kafka.records(TOPIC).length} records and the outbox \${outboxRows(ctx).length} rows, expected true, one record and no row. Wait up to ACK_TIMEOUT_S for the delivery report\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishEvent(event('checkout-1'));
+  ok = await m.publishEvent(event('checkout-1'));
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the change never reaches a membership cache\`);
@@ -892,7 +924,7 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.publishEvent(event('checkout-2'));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishEvent waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.instance_id === 'checkout-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishEvent resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -904,6 +936,7 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strconv"
 
 	"discovery/instances"
 
@@ -968,13 +1001,30 @@ func CheckRealExpiry(ctx *harness.Ctx) {
 	for _, v := range ctx.Kafka.Values(eventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &e), "an event must be JSON")
-		kinds = append(kinds, e["kind"].(string)+" "+e["instance_id"].(string))
+		kind, _ := e["kind"].(string)
+		service, _ := e["service"].(string)
+		id, _ := e["instance_id"].(string)
+		kinds = append(kinds, kind+" "+service+" "+id)
 	}
-	ctx.Equal(kinds, []string{"expired checkout-1"}, "the sweep must produce one expired event for checkout-1; the events")
+	ctx.Equal(kinds, []string{"expired checkout checkout-1"}, "the sweep must produce one expired event for checkout-1 of service checkout; the events")
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"checkout"}, "the expired event must be keyed by the service")
 	ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), []string{"checkout-2", "checkout-3"}, "sd:members:checkout after the sweep must hold the live checkout-2 and checkout-3")
 	again, err := sweepExpired(eventsBg, "checkout")
 	ctx.NoError(err, "the second sweepExpired(checkout)")
 	ctx.Assert(len(again) == 0 && len(ctx.Kafka.Records(eventsTopic)) == 1, "a second sweep announced %v: an expiry is announced once", again)
+	// 10 s in, checkout-2's record lapsed; its agent re-registers right as the sweep finds the record gone.
+	ctx.Clock.Advance(3)
+	back := ctx.Redis.After("sd:checkout:checkout-2", func() any {
+		ctx.Redis.Do("HSET", "sd:checkout:checkout-2", "address", "10.4.2.2", "port", "8080", "heartbeat_interval", "3", "metadata_version", "2", "last_heartbeat", strconv.FormatInt(int64(ctx.Clock.Now())/1000, 10))
+		ctx.Redis.Do("EXPIRE", "sd:checkout:checkout-2", 9)
+		ctx.Redis.Do("SADD", "sd:members:checkout", "checkout-2")
+		return nil
+	})
+	_, err = sweepExpired(eventsBg, "checkout")
+	ctx.NoError(err, "the third sweepExpired(checkout)")
+	ctx.Assert(back.Fired, "the sweep never looked at sd:checkout:checkout-2")
+	ctx.NoError(back.Err, "re-registering checkout-2")
+	ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), []string{"checkout-2", "checkout-3"}, "checkout-2 re-registered right after the sweep checked its record: the existence check and the SREM must be one script, or the sweep drops a live instance; sd:members:checkout")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -989,8 +1039,12 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ctx.Kafka.StallFor(eventsTopic, 1) // the broker answers 1 s late, inside the 2 s window
+	ok := eventsPublish(ctx, eventFor("checkout-0", "checkout"))
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0 && len(ctx.Kafka.Records(eventsTopic)) == 1, "the broker acknowledged after 1 s, inside the 2 s window: publishEvent returned %v, the topic holds %d records and the outbox %d rows, expected true, one record and no row. Wait up to the ack timeout for the delivery report", ok, len(ctx.Kafka.Records(eventsTopic)), len(eventsOutbox(ctx)))
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventFor("checkout-1", "checkout"))
+	ok = eventsPublish(ctx, eventFor("checkout-1", "checkout"))
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the change never reaches a membership cache; the rows")
@@ -1000,7 +1054,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventFor("checkout-2", "checkout"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["instance_id"] == "checkout-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishEvent's result without a delivery report")
@@ -1021,7 +1075,7 @@ namespace {
 
 const std::string kEventsTopic = "discovery.event";
 
-MembershipEvent eventFor(const std::string& instance_id, const std::string& service = "checkout") {
+MembershipEvent eventsFor(const std::string& instance_id, const std::string& service = "checkout") {
   return MembershipEvent{"registered", service, instance_id, "registered by checkout-agent"};
 }
 
@@ -1042,9 +1096,9 @@ std::string eventsField(const nlohmann::json& j, const std::string& field) {
 }  // namespace
 
 void CheckServiceKey(harness::Ctx& ctx) {
-  publishEvent(eventFor("checkout-1"));
-  publishEvent(eventFor("payments-1", "payments"));
-  publishEvent(eventFor("checkout-2"));
+  publishEvent(eventsFor("checkout-1"));
+  publishEvent(eventsFor("payments-1", "payments"));
+  publishEvent(eventsFor("checkout-2"));
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kEventsTopic);
   ctx.Equal(records.size(), 3, "three publishEvent calls must produce three records on discovery.event; the records");
@@ -1065,29 +1119,46 @@ void CheckRealExpiry(harness::Ctx& ctx) {
   std::vector<std::string> kinds;
   for (const auto& v : ctx.Kafka.Values(kEventsTopic)) {
     const auto e = nlohmann::json::parse(v, nullptr, false);
-    kinds.push_back(eventsField(e, "kind") + " " + eventsField(e, "instance_id"));
+    kinds.push_back(eventsField(e, "kind") + " " + eventsField(e, "service") + " " + eventsField(e, "instance_id"));
   }
-  ctx.Equal(kinds, {"expired checkout-1"}, "the sweep must produce one expired event for checkout-1; the events");
+  ctx.Equal(kinds, {"expired checkout checkout-1"}, "the sweep must produce one expired event for checkout-1 of service checkout; the events");
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"checkout"}, "the expired event must be keyed by the service");
   ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), {"checkout-2", "checkout-3"}, "sd:members:checkout after the sweep must hold the live checkout-2 and checkout-3");
   const auto again = sweepExpired("checkout");
   ctx.Assert(again.empty() && ctx.Kafka.Records(kEventsTopic).size() == 1, "a second sweep announced %q: an expiry is announced once", again);
+  // 10 s in, checkout-2's record lapsed; its agent re-registers right as the sweep finds the record gone.
+  ctx.Clock.Advance(3);
+  bool back = false;
+  ctx.Redis.After("sd:checkout:checkout-2", [&ctx, &back] {
+    back = true;
+    ctx.Redis.Do("HSET", "sd:checkout:checkout-2", "address", "10.4.2.2", "port", "8080", "heartbeat_interval", "3", "metadata_version", "2", "last_heartbeat", std::to_string(ctx.Clock.Now() / 1000));
+    ctx.Redis.Do("EXPIRE", "sd:checkout:checkout-2", "9");
+    ctx.Redis.Do("SADD", "sd:members:checkout", "checkout-2");
+  });
+  sweepExpired("checkout");
+  ctx.Assert(back, "the sweep never looked at sd:checkout:checkout-2");
+  ctx.Equal(ctx.Redis.SMembers("sd:members:checkout"), {"checkout-2", "checkout-3"}, "checkout-2 re-registered right after the sweep checked its record: the existence check and the SREM must be one script, or the sweep drops a live instance; sd:members:checkout");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishEvent(eventFor("checkout-1"));
+  publishEvent(eventsFor("checkout-1"));
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1,
             "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishEvent(eventFor("checkout-2"));
+  publishEvent(eventsFor("checkout-2"));
   ctx.Settle();
   ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  ctx.Kafka.StallFor(kEventsTopic, 1);  // the broker answers 1 s late, inside the 2 s window
+  bool ok = publishEvent(eventsFor("checkout-0"));
+  ctx.Settle();
+  ctx.Assert(ok && eventsOutbox(ctx).empty() && ctx.Kafka.Records(kEventsTopic).size() == 1, "the broker acknowledged after 1 s, inside the 2 s window: publishEvent returned %v, the topic holds %d records and the outbox %d rows, expected true, one record and no row. Wait up to kAckTimeoutMs for the delivery report", ok, ctx.Kafka.Records(kEventsTopic).size(), eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishEvent(eventFor("checkout-1"));
+  ok = publishEvent(eventsFor("checkout-1"));
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the change never reaches a membership cache; the rows");
@@ -1097,9 +1168,9 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Equal(ok, false, "publishEvent's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishEvent(eventFor("checkout-2"));
+  ok = publishEvent(eventsFor("checkout-2"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "instance_id") == "checkout-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());

@@ -81,7 +81,7 @@ the database dropped is retried round after round while the WAL it held is gone.
       id: 'slot-lost',
       title: 'Halts the subscription when its slot is gone',
       detail:
-        '`NOT_FOUND` marks the subscription `slot_lost` and answers `"halted"`, and a halted subscription is not read again; the starter treats it like any error and retries.',
+        '`NOT_FOUND` marks the subscription `slot_lost` and answers `"halted"`, while an `UNAVAILABLE` read answers `"retry"` and leaves it active; a subscription whose stored status is not `active` is not read at all. The starter treats `NOT_FOUND` like any error and retries.',
       match: {
         python: {all: [/StatusCode\.NOT_FOUND/, /store\.set_status\(/, /slot_lost/]},
         typescript: {all: [/status\.NOT_FOUND/, /setStatus\(/, /slot_lost/]},
@@ -643,13 +643,25 @@ def check_no_skip(ctx):
 
 def check_slot_lost(ctx):
     m, source, sub, sink = _setup(ctx)
+    # An outage of the source says nothing about the slot: retry, and keep the subscription active.
+    ctx.grpc.fail("ReadSlot", grpc.StatusCode.UNAVAILABLE)
+    outcome = m.replicate_once(sub["id"], sink)
+    status = store.find_subscription(sub["id"])["status"]
+    assert outcome == "retry" and status == "active", f"a read that failed UNAVAILABLE answered {outcome!r} and left the subscription {status!r}: only NOT_FOUND is final, expected 'retry' and 'active'"
     source.lost.add(sub["slot"])
     outcome = m.replicate_once(sub["id"], sink)
     assert outcome == "halted", f"a slot the database dropped answered {outcome!r}: NOT_FOUND is final, expected 'halted'"
     status = store.find_subscription(sub["id"])["status"]
     assert status == "slot_lost", f"after its slot was dropped the subscription is {status!r}, expected 'slot_lost' so the lag read can page"
+    reads = len(ctx.grpc.calls_to("ReadSlot"))
     outcome = m.replicate_once(sub["id"], sink)
-    assert outcome == "halted" and len(ctx.grpc.calls_to("ReadSlot")) == 1, f"a halted subscription answered {outcome!r} and read the slot {len(ctx.grpc.calls_to('ReadSlot'))} times: it must not be read again"
+    assert outcome == "halted" and len(ctx.grpc.calls_to("ReadSlot")) == reads, f"a halted subscription answered {outcome!r} and read the slot again: it must not be read again"
+    # Another replica marked this one slot_lost: the stored status decides, not this process's memory.
+    other = store.create_subscription("acme", "orders", ["id", "status"], "warehouse-2")
+    store.set_status(other["id"], "slot_lost")
+    outcome = m.replicate_once(other["id"], sink)
+    assert outcome == "halted" and len(ctx.grpc.calls_to("ReadSlot")) == reads, f"a subscription stored as slot_lost answered {outcome!r} and read the slot {len(ctx.grpc.calls_to('ReadSlot')) - reads} times: a subscription that is not active answers 'halted' without reading"
+    assert sink.batches == [], f"no round of this check may deliver, the sink got {sink.batches}"
 `,
     typescript: `const WAL = [
   {lsn: 101, table: 'orders', pk: '42', op: 'insert', before: '', after: '{"id":42,"status":"new"}'},
@@ -730,14 +742,26 @@ export async function check_no_skip(ctx) {
 
 export async function check_slot_lost(ctx) {
   const {m, lost, store, sub, sink} = await setup(ctx);
-  lost.add(sub.slot);
+  // An outage of the source says nothing about the slot: retry, and keep the subscription active.
+  ctx.grpc.fail('ReadSlot', ctx.grpc.status.UNAVAILABLE);
   let outcome = await m.replicateOnce(sub.id, sink.deliver);
-  assert.equal(outcome, 'halted', \`a slot the database dropped answered \${outcome}: NOT_FOUND is final, expected halted\`);
-  const {status} = await store.findSubscription(sub.id);
-  assert.equal(status, 'slot_lost', \`after its slot was dropped the subscription is \${status}, expected slot_lost so the lag read can page\`);
+  let {status} = await store.findSubscription(sub.id);
+  assert(outcome === 'retry' && status === 'active', \`a read that failed UNAVAILABLE answered \${outcome} and left the subscription \${status}: only NOT_FOUND is final, expected retry and active\`);
+  lost.add(sub.slot);
   outcome = await m.replicateOnce(sub.id, sink.deliver);
-  const calls = ctx.grpc.callsTo('ReadSlot').length;
-  assert(outcome === 'halted' && calls === 1, \`a halted subscription answered \${outcome} and read the slot \${calls} times: it must not be read again\`);
+  assert.equal(outcome, 'halted', \`a slot the database dropped answered \${outcome}: NOT_FOUND is final, expected halted\`);
+  ({status} = await store.findSubscription(sub.id));
+  assert.equal(status, 'slot_lost', \`after its slot was dropped the subscription is \${status}, expected slot_lost so the lag read can page\`);
+  const reads = ctx.grpc.callsTo('ReadSlot').length;
+  outcome = await m.replicateOnce(sub.id, sink.deliver);
+  assert(outcome === 'halted' && ctx.grpc.callsTo('ReadSlot').length === reads, \`a halted subscription answered \${outcome} and read the slot again: it must not be read again\`);
+  // Another replica marked this one slot_lost: the stored status decides, not this process's memory.
+  const other = await store.createSubscription('acme', 'orders', ['id', 'status'], 'warehouse-2');
+  await store.setStatus(other.id, 'slot_lost');
+  outcome = await m.replicateOnce(other.id, sink.deliver);
+  const extra = ctx.grpc.callsTo('ReadSlot').length - reads;
+  assert(outcome === 'halted' && extra === 0, \`a subscription stored as slot_lost answered \${outcome} and read the slot \${extra} times: a subscription that is not active answers halted without reading\`);
+  assert.deepStrictEqual(sink.batches, [], \`no round of this check may deliver, the sink got \${JSON.stringify(sink.batches)}\`);
 }
 `,
     go: `package main
@@ -758,29 +782,29 @@ import (
 
 var replBg = context.Background()
 
-type walEntry struct {
+type hWalEntry struct {
 	lsn                   int64
 	pk, op, before, after string
 }
 
-var wal = []walEntry{
+var hWal = []hWalEntry{
 	{101, "42", "insert", "", \`{"id":42,"status":"new"}\`},
 	{102, "42", "update", \`{"id":42,"status":"new"}\`, \`{"id":42,"status":"paid"}\`},
 	{103, "7", "insert", "", \`{"id":7,"status":"new"}\`},
 }
 
-// sourcePeer serves the orders WAL at LSN 101..103; a slot in lost was dropped.
-type sourcePeer struct {
+// hSourcePeer serves the orders WAL at LSN 101..103; a slot in lost was dropped.
+type hSourcePeer struct {
 	pb.UnimplementedSlotsServer
 	lost map[string]bool
 }
 
-func (s *sourcePeer) ReadSlot(_ context.Context, req *pb.ReadSlotRequest) (*pb.Batch, error) {
+func (s *hSourcePeer) ReadSlot(_ context.Context, req *pb.ReadSlotRequest) (*pb.Batch, error) {
 	if s.lost[req.GetSlot()] {
 		return nil, status.Errorf(codes.NotFound, "replication slot %q does not exist", req.GetSlot())
 	}
 	batch := &pb.Batch{}
-	for _, e := range wal {
+	for _, e := range hWal {
 		if e.lsn > req.GetFromLsn() && (req.GetMaxChanges() == 0 || len(batch.Changes) < int(req.GetMaxChanges())) {
 			batch.Changes = append(batch.Changes, &pb.Change{Lsn: e.lsn, Table: "orders", Pk: e.pk, Op: e.op, Before: e.before, After: e.after})
 		}
@@ -792,13 +816,13 @@ func (s *sourcePeer) ReadSlot(_ context.Context, req *pb.ReadSlotRequest) (*pb.B
 	return batch, nil
 }
 
-// recorder is a deliver that records every batch it is handed and answers accept.
-type recorder struct {
+// hRecorder is a deliver that records every batch it is handed and answers accept.
+type hRecorder struct {
 	accept  bool
 	batches []string
 }
 
-func (r *recorder) deliver(b *pb.Batch) bool {
+func (r *hRecorder) deliver(b *pb.Batch) bool {
 	lsns := ""
 	for _, c := range b.GetChanges() {
 		lsns += fmt.Sprintf(",%d", c.GetLsn())
@@ -807,21 +831,21 @@ func (r *recorder) deliver(b *pb.Batch) bool {
 	return r.accept
 }
 
-func setup(ctx *harness.Ctx) (*sourcePeer, *store.Subscription, *recorder) {
-	source := &sourcePeer{lost: map[string]bool{}}
+func hSetup(ctx *harness.Ctx) (*hSourcePeer, *store.Subscription, *hRecorder) {
+	source := &hSourcePeer{lost: map[string]bool{}}
 	pb.RegisterSlotsServer(ctx.GRPC.Server(""), source)
 	sub, err := store.CreateSubscription(replBg, "acme", "orders", []string{"id", "status"}, "warehouse-1")
 	ctx.NoError(err, "creating the subscription")
-	return source, sub, &recorder{accept: true}
+	return source, sub, &hRecorder{accept: true}
 }
 
-func confirmedLsn(ctx *harness.Ctx, sub *store.Subscription) (int64, bool) {
+func hConfirmedLsn(ctx *harness.Ctx, sub *store.Subscription) (int64, bool) {
 	lsn, ok, err := cursor.LoadCursor(replBg, sub.ID, "orders")
 	ctx.NoError(err, "cursor.LoadCursor")
 	return lsn, ok
 }
 
-func reads(ctx *harness.Ctx) []int64 {
+func hReads(ctx *harness.Ctx) []int64 {
 	out := []int64{}
 	for _, c := range ctx.GRPC.CallsTo("ReadSlot", "") {
 		out = append(out, c.Request.(*pb.ReadSlotRequest).GetFromLsn())
@@ -830,18 +854,18 @@ func reads(ctx *harness.Ctx) []int64 {
 }
 
 func CheckReadApply(ctx *harness.Ctx) {
-	_, sub, sink := setup(ctx)
+	_, sub, sink := hSetup(ctx)
 	ctx.Equal(replicateOnce(replBg, sub.ID, sink.deliver), "applied", "a round over a healthy slot")
 	ctx.Equal(sink.batches, []string{sub.Slot + "@101:,101,102,103"}, "the sink must be handed the batch 101..103; the batches")
-	lsn, _ := confirmedLsn(ctx, sub)
+	lsn, _ := hConfirmedLsn(ctx, sub)
 	ctx.Equal(lsn, int64(103), "after the sink took 101..103, the cursor")
 	ctx.Equal(replicateOnce(replBg, sub.ID, sink.deliver), "idle", "a round with nothing new")
-	ctx.Equal(reads(ctx), []int64{0, 103}, "the rounds must read from 0, then from the confirmed 103; the from LSNs")
+	ctx.Equal(hReads(ctx), []int64{0, 103}, "the rounds must read from 0, then from the confirmed 103; the from LSNs")
 	ctx.Equal(len(sink.batches), 1, "an empty read must deliver nothing; the batches")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	_, sub, sink := setup(ctx)
+	_, sub, sink := hSetup(ctx)
 	ctx.GRPC.SetLatency("ReadSlot", 30, "")
 	before := ctx.Clock.Now()
 	outcome := replicateOnce(replBg, sub.ID, sink.deliver)
@@ -850,35 +874,48 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(call.HasDeadline(), "ReadSlot was called without a deadline: a source that stops answering held the round for %.0f s", waited)
 	ctx.Assert(call.Timeout.Seconds() >= 4.5 && call.Timeout.Seconds() <= 5.5, "ReadSlot carries a %v deadline, expected readDeadline = 5 s", call.Timeout)
 	ctx.Equal(outcome, "retry", "a read that ran past its deadline")
-	_, ok := confirmedLsn(ctx, sub)
+	_, ok := hConfirmedLsn(ctx, sub)
 	ctx.Assert(!ok && len(sink.batches) == 0, "a timed-out read must deliver nothing and leave the cursor alone")
 	ctx.GRPC.SetLatency("ReadSlot", 0, "")
 	ctx.Equal(replicateOnce(replBg, sub.ID, sink.deliver), "applied", "once the source answers again the next round")
 }
 
 func CheckNoSkip(ctx *harness.Ctx) {
-	_, sub, sink := setup(ctx)
+	_, sub, sink := hSetup(ctx)
 	sink.accept = false
 	outcome := replicateOnce(replBg, sub.ID, sink.deliver)
-	lsn, ok := confirmedLsn(ctx, sub)
+	lsn, ok := hConfirmedLsn(ctx, sub)
 	ctx.Assert(!ok, "the sink refused the batch and the cursor moved to %d: the next round reads past changes the sink never applied", lsn)
 	ctx.Equal(outcome, "retry", "a refused batch")
 	sink.accept = true
 	ctx.Equal(replicateOnce(replBg, sub.ID, sink.deliver), "applied", "the second round")
-	ctx.Equal(reads(ctx), []int64{0, 0}, "after a refusal the next round must read the same batch again; the from LSNs")
+	ctx.Equal(hReads(ctx), []int64{0, 0}, "after a refusal the next round must read the same batch again; the from LSNs")
 	ctx.Equal(sink.batches[1], sink.batches[0], "the retry must deliver the same batch, same id")
-	lsn, _ = confirmedLsn(ctx, sub)
+	lsn, _ = hConfirmedLsn(ctx, sub)
 	ctx.Equal(lsn, int64(103), "once the sink took the batch, the cursor")
 }
 
 func CheckSlotLost(ctx *harness.Ctx) {
-	source, sub, sink := setup(ctx)
+	source, sub, sink := hSetup(ctx)
+	// An outage of the source says nothing about the slot: retry, and keep the subscription active.
+	ctx.GRPC.Fail("ReadSlot", codes.Unavailable, "", 1, "")
+	outcome := replicateOnce(replBg, sub.ID, sink.deliver)
+	status := store.FindSubscription(replBg, sub.ID).Status
+	ctx.Assert(outcome == "retry" && status == "active", "a read that failed UNAVAILABLE answered %q and left the subscription %q: only NOT_FOUND is final, expected retry and active", outcome, status)
 	source.lost[sub.Slot] = true
 	ctx.Equal(replicateOnce(replBg, sub.ID, sink.deliver), "halted", "a slot the database dropped (NOT_FOUND is final)")
 	ctx.Equal(store.FindSubscription(replBg, sub.ID).Status, "slot_lost", "after its slot was dropped the subscription must be slot_lost so the lag read can page; the status")
-	outcome := replicateOnce(replBg, sub.ID, sink.deliver)
-	calls := len(ctx.GRPC.CallsTo("ReadSlot", ""))
-	ctx.Assert(outcome == "halted" && calls == 1, "a halted subscription answered %q and read the slot %d times: it must not be read again", outcome, calls)
+	readCount := len(ctx.GRPC.CallsTo("ReadSlot", ""))
+	outcome = replicateOnce(replBg, sub.ID, sink.deliver)
+	ctx.Assert(outcome == "halted" && len(ctx.GRPC.CallsTo("ReadSlot", "")) == readCount, "a halted subscription answered %q and read the slot again: it must not be read again", outcome)
+	// Another replica marked this one slot_lost: the stored status decides, not this process's memory.
+	other, err := store.CreateSubscription(replBg, "acme", "orders", []string{"id", "status"}, "warehouse-2")
+	ctx.NoError(err, "creating the second subscription")
+	ctx.NoError(store.SetStatus(replBg, other.ID, "slot_lost"), "marking the second subscription slot_lost")
+	outcome = replicateOnce(replBg, other.ID, sink.deliver)
+	extra := len(ctx.GRPC.CallsTo("ReadSlot", "")) - readCount
+	ctx.Assert(outcome == "halted" && extra == 0, "a subscription stored as slot_lost answered %q and read the slot %d times: a subscription that is not active answers halted without reading", outcome, extra)
+	ctx.Equal(len(sink.batches), 0, "no round of this check may deliver; the batches")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -902,7 +939,7 @@ const std::vector<std::tuple<int64_t, std::string, std::string, std::string, std
     {103, "7", "insert", "", R"({"id":7,"status":"new"})"}};
 
 // The orders WAL at LSN 101..103; a slot in lost was dropped.
-class SourcePeer final : public cdcstream::Slots::Service {
+class HSourcePeer final : public cdcstream::Slots::Service {
  public:
   std::set<std::string> lost;
   grpc::Status ReadSlot(grpc::ServerContext*, const cdcstream::ReadSlotRequest* req, cdcstream::Batch* out) override {
@@ -927,7 +964,7 @@ class SourcePeer final : public cdcstream::Slots::Service {
 };
 
 // A deliver that records every batch it is handed and answers accept.
-struct Recorder {
+struct HRecorder {
   bool accept = true;
   std::vector<std::string> batches;
   bool operator()(const cdcstream::Batch& batch) {
@@ -938,26 +975,26 @@ struct Recorder {
   }
 };
 
-struct World {
-  SourcePeer source;
-  Recorder sink;
+struct HWorld {
+  HSourcePeer source;
+  HRecorder sink;
   store::Subscription sub;
 };
 
-World& setup(harness::Ctx& ctx) {
-  static World* world = nullptr;
+HWorld& hSetup(harness::Ctx& ctx) {
+  static HWorld* world = nullptr;
   delete world;
-  world = new World;
+  world = new HWorld;
   ctx.GRPC.Server("")->RegisterService(&world->source);
   world->sub = store::createSubscription("acme", "orders", {"id", "status"}, "warehouse-1");
   return *world;
 }
 
-std::string runRound(World& w) {
+std::string hRunRound(HWorld& w) {
   return replicateOnce(w.sub.id, [&w](const cdcstream::Batch& b) { return w.sink(b); });
 }
 
-std::vector<int64_t> reads(harness::Ctx& ctx) {
+std::vector<int64_t> hReads(harness::Ctx& ctx) {
   std::vector<int64_t> out;
   for (const auto& c : ctx.GRPC.CallsTo("ReadSlot")) out.push_back(c.Request<cdcstream::ReadSlotRequest>().from_lsn());
   return out;
@@ -966,20 +1003,20 @@ std::vector<int64_t> reads(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckReadApply(harness::Ctx& ctx) {
-  World& w = setup(ctx);
-  ctx.Equal(runRound(w), "applied", "a round over a healthy slot");
+  HWorld& w = hSetup(ctx);
+  ctx.Equal(hRunRound(w), "applied", "a round over a healthy slot");
   ctx.Equal(w.sink.batches, {w.sub.slot + "@101:,101,102,103"}, "the sink must be handed the batch 101..103; the batches");
   ctx.Equal(cursor::loadCursor(w.sub.id, "orders"), std::optional<int64_t>(103), "after the sink took 101..103, the cursor");
-  ctx.Equal(runRound(w), "idle", "a round with nothing new");
-  ctx.Equal(reads(ctx), std::vector<int64_t>{0, 103}, "the rounds must read from 0, then from the confirmed 103; the from LSNs");
+  ctx.Equal(hRunRound(w), "idle", "a round with nothing new");
+  ctx.Equal(hReads(ctx), std::vector<int64_t>{0, 103}, "the rounds must read from 0, then from the confirmed 103; the from LSNs");
   ctx.Equal(w.sink.batches.size(), 1, "an empty read must deliver nothing; the batches");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  World& w = setup(ctx);
+  HWorld& w = hSetup(ctx);
   ctx.GRPC.SetLatency("ReadSlot", 30.0);
   const int64_t before = ctx.Clock.Now();
-  const std::string outcome = runRound(w);
+  const std::string outcome = hRunRound(w);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   const auto call = ctx.GRPC.CallsTo("ReadSlot").at(0);
   ctx.Assert(call.HasDeadline(), "ReadSlot was called without a deadline: a source that stops answering held the round for %.0f s", waited);
@@ -987,31 +1024,43 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Equal(outcome, "retry", "a read that ran past its deadline");
   ctx.Assert(!cursor::loadCursor(w.sub.id, "orders") && w.sink.batches.empty(), "a timed-out read must deliver nothing and leave the cursor alone");
   ctx.GRPC.SetLatency("ReadSlot", 0);
-  ctx.Equal(runRound(w), "applied", "once the source answers again the next round");
+  ctx.Equal(hRunRound(w), "applied", "once the source answers again the next round");
 }
 
 void CheckNoSkip(harness::Ctx& ctx) {
-  World& w = setup(ctx);
+  HWorld& w = hSetup(ctx);
   w.sink.accept = false;
-  const std::string outcome = runRound(w);
+  const std::string outcome = hRunRound(w);
   const auto confirmed = cursor::loadCursor(w.sub.id, "orders");
   ctx.Assert(!confirmed, "the sink refused the batch and the cursor moved to %d: the next round reads past changes the sink never applied", confirmed.value_or(0));
   ctx.Equal(outcome, "retry", "a refused batch");
   w.sink.accept = true;
-  ctx.Equal(runRound(w), "applied", "the second round");
-  ctx.Equal(reads(ctx), std::vector<int64_t>{0, 0}, "after a refusal the next round must read the same batch again; the from LSNs");
+  ctx.Equal(hRunRound(w), "applied", "the second round");
+  ctx.Equal(hReads(ctx), std::vector<int64_t>{0, 0}, "after a refusal the next round must read the same batch again; the from LSNs");
   ctx.Equal(w.sink.batches.at(1), w.sink.batches.at(0), "the retry must deliver the same batch, same id");
   ctx.Equal(cursor::loadCursor(w.sub.id, "orders"), std::optional<int64_t>(103), "once the sink took the batch, the cursor");
 }
 
 void CheckSlotLost(harness::Ctx& ctx) {
-  World& w = setup(ctx);
+  HWorld& w = hSetup(ctx);
+  // An outage of the source says nothing about the slot: retry, and keep the subscription active.
+  ctx.GRPC.Fail("ReadSlot", grpc::StatusCode::UNAVAILABLE);
+  std::string outcome = hRunRound(w);
+  std::string status = store::findSubscription(w.sub.id)->status;
+  ctx.Assert(outcome == "retry" && status == "active", "a read that failed UNAVAILABLE answered %q and left the subscription %q: only NOT_FOUND is final, expected retry and active", outcome, status);
   w.source.lost.insert(w.sub.slot);
-  ctx.Equal(runRound(w), "halted", "a slot the database dropped (NOT_FOUND is final)");
+  ctx.Equal(hRunRound(w), "halted", "a slot the database dropped (NOT_FOUND is final)");
   ctx.Equal(store::findSubscription(w.sub.id)->status, "slot_lost", "after its slot was dropped the subscription must be slot_lost so the lag read can page; the status");
-  const std::string outcome = runRound(w);
-  const size_t calls = ctx.GRPC.CallsTo("ReadSlot").size();
-  ctx.Assert(outcome == "halted" && calls == 1, "a halted subscription answered %q and read the slot %d times: it must not be read again", outcome, calls);
+  const size_t readCount = ctx.GRPC.CallsTo("ReadSlot").size();
+  outcome = hRunRound(w);
+  ctx.Assert(outcome == "halted" && ctx.GRPC.CallsTo("ReadSlot").size() == readCount, "a halted subscription answered %q and read the slot again: it must not be read again", outcome);
+  // Another replica marked this one slot_lost: the stored status decides, not this process's memory.
+  const auto other = store::createSubscription("acme", "orders", {"id", "status"}, "warehouse-2");
+  store::setStatus(other.id, "slot_lost");
+  outcome = replicateOnce(other.id, [&w](const cdcstream::Batch& b) { return w.sink(b); });
+  const size_t extra = ctx.GRPC.CallsTo("ReadSlot").size() - readCount;
+  ctx.Assert(outcome == "halted" && extra == 0, "a subscription stored as slot_lost answered %q and read the slot %d times: a subscription that is not active answers halted without reading", outcome, extra);
+  ctx.Equal(w.sink.batches.size(), 0, "no round of this check may deliver; the batches");
 }
 `,
   },
