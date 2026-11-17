@@ -77,7 +77,7 @@ Requirements:
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        'A write whose acknowledgement was lost is retried and lands once, and a record survives a leader failover right after its acknowledgement. The starter sets acks=1 and no idempotence.',
+        'A write whose acknowledgement was lost is retried and lands once, a record survives a leader failover right after its acknowledgement, and with the broker stalled publish_feedback returns false within about 2 s. The starter sets acks=1 and no idempotence.',
       match: {
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -90,7 +90,7 @@ Requirements:
       id: 'eval-counters',
       title: 'Aggregates the signals and the table overlap into eval:{workspace}',
       detail:
-        'Three Mobility events leave queries 3, run_ok 2, has_output 1, rating_sum 8 and overlap_milli 2500 (overlaps 1, 0.5 and 1). The starter counts queries and ratings only.',
+        'Three Mobility events leave queries 3, run_ok 2, has_output 1, rating_sum 8 and overlap_milli 2500 (overlaps 1, 0.5 and 1); in another workspace an event with nothing ACKed adds an overlap of 0 and one with 2 of 3 ACKed tables proposed adds 667. The starter counts queries and ratings only.',
       match: {
         python: {all: [/table_overlap\(/, /["']overlap_milli["']/, /["']has_output["']\s*,\s*int\(/]},
         typescript: {all: [/tableOverlap\(/, /['"]overlap_milli['"]/]},
@@ -103,7 +103,7 @@ Requirements:
       id: 'write-before-commit',
       title: 'Writes the counters before committing the offset',
       detail:
-        'At every commit the counters already include the committed record, and nothing is left uncommitted. The starter commits first, so a crash between the commit and the write loses that rating.',
+        'At every commit every counter already includes the committed record, and nothing is left uncommitted. The starter commits first, so a crash between the commit and the write loses that rating.',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -1019,26 +1019,45 @@ def check_idempotent_acks(ctx):
     ctx.kafka.failover(TOPIC)
     ids = [e["query_id"] for e in _events(ctx)]
     assert "q2" in ids, f"a leader failover right after the acknowledgement lost the rating, the topic holds {ids}: wait for all in-sync replicas (acks=all)"
+    ctx.kafka.stall(TOPIC)
+    started = ctx.clock.offset
+    delivered = m.publish_feedback(_record("q3"), 4)
+    waited = ctx.clock.offset - started
+    assert delivered is False, f"with the broker stalled publish_feedback returned {delivered!r}: it returns True only once the broker acknowledged the record"
+    assert waited <= 2.5, f"with the broker stalled publish_feedback waited {waited:.1f} s: it waits up to 2 s for the delivery report"
 
 
 def check_eval_counters(ctx):
     _seed_events(ctx)
+    for event in (
+        dict(query_id="q5", user="dee", workspace="it", rating=3, tables_proposed=["riders"], tables_acked=[], run_ok=False, has_output=False),
+        dict(query_id="q6", user="dee", workspace="it", rating=4, tables_proposed=["riders", "trips"], tables_acked=["riders", "trips", "cities"], run_ok=True, has_output=True),
+    ):
+        ctx.kafka.seed(TOPIC, key=event["user"], value=json.dumps(event))
     m = ctx.load("feedback")
     ctx.drain(m.run_eval)
     counters = _counters(ctx)
     expected = {"queries": 3, "run_ok": 2, "has_output": 1, "rating_sum": 8, "overlap_milli": 2500}
     assert counters == expected, f"eval:mobility is {counters}, expected {expected} (overlaps 1, 0.5 and 1)"
     assert _counters(ctx, "ads").get("queries") == 1, f"the Ads event counts in eval:ads, which is {_counters(ctx, 'ads')}"
+    it = _counters(ctx, "it")
+    assert it.get("queries") == 2 and it.get("overlap_milli") == 667, f"eval:it is {it}: nothing ACKed is an overlap of 0, and 2 of 3 ACKed tables proposed is round(1000 * 2/3) = 667"
 
 
 def check_write_before_commit(ctx):
     _seed_events(ctx)
-    at_commit = []
-    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(sum(_counters(ctx, w).get("queries", 0) for w in ("mobility", "ads"))))
+    totals = []
+
+    def snapshot(group, offsets):
+        fields = ("queries", "run_ok", "has_output", "rating_sum", "overlap_milli")
+        totals.append(tuple(sum(_counters(ctx, w).get(f, 0) for w in ("mobility", "ads")) for f in fields))
+
+    ctx.kafka.on_commit(snapshot)
     m = ctx.load("feedback")
     ctx.drain(m.run_eval)
-    assert at_commit, "the consumer never committed an offset"
-    assert at_commit == [1, 2, 3, 4], f"queries counted at each commit: {at_commit}, expected [1, 2, 3, 4]: write the counters before the commit, or a crash in between loses the rating"
+    assert totals, "the consumer never committed an offset"
+    expected = [(1, 1, 1, 5, 1000), (2, 2, 1, 7, 1500), (3, 2, 1, 8, 2500), (4, 3, 2, 12, 3500)]
+    assert totals == expected, f"(queries, run_ok, has_output, rating_sum, overlap_milli) at each commit: {totals}, expected {expected}: write every counter before the commit, or a crash in between loses part of the rating"
     assert ctx.kafka.lag("eval", TOPIC) == 0, f"the consumer left {ctx.kafka.lag('eval', TOPIC)} record(s) uncommitted"
 `,
     typescript: `const TOPIC = 'query.feedback';
@@ -1099,10 +1118,22 @@ export async function check_idempotent_acks(ctx) {
   ctx.kafka.failover(TOPIC);
   ids = events(ctx).map(e => e.query_id);
   assert(ids.includes('q2'), \`a leader failover right after the acknowledgement lost the rating, the topic holds \${JSON.stringify(ids)}: wait for all in-sync replicas (acks: -1)\`);
+  ctx.kafka.stall(TOPIC);
+  const started = ctx.clock.now();
+  const delivered = await m.publishFeedback(record('q3'), 4);
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert.equal(delivered, false, \`with the broker stalled publishFeedback resolved \${delivered}: it resolves true only once the broker acknowledged the record\`);
+  assert(waited <= 2.5, \`with the broker stalled publishFeedback waited \${waited.toFixed(1)} s: it waits up to 2 s for the acknowledgement\`);
 }
 
 export async function check_eval_counters(ctx) {
   seedEvents(ctx);
+  for (const event of [
+    {query_id: 'q5', user: 'dee', workspace: 'it', rating: 3, tables_proposed: ['riders'], tables_acked: [], run_ok: false, has_output: false},
+    {query_id: 'q6', user: 'dee', workspace: 'it', rating: 4, tables_proposed: ['riders', 'trips'], tables_acked: ['riders', 'trips', 'cities'], run_ok: true, has_output: true},
+  ]) {
+    ctx.kafka.seed(TOPIC, {key: event.user, value: JSON.stringify(event)});
+  }
   const m = ctx.load('feedback');
   await ctx.drain(m.runEval());
   const expected = {queries: 3, run_ok: 2, has_output: 1, rating_sum: 8, overlap_milli: 2500};
@@ -1110,16 +1141,20 @@ export async function check_eval_counters(ctx) {
   const sorted = (o: Record<string, number>) => JSON.stringify(Object.keys(o).sort().map(k => [k, o[k]]));
   assert.equal(sorted(got), sorted(expected), \`eval:mobility is \${JSON.stringify(got)}, expected \${JSON.stringify(expected)} (overlaps 1, 0.5 and 1)\`);
   assert.equal(counters(ctx, 'ads').queries, 1, \`the Ads event counts in eval:ads, which is \${JSON.stringify(counters(ctx, 'ads'))}\`);
+  const it = counters(ctx, 'it');
+  assert(it.queries === 2 && it.overlap_milli === 667, \`eval:it is \${JSON.stringify(it)}: nothing ACKed is an overlap of 0, and 2 of 3 ACKed tables proposed is round(1000 * 2/3) = 667\`);
 }
 
 export async function check_write_before_commit(ctx) {
   seedEvents(ctx);
-  const atCommit: number[] = [];
-  ctx.kafka.onCommit(() => atCommit.push((counters(ctx).queries ?? 0) + (counters(ctx, 'ads').queries ?? 0)));
+  const totals: number[][] = [];
+  const fields = ['queries', 'run_ok', 'has_output', 'rating_sum', 'overlap_milli'];
+  ctx.kafka.onCommit(() => totals.push(fields.map(f => (counters(ctx)[f] ?? 0) + (counters(ctx, 'ads')[f] ?? 0))));
   const m = ctx.load('feedback');
   await ctx.drain(m.runEval());
-  assert(atCommit.length > 0, 'the consumer never committed an offset');
-  assert.deepStrictEqual(atCommit, [1, 2, 3, 4], \`queries counted at each commit: \${JSON.stringify(atCommit)}, expected [1,2,3,4]: write the counters before the commit, or a crash in between loses the rating\`);
+  assert(totals.length > 0, 'the consumer never committed an offset');
+  const expected = [[1, 1, 1, 5, 1000], [2, 2, 1, 7, 1500], [3, 2, 1, 8, 2500], [4, 3, 2, 12, 3500]];
+  assert.deepStrictEqual(totals, expected, \`(queries, run_ok, has_output, rating_sum, overlap_milli) at each commit: \${JSON.stringify(totals)}, expected \${JSON.stringify(expected)}: write every counter before the commit, or a crash in between loses part of the rating\`);
   assert.equal(ctx.kafka.lag('eval', TOPIC), 0, \`the consumer left \${ctx.kafka.lag('eval', TOPIC)} record(s) uncommitted\`);
 }
 `,
@@ -1221,24 +1256,44 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Settle()
 	ctx.Kafka.Failover(feedbackTopic)
 	ctx.Equal(len(ctx.Kafka.Records(feedbackTopic)), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records")
+	ctx.Kafka.Stall(feedbackTopic)
+	started := ctx.Clock.Now()
+	delivered := publishFeedback(context.Background(), feedbackRecord("q3", "ana", true), 4)
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Equal(delivered, false, "with the broker stalled publishFeedback must report the record undelivered (true only once the broker acknowledged it)")
+	ctx.Assert(waited <= 2.5, "with the broker stalled publishFeedback waited %.1f s: it waits up to 2 s for the delivery report", waited)
 }
 
 func CheckEvalCounters(ctx *harness.Ctx) {
 	feedbackSeed(ctx)
+	for _, event := range []map[string]any{
+		{"query_id": "q5", "user": "dee", "workspace": "it", "rating": 3, "tables_proposed": []string{"riders"}, "tables_acked": []string{}, "run_ok": false, "has_output": false},
+		{"query_id": "q6", "user": "dee", "workspace": "it", "rating": 4, "tables_proposed": []string{"riders", "trips"}, "tables_acked": []string{"riders", "trips", "cities"}, "run_ok": true, "has_output": true},
+	} {
+		raw, _ := json.Marshal(event)
+		ctx.Kafka.Seed(feedbackTopic, event["user"], string(raw))
+	}
 	ctx.Drain(func() { runEval(context.Background()) })
 	ctx.Equal(feedbackCounters(ctx, "mobility"), map[string]int64{"queries": 3, "run_ok": 2, "has_output": 1, "rating_sum": 8, "overlap_milli": 2500}, "eval:mobility (overlaps 1, 0.5 and 1)")
 	ctx.Equal(feedbackCounters(ctx, "ads")["queries"], int64(1), "the Ads event counts in eval:ads; queries")
+	it := feedbackCounters(ctx, "it")
+	ctx.Assert(it["queries"] == 2 && it["overlap_milli"] == 667, "eval:it is %v: nothing ACKed is an overlap of 0, and 2 of 3 ACKed tables proposed is round(1000 * 2/3) = 667", it)
 }
 
 func CheckWriteBeforeCommit(ctx *harness.Ctx) {
 	feedbackSeed(ctx)
-	var atCommit []int64
+	var totals [][]int64
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
-		atCommit = append(atCommit, feedbackCounters(ctx, "mobility")["queries"]+feedbackCounters(ctx, "ads")["queries"])
+		mobility, ads := feedbackCounters(ctx, "mobility"), feedbackCounters(ctx, "ads")
+		var row []int64
+		for _, f := range []string{"queries", "run_ok", "has_output", "rating_sum", "overlap_milli"} {
+			row = append(row, mobility[f]+ads[f])
+		}
+		totals = append(totals, row)
 	})
 	ctx.Drain(func() { runEval(context.Background()) })
-	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
-	ctx.Equal(atCommit, []int64{1, 2, 3, 4}, "queries counted at each commit (write the counters before the commit, or a crash in between loses the rating)")
+	ctx.Assert(len(totals) > 0, "the consumer never committed an offset")
+	ctx.Equal(totals, [][]int64{{1, 1, 1, 5, 1000}, {2, 2, 1, 7, 1500}, {3, 2, 1, 8, 2500}, {4, 3, 2, 12, 3500}}, "(queries, run_ok, has_output, rating_sum, overlap_milli) at each commit (write every counter before the commit, or a crash in between loses part of the rating)")
 	ctx.Equal(ctx.Kafka.Lag("eval", feedbackTopic), int64(0), "records the consumer left uncommitted")
 }
 `,
@@ -1323,25 +1378,43 @@ void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Kafka.Failover(kFeedbackTopic);
   ctx.Equal(ctx.Kafka.Records(kFeedbackTopic).size(), 2, "after a leader failover both ratings must still be on the topic (acks=all); the records");
+  ctx.Kafka.Stall(kFeedbackTopic);
+  const int64_t started = ctx.Clock.Now();
+  const bool delivered = publish_feedback(feedbackRecord("q3", "ana"), 4);
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Equal(delivered, false, "with the broker stalled publish_feedback must report the record undelivered (true only once the broker acknowledged it)");
+  ctx.Assert(waited <= 2.5, "with the broker stalled publish_feedback waited %.1f s: it waits up to 2 s for the delivery report", waited);
 }
 
 void CheckEvalCounters(harness::Ctx& ctx) {
   feedbackSeed(ctx);
+  const std::vector<json> more = {
+      {{"query_id", "q5"}, {"user", "dee"}, {"workspace", "it"}, {"rating", 3}, {"tables_proposed", {"riders"}}, {"tables_acked", json::array()}, {"run_ok", false}, {"has_output", false}},
+      {{"query_id", "q6"}, {"user", "dee"}, {"workspace", "it"}, {"rating", 4}, {"tables_proposed", {"riders", "trips"}}, {"tables_acked", {"riders", "trips", "cities"}}, {"run_ok", true}, {"has_output", true}},
+  };
+  for (const auto& event : more) ctx.Kafka.Seed(kFeedbackTopic, event["user"].get<std::string>(), event.dump());
   ctx.Drain([] { run_eval(); });
   const std::map<std::string, long long> expected = {{"queries", 3}, {"run_ok", 2}, {"has_output", 1}, {"rating_sum", 8}, {"overlap_milli", 2500}};
   ctx.Equal(feedbackCounters(ctx, "mobility"), expected, "eval:mobility (overlaps 1, 0.5 and 1)");
   ctx.Equal(feedbackCounters(ctx, "ads")["queries"], 1, "the Ads event counts in eval:ads; queries");
+  auto it = feedbackCounters(ctx, "it");
+  ctx.Assert(it["queries"] == 2 && it["overlap_milli"] == 667, "eval:it has queries %d and overlap_milli %d: nothing ACKed is an overlap of 0, and 2 of 3 ACKed tables proposed is round(1000 * 2/3) = 667", it["queries"], it["overlap_milli"]);
 }
 
 void CheckWriteBeforeCommit(harness::Ctx& ctx) {
   feedbackSeed(ctx);
-  auto atCommit = std::make_shared<std::vector<long long>>();
-  ctx.Kafka.OnCommit([&ctx, atCommit](const std::string&, const harness::KafkaOffsets&) {
-    atCommit->push_back(feedbackCounters(ctx, "mobility")["queries"] + feedbackCounters(ctx, "ads")["queries"]);
+  auto totals = std::make_shared<std::vector<std::vector<long long>>>();
+  ctx.Kafka.OnCommit([&ctx, totals](const std::string&, const harness::KafkaOffsets&) {
+    auto mobility = feedbackCounters(ctx, "mobility");
+    auto ads = feedbackCounters(ctx, "ads");
+    std::vector<long long> row;
+    for (const char* f : {"queries", "run_ok", "has_output", "rating_sum", "overlap_milli"}) row.push_back(mobility[f] + ads[f]);
+    totals->push_back(row);
   });
   ctx.Drain([] { run_eval(); });
-  ctx.Assert(!atCommit->empty(), "the consumer never committed an offset");
-  ctx.Equal(*atCommit, std::vector<long long>{1, 2, 3, 4}, "queries counted at each commit (write the counters before the commit, or a crash in between loses the rating)");
+  ctx.Assert(!totals->empty(), "the consumer never committed an offset");
+  const std::vector<std::vector<long long>> expected = {{1, 1, 1, 5, 1000}, {2, 2, 1, 7, 1500}, {3, 2, 1, 8, 2500}, {4, 3, 2, 12, 3500}};
+  ctx.Equal(*totals, expected, "(queries, run_ok, has_output, rating_sum, overlap_milli) at each commit (write every counter before the commit, or a crash in between loses part of the rating)");
   ctx.Equal(ctx.Kafka.Lag("eval", kFeedbackTopic), 0, "records the consumer left uncommitted");
 }
 `,

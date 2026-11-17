@@ -25,7 +25,8 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
   and \`HINCRBY\`s both otherwise, setting \`EXPIRE\` on first write.
 - Read results are cached under \`tool:{shop}:{name}:{digest}\` for \`CACHE_TTL_S = 120\`.
 - A write tool (\`writes\` in the catalog) is claimed with \`SET NX\` on
-  \`write:{shop}:{turn_id}:{name}\` (24 h): a second call in the turn answers the stored result.`,
+  \`write:{shop}:{turn_id}:{name}\` (24 h): a second call in the turn answers the stored result. A
+  write whose \`Invoke\` fails wrote nothing: the failure reaches the loop and a retry may write.`,
   sequence: {
     participants: ['agent loop', 'budget_cache', 'Redis', 'Tools'],
     messages: [
@@ -61,7 +62,7 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
       id: 'budget-window',
       title: 'Counts per 60-second window that expires',
       detail:
-        'The 31st reservation in a minute is refused, the budget hash has a TTL of at most 60 s, and a minute later the shop reserves again; 100 000 tokens plus 60 000 is refused, plus 50 000 fits. The starter keeps one counter forever.',
+        'The 31st reservation in a minute is refused, the budget hash has a TTL of at most 60 s from the command that creates it, and a minute later the shop reserves again; 30 reservations in the last second of a clock minute leave the next minute free; 100 000 tokens plus 60 000 is refused, plus 50 000 fits. The starter keeps one counter forever.',
       match: {
         python: {all: [/\/\/\s*WINDOW_S\b/, /EXPIRE/]},
         typescript: {all: [/\/\s*WINDOW_S\b/, /EXPIRE/]},
@@ -74,7 +75,7 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
       id: 'shop-scoped-cache',
       title: 'Keys the tool cache by shop',
       detail:
-        "Shop s1's second identical segment query is a cache hit; shop s2 asking the same thing gets its own Invoke and its own customers. The starter's key has no shop, so s2 gets s1's answer.",
+        "Shop s1's second identical segment query is a cache hit and another query is a miss; shop s2 asking the same thing gets its own Invoke and its own customers. The starter's key has no shop, so s2 gets s1's answer.",
       match: {
         python: {all: [/f["']tool:\{shop\}:/]},
         typescript: {all: [/tool:\$\{shop\}:/]},
@@ -87,7 +88,7 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
       id: 'cache-ttl',
       title: 'Expires cached tool results after 120 s',
       detail:
-        'A cached result has a TTL of at most 120 s, and after 121 s the next call reaches the tool again. The starter caches forever, so a merchant who adds a customer never sees it.',
+        'A cached result has a TTL of at most 120 s from the command that writes it; a hit 100 s in does not extend it, and 121 s after the fetch the next call reaches the tool again. The starter caches forever, so a merchant who adds a customer never sees it.',
       match: {
         python: {all: [/ex\s*=\s*CACHE_TTL_S/]},
         typescript: {all: [/['"]EX['"],\s*CACHE_TTL_S/]},
@@ -100,7 +101,7 @@ served to another, and stays stale forever. A retried turn fills the merchant's 
       id: 'write-once',
       title: 'Runs a write tool once per turn',
       detail:
-        'Two `fill_product_form` calls in one turn reach the tool once and answer the same result; the claim key lives about a day; another turn fills again. The starter invokes the write on every call.',
+        'Two `fill_product_form` calls in one turn reach the tool once and answer the same result; the claim lives about a day from the command that takes it; another replica running the same turn at that moment does not write a second time; a write whose Invoke failed raises and its retry reaches the tool; another turn fills again. The starter invokes the write on every call.',
       match: {
         python: {all: [/nx\s*=\s*True/, /write:\{shop\}:\{turn_id\}/]},
         typescript: {all: [/['"]NX['"]/, /write:\$\{shop\}:\$\{turnId\}/]},
@@ -833,11 +834,14 @@ std::string invoke_tool(const std::string& shop, const std::string& turn_id, con
     },
   },
   harness: {
-    python: `import merchant_agent_pb2
+    python: `import grpc
+
+import merchant_agent_pb2
 import merchant_agent_pb2_grpc
 from sidekick import config, tools
 
 TORONTO = '{"query":"default_address_city = Toronto"}'
+OTTAWA = '{"query":"default_address_city = Ottawa"}'
 SEO = '{"product_id":"p-1","field":"seo_description"}'
 
 
@@ -857,6 +861,24 @@ def _invoked(ctx):
     return [(call.request.shop, call.request.name) for call in ctx.grpc.calls_to("Invoke")]
 
 
+def _budget_key(ctx, shop):
+    return f"budget:{shop}:{int(ctx.clock.time()) // 60}"
+
+
+def _ttl_when_written(ctx, key):
+    """The TTL key has right after the first command that leaves it in Redis: a TTL set by a second command is missing then."""
+    seen = {}
+
+    def look():
+        if ctx.redis.exists(key):
+            seen["ttl"] = ctx.redis.ttl(key)
+        else:
+            ctx.redis_after(key, look)
+
+    ctx.redis_after(key, look)
+    return seen
+
+
 def check_atomic_reserve(ctx):
     m = _world(ctx)
     sent = []
@@ -874,15 +896,28 @@ def check_atomic_reserve(ctx):
     assert not client_side, f"reserve sent {sent}: {client_side} from the client let another replica land between the read and the increment"
     keys = ctx.redis.keys("budget:s1*")
     assert len(keys) == 1 and ctx.redis.hgetall(keys[0]) == {"requests": "1", "tokens": "2000"}, f"one reservation counts one request and its tokens: {[(k, ctx.redis.hgetall(k)) for k in keys]}"
+    # Shop s9 has one request left; a second replica reserves right after this one's first command on the hash.
+    key = _budget_key(ctx, "s9")
+    ctx.redis.hset(key, mapping={"requests": "29", "tokens": "58000"})
+    ctx.redis.expire(key, 60)
+    other = ctx.reload("budget_cache")
+    race = ctx.redis_after(key, lambda: other.reserve("s9", 2000))
+    mine = m.reserve("s9", 2000)
+    assert race.fired, f"reserve never touched {key}: the hash is budget:{{shop}}:{{window}}"
+    assert race.error is None, f"the second replica's reserve raised {race.error!r}"
+    assert sorted([mine, race.result]) == [False, True], f"one request was left and two replicas reserved at once: they got {mine} and {race.result}, exactly one must get it"
+    assert ctx.redis.hget(key, "requests") == "30", f"the hash holds {ctx.redis.hget(key, 'requests')} requests after the race, not 30: the second replica landed between the read and the increment"
 
 
 def check_budget_window(ctx):
     m = _world(ctx)
+    created = _ttl_when_written(ctx, _budget_key(ctx, "s1"))
     results = [m.reserve("s1", 2000) for _ in range(31)]
     assert results[:30] == [True] * 30, f"30 requests fit in a minute, got {results[:30].count(True)} reserved"
     assert results[30] is False, "the 31st request in a minute must be refused"
+    assert "ttl" in created, f"reserve left no {_budget_key(ctx, 's1')}: the hash is budget:{{shop}}:{{window}} with window = unix_seconds // WINDOW_S"
+    assert 0 < created["ttl"] <= 60, f"right after the command that created it, the budget hash had TTL {created['ttl']}: the EXPIRE belongs in the same script, or a crash between the two leaves a counter that refuses the shop for good"
     keys = ctx.redis.keys("budget:s1*")
-    assert keys, "reserve left no budget:s1… key"
     ttl = ctx.redis.ttl(keys[0])
     assert 0 < ttl <= 60, f"{keys[0]} has TTL {ttl}: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good"
     ctx.clock.advance(60)
@@ -890,6 +925,13 @@ def check_budget_window(ctx):
     assert m.reserve("s2", 100_000) is True, "100 000 tokens fit in 150 000"
     assert m.reserve("s2", 60_000) is False, "100 000 + 60 000 tokens is over 150 000 and must be refused"
     assert m.reserve("s2", 50_000) is True, "a refused reservation must not count: 100 000 + 50 000 fits exactly"
+    # Windows follow the clock's minutes: 30 requests in the last second of one minute, then one more in the next.
+    now = ctx.clock.time()
+    ctx.clock.advance(60 - now % 60 - 1)
+    late = [m.reserve("s3", 2000) for _ in range(31)]
+    assert late[:30] == [True] * 30 and late[30] is False, f"30 requests fit in a minute and the 31st is refused, got {late}"
+    ctx.clock.advance(2)
+    assert m.reserve("s3", 2000) is True, "two seconds later the clock is in the next minute, a new window (window = unix_seconds // WINDOW_S): the shop must reserve again, not wait 60 s from its first request"
 
 
 def check_shop_scoped_cache(ctx):
@@ -901,6 +943,8 @@ def check_shop_scoped_cache(ctx):
     other = m.invoke_tool("s2", "t-3", "segment_customers", TORONTO)
     assert '"shop":"s2"' in other, f"s2 asked the same question and got {other!r}: another merchant's customers, served from the cache"
     assert _invoked(ctx) == [("s1", "segment_customers"), ("s2", "segment_customers")], f"each shop's first query reaches the tool: {_invoked(ctx)}"
+    ottawa = m.invoke_tool("s1", "t-4", "segment_customers", OTTAWA)
+    assert "Ottawa" in ottawa and len(_invoked(ctx)) == 3, f"s1 asking another query must reach the tool and get its answer, got {ottawa!r}: the key holds the arguments' digest"
 
 
 def check_cache_ttl(ctx):
@@ -910,23 +954,49 @@ def check_cache_ttl(ctx):
     assert len(keys) == 1, f"one read leaves one cache key, found {keys}"
     ttl = ctx.redis.ttl(keys[0])
     assert 0 < ttl <= 120, f"{keys[0]} has TTL {ttl}: cached results expire after CACHE_TTL_S = 120"
-    ctx.clock.advance(121)
+    ctx.clock.advance(100)
     m.invoke_tool("s1", "t-2", "segment_customers", TORONTO)
-    assert len(_invoked(ctx)) == 2, f"after 121 s the next query must reach the tool again, it was called {len(_invoked(ctx))} times: a customer added a minute ago is invisible"
+    assert len(_invoked(ctx)) == 1, f"100 s later the result is still cached, the tool was called {len(_invoked(ctx))} times"
+    rewritten = _ttl_when_written(ctx, keys[0])
+    ctx.clock.advance(21)
+    m.invoke_tool("s1", "t-3", "segment_customers", TORONTO)
+    assert len(_invoked(ctx)) == 2, f"121 s after the result was fetched the next query must reach the tool again, it was called {len(_invoked(ctx))} times: a hit must not extend the TTL, or a merchant who asks every minute never sees a new customer"
+    assert "ttl" in rewritten and 0 < rewritten["ttl"] <= 120, f"right after the command that wrote the refetched result, {keys[0]} had TTL {rewritten.get('ttl')}: SET it with EX in one command"
 
 
 def check_write_once(ctx):
     m = _world(ctx)
+    claimed = _ttl_when_written(ctx, "write:s1:t-1:fill_product_form")
     first = m.invoke_tool("s1", "t-1", "fill_product_form", SEO)
     again = m.invoke_tool("s1", "t-1", "fill_product_form", SEO)
     assert _invoked(ctx) == [("s1", "fill_product_form")], f"two fill_product_form calls in turn t-1 reached the tool {len(_invoked(ctx))} times: the form was filled twice"
     assert again == first, f"the second call in the turn answers the stored result: {first!r} then {again!r}"
+    assert "ttl" in claimed, "fill_product_form left no claim write:s1:t-1:fill_product_form"
+    assert 82_800 <= claimed["ttl"] <= 86_400, f"right after the command that created it, the claim write:s1:t-1:fill_product_form had TTL {claimed['ttl']}: it must live about a day from the SET NX itself"
     ttl = ctx.redis.ttl("write:s1:t-1:fill_product_form")
     assert 82_800 <= ttl <= 86_400, f"the claim write:s1:t-1:fill_product_form must live about a day, TTL {ttl}"
     m.invoke_tool("s1", "t-2", "fill_product_form", SEO)
     assert len(_invoked(ctx)) == 2, "another turn is another write"
+    # The tool fails once: nothing was written, so a retry in the same turn must reach it.
+    ctx.grpc.fail("Invoke", grpc.StatusCode.UNAVAILABLE, "the admin is restarting", target=config.TOOLS_ADDR)
+    try:
+        m.invoke_tool("s1", "t-5", "fill_product_form", SEO)
+        raised = False
+    except grpc.RpcError:
+        raised = True
+    assert raised, "fill_product_form failed with UNAVAILABLE in turn t-5 and invoke_tool returned anyway: the failure must reach the loop"
+    retried = m.invoke_tool("s1", "t-5", "fill_product_form", SEO)
+    assert "fill_product_form" in retried, f"the retry after a failed write answered {retried!r}: a write that failed wrote nothing, so its claim is released and the retry reaches the tool"
+    # Two replicas run the same turn's write at once: the second lands right after the first's first command on the claim.
+    other = ctx.reload("budget_cache")
+    race = ctx.redis_after("write:s1:t-9:fill_product_form", lambda: other.invoke_tool("s1", "t-9", "fill_product_form", SEO))
+    m.invoke_tool("s1", "t-9", "fill_product_form", SEO)
+    assert race.fired and race.error is None, f"the second replica's call in turn t-9 failed: {race.error!r}"
+    nine = [call for call in ctx.grpc.calls_to("Invoke") if call.request.turn_id == "t-9"]
+    assert len(nine) == 1, f"two replicas running turn t-9's fill_product_form at once reached the tool {len(nine)} times: the claim must be taken with SET NX before the tool runs"
 `,
     typescript: `const TORONTO = '{"query":"default_address_city = Toronto"}';
+const OTTAWA = '{"query":"default_address_city = Ottawa"}';
 const SEO = '{"product_id":"p-1","field":"seo_description"}';
 
 /** The stand-in tools, the learner's module. */
@@ -943,6 +1013,18 @@ function world(ctx) {
 }
 
 const invoked = (ctx): string[] => ctx.grpc.callsTo('Invoke').map(call => call.request.shop + ' ' + call.request.name);
+const budgetKey = (ctx, shop: string) => \`budget:\${shop}:\${Math.floor(Math.floor(ctx.clock.now() / 1000) / 60)}\`;
+
+/** The TTL key has right after the first command that leaves it in Redis: a TTL set by a second command is missing then. */
+function ttlWhenWritten(ctx, key: string): {ttl?: number} {
+  const seen: {ttl?: number} = {};
+  const look = () => {
+    if (ctx.redis.exists(key)) seen.ttl = ctx.redis.ttl(key);
+    else ctx.redisAfter(key, look);
+  };
+  ctx.redisAfter(key, look);
+  return seen;
+}
 
 export async function check_atomic_reserve(ctx) {
   const m = world(ctx);
@@ -972,12 +1054,14 @@ export async function check_atomic_reserve(ctx) {
 
 export async function check_budget_window(ctx) {
   const m = world(ctx);
+  const created = ttlWhenWritten(ctx, budgetKey(ctx, 's1'));
   const results: boolean[] = [];
   for (let i = 0; i < 31; i += 1) results.push(await m.reserve('s1', 2000));
   assert.equal(results.slice(0, 30).filter(Boolean).length, 30, \`30 requests fit in a minute, got \${results.slice(0, 30).filter(Boolean).length} reserved\`);
   assert.equal(results[30], false, 'the 31st request in a minute must be refused');
+  assert(created.ttl !== undefined, \`reserve left no \${budgetKey(ctx, 's1')}: the hash is budget:{shop}:{window} with window = unix_seconds / WINDOW_S, rounded down\`);
+  assert(created.ttl > 0 && created.ttl <= 60, \`right after the command that created it, the budget hash had TTL \${created.ttl}: the EXPIRE belongs in the same script, or a crash between the two leaves a counter that refuses the shop for good\`);
   const keys = ctx.redis.keys('budget:s1*');
-  assert(keys.length > 0, 'reserve left no budget:s1… key');
   const ttl = ctx.redis.ttl(keys[0]);
   assert(ttl > 0 && ttl <= 60, \`\${keys[0]} has TTL \${ttl}: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good\`);
   ctx.clock.advance(60);
@@ -985,6 +1069,13 @@ export async function check_budget_window(ctx) {
   assert.equal(await m.reserve('s2', 100_000), true, '100 000 tokens fit in 150 000');
   assert.equal(await m.reserve('s2', 60_000), false, '100 000 + 60 000 tokens is over 150 000 and must be refused');
   assert.equal(await m.reserve('s2', 50_000), true, 'a refused reservation must not count: 100 000 + 50 000 fits exactly');
+  // Windows follow the clock's minutes: 30 requests in the last second of one minute, then one more in the next.
+  ctx.clock.advance(60 - ((ctx.clock.now() / 1000) % 60) - 1);
+  const late: boolean[] = [];
+  for (let i = 0; i < 31; i += 1) late.push(await m.reserve('s3', 2000));
+  assert(late.slice(0, 30).every(Boolean) && late[30] === false, \`30 requests fit in a minute and the 31st is refused, got \${JSON.stringify(late)}\`);
+  ctx.clock.advance(2);
+  assert.equal(await m.reserve('s3', 2000), true, 'two seconds later the clock is in the next minute, a new window (window = unix_seconds / WINDOW_S, rounded down): the shop must reserve again, not wait 60 s from its first request');
 }
 
 export async function check_shop_scoped_cache(ctx) {
@@ -996,6 +1087,8 @@ export async function check_shop_scoped_cache(ctx) {
   const other = await m.invokeTool('s2', 't-3', 'segment_customers', TORONTO);
   assert(other.includes('"shop":"s2"'), \`s2 asked the same question and got \${other}: another merchant's customers, served from the cache\`);
   assert.deepEqual(invoked(ctx), ['s1 segment_customers', 's2 segment_customers'], \`each shop's first query reaches the tool: \${JSON.stringify(invoked(ctx))}\`);
+  const ottawa = await m.invokeTool('s1', 't-4', 'segment_customers', OTTAWA);
+  assert(ottawa.includes('Ottawa') && invoked(ctx).length === 3, \`s1 asking another query must reach the tool and get its answer, got \${ottawa}: the key holds the arguments' digest\`);
 }
 
 export async function check_cache_ttl(ctx) {
@@ -1005,21 +1098,48 @@ export async function check_cache_ttl(ctx) {
   assert.equal(keys.length, 1, \`one read leaves one cache key, found \${JSON.stringify(keys)}\`);
   const ttl = ctx.redis.ttl(keys[0]);
   assert(ttl > 0 && ttl <= 120, \`\${keys[0]} has TTL \${ttl}: cached results expire after CACHE_TTL_S = 120\`);
-  ctx.clock.advance(121);
+  ctx.clock.advance(100);
   await m.invokeTool('s1', 't-2', 'segment_customers', TORONTO);
-  assert.equal(invoked(ctx).length, 2, \`after 121 s the next query must reach the tool again, it was called \${invoked(ctx).length} times: a customer added a minute ago is invisible\`);
+  assert.equal(invoked(ctx).length, 1, \`100 s later the result is still cached, the tool was called \${invoked(ctx).length} times\`);
+  const rewritten = ttlWhenWritten(ctx, keys[0]);
+  ctx.clock.advance(21);
+  await m.invokeTool('s1', 't-3', 'segment_customers', TORONTO);
+  assert.equal(invoked(ctx).length, 2, \`121 s after the result was fetched the next query must reach the tool again, it was called \${invoked(ctx).length} times: a hit must not extend the TTL, or a merchant who asks every minute never sees a new customer\`);
+  assert(rewritten.ttl !== undefined && rewritten.ttl > 0 && rewritten.ttl <= 120, \`right after the command that wrote the refetched result, \${keys[0]} had TTL \${rewritten.ttl}: SET it with EX in one command\`);
 }
 
 export async function check_write_once(ctx) {
   const m = world(ctx);
+  const claimed = ttlWhenWritten(ctx, 'write:s1:t-1:fill_product_form');
   const first = await m.invokeTool('s1', 't-1', 'fill_product_form', SEO);
   const again = await m.invokeTool('s1', 't-1', 'fill_product_form', SEO);
   assert.deepEqual(invoked(ctx), ['s1 fill_product_form'], \`two fill_product_form calls in turn t-1 reached the tool \${invoked(ctx).length} times: the form was filled twice\`);
   assert.equal(again, first, \`the second call in the turn answers the stored result: \${first} then \${again}\`);
+  assert(claimed.ttl !== undefined, 'fill_product_form left no claim write:s1:t-1:fill_product_form');
+  assert(claimed.ttl >= 82_800 && claimed.ttl <= 86_400, \`right after the command that created it, the claim write:s1:t-1:fill_product_form had TTL \${claimed.ttl}: it must live about a day from the SET NX itself\`);
   const ttl = ctx.redis.ttl('write:s1:t-1:fill_product_form');
   assert(ttl >= 82_800 && ttl <= 86_400, \`the claim write:s1:t-1:fill_product_form must live about a day, TTL \${ttl}\`);
   await m.invokeTool('s1', 't-2', 'fill_product_form', SEO);
   assert.equal(invoked(ctx).length, 2, 'another turn is another write');
+  // The tool fails once: nothing was written, so a retry in the same turn must reach it.
+  const config = ctx.load('/support/sidekick/config.ts');
+  ctx.grpc.fail('Invoke', ctx.grpc.status.UNAVAILABLE, 'the admin is restarting', 1, config.TOOLS_ADDR);
+  let raised = false;
+  try {
+    await m.invokeTool('s1', 't-5', 'fill_product_form', SEO);
+  } catch {
+    raised = true;
+  }
+  assert(raised, 'fill_product_form failed with UNAVAILABLE in turn t-5 and invokeTool returned anyway: the failure must reach the loop');
+  const retried = await m.invokeTool('s1', 't-5', 'fill_product_form', SEO);
+  assert(retried.includes('fill_product_form'), \`the retry after a failed write answered \${JSON.stringify(retried)}: a write that failed wrote nothing, so its claim is released and the retry reaches the tool\`);
+  // Another replica runs turn t-9's write right after this one's first command on the claim: it claims with SET NX and writes if it got the claim.
+  const claim = 'write:s1:t-9:fill_product_form';
+  const race = ctx.redisAfter(claim, () => ctx.redis.set(claim, '', 'EX', 86_400, 'NX') === 'OK');
+  await m.invokeTool('s1', 't-9', 'fill_product_form', SEO);
+  assert(race.fired, \`fill_product_form in turn t-9 never touched \${claim}\`);
+  const writes = ctx.grpc.callsTo('Invoke').filter(call => call.request.turn_id === 't-9').length + (race.result === true ? 1 : 0);
+  assert.equal(writes, 1, \`two replicas running turn t-9's fill_product_form at once wrote \${writes} times (this one \${writes - (race.result === true ? 1 : 0)}, the other \${race.result === true ? 1 : 0}): the claim must be taken with SET NX before the tool runs\`);
 }
 `,
     go: `package main
@@ -1030,6 +1150,8 @@ import (
 	"strconv"
 	"strings"
 
+	"google.golang.org/grpc/codes"
+
 	"sidekick/config"
 	"sidekick/tools"
 	pb "sidekickrpc/gen/merchant_agent"
@@ -1039,6 +1161,7 @@ import (
 
 const (
 	budgetToronto = \`{"query":"default_address_city = Toronto"}\`
+	budgetOttawa  = \`{"query":"default_address_city = Ottawa"}\`
 	budgetSeo     = \`{"product_id":"p-1","field":"seo_description"}\`
 )
 
@@ -1074,6 +1197,27 @@ func budgetInvoked(ctx *harness.Ctx) []string {
 		out = append(out, req.GetShop()+" "+req.GetName())
 	}
 	return out
+}
+
+func budgetKey(ctx *harness.Ctx, shop string) string {
+	return fmt.Sprintf("budget:%s:%d", shop, ctx.Clock.Now()/1000/60)
+}
+
+// budgetTTLWhenWritten records the TTL key has right after the first command that leaves it in
+// Redis (-100 until then): a TTL set by a second command is missing at that instant.
+func budgetTTLWhenWritten(ctx *harness.Ctx, key string) *int64 {
+	seen := int64(-100)
+	var look func() any
+	look = func() any {
+		if ctx.Redis.Exists(key) == 1 {
+			seen = ctx.Redis.TTL(key)
+		} else {
+			ctx.Redis.After(key, look)
+		}
+		return nil
+	}
+	ctx.Redis.After(key, look)
+	return &seen
 }
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
@@ -1120,6 +1264,7 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 
 func CheckBudgetWindow(ctx *harness.Ctx) {
 	budgetWorld(ctx)
+	created := budgetTTLWhenWritten(ctx, budgetKey(ctx, "s1"))
 	reserved := 0
 	for i := 0; i < 30; i++ {
 		if budgetReserve(ctx, "s1", 2000) {
@@ -1128,8 +1273,9 @@ func CheckBudgetWindow(ctx *harness.Ctx) {
 	}
 	ctx.Equal(reserved, 30, "30 requests fit in a minute; reserved")
 	ctx.Assert(!budgetReserve(ctx, "s1", 2000), "the 31st request in a minute must be refused")
+	ctx.Assert(*created != -100, "reserve left no %s: the hash is budget:{shop}:{window} with window = unix seconds / windowSeconds", budgetKey(ctx, "s1"))
+	ctx.Assert(*created > 0 && *created <= 60, "right after the command that created it, the budget hash had TTL %d: the EXPIRE belongs in the same script, or a crash between the two leaves a counter that refuses the shop for good", *created)
 	keys := ctx.Redis.Keys("budget:s1*")
-	ctx.Assert(len(keys) > 0, "reserve left no budget:s1… key")
 	ttl := ctx.Redis.TTL(keys[0])
 	ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good", keys[0], ttl)
 	ctx.Clock.Advance(60)
@@ -1137,6 +1283,17 @@ func CheckBudgetWindow(ctx *harness.Ctx) {
 	ctx.Assert(budgetReserve(ctx, "s2", 100000), "100 000 tokens fit in 150 000")
 	ctx.Assert(!budgetReserve(ctx, "s2", 60000), "100 000 + 60 000 tokens is over 150 000 and must be refused")
 	ctx.Assert(budgetReserve(ctx, "s2", 50000), "a refused reservation must not count: 100 000 + 50 000 fits exactly")
+	// Windows follow the clock's minutes: 30 requests in the last second of one minute, then one more in the next.
+	ctx.Clock.Advance(60 - float64(ctx.Clock.Now()%60000)/1000 - 1)
+	late := 0
+	for i := 0; i < 30; i++ {
+		if budgetReserve(ctx, "s3", 2000) {
+			late++
+		}
+	}
+	ctx.Assert(late == 30 && !budgetReserve(ctx, "s3", 2000), "30 requests fit in a minute and the 31st is refused, %d of 30 fit", late)
+	ctx.Clock.Advance(2)
+	ctx.Assert(budgetReserve(ctx, "s3", 2000), "two seconds later the clock is in the next minute, a new window (window = unix seconds / windowSeconds): the shop must reserve again, not wait 60 s from its first request")
 }
 
 func CheckShopScopedCache(ctx *harness.Ctx) {
@@ -1148,6 +1305,8 @@ func CheckShopScopedCache(ctx *harness.Ctx) {
 	other := budgetInvoke(ctx, "s2", "t-3", "segment_customers", budgetToronto)
 	ctx.Assert(strings.Contains(other, \`"shop":"s2"\`), "s2 asked the same question and got %s: another merchant's customers, served from the cache", other)
 	ctx.Equal(budgetInvoked(ctx), []string{"s1 segment_customers", "s2 segment_customers"}, "each shop's first query reaches the tool")
+	ottawa := budgetInvoke(ctx, "s1", "t-4", "segment_customers", budgetOttawa)
+	ctx.Assert(strings.Contains(ottawa, "Ottawa") && len(budgetInvoked(ctx)) == 3, "s1 asking another query must reach the tool and get its answer, got %s: the key holds the arguments' digest", ottawa)
 }
 
 func CheckCacheTtl(ctx *harness.Ctx) {
@@ -1157,27 +1316,58 @@ func CheckCacheTtl(ctx *harness.Ctx) {
 	ctx.Equal(len(keys), 1, "one read leaves one cache key (%v)", keys)
 	ttl := ctx.Redis.TTL(keys[0])
 	ctx.Assert(ttl > 0 && ttl <= 120, "%s has TTL %d: cached results expire after cacheTTL = 120 s", keys[0], ttl)
-	ctx.Clock.Advance(121)
+	ctx.Clock.Advance(100)
 	budgetInvoke(ctx, "s1", "t-2", "segment_customers", budgetToronto)
-	ctx.Equal(len(budgetInvoked(ctx)), 2, "after 121 s the next query must reach the tool again (a customer added a minute ago is invisible); tool calls")
+	ctx.Equal(len(budgetInvoked(ctx)), 1, "100 s later the result is still cached; tool calls")
+	rewritten := budgetTTLWhenWritten(ctx, keys[0])
+	ctx.Clock.Advance(21)
+	budgetInvoke(ctx, "s1", "t-3", "segment_customers", budgetToronto)
+	ctx.Equal(len(budgetInvoked(ctx)), 2, "121 s after the result was fetched the next query must reach the tool again (a hit must not extend the TTL, or a merchant who asks every minute never sees a new customer); tool calls")
+	ctx.Assert(*rewritten > 0 && *rewritten <= 120, "right after the command that wrote the refetched result, %s had TTL %d: SET it with its expiry in one command", keys[0], *rewritten)
 }
 
 func CheckWriteOnce(ctx *harness.Ctx) {
 	budgetWorld(ctx)
+	claimed := budgetTTLWhenWritten(ctx, "write:s1:t-1:fill_product_form")
 	first := budgetInvoke(ctx, "s1", "t-1", "fill_product_form", budgetSeo)
 	again := budgetInvoke(ctx, "s1", "t-1", "fill_product_form", budgetSeo)
 	ctx.Equal(budgetInvoked(ctx), []string{"s1 fill_product_form"}, "two fill_product_form calls in turn t-1 must fill the form once; tool calls")
 	ctx.Equal(again, first, "the second call in the turn answers the stored result")
+	ctx.Assert(*claimed != -100, "fill_product_form left no claim write:s1:t-1:fill_product_form")
+	ctx.Assert(*claimed >= 82800 && *claimed <= 86400, "right after the command that created it, the claim write:s1:t-1:fill_product_form had TTL %d: it must live about a day from the SET NX itself", *claimed)
 	ttl := ctx.Redis.TTL("write:s1:t-1:fill_product_form")
 	ctx.Assert(ttl >= 82800 && ttl <= 86400, "the claim write:s1:t-1:fill_product_form must live about a day, TTL %d", ttl)
 	budgetInvoke(ctx, "s1", "t-2", "fill_product_form", budgetSeo)
 	ctx.Equal(len(budgetInvoked(ctx)), 2, "another turn is another write; tool calls")
+	// The tool fails once: nothing was written, so a retry in the same turn must reach it.
+	ctx.GRPC.Fail("Invoke", codes.Unavailable, "the admin is restarting", 1, config.ToolsAddr)
+	_, err := invokeTool(context.Background(), "s1", "t-5", "fill_product_form", budgetSeo)
+	ctx.Assert(err != nil, "fill_product_form failed with UNAVAILABLE in turn t-5 and invokeTool returned no error: the failure must reach the loop")
+	retried := budgetInvoke(ctx, "s1", "t-5", "fill_product_form", budgetSeo)
+	ctx.Assert(strings.Contains(retried, "fill_product_form"), "the retry after a failed write answered %q: a write that failed wrote nothing, so its claim is released and the retry reaches the tool", retried)
+	// Another replica runs turn t-9's write right after this one's first command on the claim: it
+	// claims with SET NX and writes if it got the claim.
+	claim := "write:s1:t-9:fill_product_form"
+	race := ctx.Redis.After(claim, func() any { return ctx.Redis.Set(claim, "", "EX", 86400, "NX") })
+	budgetInvoke(ctx, "s1", "t-9", "fill_product_form", budgetSeo)
+	ctx.Assert(race.Fired, "fill_product_form in turn t-9 never touched %s", claim)
+	writes := 0
+	for _, c := range ctx.GRPC.CallsTo("Invoke", "") {
+		if req, _ := c.Request.(*pb.InvokeRequest); req.GetTurnId() == "t-9" {
+			writes++
+		}
+	}
+	if race.Result == true {
+		writes++
+	}
+	ctx.Equal(writes, 1, "two replicas running turn t-9's fill_product_form at once (the claim must be taken with SET NX before the tool runs); writes")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <algorithm>
 #include <cstdlib>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1188,6 +1378,7 @@ func CheckWriteOnce(ctx *harness.Ctx) {
 namespace {
 
 const std::string kToronto = R"({"query":"default_address_city = Toronto"})";
+const std::string kOttawa = R"({"query":"default_address_city = Ottawa"})";
 const std::string kSeo = R"({"product_id":"p-1","field":"seo_description"})";
 
 // The stand-in tools: answers from sidekick/tools.h.
@@ -1216,6 +1407,26 @@ std::vector<std::string> budgetInvoked(harness::Ctx& ctx) {
 long long requestsIn(harness::Ctx& ctx, const std::string& key) {
   const auto raw = ctx.Redis.HGet(key, "requests");
   return raw ? std::strtoll(raw->c_str(), nullptr, 10) : 0;
+}
+
+std::string budgetKey(harness::Ctx& ctx, const std::string& shop) { return "budget:" + shop + ":" + std::to_string(ctx.Clock.Now() / 1000 / 60); }
+
+void budgetLookTtl(harness::Ctx& ctx, const std::string& key, std::shared_ptr<long long> seen) {
+  ctx.Redis.After(key, [&ctx, key, seen] {
+    if (ctx.Redis.Exists(key) == 1) {
+      *seen = ctx.Redis.TTL(key);
+    } else {
+      budgetLookTtl(ctx, key, seen);
+    }
+  });
+}
+
+// The TTL key has right after the first command that leaves it in Redis (-100 until then): a TTL set
+// by a second command is missing at that instant.
+std::shared_ptr<long long> budgetTtlWhenWritten(harness::Ctx& ctx, const std::string& key) {
+  auto seen = std::make_shared<long long>(-100);
+  budgetLookTtl(ctx, key, seen);
+  return seen;
 }
 
 }  // namespace
@@ -1247,12 +1458,14 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
 
 void CheckBudgetWindow(harness::Ctx& ctx) {
   budgetWorld(ctx);
+  const auto created = budgetTtlWhenWritten(ctx, budgetKey(ctx, "s1"));
   int reserved = 0;
   for (int i = 0; i < 30; ++i) reserved += reserve("s1", 2000) ? 1 : 0;
   ctx.Equal(reserved, 30, "30 requests fit in a minute; reserved");
   ctx.Assert(!reserve("s1", 2000), "the 31st request in a minute must be refused");
+  ctx.Assert(*created != -100, "reserve left no %s: the hash is budget:{shop}:{window} with window = unix seconds / kWindowS", budgetKey(ctx, "s1"));
+  ctx.Assert(*created > 0 && *created <= 60, "right after the command that created it, the budget hash had TTL %d: the EXPIRE belongs in the same script, or a crash between the two leaves a counter that refuses the shop for good", *created);
   const auto keys = ctx.Redis.Keys("budget:s1*");
-  ctx.Assert(!keys.empty(), "reserve left no budget:s1… key");
   const long long ttl = ctx.Redis.TTL(keys[0]);
   ctx.Assert(ttl > 0 && ttl <= 60, "%s has TTL %d: the counter must expire with its 60 s window, or a shop that had one busy minute is refused for good", keys[0], ttl);
   ctx.Clock.Advance(60);
@@ -1260,6 +1473,13 @@ void CheckBudgetWindow(harness::Ctx& ctx) {
   ctx.Assert(reserve("s2", 100000), "100 000 tokens fit in 150 000");
   ctx.Assert(!reserve("s2", 60000), "100 000 + 60 000 tokens is over 150 000 and must be refused");
   ctx.Assert(reserve("s2", 50000), "a refused reservation must not count: 100 000 + 50 000 fits exactly");
+  // Windows follow the clock's minutes: 30 requests in the last second of one minute, then one more in the next.
+  ctx.Clock.Advance(60 - static_cast<double>(ctx.Clock.Now() % 60000) / 1000 - 1);
+  int late = 0;
+  for (int i = 0; i < 30; ++i) late += reserve("s3", 2000) ? 1 : 0;
+  ctx.Assert(late == 30 && !reserve("s3", 2000), "30 requests fit in a minute and the 31st is refused, %d of 30 fit", late);
+  ctx.Clock.Advance(2);
+  ctx.Assert(reserve("s3", 2000), "two seconds later the clock is in the next minute, a new window (window = unix seconds / kWindowS): the shop must reserve again, not wait 60 s from its first request");
 }
 
 void CheckShopScopedCache(harness::Ctx& ctx) {
@@ -1271,6 +1491,8 @@ void CheckShopScopedCache(harness::Ctx& ctx) {
   const std::string other = invoke_tool("s2", "t-3", "segment_customers", kToronto);
   ctx.Assert(other.find(R"("shop":"s2")") != std::string::npos, "s2 asked the same question and got %s: another merchant's customers, served from the cache", other);
   ctx.Equal(budgetInvoked(ctx), std::vector<std::string>{"s1 segment_customers", "s2 segment_customers"}, "each shop's first query reaches the tool");
+  const std::string ottawa = invoke_tool("s1", "t-4", "segment_customers", kOttawa);
+  ctx.Assert(ottawa.find("Ottawa") != std::string::npos && budgetInvoked(ctx).size() == 3, "s1 asking another query must reach the tool and get its answer, got %s: the key holds the arguments' digest", ottawa);
 }
 
 void CheckCacheTtl(harness::Ctx& ctx) {
@@ -1280,21 +1502,56 @@ void CheckCacheTtl(harness::Ctx& ctx) {
   ctx.Equal(keys.size(), 1, "one read leaves one cache key (%v)", keys);
   const long long ttl = ctx.Redis.TTL(keys[0]);
   ctx.Assert(ttl > 0 && ttl <= 120, "%s has TTL %d: cached results expire after kCacheTtl = 120 s", keys[0], ttl);
-  ctx.Clock.Advance(121);
+  ctx.Clock.Advance(100);
   invoke_tool("s1", "t-2", "segment_customers", kToronto);
-  ctx.Equal(budgetInvoked(ctx).size(), 2, "after 121 s the next query must reach the tool again (a customer added a minute ago is invisible); tool calls");
+  ctx.Equal(budgetInvoked(ctx).size(), 1, "100 s later the result is still cached; tool calls");
+  const auto rewritten = budgetTtlWhenWritten(ctx, keys[0]);
+  ctx.Clock.Advance(21);
+  invoke_tool("s1", "t-3", "segment_customers", kToronto);
+  ctx.Equal(budgetInvoked(ctx).size(), 2, "121 s after the result was fetched the next query must reach the tool again (a hit must not extend the TTL, or a merchant who asks every minute never sees a new customer); tool calls");
+  ctx.Assert(*rewritten > 0 && *rewritten <= 120, "right after the command that wrote the refetched result, %s had TTL %d: SET it with its expiry in one command", keys[0], *rewritten);
 }
 
 void CheckWriteOnce(harness::Ctx& ctx) {
   budgetWorld(ctx);
+  const auto claimed = budgetTtlWhenWritten(ctx, "write:s1:t-1:fill_product_form");
   const std::string first = invoke_tool("s1", "t-1", "fill_product_form", kSeo);
   const std::string again = invoke_tool("s1", "t-1", "fill_product_form", kSeo);
   ctx.Equal(budgetInvoked(ctx), std::vector<std::string>{"s1 fill_product_form"}, "two fill_product_form calls in turn t-1 must fill the form once; tool calls");
   ctx.Equal(again, first, "the second call in the turn answers the stored result");
+  ctx.Assert(*claimed != -100, "fill_product_form left no claim write:s1:t-1:fill_product_form");
+  ctx.Assert(*claimed >= 82800 && *claimed <= 86400, "right after the command that created it, the claim write:s1:t-1:fill_product_form had TTL %d: it must live about a day from the SET NX itself", *claimed);
   const long long ttl = ctx.Redis.TTL("write:s1:t-1:fill_product_form");
   ctx.Assert(ttl >= 82800 && ttl <= 86400, "the claim write:s1:t-1:fill_product_form must live about a day, TTL %d", ttl);
   invoke_tool("s1", "t-2", "fill_product_form", kSeo);
   ctx.Equal(budgetInvoked(ctx).size(), 2, "another turn is another write; tool calls");
+  // The tool fails once: nothing was written, so a retry in the same turn must reach it.
+  ctx.GRPC.Fail("Invoke", grpc::StatusCode::UNAVAILABLE, "the admin is restarting");
+  bool raised = false;
+  try {
+    invoke_tool("s1", "t-5", "fill_product_form", kSeo);
+  } catch (const harness::Failure&) {
+    throw;
+  } catch (...) {
+    raised = true;
+  }
+  ctx.Assert(raised, "fill_product_form failed with UNAVAILABLE in turn t-5 and invoke_tool returned anyway: the failure must reach the loop");
+  const std::string retried = invoke_tool("s1", "t-5", "fill_product_form", kSeo);
+  ctx.Assert(retried.find("fill_product_form") != std::string::npos,
+             "the retry after a failed write answered %q: a write that failed wrote nothing, so its claim is released and the retry reaches the tool", retried);
+  // Another replica runs turn t-9's write right after this one's first command on the claim: it
+  // claims with SET NX and writes if it got the claim.
+  const std::string claim = "write:s1:t-9:fill_product_form";
+  bool fired = false, otherWrote = false;
+  ctx.Redis.After(claim, [&ctx, &fired, &otherWrote, claim] {
+    fired = true;
+    otherWrote = ctx.Redis.Set(claim, "", "EX", 86400, "NX");
+  });
+  invoke_tool("s1", "t-9", "fill_product_form", kSeo);
+  ctx.Assert(fired, "fill_product_form in turn t-9 never touched %s", claim);
+  int writes = otherWrote ? 1 : 0;
+  for (const auto& c : ctx.GRPC.CallsTo("Invoke")) writes += c.Request<sidekickrpc::InvokeRequest>().turn_id() == "t-9" ? 1 : 0;
+  ctx.Equal(writes, 1, "two replicas running turn t-9's fill_product_form at once (the claim must be taken with SET NX before the tool runs); writes");
 }
 `,
   },

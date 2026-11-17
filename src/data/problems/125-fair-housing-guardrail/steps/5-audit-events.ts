@@ -54,7 +54,7 @@ leaves a hole in the one store that must be complete.
       id: 'conversation-key',
       title: 'Keyed by conversation, one event id per decision',
       detail:
-        "The record key is the conversation id, so one conversation's decisions share a partition and stay in order; each event carries its own `event_id`. The starter keys by the event id.",
+        "The record key is the conversation id, so one conversation's decisions share a partition and stay in order; each event carries its own `event_id`, even when the same question is decided twice. The starter keys by the event id.",
       match: {
         python: {all: [/key\s*=\s*conversation_id/, /uuid\.uuid4\(\)/]},
         typescript: {all: [/key:\s*conversationId\b/, /randomUUID\(\)/]},
@@ -106,7 +106,7 @@ leaves a hole in the one store that must be complete.
       id: 'append-before-commit',
       title: 'Appends to the audit store before committing the offset',
       detail:
-        'The consumer appends the event (`append_audit`) and only then commits its offset; committed first, a crash in between loses the row for good.',
+        'The consumer appends the event (`append_audit`) and only then commits its offset, and an append that fails is not committed; committed first, a crash in between loses the row for good.',
       match: {
         python: {order: [/store\.append_audit\(/, /consumer\.commit\(/]},
         typescript: {order: [/appendAudit\(/, /commitOffsets\(/]},
@@ -798,13 +798,14 @@ def check_conversation_key(ctx):
     m.audit("c-1", "input", QUESTION, BLOCKED, VERSION)
     m.audit("c-2", "input", "Homes near light rail under $900k", ALLOWED, VERSION)
     m.audit("c-1", "output", "Columbia City has three-bedroom homes in your budget.", ALLOWED, VERSION)
+    m.audit("c-1", "input", QUESTION, BLOCKED, VERSION)  # the same question again, later in the conversation: a decision of its own
     records = ctx.kafka.records(TOPIC)
-    assert len(records) == 3, f"three audit calls produced {len(records)} records on {TOPIC}"
+    assert len(records) == 4, f"four audit calls produced {len(records)} records on {TOPIC}"
     keys = [r.key for r in records]
-    assert keys == [b"c-1", b"c-2", b"c-1"], f"the records are keyed {keys}, expected the conversation ids c-1, c-2, c-1"
+    assert keys == [b"c-1", b"c-2", b"c-1", b"c-1"], f"the records are keyed {keys}, expected the conversation ids c-1, c-2, c-1, c-1"
     assert records[0].partition == records[2].partition, "both decisions of conversation c-1 must land on one partition, or a review reads them out of order"
     ids = [json.loads(r.value).get("event_id") for r in records]
-    assert all(ids) and len(set(ids)) == 3, f"each event needs its own event_id, got {ids}"
+    assert all(ids) and len(set(ids)) == 4, f"each event needs its own event_id, got {ids}: the same question decided twice is two decisions, and the audit store keeps one row per event_id"
 
 
 def check_text_hash(ctx):
@@ -839,14 +840,32 @@ def check_outbox_on_failure(ctx):
     assert len(rows) == 1, f"the broker refused the event and the outbox holds {len(rows)} rows: the decision is gone from the audit trail"
     event = rows[0].get("event", {})
     assert event.get("conversation_id") == "c-1" and event.get("event_id") and rows[0].get("reason"), f"the outbox row must carry the event and the broker's reason: {rows[0]}"
+    assert "families" not in json.dumps(rows[0]), f"the outbox row carries the user's question: {rows[0]}. It keeps the event as produced, with the text hash"
     assert ok is False, f"audit returned {ok!r} after a refused delivery, expected False"
     ok = m.audit("c-2", "input", QUESTION, BLOCKED, VERSION)
     assert ok is True and len(ctx.kafka.records(TOPIC)) == 1, "once the broker accepts events again they reach the topic and audit returns True"
     assert len(store.outbox_rows()) == 1, "a delivered event must not be written to the outbox"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering
+    before = ctx.clock.time()
+    ok = m.audit("c-3", "input", QUESTION, BLOCKED, VERSION)
+    waited = ctx.clock.time() - before
+    assert waited <= 2.5, f"audit waited {waited:.1f} s for a broker that does not answer: wait at most ACK_TIMEOUT_S = 2, then write the outbox row"
+    rows = store.outbox_rows()
+    assert len(rows) == 2 and rows[1].get("event", {}).get("conversation_id") == "c-3" and rows[1].get("reason"), f"no delivery report within 2 s and the outbox holds {rows}: the decision is gone from the audit trail"
+    assert ok is False, f"audit returned {ok!r} without a delivery report, expected False"
 
 
 def check_append_before_commit(ctx):
-    for n, conversation_id in ((1, "c-1"), (2, "c-2"), (3, "c-1")):
+    _seed(ctx, 1, "c-1")
+    ctx.redis.set(store.AUDIT, "not a hash")  # the audit store refuses the append (WRONGTYPE)
+    try:
+        ctx.drain(ctx.load("audit_events").consume)
+    except Exception:
+        pass  # the consumer stops on the failed append: the event stays uncommitted and comes back
+    lag = ctx.kafka.lag("audit", TOPIC)
+    assert lag == 1, f"the audit store refused e-1 and the consumer committed it anyway (lag {lag}): a failed append must not be committed, or the row is lost for good"
+    ctx.redis.delete(store.AUDIT)
+    for n, conversation_id in ((2, "c-2"), (3, "c-1")):
         _seed(ctx, n, conversation_id)
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(len(store.audit_rows())))
@@ -883,14 +902,15 @@ export async function check_conversation_key(ctx) {
   await m.audit('c-1', 'input', QUESTION, BLOCKED, VERSION);
   await m.audit('c-2', 'input', 'Homes near light rail under $900k', ALLOWED, VERSION);
   await m.audit('c-1', 'output', 'Columbia City has three-bedroom homes in your budget.', ALLOWED, VERSION);
+  await m.audit('c-1', 'input', QUESTION, BLOCKED, VERSION); // the same question again, later in the conversation: a decision of its own
   await settle();
   const records = ctx.kafka.records(TOPIC);
-  assert.equal(records.length, 3, \`three audit calls produced \${records.length} records on \${TOPIC}\`);
+  assert.equal(records.length, 4, \`four audit calls produced \${records.length} records on \${TOPIC}\`);
   const keys = ctx.kafka.keys(TOPIC);
-  assert.deepEqual(keys, ['c-1', 'c-2', 'c-1'], \`the records are keyed \${JSON.stringify(keys)}, expected the conversation ids c-1, c-2, c-1\`);
+  assert.deepEqual(keys, ['c-1', 'c-2', 'c-1', 'c-1'], \`the records are keyed \${JSON.stringify(keys)}, expected the conversation ids c-1, c-2, c-1, c-1\`);
   assert.equal(records[0].partition, records[2].partition, 'both decisions of conversation c-1 must land on one partition, or a review reads them out of order');
   const ids = ctx.kafka.values(TOPIC).map(v => JSON.parse(v).event_id);
-  assert(ids.every(Boolean) && new Set(ids).size === 3, \`each event needs its own event_id, got \${JSON.stringify(ids)}\`);
+  assert(ids.every(Boolean) && new Set(ids).size === 4, \`each event needs its own event_id, got \${JSON.stringify(ids)}: the same question decided twice is two decisions, and the audit store keeps one row per event_id\`);
 }
 
 export async function check_text_hash(ctx) {
@@ -932,15 +952,35 @@ export async function check_outbox_on_failure(ctx) {
   const rows = await store(ctx).outboxRows();
   assert.equal(rows.length, 1, \`the broker refused the event and the outbox holds \${rows.length} rows: the decision is gone from the audit trail\`);
   assert(rows[0].event?.conversation_id === 'c-1' && rows[0].event?.event_id && rows[0].reason, \`the outbox row must carry the event and the broker's reason: \${JSON.stringify(rows[0])}\`);
+  assert(!JSON.stringify(rows[0]).includes('families'), \`the outbox row carries the user's question: \${JSON.stringify(rows[0])}. It keeps the event as produced, with the text hash\`);
   assert.equal(ok, false, \`audit resolved \${JSON.stringify(ok)} after a refused delivery, expected false\`);
   ok = await m.audit('c-2', 'input', QUESTION, BLOCKED, VERSION);
   await settle();
   assert(ok === true && ctx.kafka.records(TOPIC).length === 1, 'once the broker accepts events again they reach the topic and audit resolves true');
   assert.equal((await store(ctx).outboxRows()).length, 1, 'a delivered event must not be written to the outbox');
+  ctx.kafka.stall(TOPIC); // the broker stops answering
+  const before = ctx.clock.now();
+  ok = await m.audit('c-3', 'input', QUESTION, BLOCKED, VERSION);
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 2.5, \`audit waited \${waited.toFixed(1)} s for a broker that does not answer: wait at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
+  const stalled = await store(ctx).outboxRows();
+  assert(stalled.length === 2 && stalled[1].event?.conversation_id === 'c-3' && stalled[1].reason, \`no delivery report within 2 s and the outbox holds \${JSON.stringify(stalled)}: the decision is gone from the audit trail\`);
+  assert.equal(ok, false, \`audit resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
 }
 
 export async function check_append_before_commit(ctx) {
-  for (const [n, conversationId] of [[1, 'c-1'], [2, 'c-2'], [3, 'c-1']] as const) seed(ctx, n, conversationId);
+  seed(ctx, 1, 'c-1');
+  ctx.redis.set('fhstore:audit', 'not a hash'); // the audit store refuses the append (WRONGTYPE)
+  try {
+    await ctx.drain(ctx.load('audit_events').consume());
+  } catch {
+    // the consumer stops on the failed append: the event stays uncommitted and comes back
+  }
+  const lag = ctx.kafka.lag('audit', TOPIC);
+  assert.equal(lag, 1, \`the audit store refused e-1 and the consumer committed it anyway (lag \${lag}): a failed append must not be committed, or the row is lost for good\`);
+  ctx.redis.del('fhstore:audit');
+  seed(ctx, 2, 'c-2');
+  seed(ctx, 3, 'c-1');
   const s = store(ctx);
   const atCommit: number[] = [];
   ctx.kafka.onCommit(() => atCommit.push(ctx.redis.hlen('fhstore:audit')));
@@ -970,104 +1010,120 @@ import (
 )
 
 const (
-	auditTopicName = "fairhousing.audit"
-	auditVersion   = "fh-2024-05-21"
-	auditQuestion  = "Which blocks have fewer families with kids?"
+	hAuditTopicName = "fairhousing.audit"
+	hAuditVersion   = "fh-2024-05-21"
+	hAuditQuestion  = "Which blocks have fewer families with kids?"
 )
 
 var (
-	auditBg      = context.Background()
-	auditBlocked = store.Decision{Allowed: false, Tier: "classifier", Score: 0.4, Reasons: []string{"classifier:familial_status"}}
-	auditAllowed = store.Decision{Allowed: true, Tier: "classifier", Score: 0.04, Reasons: []string{}}
+	hAuditBg      = context.Background()
+	hAuditBlocked = store.Decision{Allowed: false, Tier: "classifier", Score: 0.4, Reasons: []string{"classifier:familial_status"}}
+	hAuditAllowed = store.Decision{Allowed: true, Tier: "classifier", Score: 0.04, Reasons: []string{}}
 )
 
-func record(ctx *harness.Ctx, conversationID, direction, text string, decision store.Decision) bool {
-	ok, err := audit(auditBg, conversationID, direction, text, decision, auditVersion)
+func hRecord(ctx *harness.Ctx, conversationID, direction, text string, decision store.Decision) bool {
+	ok, err := audit(hAuditBg, conversationID, direction, text, decision, hAuditVersion)
 	ctx.NoError(err, "audit(%s) failed", conversationID)
 	return ok
 }
 
-func seedAudit(ctx *harness.Ctx, n int, conversationID string) {
-	event := map[string]any{"event_id": fmt.Sprintf("e-%d", n), "conversation_id": conversationID, "direction": "input", "text_hash": fmt.Sprintf("%064d", n), "allowed": true, "tier": "classifier", "score": 0.04, "reasons": []string{}, "policy_version": auditVersion, "ts": n}
+func hSeedAudit(ctx *harness.Ctx, n int, conversationID string) {
+	event := map[string]any{"event_id": fmt.Sprintf("e-%d", n), "conversation_id": conversationID, "direction": "input", "text_hash": fmt.Sprintf("%064d", n), "allowed": true, "tier": "classifier", "score": 0.04, "reasons": []string{}, "policy_version": hAuditVersion, "ts": n}
 	value, _ := json.Marshal(event)
-	ctx.Kafka.Seed(auditTopicName, conversationID, string(value))
+	ctx.Kafka.Seed(hAuditTopicName, conversationID, string(value))
 }
 
 func CheckConversationKey(ctx *harness.Ctx) {
-	record(ctx, "c-1", "input", auditQuestion, auditBlocked)
-	record(ctx, "c-2", "input", "Homes near light rail under $900k", auditAllowed)
-	record(ctx, "c-1", "output", "Columbia City has three-bedroom homes in your budget.", auditAllowed)
+	hRecord(ctx, "c-1", "input", hAuditQuestion, hAuditBlocked)
+	hRecord(ctx, "c-2", "input", "Homes near light rail under $900k", hAuditAllowed)
+	hRecord(ctx, "c-1", "output", "Columbia City has three-bedroom homes in your budget.", hAuditAllowed)
+	hRecord(ctx, "c-1", "input", hAuditQuestion, hAuditBlocked) // the same question again, later in the conversation: a decision of its own
 	ctx.Settle()
-	records := ctx.Kafka.Records(auditTopicName)
-	ctx.Equal(len(records), 3, "three audit calls; the records on %s", auditTopicName)
-	ctx.Equal(ctx.Kafka.Keys(auditTopicName), []string{"c-1", "c-2", "c-1"}, "the records must be keyed by the conversation ids")
+	records := ctx.Kafka.Records(hAuditTopicName)
+	ctx.Equal(len(records), 4, "four audit calls; the records on %s", hAuditTopicName)
+	ctx.Equal(ctx.Kafka.Keys(hAuditTopicName), []string{"c-1", "c-2", "c-1", "c-1"}, "the records must be keyed by the conversation ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both decisions of conversation c-1 must land on one partition, or a review reads them out of order; the partitions")
 	seen := map[string]bool{}
-	for _, v := range ctx.Kafka.Values(auditTopicName) {
+	for _, v := range ctx.Kafka.Values(hAuditTopicName) {
 		var event map[string]any
 		json.Unmarshal([]byte(v), &event)
 		id, _ := event["event_id"].(string)
 		ctx.Assert(id != "", "each event needs its own event_id, got %s", v)
 		seen[id] = true
 	}
-	ctx.Equal(len(seen), 3, "each event needs its own event_id; the distinct ids")
+	ctx.Equal(len(seen), 4, "each event needs its own event_id (the same question decided twice is two decisions, and the audit store keeps one row per event_id); the distinct ids")
 }
 
 func CheckTextHash(ctx *harness.Ctx) {
-	record(ctx, "c-1", "input", auditQuestion, auditBlocked)
+	hRecord(ctx, "c-1", "input", hAuditQuestion, hAuditBlocked)
 	ctx.Settle()
-	values := ctx.Kafka.Values(auditTopicName)
+	values := ctx.Kafka.Values(hAuditTopicName)
 	ctx.Equal(len(values), 1, "one audit call; the records")
 	ctx.Assert(!strings.Contains(values[0], "families"), "the audit event carries the user's question: %s", values[0])
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
-	sum := sha256.Sum256([]byte(auditQuestion))
+	sum := sha256.Sum256([]byte(hAuditQuestion))
 	ctx.Equal(event["text_hash"], hex.EncodeToString(sum[:]), "text_hash must be the SHA-256 hex of the text")
-	ctx.Assert(event["allowed"] == false && event["policy_version"] == auditVersion, "the event must carry the verdict and the policy version: %s", values[0])
+	ctx.Assert(event["allowed"] == false && event["policy_version"] == hAuditVersion, "the event must carry the verdict and the policy version: %s", values[0])
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(auditTopicName, 1) // the broker wrote it, the acknowledgement never arrived
-	record(ctx, "c-1", "input", auditQuestion, auditBlocked)
+	ctx.Kafka.LoseAcks(hAuditTopicName, 1) // the broker wrote it, the acknowledgement never arrived
+	hRecord(ctx, "c-1", "input", hAuditQuestion, hAuditBlocked)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(auditTopicName)), 1, "after one lost acknowledgement the producer's retry must not write the decision twice (enable.idempotence); the records")
-	record(ctx, "c-2", "input", auditQuestion, auditBlocked)
+	ctx.Equal(len(ctx.Kafka.Records(hAuditTopicName)), 1, "after one lost acknowledgement the producer's retry must not write the decision twice (enable.idempotence); the records")
+	hRecord(ctx, "c-2", "input", hAuditQuestion, hAuditBlocked)
 	ctx.Settle()
-	ctx.Kafka.Failover(auditTopicName) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(auditTopicName)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hAuditTopicName) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hAuditTopicName)), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(auditTopicName, 1)
-	ok := record(ctx, "c-1", "input", auditQuestion, auditBlocked)
+	ctx.Kafka.FailNext(hAuditTopicName, 1)
+	ok := hRecord(ctx, "c-1", "input", hAuditQuestion, hAuditBlocked)
 	ctx.Settle()
-	rows := store.OutboxRows(auditBg)
+	rows := store.OutboxRows(hAuditBg)
 	ctx.Equal(len(rows), 1, "the broker refused the event: without an outbox row the decision is gone from the audit trail; the rows")
 	ctx.Assert(rows[0].Event["conversation_id"] == "c-1" && rows[0].Event["event_id"] != nil && rows[0].Reason != "", "the outbox row must carry the event and the broker's reason: %+v", rows[0])
+	raw, _ := json.Marshal(rows[0])
+	ctx.Assert(!strings.Contains(string(raw), "families"), "the outbox row carries the user's question: %s. It keeps the event as produced, with the text hash", raw)
 	ctx.Equal(ok, false, "audit's result after a refused delivery")
-	ok = record(ctx, "c-2", "input", auditQuestion, auditBlocked)
+	ok = hRecord(ctx, "c-2", "input", hAuditQuestion, hAuditBlocked)
 	ctx.Settle()
-	ctx.Assert(ok && len(ctx.Kafka.Records(auditTopicName)) == 1, "once the broker accepts events again they reach the topic and audit returns true")
-	ctx.Equal(len(store.OutboxRows(auditBg)), 1, "a delivered event must not be written to the outbox; the rows")
+	ctx.Assert(ok && len(ctx.Kafka.Records(hAuditTopicName)) == 1, "once the broker accepts events again they reach the topic and audit returns true")
+	ctx.Equal(len(store.OutboxRows(hAuditBg)), 1, "a delivered event must not be written to the outbox; the rows")
+	ctx.Kafka.Stall(hAuditTopicName) // the broker stops answering
+	before := ctx.Clock.Now()
+	ok = hRecord(ctx, "c-3", "input", hAuditQuestion, hAuditBlocked)
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 2.5, "audit waited %.1f s for a broker that does not answer: wait at most ackTimeout = 2 s, then write the outbox row", waited)
+	rows = store.OutboxRows(hAuditBg)
+	ctx.Assert(len(rows) == 2 && rows[1].Event["conversation_id"] == "c-3" && rows[1].Reason != "", "no delivery report within 2 s and the outbox holds %+v: the decision is gone from the audit trail", rows)
+	ctx.Equal(ok, false, "audit's result without a delivery report")
 }
 
 func CheckAppendBeforeCommit(ctx *harness.Ctx) {
-	seedAudit(ctx, 1, "c-1")
-	seedAudit(ctx, 2, "c-2")
-	seedAudit(ctx, 3, "c-1")
+	hSeedAudit(ctx, 1, "c-1")
+	ctx.Redis.Set("fhstore:audit", "not a hash") // the audit store refuses the append (WRONGTYPE)
+	ctx.Drain(func() { consume(hAuditBg) })      // the consumer stops on the failed append: the event stays uncommitted and comes back
+	lag := ctx.Kafka.Lag("audit", hAuditTopicName)
+	ctx.Assert(lag == 1, "the audit store refused e-1 and the consumer committed it anyway (lag %d): a failed append must not be committed, or the row is lost for good", lag)
+	ctx.Redis.Del("fhstore:audit")
+	hSeedAudit(ctx, 2, "c-2")
+	hSeedAudit(ctx, 3, "c-1")
 	var atCommit []int64
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.HLen("fhstore:audit")) })
-	ctx.Drain(func() { consume(auditBg) })
+	ctx.Drain(func() { consume(hAuditBg) })
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
 	ctx.Assert(atCommit[0] >= 1, "at the first commit the audit store held %d rows: append first, or a crash between the commit and the append loses the row", atCommit[0])
 	var ids []string
-	for _, row := range store.AuditRows(auditBg) {
+	for _, row := range store.AuditRows(hAuditBg) {
 		id, _ := row["event_id"].(string)
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
 	ctx.Equal(ids, []string{"e-1", "e-2", "e-3"}, "the audit store's event ids")
-	ctx.Equal(ctx.Kafka.Lag("audit", auditTopicName), 0, "every appended event must be committed; the lag")
+	ctx.Equal(ctx.Kafka.Lag("audit", hAuditTopicName), 0, "every appended event must be committed; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1084,94 +1140,114 @@ func CheckAppendBeforeCommit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTopic = "fairhousing.audit";
-const std::string kVersion = "fh-2024-05-21";
-const std::string kQuestion = "Which blocks have fewer families with kids?";
-const store::Decision kBlocked{false, "classifier", 0.4, {"classifier:familial_status"}};
-const store::Decision kAllowed{true, "classifier", 0.04, {}};
+const std::string kHTopic = "fairhousing.audit";
+const std::string kHVersion = "fh-2024-05-21";
+const std::string kHQuestion = "Which blocks have fewer families with kids?";
+const store::Decision kHBlocked{false, "classifier", 0.4, {"classifier:familial_status"}};
+const store::Decision kHAllowed{true, "classifier", 0.04, {}};
 
-void seedAudit(harness::Ctx& ctx, int n, const std::string& conversation_id) {
+void hSeedAudit(harness::Ctx& ctx, int n, const std::string& conversation_id) {
   const nlohmann::json event = {{"event_id", "e-" + std::to_string(n)}, {"conversation_id", conversation_id}, {"direction", "input"},
                                 {"text_hash", std::string(63, '0') + std::to_string(n)}, {"allowed", true}, {"tier", "classifier"},
-                                {"score", 0.04}, {"reasons", nlohmann::json::array()}, {"policy_version", kVersion}, {"ts", n}};
-  ctx.Kafka.Seed(kTopic, conversation_id, event.dump());
+                                {"score", 0.04}, {"reasons", nlohmann::json::array()}, {"policy_version", kHVersion}, {"ts", n}};
+  ctx.Kafka.Seed(kHTopic, conversation_id, event.dump());
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckConversationKey(harness::Ctx& ctx) {
-  audit("c-1", "input", kQuestion, kBlocked, kVersion);
-  audit("c-2", "input", "Homes near light rail under $900k", kAllowed, kVersion);
-  audit("c-1", "output", "Columbia City has three-bedroom homes in your budget.", kAllowed, kVersion);
+  audit("c-1", "input", kHQuestion, kHBlocked, kHVersion);
+  audit("c-2", "input", "Homes near light rail under $900k", kHAllowed, kHVersion);
+  audit("c-1", "output", "Columbia City has three-bedroom homes in your budget.", kHAllowed, kHVersion);
+  audit("c-1", "input", kHQuestion, kHBlocked, kHVersion);  // the same question again, later in the conversation: a decision of its own
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three audit calls; the records on %s", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"c-1", "c-2", "c-1"}, "the records must be keyed by the conversation ids");
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 4, "four audit calls; the records on %s", kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"c-1", "c-2", "c-1", "c-1"}, "the records must be keyed by the conversation ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both decisions of conversation c-1 must land on one partition, or a review reads them out of order; the partitions");
   std::set<std::string> ids;
-  for (const auto& v : ctx.Kafka.Values(kTopic)) {
-    const std::string id = field(nlohmann::json::parse(v, nullptr, false), "event_id");
+  for (const auto& v : ctx.Kafka.Values(kHTopic)) {
+    const std::string id = hField(nlohmann::json::parse(v, nullptr, false), "event_id");
     ctx.Assert(!id.empty(), "each event needs its own event_id, got %s", v);
     ids.insert(id);
   }
-  ctx.Equal(ids.size(), 3, "each event needs its own event_id; the distinct ids");
+  ctx.Equal(ids.size(), 4, "each event needs its own event_id (the same question decided twice is two decisions, and the audit store keeps one row per event_id); the distinct ids");
 }
 
 void CheckTextHash(harness::Ctx& ctx) {
-  audit("c-1", "input", kQuestion, kBlocked, kVersion);
+  audit("c-1", "input", kHQuestion, kHBlocked, kHVersion);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kTopic);
+  const auto values = ctx.Kafka.Values(kHTopic);
   ctx.Equal(values.size(), 1, "one audit call; the records");
   ctx.Assert(values[0].find("families") == std::string::npos, "the audit event carries the user's question: %s", values[0]);
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Equal(field(event, "text_hash"), sha256_hex(kQuestion), "text_hash must be the SHA-256 hex of the text");
-  ctx.Assert(event.is_object() && event.value("allowed", true) == false && field(event, "policy_version") == kVersion, "the event must carry the verdict and the policy version: %s", values[0]);
+  ctx.Equal(hField(event, "text_hash"), sha256_hex(kHQuestion), "text_hash must be the SHA-256 hex of the text");
+  ctx.Assert(event.is_object() && event.value("allowed", true) == false && hField(event, "policy_version") == kHVersion, "the event must carry the verdict and the policy version: %s", values[0]);
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  audit("c-1", "input", kQuestion, kBlocked, kVersion);
+  ctx.Kafka.LoseAcks(kHTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  audit("c-1", "input", kHQuestion, kHBlocked, kHVersion);
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the decision twice (enable.idempotence); the records");
-  audit("c-2", "input", kQuestion, kBlocked, kVersion);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the decision twice (enable.idempotence); the records");
+  audit("c-2", "input", kHQuestion, kHBlocked, kHVersion);
   ctx.Settle();
-  ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTopic, 1);
-  bool ok = audit("c-1", "input", kQuestion, kBlocked, kVersion);
+  ctx.Kafka.FailNext(kHTopic, 1);
+  bool ok = audit("c-1", "input", kHQuestion, kHBlocked, kHVersion);
   ctx.Settle();
   auto rows = store::outboxRows();
   ctx.Equal(rows.size(), 1, "the broker refused the event: without an outbox row the decision is gone from the audit trail; the rows");
-  ctx.Assert(rows[0].contains("event") && field(rows[0]["event"], "conversation_id") == "c-1" && !field(rows[0]["event"], "event_id").empty() && !field(rows[0], "reason").empty(),
+  ctx.Assert(rows[0].contains("event") && hField(rows[0]["event"], "conversation_id") == "c-1" && !hField(rows[0]["event"], "event_id").empty() && !hField(rows[0], "reason").empty(),
              "the outbox row must carry the event and the broker's reason: %s", rows[0].dump());
+  ctx.Assert(rows[0].dump().find("families") == std::string::npos, "the outbox row carries the user's question: %s. It keeps the event as produced, with the text hash", rows[0].dump());
   ctx.Equal(ok, false, "audit's result after a refused delivery");
-  ok = audit("c-2", "input", kQuestion, kBlocked, kVersion);
+  ok = audit("c-2", "input", kHQuestion, kHBlocked, kHVersion);
   ctx.Settle();
-  ctx.Assert(ok && ctx.Kafka.Records(kTopic).size() == 1, "once the broker accepts events again they reach the topic and audit returns true");
+  ctx.Assert(ok && ctx.Kafka.Records(kHTopic).size() == 1, "once the broker accepts events again they reach the topic and audit returns true");
   ctx.Equal(store::outboxRows().size(), 1, "a delivered event must not be written to the outbox; the rows");
+  ctx.Kafka.Stall(kHTopic);  // the broker stops answering
+  const long long before = ctx.Clock.Now();
+  ok = audit("c-3", "input", kHQuestion, kHBlocked, kHVersion);
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 2.5, "audit waited %.1f s for a broker that does not answer: wait at most kAckTimeout = 2 s, then write the outbox row", waited);
+  rows = store::outboxRows();
+  ctx.Assert(rows.size() == 2 && rows[1].contains("event") && hField(rows[1]["event"], "conversation_id") == "c-3" && !hField(rows[1], "reason").empty(),
+             "no delivery report within 2 s and the outbox holds %d rows: the decision is gone from the audit trail", rows.size());
+  ctx.Equal(ok, false, "audit's result without a delivery report");
 }
 
 void CheckAppendBeforeCommit(harness::Ctx& ctx) {
-  seedAudit(ctx, 1, "c-1");
-  seedAudit(ctx, 2, "c-2");
-  seedAudit(ctx, 3, "c-1");
+  hSeedAudit(ctx, 1, "c-1");
+  ctx.Redis.Set("fhstore:audit", "not a hash");  // the audit store refuses the append (WRONGTYPE)
+  try {
+    ctx.Drain([] { consume(); });
+  } catch (...) {
+    // the consumer stops on the failed append: the event stays uncommitted and comes back
+  }
+  const long long lag = ctx.Kafka.Lag("audit", kHTopic);
+  ctx.Assert(lag == 1, "the audit store refused e-1 and the consumer committed it anyway (lag %d): a failed append must not be committed, or the row is lost for good", lag);
+  ctx.Redis.Del("fhstore:audit");
+  hSeedAudit(ctx, 2, "c-2");
+  hSeedAudit(ctx, 3, "c-1");
   std::vector<size_t> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(store::auditRows().size()); });
   ctx.Drain([] { consume(); });
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
   ctx.Assert(atCommit[0] >= 1, "at the first commit the audit store held %d rows: append first, or a crash between the commit and the append loses the row", atCommit[0]);
   std::vector<std::string> ids;
-  for (const auto& row : store::auditRows()) ids.push_back(field(row, "event_id"));
+  for (const auto& row : store::auditRows()) ids.push_back(hField(row, "event_id"));
   std::sort(ids.begin(), ids.end());
   ctx.Equal(ids, std::vector<std::string>{"e-1", "e-2", "e-3"}, "the audit store's event ids");
-  ctx.Equal(ctx.Kafka.Lag("audit", kTopic), 0, "every appended event must be committed; the lag");
+  ctx.Equal(ctx.Kafka.Lag("audit", kHTopic), 0, "every appended event must be committed; the lag");
 }
 `,
   },

@@ -79,7 +79,7 @@ unchecked, and a 0.79 ships after a 0.95.
       id: 'calibrated-judges',
       title: 'Refuses to gate with a judge that disagrees with humans',
       detail:
-        'With a judge that scores every conversation 1.0, the correctness labels disagree with the human labels (kappa 0), so the gate refuses and records nothing; with the calibrated judge the same version ships. The starter never compares the judge with the humans.',
+        'With a judge that scores every conversation 1.0, the correctness labels disagree with the human labels (kappa 0), so the gate refuses and records nothing; the same holds when only the helpfulness judge scores everything 1.0; with the calibrated judges the same version ships. The starter never compares the judge with the humans.',
       match: {
         python: {all: [/cohen_kappa\(/, /MIN_JUDGE_KAPPA/, /human_labels/]},
         typescript: {all: [/cohenKappa\(/, /MIN_JUDGE_KAPPA/, /human_labels/]},
@@ -105,7 +105,7 @@ unchecked, and a 0.79 ships after a 0.95.
       id: 'ship-decision',
       title: 'Ships only above the floor and within the regression limit',
       detail:
-        'Against a baseline of 0.95 correctness and helpfulness: v-early (correctness 0.65) and v-regress (helpfulness 0.90) are refused, v-good ships and its means are recorded. The starter ships anything above 0.5.',
+        'Against a baseline of 0.95 correctness and helpfulness: v-early (correctness 0.65) and v-regress (helpfulness 0.90) are refused, v-good ships and its means are recorded, and so does helpfulness 0.94, a point under the baseline; with the baseline at 0.8, correctness of exactly 0.8 ships and 0.795 does not. The starter ships anything above 0.5.',
       match: {
         python: {all: [/MIN_SCORE/, /MAX_REGRESSION/, /gtx\.baseline\(/]},
         typescript: {all: [/MIN_SCORE/, /MAX_REGRESSION/, /gtx\.baseline\(/]},
@@ -655,14 +655,18 @@ BASELINE = {"correctness": "0.95", "schema_compliance": "1.0", "helpfulness": "0
 
 
 class JudgePeer(merchant_agent_pb2_grpc.JudgeServicer):
-    """The stand-in judges (sidekick.judge); rubber_stamp makes them score everything 1.0."""
+    """The stand-in judges (sidekick.judge): rubber_stamp makes the named criteria's judges score everything 1.0;
+    misses[criterion] lists conversation indices that judge scores 0 (a version whose conversations miss there)."""
 
     def __init__(self):
-        self.rubber_stamp = False
+        self.rubber_stamp = set()
+        self.misses = {}
 
     def Score(self, request, context):
-        if self.rubber_stamp:
+        if request.criterion in self.rubber_stamp:
             return merchant_agent_pb2.ScoreReply(score=1.0)
+        if int(request.conversation_id.rsplit("-", 1)[1]) in self.misses.get(request.criterion, ()):
+            return merchant_agent_pb2.ScoreReply(score=0.0)
         return merchant_agent_pb2.ScoreReply(score=judge.score(request.criterion, request.rubric, request.transcript))
 
 
@@ -704,11 +708,15 @@ def check_judge_per_criterion(ctx):
 
 def check_calibrated_judges(ctx):
     m, peer = _world(ctx)
-    peer.rubber_stamp = True
+    peer.rubber_stamp = set(evals.CRITERIA)
     decision = m.gate("v-good")
     assert decision.ship is False, f"a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway: {decision}"
     assert not ctx.redis.exists("gtx:release:v-good"), "a refused release must record nothing"
-    peer.rubber_stamp = False
+    peer.rubber_stamp = {"helpfulness"}
+    decision = m.gate("v-good")
+    assert decision.ship is False, f"the correctness judge is calibrated but the helpfulness judge scores everything 1.0 (kappa 0 against the labellers) and the gate shipped: every criterion's judge is calibrated before its mean counts, {decision}"
+    assert not ctx.redis.exists("gtx:release:v-good"), "a refused release must record nothing"
+    peer.rubber_stamp = set()
     decision = m.gate("v-good")
     assert decision.ship is True, f"with judges that agree with the labellers v-good ships: {decision}"
 
@@ -722,7 +730,7 @@ def check_schema_first(ctx):
 
 
 def check_ship_decision(ctx):
-    m, _ = _world(ctx)
+    m, peer = _world(ctx)
     early = m.gate("v-early")
     assert early.ship is False, f"v-early's correctness is 0.65, under MIN_SCORE = 0.8, and it shipped: {early}"
     regress = m.gate("v-regress")
@@ -732,20 +740,38 @@ def check_ship_decision(ctx):
     recorded = ctx.redis.hgetall("gtx:release:v-good")
     assert set(recorded) == set(evals.CRITERIA) and abs(float(recorded["correctness"]) - 0.95) < 1e-6, f"a shipped version records its mean per criterion: {recorded}"
     assert not ctx.redis.exists("gtx:release:v-early") and not ctx.redis.exists("gtx:release:v-regress"), "a refused version must record nothing"
+    # Helpfulness 0.94 against a baseline of 0.95: one point down, within MAX_REGRESSION = 0.02.
+    peer.misses = {"helpfulness": {2, 22}}
+    within = m.gate("v-good")
+    assert within.ship is True, f"helpfulness {within.means.get('helpfulness')} is 0.01 below the baseline 0.95, within MAX_REGRESSION = 0.02, and the gate refused: {within}"
+    # Correctness exactly at MIN_SCORE = 0.8 (the baseline lowered to 0.8) ships; 0.795 does not.
+    ctx.redis.hset("gtx:baseline", "correctness", "0.8")
+    peer.misses = {"correctness": {i for i in range(200) if i % 20 in (1, 2, 3)}}
+    floor = m.gate("v-good")
+    assert floor.ship is True, f"correctness {floor.means.get('correctness')} is exactly MIN_SCORE = 0.8, at least the floor, and the gate refused: {floor}"
+    peer.misses = {"correctness": {i for i in range(200) if i % 20 in (1, 2, 3)} | {4}}
+    under = m.gate("v-good")
+    assert under.ship is False, f"correctness {under.means.get('correctness')} is under MIN_SCORE = 0.8 and the gate shipped: {under}"
 `,
     typescript: `const BASELINE = {correctness: '0.95', schema_compliance: '1.0', helpfulness: '0.95'};
 
-/** The stand-in judges (sidekick/judge), the baseline seeded, the learner's module. */
+/**
+ * The stand-in judges (sidekick/judge), the baseline seeded, the learner's module. peer.rubberStamp
+ * makes the named criteria's judges score everything 1; peer.misses[criterion] lists conversation
+ * indices that judge scores 0.
+ */
 function world(ctx) {
   const {sidekickrpc} = ctx.proto('merchant_agent.proto');
   const config = ctx.load('/support/sidekick/config.ts');
   const judge = ctx.load('/support/sidekick/judge.ts');
   const evals = ctx.load('/support/sidekick/evals.ts');
-  const peer = {rubberStamp: false};
+  const peer = {rubberStamp: [] as string[], misses: {} as Record<string, number[]>};
   ctx.grpc.serve(sidekickrpc.Judge.service, {
     Score(call, callback) {
-      if (peer.rubberStamp) return callback(null, {score: 1});
-      return callback(null, {score: judge.score(call.request.criterion, call.request.rubric, call.request.transcript)});
+      const {criterion, conversation_id: id} = call.request;
+      if (peer.rubberStamp.includes(criterion)) return callback(null, {score: 1});
+      if ((peer.misses[criterion] ?? []).includes(Number(id.split('-').pop()))) return callback(null, {score: 0});
+      return callback(null, {score: judge.score(criterion, call.request.rubric, call.request.transcript)});
     },
   }, config.JUDGE_ADDR);
   ctx.redis.hset('gtx:baseline', BASELINE);
@@ -780,12 +806,16 @@ export async function check_judge_per_criterion(ctx) {
 }
 
 export async function check_calibrated_judges(ctx) {
-  const {m, peer} = world(ctx);
-  peer.rubberStamp = true;
+  const {m, peer, evals} = world(ctx);
+  peer.rubberStamp = [...evals.CRITERIA];
   let decision = await m.gate('v-good');
   assert.equal(decision.ship, false, \`a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway: \${JSON.stringify(decision)}\`);
   assert.equal(ctx.redis.exists('gtx:release:v-good'), 0, 'a refused release must record nothing');
-  peer.rubberStamp = false;
+  peer.rubberStamp = ['helpfulness'];
+  decision = await m.gate('v-good');
+  assert.equal(decision.ship, false, \`the correctness judge is calibrated but the helpfulness judge scores everything 1.0 (kappa 0 against the labellers) and the gate shipped: every criterion's judge is calibrated before its mean counts, \${JSON.stringify(decision)}\`);
+  assert.equal(ctx.redis.exists('gtx:release:v-good'), 0, 'a refused release must record nothing');
+  peer.rubberStamp = [];
   decision = await m.gate('v-good');
   assert.equal(decision.ship, true, \`with judges that agree with the labellers v-good ships: \${JSON.stringify(decision)}\`);
 }
@@ -799,7 +829,7 @@ export async function check_schema_first(ctx) {
 }
 
 export async function check_ship_decision(ctx) {
-  const {m, evals} = world(ctx);
+  const {m, peer, evals} = world(ctx);
   const early = await m.gate('v-early');
   assert.equal(early.ship, false, \`v-early's correctness is 0.65, under MIN_SCORE = 0.8, and it shipped: \${JSON.stringify(early)}\`);
   const regress = await m.gate('v-regress');
@@ -809,6 +839,19 @@ export async function check_ship_decision(ctx) {
   const recorded = ctx.redis.hgetall('gtx:release:v-good');
   assert(Object.keys(recorded).sort().join() === [...evals.CRITERIA].sort().join() && Math.abs(Number(recorded.correctness) - 0.95) < 1e-6, \`a shipped version records its mean per criterion: \${JSON.stringify(recorded)}\`);
   assert(ctx.redis.exists('gtx:release:v-early') === 0 && ctx.redis.exists('gtx:release:v-regress') === 0, 'a refused version must record nothing');
+  // Helpfulness 0.94 against a baseline of 0.95: one point down, within MAX_REGRESSION = 0.02.
+  peer.misses = {helpfulness: [2, 22]};
+  const within = await m.gate('v-good');
+  assert.equal(within.ship, true, \`helpfulness \${within.means?.helpfulness} is 0.01 below the baseline 0.95, within MAX_REGRESSION = 0.02, and the gate refused: \${JSON.stringify(within)}\`);
+  // Correctness exactly at MIN_SCORE = 0.8 (the baseline lowered to 0.8) ships; 0.795 does not.
+  ctx.redis.hset('gtx:baseline', 'correctness', '0.8');
+  const atFloor = Array.from({length: 200}, (_, i) => i).filter(i => [1, 2, 3].includes(i % 20));
+  peer.misses = {correctness: atFloor};
+  const floor = await m.gate('v-good');
+  assert.equal(floor.ship, true, \`correctness \${floor.means?.correctness} is exactly MIN_SCORE = 0.8, at least the floor, and the gate refused: \${JSON.stringify(floor)}\`);
+  peer.misses = {correctness: [...atFloor, 4]};
+  const under = await m.gate('v-good');
+  assert.equal(under.ship, false, \`correctness \${under.means?.correctness} is under MIN_SCORE = 0.8 and the gate shipped: \${JSON.stringify(under)}\`);
 }
 `,
     go: `package main
@@ -828,17 +871,36 @@ import (
 	"leetbuild/harness"
 )
 
-// gatePeer is the stand-in judges (sidekick/judge); rubberStamp makes them score everything 1.0.
+// gatePeer is the stand-in judges (sidekick/judge): rubberStamp makes the named criteria's judges
+// score everything 1.0; misses[criterion] lists conversation indices that judge scores 0.
 type gatePeer struct {
 	pb.UnimplementedJudgeServer
-	rubberStamp bool
+	rubberStamp map[string]bool
+	misses      map[string]map[int]bool
 }
 
 func (p *gatePeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreReply, error) {
-	if p.rubberStamp {
+	if p.rubberStamp[req.GetCriterion()] {
 		return &pb.ScoreReply{Score: 1}, nil
 	}
+	parts := strings.Split(req.GetConversationId(), "-")
+	if i, err := strconv.Atoi(parts[len(parts)-1]); err == nil && p.misses[req.GetCriterion()][i] {
+		return &pb.ScoreReply{Score: 0}, nil
+	}
 	return &pb.ScoreReply{Score: judge.Score(req.GetCriterion(), req.GetRubric(), req.GetTranscript())}, nil
+}
+
+// gateIndices is the set of conversation indices below 200 whose position in the cycle of 20 is listed.
+func gateIndices(positions ...int) map[int]bool {
+	out := map[int]bool{}
+	for i := 0; i < 200; i++ {
+		for _, p := range positions {
+			if i%20 == p {
+				out[i] = true
+			}
+		}
+	}
+	return out
 }
 
 func gateWorld(ctx *harness.Ctx) *gatePeer {
@@ -899,11 +961,15 @@ func CheckJudgePerCriterion(ctx *harness.Ctx) {
 
 func CheckCalibratedJudges(ctx *harness.Ctx) {
 	peer := gateWorld(ctx)
-	peer.rubberStamp = true
+	peer.rubberStamp = map[string]bool{"correctness": true, "schema_compliance": true, "helpfulness": true}
 	d := gateRun(ctx, "v-good")
 	ctx.Assert(!d.Ship, "a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway: %+v", d)
 	ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), int64(0), "a refused release must record nothing; gtx:release:v-good exists")
-	peer.rubberStamp = false
+	peer.rubberStamp = map[string]bool{"helpfulness": true}
+	d = gateRun(ctx, "v-good")
+	ctx.Assert(!d.Ship, "the correctness judge is calibrated but the helpfulness judge scores everything 1.0 (kappa 0 against the labellers) and the gate shipped: every criterion's judge is calibrated before its mean counts, %+v", d)
+	ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), int64(0), "a refused release must record nothing; gtx:release:v-good exists")
+	peer.rubberStamp = nil
 	d = gateRun(ctx, "v-good")
 	ctx.Assert(d.Ship, "with judges that agree with the labellers v-good ships: %+v", d)
 }
@@ -925,7 +991,7 @@ func CheckSchemaFirst(ctx *harness.Ctx) {
 }
 
 func CheckShipDecision(ctx *harness.Ctx) {
-	gateWorld(ctx)
+	peer := gateWorld(ctx)
 	early := gateRun(ctx, "v-early")
 	ctx.Assert(!early.Ship, "v-early's correctness is 0.65, under minScore = 0.8, and it shipped: %+v", early)
 	regress := gateRun(ctx, "v-regress")
@@ -936,6 +1002,20 @@ func CheckShipDecision(ctx *harness.Ctx) {
 	correctness, _ := strconv.ParseFloat(recorded["correctness"], 64)
 	ctx.Assert(len(recorded) == len(evals.Criteria) && math.Abs(correctness-0.95) < 1e-6, "a shipped version records its mean per criterion: %v", recorded)
 	ctx.Assert(ctx.Redis.Exists("gtx:release:v-early", "gtx:release:v-regress") == 0, "a refused version must record nothing")
+	// Helpfulness 0.94 against a baseline of 0.95: one point down, within maxRegression = 0.02.
+	peer.misses = map[string]map[int]bool{"helpfulness": {2: true, 22: true}}
+	within := gateRun(ctx, "v-good")
+	ctx.Assert(within.Ship, "helpfulness %v is 0.01 below the baseline 0.95, within maxRegression = 0.02, and the gate refused: %+v", within.Means["helpfulness"], within)
+	// Correctness exactly at minScore = 0.8 (the baseline lowered to 0.8) ships; 0.795 does not.
+	ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.8")
+	peer.misses = map[string]map[int]bool{"correctness": gateIndices(1, 2, 3)}
+	floor := gateRun(ctx, "v-good")
+	ctx.Assert(floor.Ship, "correctness %v is exactly minScore = 0.8, at least the floor, and the gate refused: %+v", floor.Means["correctness"], floor)
+	under := gateIndices(1, 2, 3)
+	under[4] = true
+	peer.misses = map[string]map[int]bool{"correctness": under}
+	below := gateRun(ctx, "v-good")
+	ctx.Assert(!below.Ship, "correctness %v is under minScore = 0.8 and the gate shipped: %+v", below.Means["correctness"], below)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -955,15 +1035,37 @@ func CheckShipDecision(ctx *harness.Ctx) {
 
 namespace {
 
-// The stand-in judges (sidekick/judge.h); rubber_stamp makes them score everything 1.0.
+// The stand-in judges (sidekick/judge.h): rubber_stamp makes the named criteria's judges score
+// everything 1.0; misses[criterion] lists conversation indices that judge scores 0.
 class GatePeer final : public sidekickrpc::Judge::Service {
  public:
-  bool rubber_stamp = false;
+  std::set<std::string> rubber_stamp;
+  std::map<std::string, std::set<int>> misses;
   grpc::Status Score(grpc::ServerContext*, const sidekickrpc::ScoreRequest* req, sidekickrpc::ScoreReply* reply) override {
-    reply->set_score(rubber_stamp ? 1.0 : judge::score(req->criterion(), req->rubric(), req->transcript()));
+    const std::string& id = req->conversation_id();
+    const int index = std::atoi(id.substr(id.rfind('-') + 1).c_str());
+    const auto missed = misses.find(req->criterion());
+    if (rubber_stamp.count(req->criterion()) > 0) {
+      reply->set_score(1.0);
+    } else if (missed != misses.end() && missed->second.count(index) > 0) {
+      reply->set_score(0.0);
+    } else {
+      reply->set_score(judge::score(req->criterion(), req->rubric(), req->transcript()));
+    }
     return grpc::Status::OK;
   }
 };
+
+// The conversation indices below 200 whose position in the cycle of 20 is listed.
+std::set<int> gateIndices(std::initializer_list<int> positions) {
+  std::set<int> out;
+  for (int i = 0; i < 200; ++i) {
+    for (const int p : positions) {
+      if (i % 20 == p) out.insert(i);
+    }
+  }
+  return out;
+}
 
 GatePeer& gateWorld(harness::Ctx& ctx) {
   static GatePeer* peer = nullptr;
@@ -1012,11 +1114,15 @@ void CheckJudgePerCriterion(harness::Ctx& ctx) {
 
 void CheckCalibratedJudges(harness::Ctx& ctx) {
   auto& peer = gateWorld(ctx);
-  peer.rubber_stamp = true;
+  peer.rubber_stamp = {"correctness", "schema_compliance", "helpfulness"};
   auto d = gate("v-good");
   ctx.Assert(!d.ship, "a judge that scores everything 1.0 disagrees with the labellers on correctness (kappa 0) and the gate shipped anyway (%s)", d.reason);
   ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), 0, "a refused release must record nothing; gtx:release:v-good exists");
-  peer.rubber_stamp = false;
+  peer.rubber_stamp = {"helpfulness"};
+  d = gate("v-good");
+  ctx.Assert(!d.ship, "the correctness judge is calibrated but the helpfulness judge scores everything 1.0 (kappa 0 against the labellers) and the gate shipped: every criterion's judge is calibrated before its mean counts (%s)", d.reason);
+  ctx.Equal(ctx.Redis.Exists("gtx:release:v-good"), 0, "a refused release must record nothing; gtx:release:v-good exists");
+  peer.rubber_stamp.clear();
   d = gate("v-good");
   ctx.Assert(d.ship, "with judges that agree with the labellers v-good ships (%s)", d.reason);
 }
@@ -1035,7 +1141,7 @@ void CheckSchemaFirst(harness::Ctx& ctx) {
 }
 
 void CheckShipDecision(harness::Ctx& ctx) {
-  gateWorld(ctx);
+  auto& peer = gateWorld(ctx);
   const auto early = gate("v-early");
   ctx.Assert(!early.ship, "v-early's correctness is 0.65, under kMinScore = 0.8, and it shipped (%s)", early.reason);
   const auto regress = gate("v-regress");
@@ -1047,6 +1153,18 @@ void CheckShipDecision(harness::Ctx& ctx) {
   ctx.Assert(recorded.size() == evals::kCriteria.size() && correctness != recorded.end() && std::fabs(std::strtod(correctness->second.c_str(), nullptr) - 0.95) < 1e-6,
              "a shipped version records its mean per criterion: %v", recorded);
   ctx.Equal(ctx.Redis.Exists("gtx:release:v-early", "gtx:release:v-regress"), 0, "a refused version must record nothing; refused releases recorded");
+  // Helpfulness 0.94 against a baseline of 0.95: one point down, within kMaxRegression = 0.02.
+  peer.misses = {{"helpfulness", {2, 22}}};
+  const auto within = gate("v-good");
+  ctx.Assert(within.ship, "helpfulness 0.94 is 0.01 below the baseline 0.95, within kMaxRegression = 0.02, and the gate refused (%s)", within.reason);
+  // Correctness exactly at kMinScore = 0.8 (the baseline lowered to 0.8) ships; 0.795 does not.
+  ctx.Redis.Do("HSET", "gtx:baseline", "correctness", "0.8");
+  peer.misses = {{"correctness", gateIndices({1, 2, 3})}};
+  const auto atFloor = gate("v-good");
+  ctx.Assert(atFloor.ship, "correctness 0.8 is exactly kMinScore = 0.8, at least the floor, and the gate refused (%s)", atFloor.reason);
+  peer.misses["correctness"].insert(4);
+  const auto below = gate("v-good");
+  ctx.Assert(!below.ship, "correctness 0.795 is under kMinScore = 0.8 and the gate shipped (%s)", below.reason);
 }
 `,
   },

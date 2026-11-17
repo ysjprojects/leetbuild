@@ -27,7 +27,7 @@ commit and insert loses the candidate.
 - The producer is idempotent with \`acks=all\` (Go: confluent-kafka-go).
 - A delivery failure, reported to the delivery callback, goes to the provided
   \`outbox.insert(event, reason)\`.
-- The builder inserts the candidate, then commits.`,
+- The builder inserts the candidate, then commits; a candidate it could not insert is not committed.`,
   sequence: {
     participants: ['sidekick', 'assist.trace', 'gtx-builder', 'ground-truth set'],
     messages: [
@@ -69,7 +69,7 @@ commit and insert loses the candidate.
       id: 'no-merchant-data',
       title: "No merchant's words or tool results in the event or the logs",
       detail:
-        'A turn whose message and tool result name a customer produces an event and log lines without that name, and without `merchant_message` or `tool_results`. The starter copies both into the event and the message into the log.',
+        "A turn whose message and tool result name a customer produces an event of exactly the eight trace fields, and log lines, without the name or the merchant's wording, and without `merchant_message` or `tool_results`. The starter copies both into the event and the message into the log.",
       match: {
         python: {none: [/turn\.message/, /turn\.tool_results/]},
         typescript: {none: [/turn\.message/, /turn\.tool_results/]},
@@ -82,7 +82,7 @@ commit and insert loses the candidate.
       id: 'outbox',
       title: 'A refused delivery goes to the outbox',
       detail:
-        'When the broker refuses the record, `publish` does not fail and the outbox holds the event with a reason; the next healthy produce reaches the topic and adds no row. The starter ignores the delivery report.',
+        'When the broker refuses the record, `publish` does not fail and the outbox holds the event, the same eight fields, with a reason; the next healthy produce reaches the topic and adds no row. The starter ignores the delivery report.',
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/outbox\.insert\(/, /catch/]},
@@ -95,7 +95,7 @@ commit and insert loses the candidate.
       id: 'insert-before-commit',
       title: 'Inserts the candidate before it commits',
       detail:
-        'At the first commit of group gtx-builder the ground-truth candidates already hold the record, all three seeded traces end up as candidates, and the lag is 0. The starter commits first, so a crash in between skips the candidate.',
+        'While every insert into the ground-truth set fails, group gtx-builder commits nothing; once inserts work, at the first commit the candidates already hold the record, all three seeded traces end up as candidates, and the lag is 0. The starter commits first, so a crash in between skips the candidate.',
       match: {
         python: {order: [/gtx\.insert_candidate\(/, /consumer\.commit\(/]},
         typescript: {order: [/insertCandidate\(/, /commitOffsets\(/]},
@@ -793,11 +793,12 @@ def check_no_merchant_data(ctx):
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one turn produced {len(records)} records"
     value = records[0].value.decode()
-    assert "Okafor" not in value, f"the trace carries the merchant's words or a tool's customer list: {value}"
+    assert "Okafor" not in value and "spend like" not in value, f"the trace carries the merchant's words or a tool's customer list: {value}"
     event = json.loads(value)
     leaked = [k for k in ("merchant_message", "tool_results", "message") if k in event]
     assert not leaked, f"the trace has the fields {leaked}: a topic is retained and readable by every consumer group"
-    lines = [line for line in capture.lines if "Okafor" in line]
+    assert sorted(event) == sorted(FIELDS), f"the event holds exactly the eight trace fields {list(FIELDS)}, an allow-list, got {sorted(event)}"
+    lines = [line for line in capture.lines if "Okafor" in line or "spend like" in line]
     assert not lines, f"a log line carries the merchant's message: {lines[0]!r}"
 
 
@@ -812,6 +813,7 @@ def check_outbox(ctx):
     rows = _outbox(ctx)
     assert rows, "the broker refused the record and nothing reached outbox:assist.trace: handle the delivery report (on_delivery) with outbox.insert(event, reason)"
     assert rows[0].get("event", {}).get("turn_id") == "t-9" and rows[0].get("reason"), f"the outbox row carries the event and the reason: {rows[0]}"
+    assert sorted(rows[0]["event"]) == sorted(FIELDS), f"the outbox row holds the same event as the topic would, the eight trace fields and no merchant data: {sorted(rows[0]['event'])}"
     m.publish(_turn("t-10"))
     _settle(m)
     assert _ids(ctx) == ["t-10"] and len(_outbox(ctx)) == 1, f"a healthy produce reaches the topic and adds no outbox row: topic {_ids(ctx)}, outbox {len(_outbox(ctx))} rows"
@@ -820,6 +822,15 @@ def check_outbox(ctx):
 def check_insert_before_commit(ctx):
     for i, shop in enumerate(("s1", "s1", "s2")):
         ctx.kafka.seed(TOPIC, key=shop, value=json.dumps({"turn_id": f"t-{i}", "shop": shop, "page": "home", "tools_used": [], "latency_ms": 500, "tokens": 900, "judge_score": 0.9, "prompt_version": "sk-prompt-14"}))
+    # The ground-truth set refuses the insert (gtx:candidates is not a list): nothing may be committed past it.
+    ctx.redis.set("gtx:candidates", "not a list")
+    m = ctx.load("assist_trace")
+    try:
+        ctx.drain(m.run_gtx_builder)
+    except Exception:  # noqa: BLE001 - the builder may stop on the failed insert
+        pass
+    assert ctx.kafka.lag("gtx-builder", TOPIC) == 3, f"every insert failed and the gtx-builder committed past them (lag {ctx.kafka.lag('gtx-builder', TOPIC)}, not 3): a failed insert must not be committed, or a restart never retries it"
+    ctx.redis.delete("gtx:candidates")
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.llen("gtx:candidates")))
     m = ctx.load("assist_trace")
@@ -898,11 +909,12 @@ export async function check_no_merchant_data(ctx) {
   const records = ctx.kafka.records(TOPIC);
   assert.equal(records.length, 1, \`one turn produced \${records.length} records\`);
   const value = records[0].value.toString();
-  assert(!value.includes('Okafor'), \`the trace carries the merchant's words or a tool's customer list: \${value}\`);
+  assert(!value.includes('Okafor') && !value.includes('spend like'), \`the trace carries the merchant's words or a tool's customer list: \${value}\`);
   const event = JSON.parse(value);
   const leaked = ['merchant_message', 'tool_results', 'message'].filter(k => k in event);
   assert.deepEqual(leaked, [], \`the trace has the fields \${JSON.stringify(leaked)}: a topic is retained and readable by every consumer group\`);
-  const leak = logged.find(l => l.includes('Okafor'));
+  assert.deepEqual(Object.keys(event).sort(), [...FIELDS].sort(), \`the event holds exactly the eight trace fields \${JSON.stringify(FIELDS)}, an allow-list, got \${JSON.stringify(Object.keys(event).sort())}\`);
+  const leak = logged.find(l => l.includes('Okafor') || l.includes('spend like'));
   assert(leak === undefined, \`a log line carries the merchant's message: \${JSON.stringify(leak)}\`);
 }
 
@@ -918,6 +930,7 @@ export async function check_outbox(ctx) {
   const rows = outboxRows(ctx);
   assert(rows.length > 0, 'the broker refused the record and nothing reached outbox:assist.trace: catch the rejected send and call outbox.insert(event, reason)');
   assert(rows[0].event?.turn_id === 't-9' && rows[0].reason, \`the outbox row carries the event and the reason: \${JSON.stringify(rows[0])}\`);
+  assert.deepEqual(Object.keys(rows[0].event).sort(), [...FIELDS].sort(), \`the outbox row holds the same event as the topic would, the eight trace fields and no merchant data: \${JSON.stringify(Object.keys(rows[0].event).sort())}\`);
   await m.publish(turn('t-10'));
   await settle();
   assert(JSON.stringify(ids(ctx)) === '["t-10"]' && outboxRows(ctx).length === 1, \`a healthy produce reaches the topic and adds no outbox row: topic \${JSON.stringify(ids(ctx))}, outbox \${outboxRows(ctx).length} rows\`);
@@ -927,6 +940,16 @@ export async function check_insert_before_commit(ctx) {
   ['s1', 's1', 's2'].forEach((shop, i) => {
     ctx.kafka.seed(TOPIC, {key: shop, value: JSON.stringify({turn_id: \`t-\${i}\`, shop, page: 'home', tools_used: [], latency_ms: 500, tokens: 900, judge_score: 0.9, prompt_version: 'sk-prompt-14'})});
   });
+  // The ground-truth set refuses the insert (gtx:candidates is not a list): nothing may be committed past it.
+  ctx.redis.set('gtx:candidates', 'not a list');
+  try {
+    await ctx.drain(ctx.load('assist_trace').runGtxBuilder());
+  } catch {
+    // the builder may stop on the failed insert
+  }
+  const lag = ctx.kafka.lag('gtx-builder', TOPIC);
+  assert.equal(lag, 3, \`every insert failed and the gtx-builder committed past them (lag \${lag}, not 3): a failed insert must not be committed, or a restart never retries it\`);
+  ctx.redis.del('gtx:candidates');
   const atCommit: number[] = [];
   ctx.kafka.onCommit(() => atCommit.push(ctx.redis.llen('gtx:candidates')));
   const m = ctx.load('assist_trace');
@@ -1042,14 +1065,32 @@ func CheckNoMerchantData(ctx *harness.Ctx) {
 	records := ctx.Kafka.Records(traceTopic)
 	ctx.Equal(len(records), 1, "one turn; records")
 	value := string(records[0].Value)
-	ctx.Assert(!strings.Contains(value, "Okafor"), "the trace carries the merchant's words or a tool's customer list: %s", value)
+	ctx.Assert(!strings.Contains(value, "Okafor") && !strings.Contains(value, "spend like"), "the trace carries the merchant's words or a tool's customer list: %s", value)
 	var event map[string]any
 	json.Unmarshal(records[0].Value, &event)
 	for _, k := range []string{"merchant_message", "tool_results", "message"} {
 		_, has := event[k]
 		ctx.Assert(!has, "the trace has the field %s: a topic is retained and readable by every consumer group", k)
 	}
-	ctx.Assert(!strings.Contains(logged.String(), "Okafor"), "a log line carries the merchant's message: %q", strings.TrimSpace(logged.String()))
+	ctx.Equal(traceFieldNames(event), traceFields(), "the event holds exactly the eight trace fields, an allow-list; its fields")
+	ctx.Assert(!strings.Contains(logged.String(), "Okafor") && !strings.Contains(logged.String(), "spend like"), "a log line carries the merchant's message: %q", strings.TrimSpace(logged.String()))
+}
+
+// traceFields is the eight trace fields, sorted.
+func traceFields() []string {
+	fields := []string{"turn_id", "shop", "page", "tools_used", "latency_ms", "tokens", "judge_score", "prompt_version"}
+	sort.Strings(fields)
+	return fields
+}
+
+// traceFieldNames is the event's field names, sorted.
+func traceFieldNames(event map[string]any) []string {
+	names := []string{}
+	for k := range event {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
@@ -1067,6 +1108,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Assert(len(rows) > 0, "the broker refused the record and nothing reached outbox:assist.trace: read the delivery report (TopicPartition.Error) and call outbox.Insert")
 	event, _ := rows[0]["event"].(map[string]any)
 	ctx.Assert(event["turn_id"] == "t-9" && rows[0]["reason"] != "", "the outbox row carries the event and the reason: %v", rows[0])
+	ctx.Equal(traceFieldNames(event), traceFields(), "the outbox row holds the same event as the topic would, the eight trace fields and no merchant data; its fields")
 	tracePublish(ctx, traceTurn("t-10", "s1"))
 	ctx.Settle()
 	ctx.Equal(traceIDs(ctx), []string{"t-10"}, "a healthy produce reaches the topic; the records")
@@ -1078,6 +1120,12 @@ func CheckInsertBeforeCommit(ctx *harness.Ctx) {
 		value, _ := json.Marshal(map[string]any{"turn_id": "t-" + string(rune('0'+i)), "shop": shop, "page": "home", "tools_used": []string{}, "latency_ms": 500, "tokens": 900, "judge_score": 0.9, "prompt_version": "sk-prompt-14"})
 		ctx.Kafka.Seed(traceTopic, shop, string(value))
 	}
+	// The ground-truth set refuses the insert (gtx:candidates is not a list): nothing may be committed past it.
+	ctx.Redis.Set("gtx:candidates", "not a list")
+	ctx.Drain(func() { runGtxBuilder(context.Background()) })
+	lag := ctx.Kafka.Lag("gtx-builder", traceTopic)
+	ctx.Assert(lag == 3, "every insert failed and the gtx-builder committed past them (lag %d, not 3): a failed insert must not be committed, or a restart never retries it", lag)
+	ctx.Redis.Del("gtx:candidates")
 	var atCommit []int64
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.LLen("gtx:candidates")) })
 	ctx.Drain(func() { runGtxBuilder(context.Background()) })
@@ -1118,10 +1166,21 @@ trace::TurnRecord traceTurn(const std::string& turn_id, const std::string& shop)
   return t;
 }
 
-void settle(harness::Ctx& ctx) {
+void traceSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);  // the service loop serves delivery reports between turns
 }
+
+// The event's field names, sorted (nlohmann::json keeps an object's keys sorted).
+std::vector<std::string> traceFieldNames(const nlohmann::json& event) {
+  std::vector<std::string> names;
+  if (event.is_object()) {
+    for (const auto& [k, v] : event.items()) names.push_back(k);
+  }
+  return names;
+}
+
+const std::vector<std::string> kTraceFields = {"judge_score", "latency_ms", "page", "prompt_version", "shop", "tokens", "tools_used", "turn_id"};
 
 std::vector<std::string> traceIDs(harness::Ctx& ctx) {
   std::vector<std::string> ids;
@@ -1144,7 +1203,7 @@ void CheckShopKey(harness::Ctx& ctx) {
   publish(traceTurn("t-1", "s1"));
   publish(traceTurn("t-2", "s2"));
   publish(traceTurn("t-3", "s1"));
-  settle(ctx);
+  traceSettle(ctx);
   const auto records = ctx.Kafka.Records(kTraceTopic);
   ctx.Equal(records.size(), 3, "three turns must produce three records on %s; records", kTraceTopic);
   ctx.Equal(ctx.Kafka.Keys(kTraceTopic), {"s1", "s2", "s1"}, "records must be keyed by the shop (keyed by turn id, one shop's traces scatter across partitions)");
@@ -1160,10 +1219,10 @@ void CheckShopKey(harness::Ctx& ctx) {
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTraceTopic, 1);
   publish(traceTurn("t-1", "s1"));
-  settle(ctx);
+  traceSettle(ctx);
   ctx.Equal(traceIDs(ctx), {"t-1"}, "after one produce whose acknowledgement was lost the topic must hold the trace once (enable.idempotence); the records");
   publish(traceTurn("t-2", "s1"));
-  settle(ctx);
+  traceSettle(ctx);
   ctx.Kafka.Failover(kTraceTopic);
   ctx.Equal(traceIDs(ctx), {"t-1", "t-2"}, "a leader failover right after the acknowledgement must keep the trace (acks=all); the records");
 }
@@ -1173,18 +1232,19 @@ void CheckNoMerchantData(harness::Ctx& ctx) {
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
   publish(traceTurn("t-1", "s1"));
-  settle(ctx);
+  traceSettle(ctx);
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   const auto records = ctx.Kafka.Records(kTraceTopic);
   ctx.Equal(records.size(), 1, "one turn; records");
   const std::string value = records[0].Value.value_or("");
-  ctx.Assert(value.find("Okafor") == std::string::npos, "the trace carries the merchant's words or a tool's customer list: %s", value);
+  ctx.Assert(value.find("Okafor") == std::string::npos && value.find("spend like") == std::string::npos, "the trace carries the merchant's words or a tool's customer list: %s", value);
   const auto event = nlohmann::json::parse(value, nullptr, false);
   for (const std::string k : {"merchant_message", "tool_results", "message"}) {
     ctx.Assert(!event.is_object() || !event.contains(k), "the trace has the field %s: a topic is retained and readable by every consumer group", k);
   }
-  ctx.Assert(logged.str().find("Okafor") == std::string::npos, "a log line carries the merchant's message: %q", logged.str());
+  ctx.Equal(traceFieldNames(event), kTraceFields, "the event holds exactly the eight trace fields, an allow-list; its fields");
+  ctx.Assert(logged.str().find("Okafor") == std::string::npos && logged.str().find("spend like") == std::string::npos, "a log line carries the merchant's message: %q", logged.str());
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
@@ -1194,13 +1254,14 @@ void CheckOutbox(harness::Ctx& ctx) {
   } catch (const std::exception& e) {
     ctx.Fatalf("publish threw when the broker refused the record: %s. Write the event to the outbox instead", e.what());
   }
-  settle(ctx);
+  traceSettle(ctx);
   const auto rows = traceOutbox(ctx);
   ctx.Assert(!rows.empty(), "the broker refused the record and nothing reached outbox:assist.trace: handle the delivery report (dr_cb) with outbox::insert");
   ctx.Assert(rows[0].is_object() && rows[0].contains("event") && rows[0]["event"].value("turn_id", "") == "t-9" && !rows[0].value("reason", "").empty(),
              "the outbox row carries the event and the reason: %s", rows[0].dump());
+  ctx.Equal(traceFieldNames(rows[0]["event"]), kTraceFields, "the outbox row holds the same event as the topic would, the eight trace fields and no merchant data; its fields");
   publish(traceTurn("t-10", "s1"));
-  settle(ctx);
+  traceSettle(ctx);
   ctx.Equal(traceIDs(ctx), {"t-10"}, "a healthy produce reaches the topic; the records");
   ctx.Equal(traceOutbox(ctx).size(), 1, "a delivered record must not be written to the outbox; the rows");
 }
@@ -1212,6 +1273,18 @@ void CheckInsertBeforeCommit(harness::Ctx& ctx) {
                               {"latency_ms", 500}, {"tokens", 900}, {"judge_score", 0.9}, {"prompt_version", "sk-prompt-14"}};
     ctx.Kafka.Seed(kTraceTopic, shop, v.dump());
   }
+  // The ground-truth set refuses the insert (gtx:candidates is not a list): nothing may be committed past it.
+  ctx.Redis.Set("gtx:candidates", "not a list");
+  try {
+    ctx.Drain([] { run_gtx_builder(); });
+  } catch (const harness::Failure&) {
+    throw;
+  } catch (...) {
+    // the builder may stop on the failed insert
+  }
+  const long long lag = ctx.Kafka.Lag("gtx-builder", kTraceTopic);
+  ctx.Assert(lag == 3, "every insert failed and the gtx-builder committed past them (lag %d, not 3): a failed insert must not be committed, or a restart never retries it", lag);
+  ctx.Redis.Del("gtx:candidates");
   std::vector<long long> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.LLen("gtx:candidates")); });
   ctx.Drain([] { run_gtx_builder(); });

@@ -22,9 +22,9 @@ model's 32 000-token window on every try; and one chatty answer is a 500.
 
 Requirements:
 
-- Deadlines on every call: \`AGENT_DEADLINE_S\` (10 s) on \`PruneColumns\`, \`GENERATE_DEADLINE_S\` (30 s)
+- Deadlines on every attempt: \`AGENT_DEADLINE_S\` (10 s) on \`PruneColumns\`, \`GENERATE_DEADLINE_S\` (30 s)
   on \`Generate\`.
-- At most \`MAX_ATTEMPTS\` = 2 per call, and only \`UNAVAILABLE\` is retried; any other failure raises
+- At most \`MAX_ATTEMPTS\` = 2 per agent call, and only \`UNAVAILABLE\` is retried; any other failure raises
   \`GenerationError\`.
 - When \`estimate_tokens(schemas)\` (characters / 4) exceeds \`SCHEMA_TOKEN_BUDGET\` = 24 000, call
   \`PruneColumns\` and generate from the schemas it returns.
@@ -52,7 +52,7 @@ Requirements:
       id: 'deadlines',
       title: 'Generate gets 30 s, PruneColumns 10 s',
       detail:
-        'Every Generate call carries a deadline of about 30 s and every PruneColumns call about 10 s; a generator that hangs ends the call at the deadline with GenerationError. The starter sends no deadline and waits the hang out.',
+        'Every Generate call carries a deadline of about 30 s, a retry after a first attempt that failed late included, and every PruneColumns call about 10 s; a generator that hangs ends the call at the deadline with GenerationError. The starter sends no deadline and waits the hang out.',
       match: {
         python: {all: [/GENERATE_DEADLINE_S/, /AGENT_DEADLINE_S/, /timeout\s*=/]},
         typescript: {all: [/GENERATE_DEADLINE_MS/, /AGENT_DEADLINE_MS/, /deadline:\s*Date\.now\(\)\s*\+/]},
@@ -65,7 +65,7 @@ Requirements:
       id: 'retry-policy',
       title: 'At most two attempts, only UNAVAILABLE retried',
       detail:
-        'One UNAVAILABLE earns one retry after a backoff; two in a row end in GenerationError after two calls; INVALID_ARGUMENT ends it after one. The starter asks again after any error, for ever.',
+        'One UNAVAILABLE earns one retry after a backoff, from Generate or from PruneColumns; two in a row end in GenerationError after two calls; INVALID_ARGUMENT, INTERNAL, RESOURCE_EXHAUSTED and PERMISSION_DENIED each end it after one, and a failed PruneColumns ends the chain before Generate. The starter asks again after any error, for ever.',
       match: {
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s+True/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s*\(\s*true\s*\)/]},
@@ -81,7 +81,7 @@ Requirements:
       id: 'prune-over-budget',
       title: 'Prunes columns when the schemas exceed the token budget',
       detail:
-        'Two Tier-1 tables (about 36 000 tokens) go through PruneColumns and Generate receives the pruned schemas; one small table goes straight to Generate. The starter never prunes, so the generator refuses the oversized prompt.',
+        'Two Tier-1 tables (about 36 000 tokens) go through PruneColumns and Generate receives the pruned schemas; one small table goes straight to Generate, and so do schemas of exactly 24 000 tokens, while 24 001 are pruned. The starter never prunes, so the generator refuses the oversized prompt.',
       match: {
         python: {
           order: [/estimate_tokens\(\s*schemas\s*\)\s*>\s*SCHEMA_TOKEN_BUDGET/, /stub\.PruneColumns/, /stub\.Generate/],
@@ -114,7 +114,7 @@ Requirements:
       id: 'parse-output',
       title: 'Turns an unusable model answer into GenerationError',
       detail:
-        'Prose instead of JSON, JSON without sql, and a blank sql each raise GenerationError, and a well-formed answer comes back as {sql, explanation}. The starter indexes into the parsed text and raises whatever the parser or the lookup raises.',
+        'Prose instead of JSON, a JSON array, JSON without sql, a number for sql, a missing explanation and a blank sql each raise GenerationError, and a well-formed answer comes back as {sql, explanation}. The starter indexes into the parsed text and raises whatever the parser or the lookup raises.',
       match: {
         python: {all: [/raise GenerationError/, /except\s+\(?\s*(json\.JSONDecodeError|ValueError)/]},
         typescript: {all: [/throw new GenerationError/, /catch/]},
@@ -811,10 +811,18 @@ Output generate_sql(const std::string& question, const std::string& workspace, c
 
 import text_to_sql_pb2
 import text_to_sql_pb2_grpc
-from querygen import agents, config
+from querygen import agents, catalog, config
 
 QUESTION = "How many trips completed in Seattle yesterday?"
 WIDE = ["trips_tier1", "drivers_tier1"]
+# Answers the stand-in model gives for these question prefixes, ahead of querygen.agents.
+ODD_ANSWERS = {
+    "array:": '["SELECT * FROM trips"]',
+    "numsql:": '{"sql": 42, "explanation": "Trips."}',
+    "noexpl:": '{"sql": "SELECT * FROM trips WHERE datestr = \\'2026-11-01\\'"}',
+}
+# Generate calls the stand-in answers UNAVAILABLE after their latency, like a generator that dies mid-call.
+DYING = {"Generate": 0}
 
 
 class AgentsServicer(text_to_sql_pb2_grpc.AgentsServicer):
@@ -824,12 +832,19 @@ class AgentsServicer(text_to_sql_pb2_grpc.AgentsServicer):
         return text_to_sql_pb2.PruneColumnsReply(schemas=agents.prune_columns(request.question, list(request.schemas)))
 
     def Generate(self, request, context):
+        if DYING["Generate"] > 0:
+            DYING["Generate"] -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "generator restarting")
         if agents.prompt_tokens(list(request.schemas)) > agents.CONTEXT_LIMIT_TOKENS:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "prompt is over the model's context window")
+        for prefix, text in ODD_ANSWERS.items():
+            if request.question.startswith(prefix):
+                return text_to_sql_pb2.GenerateReply(text=text)
         return text_to_sql_pb2.GenerateReply(text=agents.generate(request.question, request.workspace, list(request.schemas)))
 
 
 def _world(ctx):
+    DYING["Generate"] = 0
     ctx.grpc.serve(text_to_sql_pb2_grpc.add_AgentsServicer_to_server, AgentsServicer(), config.AGENTS)
     return ctx.load("agent_chain")
 
@@ -867,6 +882,14 @@ def check_deadlines(ctx):
     _expect_error(m, out, err, "a generator that hangs for 45 s")
     assert waited <= 31, f"generate_sql waited {waited:.0f} s on a hung generator: the deadline must end the call at 30 s"
     assert len(ctx.grpc.calls_to("Generate")) == calls + 1, "DEADLINE_EXCEEDED is not retried: the next try would hang as long"
+    ctx.grpc.set_latency("Generate", 20.0, config.AGENTS)
+    DYING["Generate"] = 1
+    calls = len(ctx.grpc.calls_to("Generate"))
+    out, err = _generate(ctx, m)
+    tries = ctx.grpc.calls_to("Generate")[calls:]
+    assert len(tries) == 2, f"a generator that died after 20 s with UNAVAILABLE earns one retry: expected 2 Generate calls, saw {len(tries)}"
+    assert all(t.timeout is not None and 29 <= t.timeout <= 31 for t in tries), f"every attempt carries its own 30 s deadline, the retry too: the attempts got {[t.timeout for t in tries]} s"
+    assert err is None and out.get("sql"), f"the retry after a 20 s UNAVAILABLE has a full 30 s and answers SQL, got {out!r} / {err!r}"
 
 
 def check_retry_policy(ctx):
@@ -884,6 +907,22 @@ def check_retry_policy(ctx):
     out, err = _generate(ctx, m)
     _expect_error(m, out, err, "an INVALID_ARGUMENT from the generator")
     assert len(ctx.grpc.calls_to("Generate")) == 5, f"INVALID_ARGUMENT will not change on a retry: expected 1 call, saw {len(ctx.grpc.calls_to('Generate')) - 4}"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.PERMISSION_DENIED):
+        calls = len(ctx.grpc.calls_to("Generate"))
+        ctx.grpc.fail("Generate", code, "refused", times=1, target=config.AGENTS)
+        out, err = _generate(ctx, m)
+        _expect_error(m, out, err, f"the generator answering {code.name}")
+        assert len(ctx.grpc.calls_to("Generate")) == calls + 1, f"only UNAVAILABLE is retried: {code.name} got {len(ctx.grpc.calls_to('Generate')) - calls} calls, expected 1"
+    ctx.grpc.fail("PruneColumns", grpc.StatusCode.UNAVAILABLE, "prune agent restarting", times=1, target=config.AGENTS)
+    out, err = _generate(ctx, m, tables=WIDE)
+    assert err is None and out.get("sql"), f"one UNAVAILABLE from PruneColumns earns one retry, like Generate, and then SQL; got {out!r} / {err!r}"
+    assert len(ctx.grpc.calls_to("PruneColumns")) == 2, f"one UNAVAILABLE from PruneColumns, then success: expected 2 PruneColumns calls, saw {len(ctx.grpc.calls_to('PruneColumns'))}"
+    calls = len(ctx.grpc.calls_to("Generate"))
+    ctx.grpc.fail("PruneColumns", grpc.StatusCode.INVALID_ARGUMENT, "bad request", times=1, target=config.AGENTS)
+    out, err = _generate(ctx, m, tables=WIDE)
+    _expect_error(m, out, err, "an INVALID_ARGUMENT from PruneColumns")
+    assert len(ctx.grpc.calls_to("PruneColumns")) == 3, f"INVALID_ARGUMENT from PruneColumns is not retried: expected 1 call, saw {len(ctx.grpc.calls_to('PruneColumns')) - 2}"
+    assert len(ctx.grpc.calls_to("Generate")) == calls, "a failed PruneColumns must end the chain before Generate"
 
 
 def check_prune_over_budget(ctx):
@@ -897,6 +936,14 @@ def check_prune_over_budget(ctx):
     sent = list(ctx.grpc.calls_to("Generate")[-1].request.schemas)
     assert sent and not any("attr_" in s for s in sent), "Generate must receive the pruned schemas, not the ones that were too wide"
     assert err is None and out.get("sql", "").startswith("SELECT * FROM trips_tier1"), f"the pruned prompt generates SQL, got {out!r} / {err!r}"
+    # trips_tier1 plus a filler table whose name pads the DDL to exactly 96 000 characters: 24 000 tokens
+    wide = len(catalog.schema_for("trips_tier1"))
+    at_budget = "f" * (96_000 - wide - len(catalog.schema_for("")))
+    assert wide + len(catalog.schema_for(at_budget)) == 96_000, "the harness's filler table is the wrong size"
+    out, err = _generate(ctx, m, tables=["trips_tier1", at_budget])
+    assert err is None and len(ctx.grpc.calls_to("PruneColumns")) == 1, f"schemas of exactly SCHEMA_TOKEN_BUDGET (24 000) tokens are within the budget and go straight to Generate: {len(ctx.grpc.calls_to('PruneColumns')) - 1} PruneColumns call(s), {err!r}"
+    out, err = _generate(ctx, m, tables=["trips_tier1", at_budget + "ffff"])
+    assert err is None and len(ctx.grpc.calls_to("PruneColumns")) == 2, f"schemas of 24 001 tokens exceed the budget and must be pruned: {len(ctx.grpc.calls_to('PruneColumns')) - 1} PruneColumns call(s), {err!r}"
 
 
 def check_parse_output(ctx):
@@ -905,7 +952,10 @@ def check_parse_output(ctx):
     assert err is None and out == {"sql": "SELECT * FROM trips WHERE datestr = '2026-11-01'", "explanation": "Rows of trips for 2026-11-01."}, f"a well-formed answer comes back as {{sql, explanation}}, got {out!r} / {err!r}"
     for question, what in (
         ("garbled: trips last week", "prose instead of JSON"),
+        ("array: trips last week", "a JSON array instead of an object"),
         ("nosql: trips last week", "JSON without sql"),
+        ("numsql: trips last week", "a number for sql"),
+        ("noexpl: trips last week", "no explanation"),
         ("blank: trips last week", "a blank sql"),
     ):
         out, err = _generate(ctx, m, question=question)
@@ -913,18 +963,37 @@ def check_parse_output(ctx):
 `,
     typescript: `const QUESTION = 'How many trips completed in Seattle yesterday?';
 const WIDE = ['trips_tier1', 'drivers_tier1'];
+// Answers the stand-in model gives for these question prefixes, ahead of querygen/agents.
+const ODD_ANSWERS: [string, string][] = [
+  ['array:', '["SELECT * FROM trips"]'],
+  ['numsql:', '{"sql": 42, "explanation": "Trips."}'],
+  ['noexpl:', '{"sql": "SELECT * FROM trips WHERE datestr = \\'2026-11-01\\'"}'],
+];
+// Generate calls the stand-in answers UNAVAILABLE after their latency, like a generator that dies mid-call.
+const dying = {generate: 0};
 
 function world(ctx) {
   const {sqlagents} = ctx.proto('text_to_sql.proto');
   const config = ctx.load('/support/querygen/config.ts');
   const agents = ctx.load('/support/querygen/agents.ts');
+  dying.generate = 0;
   ctx.grpc.serve(sqlagents.Agents.service, {
     PruneColumns(call, callback) {
       callback(null, {schemas: agents.pruneColumns(call.request.question, call.request.schemas)});
     },
     Generate(call, callback) {
+      if (dying.generate > 0) {
+        dying.generate -= 1;
+        callback({code: ctx.grpc.status.UNAVAILABLE, details: 'generator restarting'});
+        return;
+      }
       if (agents.promptTokens(call.request.schemas) > agents.CONTEXT_LIMIT_TOKENS) {
         callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: "prompt is over the model's context window"});
+        return;
+      }
+      const odd = ODD_ANSWERS.find(([prefix]) => call.request.question.startsWith(prefix));
+      if (odd !== undefined) {
+        callback(null, {text: odd[1]});
         return;
       }
       callback(null, {text: agents.generate(call.request.question, call.request.workspace, call.request.schemas)});
@@ -965,13 +1034,21 @@ export async function check_deadlines(ctx) {
     assert(prune.timeout !== null && prune.timeout >= 9 && prune.timeout <= 11, \`PruneColumns must carry AGENT_DEADLINE_MS = 10 s, got \${prune.timeout}\`);
   }
   ctx.grpc.setLatency('Generate', 45, config.AGENTS);
-  const calls = generates(ctx).length;
+  let calls = generates(ctx).length;
   const started = ctx.clock.now();
   r = await generate(ctx, m);
   const waited = (ctx.clock.now() - started) / 1000;
   expectError(m, r, 'a generator that hangs for 45 s');
   assert(waited <= 31, \`generateSql waited \${waited.toFixed(0)} s on a hung generator: the deadline must end the call at 30 s\`);
   assert.equal(generates(ctx).length, calls + 1, 'DEADLINE_EXCEEDED is not retried: the next try would hang as long');
+  ctx.grpc.setLatency('Generate', 20, config.AGENTS);
+  dying.generate = 1;
+  calls = generates(ctx).length;
+  r = await generate(ctx, m);
+  const tries = generates(ctx).slice(calls);
+  assert.equal(tries.length, 2, \`a generator that died after 20 s with UNAVAILABLE earns one retry: expected 2 Generate calls, saw \${tries.length}\`);
+  assert(tries.every(t => t.timeout !== null && t.timeout >= 29 && t.timeout <= 31), \`every attempt carries its own 30 s deadline, the retry too: the attempts got \${JSON.stringify(tries.map(t => t.timeout))} s\`);
+  assert(r.err === undefined && r.out?.sql, \`the retry after a 20 s UNAVAILABLE has a full 30 s and answers SQL, got \${JSON.stringify(r.out)} / \${r.err}\`);
 }
 
 export async function check_retry_policy(ctx) {
@@ -989,10 +1066,26 @@ export async function check_retry_policy(ctx) {
   r = await generate(ctx, m);
   expectError(m, r, 'an INVALID_ARGUMENT from the generator');
   assert.equal(generates(ctx).length, 5, \`INVALID_ARGUMENT will not change on a retry: expected 1 call, saw \${generates(ctx).length - 4}\`);
+  for (const code of ['INTERNAL', 'RESOURCE_EXHAUSTED', 'PERMISSION_DENIED']) {
+    const calls = generates(ctx).length;
+    ctx.grpc.fail('Generate', ctx.grpc.status[code], 'refused', 1, config.AGENTS);
+    expectError(m, await generate(ctx, m), \`the generator answering \${code}\`);
+    assert.equal(generates(ctx).length, calls + 1, \`only UNAVAILABLE is retried: \${code} got \${generates(ctx).length - calls} calls, expected 1\`);
+  }
+  ctx.grpc.fail('PruneColumns', ctx.grpc.status.UNAVAILABLE, 'prune agent restarting', 1, config.AGENTS);
+  r = await generate(ctx, m, QUESTION, WIDE);
+  assert(r.err === undefined && r.out?.sql, \`one UNAVAILABLE from PruneColumns earns one retry, like Generate, and then SQL; got \${JSON.stringify(r.out)} / \${r.err}\`);
+  assert.equal(ctx.grpc.callsTo('PruneColumns').length, 2, \`one UNAVAILABLE from PruneColumns, then success: expected 2 PruneColumns calls, saw \${ctx.grpc.callsTo('PruneColumns').length}\`);
+  const calls = generates(ctx).length;
+  ctx.grpc.fail('PruneColumns', ctx.grpc.status.INVALID_ARGUMENT, 'bad request', 1, config.AGENTS);
+  expectError(m, await generate(ctx, m, QUESTION, WIDE), 'an INVALID_ARGUMENT from PruneColumns');
+  assert.equal(ctx.grpc.callsTo('PruneColumns').length, 3, \`INVALID_ARGUMENT from PruneColumns is not retried: expected 1 call, saw \${ctx.grpc.callsTo('PruneColumns').length - 2}\`);
+  assert.equal(generates(ctx).length, calls, 'a failed PruneColumns must end the chain before Generate');
 }
 
 export async function check_prune_over_budget(ctx) {
   const {m} = world(ctx);
+  const catalog = ctx.load('/support/querygen/catalog.ts');
   let r = await generate(ctx, m);
   assert(r.err === undefined, \`one small table must generate, threw \${r.err}\`);
   assert.equal(ctx.grpc.callsTo('PruneColumns').length, 0, 'a schema well under the token budget was sent to the prune agent: that is a model call for nothing');
@@ -1002,6 +1095,14 @@ export async function check_prune_over_budget(ctx) {
   const sent = generates(ctx).at(-1).request.schemas as string[];
   assert(sent.length > 0 && !sent.some(s => s.includes('attr_')), 'Generate must receive the pruned schemas, not the ones that were too wide');
   assert(r.err === undefined && String(r.out?.sql).startsWith('SELECT * FROM trips_tier1'), \`the pruned prompt generates SQL, got \${JSON.stringify(r.out)} / \${r.err}\`);
+  // trips_tier1 plus a filler table whose name pads the DDL to exactly 96 000 characters: 24 000 tokens
+  const wide = catalog.schemaFor('trips_tier1').length;
+  const atBudget = 'f'.repeat(96_000 - wide - catalog.schemaFor('').length);
+  assert.equal(wide + catalog.schemaFor(atBudget).length, 96_000, "the harness's filler table is the wrong size");
+  r = await generate(ctx, m, QUESTION, ['trips_tier1', atBudget]);
+  assert(r.err === undefined && ctx.grpc.callsTo('PruneColumns').length === 1, \`schemas of exactly SCHEMA_TOKEN_BUDGET (24 000) tokens are within the budget and go straight to Generate: \${ctx.grpc.callsTo('PruneColumns').length - 1} PruneColumns call(s), \${r.err}\`);
+  r = await generate(ctx, m, QUESTION, ['trips_tier1', atBudget + 'ffff']);
+  assert(r.err === undefined && ctx.grpc.callsTo('PruneColumns').length === 2, \`schemas of 24 001 tokens exceed the budget and must be pruned: \${ctx.grpc.callsTo('PruneColumns').length - 1} PruneColumns call(s), \${r.err}\`);
 }
 
 export async function check_parse_output(ctx) {
@@ -1010,7 +1111,10 @@ export async function check_parse_output(ctx) {
   assert.deepStrictEqual(r.out, {sql: "SELECT * FROM trips WHERE datestr = '2026-11-01'", explanation: 'Rows of trips for 2026-11-01.'}, \`a well-formed answer comes back as {sql, explanation}, got \${JSON.stringify(r.out)} / \${r.err}\`);
   for (const [question, what] of [
     ['garbled: trips last week', 'prose instead of JSON'],
+    ['array: trips last week', 'a JSON array instead of an object'],
     ['nosql: trips last week', 'JSON without sql'],
+    ['numsql: trips last week', 'a number for sql'],
+    ['noexpl: trips last week', 'no explanation'],
     ['blank: trips last week', 'a blank sql'],
   ]) {
     expectError(m, await generate(ctx, m, question), \`an answer with \${what}\`);
@@ -1023,12 +1127,14 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
 	"querygen/agents"
+	"querygen/catalog"
 	"querygen/config"
 	pb "sqlagents/gen/text_to_sql"
 
@@ -1038,6 +1144,16 @@ import (
 const chainQuestion = "How many trips completed in Seattle yesterday?"
 
 var chainWide = []string{"trips_tier1", "drivers_tier1"}
+
+// chainOddAnswers are the answers the stand-in model gives for these question prefixes, ahead of querygen/agents.
+var chainOddAnswers = [][2]string{
+	{"array:", \`["SELECT * FROM trips"]\`},
+	{"numsql:", \`{"sql": 42, "explanation": "Trips."}\`},
+	{"noexpl:", \`{"sql": "SELECT * FROM trips WHERE datestr = '2026-11-01'"}\`},
+}
+
+// chainDying counts the Generate calls the stand-in answers UNAVAILABLE after their latency, like a generator that dies mid-call.
+var chainDying atomic.Int32
 
 // chainPeer is the stand-in agents: answers from querygen/agents.
 type chainPeer struct {
@@ -1049,13 +1165,23 @@ func (chainPeer) PruneColumns(_ context.Context, req *pb.PruneColumnsRequest) (*
 }
 
 func (chainPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+	if chainDying.Load() > 0 {
+		chainDying.Add(-1)
+		return nil, status.Error(codes.Unavailable, "generator restarting")
+	}
 	if agents.PromptTokens(req.GetSchemas()) > agents.ContextLimitTokens {
 		return nil, status.Error(codes.InvalidArgument, "prompt is over the model's context window")
+	}
+	for _, odd := range chainOddAnswers {
+		if strings.HasPrefix(req.GetQuestion(), odd[0]) {
+			return &pb.GenerateReply{Text: odd[1]}, nil
+		}
 	}
 	return &pb.GenerateReply{Text: agents.Generate(req.GetQuestion(), req.GetWorkspace(), req.GetSchemas())}, nil
 }
 
 func chainWorld(ctx *harness.Ctx) {
+	chainDying.Store(0)
 	pb.RegisterAgentsServer(ctx.GRPC.Server(config.Agents), &chainPeer{})
 }
 
@@ -1093,6 +1219,16 @@ func CheckDeadlines(ctx *harness.Ctx) {
 	chainExpectError(ctx, out, err, "a generator that hangs for 45 s")
 	ctx.Assert(waited <= 31, "generateSQL waited %.0f s on a hung generator: the deadline must end the call at 30 s", waited)
 	ctx.Equal(len(chainGenerates(ctx)), calls+1, "DEADLINE_EXCEEDED is not retried (the next try would hang as long); Generate calls")
+	ctx.GRPC.SetLatency("Generate", 20, config.Agents)
+	chainDying.Store(1)
+	calls = len(chainGenerates(ctx))
+	out, err = chainGenerate(ctx, chainQuestion, []string{"trips"})
+	tries := chainGenerates(ctx)[calls:]
+	ctx.Equal(len(tries), 2, "a generator that died after 20 s with UNAVAILABLE earns one retry; Generate calls")
+	for i, t := range tries {
+		ctx.Assert(t.HasDeadline() && 29*time.Second <= t.Timeout && t.Timeout <= 31*time.Second, "every attempt carries its own 30 s deadline, the retry too: attempt %d got %v", i+1, t.Timeout)
+	}
+	ctx.Assert(err == nil && out.SQL != "", "the retry after a 20 s UNAVAILABLE has a full 30 s and answers SQL, got %+v / %v", out, err)
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
@@ -1110,6 +1246,23 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	out, err = chainGenerate(ctx, chainQuestion, []string{"trips"})
 	chainExpectError(ctx, out, err, "an INVALID_ARGUMENT from the generator")
 	ctx.Equal(len(chainGenerates(ctx)), 5, "INVALID_ARGUMENT will not change on a retry (1 call); Generate calls so far")
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.PermissionDenied} {
+		calls := len(chainGenerates(ctx))
+		ctx.GRPC.Fail("Generate", code, "refused", 1, config.Agents)
+		out, err = chainGenerate(ctx, chainQuestion, []string{"trips"})
+		chainExpectError(ctx, out, err, "the generator answering "+code.String())
+		ctx.Equal(len(chainGenerates(ctx)), calls+1, "only UNAVAILABLE is retried, not %v; Generate calls", code)
+	}
+	ctx.GRPC.Fail("PruneColumns", codes.Unavailable, "prune agent restarting", 1, config.Agents)
+	out, err = chainGenerate(ctx, chainQuestion, chainWide)
+	ctx.Assert(err == nil && out.SQL != "", "one UNAVAILABLE from PruneColumns earns one retry, like Generate, and then SQL; got %+v / %v", out, err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("PruneColumns", "")), 2, "one UNAVAILABLE from PruneColumns, then success; PruneColumns calls")
+	calls := len(chainGenerates(ctx))
+	ctx.GRPC.Fail("PruneColumns", codes.InvalidArgument, "bad request", 1, config.Agents)
+	out, err = chainGenerate(ctx, chainQuestion, chainWide)
+	chainExpectError(ctx, out, err, "an INVALID_ARGUMENT from PruneColumns")
+	ctx.Equal(len(ctx.GRPC.CallsTo("PruneColumns", "")), 3, "INVALID_ARGUMENT from PruneColumns is not retried (1 call); PruneColumns calls so far")
+	ctx.Equal(len(chainGenerates(ctx)), calls, "a failed PruneColumns must end the chain before Generate; Generate calls")
 }
 
 func CheckPruneOverBudget(ctx *harness.Ctx) {
@@ -1123,6 +1276,16 @@ func CheckPruneOverBudget(ctx *harness.Ctx) {
 	sent, _ := calls[len(calls)-1].Request.(*pb.GenerateRequest)
 	ctx.Assert(sent != nil && len(sent.GetSchemas()) > 0 && !strings.Contains(strings.Join(sent.GetSchemas(), " "), "attr_"), "Generate must receive the pruned schemas, not the ones that were too wide")
 	ctx.Assert(err == nil && strings.HasPrefix(out.SQL, "SELECT * FROM trips_tier1"), "the pruned prompt generates SQL, got %+v / %v", out, err)
+	// trips_tier1 plus a filler table whose name pads the DDL to exactly 96 000 characters: 24 000 tokens
+	wide := len(catalog.SchemaFor("trips_tier1"))
+	atBudget := strings.Repeat("f", 96000-wide-len(catalog.SchemaFor("")))
+	ctx.Equal(wide+len(catalog.SchemaFor(atBudget)), 96000, "the harness's filler table is the wrong size")
+	_, err = chainGenerate(ctx, chainQuestion, []string{"trips_tier1", atBudget})
+	prunes := len(ctx.GRPC.CallsTo("PruneColumns", ""))
+	ctx.Assert(err == nil && prunes == 1, "schemas of exactly the 24 000-token budget are within it and go straight to Generate: %d PruneColumns call(s), %v", prunes-1, err)
+	_, err = chainGenerate(ctx, chainQuestion, []string{"trips_tier1", atBudget + "ffff"})
+	prunes = len(ctx.GRPC.CallsTo("PruneColumns", ""))
+	ctx.Assert(err == nil && prunes == 2, "schemas of 24 001 tokens exceed the budget and must be pruned: %d PruneColumns call(s), %v", prunes-1, err)
 }
 
 func CheckParseOutput(ctx *harness.Ctx) {
@@ -1132,7 +1295,10 @@ func CheckParseOutput(ctx *harness.Ctx) {
 	ctx.Equal(out, Output{SQL: "SELECT * FROM trips WHERE datestr = '2026-11-01'", Explanation: "Rows of trips for 2026-11-01."}, "a well-formed answer comes back as {SQL, Explanation}")
 	for _, c := range []struct{ question, what string }{
 		{"garbled: trips last week", "prose instead of JSON"},
+		{"array: trips last week", "a JSON array instead of an object"},
 		{"nosql: trips last week", "JSON without sql"},
+		{"numsql: trips last week", "a number for sql"},
+		{"noexpl: trips last week", "no explanation"},
 		{"blank: trips last week", "a blank sql"},
 	} {
 		out, err := chainGenerate(ctx, c.question, []string{"trips"})
@@ -1142,47 +1308,69 @@ func CheckParseOutput(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <atomic>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "querygen/agents.h"
+#include "querygen/catalog.h"
 
 namespace {
 
-const std::string kQuestion = "How many trips completed in Seattle yesterday?";
-const std::vector<std::string> kWide = {"trips_tier1", "drivers_tier1"};
+const std::string kHarnessQuestion = "How many trips completed in Seattle yesterday?";
+const std::vector<std::string> kHarnessWide = {"trips_tier1", "drivers_tier1"};
+// Answers the stand-in model gives for these question prefixes, ahead of querygen/agents.h.
+const std::vector<std::pair<std::string, std::string>> kHarnessOddAnswers = {
+    {"array:", R"(["SELECT * FROM trips"])"},
+    {"numsql:", R"({"sql": 42, "explanation": "Trips."})"},
+    {"noexpl:", R"({"sql": "SELECT * FROM trips WHERE datestr = '2026-11-01'"})"},
+};
+// Generate calls the stand-in answers UNAVAILABLE after their latency, like a generator that dies mid-call.
+std::atomic<int> harness_dying{0};
 
 // The stand-in agents: answers from querygen/agents.h.
-class ChainPeer final : public sqlagents::Agents::Service {
+class HarnessChainPeer final : public sqlagents::Agents::Service {
  public:
   grpc::Status PruneColumns(grpc::ServerContext*, const sqlagents::PruneColumnsRequest* req, sqlagents::PruneColumnsReply* reply) override {
     for (const auto& s : agents::prune_columns(req->question(), {req->schemas().begin(), req->schemas().end()})) reply->add_schemas(s);
     return grpc::Status::OK;
   }
   grpc::Status Generate(grpc::ServerContext*, const sqlagents::GenerateRequest* req, sqlagents::GenerateReply* reply) override {
+    if (harness_dying.load() > 0) {
+      harness_dying--;
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "generator restarting");
+    }
     const std::vector<std::string> schemas(req->schemas().begin(), req->schemas().end());
     if (agents::prompt_tokens(schemas) > agents::kContextLimitTokens)
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "prompt is over the model's context window");
+    for (const auto& [prefix, text] : kHarnessOddAnswers) {
+      if (req->question().rfind(prefix, 0) == 0) {
+        reply->set_text(text);
+        return grpc::Status::OK;
+      }
+    }
     reply->set_text(agents::generate(req->question(), req->workspace(), schemas));
     return grpc::Status::OK;
   }
 };
 
-void world(harness::Ctx& ctx) {
-  static ChainPeer peer;
+void harness_world(harness::Ctx& ctx) {
+  static HarnessChainPeer peer;
+  harness_dying = 0;
   ctx.GRPC.Server(config::kAgents)->RegisterService(&peer);
 }
 
 // What generate_sql returned, or what it threw.
-struct Result {
+struct HarnessResult {
   Output out;
   bool threw = false;
   bool generation_error = false;
   std::string error;
 };
 
-Result run(harness::Ctx& ctx, const std::string& question = kQuestion, const std::vector<std::string>& tables = {"trips"}) {
-  Result r;
+HarnessResult harness_run(harness::Ctx& ctx, const std::string& question = kHarnessQuestion, const std::vector<std::string>& tables = {"trips"}) {
+  HarnessResult r;
   const bool ended = ctx.Drain([&] {
     try {
       r.out = generate_sql(question, "mobility", tables);
@@ -1198,7 +1386,7 @@ Result run(harness::Ctx& ctx, const std::string& question = kQuestion, const std
   return r;
 }
 
-void expectError(harness::Ctx& ctx, const Result& r, const std::string& what) {
+void harness_expect_error(harness::Ctx& ctx, const HarnessResult& r, const std::string& what) {
   ctx.Assert(r.threw, "%s returned sql %q: it must throw GenerationError", what, r.out.sql);
   ctx.Assert(r.generation_error, "%s threw something else (%s); it must throw GenerationError", what, r.error);
 }
@@ -1206,49 +1394,75 @@ void expectError(harness::Ctx& ctx, const Result& r, const std::string& what) {
 }  // namespace
 
 void CheckDeadlines(harness::Ctx& ctx) {
-  world(ctx);
-  Result r = run(ctx);
+  harness_world(ctx);
+  HarnessResult r = harness_run(ctx);
   ctx.Assert(!r.threw, "a healthy chain threw: %s", r.error);
   const auto call = ctx.GRPC.CallsTo("Generate")[0];
   ctx.Assert(call.HasDeadline(), "Generate was called without a deadline: a generator that hangs holds the request open");
   ctx.Assert(29 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 31, "the Generate deadline must be 30 s, got %vs", call.TimeoutSeconds());
-  run(ctx, kQuestion, kWide);
+  harness_run(ctx, kHarnessQuestion, kHarnessWide);
   for (const auto& prune : ctx.GRPC.CallsTo("PruneColumns")) {
     ctx.Assert(prune.HasDeadline() && 9 <= prune.TimeoutSeconds() && prune.TimeoutSeconds() <= 11, "PruneColumns must carry config::kAgentDeadline (10 s), got %vs", prune.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Generate", 45, config::kAgents);
-  const size_t calls = ctx.GRPC.CallsTo("Generate").size();
+  size_t calls = ctx.GRPC.CallsTo("Generate").size();
   const int64_t started = ctx.Clock.Now();
-  r = run(ctx);
+  r = harness_run(ctx);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
-  expectError(ctx, r, "a generator that hangs for 45 s");
+  harness_expect_error(ctx, r, "a generator that hangs for 45 s");
   ctx.Assert(waited <= 31, "generate_sql waited %.0f s on a hung generator: the deadline must end the call at 30 s", waited);
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), calls + 1, "DEADLINE_EXCEEDED is not retried (the next try would hang as long); Generate calls");
+  ctx.GRPC.SetLatency("Generate", 20, config::kAgents);
+  harness_dying = 1;
+  calls = ctx.GRPC.CallsTo("Generate").size();
+  r = harness_run(ctx);
+  const auto all = ctx.GRPC.CallsTo("Generate");
+  ctx.Equal(all.size() - calls, 2, "a generator that died after 20 s with UNAVAILABLE earns one retry; Generate calls");
+  for (size_t i = calls; i < all.size(); ++i) {
+    ctx.Assert(all[i].HasDeadline() && 29 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 31, "every attempt carries its own 30 s deadline, the retry too: attempt %d got %vs", i - calls + 1, all[i].TimeoutSeconds());
+  }
+  ctx.Assert(!r.threw && !r.out.sql.empty(), "the retry after a 20 s UNAVAILABLE has a full 30 s and answers SQL, got %q / %s", r.out.sql, r.error);
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  world(ctx);
+  harness_world(ctx);
   ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "generator restarting", 1, config::kAgents);
-  Result r = run(ctx);
+  HarnessResult r = harness_run(ctx);
   ctx.Assert(!r.threw && !r.out.sql.empty(), "one UNAVAILABLE earns one retry and then SQL, got %q / %s", r.out.sql, r.error);
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 2, "one UNAVAILABLE, then success; Generate calls");
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
   ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "generator down", 2, config::kAgents);
-  r = run(ctx);
-  expectError(ctx, r, "a generator that stays UNAVAILABLE");
+  r = harness_run(ctx);
+  harness_expect_error(ctx, r, "a generator that stays UNAVAILABLE");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 4, "kMaxAttempts = 2: a generator that stays UNAVAILABLE gets 2 calls; Generate calls so far");
   ctx.GRPC.Fail("Generate", grpc::StatusCode::INVALID_ARGUMENT, "bad request", 1, config::kAgents);
-  r = run(ctx);
-  expectError(ctx, r, "an INVALID_ARGUMENT from the generator");
+  r = harness_run(ctx);
+  harness_expect_error(ctx, r, "an INVALID_ARGUMENT from the generator");
   ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), 5, "INVALID_ARGUMENT will not change on a retry (1 call); Generate calls so far");
+  for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{
+           {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}}) {
+    const size_t calls = ctx.GRPC.CallsTo("Generate").size();
+    ctx.GRPC.Fail("Generate", code, "refused", 1, config::kAgents);
+    harness_expect_error(ctx, harness_run(ctx), "the generator answering " + name);
+    ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), calls + 1, "only UNAVAILABLE is retried, not %s; Generate calls", name);
+  }
+  ctx.GRPC.Fail("PruneColumns", grpc::StatusCode::UNAVAILABLE, "prune agent restarting", 1, config::kAgents);
+  r = harness_run(ctx, kHarnessQuestion, kHarnessWide);
+  ctx.Assert(!r.threw && !r.out.sql.empty(), "one UNAVAILABLE from PruneColumns earns one retry, like Generate, and then SQL; got %q / %s", r.out.sql, r.error);
+  ctx.Equal(ctx.GRPC.CallsTo("PruneColumns").size(), 2, "one UNAVAILABLE from PruneColumns, then success; PruneColumns calls");
+  const size_t calls = ctx.GRPC.CallsTo("Generate").size();
+  ctx.GRPC.Fail("PruneColumns", grpc::StatusCode::INVALID_ARGUMENT, "bad request", 1, config::kAgents);
+  harness_expect_error(ctx, harness_run(ctx, kHarnessQuestion, kHarnessWide), "an INVALID_ARGUMENT from PruneColumns");
+  ctx.Equal(ctx.GRPC.CallsTo("PruneColumns").size(), 3, "INVALID_ARGUMENT from PruneColumns is not retried (1 call); PruneColumns calls so far");
+  ctx.Equal(ctx.GRPC.CallsTo("Generate").size(), calls, "a failed PruneColumns must end the chain before Generate; Generate calls");
 }
 
 void CheckPruneOverBudget(harness::Ctx& ctx) {
-  world(ctx);
-  Result r = run(ctx);
+  harness_world(ctx);
+  HarnessResult r = harness_run(ctx);
   ctx.Assert(!r.threw, "one small table must generate, threw: %s", r.error);
   ctx.Equal(ctx.GRPC.CallsTo("PruneColumns").size(), 0, "a schema well under the token budget was sent to the prune agent (a model call for nothing); PruneColumns calls");
-  r = run(ctx, kQuestion, kWide);
+  r = harness_run(ctx, kHarnessQuestion, kHarnessWide);
   ctx.Equal(ctx.GRPC.CallsTo("PruneColumns").size(), 1, "two Tier-1 tables (about 36 000 tokens of DDL) must go through PruneColumns once (the generator answered: %s); PruneColumns calls", r.error);
   const auto calls = ctx.GRPC.CallsTo("Generate");
   const auto sent = calls.back().Request<sqlagents::GenerateRequest>();
@@ -1256,16 +1470,31 @@ void CheckPruneOverBudget(harness::Ctx& ctx) {
   for (const auto& s : sent.schemas()) wide = wide || s.find("attr_") != std::string::npos;
   ctx.Assert(sent.schemas_size() > 0 && !wide, "Generate must receive the pruned schemas, not the ones that were too wide");
   ctx.Assert(!r.threw && r.out.sql.rfind("SELECT * FROM trips_tier1", 0) == 0, "the pruned prompt generates SQL, got %q / %s", r.out.sql, r.error);
+  // trips_tier1 plus a filler table whose name pads the DDL to exactly 96 000 characters: 24 000 tokens
+  const size_t tier1 = catalog::schema_for("trips_tier1").size();
+  const std::string at_budget(96000 - tier1 - catalog::schema_for("").size(), 'f');
+  ctx.Equal(tier1 + catalog::schema_for(at_budget).size(), 96000, "the harness's filler table is the wrong size");
+  r = harness_run(ctx, kHarnessQuestion, {"trips_tier1", at_budget});
+  size_t prunes = ctx.GRPC.CallsTo("PruneColumns").size();
+  ctx.Assert(!r.threw && prunes == 1, "schemas of exactly the 24 000-token budget are within it and go straight to Generate: %d PruneColumns call(s), %s", prunes - 1, r.error);
+  r = harness_run(ctx, kHarnessQuestion, {"trips_tier1", at_budget + "ffff"});
+  prunes = ctx.GRPC.CallsTo("PruneColumns").size();
+  ctx.Assert(!r.threw && prunes == 2, "schemas of 24 001 tokens exceed the budget and must be pruned: %d PruneColumns call(s), %s", prunes - 1, r.error);
 }
 
 void CheckParseOutput(harness::Ctx& ctx) {
-  world(ctx);
-  const Result r = run(ctx);
+  harness_world(ctx);
+  const HarnessResult r = harness_run(ctx);
   ctx.Assert(!r.threw && r.out.sql == "SELECT * FROM trips WHERE datestr = '2026-11-01'" && r.out.explanation == "Rows of trips for 2026-11-01.",
              "a well-formed answer comes back as {sql, explanation}, got %q / %q / %s", r.out.sql, r.out.explanation, r.error);
   for (const auto& [question, what] : std::vector<std::pair<std::string, std::string>>{
-           {"garbled: trips last week", "prose instead of JSON"}, {"nosql: trips last week", "JSON without sql"}, {"blank: trips last week", "a blank sql"}}) {
-    expectError(ctx, run(ctx, question), "an answer with " + what);
+           {"garbled: trips last week", "prose instead of JSON"},
+           {"array: trips last week", "a JSON array instead of an object"},
+           {"nosql: trips last week", "JSON without sql"},
+           {"numsql: trips last week", "a number for sql"},
+           {"noexpl: trips last week", "no explanation"},
+           {"blank: trips last week", "a blank sql"}}) {
+    harness_expect_error(ctx, harness_run(ctx, question), "an answer with " + what);
   }
 }
 `,
@@ -1273,7 +1502,7 @@ void CheckParseOutput(harness::Ctx& ctx) {
   hints: [
     'Symptom: two wide Tier-1 tables never produce SQL, a slow generator holds the request for minutes, a request the generator rejects keeps a worker busy for good, and one chatty model answer surfaces as a 500.',
     'Mechanism: `call` loops on every `RpcError` with no deadline and no attempt cap; nothing measures the schemas before `Generate`, so the prompt overflows the window on every try; `parse_output` trusts `json.loads(text)["sql"]`.',
-    'Change: `call(method, request, timeout_s)` with `timeout=`, `range(MAX_ATTEMPTS)`, retry only `UNAVAILABLE`, else `raise GenerationError`; prune when `estimate_tokens(schemas) > SCHEMA_TOKEN_BUDGET`; in `parse_output` catch `ValueError` and check both fields are non-blank strings.',
+    'Change: `call(method, request, timeout_s)` with `timeout=`, `range(MAX_ATTEMPTS)`, retry only `UNAVAILABLE`, else `raise GenerationError`; prune when `estimate_tokens(schemas) > SCHEMA_TOKEN_BUDGET`; in `parse_output` catch `ValueError`, require a JSON object whose `sql` and `explanation` are strings, and refuse a blank `sql`.',
   ],
   debrief: `The chain treats every agent answer as one of three kinds. \`UNAVAILABLE\` means the agent is restarting and is worth one more try after a pause; a deadline or an invalid argument will fail the same way again, so it ends the chain with a reason the caller can show. The deadline belongs on the call: a loop around a call without one still waits for the reply. Pruning is cheaper than a larger window because the generator only needs the columns the question touches; QueryGPT added its column prune agent for exactly the 200-column tables that broke the 32K model. Parsing defensively turns a chatty answer into a user-facing error instead of a stack trace. A production chain would also log the token estimate and the pruned column count per question.`,
 };

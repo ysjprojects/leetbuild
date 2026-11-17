@@ -61,7 +61,7 @@ Requirements:
       id: 'question-cap',
       title: 'Caps the question at 2000 characters before any agent call',
       detail:
-        'An empty question is 400 and one over 2000 characters is 413, with no agent called and no record stored; exactly 2000 is accepted. The starter forwards whatever arrives.',
+        'An empty question is 400 and one over 2000 characters is 413, with no agent called and no record stored; exactly 2000 is accepted, also when they are multi-byte characters such as é. The starter forwards whatever arrives.',
       match: {
         python: {all: [/MAX_QUESTION_CHARS/, /status_code\s*=\s*413/]},
         typescript: {all: [/MAX_QUESTION_CHARS/, /code\(\s*413\s*\)/]},
@@ -87,7 +87,7 @@ Requirements:
       id: 'idempotency-key',
       title: 'Keys question submissions by (user, Idempotency-Key)',
       detail:
-        "Idempotency-Key is required (400 without it); a replay of the same (user, key) answers 200 with the stored query and calls no agent; another user's same key gets its own query. The starter ignores the header.",
+        "Idempotency-Key is required (400 without it); a replay of the same (user, key) answers 200 with the stored query and calls no agent, not even the intent agent; another user's same key gets its own query. The starter ignores the header.",
       match: {
         python: {all: [/store\.find\(\s*user\s*,/, /store\.put\(\s*user\s*,\s*idem_key/]},
         typescript: {all: [/store\.find\(\s*user\s*,/, /store\.put\(\s*user\s*,\s*idemKey/]},
@@ -1009,6 +1009,8 @@ async def check_question_cap(ctx):
         assert ctx.redis.keys("query:*") == [], f"a rejected question must store nothing, found {ctx.redis.keys('query:*')}"
         r = await _post(c, {"question": "y" * 2000, "workspace": "mobility"}, key="k-max")
         assert 200 <= r.status_code < 300, f"exactly 2000 characters is allowed, got {r.status_code}: {r.text}"
+        r = await _post(c, {"question": "é" * 2000, "workspace": "mobility"}, key="k-accent")
+        assert 200 <= r.status_code < 300, f"2000 characters of 'é' (4000 bytes in UTF-8) is allowed, got {r.status_code}: {r.text}; count characters, not bytes"
 
 
 async def check_workspace_allowlist(ctx):
@@ -1043,6 +1045,14 @@ async def check_idempotency_key(ctx):
         other = await _post(c, GOOD, user="ben", key="k-7")
         assert 200 <= other.status_code < 300 and other.json().get("query_id") != first.json().get("query_id"), "another user reusing the key gets their own query (keys are per user)"
         assert len(ctx.redis.keys("query:*")) == 2, f"two users, two queries: the store holds {len(ctx.redis.keys('query:*'))}"
+        ads = {"question": "Which campaign spent the most last week?"}
+        first = await _post(c, ads, key="k-8")
+        assert 200 <= first.status_code < 300, f"a question without a workspace answered {first.status_code}: {first.text}"
+        before = _calls(ctx)
+        replay = await _post(c, ads, key="k-8")
+        assert replay.status_code == 200 and replay.json().get("query_id") == first.json().get("query_id"), f"a replay of a question without a workspace must answer 200 with the stored query: {replay.status_code} {replay.text}"
+        assert replay.json().get("tables_proposed") == first.json().get("tables_proposed"), f"the replay answers the stored record: {replay.text}"
+        assert _calls(ctx) == before, f"a replay of a question without a workspace made {_calls(ctx) - before} agent call(s); a replay calls no agent, not even Intent"
 
 
 async def check_pending_ack(ctx):
@@ -1123,6 +1133,8 @@ export async function check_question_cap(ctx) {
   assert.deepStrictEqual(ctx.redis.keys('query:*'), [], \`a rejected question must store nothing, found \${JSON.stringify(ctx.redis.keys('query:*'))}\`);
   r = await post(c, {question: 'y'.repeat(2000), workspace: 'mobility'}, {key: 'k-max'});
   assert(ok(r.status), \`exactly 2000 characters is allowed, got \${r.status}: \${r.text}\`);
+  r = await post(c, {question: 'é'.repeat(2000), workspace: 'mobility'}, {key: 'k-accent'});
+  assert(ok(r.status), \`2000 characters of 'é' (4000 bytes in UTF-8) is allowed, got \${r.status}: \${r.text}; count characters, not bytes\`);
 }
 
 export async function check_workspace_allowlist(ctx) {
@@ -1157,6 +1169,14 @@ export async function check_idempotency_key(ctx) {
   const other = await post(c, GOOD, {user: 'ben', key: 'k-7'});
   assert(ok(other.status) && other.json().query_id !== first.json().query_id, 'another user reusing the key gets their own query (keys are per user)');
   assert.equal(ctx.redis.keys('query:*').length, 2, \`two users, two queries: the store holds \${ctx.redis.keys('query:*').length}\`);
+  const ads = {question: 'Which campaign spent the most last week?'};
+  const adsFirst = await post(c, ads, {key: 'k-8'});
+  assert(ok(adsFirst.status), \`a question without a workspace answered \${adsFirst.status}: \${adsFirst.text}\`);
+  const before = calls(ctx);
+  const adsReplay = await post(c, ads, {key: 'k-8'});
+  assert(adsReplay.status === 200 && adsReplay.json().query_id === adsFirst.json().query_id, \`a replay of a question without a workspace must answer 200 with the stored query: \${adsReplay.status} \${adsReplay.text}\`);
+  assert.deepStrictEqual(adsReplay.json().tables_proposed, adsFirst.json().tables_proposed, \`the replay answers the stored record: \${adsReplay.text}\`);
+  assert.equal(calls(ctx), before, \`a replay of a question without a workspace made \${calls(ctx) - before} agent call(s); a replay calls no agent, not even Intent\`);
 }
 
 export async function check_pending_ack(ctx) {
@@ -1281,6 +1301,8 @@ func CheckQuestionCap(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.Keys("query:*")), 0, "a rejected question must store nothing; records")
 	r = apiPost(c, map[string]any{"question": strings.Repeat("y", 2000), "workspace": "mobility"}, "ana", "k-max")
 	ctx.Assert(apiOK(r.Status), "exactly 2000 characters is allowed, got %d: %s", r.Status, r.Text())
+	r = apiPost(c, map[string]any{"question": strings.Repeat("é", 2000), "workspace": "mobility"}, "ana", "k-accent")
+	ctx.Assert(apiOK(r.Status), "2000 characters of 'é' (4000 bytes in UTF-8) is allowed, got %d: %s; count characters, not bytes", r.Status, r.Text())
 }
 
 func CheckWorkspaceAllowlist(ctx *harness.Ctx) {
@@ -1314,6 +1336,14 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	other := apiPost(c, apiGood, "ben", "k-7")
 	ctx.Assert(apiOK(other.Status) && apiBody(ctx, other)["query_id"] != apiBody(ctx, first)["query_id"], "another user reusing the key gets their own query (keys are per user)")
 	ctx.Equal(len(ctx.Redis.Keys("query:*")), 2, "two users, two queries; records")
+	ads := map[string]any{"question": "Which campaign spent the most last week?"}
+	adsFirst := apiPost(c, ads, "ana", "k-8")
+	ctx.Assert(apiOK(adsFirst.Status), "a question without a workspace answered %d: %s", adsFirst.Status, adsFirst.Text())
+	before := apiCalls(ctx)
+	adsReplay := apiPost(c, ads, "ana", "k-8")
+	ctx.Assert(adsReplay.Status == 200 && apiBody(ctx, adsReplay)["query_id"] == apiBody(ctx, adsFirst)["query_id"], "a replay of a question without a workspace must answer 200 with the stored query: %d %s", adsReplay.Status, adsReplay.Text())
+	ctx.Equal(apiBody(ctx, adsReplay)["tables_proposed"], apiBody(ctx, adsFirst)["tables_proposed"], "the replay answers the stored record")
+	ctx.Equal(apiCalls(ctx), before, "a replay of a question without a workspace called the agents (a replay calls no agent, not even Intent); agent calls")
 }
 
 func CheckPendingAck(ctx *harness.Ctx) {
@@ -1346,11 +1376,11 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kQuestion = "How many trips completed in Seattle yesterday?";
-const json kGood = {{"question", kQuestion}, {"workspace", "mobility"}};
+const std::string kHarnessQuestion = "How many trips completed in Seattle yesterday?";
+const json kHarnessGood = {{"question", kHarnessQuestion}, {"workspace", "mobility"}};
 
 // The stand-in agents: answers from querygen/agents.h.
-class AgentsPeer final : public sqlagents::Agents::Service {
+class HarnessAgentsPeer final : public sqlagents::Agents::Service {
  public:
   grpc::Status Intent(grpc::ServerContext*, const sqlagents::IntentRequest* req, sqlagents::IntentReply* reply) override {
     reply->set_workspace(agents::intent(req->question()));
@@ -1373,11 +1403,11 @@ class AgentsPeer final : public sqlagents::Agents::Service {
   }
 };
 
-struct Api {
-  AgentsPeer peer;
+struct HarnessApi {
+  HarnessAgentsPeer peer;
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+  explicit HarnessApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
     ctx.GRPC.Server(config::kAgents)->RegisterService(&peer);
     register_routes(svr);
   }
@@ -1389,98 +1419,110 @@ struct Api {
   }
 };
 
-Api& api(harness::Ctx& ctx) {
-  static Api* current = nullptr;
+HarnessApi& harness_api(harness::Ctx& ctx) {
+  static HarnessApi* current = nullptr;
   delete current;
-  current = new Api(ctx);
+  current = new HarnessApi(ctx);
   return *current;
 }
 
-size_t calls(harness::Ctx& ctx, const std::vector<std::string>& methods = {"Intent", "PickTables", "PruneColumns", "Generate"}) {
+size_t harness_calls(harness::Ctx& ctx, const std::vector<std::string>& methods = {"Intent", "PickTables", "PruneColumns", "Generate"}) {
   size_t n = 0;
   for (const auto& m : methods) n += ctx.GRPC.CallsTo(m).size();
   return n;
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json harness_body(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
 }
 
-bool ok(int status) { return status >= 200 && status < 300; }
+bool harness_ok(int status) { return status >= 200 && status < 300; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto& a = api(ctx);
-  const auto r = a.post(kGood);
-  ctx.Assert(ok(r.Status), "a valid question answered %d: %s", r.Status, r.Text());
-  const json body = bodyOf(ctx, r);
+  auto& a = harness_api(ctx);
+  const auto r = a.post(kHarnessGood);
+  ctx.Assert(harness_ok(r.Status), "a valid question answered %d: %s", r.Status, r.Text());
+  const json body = harness_body(ctx, r);
   const std::string id = body.value("query_id", "");
   ctx.Assert(!id.empty(), "the answer needs a query_id: %s", r.Text());
   ctx.Equal(body.value("workspace", ""), "mobility", "the answer carries the workspace");
   ctx.Assert(body["tables_proposed"] == json({"trips", "drivers"}), "tables_proposed must be the table agent's pick for mobility (trips, drivers): %s", r.Text());
   ctx.Assert(ctx.Redis.Get("query:" + id).has_value(), "the record must be in the query store (query:{query_id}): keys %v", ctx.Redis.Keys("*"));
-  ctx.Equal(a.post(kGood, "", "k-2").Status, 401, "without X-User-Id the request");
+  ctx.Equal(a.post(kHarnessGood, "", "k-2").Status, 401, "without X-User-Id the request");
 }
 
 void CheckQuestionCap(harness::Ctx& ctx) {
-  auto& a = api(ctx);
+  auto& a = harness_api(ctx);
   for (const std::string q : {"", "   "}) {
     const auto r = a.post({{"question", q}, {"workspace", "mobility"}}, "ana", "k-empty");
     ctx.Equal(r.Status, 400, "question %q", q);
   }
   auto r = a.post({{"question", std::string(2001, 'x')}, {"workspace", "mobility"}}, "ana", "k-long");
   ctx.Equal(r.Status, 413, "a 2001-character question (a pasted document must not reach the agents)");
-  ctx.Equal(calls(ctx), 0, "rejected questions reached the agents (refuse before the first call); agent calls");
+  ctx.Equal(harness_calls(ctx), 0, "rejected questions reached the agents (refuse before the first call); agent calls");
   ctx.Equal(ctx.Redis.Keys("query:*").size(), 0, "a rejected question must store nothing; records");
   r = a.post({{"question", std::string(2000, 'y')}, {"workspace", "mobility"}}, "ana", "k-max");
-  ctx.Assert(ok(r.Status), "exactly 2000 characters is allowed, got %d: %s", r.Status, r.Text());
+  ctx.Assert(harness_ok(r.Status), "exactly 2000 characters is allowed, got %d: %s", r.Status, r.Text());
+  std::string accents;
+  for (int i = 0; i < 2000; ++i) accents += "\\u00e9";
+  r = a.post({{"question", accents}, {"workspace", "mobility"}}, "ana", "k-accent");
+  ctx.Assert(harness_ok(r.Status), "2000 characters of 'é' (4000 bytes in UTF-8) is allowed, got %d: %s; count characters, not bytes", r.Status, r.Text());
 }
 
 void CheckWorkspaceAllowlist(harness::Ctx& ctx) {
-  auto& a = api(ctx);
-  auto r = a.post({{"question", kQuestion}, {"workspace", "finance"}}, "ana", "k-fin");
+  auto& a = harness_api(ctx);
+  auto r = a.post({{"question", kHarnessQuestion}, {"workspace", "finance"}}, "ana", "k-fin");
   ctx.Equal(r.Status, 400, "workspace 'finance' is not a system workspace");
-  ctx.Equal(calls(ctx), 0, "a caller's unknown workspace reached the agents (check it against config::kSystemWorkspaces first); agent calls");
+  ctx.Equal(harness_calls(ctx), 0, "a caller's unknown workspace reached the agents (check it against config::kSystemWorkspaces first); agent calls");
   r = a.post({{"question", "offtopic: what did payroll pay contractors in October?"}}, "ana", "k-off");
   ctx.Equal(r.Status, 422, "the intent agent answered 'hr-payroll', which is no system workspace (%s)", r.Text());
-  ctx.Equal(calls(ctx, {"PickTables"}), 0, "an intent answer outside the system workspaces went on to the table agent; PickTables calls");
+  ctx.Equal(harness_calls(ctx, {"PickTables"}), 0, "an intent answer outside the system workspaces went on to the table agent; PickTables calls");
   ctx.Equal(ctx.Redis.Keys("query:*").size(), 0, "a refused question must store nothing; records");
   r = a.post({{"question", "Which campaign spent the most last week?"}}, "ana", "k-ads");
-  ctx.Assert(ok(r.Status) && bodyOf(ctx, r).value("workspace", "") == "ads", "without a workspace the intent agent's 'ads' must be used: %d %s", r.Status, r.Text());
-  const size_t intents = calls(ctx, {"Intent"});
-  r = a.post({{"question", kQuestion}, {"workspace", "core-services"}}, "ana", "k-core");
-  ctx.Assert(ok(r.Status) && bodyOf(ctx, r).value("workspace", "") == "core-services", "a system workspace the caller names is used as given: %d %s", r.Status, r.Text());
-  ctx.Equal(calls(ctx, {"Intent"}), intents, "with a valid workspace in the body the intent agent must not be asked; Intent calls");
+  ctx.Assert(harness_ok(r.Status) && harness_body(ctx, r).value("workspace", "") == "ads", "without a workspace the intent agent's 'ads' must be used: %d %s", r.Status, r.Text());
+  const size_t intents = harness_calls(ctx, {"Intent"});
+  r = a.post({{"question", kHarnessQuestion}, {"workspace", "core-services"}}, "ana", "k-core");
+  ctx.Assert(harness_ok(r.Status) && harness_body(ctx, r).value("workspace", "") == "core-services", "a system workspace the caller names is used as given: %d %s", r.Status, r.Text());
+  ctx.Equal(harness_calls(ctx, {"Intent"}), intents, "with a valid workspace in the body the intent agent must not be asked; Intent calls");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto& a = api(ctx);
-  ctx.Equal(a.post(kGood, "ana", "").Status, 400, "a request without Idempotency-Key");
-  ctx.Equal(calls(ctx), 0, "a request without Idempotency-Key reached the agents; agent calls");
-  const auto first = a.post(kGood, "ana", "k-7");
-  ctx.Assert(ok(first.Status), "the first request answered %d: %s", first.Status, first.Text());
-  const size_t picks = calls(ctx, {"PickTables"});
-  const auto replay = a.post(kGood, "ana", "k-7");
+  auto& a = harness_api(ctx);
+  ctx.Equal(a.post(kHarnessGood, "ana", "").Status, 400, "a request without Idempotency-Key");
+  ctx.Equal(harness_calls(ctx), 0, "a request without Idempotency-Key reached the agents; agent calls");
+  const auto first = a.post(kHarnessGood, "ana", "k-7");
+  ctx.Assert(harness_ok(first.Status), "the first request answered %d: %s", first.Status, first.Text());
+  const size_t picks = harness_calls(ctx, {"PickTables"});
+  const auto replay = a.post(kHarnessGood, "ana", "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (user, Idempotency-Key) must answer the stored query");
-  ctx.Equal(bodyOf(ctx, replay)["query_id"], bodyOf(ctx, first)["query_id"], "the replay must return the same query");
-  ctx.Equal(calls(ctx, {"PickTables"}), picks, "a replay ran the agents again (the client retried, the chain must not); PickTables calls");
-  const auto other = a.post(kGood, "ben", "k-7");
-  ctx.Assert(ok(other.Status) && bodyOf(ctx, other)["query_id"] != bodyOf(ctx, first)["query_id"], "another user reusing the key gets their own query (keys are per user)");
+  ctx.Equal(harness_body(ctx, replay)["query_id"], harness_body(ctx, first)["query_id"], "the replay must return the same query");
+  ctx.Equal(harness_calls(ctx, {"PickTables"}), picks, "a replay ran the agents again (the client retried, the chain must not); PickTables calls");
+  const auto other = a.post(kHarnessGood, "ben", "k-7");
+  ctx.Assert(harness_ok(other.Status) && harness_body(ctx, other)["query_id"] != harness_body(ctx, first)["query_id"], "another user reusing the key gets their own query (keys are per user)");
   ctx.Equal(ctx.Redis.Keys("query:*").size(), 2, "two users, two queries; records");
+  const json ads = {{"question", "Which campaign spent the most last week?"}};
+  const auto ads_first = a.post(ads, "ana", "k-8");
+  ctx.Assert(harness_ok(ads_first.Status), "a question without a workspace answered %d: %s", ads_first.Status, ads_first.Text());
+  const size_t before = harness_calls(ctx);
+  const auto ads_replay = a.post(ads, "ana", "k-8");
+  ctx.Assert(ads_replay.Status == 200 && harness_body(ctx, ads_replay)["query_id"] == harness_body(ctx, ads_first)["query_id"], "a replay of a question without a workspace must answer 200 with the stored query: %d %s", ads_replay.Status, ads_replay.Text());
+  ctx.Assert(harness_body(ctx, ads_replay)["tables_proposed"] == harness_body(ctx, ads_first)["tables_proposed"], "the replay answers the stored record: %s", ads_replay.Text());
+  ctx.Equal(harness_calls(ctx), before, "a replay of a question without a workspace called the agents (a replay calls no agent, not even Intent); agent calls");
 }
 
 void CheckPendingAck(harness::Ctx& ctx) {
-  auto& a = api(ctx);
-  const auto r = a.post(kGood, "ana", "k-ack");
+  auto& a = harness_api(ctx);
+  const auto r = a.post(kHarnessGood, "ana", "k-ack");
   ctx.Equal(r.Status, 202, "a proposal waiting for the user's ACK");
-  const json body = bodyOf(ctx, r);
+  const json body = harness_body(ctx, r);
   ctx.Equal(body.value("status", ""), "pending_ack", "status");
   ctx.Assert(body["tables_proposed"] == json({"trips", "drivers"}), "tables_proposed must be the table agent's pick: %s", r.Text());
   ctx.Assert(body["tables_acked"] == json::array() && body.value("sql", "?") == "", "nothing is ACKed or generated yet: %s", r.Text());
-  ctx.Equal(calls(ctx, {"Generate"}), 0, "Generate ran before the user ACKed the tables; Generate calls");
+  ctx.Equal(harness_calls(ctx, {"Generate"}), 0, "Generate ran before the user ACKed the tables; Generate calls");
   const auto stored = ctx.Redis.Get("query:" + body.value("query_id", ""));
   ctx.Assert(stored && json::parse(*stored, nullptr, false).value("status", "") == "pending_ack", "the stored record must say pending_ack: %s", stored.value_or("(none)"));
 }

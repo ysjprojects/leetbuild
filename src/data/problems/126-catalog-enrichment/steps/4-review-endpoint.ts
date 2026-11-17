@@ -20,11 +20,12 @@ hides 4 flaws.
 a SKU another reviewer has claimed; a retried request decides twice; and the decision is not kept
 as a label or sent as an event, so the next model learns nothing and search does not hear of it.
 
-- No \`X-Reviewer-Id\` is 401; an \`X-Reviewer-Role\` outside \`REVIEWER_ROLES\` is 403.
+- No \`X-Reviewer-Id\` is 401; an \`X-Reviewer-Role\` that is missing or outside \`REVIEWER_ROLES\`
+  (\`reviewer\`, \`catalog-admin\`) is 403.
 - \`Idempotency-Key\` is required (400); \`store.review_result(reviewer, key)\` answers a retry,
   \`store.record_review\` stores the answer.
-- A caller who is not \`store.lease_holder(sku_id)\` (step 3's lease) is 409; the lease is released
-  after the decision.
+- A caller who is not \`store.lease_holder(sku_id)\` (step 3's lease), including when nobody holds it, is
+  409; the lease is released after the decision.
 - Every decision is \`store.put_label(...)\`, then \`publish(event)\` (step 5) with \`source: "human"\`
   and \`attributes_version = store.next_version(sku_id)\`; the answer carries \`label_version\`.`,
   sequence: {
@@ -53,7 +54,7 @@ as a label or sent as an event, so the next model learns nothing and search does
       id: 'reviewer-auth',
       title: 'No reviewer is 401, a role outside REVIEWER_ROLES is 403',
       detail:
-        'A request without `X-Reviewer-Id` is 401 and one whose `X-Reviewer-Role` is not in `REVIEWER_ROLES` is 403, and neither changes anything. The starter calls such a caller "unknown" and applies the decision.',
+        'A request without `X-Reviewer-Id` is 401 and one whose `X-Reviewer-Role` is missing or not in `REVIEWER_ROLES` (`reviewer`, `catalog-admin`) is 403, and neither changes anything. The starter calls such a caller "unknown" and applies the decision.',
       match: {
         python: {
           all: [/REVIEWER_ROLES\s*=/, /\b401\b/, /\b403\b/],
@@ -69,7 +70,7 @@ as a label or sent as an event, so the next model learns nothing and search does
       id: 'lease-held',
       title: 'Only the lease holder decides, and the lease is released after',
       detail:
-        'A caller who does not hold `review:lease:{sku_id}` is 409; after the decision the lease is released. The starter does not look at the lease, so two reviewers on one SKU overwrite each other.',
+        'A caller who does not hold `review:lease:{sku_id}`, because another reviewer holds it or nobody does, is 409; after the decision the lease is released. The starter does not look at the lease, so two reviewers on one SKU overwrite each other.',
       match: {
         python: {
           all: [/\b409\b/, /store\.release_lease\(/],
@@ -107,7 +108,7 @@ as a label or sent as an event, so the next model learns nothing and search does
       id: 'label-and-publish',
       title: 'Every decision becomes a label and a human event',
       detail:
-        'The decision is stored with `store.put_label` and published on `sku.enriched` with `source: "human"` and a new `attributes_version`; the answer names the label version. The starter edits the catalog row directly, so no label is written for the next model and search does not hear of the fix.',
+        'The decision is stored with `store.put_label` and published on `sku.enriched` with `source: "human"`, the proposal\'s merchant and taxonomy version, and the SKU\'s next `attributes_version` from `store.next_version`; the answer names the label version. The starter edits the catalog row directly, so no label is written for the next model and search does not hear of the fix.',
       match: {
         python: {all: [/store\.put_label\(/, /publish\(event\)/], none: [/store\.apply_catalog\(/]},
         typescript: {all: [/putLabel\(/, /publish\(event\)/], none: [/applyCatalog\(/]},
@@ -848,22 +849,28 @@ async def check_reviewer_auth(ctx):
         assert r.status_code == 401, f"a decision without X-Reviewer-Id answered {r.status_code}, expected 401"
         r = await _post(c, "k-2", role="shopper")
         assert r.status_code == 403, f"a decision from role 'shopper' answered {r.status_code}, expected 403"
-        _untouched(ctx, "after two refused requests")
-        r = await _post(c, "k-3")
-    assert r.status_code == 200, f"a reviewer holding the lease answered {r.status_code}: {r.text}"
+        r = await _post(c, "k-4", role=None)
+        assert r.status_code == 403, f"a decision with no X-Reviewer-Role answered {r.status_code}, expected 403: only the roles in REVIEWER_ROLES decide"
+        _untouched(ctx, "after three refused requests")
+        r = await _post(c, "k-3", role="catalog-admin")
+    assert r.status_code == 200, f"a catalog-admin holding the lease answered {r.status_code}: {r.text}"
 
 
 async def check_lease_held(ctx):
     async with _api(ctx, holder="ben") as c:
         r = await _post(c, "k-1")
         assert r.status_code == 409, f"ana decided on a SKU whose review lease ben holds: answered {r.status_code}, expected 409"
-        _untouched(ctx, "after a decision without the lease")
+        ctx.redis.delete("review:lease:sku-1")
+        r = await _post(c, "k-4")
+        assert r.status_code == 409, f"ana decided on a SKU whose review lease nobody holds: answered {r.status_code}, expected 409"
+        _untouched(ctx, "after two decisions without the lease")
         ctx.redis.set("review:lease:sku-1", "ana")
         r = await _post(c, "k-2")
         assert r.status_code == 200, f"the lease holder's decision answered {r.status_code}: {r.text}"
         assert ctx.redis.get("review:lease:sku-1") is None, "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes"
+        ctx.redis.set("review:lease:sku-404", "ana")
         r = await _post(c, "k-3", sku_id="sku-404")
-    assert r.status_code == 404, f"a decision on a SKU with no proposal answered {r.status_code}, expected 404"
+    assert r.status_code == 404, f"a decision by the lease holder on a SKU with no proposal answered {r.status_code}, expected 404"
 
 
 async def check_idempotency_key(ctx):
@@ -879,6 +886,8 @@ async def check_idempotency_key(ctx):
 
 
 async def check_label_and_publish(ctx):
+    for _ in range(3):
+        store.next_version("sku-1")  # three model events came before this decision
     async with _api(ctx) as c:
         r = await _post(c, "k-1")
     assert r.status_code == 200, f"the decision answered {r.status_code}: {r.text}"
@@ -891,6 +900,8 @@ async def check_label_and_publish(ctx):
     assert len(events) == 1, f"the decision must reach sku.enriched once, the topic holds {len(events)} events"
     assert events[0]["source"] == "human" and events[0]["attributes"]["brand"] == "Oatly", f"the event must carry the corrected attributes with source human, got {events[0]}"
     assert events[0]["attributes_version"] == body.get("attributes_version"), f"the event's attributes_version {events[0]['attributes_version']} differs from the answer's {body.get('attributes_version')}"
+    assert events[0]["attributes_version"] == 4, f"the SKU's attributes were at version 3, so the decision's event must carry store.next_version (4), got {events[0]['attributes_version']}"
+    assert events[0].get("merchant") == "m-1" and events[0].get("taxonomy_version") == taxonomy.VERSION, f"the event must carry the proposal's merchant and taxonomy version, got {events[0]}"
     assert store.pending("sku-1") is None, "the decided proposal is still in the review queue"
 `,
     typescript: `const PROPOSAL = {
@@ -935,22 +946,28 @@ export async function check_reviewer_auth(ctx) {
   assert.equal(r.status, 401, \`a decision without X-Reviewer-Id answered \${r.status}, expected 401\`);
   r = await post(c, 'k-2', 'sku-1', 'ana', 'shopper');
   assert.equal(r.status, 403, \`a decision from role 'shopper' answered \${r.status}, expected 403\`);
-  await untouched(ctx, store, 'after two refused requests');
-  r = await post(c, 'k-3');
-  assert.equal(r.status, 200, \`a reviewer holding the lease answered \${r.status}: \${r.text}\`);
+  r = await post(c, 'k-4', 'sku-1', 'ana', null);
+  assert.equal(r.status, 403, \`a decision with no X-Reviewer-Role answered \${r.status}, expected 403: only the roles in REVIEWER_ROLES decide\`);
+  await untouched(ctx, store, 'after three refused requests');
+  r = await post(c, 'k-3', 'sku-1', 'ana', 'catalog-admin');
+  assert.equal(r.status, 200, \`a catalog-admin holding the lease answered \${r.status}: \${r.text}\`);
 }
 
 export async function check_lease_held(ctx) {
   const {c, store} = await api(ctx, 'ben');
   let r = await post(c, 'k-1');
   assert.equal(r.status, 409, \`ana decided on a SKU whose review lease ben holds: answered \${r.status}, expected 409\`);
-  await untouched(ctx, store, 'after a decision without the lease');
+  ctx.redis.del('review:lease:sku-1');
+  r = await post(c, 'k-4');
+  assert.equal(r.status, 409, \`ana decided on a SKU whose review lease nobody holds: answered \${r.status}, expected 409\`);
+  await untouched(ctx, store, 'after two decisions without the lease');
   ctx.redis.set('review:lease:sku-1', 'ana');
   r = await post(c, 'k-2');
   assert.equal(r.status, 200, \`the lease holder's decision answered \${r.status}: \${r.text}\`);
   assert.equal(ctx.redis.get('review:lease:sku-1'), null, 'the decision is made: release the lease so the SKU does not stay claimed for 15 minutes');
+  ctx.redis.set('review:lease:sku-404', 'ana');
   r = await post(c, 'k-3', 'sku-404');
-  assert.equal(r.status, 404, \`a decision on a SKU with no proposal answered \${r.status}, expected 404\`);
+  assert.equal(r.status, 404, \`a decision by the lease holder on a SKU with no proposal answered \${r.status}, expected 404\`);
 }
 
 export async function check_idempotency_key(ctx) {
@@ -967,6 +984,7 @@ export async function check_idempotency_key(ctx) {
 
 export async function check_label_and_publish(ctx) {
   const {c, store} = await api(ctx);
+  for (let i = 0; i < 3; i++) await store.nextVersion('sku-1'); // three model events came before this decision
   const r = await post(c, 'k-1');
   assert.equal(r.status, 200, \`the decision answered \${r.status}: \${r.text}\`);
   const body = r.json();
@@ -978,6 +996,8 @@ export async function check_label_and_publish(ctx) {
   assert.equal(all.length, 1, 'the decision must reach sku.enriched once');
   assert(all[0].source === 'human' && all[0].attributes.brand === 'Oatly', \`the event must carry the corrected attributes with source human, got \${JSON.stringify(all[0])}\`);
   assert.equal(all[0].attributes_version, body.attributes_version, "the event's attributes_version must be the one the answer names");
+  assert.equal(all[0].attributes_version, 4, \`the SKU's attributes were at version 3, so the decision's event must carry nextVersion (4), got \${all[0].attributes_version}\`);
+  assert(all[0].merchant === 'm-1' && all[0].taxonomy_version === 'tx-2026.11', \`the event must carry the proposal's merchant and taxonomy version, got \${JSON.stringify(all[0])}\`);
   assert.equal(await store.pending('sku-1'), null, 'the decided proposal is still in the review queue');
 }
 `,
@@ -995,7 +1015,7 @@ import (
 
 var reviewBg = context.Background()
 
-var correction = map[string]any{"decision": "correct", "attributes": map[string]any{"brand": "Oatly"}, "note": "brand printed on the carton"}
+var reviewCorrection = map[string]any{"decision": "correct", "attributes": map[string]any{"brand": "Oatly"}, "note": "brand printed on the carton"}
 
 // reviewAPI parks one proposal for sku-1, gives the lease to holder, and stands in for step 5's publish.
 func reviewAPI(ctx *harness.Ctx, holder string) (*harness.HTTP, *[]store.Event) {
@@ -1015,57 +1035,66 @@ func reviewAPI(ctx *harness.Ctx, holder string) (*harness.HTTP, *[]store.Event) 
 	return ctx.HTTP(mux), &published
 }
 
-func decide(c *harness.HTTP, skuID string, headers ...string) *harness.Response {
-	return c.Post("/v1/skus/"+skuID+"/review", correction, headers...)
+func reviewDecide(c *harness.HTTP, skuID string, headers ...string) *harness.Response {
+	return c.Post("/v1/skus/"+skuID+"/review", reviewCorrection, headers...)
 }
 
-func untouched(ctx *harness.Ctx, published *[]store.Event, why string) {
+func reviewUntouched(ctx *harness.Ctx, published *[]store.Event, why string) {
 	ctx.Assert(store.ReadLabel(reviewBg, "sku-1", 1) == nil && len(*published) == 0 && store.CatalogCurrent(reviewBg, "sku-1") == nil, "%s, yet a label, an event or a catalog row was written", why)
 	ctx.Assert(store.Pending(reviewBg, "sku-1") != nil, "%s, yet the proposal left the review queue", why)
 }
 
 func CheckReviewerAuth(ctx *harness.Ctx) {
 	c, published := reviewAPI(ctx, "ana")
-	r := decide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer")
+	r := reviewDecide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Role", "reviewer")
 	ctx.Equal(r.Status, 401, "a decision without X-Reviewer-Id; the status")
-	r = decide(c, "sku-1", "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper")
+	r = reviewDecide(c, "sku-1", "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper")
 	ctx.Equal(r.Status, 403, "a decision from role 'shopper'; the status")
-	untouched(ctx, published, "after two refused requests")
-	r = decide(c, "sku-1", "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer")
-	ctx.Equal(r.Status, 200, "a reviewer holding the lease (%s); the status", r.Text())
+	r = reviewDecide(c, "sku-1", "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana")
+	ctx.Equal(r.Status, 403, "a decision with no X-Reviewer-Role (only the roles in reviewerRoles decide); the status")
+	reviewUntouched(ctx, published, "after three refused requests")
+	r = reviewDecide(c, "sku-1", "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "catalog-admin")
+	ctx.Equal(r.Status, 200, "a catalog-admin holding the lease (%s); the status", r.Text())
 }
 
 func CheckLeaseHeld(ctx *harness.Ctx) {
 	c, published := reviewAPI(ctx, "ben")
 	ana := []string{"X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer"}
-	r := decide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	r := reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
 	ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease ben holds; the status")
-	untouched(ctx, published, "after a decision without the lease")
+	ctx.Redis.Del("review:lease:sku-1")
+	r = reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-4"}, ana...)...)
+	ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease nobody holds; the status")
+	reviewUntouched(ctx, published, "after two decisions without the lease")
 	ctx.Redis.Set("review:lease:sku-1", "ana")
-	r = decide(c, "sku-1", append([]string{"Idempotency-Key", "k-2"}, ana...)...)
+	r = reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-2"}, ana...)...)
 	ctx.Equal(r.Status, 200, "the lease holder's decision (%s); the status", r.Text())
 	_, held := ctx.Redis.Get("review:lease:sku-1")
 	ctx.Assert(!held, "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes")
-	r = decide(c, "sku-404", append([]string{"Idempotency-Key", "k-3"}, ana...)...)
-	ctx.Equal(r.Status, 404, "a decision on a SKU with no proposal; the status")
+	ctx.Redis.Set("review:lease:sku-404", "ana")
+	r = reviewDecide(c, "sku-404", append([]string{"Idempotency-Key", "k-3"}, ana...)...)
+	ctx.Equal(r.Status, 404, "a decision by the lease holder on a SKU with no proposal; the status")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
 	c, published := reviewAPI(ctx, "ana")
 	ana := []string{"X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer"}
-	r := decide(c, "sku-1", ana...)
+	r := reviewDecide(c, "sku-1", ana...)
 	ctx.Equal(r.Status, 400, "a decision without Idempotency-Key; the status")
-	untouched(ctx, published, "after a decision without Idempotency-Key")
-	first := decide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	reviewUntouched(ctx, published, "after a decision without Idempotency-Key")
+	first := reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
 	ctx.Equal(first.Status, 200, "the first decision (%s); the status", first.Text())
-	retry := decide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
+	retry := reviewDecide(c, "sku-1", append([]string{"Idempotency-Key", "k-1"}, ana...)...)
 	ctx.Assert(retry.Status == 200 && retry.Text() == first.Text(), "a retry with the same Idempotency-Key must answer the first response: first %s, retry %d %s", first.Text(), retry.Status, retry.Text())
 	ctx.Assert(store.ReadLabel(reviewBg, "sku-1", 2) == nil && len(*published) == 1, "the retry recorded a second decision: %d events published", len(*published))
 }
 
 func CheckLabelAndPublish(ctx *harness.Ctx) {
 	c, published := reviewAPI(ctx, "ana")
-	r := decide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer")
+	for i := 0; i < 3; i++ {
+		store.NextVersion(reviewBg, "sku-1") // three model events came before this decision
+	}
+	r := reviewDecide(c, "sku-1", "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer")
 	ctx.Equal(r.Status, 200, "the decision (%s); the status", r.Text())
 	var body struct {
 		LabelVersion      int64 \`json:"label_version"\`
@@ -1082,6 +1111,8 @@ func CheckLabelAndPublish(ctx *harness.Ctx) {
 	event := (*published)[0]
 	ctx.Assert(event.Source == "human" && event.Attributes["brand"] == "Oatly", "the event must carry the corrected attributes with source human, got %+v", event)
 	ctx.Equal(event.AttributesVersion, body.AttributesVersion, "the event's attributes_version must be the one the answer names")
+	ctx.Equal(event.AttributesVersion, int64(4), "the SKU's attributes were at version 3, so the decision's event must carry store.NextVersion (4); attributes_version")
+	ctx.Assert(event.Merchant == "m-1" && event.TaxonomyVersion == taxonomy.Version, "the event must carry the proposal's merchant and taxonomy version, got %+v", event)
 	ctx.Assert(store.Pending(reviewBg, "sku-1") == nil, "the decided proposal is still in the review queue")
 }
 `,
@@ -1119,7 +1150,7 @@ harness::HTTP reviewAPI(harness::Ctx& ctx, const std::string& holder) {
   return ctx.HTTP(*svr);
 }
 
-void untouched(harness::Ctx& ctx, const std::string& why) {
+void hUntouched(harness::Ctx& ctx, const std::string& why) {
   ctx.Assert(!store::read_label("sku-1", 1) && review_published.empty() && !store::catalog_current("sku-1"), "%s, yet a label, an event or a catalog row was written", why);
   ctx.Assert(store::pending("sku-1").has_value(), "%s, yet the proposal left the review queue", why);
 }
@@ -1132,29 +1163,35 @@ void CheckReviewerAuth(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 401, "a decision without X-Reviewer-Id; the status");
   r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "shopper");
   ctx.Equal(r.Status, 403, "a decision from role 'shopper'; the status");
-  untouched(ctx, "after two refused requests");
-  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
-  ctx.Equal(r.Status, 200, "a reviewer holding the lease (%s); the status", r.Text());
+  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana");
+  ctx.Equal(r.Status, 403, "a decision with no X-Reviewer-Role (only the roles in kReviewerRoles decide); the status");
+  hUntouched(ctx, "after three refused requests");
+  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "catalog-admin");
+  ctx.Equal(r.Status, 200, "a catalog-admin holding the lease (%s); the status", r.Text());
 }
 
 void CheckLeaseHeld(harness::Ctx& ctx) {
   auto c = reviewAPI(ctx, "ben");
   auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease ben holds; the status");
-  untouched(ctx, "after a decision without the lease");
+  ctx.Redis.Del("review:lease:sku-1");
+  r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-4", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
+  ctx.Equal(r.Status, 409, "ana decided on a SKU whose review lease nobody holds; the status");
+  hUntouched(ctx, "after two decisions without the lease");
   ctx.Redis.Set("review:lease:sku-1", "ana");
   r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-2", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 200, "the lease holder's decision (%s); the status", r.Text());
   ctx.Assert(!ctx.Redis.Get("review:lease:sku-1"), "the decision is made: release the lease so the SKU does not stay claimed for 15 minutes");
+  ctx.Redis.Set("review:lease:sku-404", "ana");
   r = c.Post("/v1/skus/sku-404/review", kCorrection, "Idempotency-Key", "k-3", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
-  ctx.Equal(r.Status, 404, "a decision on a SKU with no proposal; the status");
+  ctx.Equal(r.Status, 404, "a decision by the lease holder on a SKU with no proposal; the status");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
   auto c = reviewAPI(ctx, "ana");
   const auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 400, "a decision without Idempotency-Key; the status");
-  untouched(ctx, "after a decision without Idempotency-Key");
+  hUntouched(ctx, "after a decision without Idempotency-Key");
   const auto first = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(first.Status, 200, "the first decision (%s); the status", first.Text());
   const auto retry = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
@@ -1164,6 +1201,7 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
 
 void CheckLabelAndPublish(harness::Ctx& ctx) {
   auto c = reviewAPI(ctx, "ana");
+  for (int i = 0; i < 3; i++) store::next_version("sku-1");  // three model events came before this decision
   const auto r = c.Post("/v1/skus/sku-1/review", kCorrection, "Idempotency-Key", "k-1", "X-Reviewer-Id", "ana", "X-Reviewer-Role", "reviewer");
   ctx.Equal(r.Status, 200, "the decision (%s); the status", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -1176,6 +1214,8 @@ void CheckLabelAndPublish(harness::Ctx& ctx) {
   const auto& event = review_published[0];
   ctx.Assert(event["source"] == "human" && event["attributes"]["brand"] == "Oatly", "the event must carry the corrected attributes with source human, got %s", event.dump());
   ctx.Assert(event["attributes_version"] == body["attributes_version"], "the event's attributes_version %s differs from the answer's %s", event["attributes_version"].dump(), body.value("attributes_version", nlohmann::json()).dump());
+  ctx.Assert(event["attributes_version"] == 4, "the SKU's attributes were at version 3, so the decision's event must carry store::next_version (4), got %s", event["attributes_version"].dump());
+  ctx.Assert(event.value("merchant", "") == "m-1" && event.value("taxonomy_version", "") == taxonomy::kVersion, "the event must carry the proposal's merchant and taxonomy version, got %s", event.dump());
   ctx.Assert(!store::pending("sku-1"), "the decided proposal is still in the review queue");
 }
 `,

@@ -738,12 +738,24 @@ def check_cache_key(ctx):
 
 def check_cache_ttl(ctx):
     m = _module(ctx)
-    m.enrich(_job())
+    job = _job()
+    key = f"extract:{taxonomy.VERSION}:{job['content_hash']}"
+    written = []
+
+    def watch():  # the TTL right after the command that created the entry
+        if ctx.redis.exists(key):
+            written.append(ctx.redis.ttl(key))
+        else:
+            ctx.redis_after(key, watch)
+
+    ctx.redis_after(key, watch)
+    m.enrich(job)
     keys = ctx.redis.keys("extract:*")
     assert keys, "an accepted extraction was not cached"
-    for key in keys:
-        ttl = ctx.redis.ttl(key)
-        assert 604800 - 60 <= ttl <= 604800, f"{key} has TTL {ttl}: cache entries expire after 7 days (CACHE_TTL_S), set with the write"
+    for k in keys:
+        ttl = ctx.redis.ttl(k)
+        assert 604800 - 60 <= ttl <= 604800, f"{k} has TTL {ttl}: cache entries expire after 7 days (CACHE_TTL_S), set with the write"
+    assert written and written[0] > 0, f"right after the command that wrote {key} it had TTL {written[0] if written else None}: a worker that dies before a second command leaves the entry forever. Set CACHE_TTL_S with the write"
 
 
 def check_budget_before_call(ctx):
@@ -760,6 +772,20 @@ def check_budget_before_call(ctx):
     m.enrich(job)
     m.enrich(job)
     assert ctx.redis.get(_budget_key("m-2")) == "1", f"one miss and one hit spent {ctx.redis.get(_budget_key('m-2'))} units of m-2's budget, expected 1: a hit costs nothing"
+    ctx.redis.set(_budget_key("m-3"), DAILY_BUDGET - 1)
+    try:
+        m.enrich(_job("sku-3", merchant="m-3"))
+    except m.BudgetExhausted:
+        raise AssertionError(f"a merchant at {DAILY_BUDGET - 1} extractions was refused: the last unit of DAILY_BUDGET is still its to spend") from None
+    assert ctx.redis.get(_budget_key("m-3")) == str(DAILY_BUDGET), f"the last unit left m-3's counter at {ctx.redis.get(_budget_key('m-3'))}, expected {DAILY_BUDGET}"
+    calls = _calls(ctx)
+    try:
+        m.enrich(_job("sku-4", title="DOVE SILK GLOW BODY WASH 250ML", merchant="m-3"))
+    except m.BudgetExhausted:
+        pass
+    else:
+        raise AssertionError(f"a merchant that spent all {DAILY_BUDGET} extractions was extracted again")
+    assert _calls(ctx) == calls, "a merchant that spent its budget made a model call before it was refused"
 
 
 def check_atomic_budget(ctx):
@@ -779,6 +805,10 @@ def check_atomic_budget(ctx):
     assert ctx.redis.get(key) == "1", f"one reservation left {key} at {ctx.redis.get(key)!r}"
     ttl = ctx.redis.ttl(key)
     assert 0 < ttl <= 172800, f"{key} has TTL {ttl}: the script sets BUDGET_TTL_S (2 days) on the first increment"
+    ctx.clock.advance(120)
+    m.enrich(_job("sku-2", title="DOVE SILK GLOW BODY WASH 250ML"))
+    ttl = ctx.redis.ttl(key)
+    assert 0 < ttl <= 172800 - 100, f"a second reservation two minutes later left {key} with TTL {ttl}: BUDGET_TTL_S is set on the first increment only, and a later reservation must not push the expiry out"
 
 
 def check_review_lease(ctx):
@@ -788,6 +818,24 @@ def check_review_lease(ctx):
     assert ctx.redis.get("review:lease:sku-1") == "ana", f"the lease is held by {ctx.redis.get('review:lease:sku-1')!r}, expected ana"
     ttl = ctx.redis.ttl("review:lease:sku-1")
     assert 890 <= ttl <= 900, f"the lease has TTL {ttl}: it expires after LEASE_TTL_S (900 s), so an abandoned review frees itself"
+    rival = []
+
+    def ben_claims():  # ben claims sku-2 right after ana's first command on it
+        if ctx.redis.exists("review:lease:sku-2"):
+            rival.append(("ttl", ctx.redis.ttl("review:lease:sku-2")))
+        else:
+            ctx.redis.set("review:lease:sku-2", "ben", ex=900)
+            rival.append(("ben", None))
+
+    ctx.redis_after("review:lease:sku-2", ben_claims)
+    got = m.claim_review("sku-2", "ana")
+    holder = ctx.redis.get("review:lease:sku-2")
+    assert rival, "claim_review never touched review:lease:sku-2"
+    if rival[0][0] == "ben":
+        assert got is False and holder == "ben", f"ben took sku-2's lease between ana's read and her write, yet her claim answered {got} and the lease is held by {holder!r}: two reviewers believe they hold one SKU. Take the lease in one command"
+    else:
+        assert got is True and holder == "ana", f"ana's claim of a free lease answered {got}, lease held by {holder!r}"
+        assert 890 <= rival[0][1] <= 900, f"right after the command that took the lease it had TTL {rival[0][1]}: a reviewer whose process dies before a second command holds the SKU forever. Take it with its expiry in one command"
     ctx.clock.advance(901)
     assert m.claim_review("sku-1", "ben") is True, "after 15 minutes ana's lease must have expired and ben may claim it"
 `,
@@ -831,14 +879,24 @@ export async function check_cache_key(ctx) {
 }
 
 export async function check_cache_ttl(ctx) {
-  const {m, store} = module(ctx);
-  await m.enrich(job(store));
+  const {m, store, taxonomy} = module(ctx);
+  const first = job(store);
+  const entry = \`extract:\${taxonomy.VERSION}:\${first.content_hash}\`;
+  const written: number[] = [];
+  // the TTL right after the command that created the entry
+  const watch = () => {
+    if (ctx.redis.exists(entry)) written.push(ctx.redis.ttl(entry));
+    else ctx.redisAfter(entry, watch);
+  };
+  ctx.redisAfter(entry, watch);
+  await m.enrich(first);
   const keys: string[] = ctx.redis.keys('extract:*');
   assert(keys.length > 0, 'an accepted extraction was not cached');
   for (const key of keys) {
     const ttl = ctx.redis.ttl(key);
     assert(ttl >= 604800 - 60 && ttl <= 604800, \`\${key} has TTL \${ttl}: cache entries expire after 7 days (CACHE_TTL_S), set with the write\`);
   }
+  assert(written.length > 0 && written[0] > 0, \`right after the command that wrote \${entry} it had TTL \${written[0]}: a worker that dies before a second command leaves the entry forever. Set CACHE_TTL_S with the write\`);
 }
 
 export async function check_budget_before_call(ctx) {
@@ -856,6 +914,22 @@ export async function check_budget_before_call(ctx) {
   await m.enrich(other);
   await m.enrich(other);
   assert.equal(ctx.redis.get(budgetKey(ctx, 'm-2')), '1', 'one miss and one hit must spend 1 unit of the budget: a hit costs nothing');
+  ctx.redis.set(budgetKey(ctx, 'm-3'), DAILY_BUDGET - 1);
+  try {
+    await m.enrich(job(store, 'sku-3', 'DOVE SILK GLOW BODY WASH 500ML', 'm-3'));
+  } catch (e) {
+    assert.fail(\`a merchant at \${DAILY_BUDGET - 1} extractions was refused (\${e}): the last unit of DAILY_BUDGET is still its to spend\`);
+  }
+  assert.equal(ctx.redis.get(budgetKey(ctx, 'm-3')), String(DAILY_BUDGET), 'the last unit must leave the counter at DAILY_BUDGET');
+  const before = calls(ctx);
+  refused = false;
+  try {
+    await m.enrich(job(store, 'sku-4', 'DOVE SILK GLOW BODY WASH 250ML', 'm-3'));
+  } catch (e) {
+    refused = e instanceof m.BudgetExhausted;
+  }
+  assert(refused, \`a merchant that spent all \${DAILY_BUDGET} extractions was extracted again\`);
+  assert.equal(calls(ctx), before, 'a merchant that spent its budget made a model call before it was refused');
 }
 
 export async function check_atomic_budget(ctx) {
@@ -882,6 +956,10 @@ export async function check_atomic_budget(ctx) {
   await m.enrich(job(store, 'sku-3', 'DOVE SILK GLOW BODY WASH 250ML', 'm-3'));
   const ttl = ctx.redis.ttl(fresh);
   assert(ttl > 0 && ttl <= 172800, \`\${fresh} has TTL \${ttl}: the script sets BUDGET_TTL_S (2 days) on the first increment\`);
+  ctx.clock.advance(120);
+  await m.enrich(job(store, 'sku-4', 'DOVE SILK GLOW BODY WASH 750ML', 'm-3'));
+  const later = ctx.redis.ttl(fresh);
+  assert(later > 0 && later <= 172800 - 100, \`a second reservation two minutes later left \${fresh} with TTL \${later}: BUDGET_TTL_S is set on the first increment only, and a later reservation must not push the expiry out\`);
 }
 
 export async function check_review_lease(ctx) {
@@ -891,6 +969,21 @@ export async function check_review_lease(ctx) {
   assert.equal(ctx.redis.get('review:lease:sku-1'), 'ana', 'the lease must still be held by ana');
   const ttl = ctx.redis.ttl('review:lease:sku-1');
   assert(ttl >= 890 && ttl <= 900, \`the lease has TTL \${ttl}: it expires after LEASE_TTL_S (900 s), so an abandoned review frees itself\`);
+  // ben claims sku-2 right after ana's first command on it
+  const rival = ctx.redisAfter('review:lease:sku-2', () => {
+    if (ctx.redis.exists('review:lease:sku-2')) return ctx.redis.ttl('review:lease:sku-2');
+    ctx.redis.set('review:lease:sku-2', 'ben', 'EX', 900);
+    return 'ben';
+  });
+  const got = await m.claimReview('sku-2', 'ana');
+  const holder = ctx.redis.get('review:lease:sku-2');
+  assert(rival.fired, 'claimReview never touched review:lease:sku-2');
+  if (rival.result === 'ben') {
+    assert(got === false && holder === 'ben', \`ben took sku-2's lease between ana's read and her write, yet her claim answered \${got} and the lease is held by \${holder}: two reviewers believe they hold one SKU. Take the lease in one command\`);
+  } else {
+    assert(got === true && holder === 'ana', \`ana's claim of a free lease answered \${got}, lease held by \${holder}\`);
+    assert(rival.result >= 890 && rival.result <= 900, \`right after the command that took the lease it had TTL \${rival.result}: a reviewer whose process dies before a second command holds the SKU forever. Take it with its expiry in one command\`);
+  }
   ctx.clock.advance(901);
   assert.equal(await m.claimReview('sku-1', 'ben'), true, "after 15 minutes ana's lease must have expired and ben may claim it");
 }
@@ -963,13 +1056,28 @@ func CheckCacheKey(ctx *harness.Ctx) {
 
 func CheckCacheTtl(ctx *harness.Ctx) {
 	cacheModel()
-	mustEnrich(ctx, cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the first job")
+	job := cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1")
+	entry := "extract:" + taxonomy.Version + ":" + job.ContentHash
+	written := []int64{}
+	// the TTL right after the command that created the entry
+	var watch func() any
+	watch = func() any {
+		if ctx.Redis.Exists(entry) == 1 {
+			written = append(written, ctx.Redis.TTL(entry))
+		} else {
+			ctx.Redis.After(entry, watch)
+		}
+		return nil
+	}
+	ctx.Redis.After(entry, watch)
+	mustEnrich(ctx, job, "the first job")
 	keys := ctx.Redis.Keys("extract:*")
 	ctx.Assert(len(keys) > 0, "an accepted extraction was not cached")
 	for _, key := range keys {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 604800-60 && ttl <= 604800, "%s has TTL %d: cache entries expire after 7 days, set with the write", key, ttl)
 	}
+	ctx.Assert(len(written) > 0 && written[0] > 0, "right after the command that wrote %s it had TTL %v: a worker that dies before a second command leaves the entry forever. Set cacheTTL with the write", entry, written)
 }
 
 func CheckBudgetBeforeCall(ctx *harness.Ctx) {
@@ -983,6 +1091,15 @@ func CheckBudgetBeforeCall(ctx *harness.Ctx) {
 	mustEnrich(ctx, other, "a hit")
 	spent, _ := ctx.Redis.Get(cacheBudgetKey(ctx, "m-2"))
 	ctx.Equal(spent, "1", "one miss and one hit (a hit costs nothing); m-2's budget spent")
+	ctx.Redis.Set(cacheBudgetKey(ctx, "m-3"), cacheBudget-1)
+	_, err = enrich(cacheBg, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 500ML", "m-3"))
+	ctx.NoError(err, "a merchant at %d extractions still has the last unit of its daily budget to spend", cacheBudget-1)
+	spent, _ = ctx.Redis.Get(cacheBudgetKey(ctx, "m-3"))
+	ctx.Equal(spent, strconv.Itoa(cacheBudget), "the last unit must leave the counter at the daily budget; m-3's counter")
+	before := *calls
+	_, err = enrich(cacheBg, cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 250ML", "m-3"))
+	ctx.Assert(errors.Is(err, ErrBudgetExhausted), "a merchant that spent its whole daily budget must be refused with ErrBudgetExhausted, got %v", err)
+	ctx.Equal(*calls, before, "a merchant that spent its budget must be refused before the model is called; the model calls")
 }
 
 func CheckAtomicBudget(ctx *harness.Ctx) {
@@ -1016,6 +1133,10 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 	mustEnrich(ctx, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 250ML", "m-3"), "a fresh merchant")
 	ttl := ctx.Redis.TTL(fresh)
 	ctx.Assert(ttl > 0 && ttl <= 172800, "%s has TTL %d: the script sets the 2-day TTL on the first increment", fresh, ttl)
+	ctx.Clock.Advance(120)
+	mustEnrich(ctx, cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 750ML", "m-3"), "a second job of the fresh merchant")
+	later := ctx.Redis.TTL(fresh)
+	ctx.Assert(later > 0 && later <= 172800-100, "a second reservation two minutes later left %s with TTL %d: the 2-day TTL is set on the first increment only, and a later reservation must not push the expiry out", fresh, later)
 }
 
 func CheckReviewLease(ctx *harness.Ctx) {
@@ -1030,6 +1151,27 @@ func CheckReviewLease(ctx *harness.Ctx) {
 	ctx.Equal(holder, "ana", "the lease holder")
 	ttl := ctx.Redis.TTL("review:lease:sku-1")
 	ctx.Assert(ttl >= 890 && ttl <= 900, "the lease has TTL %d: it expires after 900 s, so an abandoned review frees itself", ttl)
+	// ben claims sku-2 right after ana's first command on it
+	rival, rivalTTL := "", int64(0)
+	ctx.Redis.After("review:lease:sku-2", func() any {
+		if ctx.Redis.Exists("review:lease:sku-2") == 1 {
+			rival, rivalTTL = "ttl", ctx.Redis.TTL("review:lease:sku-2")
+		} else {
+			ctx.Redis.Set("review:lease:sku-2", "ben", "EX", 900)
+			rival = "ben"
+		}
+		return nil
+	})
+	got, err := claimReview(cacheBg, "sku-2", "ana")
+	ctx.NoError(err, "claimReview(sku-2, ana) failed")
+	holder, _ = ctx.Redis.Get("review:lease:sku-2")
+	ctx.Assert(rival != "", "claimReview never touched review:lease:sku-2")
+	if rival == "ben" {
+		ctx.Assert(!got && holder == "ben", "ben took sku-2's lease between ana's read and her write, yet her claim answered %v and the lease is held by %q: two reviewers believe they hold one SKU. Take the lease in one command", got, holder)
+	} else {
+		ctx.Assert(got && holder == "ana", "ana's claim of a free lease answered %v, lease held by %q", got, holder)
+		ctx.Assert(rivalTTL >= 890 && rivalTTL <= 900, "right after the command that took the lease it had TTL %d: a reviewer whose process dies before a second command holds the SKU forever. Take it with its expiry in one command", rivalTTL)
+	}
 	ctx.Clock.Advance(901)
 	ctx.Assert(claim("ben"), "after 15 minutes ana's lease must have expired and ben may claim it")
 }
@@ -1040,6 +1182,7 @@ func CheckReviewLease(ctx *harness.Ctx) {
 
 #include <algorithm>
 #include <ctime>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1104,13 +1247,23 @@ void CheckCacheKey(harness::Ctx& ctx) {
 }
 
 void CheckCacheTtl(harness::Ctx& ctx) {
-  mustEnrich(ctx, cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1"), "the first job");
+  const auto job = cacheJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML", "m-1");
+  const std::string entry = "extract:" + taxonomy::kVersion + ":" + job["content_hash"].get<std::string>();
+  std::vector<long long> written;
+  // the TTL right after the command that created the entry
+  std::function<void()> watch = [&] {
+    if (ctx.Redis.Exists(entry) == 1) written.push_back(ctx.Redis.TTL(entry));
+    else ctx.Redis.After(entry, watch);
+  };
+  ctx.Redis.After(entry, watch);
+  mustEnrich(ctx, job, "the first job");
   const auto keys = ctx.Redis.Keys("extract:*");
   ctx.Assert(!keys.empty(), "an accepted extraction was not cached");
   for (const auto& key : keys) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl >= 604800 - 60 && ttl <= 604800, "%s has TTL %d: cache entries expire after 7 days, set with the write", key, ttl);
   }
+  ctx.Assert(!written.empty() && written[0] > 0, "right after the command that wrote %s it had TTL %d: a worker that dies before a second command leaves the entry forever. Set kCacheTtl with the write", entry, written.empty() ? -2 : written[0]);
 }
 
 void CheckBudgetBeforeCall(harness::Ctx& ctx) {
@@ -1128,6 +1281,18 @@ void CheckBudgetBeforeCall(harness::Ctx& ctx) {
   mustEnrich(ctx, other, "a miss");
   mustEnrich(ctx, other, "a hit");
   ctx.Equal(ctx.Redis.Get(cacheBudgetKey(ctx, "m-2")).value_or(""), "1", "one miss and one hit (a hit costs nothing); m-2's budget spent");
+  ctx.Redis.Set(cacheBudgetKey(ctx, "m-3"), kCacheBudget - 1);
+  mustEnrich(ctx, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 500ML", "m-3"), "a merchant at 49999 extractions still has the last unit of its daily budget to spend");
+  ctx.Equal(ctx.Redis.Get(cacheBudgetKey(ctx, "m-3")).value_or(""), std::to_string(kCacheBudget), "the last unit must leave the counter at the daily budget; m-3's counter");
+  const int before = cache_model_calls;
+  refused = false;
+  try {
+    enrich(cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 250ML", "m-3"));
+  } catch (const BudgetExhausted&) {
+    refused = true;
+  }
+  ctx.Assert(refused, "a merchant that spent its whole daily budget was extracted again: enrich must throw BudgetExhausted");
+  ctx.Equal(cache_model_calls, before, "a merchant that spent its budget must be refused before the model is called; the model calls");
 }
 
 void CheckAtomicBudget(harness::Ctx& ctx) {
@@ -1158,6 +1323,10 @@ void CheckAtomicBudget(harness::Ctx& ctx) {
   mustEnrich(ctx, cacheJob("sku-3", "DOVE SILK GLOW BODY WASH 250ML", "m-3"), "a fresh merchant");
   const long long ttl = ctx.Redis.TTL(fresh);
   ctx.Assert(ttl > 0 && ttl <= 172800, "%s has TTL %d: the script sets the 2-day TTL on the first increment", fresh, ttl);
+  ctx.Clock.Advance(120);
+  mustEnrich(ctx, cacheJob("sku-4", "DOVE SILK GLOW BODY WASH 750ML", "m-3"), "a second job of the fresh merchant");
+  const long long later = ctx.Redis.TTL(fresh);
+  ctx.Assert(later > 0 && later <= 172800 - 100, "a second reservation two minutes later left %s with TTL %d: the 2-day TTL is set on the first increment only, and a later reservation must not push the expiry out", fresh, later);
 }
 
 void CheckReviewLease(harness::Ctx& ctx) {
@@ -1166,6 +1335,27 @@ void CheckReviewLease(harness::Ctx& ctx) {
   ctx.Equal(ctx.Redis.Get("review:lease:sku-1").value_or(""), "ana", "the lease holder");
   const long long ttl = ctx.Redis.TTL("review:lease:sku-1");
   ctx.Assert(ttl >= 890 && ttl <= 900, "the lease has TTL %d: it expires after 900 s, so an abandoned review frees itself", ttl);
+  // ben claims sku-2 right after ana's first command on it
+  std::string rival;
+  long long rival_ttl = 0;
+  ctx.Redis.After("review:lease:sku-2", [&] {
+    if (ctx.Redis.Exists("review:lease:sku-2") == 1) {
+      rival = "ttl";
+      rival_ttl = ctx.Redis.TTL("review:lease:sku-2");
+    } else {
+      ctx.Redis.Set("review:lease:sku-2", "ben", "EX", 900);
+      rival = "ben";
+    }
+  });
+  const bool got = claimReview("sku-2", "ana");
+  const std::string holder = ctx.Redis.Get("review:lease:sku-2").value_or("");
+  ctx.Assert(!rival.empty(), "claimReview never touched review:lease:sku-2");
+  if (rival == "ben") {
+    ctx.Assert(!got && holder == "ben", "ben took sku-2's lease between ana's read and her write, yet her claim answered %v and the lease is held by %s: two reviewers believe they hold one SKU. Take the lease in one command", got, holder);
+  } else {
+    ctx.Assert(got && holder == "ana", "ana's claim of a free lease answered %v, lease held by %s", got, holder);
+    ctx.Assert(rival_ttl >= 890 && rival_ttl <= 900, "right after the command that took the lease it had TTL %d: a reviewer whose process dies before a second command holds the SKU forever. Take it with its expiry in one command", rival_ttl);
+  }
   ctx.Clock.Advance(901);
   ctx.Assert(claimReview("sku-1", "ben"), "after 15 minutes ana's lease must have expired and ben may claim it");
 }

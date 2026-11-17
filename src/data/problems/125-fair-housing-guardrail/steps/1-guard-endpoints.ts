@@ -65,7 +65,7 @@ straight to the classifier.
       id: 'api-key',
       title: 'A missing or unknown X-Api-Key is 401 before any tier',
       detail:
-        'The caller is looked up with `store.caller` on `X-Api-Key` before the tiers run; a missing or unknown key answers **401** and reaches no classifier.',
+        'The caller is looked up with `store.caller` on the `X-Api-Key` header before the tiers run; a missing or unknown key answers **401** and reaches no classifier, and a key sent in the body does not count.',
       match: {
         python: {all: [/x-api-key/i, /store\.caller\(/, /\b401\b/], order: [/store\.caller\(/, /tiers\.evaluate\(/]},
         typescript: {all: [/x-api-key/i, /\bcaller\(/, /\b401\b/], order: [/\bcaller\(/, /\bevaluate\(/]},
@@ -84,7 +84,7 @@ straight to the classifier.
       id: 'policy-version',
       title: 'Judges under the pinned X-Policy-Version and echoes it',
       detail:
-        '`X-Policy-Version` is required and validated against `fh-YYYY-MM-DD[.n]` (**400** otherwise), passed to `evaluate` and echoed as `policy_version`; the starter evaluates every request under its own constant.',
+        '`X-Policy-Version` is a required header whose whole value matches `fh-YYYY-MM-DD[.n]` (**400** otherwise; a revision such as `.2` is valid), passed to `evaluate` and echoed as `policy_version`; the starter evaluates every request under its own constant.',
       match: {
         python: {all: [/x-policy-version/i, /POLICY_VERSION_RE/, /\b400\b/], none: [/evaluate\([^)]*POLICY_VERSION\)/]},
         typescript: {
@@ -106,7 +106,7 @@ straight to the classifier.
       id: 'caps',
       title: 'Caps text at 8 KiB of UTF-8 and validates conversation_id',
       detail:
-        'Text over `MAX_TEXT_BYTES` (8 KiB, counted in UTF-8 bytes) is **413** and a `conversation_id` outside `[A-Za-z0-9_-]{1,64}` is **400**, both before any tier runs.',
+        'Text over `MAX_TEXT_BYTES` (8 KiB, counted in UTF-8 bytes) is **413**, exactly 8 KiB passes, and a `conversation_id` whose whole value is not `[A-Za-z0-9_-]{1,64}` is **400**, both before any tier runs.',
       match: {
         python: {
           all: [/MAX_TEXT_BYTES/, /\.encode\(/, /\b413\b/, /CONVERSATION_ID_RE/],
@@ -659,6 +659,8 @@ async def check_api_key(ctx):
         assert r.status_code == 401, f"a request without X-Api-Key answered {r.status_code}, expected 401"
         r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-stolen", "X-Policy-Version": V1})
         assert r.status_code == 401, f"a request with an unknown X-Api-Key answered {r.status_code}, expected 401"
+        r = await c.post("/v1/guard/input", json=_body(api_key="k-assistant"), headers={"X-Policy-Version": V1})
+        assert r.status_code == 401, f"a request with no X-Api-Key header but a known key in its body answered {r.status_code}, expected 401: the key is a header"
         calls = len(ctx.grpc.calls_to("Classify"))
         assert calls == 0, f"unauthenticated requests reached the classifier {calls} times: look the key up before any tier runs"
         r = await c.post("/v1/guard/input", json=_body(), headers=HEADERS)
@@ -678,8 +680,14 @@ async def check_policy_version(ctx):
         assert asked == [V2], f"the classifier was asked under {asked}, expected [{V2!r}]"
         r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-assistant"})
         assert r.status_code == 400, f"a request without X-Policy-Version answered {r.status_code}, expected 400"
-        r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-assistant", "X-Policy-Version": "latest"})
-    assert r.status_code == 400, f"X-Policy-Version: latest answered {r.status_code}, expected 400 (fh-YYYY-MM-DD[.n])"
+        r = await c.post("/v1/guard/input", json=_body(policy_version=V2), headers={"X-Api-Key": "k-assistant"})
+        assert r.status_code == 400, f"a request with no X-Policy-Version header but a version in its body answered {r.status_code}, expected 400: the version is a header"
+        for bad in ("latest", "fh-2024-05-21-draft", "xfh-2024-05-21", "fh-2024-5-21"):
+            r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-assistant", "X-Policy-Version": bad})
+            assert r.status_code == 400, f"X-Policy-Version: {bad} answered {r.status_code}, expected 400 (the whole value matches fh-YYYY-MM-DD[.n])"
+        r = await c.post("/v1/guard/input", json=_body(), headers={"X-Api-Key": "k-assistant", "X-Policy-Version": V2 + ".2"})
+    assert r.status_code == 200, f"X-Policy-Version: {V2}.2 answered {r.status_code}, expected 200 (fh-YYYY-MM-DD[.n] allows a revision): {r.text}"
+    assert r.json().get("policy_version") == V2 + ".2", f"the response names policy {r.json().get('policy_version')!r}, expected the pinned {V2}.2"
 
 
 async def check_caps(ctx):
@@ -692,9 +700,14 @@ async def check_caps(ctx):
         assert calls == 0, f"oversized text reached the classifier {calls} times: check the size before any tier runs"
         r = await c.post("/v1/guard/input", json=_body("a" * 8192), headers=HEADERS)
         assert r.status_code == 200, f"exactly 8 KiB of text answered {r.status_code}, expected 200"
-        for bad in ("../../etc/passwd", "c" * 65, ""):
+        before = len(ctx.grpc.calls_to("Classify"))
+        for bad in ("../../etc/passwd", "c" * 65, "", "c-1\\n", "c-1/../c-2"):
             r = await c.post("/v1/guard/input", json=_body(conversation_id=bad), headers=HEADERS)
-            assert r.status_code == 400, f"conversation_id {bad!r} answered {r.status_code}, expected 400"
+            assert r.status_code == 400, f"conversation_id {bad!r} answered {r.status_code}, expected 400 (the whole id matches [A-Za-z0-9_-]{{1,64}})"
+        calls = len(ctx.grpc.calls_to("Classify")) - before
+        assert calls == 0, f"requests with an invalid conversation_id reached the classifier {calls} times: validate it before any tier runs"
+        r = await c.post("/v1/guard/input", json=_body(conversation_id="c" * 64), headers=HEADERS)
+    assert r.status_code == 200, f"a 64-character conversation_id answered {r.status_code}, expected 200: {r.text}"
 
 
 async def check_no_bypass(ctx):
@@ -757,6 +770,8 @@ export async function check_api_key(ctx) {
   assert.equal(r.status, 401, \`a request without X-Api-Key answered \${r.status}, expected 401\`);
   r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-stolen', 'X-Policy-Version': V1}});
   assert.equal(r.status, 401, \`a request with an unknown X-Api-Key answered \${r.status}, expected 401\`);
+  r = await c.post('/v1/guard/input', {json: body(NEUTRAL, 'c-1', {api_key: 'k-assistant'}), headers: {'X-Policy-Version': V1}});
+  assert.equal(r.status, 401, \`a request with no X-Api-Key header but a known key in its body answered \${r.status}, expected 401: the key is a header\`);
   const calls = ctx.grpc.callsTo('Classify').length;
   assert.equal(calls, 0, \`unauthenticated requests reached the classifier \${calls} times: look the key up before any tier runs\`);
   r = await c.post('/v1/guard/input', {json: body(), headers: HEADERS});
@@ -776,8 +791,15 @@ export async function check_policy_version(ctx) {
   assert.deepStrictEqual(asked, [V2], \`the classifier was asked under \${JSON.stringify(asked)}, expected ["\${V2}"]\`);
   r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-assistant'}});
   assert.equal(r.status, 400, \`a request without X-Policy-Version answered \${r.status}, expected 400\`);
-  r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-assistant', 'X-Policy-Version': 'latest'}});
-  assert.equal(r.status, 400, \`X-Policy-Version: latest answered \${r.status}, expected 400 (fh-YYYY-MM-DD[.n])\`);
+  r = await c.post('/v1/guard/input', {json: body(NEUTRAL, 'c-1', {policy_version: V2}), headers: {'X-Api-Key': 'k-assistant'}});
+  assert.equal(r.status, 400, \`a request with no X-Policy-Version header but a version in its body answered \${r.status}, expected 400: the version is a header\`);
+  for (const bad of ['latest', 'fh-2024-05-21-draft', 'xfh-2024-05-21', 'fh-2024-5-21']) {
+    r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-assistant', 'X-Policy-Version': bad}});
+    assert.equal(r.status, 400, \`X-Policy-Version: \${bad} answered \${r.status}, expected 400 (the whole value matches fh-YYYY-MM-DD[.n])\`);
+  }
+  r = await c.post('/v1/guard/input', {json: body(), headers: {'X-Api-Key': 'k-assistant', 'X-Policy-Version': \`\${V2}.2\`}});
+  assert.equal(r.status, 200, \`X-Policy-Version: \${V2}.2 answered \${r.status}, expected 200 (fh-YYYY-MM-DD[.n] allows a revision): \${r.text}\`);
+  assert.equal(r.json().policy_version, \`\${V2}.2\`, \`the response names policy \${JSON.stringify(r.json().policy_version)}, expected the pinned \${V2}.2\`);
 }
 
 export async function check_caps(ctx) {
@@ -790,10 +812,15 @@ export async function check_caps(ctx) {
   assert.equal(calls, 0, \`oversized text reached the classifier \${calls} times: check the size before any tier runs\`);
   r = await c.post('/v1/guard/input', {json: body('a'.repeat(8192)), headers: HEADERS});
   assert.equal(r.status, 200, \`exactly 8 KiB of text answered \${r.status}, expected 200\`);
-  for (const bad of ['../../etc/passwd', 'c'.repeat(65), '']) {
+  const before = ctx.grpc.callsTo('Classify').length;
+  for (const bad of ['../../etc/passwd', 'c'.repeat(65), '', 'c-1\\n', 'c-1/../c-2']) {
     r = await c.post('/v1/guard/input', {json: body(NEUTRAL, bad), headers: HEADERS});
-    assert.equal(r.status, 400, \`conversation_id \${JSON.stringify(bad)} answered \${r.status}, expected 400\`);
+    assert.equal(r.status, 400, \`conversation_id \${JSON.stringify(bad)} answered \${r.status}, expected 400 (the whole id matches [A-Za-z0-9_-]{1,64})\`);
   }
+  const reached = ctx.grpc.callsTo('Classify').length - before;
+  assert.equal(reached, 0, \`requests with an invalid conversation_id reached the classifier \${reached} times: validate it before any tier runs\`);
+  r = await c.post('/v1/guard/input', {json: body(NEUTRAL, 'c'.repeat(64)), headers: HEADERS});
+  assert.equal(r.status, 200, \`a 64-character conversation_id answered \${r.status}, expected 200: \${r.text}\`);
 }
 
 export async function check_no_bypass(ctx) {
@@ -821,10 +848,10 @@ import (
 )
 
 const (
-	v1       = "fh-2024-05-21"
-	v2       = "fh-2024-06-01"
-	neutral  = "Two-bedroom homes near light rail under $900k"
-	steering = "Beacon Hill is mostly Latino families, so you would fit right in."
+	hV1       = "fh-2024-05-21"
+	hV2       = "fh-2024-06-01"
+	hNeutral  = "Two-bedroom homes near light rail under $900k"
+	hSteering = "Beacon Hill is mostly Latino families, so you would fit right in."
 )
 
 // classifierPeer scores 0.92 for text that names a protected group, 0.04 for anything else.
@@ -850,23 +877,23 @@ func (judgePeer) Assess(context.Context, *pb.AssessRequest) (*pb.Assessment, err
 	return &pb.Assessment{Compliant: true}, nil
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	pb.RegisterClassifierServer(ctx.GRPC.Server(""), classifierPeer{})
 	pb.RegisterJudgeServer(ctx.GRPC.Server(""), judgePeer{})
 	bg := context.Background()
 	store.AddAPIKey(bg, "k-assistant", "assistant")
-	store.SavePolicy(bg, store.Policy{Version: v1, StopPhrases: []string{"no section 8"}})
-	store.SavePolicy(bg, store.Policy{Version: v2, StopPhrases: []string{"no section 8", "adults only"}})
+	store.SavePolicy(bg, store.Policy{Version: hV1, StopPhrases: []string{"no section 8"}})
+	store.SavePolicy(bg, store.Policy{Version: hV2, StopPhrases: []string{"no section 8", "adults only"}})
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func body(text, conversationID string) map[string]any {
+func hBody(text, conversationID string) map[string]any {
 	return map[string]any{"conversation_id": conversationID, "text": text}
 }
 
-type verdict struct {
+type hVerdict struct {
 	Direction     string   \`json:"direction"\`
 	Allowed       bool     \`json:"allowed"\`
 	Reasons       []string \`json:"reasons"\`
@@ -874,79 +901,97 @@ type verdict struct {
 	PolicyVersion string   \`json:"policy_version"\`
 }
 
-func decode(r *harness.Response) verdict {
-	var v verdict
+func hDecode(r *harness.Response) hVerdict {
+	var v hVerdict
 	r.Decode(&v)
 	return v
 }
 
 func CheckRoutes(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	c := hAPI(ctx)
+	r := c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 200, "POST /v1/guard/input (%s)", r.Text())
-	got := decode(r)
+	got := hDecode(r)
 	ctx.Assert(got.Allowed && got.Tier == "classifier", "a neutral question must be allowed by the classifier, got %s", r.Text())
 	ctx.Equal(got.Direction, "input", "the input route's direction")
-	r = c.Post("/v1/guard/output", body(steering, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	r = c.Post("/v1/guard/output", hBody(hSteering, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 200, "POST /v1/guard/output (%s)", r.Text())
-	got = decode(r)
+	got = hDecode(r)
 	ctx.Assert(!got.Allowed && got.Tier == "classifier", "an answer that steers by national origin must be blocked by the classifier, got %s", r.Text())
 	ctx.Equal(got.Direction, "output", "the output route's direction")
 }
 
 func CheckApiKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Policy-Version", v1)
+	c := hAPI(ctx)
+	r := c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 401, "a request without X-Api-Key")
-	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-stolen", "X-Policy-Version", v1)
+	r = c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-stolen", "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 401, "a request with an unknown X-Api-Key")
+	keyInBody := hBody(hNeutral, "c-1")
+	keyInBody["api_key"] = "k-assistant"
+	r = c.Post("/v1/guard/input", keyInBody, "X-Policy-Version", hV1)
+	ctx.Equal(r.Status, 401, "a request with no X-Api-Key header but a known key in its body (the key is a header)")
 	calls := len(ctx.GRPC.CallsTo("Classify", ""))
 	ctx.Equal(calls, 0, "unauthenticated requests must not reach the classifier (look the key up before any tier runs); the calls")
-	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	r = c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 200, "a request with a known key (%s)", r.Text())
 }
 
 func CheckPolicyVersion(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/guard/input", body("Is this building adults only?", "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v2)
-	ctx.Equal(r.Status, 200, "a request pinned to %s (%s)", v2, r.Text())
-	got := decode(r)
-	ctx.Equal(got.PolicyVersion, v2, "the response must name the pinned X-Policy-Version; policy_version")
-	ctx.Assert(!got.Allowed && got.Tier == "stoplist", "%s stops 'adults only', got %s: the request was judged under another policy", v2, r.Text())
-	c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v2)
+	c := hAPI(ctx)
+	r := c.Post("/v1/guard/input", hBody("Is this building adults only?", "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV2)
+	ctx.Equal(r.Status, 200, "a request pinned to %s (%s)", hV2, r.Text())
+	got := hDecode(r)
+	ctx.Equal(got.PolicyVersion, hV2, "the response must name the pinned X-Policy-Version; policy_version")
+	ctx.Assert(!got.Allowed && got.Tier == "stoplist", "%s stops 'adults only', got %s: the request was judged under another policy", hV2, r.Text())
+	c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV2)
 	var asked []string
 	for _, call := range ctx.GRPC.CallsTo("Classify", "") {
 		asked = append(asked, call.Request.(*pb.ClassifyRequest).GetPolicyVersion())
 	}
-	ctx.Equal(asked, []string{v2}, "the policy versions the classifier was asked under")
-	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant")
+	ctx.Equal(asked, []string{hV2}, "the policy versions the classifier was asked under")
+	r = c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-assistant")
 	ctx.Equal(r.Status, 400, "a request without X-Policy-Version")
-	r = c.Post("/v1/guard/input", body(neutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", "latest")
-	ctx.Equal(r.Status, 400, "X-Policy-Version: latest (fh-YYYY-MM-DD[.n])")
+	r = c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", "latest")
+	versionInBody := hBody(hNeutral, "c-1")
+	versionInBody["policy_version"] = hV2
+	r = c.Post("/v1/guard/input", versionInBody, "X-Api-Key", "k-assistant")
+	ctx.Equal(r.Status, 400, "a request with no X-Policy-Version header but a version in its body (the version is a header)")
+	for _, bad := range []string{"latest", "fh-2024-05-21-draft", "xfh-2024-05-21", "fh-2024-5-21"} {
+		r = c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", bad)
+		ctx.Equal(r.Status, 400, "X-Policy-Version: %s (the whole value matches fh-YYYY-MM-DD[.n])", bad)
+	}
+	r = c.Post("/v1/guard/input", hBody(hNeutral, "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV2+".2")
+	ctx.Equal(r.Status, 200, "X-Policy-Version: %s.2, a revision fh-YYYY-MM-DD[.n] allows (%s)", hV2, r.Text())
+	ctx.Equal(hDecode(r).PolicyVersion, hV2+".2", "the response must name the pinned revision; policy_version")
 }
 
 func CheckCaps(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/guard/input", body(strings.Repeat("a", 8193), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	c := hAPI(ctx)
+	r := c.Post("/v1/guard/input", hBody(strings.Repeat("a", 8193), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 413, "8193 bytes of text")
-	r = c.Post("/v1/guard/input", body(strings.Repeat("é", 4097), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	r = c.Post("/v1/guard/input", hBody(strings.Repeat("é", 4097), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 413, "4097 'é' (8194 bytes of UTF-8): the cap counts bytes, not characters")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Classify", "")), 0, "oversized text must not reach the classifier (check the size before any tier runs); the calls")
-	r = c.Post("/v1/guard/input", body(strings.Repeat("a", 8192), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	r = c.Post("/v1/guard/input", hBody(strings.Repeat("a", 8192), "c-1"), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
 	ctx.Equal(r.Status, 200, "exactly 8 KiB of text")
-	for _, bad := range []string{"../../etc/passwd", strings.Repeat("c", 65), ""} {
-		r = c.Post("/v1/guard/input", body(neutral, bad), "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
-		ctx.Equal(r.Status, 400, "conversation_id %q", bad)
+	before := len(ctx.GRPC.CallsTo("Classify", ""))
+	for _, bad := range []string{"../../etc/passwd", strings.Repeat("c", 65), "", "c-1\\n", "c-1/../c-2"} {
+		r = c.Post("/v1/guard/input", hBody(hNeutral, bad), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
+		ctx.Equal(r.Status, 400, "conversation_id %q (the whole id matches [A-Za-z0-9_-]{1,64})", bad)
 	}
+	ctx.Equal(len(ctx.GRPC.CallsTo("Classify", ""))-before, 0, "requests with an invalid conversation_id must not reach the classifier (validate it before any tier runs); the calls")
+	r = c.Post("/v1/guard/input", hBody(hNeutral, strings.Repeat("c", 64)), "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
+	ctx.Equal(r.Status, 200, "a 64-character conversation_id (%s)", r.Text())
 }
 
 func CheckNoBypass(ctx *harness.Ctx) {
-	c := api(ctx)
-	payload := body(steering, "c-1")
+	c := hAPI(ctx)
+	payload := hBody(hSteering, "c-1")
 	payload["skip_guard"] = true
-	r := c.Post("/v1/guard/output", payload, "X-Api-Key", "k-assistant", "X-Policy-Version", v1)
+	r := c.Post("/v1/guard/output", payload, "X-Api-Key", "k-assistant", "X-Policy-Version", hV1)
 	if r.Status == 200 {
-		ctx.Assert(!decode(r).Allowed, "skip_guard: true let an answer that steers by national origin through (%s): no caller may skip the guard", r.Text())
+		ctx.Assert(!hDecode(r).Allowed, "skip_guard: true let an answer that steers by national origin through (%s): no caller may skip the guard", r.Text())
 		ctx.Assert(len(ctx.GRPC.CallsTo("Classify", "")) > 0, "with skip_guard: true the classifier was never asked")
 		return
 	}
@@ -966,10 +1011,10 @@ func CheckNoBypass(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kV1 = "fh-2024-05-21";
-const std::string kV2 = "fh-2024-06-01";
-const std::string kNeutral = "Two-bedroom homes near light rail under $900k";
-const std::string kSteering = "Beacon Hill is mostly Latino families, so you would fit right in.";
+const std::string kHV1 = "fh-2024-05-21";
+const std::string kHV2 = "fh-2024-06-01";
+const std::string kHNeutral = "Two-bedroom homes near light rail under $900k";
+const std::string kHSteering = "Beacon Hill is mostly Latino families, so you would fit right in.";
 
 // Scores 0.92 for text that names a protected group, 0.04 for anything else.
 class ClassifierPeer final : public fairhousing::Classifier::Service {
@@ -997,20 +1042,20 @@ class JudgePeer final : public fairhousing::Judge::Service {
   }
 };
 
-struct Peers {
+struct HPeers {
   ClassifierPeer classifier;
   JudgePeer judge;
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
-  static Peers* peers = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx) {
+  static HPeers* peers = nullptr;
   delete peers;
-  peers = new Peers;
+  peers = new HPeers;
   ctx.GRPC.Server("")->RegisterService(&peers->classifier);
   ctx.GRPC.Server("")->RegisterService(&peers->judge);
   store::addApiKey("k-assistant", "assistant");
-  store::savePolicy({kV1, {"no section 8"}});
-  store::savePolicy({kV2, {"no section 8", "adults only"}});
+  store::savePolicy({kHV1, {"no section 8"}});
+  store::savePolicy({kHV2, {"no section 8", "adults only"}});
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1018,25 +1063,27 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string body(const std::string& text, const std::string& conversation_id, bool skip = false) {
+std::string hBody(const std::string& text, const std::string& conversation_id, bool skip = false,
+                  const nlohmann::json& extra = nlohmann::json::object()) {
   nlohmann::json b = {{"conversation_id", conversation_id}, {"text", text}};
   if (skip) b["skip_guard"] = true;
+  b.update(extra);
   return b.dump();
 }
 
-harness::Response post(harness::HTTP& c, const std::string& route, const std::string& payload, const std::string& version = kV1,
+harness::Response hPost(harness::HTTP& c, const std::string& route, const std::string& payload, const std::string& version = kHV1,
                        const std::string& key = "k-assistant") {
   if (key.empty()) return c.Post("/v1/guard/" + route, payload, "Content-Type", "application/json", "X-Policy-Version", version);
   if (version.empty()) return c.Post("/v1/guard/" + route, payload, "Content-Type", "application/json", "X-Api-Key", key);
   return c.Post("/v1/guard/" + route, payload, "Content-Type", "application/json", "X-Api-Key", key, "X-Policy-Version", version);
 }
 
-nlohmann::json decode(const harness::Response& r) {
+nlohmann::json hDecode(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
@@ -1045,67 +1092,80 @@ std::string repeat(const std::string& s, int n) {
 }  // namespace
 
 void CheckRoutes(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "input", body(kNeutral, "c-1"));
+  auto c = hApi(ctx);
+  auto r = hPost(c, "input", hBody(kHNeutral, "c-1"));
   ctx.Equal(r.Status, 200, "POST /v1/guard/input (%s)", r.Text());
-  auto got = decode(r);
+  auto got = hDecode(r);
   ctx.Assert(got.value("allowed", false) && got.value("tier", "") == "classifier", "a neutral question must be allowed by the classifier, got %s", r.Text());
   ctx.Equal(got.value("direction", ""), "input", "the input route's direction");
-  r = post(c, "output", body(kSteering, "c-1"));
+  r = hPost(c, "output", hBody(kHSteering, "c-1"));
   ctx.Equal(r.Status, 200, "POST /v1/guard/output (%s)", r.Text());
-  got = decode(r);
+  got = hDecode(r);
   ctx.Assert(!got.value("allowed", true) && got.value("tier", "") == "classifier", "an answer that steers by national origin must be blocked by the classifier, got %s", r.Text());
   ctx.Equal(got.value("direction", ""), "output", "the output route's direction");
 }
 
 void CheckApiKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "input", body(kNeutral, "c-1"), kV1, "");
+  auto c = hApi(ctx);
+  auto r = hPost(c, "input", hBody(kHNeutral, "c-1"), kHV1, "");
   ctx.Equal(r.Status, 401, "a request without X-Api-Key");
-  r = post(c, "input", body(kNeutral, "c-1"), kV1, "k-stolen");
+  r = hPost(c, "input", hBody(kHNeutral, "c-1"), kHV1, "k-stolen");
   ctx.Equal(r.Status, 401, "a request with an unknown X-Api-Key");
+  r = hPost(c, "input", hBody(kHNeutral, "c-1", false, {{"api_key", "k-assistant"}}), kHV1, "");
+  ctx.Equal(r.Status, 401, "a request with no X-Api-Key header but a known key in its body (the key is a header)");
   ctx.Equal(ctx.GRPC.CallsTo("Classify").size(), 0, "unauthenticated requests must not reach the classifier (look the key up before any tier runs); the calls");
-  r = post(c, "input", body(kNeutral, "c-1"));
+  r = hPost(c, "input", hBody(kHNeutral, "c-1"));
   ctx.Equal(r.Status, 200, "a request with a known key (%s)", r.Text());
 }
 
 void CheckPolicyVersion(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "input", body("Is this building adults only?", "c-1"), kV2);
-  ctx.Equal(r.Status, 200, "a request pinned to %s (%s)", kV2, r.Text());
-  const auto got = decode(r);
-  ctx.Equal(got.value("policy_version", ""), kV2, "the response must name the pinned X-Policy-Version; policy_version");
-  ctx.Assert(!got.value("allowed", true) && got.value("tier", "") == "stoplist", "%s stops 'adults only', got %s: the request was judged under another policy", kV2, r.Text());
-  post(c, "input", body(kNeutral, "c-1"), kV2);
+  auto c = hApi(ctx);
+  auto r = hPost(c, "input", hBody("Is this building adults only?", "c-1"), kHV2);
+  ctx.Equal(r.Status, 200, "a request pinned to %s (%s)", kHV2, r.Text());
+  const auto got = hDecode(r);
+  ctx.Equal(got.value("policy_version", ""), kHV2, "the response must name the pinned X-Policy-Version; policy_version");
+  ctx.Assert(!got.value("allowed", true) && got.value("tier", "") == "stoplist", "%s stops 'adults only', got %s: the request was judged under another policy", kHV2, r.Text());
+  hPost(c, "input", hBody(kHNeutral, "c-1"), kHV2);
   std::vector<std::string> asked;
   for (const auto& call : ctx.GRPC.CallsTo("Classify")) asked.push_back(call.Request<fairhousing::ClassifyRequest>().policy_version());
-  ctx.Equal(asked, std::vector<std::string>{kV2}, "the policy versions the classifier was asked under");
-  r = post(c, "input", body(kNeutral, "c-1"), "");
+  ctx.Equal(asked, std::vector<std::string>{kHV2}, "the policy versions the classifier was asked under");
+  r = hPost(c, "input", hBody(kHNeutral, "c-1"), "");
   ctx.Equal(r.Status, 400, "a request without X-Policy-Version");
-  r = post(c, "input", body(kNeutral, "c-1"), "latest");
-  ctx.Equal(r.Status, 400, "X-Policy-Version: latest (fh-YYYY-MM-DD[.n])");
+  r = hPost(c, "input", hBody(kHNeutral, "c-1", false, {{"policy_version", kHV2}}), "");
+  ctx.Equal(r.Status, 400, "a request with no X-Policy-Version header but a version in its body (the version is a header)");
+  for (const std::string bad : {"latest", "fh-2024-05-21-draft", "xfh-2024-05-21", "fh-2024-5-21"}) {
+    r = hPost(c, "input", hBody(kHNeutral, "c-1"), bad);
+    ctx.Equal(r.Status, 400, "X-Policy-Version: %s (the whole value matches fh-YYYY-MM-DD[.n])", bad);
+  }
+  r = hPost(c, "input", hBody(kHNeutral, "c-1"), kHV2 + ".2");
+  ctx.Equal(r.Status, 200, "X-Policy-Version: %s.2, a revision fh-YYYY-MM-DD[.n] allows (%s)", kHV2, r.Text());
+  ctx.Equal(hDecode(r).value("policy_version", ""), kHV2 + ".2", "the response must name the pinned revision; policy_version");
 }
 
 void CheckCaps(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, "input", body(repeat("a", 8193), "c-1"));
+  auto c = hApi(ctx);
+  auto r = hPost(c, "input", hBody(hRepeat("a", 8193), "c-1"));
   ctx.Equal(r.Status, 413, "8193 bytes of text");
-  r = post(c, "input", body(repeat("\\u00e9", 4097), "c-1"));
+  r = hPost(c, "input", hBody(hRepeat("\\u00e9", 4097), "c-1"));
   ctx.Equal(r.Status, 413, "4097 'é' (8194 bytes of UTF-8): the cap counts bytes, not characters");
   ctx.Equal(ctx.GRPC.CallsTo("Classify").size(), 0, "oversized text must not reach the classifier (check the size before any tier runs); the calls");
-  r = post(c, "input", body(repeat("a", 8192), "c-1"));
+  r = hPost(c, "input", hBody(hRepeat("a", 8192), "c-1"));
   ctx.Equal(r.Status, 200, "exactly 8 KiB of text");
-  for (const std::string bad : {std::string("../../etc/passwd"), repeat("c", 65), std::string()}) {
-    r = post(c, "input", body(kNeutral, bad));
-    ctx.Equal(r.Status, 400, "conversation_id %q", bad);
+  const size_t before = ctx.GRPC.CallsTo("Classify").size();
+  for (const std::string bad : {std::string("../../etc/passwd"), hRepeat("c", 65), std::string(), std::string("c-1\\n"), std::string("c-1/../c-2")}) {
+    r = hPost(c, "input", hBody(kHNeutral, bad));
+    ctx.Equal(r.Status, 400, "conversation_id %q (the whole id matches [A-Za-z0-9_-]{1,64})", bad);
   }
+  ctx.Equal(ctx.GRPC.CallsTo("Classify").size() - before, 0, "requests with an invalid conversation_id must not reach the classifier (validate it before any tier runs); the calls");
+  r = hPost(c, "input", hBody(kHNeutral, hRepeat("c", 64)));
+  ctx.Equal(r.Status, 200, "a 64-character conversation_id (%s)", r.Text());
 }
 
 void CheckNoBypass(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, "output", body(kSteering, "c-1", true));
+  auto c = hApi(ctx);
+  const auto r = hPost(c, "output", hBody(kHSteering, "c-1", true));
   if (r.Status == 200) {
-    ctx.Assert(!decode(r).value("allowed", true), "skip_guard: true let an answer that steers by national origin through (%s): no caller may skip the guard", r.Text());
+    ctx.Assert(!hDecode(r).value("allowed", true), "skip_guard: true let an answer that steers by national origin through (%s): no caller may skip the guard", r.Text());
     ctx.Assert(!ctx.GRPC.CallsTo("Classify").empty(), "with skip_guard: true the classifier was never asked");
     return;
   }

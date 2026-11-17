@@ -56,7 +56,7 @@ Requirements:
       id: 'decision-ttl',
       title: 'Decision entries expire after 24 hours',
       detail:
-        'The cached decision carries a TTL of DECISION_TTL_S (86400 s), and a day later the table agent is asked again. The starter writes it with no expiry.',
+        'The cached decision carries a TTL of DECISION_TTL_S (86400 s) from the command that writes it, and a day after it was written the table agent is asked again, even when the entry was read in between. The starter writes it with no expiry.',
       match: {
         python: {all: [/ex\s*=\s*DECISION_TTL_S/]},
         typescript: {all: [/['"]EX['"]\s*,\s*DECISION_TTL_S/]},
@@ -69,7 +69,7 @@ Requirements:
       id: 'atomic-budget',
       title: 'Reserves the hourly budget in one script',
       detail:
-        "A second server reserving between the starter's GET and INCR cannot push a user past 50: exactly one of the two gets the 50th query. The counter expires WINDOW_S after the first query, so the next hour starts at 1. The starter reads and writes in separate round trips on a key that never expires.",
+        "A second server reserving between the starter's GET and INCR cannot push a user past 50: exactly one of the two gets the 50th query. The counter has its expiry from the command that creates it and expires WINDOW_S after the first query, however many follow, so the next hour starts at 1. The starter reads and writes in separate round trips on a key that never expires.",
       match: {
         python: {all: [/register_script\(|\.eval\(/, /EXPIRE/], none: [/\br\.incr\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /EXPIRE/], none: [/redis\.incr\(/]},
@@ -780,16 +780,29 @@ def check_normalised_key(ctx):
 def check_decision_ttl(ctx):
     m = ctx.load("decisions")
     pick, picks = _picker()
-    m.tables_for("mobility", QUESTION, pick)
+    key = f"decision:mobility:{_qhash('trips in seattle last week')}"
+    probes = []
+
+    def pick_and_watch(question, workspace):
+        # the table agent answers between the miss and the write: watch the TTL the write leaves
+        probes.append(ctx.redis_after(key, lambda: ctx.redis.ttl(key)))
+        return pick(question, workspace)
+
+    m.tables_for("mobility", QUESTION, pick_and_watch)
     keys = ctx.redis.keys("decision:*")
     assert len(keys) == 1, f"one question, one decision entry: {keys}"
     ttl = ctx.redis.ttl(keys[0])
     assert 86_000 < ttl <= 86_400, f"the decision has TTL {ttl}: it must expire DECISION_TTL_S (86400 s) after it was written"
+    assert probes and probes[0].fired, f"the decision was never written to {key}"
+    assert 86_000 < probes[0].result <= 86_400, f"right after the decision was written its TTL was {probes[0].result}: write it with its expiry in the same command, or a crash in between leaves it forever"
     m.tables_for("mobility", QUESTION, pick)
     assert len(picks) == 1, "within the day the decision is served from the cache"
-    ctx.clock.advance(86_401)
+    ctx.clock.advance(43_200)
     m.tables_for("mobility", QUESTION, pick)
-    assert len(picks) == 2, "a day later the table agent must be asked again: the workspace may have been re-curated"
+    assert len(picks) == 1, "half a day later the decision is still served from the cache"
+    ctx.clock.advance(43_201)
+    m.tables_for("mobility", QUESTION, pick)
+    assert len(picks) == 2, "a day after it was written the table agent must be asked again, however often the entry was read: the workspace may have been re-curated"
 
 
 def check_atomic_budget(ctx):
@@ -799,6 +812,15 @@ def check_atomic_budget(ctx):
     assert ctx.redis.get("budget:ana") == "1", f"budget:ana must count 1, holds {ctx.redis.get('budget:ana')!r}"
     ttl = ctx.redis.ttl("budget:ana")
     assert 0 < ttl <= 3_600, f"budget:ana has TTL {ttl}: the window must expire WINDOW_S (3600 s) after the first query, or the user is locked out for good"
+    ctx.clock.advance(1_800)
+    allowed, _ = m.reserve("ana")
+    assert allowed and ctx.redis.get("budget:ana") == "2", f"ana's second query counts 2, holds {ctx.redis.get('budget:ana')!r}"
+    ttl = ctx.redis.ttl("budget:ana")
+    assert 0 < ttl <= 1_800, f"half an hour into the window budget:ana has TTL {ttl}: the window expires an hour after the first query, later queries must not push it back"
+    probe = ctx.redis_after("budget:eve", lambda: ctx.redis.ttl("budget:eve"))
+    allowed, _ = m.reserve("eve")
+    assert allowed and probe.fired, "eve's first query is within budget and touches budget:eve"
+    assert 0 < probe.result <= 3_600, f"right after the command that created budget:eve its TTL was {probe.result}: the EXPIRE belongs in the same script, or a crash in between locks eve out for good"
     ctx.redis.set("budget:bo", 49, ex=1_800)
 
     def other_server():
@@ -814,7 +836,7 @@ def check_atomic_budget(ctx):
     winners = [mine, probe.result].count(True)
     assert winners == 1, f"two servers reserved bo's 50th query and {winners} got through: the read, the check and the increment must run in one script"
     assert ctx.redis.get("budget:bo") == "50", f"budget:bo must stop at 50, holds {ctx.redis.get('budget:bo')}"
-    ctx.clock.advance(3_601)
+    ctx.clock.advance(1_801)
     allowed, _ = m.reserve("ana")
     assert allowed and ctx.redis.get("budget:ana") == "1", f"after the hour the window starts over at 1, holds {ctx.redis.get('budget:ana')!r}"
 
@@ -865,16 +887,29 @@ export async function check_normalised_key(ctx) {
 export async function check_decision_ttl(ctx) {
   const m = ctx.load('decisions');
   const {pick, picks} = picker(ctx);
-  await m.tablesFor('mobility', QUESTION, pick);
+  const key = \`decision:mobility:\${qhash('trips in seattle last week')}\`;
+  const probes: {fired: boolean; result: unknown}[] = [];
+  const pickAndWatch = (question: string, workspace: string) => {
+    // the table agent answers between the miss and the write: watch the TTL the write leaves
+    probes.push(ctx.redisAfter(key, () => ctx.redis.ttl(key)));
+    return pick(question, workspace);
+  };
+  await m.tablesFor('mobility', QUESTION, pickAndWatch);
   const keys = ctx.redis.keys('decision:*');
   assert.equal(keys.length, 1, \`one question, one decision entry: \${JSON.stringify(keys)}\`);
   const ttl = ctx.redis.ttl(keys[0]);
   assert(ttl > 86_000 && ttl <= 86_400, \`the decision has TTL \${ttl}: it must expire DECISION_TTL_S (86400 s) after it was written\`);
+  assert(probes.length > 0 && probes[0].fired, \`the decision was never written to \${key}\`);
+  const written = Number(probes[0].result);
+  assert(written > 86_000 && written <= 86_400, \`right after the decision was written its TTL was \${written}: write it with its expiry in the same command, or a crash in between leaves it forever\`);
   await m.tablesFor('mobility', QUESTION, pick);
   assert.equal(picks.length, 1, 'within the day the decision is served from the cache');
-  ctx.clock.advance(86_401);
+  ctx.clock.advance(43_200);
   await m.tablesFor('mobility', QUESTION, pick);
-  assert.equal(picks.length, 2, 'a day later the table agent must be asked again: the workspace may have been re-curated');
+  assert.equal(picks.length, 1, 'half a day later the decision is still served from the cache');
+  ctx.clock.advance(43_201);
+  await m.tablesFor('mobility', QUESTION, pick);
+  assert.equal(picks.length, 2, 'a day after it was written the table agent must be asked again, however often the entry was read: the workspace may have been re-curated');
 }
 
 export async function check_atomic_budget(ctx) {
@@ -882,8 +917,17 @@ export async function check_atomic_budget(ctx) {
   const first = await m.reserve('ana');
   assert(first.allowed, "a user's first query is within budget");
   assert.equal(ctx.redis.get('budget:ana'), '1', \`budget:ana must count 1, holds \${ctx.redis.get('budget:ana')}\`);
-  const ttl = ctx.redis.ttl('budget:ana');
+  let ttl = ctx.redis.ttl('budget:ana');
   assert(ttl > 0 && ttl <= 3_600, \`budget:ana has TTL \${ttl}: the window must expire WINDOW_S (3600 s) after the first query, or the user is locked out for good\`);
+  ctx.clock.advance(1_800);
+  const second = await m.reserve('ana');
+  assert(second.allowed && ctx.redis.get('budget:ana') === '2', \`ana's second query counts 2, holds \${ctx.redis.get('budget:ana')}\`);
+  ttl = ctx.redis.ttl('budget:ana');
+  assert(ttl > 0 && ttl <= 1_800, \`half an hour into the window budget:ana has TTL \${ttl}: the window expires an hour after the first query, later queries must not push it back\`);
+  const created = ctx.redisAfter('budget:eve', () => ctx.redis.ttl('budget:eve'));
+  const eve = await m.reserve('eve');
+  assert(eve.allowed && created.fired, "eve's first query is within budget and touches budget:eve");
+  assert(created.result > 0 && created.result <= 3_600, \`right after the command that created budget:eve its TTL was \${created.result}: the EXPIRE belongs in the same script, or a crash in between locks eve out for good\`);
   ctx.redis.set('budget:bo', '49', 'EX', 1_800);
   const probe = ctx.redisAfter('budget:bo', () => {
     // another app server reserving bo's query, landing between two of this server's commands
@@ -896,7 +940,7 @@ export async function check_atomic_budget(ctx) {
   const winners = [mine.allowed, probe.result].filter(v => v === true).length;
   assert.equal(winners, 1, \`two servers reserved bo's 50th query and \${winners} got through: the read, the check and the increment must run in one script\`);
   assert.equal(ctx.redis.get('budget:bo'), '50', \`budget:bo must stop at 50, holds \${ctx.redis.get('budget:bo')}\`);
-  ctx.clock.advance(3_601);
+  ctx.clock.advance(1_801);
   const next = await m.reserve('ana');
   assert(next.allowed && ctx.redis.get('budget:ana') === '1', \`after the hour the window starts over at 1, holds \${ctx.redis.get('budget:ana')}\`);
 }
@@ -966,16 +1010,35 @@ func CheckNormalisedKey(ctx *harness.Ctx) {
 
 func CheckDecisionTtl(ctx *harness.Ctx) {
 	pick, picks := decisionsPicker()
-	decisionsTables(ctx, "mobility", decisionsQuestion, pick)
+	sum := sha256.Sum256([]byte("trips in seattle last week"))
+	key := "decision:mobility:" + hex.EncodeToString(sum[:])
+	watched, fired, written := false, false, int64(0)
+	pickAndWatch := func(c context.Context, question, workspace string) ([]string, error) {
+		// the table agent answers between the miss and the write: watch the TTL the write leaves
+		if !watched {
+			watched = true
+			ctx.Redis.After(key, func() any {
+				fired, written = true, ctx.Redis.TTL(key)
+				return nil
+			})
+		}
+		return pick(c, question, workspace)
+	}
+	decisionsTables(ctx, "mobility", decisionsQuestion, pickAndWatch)
 	keys := ctx.Redis.Keys("decision:*")
 	ctx.Equal(len(keys), 1, "one question, one decision entry; entries")
 	ttl := ctx.Redis.TTL(keys[0])
 	ctx.Assert(ttl > 86000 && ttl <= 86400, "the decision has TTL %d: it must expire after 86400 s", ttl)
+	ctx.Assert(fired, "the decision was never written to %s", key)
+	ctx.Assert(written > 86000 && written <= 86400, "right after the decision was written its TTL was %d: write it with its expiry in the same command, or a crash in between leaves it forever", written)
 	decisionsTables(ctx, "mobility", decisionsQuestion, pick)
 	ctx.Equal(*picks, 1, "within the day the decision is served from the cache; picks")
-	ctx.Clock.Advance(86401)
+	ctx.Clock.Advance(43200)
 	decisionsTables(ctx, "mobility", decisionsQuestion, pick)
-	ctx.Equal(*picks, 2, "a day later the table agent must be asked again (the workspace may have been re-curated); picks")
+	ctx.Equal(*picks, 1, "half a day later the decision is still served from the cache; picks")
+	ctx.Clock.Advance(43201)
+	decisionsTables(ctx, "mobility", decisionsQuestion, pick)
+	ctx.Equal(*picks, 2, "a day after it was written the table agent must be asked again, however often the entry was read (the workspace may have been re-curated); picks")
 }
 
 func CheckAtomicBudget(ctx *harness.Ctx) {
@@ -985,6 +1048,20 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 	ctx.Equal(used, "1", "budget:ana")
 	ttl := ctx.Redis.TTL("budget:ana")
 	ctx.Assert(ttl > 0 && ttl <= 3600, "budget:ana has TTL %d: the window must expire 3600 s after the first query, or the user is locked out for good", ttl)
+	ctx.Clock.Advance(1800)
+	allowed, _ = decisionsReserve(ctx, "ana")
+	used, _ = ctx.Redis.Get("budget:ana")
+	ctx.Assert(allowed && used == "2", "ana's second query counts 2, holds %q", used)
+	ttl = ctx.Redis.TTL("budget:ana")
+	ctx.Assert(ttl > 0 && ttl <= 1800, "half an hour into the window budget:ana has TTL %d: the window expires an hour after the first query, later queries must not push it back", ttl)
+	eveFired, eveTTL := false, int64(0)
+	ctx.Redis.After("budget:eve", func() any {
+		eveFired, eveTTL = true, ctx.Redis.TTL("budget:eve")
+		return nil
+	})
+	allowed, _ = decisionsReserve(ctx, "eve")
+	ctx.Assert(allowed && eveFired, "eve's first query is within budget and touches budget:eve")
+	ctx.Assert(eveTTL > 0 && eveTTL <= 3600, "right after the command that created budget:eve its TTL was %d: the EXPIRE belongs in the same script, or a crash in between locks eve out for good", eveTTL)
 	ctx.Redis.Set("budget:bo", 49, "EX", 1800)
 	fired, other := false, false
 	ctx.Redis.After("budget:bo", func() any {
@@ -1009,7 +1086,7 @@ func CheckAtomicBudget(ctx *harness.Ctx) {
 	ctx.Equal(winners, 1, "two servers reserved bo's 50th query (the read, the check and the increment must run in one script); servers that got through")
 	bo, _ := ctx.Redis.Get("budget:bo")
 	ctx.Equal(bo, "50", "budget:bo must stop at 50")
-	ctx.Clock.Advance(3601)
+	ctx.Clock.Advance(1801)
 	allowed, _ = decisionsReserve(ctx, "ana")
 	used, _ = ctx.Redis.Get("budget:ana")
 	ctx.Assert(allowed && used == "1", "after the hour the window starts over at 1, holds %q", used)
@@ -1042,9 +1119,9 @@ func CheckBudgetFirst(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kQuestion = "Trips in Seattle last week";
+const std::string kHarnessQuestion = "Trips in Seattle last week";
 
-struct Picker {
+struct HarnessPicker {
   int picks = 0;
   TablePicker fn() {
     return [this](const std::string& question, const std::string& workspace) {
@@ -1057,37 +1134,72 @@ struct Picker {
 }  // namespace
 
 void CheckNormalisedKey(harness::Ctx& ctx) {
-  Picker p;
-  const auto first = tables_for("mobility", kQuestion, p.fn());
+  HarnessPicker p;
+  const auto first = tables_for("mobility", kHarnessQuestion, p.fn());
   ctx.Equal(first, std::vector<std::string>{"trips", "drivers"}, "a miss returns the table agent's pick");
   const auto again = tables_for("mobility", "  trips IN seattle\\tlast   week ", p.fn());
   ctx.Equal(p.picks, 1, "the same question with other capitals and spacing asked the table agent again (normalise before you hash); picks");
   ctx.Equal(again, first, "the cache hit must return the cached tables");
   const std::string key = "decision:mobility:" + sha256_hex("trips in seattle last week");
   ctx.Assert(ctx.Redis.Get(key).has_value(), "the decision must live at decision:{workspace}:{sha256 of the normalised question}, keys are %v", ctx.Redis.Keys("decision:*"));
-  const auto ads = tables_for("ads", kQuestion, p.fn());
+  const auto ads = tables_for("ads", kHarnessQuestion, p.fn());
   ctx.Assert(p.picks == 2 && ads == std::vector<std::string>{"ad_campaigns"}, "an Ads question must not read Mobility's decision: %d picks, tables %v", p.picks, ads);
 }
 
 void CheckDecisionTtl(harness::Ctx& ctx) {
-  Picker p;
-  tables_for("mobility", kQuestion, p.fn());
+  HarnessPicker p;
+  const std::string key = "decision:mobility:" + sha256_hex("trips in seattle last week");
+  bool watched = false;
+  bool fired = false;
+  long long written = 0;
+  const TablePicker inner = p.fn();
+  const TablePicker pick_and_watch = [&](const std::string& question, const std::string& workspace) {
+    // the table agent answers between the miss and the write: watch the TTL the write leaves
+    if (!watched) {
+      watched = true;
+      ctx.Redis.After(key, [&] {
+        fired = true;
+        written = ctx.Redis.TTL(key);
+      });
+    }
+    return inner(question, workspace);
+  };
+  tables_for("mobility", kHarnessQuestion, pick_and_watch);
   const auto keys = ctx.Redis.Keys("decision:*");
   ctx.Equal(keys.size(), 1, "one question, one decision entry; entries");
   const long long ttl = ctx.Redis.TTL(keys[0]);
   ctx.Assert(ttl > 86000 && ttl <= 86400, "the decision has TTL %d: it must expire after 86400 s", ttl);
-  tables_for("mobility", kQuestion, p.fn());
+  ctx.Assert(fired, "the decision was never written to %s", key);
+  ctx.Assert(written > 86000 && written <= 86400, "right after the decision was written its TTL was %d: write it with its expiry in the same command, or a crash in between leaves it forever", written);
+  tables_for("mobility", kHarnessQuestion, p.fn());
   ctx.Equal(p.picks, 1, "within the day the decision is served from the cache; picks");
-  ctx.Clock.Advance(86401);
-  tables_for("mobility", kQuestion, p.fn());
-  ctx.Equal(p.picks, 2, "a day later the table agent must be asked again (the workspace may have been re-curated); picks");
+  ctx.Clock.Advance(43200);
+  tables_for("mobility", kHarnessQuestion, p.fn());
+  ctx.Equal(p.picks, 1, "half a day later the decision is still served from the cache; picks");
+  ctx.Clock.Advance(43201);
+  tables_for("mobility", kHarnessQuestion, p.fn());
+  ctx.Equal(p.picks, 2, "a day after it was written the table agent must be asked again, however often the entry was read (the workspace may have been re-curated); picks");
 }
 
 void CheckAtomicBudget(harness::Ctx& ctx) {
   ctx.Assert(reserve("ana").allowed, "a user's first query is within budget");
   ctx.Equal(ctx.Redis.Get("budget:ana").value_or(""), "1", "budget:ana");
-  const long long ttl = ctx.Redis.TTL("budget:ana");
+  long long ttl = ctx.Redis.TTL("budget:ana");
   ctx.Assert(ttl > 0 && ttl <= 3600, "budget:ana has TTL %d: the window must expire 3600 s after the first query, or the user is locked out for good", ttl);
+  ctx.Clock.Advance(1800);
+  const bool second = reserve("ana").allowed;
+  ctx.Assert(second && ctx.Redis.Get("budget:ana").value_or("") == "2", "ana's second query counts 2, holds %s", ctx.Redis.Get("budget:ana").value_or("(none)"));
+  ttl = ctx.Redis.TTL("budget:ana");
+  ctx.Assert(ttl > 0 && ttl <= 1800, "half an hour into the window budget:ana has TTL %d: the window expires an hour after the first query, later queries must not push it back", ttl);
+  bool eve_fired = false;
+  long long eve_ttl = 0;
+  ctx.Redis.After("budget:eve", [&] {
+    eve_fired = true;
+    eve_ttl = ctx.Redis.TTL("budget:eve");
+  });
+  const bool eve = reserve("eve").allowed;
+  ctx.Assert(eve && eve_fired, "eve's first query is within budget and touches budget:eve");
+  ctx.Assert(eve_ttl > 0 && eve_ttl <= 3600, "right after the command that created budget:eve its TTL was %d: the EXPIRE belongs in the same script, or a crash in between locks eve out for good", eve_ttl);
   ctx.Redis.Set("budget:bo", 49, "EX", 1800);
   bool fired = false;
   bool other = false;
@@ -1102,20 +1214,20 @@ void CheckAtomicBudget(harness::Ctx& ctx) {
   ctx.Assert(fired, "reserve never touched budget:bo");
   ctx.Equal(int(mine) + int(other), 1, "two servers reserved bo's 50th query (the read, the check and the increment must run in one script); servers that got through");
   ctx.Equal(ctx.Redis.Get("budget:bo").value_or(""), "50", "budget:bo must stop at 50");
-  ctx.Clock.Advance(3601);
+  ctx.Clock.Advance(1801);
   const bool next = reserve("ana").allowed;
   ctx.Assert(next && ctx.Redis.Get("budget:ana").value_or("") == "1", "after the hour the window starts over at 1, holds %s", ctx.Redis.Get("budget:ana").value_or("(none)"));
 }
 
 void CheckBudgetFirst(harness::Ctx& ctx) {
-  Picker p;
+  HarnessPicker p;
   ctx.Redis.Set("budget:cy", 50, "EX", 1200);
-  Proposal out = propose("cy", "mobility", kQuestion, p.fn());
+  Proposal out = propose("cy", "mobility", kHarnessQuestion, p.fn());
   ctx.Equal(out.status, "over_budget", "a user at 50 queries");
   ctx.Equal(p.picks, 0, "the table agent was called for a user already over budget (reserve before the agent call); picks");
   ctx.Assert(out.retry_after >= 1190 && out.retry_after <= 1200, "retry_after must be the window's TTL (about 1200 s), got %d", out.retry_after);
   ctx.Equal(ctx.Redis.Get("budget:cy").value_or(""), "50", "a refused query must not count; budget:cy");
-  out = propose("dee", "mobility", kQuestion, p.fn());
+  out = propose("dee", "mobility", kHarnessQuestion, p.fn());
   ctx.Assert(out.status == "proposed" && out.tables == std::vector<std::string>{"trips", "drivers"}, "a user within budget gets the proposal, got %s", out.status);
   ctx.Equal(ctx.Redis.Get("budget:dee").value_or(""), "1", "the proposal counts against dee's budget; budget:dee");
 }

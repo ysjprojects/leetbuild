@@ -45,7 +45,7 @@ names, visible to \`SCAN\` and every dump. One bad week flags a conversation for
       id: 'versioned-policy',
       title: 'Caches each policy version under its own key for an hour',
       detail:
-        'A policy is cached under `fh:policy:{version}` with a one-hour TTL and loaded from the store on a miss; the starter caches the first policy it sees under one version-less key, forever.',
+        'A policy is cached under `fh:policy:{version}` with a one-hour TTL, set by the command that creates the key, and loaded from the store on a miss; the starter caches the first policy it sees under one version-less key, forever.',
       match: {
         python: {
           all: [/fh:policy:\{version\}/, /POLICY_TTL_S\s*=\s*3600\b/, /ex\s*=\s*POLICY_TTL_S/],
@@ -86,7 +86,7 @@ names, visible to \`SCAN\` and every dump. One bad week flags a conversation for
       id: 'versioned-decision',
       title: 'Caches decisions per policy version, for a day',
       detail:
-        'A decision is cached under `fh:decision:{version}:{hash}` with a one-day TTL, so a new policy version starts from an empty cache; the starter’s key has no version and no TTL.',
+        'A decision is cached under `fh:decision:{version}:{hash}` with a one-day TTL, set by the command that creates the key, so a new policy version starts from an empty cache; the starter’s key has no version and no TTL.',
       match: {
         python: {all: [/fh:decision:\{version\}:/, /DECISION_TTL_S\s*=\s*86_?400\b/, /ex\s*=\s*DECISION_TTL_S/]},
         typescript: {all: [/fh:decision:\$\{version\}:/, /DECISION_TTL_S\s*=\s*86_?400\b/, /'EX',\s*DECISION_TTL_S/]},
@@ -705,19 +705,37 @@ def _cache(ctx):
     return ctx.load("policy_cache")
 
 
+def _ttl_when_created(ctx, key):
+    """The key's TTL right after the command that created it, as another client would see it: -3 if never created."""
+    seen = {"ttl": -3}
+
+    def probe():
+        if ctx.redis.exists(key):
+            seen["ttl"] = ctx.redis.ttl(key)
+        else:
+            ctx.redis_after(key, probe)
+
+    ctx.redis_after(key, probe)
+    return seen
+
+
 def _phrases(policy):
     return None if policy is None else list(policy.stop_phrases)
 
 
 def check_versioned_policy(ctx):
     m = _cache(ctx)
+    created = _ttl_when_created(ctx, f"fh:policy:{V1.version}")
     assert _phrases(m.get_policy(V1.version)) == V1.stop_phrases, f"get_policy({V1.version!r}) returned {m.get_policy(V1.version)}"
     got = m.get_policy(V2.version)
     assert _phrases(got) == V2.stop_phrases, f"get_policy({V2.version!r}) returned {got}: the policy cached for {V1.version} answered for another version. Key the cache by version"
     ttl = ctx.redis.ttl(f"fh:policy:{V1.version}")
     assert 0 < ttl <= 3600, f"fh:policy:{V1.version} has TTL {ttl}, expected at most POLICY_TTL_S = 3600 (keys: {sorted(ctx.redis.keys('fh:policy*'))})"
+    assert 0 < created["ttl"] <= 3600, f"fh:policy:{V1.version} had TTL {created['ttl']} right after the command that created it: set the TTL in that same command, or a crash in between leaves a policy cached forever"
     assert m.get_policy("fh-2023-01-01") is None, "a version no store holds must come back None"
-    ctx.clock.advance(3601)
+    ctx.clock.advance(3590)
+    assert ctx.redis.exists(f"fh:policy:{V1.version}"), "the cached policy expired within 3590 s: it is cached for POLICY_TTL_S = 3600"
+    ctx.clock.advance(11)
     assert ctx.redis.get(f"fh:policy:{V1.version}") is None, "the cached policy must expire after an hour"
     assert _phrases(m.get_policy(V1.version)) == V1.stop_phrases, "after expiry the policy is loaded from the store again"
 
@@ -727,8 +745,12 @@ def check_atomic_publish(ctx):
     m.publish(V2)
     assert m.active_version() == V2.version, f"after publishing {V2.version} the active version is {m.active_version()!r}"
     key = f"fh:policy:{V3.version}"
+    entry = ctx.redis_after(key, lambda: (ctx.redis.get("fh:policy:active"), ctx.redis.ttl(key)) if ctx.redis.exists(key) else None)
     seen = ctx.redis_after("fh:policy:active", lambda: (ctx.redis.get("fh:policy:active"), ctx.redis.get(key), ctx.redis.exists(f"fhstore:policy:{V3.version}")))
     m.publish(V3)
+    if entry.result is not None:
+        assert entry.result[0] == V3.version, f"{key} was written while fh:policy:active still named {entry.result[0]!r}: move the cache entry and the pointer in one MULTI/EXEC"
+        assert 0 < entry.result[1] <= 3600, f"{key} had TTL {entry.result[1]} right after publish wrote it, expected at most POLICY_TTL_S = 3600 set in the same command"
     assert seen.fired, "publish never touched fh:policy:active"
     active, cached, stored = seen.result
     assert active == V3.version, f"fh:policy:active held {active!r} right after the publish wrote it"
@@ -741,7 +763,9 @@ def check_atomic_publish(ctx):
 
 def check_versioned_decision(ctx):
     m = _cache(ctx)
+    created = _ttl_when_created(ctx, f"fh:decision:{V1.version}:{hashlib.sha256(TEXT.encode('utf-8')).hexdigest()}")
     m.cache_decision(V1.version, TEXT, BLOCKED)
+    assert created["ttl"] == -3 or 0 < created["ttl"] <= 86400, f"the decision key had TTL {created['ttl']} right after the command that created it: set DECISION_TTL_S in that same command"
     got = m.cached_decision(V1.version, TEXT)
     assert got is not None and got.allowed is False and got.reasons == BLOCKED.reasons, f"cached_decision under the same version returned {got}"
     other = m.cached_decision(V2.version, TEXT)
@@ -750,7 +774,9 @@ def check_versioned_decision(ctx):
     assert len(keys) == 1, f"one cached decision left the keys {keys}"
     ttl = ctx.redis.ttl(keys[0])
     assert 0 < ttl <= 86400, f"{keys[0]} has TTL {ttl}, expected at most DECISION_TTL_S = 86400"
-    ctx.clock.advance(86401)
+    ctx.clock.advance(86_000)
+    assert m.cached_decision(V1.version, TEXT) is not None, "the cached decision expired within 86000 s: it is cached for DECISION_TTL_S = 86400"
+    ctx.clock.advance(401)
     assert m.cached_decision(V1.version, TEXT) is None, "a cached decision must expire after a day"
 
 
@@ -790,17 +816,32 @@ async function cache(ctx) {
   return ctx.load('policy_cache');
 }
 
+/** The key's TTL right after the command that created it, as another client would see it: -3 if never created. */
+function ttlWhenCreated(ctx, key) {
+  const seen = {ttl: -3};
+  const probe = () => {
+    if (ctx.redis.exists(key)) seen.ttl = ctx.redis.ttl(key);
+    else ctx.redisAfter(key, probe);
+  };
+  ctx.redisAfter(key, probe);
+  return seen;
+}
+
 const phrases = p => (p === null ? null : JSON.stringify(p.stop_phrases));
 
 export async function check_versioned_policy(ctx) {
   const m = await cache(ctx);
+  const created = ttlWhenCreated(ctx, \`fh:policy:\${V1.version}\`);
   assert.equal(phrases(await m.getPolicy(V1.version)), JSON.stringify(V1.stop_phrases), \`getPolicy(\${V1.version}) returned the wrong policy\`);
   const got = await m.getPolicy(V2.version);
   assert.equal(phrases(got), JSON.stringify(V2.stop_phrases), \`getPolicy(\${V2.version}) returned \${JSON.stringify(got)}: the policy cached for \${V1.version} answered for another version. Key the cache by version\`);
   const ttl = ctx.redis.ttl(\`fh:policy:\${V1.version}\`);
   assert(0 < ttl && ttl <= 3600, \`fh:policy:\${V1.version} has TTL \${ttl}, expected at most POLICY_TTL_S = 3600 (keys: \${JSON.stringify(ctx.redis.keys('fh:policy*'))})\`);
+  assert(0 < created.ttl && created.ttl <= 3600, \`fh:policy:\${V1.version} had TTL \${created.ttl} right after the command that created it: set the TTL in that same command, or a crash in between leaves a policy cached forever\`);
   assert.equal(await m.getPolicy('fh-2023-01-01'), null, 'a version no store holds must come back null');
-  ctx.clock.advance(3601);
+  ctx.clock.advance(3590);
+  assert.equal(ctx.redis.exists(\`fh:policy:\${V1.version}\`), 1, 'the cached policy expired within 3590 s: it is cached for POLICY_TTL_S = 3600');
+  ctx.clock.advance(11);
   assert.equal(ctx.redis.get(\`fh:policy:\${V1.version}\`), null, 'the cached policy must expire after an hour');
   assert.equal(phrases(await m.getPolicy(V1.version)), JSON.stringify(V1.stop_phrases), 'after expiry the policy is loaded from the store again');
 }
@@ -810,8 +851,13 @@ export async function check_atomic_publish(ctx) {
   await m.publish(V2);
   assert.equal(await m.activeVersion(), V2.version, \`after publishing \${V2.version} the active version must name it\`);
   const key = \`fh:policy:\${V3.version}\`;
+  const entry = ctx.redisAfter(key, () => (ctx.redis.exists(key) ? [ctx.redis.get('fh:policy:active'), ctx.redis.ttl(key)] : null));
   const seen = ctx.redisAfter('fh:policy:active', () => [ctx.redis.get('fh:policy:active'), ctx.redis.get(key), ctx.redis.exists(\`fhstore:policy:\${V3.version}\`)]);
   await m.publish(V3);
+  if (entry.result) {
+    assert.equal(entry.result[0], V3.version, \`\${key} was written while fh:policy:active still named \${JSON.stringify(entry.result[0])}: move the cache entry and the pointer in one MULTI/EXEC\`);
+    assert(0 < entry.result[1] && entry.result[1] <= 3600, \`\${key} had TTL \${entry.result[1]} right after publish wrote it, expected at most POLICY_TTL_S = 3600 set in the same command\`);
+  }
   assert(seen.fired, 'publish never touched fh:policy:active');
   const [active, cached, stored] = seen.result;
   assert.equal(active, V3.version, \`fh:policy:active held \${JSON.stringify(active)} right after the publish wrote it\`);
@@ -824,7 +870,10 @@ export async function check_atomic_publish(ctx) {
 
 export async function check_versioned_decision(ctx) {
   const m = await cache(ctx);
+  const {textHash} = ctx.load('/support/fhguard/cache.ts');
+  const created = ttlWhenCreated(ctx, \`fh:decision:\${V1.version}:\${textHash(TEXT)}\`);
   await m.cacheDecision(V1.version, TEXT, BLOCKED);
+  assert(created.ttl === -3 || (0 < created.ttl && created.ttl <= 86400), \`the decision key had TTL \${created.ttl} right after the command that created it: set DECISION_TTL_S in that same command\`);
   const got = await m.cachedDecision(V1.version, TEXT);
   assert(got !== null && got.allowed === false && JSON.stringify(got.reasons) === JSON.stringify(BLOCKED.reasons), \`cachedDecision under the same version returned \${JSON.stringify(got)}\`);
   const other = await m.cachedDecision(V2.version, TEXT);
@@ -833,7 +882,9 @@ export async function check_versioned_decision(ctx) {
   assert.equal(keys.length, 1, \`one cached decision left the keys \${JSON.stringify(keys)}\`);
   const ttl = ctx.redis.ttl(keys[0]);
   assert(0 < ttl && ttl <= 86400, \`\${keys[0]} has TTL \${ttl}, expected at most DECISION_TTL_S = 86400\`);
-  ctx.clock.advance(86401);
+  ctx.clock.advance(86_000);
+  assert.notEqual(await m.cachedDecision(V1.version, TEXT), null, 'the cached decision expired within 86000 s: it is cached for DECISION_TTL_S = 86400');
+  ctx.clock.advance(401);
   assert.equal(await m.cachedDecision(V1.version, TEXT), null, 'a cached decision must expire after a day');
 }
 
@@ -876,22 +927,35 @@ import (
 )
 
 var (
-	cacheBg = context.Background()
-	pv1     = store.Policy{Version: "fh-2024-05-21", StopPhrases: []string{"no section 8"}}
-	pv2     = store.Policy{Version: "fh-2024-06-01", StopPhrases: []string{"no section 8", "adults only"}}
-	pv3     = store.Policy{Version: "fh-2024-07-01", StopPhrases: []string{"no section 8", "adults only", "no vouchers"}}
-	blocked = store.Decision{Allowed: false, Tier: "classifier", Score: 0.4, Reasons: []string{"classifier:familial_status"}}
+	hBg      = context.Background()
+	hPV1     = store.Policy{Version: "fh-2024-05-21", StopPhrases: []string{"no section 8"}}
+	hPV2     = store.Policy{Version: "fh-2024-06-01", StopPhrases: []string{"no section 8", "adults only"}}
+	hPV3     = store.Policy{Version: "fh-2024-07-01", StopPhrases: []string{"no section 8", "adults only", "no vouchers"}}
+	hBlocked = store.Decision{Allowed: false, Tier: "classifier", Score: 0.4, Reasons: []string{"classifier:familial_status"}}
 )
 
-const question = "Which blocks have fewer families with kids?"
+const hQuestion = "Which blocks have fewer families with kids?"
 
-func seedPolicies() {
-	store.SavePolicy(cacheBg, pv1)
-	store.SavePolicy(cacheBg, pv2)
+func hSeedPolicies() {
+	store.SavePolicy(hBg, hPV1)
+	store.SavePolicy(hBg, hPV2)
 }
 
-func phrasesOf(ctx *harness.Ctx, version string) []string {
-	p, err := getPolicy(cacheBg, version)
+// hTTLWhenCreated records key's TTL right after the command that created it, as another client would
+// see it; it stays -3 if nothing creates the key.
+func hTTLWhenCreated(ctx *harness.Ctx, key string, ttl *int64) {
+	ctx.Redis.After(key, func() any {
+		if ctx.Redis.Exists(key) == 1 {
+			*ttl = ctx.Redis.TTL(key)
+		} else {
+			hTTLWhenCreated(ctx, key, ttl)
+		}
+		return nil
+	})
+}
+
+func hPhrasesOf(ctx *harness.Ctx, version string) []string {
+	p, err := getPolicy(hBg, version)
 	ctx.NoError(err, "getPolicy(%s) failed", version)
 	if p == nil {
 		return nil
@@ -900,62 +964,88 @@ func phrasesOf(ctx *harness.Ctx, version string) []string {
 }
 
 func CheckVersionedPolicy(ctx *harness.Ctx) {
-	seedPolicies()
-	ctx.Equal(phrasesOf(ctx, pv1.Version), pv1.StopPhrases, "getPolicy(%s)'s stop phrases", pv1.Version)
-	ctx.Equal(phrasesOf(ctx, pv2.Version), pv2.StopPhrases, "getPolicy(%s)'s stop phrases (the policy cached for %s must not answer for another version: key the cache by version)", pv2.Version, pv1.Version)
-	ttl := ctx.Redis.TTL("fh:policy:" + pv1.Version)
-	ctx.Assert(0 < ttl && ttl <= 3600, "fh:policy:%s has TTL %d, expected at most an hour (keys: %q)", pv1.Version, ttl, ctx.Redis.Keys("fh:policy*"))
-	p, _ := getPolicy(cacheBg, "fh-2023-01-01")
+	hSeedPolicies()
+	created := int64(-3)
+	hTTLWhenCreated(ctx, "fh:policy:"+hPV1.Version, &created)
+	ctx.Equal(hPhrasesOf(ctx, hPV1.Version), hPV1.StopPhrases, "getPolicy(%s)'s stop phrases", hPV1.Version)
+	ctx.Equal(hPhrasesOf(ctx, hPV2.Version), hPV2.StopPhrases, "getPolicy(%s)'s stop phrases (the policy cached for %s must not answer for another version: key the cache by version)", hPV2.Version, hPV1.Version)
+	ttl := ctx.Redis.TTL("fh:policy:" + hPV1.Version)
+	ctx.Assert(0 < ttl && ttl <= 3600, "fh:policy:%s has TTL %d, expected at most an hour (keys: %q)", hPV1.Version, ttl, ctx.Redis.Keys("fh:policy*"))
+	ctx.Assert(0 < created && created <= 3600, "fh:policy:%s had TTL %d right after the command that created it: set the TTL in that same command, or a crash in between leaves a policy cached forever", hPV1.Version, created)
+	p, _ := getPolicy(hBg, "fh-2023-01-01")
 	ctx.Assert(p == nil, "a version no store holds must come back nil, got %+v", p)
-	ctx.Clock.Advance(3601)
-	_, ok := ctx.Redis.Get("fh:policy:" + pv1.Version)
+	ctx.Clock.Advance(3590)
+	ctx.Equal(ctx.Redis.Exists("fh:policy:"+hPV1.Version), int64(1), "the cached policy must still be cached 3590 s later (POLICY_TTL_S = 3600); EXISTS")
+	ctx.Clock.Advance(11)
+	_, ok := ctx.Redis.Get("fh:policy:" + hPV1.Version)
 	ctx.Assert(!ok, "the cached policy must expire after an hour")
-	ctx.Equal(phrasesOf(ctx, pv1.Version), pv1.StopPhrases, "after expiry the policy is loaded from the store again; its stop phrases")
+	ctx.Equal(hPhrasesOf(ctx, hPV1.Version), hPV1.StopPhrases, "after expiry the policy is loaded from the store again; its stop phrases")
 }
 
 func CheckAtomicPublish(ctx *harness.Ctx) {
-	seedPolicies()
-	ctx.NoError(publish(cacheBg, pv2), "publish(%s) failed", pv2.Version)
-	ctx.Equal(activeVersion(cacheBg), pv2.Version, "the active version after publishing %s", pv2.Version)
-	key := "fh:policy:" + pv3.Version
+	hSeedPolicies()
+	ctx.NoError(publish(hBg, hPV2), "publish(%s) failed", hPV2.Version)
+	ctx.Equal(activeVersion(hBg), hPV2.Version, "the active version after publishing %s", hPV2.Version)
+	key := "fh:policy:" + hPV3.Version
 	var active, cached string
 	var hasCache, stored bool
+	var entryActive string
+	entryTTL := int64(-3)
+	entryWritten := false
+	ctx.Redis.After(key, func() any {
+		if ctx.Redis.Exists(key) != 1 {
+			return nil // a read of the missing entry, not the publish's write
+		}
+		entryWritten = true
+		entryActive, _ = ctx.Redis.Get("fh:policy:active")
+		entryTTL = ctx.Redis.TTL(key)
+		return nil
+	})
 	probe := ctx.Redis.After("fh:policy:active", func() any {
 		active, _ = ctx.Redis.Get("fh:policy:active")
 		cached, hasCache = ctx.Redis.Get(key)
-		stored = ctx.Redis.Exists("fhstore:policy:"+pv3.Version) == 1
+		stored = ctx.Redis.Exists("fhstore:policy:"+hPV3.Version) == 1
 		return nil
 	})
-	ctx.NoError(publish(cacheBg, pv3), "publish(%s) failed", pv3.Version)
+	ctx.NoError(publish(hBg, hPV3), "publish(%s) failed", hPV3.Version)
+	ctx.Assert(!entryWritten || entryActive == hPV3.Version, "%s was written while fh:policy:active still named %q: move the cache entry and the pointer in one MULTI/EXEC", key, entryActive)
+	ctx.Assert(!entryWritten || (0 < entryTTL && entryTTL <= 3600), "%s had TTL %d right after publish wrote it, expected at most an hour set in the same command", key, entryTTL)
 	ctx.Assert(probe.Fired, "publish never touched fh:policy:active")
-	ctx.Equal(active, pv3.Version, "fh:policy:active right after the publish wrote it")
-	ctx.Assert(stored, "fh:policy:active pointed at %s before the store held that version: a reader in between finds no policy", pv3.Version)
-	ctx.Assert(hasCache && cached != "", "fh:policy:active pointed at %s while %s was missing: move the pointer and the cache entry in one MULTI/EXEC", pv3.Version, key)
-	ctx.Equal(phrasesOf(ctx, activeVersion(cacheBg)), pv3.StopPhrases, "a reader after the publish; the stop phrases")
+	ctx.Equal(active, hPV3.Version, "fh:policy:active right after the publish wrote it")
+	ctx.Assert(stored, "fh:policy:active pointed at %s before the store held that version: a reader in between finds no policy", hPV3.Version)
+	ctx.Assert(hasCache && cached != "", "fh:policy:active pointed at %s while %s was missing: move the pointer and the cache entry in one MULTI/EXEC", hPV3.Version, key)
+	ctx.Equal(hPhrasesOf(ctx, activeVersion(hBg)), hPV3.StopPhrases, "a reader after the publish; the stop phrases")
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= 3600, "%s has TTL %d, expected at most an hour", key, ttl)
 }
 
 func CheckVersionedDecision(ctx *harness.Ctx) {
-	seedPolicies()
-	ctx.NoError(cacheDecision(cacheBg, pv1.Version, question, blocked), "cacheDecision failed")
-	got, err := cachedDecision(cacheBg, pv1.Version, question)
+	hSeedPolicies()
+	sum := sha256.Sum256([]byte(hQuestion))
+	created := int64(-3)
+	hTTLWhenCreated(ctx, "fh:decision:"+hPV1.Version+":"+hex.EncodeToString(sum[:]), &created)
+	ctx.NoError(cacheDecision(hBg, hPV1.Version, hQuestion, hBlocked), "cacheDecision failed")
+	ctx.Assert(created == -3 || (0 < created && created <= 86400), "the decision key had TTL %d right after the command that created it: set the day's TTL in that same command", created)
+	got, err := cachedDecision(hBg, hPV1.Version, hQuestion)
 	ctx.NoError(err, "cachedDecision failed")
 	ctx.Assert(got != nil && !got.Allowed && len(got.Reasons) == 1, "cachedDecision under the same version returned %+v", got)
-	other, _ := cachedDecision(cacheBg, pv2.Version, question)
-	ctx.Assert(other == nil, "a decision cached under %s was served under %s: %+v. The key must carry the policy version", pv1.Version, pv2.Version, other)
+	other, _ := cachedDecision(hBg, hPV2.Version, hQuestion)
+	ctx.Assert(other == nil, "a decision cached under %s was served under %s: %+v. The key must carry the policy version", hPV1.Version, hPV2.Version, other)
 	keys := ctx.Redis.Keys("fh:decision:*")
 	ctx.Equal(len(keys), 1, "one cached decision; the keys %q", keys)
 	ttl := ctx.Redis.TTL(keys[0])
 	ctx.Assert(0 < ttl && ttl <= 86400, "%s has TTL %d, expected at most a day", keys[0], ttl)
-	ctx.Clock.Advance(86401)
-	gone, _ := cachedDecision(cacheBg, pv1.Version, question)
+	ctx.Clock.Advance(86000)
+	kept, _ := cachedDecision(hBg, hPV1.Version, hQuestion)
+	ctx.Assert(kept != nil, "the cached decision expired within 86000 s: it is cached for a day")
+	ctx.Clock.Advance(401)
+	gone, _ := cachedDecision(hBg, hPV1.Version, hQuestion)
 	ctx.Assert(gone == nil, "a cached decision must expire after a day")
 }
 
 func CheckHashNotText(ctx *harness.Ctx) {
-	seedPolicies()
-	cacheDecision(cacheBg, pv1.Version, question, blocked)
+	hSeedPolicies()
+	cacheDecision(hBg, hPV1.Version, hQuestion, hBlocked)
 	var leaked []string
 	for _, k := range ctx.Redis.Keys("*") {
 		if strings.Contains(k, "families") {
@@ -963,30 +1053,30 @@ func CheckHashNotText(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(len(leaked) == 0, "the user's question is a Redis key name: %q", leaked)
-	sum := sha256.Sum256([]byte(question))
-	expected := "fh:decision:" + pv1.Version + ":" + hex.EncodeToString(sum[:])
+	sum := sha256.Sum256([]byte(hQuestion))
+	expected := "fh:decision:" + hPV1.Version + ":" + hex.EncodeToString(sum[:])
 	ctx.Equal(ctx.Redis.Exists(expected), int64(1), "the decision under %s (Redis holds %q)", expected, ctx.Redis.Keys("fh:decision:*"))
-	got, _ := cachedDecision(cacheBg, pv1.Version, question)
-	ctx.Assert(got != nil && got.Tier == blocked.Tier && got.Score == blocked.Score, "the cached decision must read back unchanged, got %+v", got)
+	got, _ := cachedDecision(hBg, hPV1.Version, hQuestion)
+	ctx.Assert(got != nil && got.Tier == hBlocked.Tier && got.Score == hBlocked.Score, "the cached decision must read back unchanged, got %+v", got)
 }
 
-func strike(ctx *harness.Ctx, conversationID string) int64 {
-	n, err := recordStrike(cacheBg, conversationID)
+func hStrike(ctx *harness.Ctx, conversationID string) int64 {
+	n, err := recordStrike(hBg, conversationID)
 	ctx.NoError(err, "recordStrike(%s) failed", conversationID)
 	return n
 }
 
 func CheckStrikesExpire(ctx *harness.Ctx) {
-	seedPolicies()
-	counts := []int64{strike(ctx, "c-1"), strike(ctx, "c-1"), strike(ctx, "c-1")}
+	hSeedPolicies()
+	counts := []int64{hStrike(ctx, "c-1"), hStrike(ctx, "c-1"), hStrike(ctx, "c-1")}
 	ctx.Equal(counts, []int64{1, 2, 3}, "three strikes counted")
 	ttl := ctx.Redis.TTL("fh:strikes:c-1")
 	ctx.Assert(0 < ttl && ttl <= 86400, "fh:strikes:c-1 has TTL %d: a conversation stays flagged forever. Expire it a day after the first strike", ttl)
 	ctx.Clock.Advance(80000)
-	ctx.Equal(strike(ctx, "c-1"), int64(4), "a strike within the day adds to the count")
+	ctx.Equal(hStrike(ctx, "c-1"), int64(4), "a strike within the day adds to the count")
 	ctx.Clock.Advance(7000)
-	ctx.Equal(strike(ctx, "c-1"), int64(1), "87000 s after the first strike the window must have closed (a later strike must not extend it); the count")
-	ctx.Equal(strike(ctx, "c-2"), int64(1), "strikes are counted per conversation; c-2's first")
+	ctx.Equal(hStrike(ctx, "c-1"), int64(1), "87000 s after the first strike the window must have closed (a later strike must not extend it); the count")
+	ctx.Equal(hStrike(ctx, "c-2"), int64(1), "strikes are counted per conversation; c-2's first")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1003,24 +1093,36 @@ func CheckStrikesExpire(ctx *harness.Ctx) {
 
 namespace {
 
-const store::Policy kV1{"fh-2024-05-21", {"no section 8"}};
-const store::Policy kV2{"fh-2024-06-01", {"no section 8", "adults only"}};
-const store::Policy kV3{"fh-2024-07-01", {"no section 8", "adults only", "no vouchers"}};
-const std::string kQuestion = "Which blocks have fewer families with kids?";
-const store::Decision kBlocked{false, "classifier", 0.4, {"classifier:familial_status"}};
+const store::Policy kHV1{"fh-2024-05-21", {"no section 8"}};
+const store::Policy kHV2{"fh-2024-06-01", {"no section 8", "adults only"}};
+const store::Policy kHV3{"fh-2024-07-01", {"no section 8", "adults only", "no vouchers"}};
+const std::string kHQuestion = "Which blocks have fewer families with kids?";
+const store::Decision kHBlocked{false, "classifier", 0.4, {"classifier:familial_status"}};
 
-void seedPolicies() {
-  store::savePolicy(kV1);
-  store::savePolicy(kV2);
+void hSeedPolicies() {
+  store::savePolicy(kHV1);
+  store::savePolicy(kHV2);
 }
 
-std::optional<std::vector<std::string>> phrasesOf(const std::string& version) {
+// Records key's TTL right after the command that created it, as another client would see it; it stays
+// -3 if nothing creates the key.
+void hTTLWhenCreated(harness::Ctx& ctx, const std::string& key, std::shared_ptr<long long> ttl) {
+  ctx.Redis.After(key, [&ctx, key, ttl] {
+    if (ctx.Redis.Exists(key) == 1) {
+      *ttl = ctx.Redis.TTL(key);
+    } else {
+      hTTLWhenCreated(ctx, key, ttl);
+    }
+  });
+}
+
+std::optional<std::vector<std::string>> hPhrasesOf(const std::string& version) {
   const auto p = getPolicy(version);
   if (!p) return std::nullopt;
   return p->stop_phrases;
 }
 
-struct Snapshot {
+struct HSnapshot {
   bool fired = false;
   std::optional<std::string> active;
   std::optional<std::string> cached;
@@ -1030,70 +1132,90 @@ struct Snapshot {
 }  // namespace
 
 void CheckVersionedPolicy(harness::Ctx& ctx) {
-  seedPolicies();
-  ctx.Equal(phrasesOf(kV1.version), std::optional<std::vector<std::string>>(kV1.stop_phrases), "getPolicy(%s)'s stop phrases", kV1.version);
-  ctx.Equal(phrasesOf(kV2.version), std::optional<std::vector<std::string>>(kV2.stop_phrases), "getPolicy(%s)'s stop phrases (the policy cached for %s must not answer for another version: key the cache by version)", kV2.version, kV1.version);
-  const long long ttl = ctx.Redis.TTL("fh:policy:" + kV1.version);
-  ctx.Assert(0 < ttl && ttl <= 3600, "fh:policy:%s has TTL %d, expected at most an hour (keys: %q)", kV1.version, ttl, ctx.Redis.Keys("fh:policy*"));
+  hSeedPolicies();
+  auto created = std::make_shared<long long>(-3);
+  hTTLWhenCreated(ctx, "fh:policy:" + kHV1.version, created);
+  ctx.Equal(hPhrasesOf(kHV1.version), std::optional<std::vector<std::string>>(kHV1.stop_phrases), "getPolicy(%s)'s stop phrases", kHV1.version);
+  ctx.Equal(hPhrasesOf(kHV2.version), std::optional<std::vector<std::string>>(kHV2.stop_phrases), "getPolicy(%s)'s stop phrases (the policy cached for %s must not answer for another version: key the cache by version)", kHV2.version, kHV1.version);
+  const long long ttl = ctx.Redis.TTL("fh:policy:" + kHV1.version);
+  ctx.Assert(0 < ttl && ttl <= 3600, "fh:policy:%s has TTL %d, expected at most an hour (keys: %q)", kHV1.version, ttl, ctx.Redis.Keys("fh:policy*"));
+  ctx.Assert(0 < *created && *created <= 3600, "fh:policy:%s had TTL %d right after the command that created it: set the TTL in that same command, or a crash in between leaves a policy cached forever", kHV1.version, *created);
   ctx.Assert(!getPolicy("fh-2023-01-01"), "a version no store holds must come back empty");
-  ctx.Clock.Advance(3601);
-  ctx.Assert(!ctx.Redis.Get("fh:policy:" + kV1.version), "the cached policy must expire after an hour");
-  ctx.Equal(phrasesOf(kV1.version), std::optional<std::vector<std::string>>(kV1.stop_phrases), "after expiry the policy is loaded from the store again; its stop phrases");
+  ctx.Clock.Advance(3590);
+  ctx.Equal(ctx.Redis.Exists("fh:policy:" + kHV1.version), 1, "the cached policy must still be cached 3590 s later (POLICY_TTL_S = 3600); EXISTS");
+  ctx.Clock.Advance(11);
+  ctx.Assert(!ctx.Redis.Get("fh:policy:" + kHV1.version), "the cached policy must expire after an hour");
+  ctx.Equal(hPhrasesOf(kHV1.version), std::optional<std::vector<std::string>>(kHV1.stop_phrases), "after expiry the policy is loaded from the store again; its stop phrases");
 }
 
 void CheckAtomicPublish(harness::Ctx& ctx) {
-  seedPolicies();
-  publish(kV2);
-  ctx.Equal(activeVersion(), std::optional<std::string>(kV2.version), "the active version after publishing %s", kV2.version);
-  const std::string key = "fh:policy:" + kV3.version;
-  auto seen = std::make_shared<Snapshot>();
+  hSeedPolicies();
+  publish(kHV2);
+  ctx.Equal(activeVersion(), std::optional<std::string>(kHV2.version), "the active version after publishing %s", kHV2.version);
+  const std::string key = "fh:policy:" + kHV3.version;
+  auto entry = std::make_shared<HSnapshot>();
+  auto entryTtl = std::make_shared<long long>(-3);
+  ctx.Redis.After(key, [&ctx, entry, entryTtl, key] {
+    if (ctx.Redis.Exists(key) != 1) return;  // a read of the missing entry, not the publish's write
+    entry->fired = true;
+    entry->active = ctx.Redis.Get("fh:policy:active");
+    *entryTtl = ctx.Redis.TTL(key);
+  });
+  auto seen = std::make_shared<HSnapshot>();
   ctx.Redis.After("fh:policy:active", [&ctx, seen, key] {
     seen->fired = true;
     seen->active = ctx.Redis.Get("fh:policy:active");
     seen->cached = ctx.Redis.Get(key);
-    seen->stored = ctx.Redis.Exists("fhstore:policy:" + kV3.version) == 1;
+    seen->stored = ctx.Redis.Exists("fhstore:policy:" + kHV3.version) == 1;
   });
-  publish(kV3);
+  publish(kHV3);
+  ctx.Assert(!entry->fired || entry->active == std::optional<std::string>(kHV3.version), "%s was written while fh:policy:active still named %s: move the cache entry and the pointer in one MULTI/EXEC", key, entry->active.value_or("nothing"));
+  ctx.Assert(!entry->fired || (0 < *entryTtl && *entryTtl <= 3600), "%s had TTL %d right after publish wrote it, expected at most an hour set in the same command", key, *entryTtl);
   ctx.Assert(seen->fired, "publish never touched fh:policy:active");
-  ctx.Equal(seen->active, std::optional<std::string>(kV3.version), "fh:policy:active right after the publish wrote it");
-  ctx.Assert(seen->stored, "fh:policy:active pointed at %s before the store held that version: a reader in between finds no policy", kV3.version);
-  ctx.Assert(seen->cached.has_value(), "fh:policy:active pointed at %s while %s was missing: move the pointer and the cache entry in one MULTI/EXEC", kV3.version, key);
-  ctx.Equal(phrasesOf(activeVersion().value_or("")), std::optional<std::vector<std::string>>(kV3.stop_phrases), "a reader after the publish; the stop phrases");
+  ctx.Equal(seen->active, std::optional<std::string>(kHV3.version), "fh:policy:active right after the publish wrote it");
+  ctx.Assert(seen->stored, "fh:policy:active pointed at %s before the store held that version: a reader in between finds no policy", kHV3.version);
+  ctx.Assert(seen->cached.has_value(), "fh:policy:active pointed at %s while %s was missing: move the pointer and the cache entry in one MULTI/EXEC", kHV3.version, key);
+  ctx.Equal(hPhrasesOf(activeVersion().value_or("")), std::optional<std::vector<std::string>>(kHV3.stop_phrases), "a reader after the publish; the stop phrases");
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= 3600, "%s has TTL %d, expected at most an hour", key, ttl);
 }
 
 void CheckVersionedDecision(harness::Ctx& ctx) {
-  seedPolicies();
-  cacheDecision(kV1.version, kQuestion, kBlocked);
-  const auto got = cachedDecision(kV1.version, kQuestion);
-  ctx.Assert(got && !got->allowed && got->reasons == kBlocked.reasons, "cachedDecision under the same version came back %s", got ? nlohmann::json(*got).dump() : "empty");
-  const auto other = cachedDecision(kV2.version, kQuestion);
-  ctx.Assert(!other, "a decision cached under %s was served under %s: the key must carry the policy version", kV1.version, kV2.version);
+  hSeedPolicies();
+  auto created = std::make_shared<long long>(-3);
+  hTTLWhenCreated(ctx, "fh:decision:" + kHV1.version + ":" + sha256_hex(kHQuestion), created);
+  cacheDecision(kHV1.version, kHQuestion, kHBlocked);
+  ctx.Assert(*created == -3 || (0 < *created && *created <= 86400), "the decision key had TTL %d right after the command that created it: set the day's TTL in that same command", *created);
+  const auto got = cachedDecision(kHV1.version, kHQuestion);
+  ctx.Assert(got && !got->allowed && got->reasons == kHBlocked.reasons, "cachedDecision under the same version came back %s", got ? nlohmann::json(*got).dump() : "empty");
+  const auto other = cachedDecision(kHV2.version, kHQuestion);
+  ctx.Assert(!other, "a decision cached under %s was served under %s: the key must carry the policy version", kHV1.version, kHV2.version);
   const auto keys = ctx.Redis.Keys("fh:decision:*");
   ctx.Equal(keys.size(), 1, "one cached decision; the keys %q", keys);
   const long long ttl = ctx.Redis.TTL(keys[0]);
   ctx.Assert(0 < ttl && ttl <= 86400, "%s has TTL %d, expected at most a day", keys[0], ttl);
-  ctx.Clock.Advance(86401);
-  ctx.Assert(!cachedDecision(kV1.version, kQuestion), "a cached decision must expire after a day");
+  ctx.Clock.Advance(86000);
+  ctx.Assert(cachedDecision(kHV1.version, kHQuestion).has_value(), "the cached decision expired within 86000 s: it is cached for a day");
+  ctx.Clock.Advance(401);
+  ctx.Assert(!cachedDecision(kHV1.version, kHQuestion), "a cached decision must expire after a day");
 }
 
 void CheckHashNotText(harness::Ctx& ctx) {
-  seedPolicies();
-  cacheDecision(kV1.version, kQuestion, kBlocked);
+  hSeedPolicies();
+  cacheDecision(kHV1.version, kHQuestion, kHBlocked);
   std::vector<std::string> leaked;
   for (const auto& k : ctx.Redis.Keys("*")) {
     if (k.find("families") != std::string::npos) leaked.push_back(k);
   }
   ctx.Assert(leaked.empty(), "the user's question is a Redis key name: %q", leaked);
-  const std::string expected = "fh:decision:" + kV1.version + ":" + sha256_hex(kQuestion);
+  const std::string expected = "fh:decision:" + kHV1.version + ":" + sha256_hex(kHQuestion);
   ctx.Equal(ctx.Redis.Exists(expected), 1, "the decision under %s (Redis holds %q)", expected, ctx.Redis.Keys("fh:decision:*"));
-  const auto got = cachedDecision(kV1.version, kQuestion);
-  ctx.Assert(got && got->tier == kBlocked.tier && got->score == kBlocked.score, "the cached decision must read back unchanged");
+  const auto got = cachedDecision(kHV1.version, kHQuestion);
+  ctx.Assert(got && got->tier == kHBlocked.tier && got->score == kHBlocked.score, "the cached decision must read back unchanged");
 }
 
 void CheckStrikesExpire(harness::Ctx& ctx) {
-  seedPolicies();
+  hSeedPolicies();
   std::vector<long long> counts;
   for (int i = 0; i < 3; i++) counts.push_back(recordStrike("c-1"));
   ctx.Equal(counts, std::vector<long long>{1, 2, 3}, "three strikes counted");

@@ -86,7 +86,7 @@ times looks like twenty users.
       id: 'regenerate-once',
       title: 'Regenerates once under the FHA instructions and evaluates the new answer',
       detail:
-        'A blocked answer is regenerated at most once (`MAX_REGENERATIONS` = 1) with `FHA_INSTRUCTIONS` as the model’s instructions, and the regenerated answer is evaluated before it can go back. The starter never regenerates.',
+        'A blocked answer is regenerated at most once (`MAX_REGENERATIONS` = 1), asking the same question with `FHA_INSTRUCTIONS` as the model’s instructions, and the regenerated answer is evaluated before it can go back. The starter never regenerates.',
       match: {
         python: {
           all: [/MAX_REGENERATIONS\s*=\s*1\b/, /range\(MAX_REGENERATIONS\)/],
@@ -114,7 +114,7 @@ times looks like twenty users.
       id: 'strikes-escalate',
       title: 'Counts strikes and escalates the third, once',
       detail:
-        'Every blocked turn records a strike; the strike that reaches `REVIEW_AFTER_STRIKES` = 3 enqueues the conversation for human review once, and blocked turns from then on answer `escalated: true`. The starter keeps no count.',
+        'Every blocked turn records one strike, and a turn answered after a regeneration records none; the strike that reaches `REVIEW_AFTER_STRIKES` = 3 enqueues the conversation for human review once, and blocked turns from then on answer `escalated: true`. The starter keeps no count.',
       match: {
         python: {all: [/REVIEW_AFTER_STRIKES\s*=\s*3\b/, /cache\.record_strike\(/, /store\.enqueue_review\(/]},
         typescript: {all: [/REVIEW_AFTER_STRIKES\s*=\s*3\b/, /recordStrike\(/, /enqueueReview\(/]},
@@ -715,6 +715,7 @@ async def check_regenerate_once(ctx):
         calls = ctx.grpc.calls_to("Complete")
         assert len(calls) == 2, f"a blocked answer led to {len(calls)} model call(s), expected the first and one regeneration"
         instructions = getattr(m, "FHA_INSTRUCTIONS", None)
+        assert [call.request.question for call in calls] == [STEER_Q, STEER_Q], f"both model calls must carry the user's question unchanged, they carried {[call.request.question for call in calls]}: the instructions go in the instructions field"
         assert calls[0].request.instructions == "" and instructions and calls[1].request.instructions == instructions, f"the regeneration must carry FHA_INSTRUCTIONS, the calls carried {[c.request.instructions for c in calls]}"
         assert body.get("outcome") == "answered" and body.get("answer") == COMPLIANT_A, f"the compliant regenerated answer must go back, got {body}"
         stubborn = (await _turn(c, STUBBORN_Q, "c-2")).json()
@@ -735,6 +736,9 @@ async def check_strikes_escalate(ctx):
         assert len(store.review_queue()) == 1, f"the fourth strike enqueued the conversation again: {store.review_queue()}"
         answered = (await _turn(c, NEUTRAL_Q, "c-9")).json()
         assert answered.get("outcome") == "answered" and ctx.redis.get("fh:strikes:c-9") == "4", "an answered turn must not add a strike"
+        regenerated = (await _turn(c, STEER_Q, "c-12")).json()
+        assert regenerated.get("outcome") == "answered", f"a turn whose regenerated answer is compliant answered {regenerated}"
+        assert ctx.redis.get("fh:strikes:c-12") is None, f"a turn answered after one regeneration left fh:strikes:c-12 = {ctx.redis.get('fh:strikes:c-12')!r}: only a blocked turn records a strike"
         await _turn(c, STUBBORN_Q, "c-11")
     assert ctx.redis.get("fh:strikes:c-11") == "1", f"a turn blocked on the output must count a strike, fh:strikes:c-11 is {ctx.redis.get('fh:strikes:c-11')!r}"
 `,
@@ -811,6 +815,8 @@ export async function check_regenerate_once(ctx) {
   const body = (await turn(c, STEER_Q)).json();
   const calls = ctx.grpc.callsTo('Complete');
   assert.equal(calls.length, 2, \`a blocked answer led to \${calls.length} model call(s), expected the first and one regeneration\`);
+  const questions = calls.map(call => call.request.question);
+  assert.deepStrictEqual(questions, [STEER_Q, STEER_Q], \`both model calls must carry the user's question unchanged, they carried \${JSON.stringify(questions)}: the instructions go in the instructions field\`);
   const sent = calls.map(call => call.request.instructions);
   assert(sent[0] === '' && m.FHA_INSTRUCTIONS && sent[1] === m.FHA_INSTRUCTIONS, \`the regeneration must carry FHA_INSTRUCTIONS, the calls carried \${JSON.stringify(sent)}\`);
   assert(body.outcome === 'answered' && body.answer === COMPLIANT_A, \`the compliant regenerated answer must go back, got \${JSON.stringify(body)}\`);
@@ -832,6 +838,9 @@ export async function check_strikes_escalate(ctx) {
   assert.equal((await store.reviewQueue()).length, 1, 'the fourth strike must not enqueue the conversation again');
   const answered = (await turn(c, NEUTRAL_Q, 'c-9')).json();
   assert(answered.outcome === 'answered' && ctx.redis.get('fh:strikes:c-9') === '4', 'an answered turn must not add a strike');
+  const regenerated = (await turn(c, STEER_Q, 'c-12')).json();
+  assert.equal(regenerated.outcome, 'answered', \`a turn whose regenerated answer is compliant answered \${JSON.stringify(regenerated)}\`);
+  assert.equal(ctx.redis.get('fh:strikes:c-12'), null, \`a turn answered after one regeneration left fh:strikes:c-12 = \${JSON.stringify(ctx.redis.get('fh:strikes:c-12'))}: only a blocked turn records a strike\`);
   await turn(c, STUBBORN_Q, 'c-11');
   assert.equal(ctx.redis.get('fh:strikes:c-11'), '1', 'a turn blocked on the output must count a strike');
 }
@@ -851,16 +860,16 @@ import (
 )
 
 const (
-	neutralQ   = "What do two-bedroom homes near light rail cost?"
-	neutralA   = "Two-bedroom homes near light rail start around $750k."
-	steerQ     = "Which neighborhood would suit my family?"
-	stubbornQ  = "Which neighborhood would suit my family? Be specific about the people."
-	blockedQ   = "Which buildings have no section 8 tenants?"
-	steeringA  = "Beacon Hill is mostly Latino families, so you would fit right in."
-	compliantA = "Columbia City and Rainier Beach have three-bedroom homes in your budget near light rail."
+	hNeutralQ   = "What do two-bedroom homes near light rail cost?"
+	hNeutralA   = "Two-bedroom homes near light rail start around $750k."
+	hSteerQ     = "Which neighborhood would suit my family?"
+	hStubbornQ  = "Which neighborhood would suit my family? Be specific about the people."
+	hBlockedQ   = "Which buildings have no section 8 tenants?"
+	hSteeringA  = "Beacon Hill is mostly Latino families, so you would fit right in."
+	hCompliantA = "Columbia City and Rainier Beach have three-bedroom homes in your budget near light rail."
 )
 
-var turnPolicy = store.Policy{Version: "fh-2024-05-21", StopPhrases: []string{"no section 8"}}
+var hTurnPolicy = store.Policy{Version: "fh-2024-05-21", StopPhrases: []string{"no section 8"}}
 
 type classifierPeer struct {
 	pb.UnimplementedClassifierServer
@@ -889,25 +898,25 @@ type assistantPeer struct {
 func (assistantPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	q := req.GetQuestion()
 	if !strings.Contains(q, "neighborhood") {
-		return &pb.CompleteReply{Answer: neutralA}, nil
+		return &pb.CompleteReply{Answer: hNeutralA}, nil
 	}
 	if req.GetInstructions() != "" && !strings.Contains(q, "about the people") {
-		return &pb.CompleteReply{Answer: compliantA}, nil
+		return &pb.CompleteReply{Answer: hCompliantA}, nil
 	}
-	return &pb.CompleteReply{Answer: steeringA}, nil
+	return &pb.CompleteReply{Answer: hSteeringA}, nil
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	pb.RegisterClassifierServer(ctx.GRPC.Server("classifier:9000"), classifierPeer{})
 	pb.RegisterJudgeServer(ctx.GRPC.Server("judge:9000"), judgePeer{})
 	pb.RegisterAssistantServer(ctx.GRPC.Server("model:9000"), assistantPeer{})
-	cache.Publish(context.Background(), turnPolicy)
+	cache.Publish(context.Background(), hTurnPolicy)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type turnReply struct {
+type hTurnReply struct {
 	Answer        string   \`json:"answer"\`
 	Outcome       string   \`json:"outcome"\`
 	Reasons       []string \`json:"reasons"\`
@@ -915,70 +924,76 @@ type turnReply struct {
 	PolicyVersion string   \`json:"policy_version"\`
 }
 
-func ask(ctx *harness.Ctx, c *harness.HTTP, question, conversationID string) (turnReply, string) {
+func hAsk(ctx *harness.Ctx, c *harness.HTTP, question, conversationID string) (hTurnReply, string) {
 	r := c.Post("/v1/turn", map[string]string{"conversation_id": conversationID, "question": question})
 	ctx.Equal(r.Status, 200, "POST /v1/turn (%s)", r.Text())
-	var out turnReply
+	var out hTurnReply
 	r.Decode(&out)
 	return out, r.Text()
 }
 
 func CheckTurnRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	got, text := ask(ctx, c, neutralQ, "c-1")
-	ctx.Assert(got.Outcome == "answered" && got.Answer == neutralA, "a compliant question must be answered with the model's answer, got %s", text)
-	ctx.Equal(got.PolicyVersion, turnPolicy.Version, "the turn must name the active policy; policy_version")
+	c := hAPI(ctx)
+	got, text := hAsk(ctx, c, hNeutralQ, "c-1")
+	ctx.Assert(got.Outcome == "answered" && got.Answer == hNeutralA, "a compliant question must be answered with the model's answer, got %s", text)
+	ctx.Equal(got.PolicyVersion, hTurnPolicy.Version, "the turn must name the active policy; policy_version")
 }
 
 func CheckInputGuardFirst(ctx *harness.Ctx) {
-	c := api(ctx)
-	got, _ := ask(ctx, c, blockedQ, "c-1")
+	c := hAPI(ctx)
+	got, _ := hAsk(ctx, c, hBlockedQ, "c-1")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 0, "the model must not be asked a question the guard blocks (evaluate the question before any model call); the Complete calls")
 	ctx.Equal(got.Outcome, "blocked_input", "a question the stop list blocks; the outcome")
 	ctx.Equal(got.Answer, fallbackMessage, "a blocked question must answer fallbackMessage; the answer")
 }
 
 func CheckFallbackNotText(ctx *harness.Ctx) {
-	c := api(ctx)
-	got, text := ask(ctx, c, stubbornQ, "c-1")
+	c := hAPI(ctx)
+	got, text := hAsk(ctx, c, hStubbornQ, "c-1")
 	ctx.Assert(!strings.Contains(text, "Latino"), "the blocked answer reached the user: %q. A blocked turn answers the fallback, nothing of the model's text", got.Answer)
 	ctx.Equal(got.Outcome, "blocked_output", "a turn whose answers stay blocked; the outcome")
 	ctx.Equal(got.Answer, fallbackMessage, "a blocked turn must answer fallbackMessage; the answer")
 }
 
 func CheckRegenerateOnce(ctx *harness.Ctx) {
-	c := api(ctx)
-	got, text := ask(ctx, c, steerQ, "c-1")
+	c := hAPI(ctx)
+	got, text := hAsk(ctx, c, hSteerQ, "c-1")
 	calls := ctx.GRPC.CallsTo("Complete", "")
 	ctx.Equal(len(calls), 2, "a blocked answer must lead to the first call and one regeneration; the model calls")
-	var sent []string
+	var sent, questions []string
 	for _, call := range calls {
 		sent = append(sent, call.Request.(*pb.CompleteRequest).GetInstructions())
+		questions = append(questions, call.Request.(*pb.CompleteRequest).GetQuestion())
 	}
+	ctx.Equal(questions, []string{hSteerQ, hSteerQ}, "both model calls must carry the user's question unchanged (the instructions go in the instructions field); the questions sent")
 	ctx.Equal(sent, []string{"", fhaInstructions}, "the regeneration must carry fhaInstructions; the instructions sent")
-	ctx.Assert(got.Outcome == "answered" && got.Answer == compliantA, "the compliant regenerated answer must go back, got %s", text)
-	stubborn, stubbornText := ask(ctx, c, stubbornQ, "c-2")
+	ctx.Assert(got.Outcome == "answered" && got.Answer == hCompliantA, "the compliant regenerated answer must go back, got %s", text)
+	stubborn, stubbornText := hAsk(ctx, c, hStubbornQ, "c-2")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 4, "a turn whose regeneration is blocked too must make 2 model calls (regenerate at most once); the calls after both turns")
 	ctx.Assert(stubborn.Outcome == "blocked_output", "a regenerated answer that still steers went back as %s: evaluate the regenerated answer before returning it", stubbornText)
 }
 
 func CheckStrikesEscalate(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	var escalated []bool
 	for i := 0; i < 3; i++ {
-		got, _ := ask(ctx, c, blockedQ, "c-9")
+		got, _ := hAsk(ctx, c, hBlockedQ, "c-9")
 		escalated = append(escalated, got.Escalated)
 	}
 	ctx.Equal(escalated, []bool{false, false, true}, "three blocked turns; escalated")
 	bg := context.Background()
 	ctx.Equal(store.ReviewQueue(bg), []store.ReviewItem{{ConversationID: "c-9", Strikes: 3}}, "the review queue must hold c-9 once with 3 strikes")
-	fourth, text := ask(ctx, c, blockedQ, "c-9")
+	fourth, text := hAsk(ctx, c, hBlockedQ, "c-9")
 	ctx.Assert(fourth.Escalated, "a blocked turn after the third strike answered %s", text)
 	ctx.Equal(len(store.ReviewQueue(bg)), 1, "the fourth strike must not enqueue the conversation again; the queue length")
-	answered, _ := ask(ctx, c, neutralQ, "c-9")
+	answered, _ := hAsk(ctx, c, hNeutralQ, "c-9")
 	strikes, _ := ctx.Redis.Get("fh:strikes:c-9")
 	ctx.Assert(answered.Outcome == "answered" && strikes == "4", "an answered turn must not add a strike (fh:strikes:c-9 is %q)", strikes)
-	ask(ctx, c, stubbornQ, "c-11")
+	regenerated, regeneratedText := hAsk(ctx, c, hSteerQ, "c-12")
+	ctx.Equal(regenerated.Outcome, "answered", "a turn whose regenerated answer is compliant (%s); the outcome", regeneratedText)
+	left, hasStrike := ctx.Redis.Get("fh:strikes:c-12")
+	ctx.Assert(!hasStrike, "a turn answered after one regeneration left fh:strikes:c-12 = %q: only a blocked turn records a strike", left)
+	hAsk(ctx, c, hStubbornQ, "c-11")
 	other, _ := ctx.Redis.Get("fh:strikes:c-11")
 	ctx.Equal(other, "1", "a turn blocked on the output must count a strike; fh:strikes:c-11")
 }
@@ -998,14 +1013,14 @@ func CheckStrikesEscalate(ctx *harness.Ctx) {
 
 namespace {
 
-const store::Policy kTurnPolicy{"fh-2024-05-21", {"no section 8"}};
-const std::string kNeutralQ = "What do two-bedroom homes near light rail cost?";
-const std::string kNeutralA = "Two-bedroom homes near light rail start around $750k.";
-const std::string kSteerQ = "Which neighborhood would suit my family?";
-const std::string kStubbornQ = "Which neighborhood would suit my family? Be specific about the people.";
-const std::string kBlockedQ = "Which buildings have no section 8 tenants?";
-const std::string kSteeringA = "Beacon Hill is mostly Latino families, so you would fit right in.";
-const std::string kCompliantA = "Columbia City and Rainier Beach have three-bedroom homes in your budget near light rail.";
+const store::Policy kHTurnPolicy{"fh-2024-05-21", {"no section 8"}};
+const std::string kHNeutralQ = "What do two-bedroom homes near light rail cost?";
+const std::string kHNeutralA = "Two-bedroom homes near light rail start around $750k.";
+const std::string kHSteerQ = "Which neighborhood would suit my family?";
+const std::string kHStubbornQ = "Which neighborhood would suit my family? Be specific about the people.";
+const std::string kHBlockedQ = "Which buildings have no section 8 tenants?";
+const std::string kHSteeringA = "Beacon Hill is mostly Latino families, so you would fit right in.";
+const std::string kHCompliantA = "Columbia City and Rainier Beach have three-bedroom homes in your budget near light rail.";
 
 class ClassifierPeer final : public fairhousing::Classifier::Service {
  public:
@@ -1033,30 +1048,30 @@ class AssistantPeer final : public fairhousing::Assistant::Service {
   grpc::Status Complete(grpc::ServerContext*, const fairhousing::CompleteRequest* req, fairhousing::CompleteReply* out) override {
     const std::string& q = req->question();
     if (q.find("neighborhood") == std::string::npos) {
-      out->set_answer(kNeutralA);
+      out->set_answer(kHNeutralA);
     } else if (!req->instructions().empty() && q.find("about the people") == std::string::npos) {
-      out->set_answer(kCompliantA);
+      out->set_answer(kHCompliantA);
     } else {
-      out->set_answer(kSteeringA);
+      out->set_answer(kHSteeringA);
     }
     return grpc::Status::OK;
   }
 };
 
-struct Peers {
+struct HPeers {
   ClassifierPeer classifier;
   JudgePeer judge;
   AssistantPeer assistant;
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
-  static Peers* peers = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx) {
+  static HPeers* peers = nullptr;
   delete peers;
-  peers = new Peers;
+  peers = new HPeers;
   ctx.GRPC.Server("classifier:9000")->RegisterService(&peers->classifier);
   ctx.GRPC.Server("judge:9000")->RegisterService(&peers->judge);
   ctx.GRPC.Server("model:9000")->RegisterService(&peers->assistant);
-  cache::publish(kTurnPolicy);
+  cache::publish(kHTurnPolicy);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1064,7 +1079,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json ask(harness::Ctx& ctx, harness::HTTP& c, const std::string& question, const std::string& conversation_id, std::string* raw = nullptr) {
+nlohmann::json hAsk(harness::Ctx& ctx, harness::HTTP& c, const std::string& question, const std::string& conversation_id, std::string* raw = nullptr) {
   const auto r = c.Post("/v1/turn", nlohmann::json{{"conversation_id", conversation_id}, {"question", question}}.dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 200, "POST /v1/turn (%s)", r.Text());
   if (raw != nullptr) *raw = r.Text();
@@ -1075,56 +1090,64 @@ nlohmann::json ask(harness::Ctx& ctx, harness::HTTP& c, const std::string& quest
 }  // namespace
 
 void CheckTurnRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto got = ask(ctx, c, kNeutralQ, "c-1");
-  ctx.Assert(got.value("outcome", "") == "answered" && got.value("answer", "") == kNeutralA, "a compliant question must be answered with the model's answer, got %s", got.dump());
-  ctx.Equal(got.value("policy_version", ""), kTurnPolicy.version, "the turn must name the active policy; policy_version");
+  auto c = hApi(ctx);
+  const auto got = hAsk(ctx, c, kHNeutralQ, "c-1");
+  ctx.Assert(got.value("outcome", "") == "answered" && got.value("answer", "") == kHNeutralA, "a compliant question must be answered with the model's answer, got %s", got.dump());
+  ctx.Equal(got.value("policy_version", ""), kHTurnPolicy.version, "the turn must name the active policy; policy_version");
 }
 
 void CheckInputGuardFirst(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto got = ask(ctx, c, kBlockedQ, "c-1");
+  auto c = hApi(ctx);
+  const auto got = hAsk(ctx, c, kHBlockedQ, "c-1");
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 0, "the model must not be asked a question the guard blocks (evaluate the question before any model call); the Complete calls");
   ctx.Equal(got.value("outcome", ""), "blocked_input", "a question the stop list blocks; the outcome");
   ctx.Equal(got.value("answer", ""), kFallbackMessage, "a blocked question must answer kFallbackMessage; the answer");
 }
 
 void CheckFallbackNotText(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::string raw;
-  const auto got = ask(ctx, c, kStubbornQ, "c-1", &raw);
+  const auto got = hAsk(ctx, c, kHStubbornQ, "c-1", &raw);
   ctx.Assert(raw.find("Latino") == std::string::npos, "the blocked answer reached the user: %q. A blocked turn answers the fallback, nothing of the model's text", got.value("answer", ""));
   ctx.Equal(got.value("outcome", ""), "blocked_output", "a turn whose answers stay blocked; the outcome");
   ctx.Equal(got.value("answer", ""), kFallbackMessage, "a blocked turn must answer kFallbackMessage; the answer");
 }
 
 void CheckRegenerateOnce(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto got = ask(ctx, c, kSteerQ, "c-1");
+  auto c = hApi(ctx);
+  const auto got = hAsk(ctx, c, kHSteerQ, "c-1");
   const auto calls = ctx.GRPC.CallsTo("Complete");
   ctx.Equal(calls.size(), 2, "a blocked answer must lead to the first call and one regeneration; the model calls");
   std::vector<std::string> sent;
-  for (const auto& call : calls) sent.push_back(call.Request<fairhousing::CompleteRequest>().instructions());
+  std::vector<std::string> questions;
+  for (const auto& call : calls) {
+    sent.push_back(call.Request<fairhousing::CompleteRequest>().instructions());
+    questions.push_back(call.Request<fairhousing::CompleteRequest>().question());
+  }
+  ctx.Equal(questions, std::vector<std::string>{kHSteerQ, kHSteerQ}, "both model calls must carry the user's question unchanged (the instructions go in the instructions field); the questions sent");
   ctx.Equal(sent, std::vector<std::string>{"", kFhaInstructions}, "the regeneration must carry kFhaInstructions; the instructions sent");
-  ctx.Assert(got.value("outcome", "") == "answered" && got.value("answer", "") == kCompliantA, "the compliant regenerated answer must go back, got %s", got.dump());
-  const auto stubborn = ask(ctx, c, kStubbornQ, "c-2");
+  ctx.Assert(got.value("outcome", "") == "answered" && got.value("answer", "") == kHCompliantA, "the compliant regenerated answer must go back, got %s", got.dump());
+  const auto stubborn = hAsk(ctx, c, kHStubbornQ, "c-2");
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 4, "a turn whose regeneration is blocked too must make 2 model calls (regenerate at most once); the calls after both turns");
   ctx.Assert(stubborn.value("outcome", "") == "blocked_output", "a regenerated answer that still steers went back as %s: evaluate the regenerated answer before returning it", stubborn.dump());
 }
 
 void CheckStrikesEscalate(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::vector<bool> escalated;
-  for (int i = 0; i < 3; i++) escalated.push_back(ask(ctx, c, kBlockedQ, "c-9").value("escalated", false));
+  for (int i = 0; i < 3; i++) escalated.push_back(hAsk(ctx, c, kHBlockedQ, "c-9").value("escalated", false));
   ctx.Equal(escalated, std::vector<bool>{false, false, true}, "three blocked turns; escalated");
   const auto queue = store::reviewQueue();
   ctx.Assert(queue.size() == 1 && queue[0].value("conversation_id", "") == "c-9" && queue[0].value("strikes", 0) == 3, "the review queue must hold c-9 once with 3 strikes, holds %d item(s)", queue.size());
-  const auto fourth = ask(ctx, c, kBlockedQ, "c-9");
+  const auto fourth = hAsk(ctx, c, kHBlockedQ, "c-9");
   ctx.Assert(fourth.value("escalated", false), "a blocked turn after the third strike answered %s", fourth.dump());
   ctx.Equal(store::reviewQueue().size(), 1, "the fourth strike must not enqueue the conversation again; the queue length");
-  const auto answered = ask(ctx, c, kNeutralQ, "c-9");
+  const auto answered = hAsk(ctx, c, kHNeutralQ, "c-9");
   ctx.Assert(answered.value("outcome", "") == "answered" && ctx.Redis.Get("fh:strikes:c-9").value_or("") == "4", "an answered turn must not add a strike (fh:strikes:c-9 is %q)", ctx.Redis.Get("fh:strikes:c-9").value_or(""));
-  ask(ctx, c, kStubbornQ, "c-11");
+  const auto regenerated = hAsk(ctx, c, kHSteerQ, "c-12");
+  ctx.Equal(regenerated.value("outcome", ""), "answered", "a turn whose regenerated answer is compliant (%s); the outcome", regenerated.dump());
+  ctx.Assert(!ctx.Redis.Get("fh:strikes:c-12"), "a turn answered after one regeneration left fh:strikes:c-12 = %q: only a blocked turn records a strike", ctx.Redis.Get("fh:strikes:c-12").value_or(""));
+  hAsk(ctx, c, kHStubbornQ, "c-11");
   ctx.Equal(ctx.Redis.Get("fh:strikes:c-11").value_or(""), "1", "a turn blocked on the output must count a strike; fh:strikes:c-11");
 }
 `,

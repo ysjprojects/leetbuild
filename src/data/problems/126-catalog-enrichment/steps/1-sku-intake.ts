@@ -100,7 +100,7 @@ first.
       id: 'commit-after-enqueue',
       title: 'Commits the offset only after the job is on sku.extract',
       detail:
-        'Auto-commit is off and the offset is committed after `intake` returns, so a job the broker refused leaves the record uncommitted for its redelivery. The starter commits each record as it arrives.',
+        'Auto-commit is off and the offset is committed after `intake` returns, so a job the broker refused stays uncommitted, and no commit of a record behind it moves past it, until the restart redelivers it. The starter commits each record as it arrives.',
       match: {
         python: {
           all: [/["']enable\.auto\.commit["']\s*:\s*False/],
@@ -981,19 +981,24 @@ def check_merchant_key(ctx):
 
 def check_dead_letter(ctx):
     _seed(ctx, b"{not json")
+    _seed(ctx, b'["sku-0", "m-1"]')
+    _seed(ctx, json.dumps({"sku_id": "sku-1", "title": TITLE}))
     _seed(ctx, _sku("sku-2", title="   "))
     _seed(ctx, _sku("sku-3", title="X" * 5000))
     _seed(ctx, _sku("sku-4", images=[f"img/{i}.jpg" for i in range(9)]))
+    _seed(ctx, _sku("sku-6", title="\\u00e9" * 2100))
+    _seed(ctx, _sku("sku-7", description="d" * 16385))
     _seed(ctx, _sku("sku-5"))
+    _seed(ctx, _sku("sku-8", title="X" * 4096, description="d" * 16384, images=[f"img/{i}.jpg" for i in range(8)]))
     err = _run(ctx)
     assert err is None, f"a malformed record stopped the consumer ({err!r}): every record behind it on the partition is stuck"
+    jobs = [j.get("sku_id") for j in _jobs(ctx)]
+    assert jobs == ["sku-5", "sku-8"], f"only the well-formed records may become jobs, and a SKU exactly at every cap (a 4096-byte title, a 16384-byte description, 8 images) is well-formed: sku.extract holds {jobs}"
     dlq = ctx.kafka.records("sku.upserted.dlq")
-    assert len(dlq) == 4, f"four malformed records (not JSON, a blank title, a 5000-byte title, nine images) put {len(dlq)} records on sku.upserted.dlq"
+    assert len(dlq) == 8, f"eight malformed records (not JSON, a JSON array, no merchant, a blank title, a 5000-byte title, nine images, a 2100-character title of 4200 UTF-8 bytes, a 16385-byte description) put {len(dlq)} records on sku.upserted.dlq"
     for r in dlq:
         reason = dict(r.headers).get("reason")
         assert reason, f"a dead-lettered record carries no reason header: {r.value[:40]!r}"
-    jobs = [j.get("sku_id") for j in _jobs(ctx)]
-    assert jobs == ["sku-5"], f"only the well-formed record may become a job, sku.extract holds {jobs}"
     assert ctx.kafka.lag(GROUP, "sku.upserted") == 0, "dead-lettered records must be committed too, or they are redelivered forever"
 
 
@@ -1018,10 +1023,16 @@ def check_content_hash(ctx):
 
 def check_commit_after_enqueue(ctx):
     _seed(ctx, _sku())
+    _seed(ctx, _sku("sku-2"))
     ctx.kafka.fail_next("sku.extract", 1)
     _run(ctx)
-    assert ctx.kafka.lag(GROUP, "sku.upserted") == 1, "the broker refused the job and the record's offset was committed anyway: the SKU is lost. Commit only after the job is on sku.extract"
-    assert store.last_hash("sku-1") is None, "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped"
+    if "sku-1" not in [j.get("sku_id") for j in _jobs(ctx)]:
+        assert ctx.kafka.lag(GROUP, "sku.upserted") == 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract"
+        assert store.last_hash("sku-1") is None, "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped"
+    _run(ctx)  # the restart
+    jobs = sorted(j.get("sku_id") for j in _jobs(ctx))
+    assert jobs == ["sku-1", "sku-2"], f"after the broker refused sku-1's job once and the consumer restarted, sku.extract holds {jobs}: each SKU must reach it exactly once"
+    assert ctx.kafka.lag(GROUP, "sku.upserted") == 0, "after the restart both records must be committed"
 `,
     typescript: `const GROUP = 'catalog-enrichment';
 const TITLE = 'DOVE SILK GLOW BODY WASH 500ML';
@@ -1068,17 +1079,22 @@ export async function check_merchant_key(ctx) {
 
 export async function check_dead_letter(ctx) {
   seed(ctx, '{not json');
+  seed(ctx, '["sku-0", "m-1"]');
+  seed(ctx, JSON.stringify({sku_id: 'sku-1', title: TITLE}));
   seed(ctx, sku('sku-2', 'm-1', '   '));
   seed(ctx, sku('sku-3', 'm-1', 'X'.repeat(5000)));
   seed(ctx, sku('sku-4', 'm-1', TITLE, {images: Array.from({length: 9}, (_, i) => \`img/\${i}.jpg\`)}));
+  seed(ctx, sku('sku-6', 'm-1', '\\u00e9'.repeat(2100)));
+  seed(ctx, sku('sku-7', 'm-1', TITLE, {description: 'd'.repeat(16385)}));
   seed(ctx, sku('sku-5'));
+  seed(ctx, sku('sku-8', 'm-1', 'X'.repeat(4096), {description: 'd'.repeat(16384), images: Array.from({length: 8}, (_, i) => \`img/\${i}.jpg\`)}));
   const err = await run(ctx);
   assert.equal(err, null, \`a malformed record stopped the consumer (\${err}): every record behind it on the partition is stuck\`);
-  const dlq = ctx.kafka.records('sku.upserted.dlq');
-  assert.equal(dlq.length, 4, \`four malformed records (not JSON, a blank title, a 5000-byte title, nine images) put \${dlq.length} records on sku.upserted.dlq\`);
-  for (const r of dlq) assert(text(r.headers?.reason) !== '', \`a dead-lettered record carries no reason header: \${text(r.value).slice(0, 40)}\`);
   const ids = jobs(ctx).map(j => j.sku_id);
-  assert.deepStrictEqual(ids, ['sku-5'], \`only the well-formed record may become a job, sku.extract holds \${JSON.stringify(ids)}\`);
+  assert.deepStrictEqual(ids, ['sku-5', 'sku-8'], \`only the well-formed records may become jobs, and a SKU exactly at every cap (a 4096-byte title, a 16384-byte description, 8 images) is well-formed: sku.extract holds \${JSON.stringify(ids)}\`);
+  const dlq = ctx.kafka.records('sku.upserted.dlq');
+  assert.equal(dlq.length, 8, \`eight malformed records (not JSON, a JSON array, no merchant, a blank title, a 5000-byte title, nine images, a 2100-character title of 4200 UTF-8 bytes, a 16385-byte description) put \${dlq.length} records on sku.upserted.dlq\`);
+  for (const r of dlq) assert(text(r.headers?.reason) !== '', \`a dead-lettered record carries no reason header: \${text(r.value).slice(0, 40)}\`);
   assert.equal(ctx.kafka.lag(GROUP, 'sku.upserted'), 0, 'dead-lettered records must be committed too, or they are redelivered forever');
 }
 
@@ -1105,10 +1121,17 @@ export async function check_content_hash(ctx) {
 export async function check_commit_after_enqueue(ctx) {
   const store = ctx.load('/support/enrich/store.ts');
   seed(ctx, sku());
+  seed(ctx, sku('sku-2'));
   ctx.kafka.failNext('sku.extract', 1);
   await run(ctx);
-  assert.equal(ctx.kafka.lag(GROUP, 'sku.upserted'), 1, "the broker refused the job and the record's offset was committed anyway: the SKU is lost. Commit only after the job is on sku.extract");
-  assert.equal(await store.lastHash('sku-1'), null, 'the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped');
+  if (!jobs(ctx).some(j => j.sku_id === 'sku-1')) {
+    assert.equal(ctx.kafka.lag(GROUP, 'sku.upserted'), 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract");
+    assert.equal(await store.lastHash('sku-1'), null, 'the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped');
+  }
+  await run(ctx); // the restart
+  const ids = jobs(ctx).map(j => j.sku_id).sort();
+  assert.deepStrictEqual(ids, ['sku-1', 'sku-2'], \`after the broker refused sku-1's job once and the consumer restarted, sku.extract holds \${JSON.stringify(ids)}: each SKU must reach it exactly once\`);
+  assert.equal(ctx.kafka.lag(GROUP, 'sku.upserted'), 0, 'after the restart both records must be committed');
 }
 `,
     go: `package main
@@ -1175,30 +1198,45 @@ func CheckMerchantKey(ctx *harness.Ctx) {
 	ctx.Equal(len(partitions), 1, "one merchant, one partition; the partitions of m-1's jobs")
 }
 
+func intakeImages(n int) []string {
+	images := []string{}
+	for i := 0; i < n; i++ {
+		images = append(images, fmt.Sprintf("img/%d.jpg", i))
+	}
+	return images
+}
+
 func CheckDeadLetter(ctx *harness.Ctx) {
 	ctx.Kafka.Seed("sku.upserted", "m-1", "{not json")
+	ctx.Kafka.Seed("sku.upserted", "m-1", \`["sku-0", "m-1"]\`)
+	noMerchant, _ := json.Marshal(map[string]any{"sku_id": "sku-1", "title": intakeTitle})
+	ctx.Kafka.Seed("sku.upserted", "m-1", string(noMerchant))
 	intakeSeed(ctx, intakeSku("sku-2", "m-1", "   "))
 	intakeSeed(ctx, intakeSku("sku-3", "m-1", strings.Repeat("X", 5000)))
 	many := intakeSku("sku-4", "m-1", intakeTitle)
-	images := []string{}
-	for i := 0; i < 9; i++ {
-		images = append(images, fmt.Sprintf("img/%d.jpg", i))
-	}
-	many["images"] = images
+	many["images"] = intakeImages(9)
 	intakeSeed(ctx, many)
+	intakeSeed(ctx, intakeSku("sku-6", "m-1", strings.Repeat("\\u00e9", 2100)))
+	long := intakeSku("sku-7", "m-1", intakeTitle)
+	long["description"] = strings.Repeat("d", 16385)
+	intakeSeed(ctx, long)
 	intakeSeed(ctx, intakeSku("sku-5", "m-1", intakeTitle))
+	full := intakeSku("sku-8", "m-1", strings.Repeat("X", 4096))
+	full["description"] = strings.Repeat("d", 16384)
+	full["images"] = intakeImages(8)
+	intakeSeed(ctx, full)
 	ctx.NoError(intakeRun(ctx), "a malformed record stopped the consumer: every record behind it on the partition is stuck")
-	dlq := ctx.Kafka.Records("sku.upserted.dlq")
-	ctx.Equal(len(dlq), 4, "four malformed records (not JSON, a blank title, a 5000-byte title, nine images); the records on sku.upserted.dlq")
-	for _, r := range dlq {
-		reason, ok := r.Header("reason")
-		ctx.Assert(ok && len(reason) > 0, "a dead-lettered record carries no reason header: %.40s", r.Value)
-	}
 	ids := []string{}
 	for _, job := range intakeJobs(ctx) {
 		ids = append(ids, job.SkuID)
 	}
-	ctx.Equal(ids, []string{"sku-5"}, "only the well-formed record may become a job; sku.extract holds")
+	ctx.Equal(ids, []string{"sku-5", "sku-8"}, "only the well-formed records may become jobs, and a SKU exactly at every cap (a 4096-byte title, a 16384-byte description, 8 images) is well-formed; sku.extract holds")
+	dlq := ctx.Kafka.Records("sku.upserted.dlq")
+	ctx.Equal(len(dlq), 8, "eight malformed records (not JSON, a JSON array, no merchant, a blank title, a 5000-byte title, nine images, a 2100-character title of 4200 UTF-8 bytes, a 16385-byte description); the records on sku.upserted.dlq")
+	for _, r := range dlq {
+		reason, ok := r.Header("reason")
+		ctx.Assert(ok && len(reason) > 0, "a dead-lettered record carries no reason header: %.40s", r.Value)
+	}
 	ctx.Equal(ctx.Kafka.Lag(intakeGroup, "sku.upserted"), 0, "dead-lettered records must be committed too, or they are redelivered forever; the lag")
 }
 
@@ -1225,13 +1263,28 @@ func CheckContentHash(ctx *harness.Ctx) {
 	ctx.Equal(last, expected, "store.LastHash(sku-1) once the changed title was enqueued")
 }
 
+func intakeJobIDs(ctx *harness.Ctx) []string {
+	ids := []string{}
+	for _, job := range intakeJobs(ctx) {
+		ids = append(ids, job.SkuID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
 func CheckCommitAfterEnqueue(ctx *harness.Ctx) {
 	intakeSeed(ctx, intakeSku("sku-1", "m-1", intakeTitle))
+	intakeSeed(ctx, intakeSku("sku-2", "m-1", intakeTitle))
 	ctx.Kafka.FailNext("sku.extract", 1)
 	intakeRun(ctx)
-	ctx.Equal(ctx.Kafka.Lag(intakeGroup, "sku.upserted"), 1, "the broker refused the job: commit only after the job is on sku.extract, or the SKU is lost; the uncommitted records")
-	_, stored := store.LastHash(intakeBg, "sku-1")
-	ctx.Assert(!stored, "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped")
+	if ids := intakeJobIDs(ctx); len(ids) == 0 || ids[0] != "sku-1" {
+		ctx.Equal(ctx.Kafka.Lag(intakeGroup, "sku.upserted"), 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract; the uncommitted records")
+		_, stored := store.LastHash(intakeBg, "sku-1")
+		ctx.Assert(!stored, "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped")
+	}
+	intakeRun(ctx) // the restart
+	ctx.Equal(intakeJobIDs(ctx), []string{"sku-1", "sku-2"}, "after the broker refused sku-1's job once and the consumer restarted, each SKU must reach sku.extract exactly once; sku.extract holds")
+	ctx.Equal(ctx.Kafka.Lag(intakeGroup, "sku.upserted"), 0, "after the restart both records must be committed; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1293,23 +1346,40 @@ void CheckMerchantKey(harness::Ctx& ctx) {
   ctx.Equal(partitions.size(), 1, "one merchant, one partition; the partitions of m-1's jobs");
 }
 
+nlohmann::json intakeImages(int n) {
+  nlohmann::json images = nlohmann::json::array();
+  for (int i = 0; i < n; i++) images.push_back("img/" + std::to_string(i) + ".jpg");
+  return images;
+}
+
 void CheckDeadLetter(harness::Ctx& ctx) {
   ctx.Kafka.Seed("sku.upserted", std::string("m-1"), std::string("{not json"));
+  ctx.Kafka.Seed("sku.upserted", std::string("m-1"), std::string(R"(["sku-0", "m-1"])"));
+  ctx.Kafka.Seed("sku.upserted", std::string("m-1"), nlohmann::json{{"sku_id", "sku-1"}, {"title", kIntakeTitle}}.dump());
   intakeSeed(ctx, intakeSku("sku-2", "m-1", "   "));
   intakeSeed(ctx, intakeSku("sku-3", "m-1", std::string(5000, 'X')));
   auto many = intakeSku("sku-4", "m-1", kIntakeTitle);
-  many["images"] = nlohmann::json::array();
-  for (int i = 0; i < 9; i++) many["images"].push_back("img/" + std::to_string(i) + ".jpg");
+  many["images"] = intakeImages(9);
   intakeSeed(ctx, many);
+  std::string accented;
+  for (int i = 0; i < 2100; i++) accented += "\\xc3\\xa9";
+  intakeSeed(ctx, intakeSku("sku-6", "m-1", accented));
+  auto long_description = intakeSku("sku-7", "m-1", kIntakeTitle);
+  long_description["description"] = std::string(16385, 'd');
+  intakeSeed(ctx, long_description);
   intakeSeed(ctx, intakeSku("sku-5", "m-1", kIntakeTitle));
+  auto full = intakeSku("sku-8", "m-1", std::string(4096, 'X'));
+  full["description"] = std::string(16384, 'd');
+  full["images"] = intakeImages(8);
+  intakeSeed(ctx, full);
   const std::string err = intakeRun(ctx);
   ctx.Assert(err.empty(), "a malformed record stopped the consumer (%s): every record behind it on the partition is stuck", err);
-  const auto dlq = ctx.Kafka.Records("sku.upserted.dlq");
-  ctx.Equal(dlq.size(), 4, "four malformed records (not JSON, a blank title, a 5000-byte title, nine images); the records on sku.upserted.dlq");
-  for (const auto& r : dlq) ctx.Assert(!r.Header("reason").value_or("").empty(), "a dead-lettered record carries no reason header: %s", r.Value.value_or("").substr(0, 40));
   std::vector<std::string> ids;
   for (const auto& job : intakeJobs(ctx)) ids.push_back(job.value("sku_id", ""));
-  ctx.Equal(ids, {"sku-5"}, "only the well-formed record may become a job; sku.extract holds");
+  ctx.Equal(ids, {"sku-5", "sku-8"}, "only the well-formed records may become jobs, and a SKU exactly at every cap (a 4096-byte title, a 16384-byte description, 8 images) is well-formed; sku.extract holds");
+  const auto dlq = ctx.Kafka.Records("sku.upserted.dlq");
+  ctx.Equal(dlq.size(), 8, "eight malformed records (not JSON, a JSON array, no merchant, a blank title, a 5000-byte title, nine images, a 2100-character title of 4200 UTF-8 bytes, a 16385-byte description); the records on sku.upserted.dlq");
+  for (const auto& r : dlq) ctx.Assert(!r.Header("reason").value_or("").empty(), "a dead-lettered record carries no reason header: %s", r.Value.value_or("").substr(0, 40));
   ctx.Equal(ctx.Kafka.Lag(kIntakeGroup, "sku.upserted"), 0, "dead-lettered records must be committed too, or they are redelivered forever; the lag");
 }
 
@@ -1334,12 +1404,26 @@ void CheckContentHash(harness::Ctx& ctx) {
   ctx.Equal(store::last_hash("sku-1").value_or(""), expected, "store::last_hash(sku-1) once the changed title was enqueued");
 }
 
+std::vector<std::string> intakeJobIds(harness::Ctx& ctx) {
+  std::vector<std::string> ids;
+  for (const auto& job : intakeJobs(ctx)) ids.push_back(job.value("sku_id", ""));
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
 void CheckCommitAfterEnqueue(harness::Ctx& ctx) {
   intakeSeed(ctx, intakeSku("sku-1", "m-1", kIntakeTitle));
+  intakeSeed(ctx, intakeSku("sku-2", "m-1", kIntakeTitle));
   ctx.Kafka.FailNext("sku.extract", 1);
   intakeRun(ctx);
-  ctx.Equal(ctx.Kafka.Lag(kIntakeGroup, "sku.upserted"), 1, "the broker refused the job: commit only after the job is on sku.extract, or the SKU is lost; the uncommitted records");
-  ctx.Assert(!store::last_hash("sku-1"), "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped");
+  const auto first = intakeJobIds(ctx);
+  if (first.empty() || first[0] != "sku-1") {
+    ctx.Equal(ctx.Kafka.Lag(kIntakeGroup, "sku.upserted"), 2, "the broker refused sku-1's job and its offset was committed anyway, by its own commit or by the commit of the record behind it: the SKU is lost. Commit only after the job is on sku.extract; the uncommitted records");
+    ctx.Assert(!store::last_hash("sku-1"), "the content hash was stored for a job that never reached sku.extract: the redelivery would be skipped");
+  }
+  intakeRun(ctx);  // the restart
+  ctx.Equal(intakeJobIds(ctx), {"sku-1", "sku-2"}, "after the broker refused sku-1's job once and the consumer restarted, each SKU must reach sku.extract exactly once; sku.extract holds");
+  ctx.Equal(ctx.Kafka.Lag(kIntakeGroup, "sku.upserted"), 0, "after the restart both records must be committed; the lag");
 }
 `,
   },

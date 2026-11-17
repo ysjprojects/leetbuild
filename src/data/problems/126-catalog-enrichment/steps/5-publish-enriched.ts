@@ -25,7 +25,7 @@ visible only weeks later as a bad brand coming back.
 - A delivery failure, read from the delivery report, writes \`store.insert_outbox(event, reason)\`.
 - The indexer writes \`store.apply_catalog\` and \`store.index_upsert\`, then commits.
 - It reads \`store.catalog_current(sku_id)\` first and skips an event whose \`attributes_version\` is
-  not newer, and a \`model\` event over attributes a \`human\` set.`,
+  not newer, and a \`model\` event over attributes a \`human\` set; a skipped event is committed too.`,
   sequence: {
     participants: ['catalogd', 'sku.enriched', 'Indexer', 'Redis'],
     messages: [
@@ -76,9 +76,9 @@ visible only weeks later as a bad brand coming back.
     },
     {
       id: 'commit-after-apply',
-      title: 'Commits only after the catalog write',
+      title: 'Commits only after the catalog and search writes',
       detail:
-        'The offset is committed after the event is applied, so a crash in between redelivers it. The starter commits each record before writing it.',
+        'The offset is committed after the event is in the catalog and in the search index, so a crash in between redelivers it. The starter commits each record before writing it.',
       match: {
         python: {order: [/store\.apply_catalog\(/, /consumer\.commit\(/]},
         typescript: {order: [/applyCatalog\(/, /commitOffsets\(/]},
@@ -104,7 +104,7 @@ visible only weeks later as a bad brand coming back.
       id: 'human-wins',
       title: 'Skips stale events and model events over human attributes',
       detail:
-        "The indexer reads `store.catalog_current` first and skips an event whose `attributes_version` is not newer, and a `model` event when a `human` set the current attributes. The starter applies events in arrival order, so a replay or a later model run overwrites a reviewer's correction.",
+        "The indexer reads `store.catalog_current` first and skips an event whose `attributes_version` is not newer, and a `model` event when a `human` set the current attributes; a newer `human` event still applies, and a skipped event is committed like any other. The starter applies events in arrival order, so a replay or a later model run overwrites a reviewer's correction.",
       match: {
         python: {all: [/store\.catalog_current\(/, /["']human["']/]},
         typescript: {all: [/catalogCurrent\(/, /'human'/]},
@@ -704,7 +704,7 @@ def check_outbox(ctx):
         raise AssertionError(f"publish raised {exc!r} when the broker refused the event: write it to the outbox instead") from None
     rows = [json.loads(row) for row in ctx.redis.lrange("outbox:enriched", 0, -1)]
     assert rows, "the broker refused the event and nothing reached outbox:enriched: read the delivery report (on_delivery) and call store.insert_outbox"
-    assert rows[0].get("event", {}).get("sku_id") == "sku-1", f"the outbox row must carry the event, got {rows[0]}"
+    assert rows[0].get("event", {}).get("sku_id") == "sku-1" and rows[0].get("reason"), f"the outbox row must carry the event and the delivery error as its reason, got {rows[0]}"
     m.publish(_event(version=2))
     m.producer.poll(0)
     assert _versions(ctx) == [2], f"once the broker accepts events they reach the topic, it holds versions {_versions(ctx)}"
@@ -714,10 +714,11 @@ def check_outbox(ctx):
 def check_commit_after_apply(ctx):
     _seed(ctx, _event("sku-1"), _event("sku-2"))
     at_commit = []
-    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(store.catalog_current("sku-1")))
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append((store.catalog_current("sku-1"), store.search_entry("sku-1"))))
     _index(ctx)
     assert at_commit, "the indexer never committed an offset"
-    assert at_commit[0] is not None, "the first commit came before sku-1 was in the catalog: a crash between the two loses the version"
+    assert at_commit[0][0] is not None, "the first commit came before sku-1 was in the catalog: a crash between the two loses the version"
+    assert at_commit[0][1] is not None, "the first commit came before sku-1 was in the search index: a crash between the two leaves search serving the old attributes"
     assert ctx.kafka.lag(GROUP, "sku.enriched") == 0, "every applied event must be committed"
 
 
@@ -731,13 +732,21 @@ def check_search_index(ctx):
 
 
 def check_human_wins(ctx):
-    _seed(ctx, _event("sku-1", 1, "model", "Glowra"), _event("sku-1", 2, "human", "Oatly"), _event("sku-1", 3, "model", "Silk"))
     _seed(ctx, _event("sku-2", 2, "model", "Califia Farms"), _event("sku-2", 1, "model", "Silk"))
+    _seed(ctx, _event("sku-3", 2, "model", "Califia Farms"), _event("sku-3", 2, "model", "Silk"))  # a replay of version 2
+    _seed(ctx, _event("sku-4", 1, "human", "Oatly"), _event("sku-4", 2, "human", "Silk"))  # a reviewer corrects a correction
+    _seed(ctx, _event("sku-1", 1, "model", "Glowra"), _event("sku-1", 2, "human", "Oatly"), _event("sku-1", 3, "model", "Silk"))
     _index(ctx)
     one = store.catalog_current("sku-1")
     assert one is not None and one["source"] == "human" and one["attributes"]["brand"] == "Oatly", f"a model event overwrote the reviewer's correction of sku-1: the catalog holds {one}"
+    assert store.search_entry("sku-1") == one, f"the search index holds {store.search_entry('sku-1')} for sku-1 while the catalog holds {one}: a skipped event must not reach search either"
     two = store.catalog_current("sku-2")
     assert two is not None and two["attributes_version"] == 2, f"an older version replaced a newer one for sku-2: the catalog holds version {two and two['attributes_version']}"
+    three = store.catalog_current("sku-3")
+    assert three is not None and three["attributes"]["brand"] == "Califia Farms", f"a second event with the same attributes_version (2) replaced the first for sku-3: only a newer version applies, the catalog holds {three}"
+    four = store.catalog_current("sku-4")
+    assert four is not None and four["attributes_version"] == 2 and four["attributes"]["brand"] == "Silk", f"a newer human event must replace an older human one for sku-4, the catalog holds {four}"
+    assert ctx.kafka.lag(GROUP, "sku.enriched") == 0, "skipped events must be committed too, or they are redelivered after every restart"
 `,
     typescript: `const GROUP = 'catalog-index';
 
@@ -791,7 +800,7 @@ export async function check_outbox(ctx) {
   await settle();
   const rows = ctx.redis.lrange('outbox:enriched', 0, -1).map((row: string) => JSON.parse(row));
   assert(rows.length > 0, 'the broker refused the event and nothing reached outbox:enriched: catch the rejected send and call insertOutbox');
-  assert.equal(rows[0].event?.sku_id, 'sku-1', \`the outbox row must carry the event, got \${JSON.stringify(rows[0])}\`);
+  assert(rows[0].event?.sku_id === 'sku-1' && rows[0].reason, \`the outbox row must carry the event and the delivery error as its reason, got \${JSON.stringify(rows[0])}\`);
   await m.publish(event('sku-1', 2));
   await settle();
   assert.deepStrictEqual(versions(ctx), [2], 'once the broker accepts events they reach the topic');
@@ -800,11 +809,12 @@ export async function check_outbox(ctx) {
 
 export async function check_commit_after_apply(ctx) {
   seed(ctx, event('sku-1'), event('sku-2'));
-  const atCommit: boolean[] = [];
-  ctx.kafka.onCommit(() => atCommit.push(ctx.redis.exists('catalog:sku-1') === 1));
+  const atCommit: [boolean, boolean][] = [];
+  ctx.kafka.onCommit(() => atCommit.push([ctx.redis.exists('catalog:sku-1') === 1, ctx.redis.exists('search:sku-1') === 1]));
   await index(ctx);
   assert(atCommit.length > 0, 'the indexer never committed an offset');
-  assert(atCommit[0], 'the first commit came before sku-1 was in the catalog: a crash between the two loses the version');
+  assert(atCommit[0][0], 'the first commit came before sku-1 was in the catalog: a crash between the two loses the version');
+  assert(atCommit[0][1], 'the first commit came before sku-1 was in the search index: a crash between the two leaves search serving the old attributes');
   assert.equal(ctx.kafka.lag(GROUP, 'sku.enriched'), 0, 'every applied event must be committed');
 }
 
@@ -820,13 +830,22 @@ export async function check_search_index(ctx) {
 }
 
 export async function check_human_wins(ctx) {
-  seed(ctx, event('sku-1', 1, 'model', 'Glowra'), event('sku-1', 2, 'human', 'Oatly'), event('sku-1', 3, 'model', 'Silk'));
   seed(ctx, event('sku-2', 2, 'model', 'Califia Farms'), event('sku-2', 1, 'model', 'Silk'));
+  seed(ctx, event('sku-3', 2, 'model', 'Califia Farms'), event('sku-3', 2, 'model', 'Silk')); // a replay of version 2
+  seed(ctx, event('sku-4', 1, 'human', 'Oatly'), event('sku-4', 2, 'human', 'Silk')); // a reviewer corrects a correction
+  seed(ctx, event('sku-1', 1, 'model', 'Glowra'), event('sku-1', 2, 'human', 'Oatly'), event('sku-1', 3, 'model', 'Silk'));
   const store = await index(ctx);
   const one = await store.catalogCurrent('sku-1');
   assert(one !== null && one.source === 'human' && one.attributes.brand === 'Oatly', \`a model event overwrote the reviewer's correction of sku-1: the catalog holds \${JSON.stringify(one)}\`);
+  const search = await store.searchEntry('sku-1');
+  assert.deepStrictEqual(search, one, \`the search index holds \${JSON.stringify(search)} for sku-1 while the catalog holds \${JSON.stringify(one)}: a skipped event must not reach search either\`);
   const two = await store.catalogCurrent('sku-2');
   assert(two !== null && two.attributes_version === 2, \`an older version replaced a newer one for sku-2: the catalog holds \${JSON.stringify(two)}\`);
+  const three = await store.catalogCurrent('sku-3');
+  assert(three !== null && three.attributes.brand === 'Califia Farms', \`a second event with the same attributes_version (2) replaced the first for sku-3: only a newer version applies, the catalog holds \${JSON.stringify(three)}\`);
+  const four = await store.catalogCurrent('sku-4');
+  assert(four !== null && four.attributes_version === 2 && four.attributes.brand === 'Silk', \`a newer human event must replace an older human one for sku-4, the catalog holds \${JSON.stringify(four)}\`);
+  assert.equal(ctx.kafka.lag(GROUP, 'sku.enriched'), 0, 'skipped events must be committed too, or they are redelivered after every restart');
 }
 `,
     go: `package main
@@ -902,6 +921,8 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Assert(len(rows) > 0, "the broker refused the event and nothing reached outbox:enriched: read the delivery report and call store.InsertOutbox")
 	event, _ := rows[0]["event"].(map[string]any)
 	ctx.Equal(event["sku_id"], "sku-1", "the outbox row must carry the event; its sku_id")
+	reason, _ := rows[0]["reason"].(string)
+	ctx.Assert(reason != "", "the outbox row must carry the delivery error as its reason, got %v", rows[0])
 	ctx.NoError(publish(eventsBg, enrichedEvent("sku-1", 2, "model", "Oatly")), "publish failed")
 	ctx.Settle()
 	ctx.Equal(eventVersions(ctx), []int64{2}, "once the broker accepts events they reach the topic; the versions")
@@ -910,11 +931,14 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 func CheckCommitAfterApply(ctx *harness.Ctx) {
 	seedEvents(ctx, enrichedEvent("sku-1", 1, "model", "Oatly"), enrichedEvent("sku-2", 1, "model", "Oatly"))
-	var atCommit []bool
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.Exists("catalog:sku-1") == 1) })
+	var atCommit [][2]bool
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		atCommit = append(atCommit, [2]bool{ctx.Redis.Exists("catalog:sku-1") == 1, ctx.Redis.Exists("search:sku-1") == 1})
+	})
 	runIndex(ctx)
 	ctx.Assert(len(atCommit) > 0, "the indexer never committed an offset")
-	ctx.Assert(atCommit[0], "the first commit came before sku-1 was in the catalog: a crash between the two loses the version")
+	ctx.Assert(atCommit[0][0], "the first commit came before sku-1 was in the catalog: a crash between the two loses the version")
+	ctx.Assert(atCommit[0][1], "the first commit came before sku-1 was in the search index: a crash between the two leaves search serving the old attributes")
 	ctx.Equal(ctx.Kafka.Lag(indexGroup, "sku.enriched"), 0, "every applied event must be committed; the lag")
 }
 
@@ -930,13 +954,23 @@ func CheckSearchIndex(ctx *harness.Ctx) {
 }
 
 func CheckHumanWins(ctx *harness.Ctx) {
-	seedEvents(ctx, enrichedEvent("sku-1", 1, "model", "Glowra"), enrichedEvent("sku-1", 2, "human", "Oatly"), enrichedEvent("sku-1", 3, "model", "Silk"))
 	seedEvents(ctx, enrichedEvent("sku-2", 2, "model", "Califia Farms"), enrichedEvent("sku-2", 1, "model", "Silk"))
+	seedEvents(ctx, enrichedEvent("sku-3", 2, "model", "Califia Farms"), enrichedEvent("sku-3", 2, "model", "Silk")) // a replay of version 2
+	seedEvents(ctx, enrichedEvent("sku-4", 1, "human", "Oatly"), enrichedEvent("sku-4", 2, "human", "Silk"))          // a reviewer corrects a correction
+	seedEvents(ctx, enrichedEvent("sku-1", 1, "model", "Glowra"), enrichedEvent("sku-1", 2, "human", "Oatly"), enrichedEvent("sku-1", 3, "model", "Silk"))
 	runIndex(ctx)
 	one := store.CatalogCurrent(eventsBg, "sku-1")
 	ctx.Assert(one != nil && one.Source == "human" && one.Attributes["brand"] == "Oatly", "a model event overwrote the reviewer's correction of sku-1: the catalog holds %+v", one)
+	search := store.SearchEntry(eventsBg, "sku-1")
+	ctx.Assert(search != nil && search.Source == one.Source && search.AttributesVersion == one.AttributesVersion && search.Attributes["brand"] == one.Attributes["brand"],
+		"the search index holds %+v for sku-1 while the catalog holds %+v: a skipped event must not reach search either", search, one)
 	two := store.CatalogCurrent(eventsBg, "sku-2")
 	ctx.Assert(two != nil && two.AttributesVersion == 2, "an older version replaced a newer one for sku-2: the catalog holds %+v", two)
+	three := store.CatalogCurrent(eventsBg, "sku-3")
+	ctx.Assert(three != nil && three.Attributes["brand"] == "Califia Farms", "a second event with the same attributes_version (2) replaced the first for sku-3: only a newer version applies, the catalog holds %+v", three)
+	four := store.CatalogCurrent(eventsBg, "sku-4")
+	ctx.Assert(four != nil && four.AttributesVersion == 2 && four.Attributes["brand"] == "Silk", "a newer human event must replace an older human one for sku-4, the catalog holds %+v", four)
+	ctx.Equal(ctx.Kafka.Lag(indexGroup, "sku.enriched"), 0, "skipped events must be committed too, or they are redelivered after every restart; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -945,6 +979,7 @@ func CheckHumanWins(ctx *harness.Ctx) {
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "enrich/store.h"
@@ -1006,7 +1041,7 @@ void CheckOutbox(harness::Ctx& ctx) {
   const auto rows = ctx.Redis.LRange("outbox:enriched", 0, -1);
   ctx.Assert(!rows.empty(), "the broker refused the event and nothing reached outbox:enriched: handle the delivery report (dr_cb) with store::insert_outbox");
   const auto row = nlohmann::json::parse(rows[0], nullptr, false);
-  ctx.Assert(row.is_object() && row.contains("event") && row["event"].value("sku_id", "") == "sku-1", "the outbox row must carry the event, got %s", rows[0]);
+  ctx.Assert(row.is_object() && row.contains("event") && row["event"].value("sku_id", "") == "sku-1" && !row.value("reason", "").empty(), "the outbox row must carry the event and the delivery error as its reason, got %s", rows[0]);
   publish(enrichedEvent("sku-1", 2, "model", "Oatly"));
   producer->poll(0);
   ctx.Settle();
@@ -1016,11 +1051,14 @@ void CheckOutbox(harness::Ctx& ctx) {
 
 void CheckCommitAfterApply(harness::Ctx& ctx) {
   seedEvents(ctx, {enrichedEvent("sku-1", 1, "model", "Oatly"), enrichedEvent("sku-2", 1, "model", "Oatly")});
-  std::vector<bool> at_commit;
-  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { at_commit.push_back(ctx.Redis.Exists("catalog:sku-1") == 1); });
+  std::vector<std::pair<bool, bool>> at_commit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+    at_commit.emplace_back(ctx.Redis.Exists("catalog:sku-1") == 1, ctx.Redis.Exists("search:sku-1") == 1);
+  });
   runIndex(ctx);
   ctx.Assert(!at_commit.empty(), "the indexer never committed an offset");
-  ctx.Assert(at_commit[0], "the first commit came before sku-1 was in the catalog: a crash between the two loses the version");
+  ctx.Assert(at_commit[0].first, "the first commit came before sku-1 was in the catalog: a crash between the two loses the version");
+  ctx.Assert(at_commit[0].second, "the first commit came before sku-1 was in the search index: a crash between the two leaves search serving the old attributes");
   ctx.Equal(ctx.Kafka.Lag(kIndexGroup, "sku.enriched"), 0, "every applied event must be committed; the lag");
 }
 
@@ -1037,13 +1075,22 @@ void CheckSearchIndex(harness::Ctx& ctx) {
 }
 
 void CheckHumanWins(harness::Ctx& ctx) {
-  seedEvents(ctx, {enrichedEvent("sku-1", 1, "model", "Glowra"), enrichedEvent("sku-1", 2, "human", "Oatly"), enrichedEvent("sku-1", 3, "model", "Silk")});
   seedEvents(ctx, {enrichedEvent("sku-2", 2, "model", "Califia Farms"), enrichedEvent("sku-2", 1, "model", "Silk")});
+  seedEvents(ctx, {enrichedEvent("sku-3", 2, "model", "Califia Farms"), enrichedEvent("sku-3", 2, "model", "Silk")});  // a replay of version 2
+  seedEvents(ctx, {enrichedEvent("sku-4", 1, "human", "Oatly"), enrichedEvent("sku-4", 2, "human", "Silk")});  // a reviewer corrects a correction
+  seedEvents(ctx, {enrichedEvent("sku-1", 1, "model", "Glowra"), enrichedEvent("sku-1", 2, "human", "Oatly"), enrichedEvent("sku-1", 3, "model", "Silk")});
   runIndex(ctx);
   const auto one = store::catalog_current("sku-1");
   ctx.Assert(one && (*one)["source"] == "human" && (*one)["attributes"]["brand"] == "Oatly", "a model event overwrote the reviewer's correction of sku-1: the catalog holds %s", one ? one->dump() : "nothing");
+  const auto search = store::search_entry("sku-1");
+  ctx.Assert(search && *search == *one, "the search index holds %s for sku-1 while the catalog holds %s: a skipped event must not reach search either", search ? search->dump() : "nothing", one->dump());
   const auto two = store::catalog_current("sku-2");
   ctx.Assert(two && (*two)["attributes_version"] == 2, "an older version replaced a newer one for sku-2: the catalog holds %s", two ? two->dump() : "nothing");
+  const auto three = store::catalog_current("sku-3");
+  ctx.Assert(three && (*three)["attributes"]["brand"] == "Califia Farms", "a second event with the same attributes_version (2) replaced the first for sku-3: only a newer version applies, the catalog holds %s", three ? three->dump() : "nothing");
+  const auto four = store::catalog_current("sku-4");
+  ctx.Assert(four && (*four)["attributes_version"] == 2 && (*four)["attributes"]["brand"] == "Silk", "a newer human event must replace an older human one for sku-4, the catalog holds %s", four ? four->dump() : "nothing");
+  ctx.Equal(ctx.Kafka.Lag(kIndexGroup, "sku.enriched"), 0, "skipped events must be committed too, or they are redelivered after every restart; the lag");
 }
 `,
   },

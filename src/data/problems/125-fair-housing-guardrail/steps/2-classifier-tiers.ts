@@ -133,7 +133,7 @@ service Judge      { rpc Assess(AssessRequest) returns (Assessment); }         /
       id: 'fail-closed',
       title: 'Fails closed on any tier error',
       detail:
-        'An RPC error or deadline at the classifier or the judge answers blocked with `guard_unavailable`; the starter catches everything and allows, so an outage reads as approval.',
+        'An RPC error of any status code, or a deadline, at the classifier or the judge answers blocked with `guard_unavailable`; the starter catches everything and allows, so an outage reads as approval.',
       match: {
         python: {
           all: [/FAIL_CLOSED_REASON\s*=\s*"guard_unavailable"/, /except grpc\.RpcError/],
@@ -574,15 +574,16 @@ import fair_housing_guardrail_pb2 as pb
 import fair_housing_guardrail_pb2_grpc as pb_grpc
 from fhguard.store import Policy
 
-POLICY = Policy("fh-2024-05-21", ["no section 8", "adults only"])
+POLICY = Policy("fh-2024-05-21", ["no section 8", "Adults Only"])
 NEUTRAL = "Two-bedroom homes near light rail under $900k"
 BAND_OK = "Which schools are within walking distance?"
 BAND_BAD = "Is this a good area for a young couple without kids?"
 LEANING = "Which blocks have fewer families with kids?"
 EDGE = "Is the building mostly retirees?"
+AT_LOW = "Is this street quiet enough for retirees?"
 HIGH = "Beacon Hill is mostly Latino families, so you would fit right in."
-# The classifier's score for each text (0.04 for any other); the judge finds only BAND_BAD non-compliant.
-SCORES = {BAND_OK: 0.20, BAND_BAD: 0.25, LEANING: 0.40, EDGE: 0.35, HIGH: 0.92}
+# The classifier's score for each text (0.04 for any other); the judge finds BAND_BAD and AT_LOW non-compliant.
+SCORES = {AT_LOW: 0.15, BAND_OK: 0.20, BAND_BAD: 0.25, LEANING: 0.40, EDGE: 0.35, HIGH: 0.92}
 
 
 class Classifier(pb_grpc.ClassifierServicer):
@@ -593,7 +594,7 @@ class Classifier(pb_grpc.ClassifierServicer):
 
 class Judge(pb_grpc.JudgeServicer):
     def Assess(self, request, context):
-        if request.text == BAND_BAD:
+        if request.text in (BAND_BAD, AT_LOW):
             return pb.Assessment(compliant=False, reason="familial_status")
         return pb.Assessment(compliant=True)
 
@@ -613,6 +614,8 @@ def check_stoplist_first(ctx):
     d = m.decide("Only tenants with NO Section 8 vouchers, please", POLICY)
     assert not d.allowed and d.tier == "stoplist", f"a text containing the stop phrase 'no section 8' (in capitals) decided {_shape(d)}, expected blocked by the stoplist tier"
     assert d.reasons == ["stop_phrase:no section 8"], f"a stop-list block must say which phrase hit, got reasons {d.reasons}"
+    d = m.decide("Is the building adults only?", POLICY)
+    assert not d.allowed and d.reasons == ["stop_phrase:Adults Only"], f"a lower-case text containing the policy's stop phrase 'Adults Only' decided {_shape(d)}, expected blocked with reason stop_phrase:Adults Only: compare both sides case-insensitively"
     calls = len(ctx.grpc.calls_to("Classify")) + len(ctx.grpc.calls_to("Assess"))
     assert calls == 0, f"a stop-list hit still made {calls} RPC(s): the deterministic tier answers before the classifier"
     d = m.decide(NEUTRAL, POLICY)
@@ -652,8 +655,10 @@ def check_judge_band(ctx):
     assert not d.allowed and d.tier == "judge" and d.reasons == ["judge:familial_status"], f"a 0.25 the judge finds non-compliant decided {_shape(d)}, expected blocked by the judge with reason judge:familial_status"
     d = m.decide(BAND_OK, POLICY)
     assert d.allowed and d.tier == "judge", f"a 0.20 the judge finds compliant decided {_shape(d)}, expected allowed by the judge"
+    d = m.decide(AT_LOW, POLICY)
+    assert not d.allowed and d.tier == "judge" and d.reasons == ["judge:familial_status"], f"a score of exactly 0.15 the judge finds non-compliant decided {_shape(d)}, expected blocked by the judge: the band [0.15, 0.35) includes 0.15"
     calls = ctx.grpc.calls_to("Assess")
-    assert len(calls) == 2, f"the judge was asked {len(calls)} times for two texts in the band"
+    assert len(calls) == 3, f"the judge was asked {len(calls)} times for three texts in the band"
     for call in calls:
         assert call.timeout is not None and 1.5 <= call.timeout <= 2.5, f"Assess carries a {call.timeout} s deadline, expected JUDGE_DEADLINE_S = 2"
 
@@ -666,19 +671,28 @@ def check_fail_closed(ctx):
     ctx.grpc.fail("Assess", grpc.StatusCode.UNAVAILABLE, "judge down")
     d = m.decide(BAND_OK, POLICY)
     assert not d.allowed and d.reasons == ["guard_unavailable"], f"with the judge UNAVAILABLE a band score decided {_shape(d)}, expected blocked with reason guard_unavailable"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.UNKNOWN):
+        for method, text in (("Classify", HIGH), ("Assess", BAND_OK)):
+            ctx.grpc.fail(method, code, "tier failed")
+            try:
+                d = m.decide(text, POLICY)
+            except grpc.RpcError as err:
+                raise AssertionError(f"with {method} failing {code.name} decide raised {err.code().name}: any RPC error answers blocked with reason guard_unavailable") from None
+            assert not d.allowed and d.reasons == ["guard_unavailable"], f"with {method} failing {code.name} decide answered {_shape(d)}, expected blocked with reason guard_unavailable: any RPC error fails closed"
     ctx.grpc.set_latency("Assess", 5.0)
     d = m.decide(BAND_OK, POLICY)
     assert not d.allowed and d.reasons == ["guard_unavailable"], f"with the judge slower than its deadline a band score decided {_shape(d)}, expected blocked with reason guard_unavailable"
 `,
-    typescript: `const POLICY = {version: 'fh-2024-05-21', stop_phrases: ['no section 8', 'adults only']};
+    typescript: `const POLICY = {version: 'fh-2024-05-21', stop_phrases: ['no section 8', 'Adults Only']};
 const NEUTRAL = 'Two-bedroom homes near light rail under $900k';
 const BAND_OK = 'Which schools are within walking distance?';
 const BAND_BAD = 'Is this a good area for a young couple without kids?';
 const LEANING = 'Which blocks have fewer families with kids?';
 const EDGE = 'Is the building mostly retirees?';
+const AT_LOW = 'Is this street quiet enough for retirees?';
 const HIGH = 'Beacon Hill is mostly Latino families, so you would fit right in.';
-/** The classifier's score for each text (0.04 for any other); the judge finds only BAND_BAD non-compliant. */
-const SCORES: Record<string, number> = {[BAND_OK]: 0.2, [BAND_BAD]: 0.25, [LEANING]: 0.4, [EDGE]: 0.35, [HIGH]: 0.92};
+/** The classifier's score for each text (0.04 for any other); the judge finds BAND_BAD and AT_LOW non-compliant. */
+const SCORES: Record<string, number> = {[AT_LOW]: 0.15, [BAND_OK]: 0.2, [BAND_BAD]: 0.25, [LEANING]: 0.4, [EDGE]: 0.35, [HIGH]: 0.92};
 
 function tiers(ctx) {
   const pkg = ctx.proto('fair_housing_guardrail.proto');
@@ -690,7 +704,7 @@ function tiers(ctx) {
   });
   ctx.grpc.serve(pkg.fairhousing.Judge.service, {
     Assess(call, callback) {
-      if (call.request.text === BAND_BAD) return callback(null, {compliant: false, reason: 'familial_status'});
+      if (call.request.text === BAND_BAD || call.request.text === AT_LOW) return callback(null, {compliant: false, reason: 'familial_status'});
       callback(null, {compliant: true, reason: ''});
     },
   });
@@ -704,6 +718,8 @@ export async function check_stoplist_first(ctx) {
   let d = await m.decide('Only tenants with NO Section 8 vouchers, please', POLICY);
   assert(!d.allowed && d.tier === 'stoplist', \`a text containing the stop phrase 'no section 8' (in capitals) decided \${shape(d)}, expected blocked by the stoplist tier\`);
   assert.deepStrictEqual(d.reasons, ['stop_phrase:no section 8'], \`a stop-list block must say which phrase hit, got reasons \${JSON.stringify(d.reasons)}\`);
+  d = await m.decide('Is the building adults only?', POLICY);
+  assert(!d.allowed && JSON.stringify(d.reasons) === '["stop_phrase:Adults Only"]', \`a lower-case text containing the policy's stop phrase 'Adults Only' decided \${shape(d)}, expected blocked with reason stop_phrase:Adults Only: compare both sides case-insensitively\`);
   const calls = ctx.grpc.callsTo('Classify').length + ctx.grpc.callsTo('Assess').length;
   assert.equal(calls, 0, \`a stop-list hit still made \${calls} RPC(s): the deterministic tier answers before the classifier\`);
   d = await m.decide(NEUTRAL, POLICY);
@@ -744,8 +760,10 @@ export async function check_judge_band(ctx) {
   assert(!d.allowed && d.tier === 'judge' && JSON.stringify(d.reasons) === '["judge:familial_status"]', \`a 0.25 the judge finds non-compliant decided \${shape(d)}, expected blocked by the judge with reason judge:familial_status\`);
   d = await m.decide(BAND_OK, POLICY);
   assert(d.allowed && d.tier === 'judge', \`a 0.20 the judge finds compliant decided \${shape(d)}, expected allowed by the judge\`);
+  d = await m.decide(AT_LOW, POLICY);
+  assert(!d.allowed && d.tier === 'judge' && JSON.stringify(d.reasons) === '["judge:familial_status"]', \`a score of exactly 0.15 the judge finds non-compliant decided \${shape(d)}, expected blocked by the judge: the band [0.15, 0.35) includes 0.15\`);
   const calls = ctx.grpc.callsTo('Assess');
-  assert.equal(calls.length, 2, \`the judge was asked \${calls.length} times for two texts in the band\`);
+  assert.equal(calls.length, 3, \`the judge was asked \${calls.length} times for three texts in the band\`);
   for (const call of calls) {
     assert(call.timeout !== null && 1.5 <= call.timeout && call.timeout <= 2.5, \`Assess carries a \${call.timeout} s deadline, expected JUDGE_DEADLINE_MS = 2000\`);
   }
@@ -759,6 +777,17 @@ export async function check_fail_closed(ctx) {
   ctx.grpc.fail('Assess', ctx.grpc.status.UNAVAILABLE, 'judge down');
   d = await m.decide(BAND_OK, POLICY);
   assert(!d.allowed && JSON.stringify(d.reasons) === '["guard_unavailable"]', \`with the judge UNAVAILABLE a band score decided \${shape(d)}, expected blocked with reason guard_unavailable\`);
+  for (const code of ['INTERNAL', 'RESOURCE_EXHAUSTED', 'UNKNOWN']) {
+    for (const [method, text] of [['Classify', HIGH], ['Assess', BAND_OK]]) {
+      ctx.grpc.fail(method, ctx.grpc.status[code], 'tier failed');
+      try {
+        d = await m.decide(text, POLICY);
+      } catch (err) {
+        assert.fail(\`with \${method} failing \${code} decide threw (\${err}): any RPC error answers blocked with reason guard_unavailable\`);
+      }
+      assert(!d.allowed && JSON.stringify(d.reasons) === '["guard_unavailable"]', \`with \${method} failing \${code} decide answered \${shape(d)}, expected blocked with reason guard_unavailable: any RPC error fails closed\`);
+    }
+  }
   ctx.grpc.setLatency('Assess', 5.0);
   d = await m.decide(BAND_OK, POLICY);
   assert(!d.allowed && JSON.stringify(d.reasons) === '["guard_unavailable"]', \`with the judge slower than its deadline a band score decided \${shape(d)}, expected blocked with reason guard_unavailable\`);
@@ -779,19 +808,20 @@ import (
 )
 
 const (
-	neutralText  = "Two-bedroom homes near light rail under $900k"
-	bandOKText   = "Which schools are within walking distance?"
-	bandBadText  = "Is this a good area for a young couple without kids?"
-	leaningText  = "Which blocks have fewer families with kids?"
-	edgeText     = "Is the building mostly retirees?"
-	highText     = "Beacon Hill is mostly Latino families, so you would fit right in."
+	hNeutralText = "Two-bedroom homes near light rail under $900k"
+	hBandOKText  = "Which schools are within walking distance?"
+	hBandBadText = "Is this a good area for a young couple without kids?"
+	hLeaningText = "Which blocks have fewer families with kids?"
+	hEdgeText    = "Is the building mostly retirees?"
+	hAtLowText   = "Is this street quiet enough for retirees?"
+	hHighText    = "Beacon Hill is mostly Latino families, so you would fit right in."
 )
 
 var (
-	tiersBg = context.Background()
-	policy  = store.Policy{Version: "fh-2024-05-21", StopPhrases: []string{"no section 8", "adults only"}}
-	// The classifier's score for each text (0.04 for any other); the judge finds only bandBadText non-compliant.
-	scores = map[string]float64{bandOKText: 0.20, bandBadText: 0.25, leaningText: 0.40, edgeText: 0.35, highText: 0.92}
+	hBg     = context.Background()
+	hPolicy = store.Policy{Version: "fh-2024-05-21", StopPhrases: []string{"no section 8", "Adults Only"}}
+	// The classifier's score for each text (0.04 for any other); the judge finds hBandBadText and hAtLowText non-compliant.
+	hScores = map[string]float64{hAtLowText: 0.15, hBandOKText: 0.20, hBandBadText: 0.25, hLeaningText: 0.40, hEdgeText: 0.35, hHighText: 0.92}
 )
 
 type classifierPeer struct {
@@ -799,7 +829,7 @@ type classifierPeer struct {
 }
 
 func (classifierPeer) Classify(_ context.Context, req *pb.ClassifyRequest) (*pb.ClassifyReply, error) {
-	score, ok := scores[req.GetText()]
+	score, ok := hScores[req.GetText()]
 	if !ok {
 		score = 0.04
 	}
@@ -815,79 +845,90 @@ type judgePeer struct {
 }
 
 func (judgePeer) Assess(_ context.Context, req *pb.AssessRequest) (*pb.Assessment, error) {
-	if req.GetText() == bandBadText {
+	if req.GetText() == hBandBadText || req.GetText() == hAtLowText {
 		return &pb.Assessment{Compliant: false, Reason: "familial_status"}, nil
 	}
 	return &pb.Assessment{Compliant: true}, nil
 }
 
-func serveTiers(ctx *harness.Ctx) {
+func hServeTiers(ctx *harness.Ctx) {
 	pb.RegisterClassifierServer(ctx.GRPC.Server("classifier:9000"), classifierPeer{})
 	pb.RegisterJudgeServer(ctx.GRPC.Server("judge:9000"), judgePeer{})
 }
 
 func CheckStoplistFirst(ctx *harness.Ctx) {
-	serveTiers(ctx)
-	d := decide(tiersBg, "Only tenants with NO Section 8 vouchers, please", policy)
+	hServeTiers(ctx)
+	d := decide(hBg, "Only tenants with NO Section 8 vouchers, please", hPolicy)
 	ctx.Assert(!d.Allowed && d.Tier == "stoplist", "a text containing the stop phrase 'no section 8' (in capitals) decided %+v, expected blocked by the stoplist tier", d)
 	ctx.Equal(d.Reasons, []string{"stop_phrase:no section 8"}, "a stop-list block must say which phrase hit; the reasons")
+	d = decide(hBg, "Is the building adults only?", hPolicy)
+	ctx.Assert(!d.Allowed && len(d.Reasons) == 1 && d.Reasons[0] == "stop_phrase:Adults Only", "a lower-case text containing the policy's stop phrase 'Adults Only' decided %+v, expected blocked with reason stop_phrase:Adults Only: compare both sides case-insensitively", d)
 	calls := len(ctx.GRPC.CallsTo("Classify", "")) + len(ctx.GRPC.CallsTo("Assess", ""))
 	ctx.Equal(calls, 0, "a stop-list hit must answer before any RPC; the RPCs made")
-	d = decide(tiersBg, neutralText, policy)
+	d = decide(hBg, hNeutralText, hPolicy)
 	ctx.Assert(d.Allowed && len(ctx.GRPC.CallsTo("Classify", "")) == 1, "a text with no stop phrase must go to the classifier, decided %+v", d)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveTiers(ctx)
-	decide(tiersBg, neutralText, policy)
+	hServeTiers(ctx)
+	decide(hBg, hNeutralText, hPolicy)
 	calls := ctx.GRPC.CallsTo("Classify", "")
 	ctx.Assert(len(calls) > 0, "decide made no Classify call")
 	ctx.Assert(calls[0].HasDeadline(), "Classify carries no deadline: a classifier that stalls holds the user's turn open")
 	ctx.Assert(200*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 300*time.Millisecond, "Classify carries a %v deadline, expected 250 ms", calls[0].Timeout)
 	ctx.GRPC.SetLatency("Classify", 1.0, "")
-	d := decide(tiersBg, neutralText, policy)
+	d := decide(hBg, hNeutralText, hPolicy)
 	ctx.Assert(!d.Allowed, "a classifier slower than the deadline decided %+v: a timeout is not an approval", d)
 }
 
 func CheckRecallThresholds(ctx *harness.Ctx) {
-	serveTiers(ctx)
-	for _, text := range []string{leaningText, edgeText, highText} {
-		d := decide(tiersBg, text, policy)
-		ctx.Assert(!d.Allowed && d.Tier == "classifier", "a classifier score of %v decided %+v, expected blocked by the classifier (blockThreshold = 0.35)", scores[text], d)
+	hServeTiers(ctx)
+	for _, text := range []string{hLeaningText, hEdgeText, hHighText} {
+		d := decide(hBg, text, hPolicy)
+		ctx.Assert(!d.Allowed && d.Tier == "classifier", "a classifier score of %v decided %+v, expected blocked by the classifier (blockThreshold = 0.35)", hScores[text], d)
 		ctx.Equal(d.Reasons, []string{"classifier:familial_status"}, "a classifier block must carry the label; the reasons")
 	}
 	ctx.Equal(len(ctx.GRPC.CallsTo("Assess", "")), 0, "scores at or above 0.35 must block without asking the judge; the judge calls")
-	d := decide(tiersBg, neutralText, policy)
+	d := decide(hBg, hNeutralText, hPolicy)
 	ctx.Assert(d.Allowed && d.Tier == "classifier", "a classifier score of 0.04 decided %+v, expected allowed by the classifier (below reviewLow = 0.15)", d)
 }
 
 func CheckJudgeBand(ctx *harness.Ctx) {
-	serveTiers(ctx)
-	d := decide(tiersBg, neutralText, policy)
+	hServeTiers(ctx)
+	d := decide(hBg, hNeutralText, hPolicy)
 	ctx.Assert(d.Allowed, "a score of 0.04 decided %+v", d)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Assess", "")), 0, "only the band [0.15, 0.35) goes to the judge; the judge calls for a score of 0.04")
-	d = decide(tiersBg, bandBadText, policy)
+	d = decide(hBg, hBandBadText, hPolicy)
 	ctx.Assert(!d.Allowed && d.Tier == "judge" && len(d.Reasons) == 1 && d.Reasons[0] == "judge:familial_status", "a 0.25 the judge finds non-compliant decided %+v, expected blocked by the judge with reason judge:familial_status", d)
-	d = decide(tiersBg, bandOKText, policy)
+	d = decide(hBg, hBandOKText, hPolicy)
 	ctx.Assert(d.Allowed && d.Tier == "judge", "a 0.20 the judge finds compliant decided %+v, expected allowed by the judge", d)
+	d = decide(hBg, hAtLowText, hPolicy)
+	ctx.Assert(!d.Allowed && d.Tier == "judge" && len(d.Reasons) == 1 && d.Reasons[0] == "judge:familial_status", "a score of exactly 0.15 the judge finds non-compliant decided %+v, expected blocked by the judge: the band [0.15, 0.35) includes 0.15", d)
 	calls := ctx.GRPC.CallsTo("Assess", "")
-	ctx.Equal(len(calls), 2, "two texts in the band; the judge calls")
+	ctx.Equal(len(calls), 3, "three texts in the band; the judge calls")
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "Assess carries a %v deadline, expected 2 s", call.Timeout)
 	}
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	serveTiers(ctx)
+	hServeTiers(ctx)
 	closed := []string{"guard_unavailable"}
 	ctx.GRPC.Fail("Classify", codes.Unavailable, "classifier pods overloaded", 1, "")
-	d := decide(tiersBg, highText, policy)
+	d := decide(hBg, hHighText, hPolicy)
 	ctx.Assert(!d.Allowed && len(d.Reasons) == 1 && d.Reasons[0] == closed[0], "with the classifier UNAVAILABLE decide answered %+v, expected blocked with reason guard_unavailable", d)
 	ctx.GRPC.Fail("Assess", codes.Unavailable, "judge down", 1, "")
-	d = decide(tiersBg, bandOKText, policy)
+	d = decide(hBg, hBandOKText, hPolicy)
 	ctx.Assert(!d.Allowed && len(d.Reasons) == 1 && d.Reasons[0] == closed[0], "with the judge UNAVAILABLE a band score decided %+v, expected blocked with reason guard_unavailable", d)
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.Unknown} {
+		for _, probe := range [][2]string{{"Classify", hHighText}, {"Assess", hBandOKText}} {
+			ctx.GRPC.Fail(probe[0], code, "tier failed", 1, "")
+			d = decide(hBg, probe[1], hPolicy)
+			ctx.Assert(!d.Allowed && len(d.Reasons) == 1 && d.Reasons[0] == closed[0], "with %s failing %v decide answered %+v, expected blocked with reason guard_unavailable: any RPC error fails closed", probe[0], code, d)
+		}
+	}
 	ctx.GRPC.SetLatency("Assess", 5.0, "")
-	d = decide(tiersBg, bandOKText, policy)
+	d = decide(hBg, hBandOKText, hPolicy)
 	ctx.Assert(!d.Allowed && len(d.Reasons) == 1 && d.Reasons[0] == closed[0], "with the judge slower than its deadline a band score decided %+v, expected blocked with reason guard_unavailable", d)
 }
 `,
@@ -902,21 +943,22 @@ func CheckFailClosed(ctx *harness.Ctx) {
 
 namespace {
 
-const store::Policy kPolicy{"fh-2024-05-21", {"no section 8", "adults only"}};
-const std::string kNeutral = "Two-bedroom homes near light rail under $900k";
-const std::string kBandOk = "Which schools are within walking distance?";
-const std::string kBandBad = "Is this a good area for a young couple without kids?";
-const std::string kLeaning = "Which blocks have fewer families with kids?";
-const std::string kEdge = "Is the building mostly retirees?";
-const std::string kHigh = "Beacon Hill is mostly Latino families, so you would fit right in.";
-// The classifier's score for each text (0.04 for any other); the judge finds only kBandBad non-compliant.
-const std::map<std::string, double> kScores = {{kBandOk, 0.20}, {kBandBad, 0.25}, {kLeaning, 0.40}, {kEdge, 0.35}, {kHigh, 0.92}};
+const store::Policy kHPolicy{"fh-2024-05-21", {"no section 8", "Adults Only"}};
+const std::string kHNeutral = "Two-bedroom homes near light rail under $900k";
+const std::string kHBandOk = "Which schools are within walking distance?";
+const std::string kHBandBad = "Is this a good area for a young couple without kids?";
+const std::string kHLeaning = "Which blocks have fewer families with kids?";
+const std::string kHEdge = "Is the building mostly retirees?";
+const std::string kHAtLow = "Is this street quiet enough for retirees?";
+const std::string kHHigh = "Beacon Hill is mostly Latino families, so you would fit right in.";
+// The classifier's score for each text (0.04 for any other); the judge finds kHBandBad and kHAtLow non-compliant.
+const std::map<std::string, double> kHScores = {{kHAtLow, 0.15}, {kHBandOk, 0.20}, {kHBandBad, 0.25}, {kHLeaning, 0.40}, {kHEdge, 0.35}, {kHHigh, 0.92}};
 
 class ClassifierPeer final : public fairhousing::Classifier::Service {
  public:
   grpc::Status Classify(grpc::ServerContext*, const fairhousing::ClassifyRequest* req, fairhousing::ClassifyReply* out) override {
-    const auto it = kScores.find(req->text());
-    const double score = it == kScores.end() ? 0.04 : it->second;
+    const auto it = kHScores.find(req->text());
+    const double score = it == kHScores.end() ? 0.04 : it->second;
     out->set_score(score);
     out->set_label(score >= 0.15 ? "familial_status" : "");
     return grpc::Status::OK;
@@ -926,96 +968,108 @@ class ClassifierPeer final : public fairhousing::Classifier::Service {
 class JudgePeer final : public fairhousing::Judge::Service {
  public:
   grpc::Status Assess(grpc::ServerContext*, const fairhousing::AssessRequest* req, fairhousing::Assessment* out) override {
-    out->set_compliant(req->text() != kBandBad);
-    if (req->text() == kBandBad) out->set_reason("familial_status");
+    const bool flagged = req->text() == kHBandBad || req->text() == kHAtLow;
+    out->set_compliant(!flagged);
+    if (flagged) out->set_reason("familial_status");
     return grpc::Status::OK;
   }
 };
 
-struct Peers {
+struct HPeers {
   ClassifierPeer classifier;
   JudgePeer judge;
 };
 
-void serveTiers(harness::Ctx& ctx) {
-  static Peers* peers = nullptr;
+void hServeTiers(harness::Ctx& ctx) {
+  static HPeers* peers = nullptr;
   delete peers;
-  peers = new Peers;
+  peers = new HPeers;
   ctx.GRPC.Server("classifier:9000")->RegisterService(&peers->classifier);
   ctx.GRPC.Server("judge:9000")->RegisterService(&peers->judge);
 }
 
-std::string shape(const store::Decision& d) {
+std::string hShape(const store::Decision& d) {
   std::string reasons;
   for (const auto& r : d.reasons) reasons += (reasons.empty() ? "" : ",") + r;
   return std::string("allowed=") + (d.allowed ? "true" : "false") + " tier=" + d.tier + " reasons=[" + reasons + "]";
 }
 
-bool closed(const store::Decision& d) { return !d.allowed && d.reasons == std::vector<std::string>{"guard_unavailable"}; }
+bool hClosed(const store::Decision& d) { return !d.allowed && d.reasons == std::vector<std::string>{"guard_unavailable"}; }
 
 }  // namespace
 
 void CheckStoplistFirst(harness::Ctx& ctx) {
-  serveTiers(ctx);
-  auto d = decide("Only tenants with NO Section 8 vouchers, please", kPolicy);
-  ctx.Assert(!d.allowed && d.tier == "stoplist", "a text containing the stop phrase 'no section 8' (in capitals) decided %s, expected blocked by the stoplist tier", shape(d));
+  hServeTiers(ctx);
+  auto d = decide("Only tenants with NO Section 8 vouchers, please", kHPolicy);
+  ctx.Assert(!d.allowed && d.tier == "stoplist", "a text containing the stop phrase 'no section 8' (in capitals) decided %s, expected blocked by the stoplist tier", hShape(d));
   ctx.Equal(d.reasons, std::vector<std::string>{"stop_phrase:no section 8"}, "a stop-list block must say which phrase hit; the reasons");
+  d = decide("Is the building adults only?", kHPolicy);
+  ctx.Assert(!d.allowed && d.reasons == std::vector<std::string>{"stop_phrase:Adults Only"}, "a lower-case text containing the policy's stop phrase 'Adults Only' decided %s, expected blocked with reason stop_phrase:Adults Only: compare both sides case-insensitively", hShape(d));
   ctx.Equal(ctx.GRPC.CallsTo("Classify").size() + ctx.GRPC.CallsTo("Assess").size(), 0, "a stop-list hit must answer before any RPC; the RPCs made");
-  d = decide(kNeutral, kPolicy);
-  ctx.Assert(d.allowed && ctx.GRPC.CallsTo("Classify").size() == 1, "a text with no stop phrase must go to the classifier, decided %s", shape(d));
+  d = decide(kHNeutral, kHPolicy);
+  ctx.Assert(d.allowed && ctx.GRPC.CallsTo("Classify").size() == 1, "a text with no stop phrase must go to the classifier, decided %s", hShape(d));
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveTiers(ctx);
-  decide(kNeutral, kPolicy);
+  hServeTiers(ctx);
+  decide(kHNeutral, kHPolicy);
   const auto calls = ctx.GRPC.CallsTo("Classify");
   ctx.Assert(!calls.empty(), "decide made no Classify call");
   ctx.Assert(calls[0].HasDeadline(), "Classify carries no deadline: a classifier that stalls holds the user's turn open");
   ctx.Assert(0.2 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.3, "Classify carries a %v s deadline, expected 250 ms", calls[0].TimeoutSeconds());
   ctx.GRPC.SetLatency("Classify", 1.0);
-  const auto d = decide(kNeutral, kPolicy);
-  ctx.Assert(!d.allowed, "a classifier slower than the deadline decided %s: a timeout is not an approval", shape(d));
+  const auto d = decide(kHNeutral, kHPolicy);
+  ctx.Assert(!d.allowed, "a classifier slower than the deadline decided %s: a timeout is not an approval", hShape(d));
 }
 
 void CheckRecallThresholds(harness::Ctx& ctx) {
-  serveTiers(ctx);
-  for (const auto& text : {kLeaning, kEdge, kHigh}) {
-    const auto d = decide(text, kPolicy);
-    ctx.Assert(!d.allowed && d.tier == "classifier", "a classifier score of %v decided %s, expected blocked by the classifier (kBlockThreshold = 0.35)", kScores.at(text), shape(d));
+  hServeTiers(ctx);
+  for (const auto& text : {kHLeaning, kHEdge, kHHigh}) {
+    const auto d = decide(text, kHPolicy);
+    ctx.Assert(!d.allowed && d.tier == "classifier", "a classifier score of %v decided %s, expected blocked by the classifier (kBlockThreshold = 0.35)", kHScores.at(text), hShape(d));
     ctx.Equal(d.reasons, std::vector<std::string>{"classifier:familial_status"}, "a classifier block must carry the label; the reasons");
   }
   ctx.Equal(ctx.GRPC.CallsTo("Assess").size(), 0, "scores at or above 0.35 must block without asking the judge; the judge calls");
-  const auto d = decide(kNeutral, kPolicy);
-  ctx.Assert(d.allowed && d.tier == "classifier", "a classifier score of 0.04 decided %s, expected allowed by the classifier (below kReviewLow = 0.15)", shape(d));
+  const auto d = decide(kHNeutral, kHPolicy);
+  ctx.Assert(d.allowed && d.tier == "classifier", "a classifier score of 0.04 decided %s, expected allowed by the classifier (below kReviewLow = 0.15)", hShape(d));
 }
 
 void CheckJudgeBand(harness::Ctx& ctx) {
-  serveTiers(ctx);
-  auto d = decide(kNeutral, kPolicy);
-  ctx.Assert(d.allowed, "a score of 0.04 decided %s", shape(d));
+  hServeTiers(ctx);
+  auto d = decide(kHNeutral, kHPolicy);
+  ctx.Assert(d.allowed, "a score of 0.04 decided %s", hShape(d));
   ctx.Equal(ctx.GRPC.CallsTo("Assess").size(), 0, "only the band [0.15, 0.35) goes to the judge; the judge calls for a score of 0.04");
-  d = decide(kBandBad, kPolicy);
-  ctx.Assert(!d.allowed && d.tier == "judge" && d.reasons == std::vector<std::string>{"judge:familial_status"}, "a 0.25 the judge finds non-compliant decided %s, expected blocked by the judge with reason judge:familial_status", shape(d));
-  d = decide(kBandOk, kPolicy);
-  ctx.Assert(d.allowed && d.tier == "judge", "a 0.20 the judge finds compliant decided %s, expected allowed by the judge", shape(d));
+  d = decide(kHBandBad, kHPolicy);
+  ctx.Assert(!d.allowed && d.tier == "judge" && d.reasons == std::vector<std::string>{"judge:familial_status"}, "a 0.25 the judge finds non-compliant decided %s, expected blocked by the judge with reason judge:familial_status", hShape(d));
+  d = decide(kHBandOk, kHPolicy);
+  ctx.Assert(d.allowed && d.tier == "judge", "a 0.20 the judge finds compliant decided %s, expected allowed by the judge", hShape(d));
+  d = decide(kHAtLow, kHPolicy);
+  ctx.Assert(!d.allowed && d.tier == "judge" && d.reasons == std::vector<std::string>{"judge:familial_status"}, "a score of exactly 0.15 the judge finds non-compliant decided %s, expected blocked by the judge: the band [0.15, 0.35) includes 0.15", hShape(d));
   const auto calls = ctx.GRPC.CallsTo("Assess");
-  ctx.Equal(calls.size(), 2, "two texts in the band; the judge calls");
+  ctx.Equal(calls.size(), 3, "three texts in the band; the judge calls");
   for (const auto& call : calls) {
     ctx.Assert(call.HasDeadline() && 1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "Assess carries a %v s deadline, expected 2 s", call.TimeoutSeconds());
   }
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  serveTiers(ctx);
+  hServeTiers(ctx);
   ctx.GRPC.Fail("Classify", grpc::StatusCode::UNAVAILABLE, "classifier pods overloaded");
-  auto d = decide(kHigh, kPolicy);
-  ctx.Assert(closed(d), "with the classifier UNAVAILABLE decide answered %s, expected blocked with reason guard_unavailable", shape(d));
+  auto d = decide(kHHigh, kHPolicy);
+  ctx.Assert(hClosed(d), "with the classifier UNAVAILABLE decide answered %s, expected blocked with reason guard_unavailable", hShape(d));
   ctx.GRPC.Fail("Assess", grpc::StatusCode::UNAVAILABLE, "judge down");
-  d = decide(kBandOk, kPolicy);
-  ctx.Assert(closed(d), "with the judge UNAVAILABLE a band score decided %s, expected blocked with reason guard_unavailable", shape(d));
+  d = decide(kHBandOk, kHPolicy);
+  ctx.Assert(hClosed(d), "with the judge UNAVAILABLE a band score decided %s, expected blocked with reason guard_unavailable", hShape(d));
+  for (const auto code : {grpc::StatusCode::INTERNAL, grpc::StatusCode::RESOURCE_EXHAUSTED, grpc::StatusCode::UNKNOWN}) {
+    for (const auto& [method, text] : std::vector<std::pair<std::string, std::string>>{{"Classify", kHHigh}, {"Assess", kHBandOk}}) {
+      ctx.GRPC.Fail(method, code, "tier failed");
+      d = decide(text, kHPolicy);
+      ctx.Assert(hClosed(d), "with %s failing code %v decide answered %s, expected blocked with reason guard_unavailable: any RPC error fails closed", method, static_cast<int>(code), hShape(d));
+    }
+  }
   ctx.GRPC.SetLatency("Assess", 5.0);
-  d = decide(kBandOk, kPolicy);
-  ctx.Assert(closed(d), "with the judge slower than its deadline a band score decided %s, expected blocked with reason guard_unavailable", shape(d));
+  d = decide(kHBandOk, kHPolicy);
+  ctx.Assert(hClosed(d), "with the judge slower than its deadline a band score decided %s, expected blocked with reason guard_unavailable", hShape(d));
 }
 `,
   },

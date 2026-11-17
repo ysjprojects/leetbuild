@@ -49,7 +49,7 @@ form because the loop invokes any tool the model names.
       id: 'compact-prompt',
       title: 'Sends the constant system prompt and a compact tool list',
       detail:
-        "Every Complete carries the same system prompt with no tool's instructions in it, and a tool list of the catalog's names with their one-line descriptions. The starter puts every tool's guidance in both.",
+        "Every Complete carries the same system prompt with no tool's instructions in it, and a tool list of the catalog's names with their one-line descriptions, in every call of the turn. The starter puts every tool's guidance in both.",
       match: {
         python: {all: [/system_prompt\s*=\s*SYSTEM_PROMPT\b/, /description\s*=\s*\w+\.description\s*\)/]},
         typescript: {all: [/system_prompt:\s*SYSTEM_PROMPT\b/, /description:\s*\w+\.description\s*[,}]/]},
@@ -62,7 +62,7 @@ form because the loop invokes any tool the model names.
       id: 'jit-instructions',
       title: "Sends a tool's instructions in the call after it ran",
       detail:
-        'The first call carries no instructions; the call after `segment_customers` ran carries exactly its instructions; a refused tool sends none. The starter never fills `instructions`.',
+        "The first call carries no instructions; the call after `segment_customers` ran carries exactly its instructions; a refused tool sends none, also right after a tool that ran; after `segment_customers` and then `fill_product_form` ran, the third call carries only the form's. The starter never fills `instructions`.",
       match: {
         python: {all: [/instructions\s*=\s*\w+\.instructions/, /instructions\s*=\s*instructions\b/]},
         typescript: {all: [/instructions\s*=\s*\w+\.instructions/]},
@@ -75,7 +75,7 @@ form because the loop invokes any tool the model names.
       id: 'turn-limit',
       title: 'Stops after six model calls',
       detail:
-        'A model that asks for a tool on every turn gets exactly 6 Complete calls and the outcome says `turn_limit`. The starter loops until the model gives up.',
+        'A model that asks for a tool on every turn gets exactly 6 Complete calls and the outcome says `turn_limit`, also when every one of those calls is refused. The starter loops until the model gives up.',
       match: {
         python: {all: [/MAX_TURNS\s*=\s*6\b/, /range\(\s*MAX_TURNS\s*\)/], none: [/while\s+True/]},
         typescript: {
@@ -91,7 +91,7 @@ form because the loop invokes any tool the model names.
       id: 'call-deadline',
       title: 'A deadline on every model call and a 30 s budget for the loop',
       detail:
-        'Every Complete carries a deadline of at most 10 s: a model that hangs ends the turn after 10 s with status `deadline`, and a model that takes 8 s per call ends the loop at 30 s. The starter waits as long as the model takes.',
+        'Every Complete carries a deadline of at most 10 s: a model that hangs ends the turn after 10 s with status `deadline`, a model that takes 8 s per call ends the loop at 30 s, and a model that takes 4 s per call still gets its six calls. The starter waits as long as the model takes.',
       match: {
         python: {all: [/timeout\s*=/, /LOOP_BUDGET_S/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/deadline:/, /LOOP_BUDGET_MS/, /DEADLINE_EXCEEDED/]},
@@ -104,7 +104,7 @@ form because the loop invokes any tool the model names.
       id: 'scope-gate',
       title: 'Invokes only catalog tools the merchant holds the scope for',
       detail:
-        'With scopes `[read_customers]`, a `fill_product_form` call and an unknown `delete_shop` call reach no tool; the model gets a `PERMISSION_DENIED` tool message and `tools_used` stays empty. The starter invokes whatever the model names.',
+        'With scopes `[read_customers]` a `fill_product_form` call, with `[read_reports]` a `segment_customers` call, and an unknown `delete_shop` call reach no tool and leave `tools_used` empty; the model gets a `PERMISSION_DENIED` tool message for the form and for `delete_shop`. The starter invokes whatever the model names.',
       match: {
         python: {all: [/PERMISSION_DENIED/], order: [/required_scope\s+(not\s+)?in\s+scopes/, /=\s*invoke_tool\(/]},
         typescript: {
@@ -783,6 +783,8 @@ LOOP_CAP = 12
 CUSTOMERS = "which of my customers are from Toronto?"
 FORM = "write an SEO description for the jacket I have open"
 LOOP = "loop: compare this week's sales with every week this year"
+# The stand-in model asks for segment_customers, then for fill_product_form, then answers.
+CHAIN = "find my Toronto customers, then write an SEO description for the jacket"
 
 
 class ModelPeer(merchant_agent_pb2_grpc.ModelServicer):
@@ -796,7 +798,14 @@ class ModelPeer(merchant_agent_pb2_grpc.ModelServicer):
         if self.calls > LOOP_CAP:
             return merchant_agent_pb2.CompleteReply(text="(the stand-in model stopped asking for tools)")
         user = request.messages[0].content if request.messages else ""
-        reply = model.respond(user, [m.content for m in request.messages if m.role == "tool"])
+        results = [m.content for m in request.messages if m.role == "tool"]
+        if user == CHAIN:
+            if len(results) == 0:
+                return merchant_agent_pb2.CompleteReply(tool_call=merchant_agent_pb2.ToolCall(name="segment_customers", args_json='{"query":"default_address_city = Toronto"}'))
+            if len(results) == 1:
+                return merchant_agent_pb2.CompleteReply(tool_call=merchant_agent_pb2.ToolCall(name="fill_product_form", args_json='{"product_id":"p-1","field":"seo_description"}'))
+            return merchant_agent_pb2.CompleteReply(text="Done: " + results[-1])
+        reply = model.respond(user, results)
         return merchant_agent_pb2.CompleteReply(text=reply.text, tool_call=merchant_agent_pb2.ToolCall(name=reply.tool_name, args_json=reply.args_json))
 
 
@@ -831,9 +840,10 @@ def check_compact_prompt(ctx):
     assert len(prompts) == 1, f"the system prompt changed between calls ({len(prompts)} versions): every change misses the provider's prompt cache"
     for tool in catalog.CATALOG.values():
         assert tool.instructions not in requests[0].system_prompt, f"the system prompt carries {tool.name}'s instructions: every tool's guidance in every call is the prompt that grows with the catalog"
-    listed = [(t.name, t.description) for t in requests[0].tools]
-    expected = [(t.name, t.description) for t in catalog.CATALOG.values()]
-    assert listed == expected, f"the tool list must be the catalog's names with their one-line descriptions, got {listed}"
+    expected = sorted((t.name, t.description) for t in catalog.CATALOG.values())
+    for i, request in enumerate(requests):
+        listed = sorted((t.name, t.description) for t in request.tools)
+        assert listed == expected, f"call {i + 1}: the tool list must be the catalog's names with their one-line descriptions, every call, got {listed}"
 
 
 def check_jit_instructions(ctx):
@@ -847,6 +857,16 @@ def check_jit_instructions(ctx):
     m.run_agent("s1", [], CUSTOMERS, "customers", "t-2")
     later = _requests(ctx)[2:]
     assert later and all(r.instructions == "" for r in later), f"a refused tool call ran nothing, so the next call carries no instructions: {[r.instructions for r in later]}"
+    seen = len(_requests(ctx))
+    out = m.run_agent("s1", ["read_customers"], CHAIN, "customers", "t-3")
+    chain = [r.instructions for r in _requests(ctx)[seen:]]
+    assert len(chain) == 3, f"segment_customers, then a refused fill_product_form, then the answer: 3 Complete calls, saw {len(chain)} and {out}"
+    assert chain == ["", wanted, ""], f"instructions travel in the one call after their tool ran: segment_customers ran, then fill_product_form was refused, so the third call carries none; the calls carried {chain}"
+    seen = len(_requests(ctx))
+    m.run_agent("s1", ["read_customers", "write_products"], CHAIN, "products", "t-4")
+    chain = [r.instructions for r in _requests(ctx)[seen:]]
+    form = catalog.CATALOG["fill_product_form"].instructions
+    assert chain == ["", wanted, form], f"after segment_customers and then fill_product_form ran, each next call carries only the instructions of the tool that just ran; the calls carried {chain}"
 
 
 def check_turn_limit(ctx):
@@ -856,6 +876,11 @@ def check_turn_limit(ctx):
     assert calls == 6, f"a model that asks for a tool on every turn got {calls} Complete calls: the loop stops at MAX_TURNS = 6"
     assert out.status == "turn_limit", f"the outcome must say turn_limit, got {out.status!r}"
     assert len(out.tools_used) == 6, f"tools_used lists the six tool calls made, got {out.tools_used}"
+    seen = len(ctx.grpc.calls_to("Complete"))
+    out = m.run_agent("s1", ["read_customers"], LOOP, "analytics", "t-2")
+    calls = len(ctx.grpc.calls_to("Complete")) - seen
+    assert calls == 6 and out.status == "turn_limit", f"a model that asks on every turn for a tool the merchant may not use got {calls} Complete calls and status {out.status!r}: a refused call is a turn too, the loop stops at MAX_TURNS = 6"
+    assert out.tools_used == [], f"every call was refused, so tools_used stays empty, got {out.tools_used}"
 
 
 def check_call_deadline(ctx):
@@ -873,6 +898,13 @@ def check_call_deadline(ctx):
     waited = ctx.clock.time() - started
     assert waited <= 30.5, f"a model that takes 8 s per call held the loop {waited:.0f} s: the whole loop has LOOP_BUDGET_S = 30"
     assert out.status == "deadline", f"a loop that ran out of time must say deadline, got {out.status!r}"
+    timeouts = [call.timeout for call in ctx.grpc.calls_to("Complete")]
+    assert all(t is not None and t <= 10.5 for t in timeouts), f"every Complete carries a deadline of at most 10 s, they carried {timeouts}"
+    ctx.grpc.set_latency("Complete", 4.0, config.MODEL_ADDR)
+    seen = len(timeouts)
+    out = m.run_agent("s1", ["read_reports"], LOOP, "analytics", "t-3")
+    calls = len(ctx.grpc.calls_to("Complete")) - seen
+    assert out.status == "turn_limit" and calls == 6, f"a model that takes 4 s per call fits six calls in the 30 s budget (24 s), got {calls} calls and status {out.status!r}: the loop's budget is LOOP_BUDGET_S = 30, each call's deadline is MODEL_DEADLINE_S = 10"
 
 
 def check_scope_gate(ctx):
@@ -883,15 +915,22 @@ def check_scope_gate(ctx):
     last = _requests(ctx)[-1]
     told = [msg for msg in last.messages if msg.role == "tool"]
     assert told and told[-1].content == catalog.PERMISSION_DENIED and told[-1].tool_name == "fill_product_form", f"the model must hear PERMISSION_DENIED for fill_product_form, its messages were {[(x.role, x.tool_name, x.content[:30]) for x in last.messages]}"
-    m.run_agent("s1", ["read_customers", "write_products"], "delete my shop", "home", "t-2")
+    out = m.run_agent("s1", ["read_reports"], CUSTOMERS, "customers", "t-2")
+    assert _invoked(ctx) == [] and out.tools_used == [], f"a staff account with only read_reports got {_invoked(ctx)} invoked: segment_customers reads customers and needs read_customers, read tools are gated too"
+    m.run_agent("s1", ["read_customers", "write_products"], "delete my shop", "home", "t-3")
     assert _invoked(ctx) == [], f"delete_shop is not in the catalog and was invoked anyway: {_invoked(ctx)}"
-    out = m.run_agent("s1", ["read_customers", "write_products"], FORM, "products", "t-3")
+    last = _requests(ctx)[-1]
+    told = [msg for msg in last.messages if msg.role == "tool"]
+    assert told and told[-1].content == catalog.PERMISSION_DENIED and told[-1].tool_name == "delete_shop", f"the model must hear PERMISSION_DENIED for delete_shop and answer, its last call's messages were {[(x.role, x.tool_name, x.content[:30]) for x in last.messages]}"
+    out = m.run_agent("s1", ["read_customers", "write_products"], FORM, "products", "t-4")
     assert _invoked(ctx) == ["fill_product_form"] and out.tools_used == ["fill_product_form"], f"with write_products the form is filled once: invoked {_invoked(ctx)}, outcome {out}"
 `,
     typescript: `const LOOP_CAP = 12; // the stand-in model answers in text after this many calls, so a loop with no exit still ends
 const CUSTOMERS = 'which of my customers are from Toronto?';
 const FORM = 'write an SEO description for the jacket I have open';
 const LOOP = "loop: compare this week's sales with every week this year";
+// The stand-in model asks for segment_customers, then for fill_product_form, then answers.
+const CHAIN = 'find my Toronto customers, then write an SEO description for the jacket';
 
 /** The stand-in model and tools, the learner's module. */
 function world(ctx) {
@@ -906,7 +945,13 @@ function world(ctx) {
       calls += 1;
       if (calls > LOOP_CAP) return callback(null, {text: '(the stand-in model stopped asking for tools)', tool_call: {name: '', args_json: ''}});
       const messages = call.request.messages ?? [];
-      const reply = model.respond(messages[0]?.content ?? '', messages.filter(x => x.role === 'tool').map(x => x.content));
+      const results = messages.filter(x => x.role === 'tool').map(x => x.content);
+      if ((messages[0]?.content ?? '') === CHAIN) {
+        if (results.length === 0) return callback(null, {text: '', tool_call: {name: 'segment_customers', args_json: '{"query":"default_address_city = Toronto"}'}});
+        if (results.length === 1) return callback(null, {text: '', tool_call: {name: 'fill_product_form', args_json: '{"product_id":"p-1","field":"seo_description"}'}});
+        return callback(null, {text: 'Done: ' + results[results.length - 1], tool_call: {name: '', args_json: ''}});
+      }
+      const reply = model.respond(messages[0]?.content ?? '', results);
       return callback(null, {text: reply.text, tool_call: {name: reply.tool_name, args_json: reply.args_json}});
     },
   }, config.MODEL_ADDR);
@@ -932,9 +977,12 @@ export async function check_compact_prompt(ctx) {
   for (const tool of Object.values(catalog.CATALOG) as {name: string; instructions: string}[]) {
     assert(!all[0].system_prompt.includes(tool.instructions), \`the system prompt carries \${tool.name}'s instructions: every tool's guidance in every call is the prompt that grows with the catalog\`);
   }
-  const listed = (all[0].tools ?? []).map(t => [t.name, t.description]);
-  const expected = (Object.values(catalog.CATALOG) as {name: string; description: string}[]).map(t => [t.name, t.description]);
-  assert.deepEqual(listed, expected, \`the tool list must be the catalog's names with their one-line descriptions, got \${JSON.stringify(listed)}\`);
+  const pairs = (list: {name: string; description: string}[]) => list.map(t => \`\${t.name} | \${t.description}\`).sort();
+  const expected = pairs(Object.values(catalog.CATALOG) as {name: string; description: string}[]);
+  all.forEach((r, i) => {
+    const listed = pairs(r.tools ?? []);
+    assert.deepEqual(listed, expected, \`call \${i + 1}: the tool list must be the catalog's names with their one-line descriptions, every call, got \${JSON.stringify(listed)}\`);
+  });
 }
 
 export async function check_jit_instructions(ctx) {
@@ -948,15 +996,30 @@ export async function check_jit_instructions(ctx) {
   await m.runAgent('s1', [], CUSTOMERS, 'customers', 't-2');
   const later = requests(ctx).slice(2);
   assert(later.length > 0 && later.every(r => (r.instructions ?? '') === ''), \`a refused tool call ran nothing, so the next call carries no instructions: \${JSON.stringify(later.map(r => r.instructions))}\`);
+  let seen = requests(ctx).length;
+  const chained = await m.runAgent('s1', ['read_customers'], CHAIN, 'customers', 't-3');
+  let chain = requests(ctx).slice(seen).map(r => r.instructions ?? '');
+  assert.equal(chain.length, 3, \`segment_customers, then a refused fill_product_form, then the answer: 3 Complete calls, saw \${chain.length} and \${JSON.stringify(chained)}\`);
+  assert.deepEqual(chain, ['', wanted, ''], \`instructions travel in the one call after their tool ran: segment_customers ran, then fill_product_form was refused, so the third call carries none; the calls carried \${JSON.stringify(chain)}\`);
+  seen = requests(ctx).length;
+  await m.runAgent('s1', ['read_customers', 'write_products'], CHAIN, 'products', 't-4');
+  chain = requests(ctx).slice(seen).map(r => r.instructions ?? '');
+  const form = catalog.CATALOG.fill_product_form.instructions;
+  assert.deepEqual(chain, ['', wanted, form], \`after segment_customers and then fill_product_form ran, each next call carries only the instructions of the tool that just ran; the calls carried \${JSON.stringify(chain)}\`);
 }
 
 export async function check_turn_limit(ctx) {
   const {m} = world(ctx);
-  const out = await m.runAgent('s1', ['read_reports'], LOOP, 'analytics', 't-1');
-  const calls = ctx.grpc.callsTo('Complete').length;
+  let out = await m.runAgent('s1', ['read_reports'], LOOP, 'analytics', 't-1');
+  let calls = ctx.grpc.callsTo('Complete').length;
   assert.equal(calls, 6, \`a model that asks for a tool on every turn got \${calls} Complete calls: the loop stops at MAX_TURNS = 6\`);
   assert.equal(out.status, 'turn_limit', \`the outcome must say turn_limit, got \${JSON.stringify(out.status)}\`);
   assert.equal(out.tools_used.length, 6, \`tools_used lists the six tool calls made, got \${JSON.stringify(out.tools_used)}\`);
+  const seen = calls;
+  out = await m.runAgent('s1', ['read_customers'], LOOP, 'analytics', 't-2');
+  calls = ctx.grpc.callsTo('Complete').length - seen;
+  assert(calls === 6 && out.status === 'turn_limit', \`a model that asks on every turn for a tool the merchant may not use got \${calls} Complete calls and status \${JSON.stringify(out.status)}: a refused call is a turn too, the loop stops at MAX_TURNS = 6\`);
+  assert.deepEqual(out.tools_used, [], \`every call was refused, so tools_used stays empty, got \${JSON.stringify(out.tools_used)}\`);
 }
 
 export async function check_call_deadline(ctx) {
@@ -974,6 +1037,12 @@ export async function check_call_deadline(ctx) {
   waited = (ctx.clock.now() - started) / 1000;
   assert(waited <= 30.5, \`a model that takes 8 s per call held the loop \${waited.toFixed(0)} s: the whole loop has LOOP_BUDGET_MS = 30000\`);
   assert.equal(out.status, 'deadline', \`a loop that ran out of time must say deadline, got \${out.status}\`);
+  const timeouts = ctx.grpc.callsTo('Complete').map(call => call.timeout);
+  assert(timeouts.every(t => t !== null && t <= 10.5), \`every Complete carries a deadline of at most 10 s, they carried \${JSON.stringify(timeouts)}\`);
+  ctx.grpc.setLatency('Complete', 4, config.MODEL_ADDR);
+  out = await m.runAgent('s1', ['read_reports'], LOOP, 'analytics', 't-3');
+  const calls = ctx.grpc.callsTo('Complete').length - timeouts.length;
+  assert(out.status === 'turn_limit' && calls === 6, \`a model that takes 4 s per call fits six calls in the 30 s budget (24 s), got \${calls} calls and status \${JSON.stringify(out.status)}: the loop's budget is LOOP_BUDGET_MS = 30000, each call's deadline is MODEL_DEADLINE_MS = 10000\`);
 }
 
 export async function check_scope_gate(ctx) {
@@ -985,9 +1054,15 @@ export async function check_scope_gate(ctx) {
   const told = (all[all.length - 1].messages ?? []).filter(x => x.role === 'tool');
   const lastTold = told[told.length - 1];
   assert(lastTold && lastTold.content === catalog.PERMISSION_DENIED && lastTold.tool_name === 'fill_product_form', \`the model must hear PERMISSION_DENIED for fill_product_form, its messages were \${JSON.stringify(all[all.length - 1].messages)}\`);
-  await m.runAgent('s1', ['read_customers', 'write_products'], 'delete my shop', 'home', 't-2');
+  out = await m.runAgent('s1', ['read_reports'], CUSTOMERS, 'customers', 't-2');
+  assert(invoked(ctx).length === 0 && out.tools_used.length === 0, \`a staff account with only read_reports got \${JSON.stringify(invoked(ctx))} invoked: segment_customers reads customers and needs read_customers, read tools are gated too\`);
+  await m.runAgent('s1', ['read_customers', 'write_products'], 'delete my shop', 'home', 't-3');
   assert.deepEqual(invoked(ctx), [], \`delete_shop is not in the catalog and was invoked anyway: \${JSON.stringify(invoked(ctx))}\`);
-  out = await m.runAgent('s1', ['read_customers', 'write_products'], FORM, 'products', 't-3');
+  const after = requests(ctx);
+  const deleteTold = (after[after.length - 1].messages ?? []).filter(x => x.role === 'tool');
+  const deleteLast = deleteTold[deleteTold.length - 1];
+  assert(deleteLast && deleteLast.content === catalog.PERMISSION_DENIED && deleteLast.tool_name === 'delete_shop', \`the model must hear PERMISSION_DENIED for delete_shop and answer, its last call's messages were \${JSON.stringify(after[after.length - 1].messages)}\`);
+  out = await m.runAgent('s1', ['read_customers', 'write_products'], FORM, 'products', 't-4');
   assert(JSON.stringify(invoked(ctx)) === '["fill_product_form"]' && JSON.stringify(out.tools_used) === '["fill_product_form"]', \`with write_products the form is filled once: invoked \${JSON.stringify(invoked(ctx))}, outcome \${JSON.stringify(out)}\`);
 }
 `,
@@ -995,6 +1070,7 @@ export async function check_scope_gate(ctx) {
 
 import (
 	"context"
+	"sort"
 	"strings"
 
 	"sidekick/catalog"
@@ -1012,6 +1088,8 @@ const (
 	loopCustomers = "which of my customers are from Toronto?"
 	loopForm      = "write an SEO description for the jacket I have open"
 	loopEndless   = "loop: compare this week's sales with every week this year"
+	// loopChain: the stand-in model asks for segment_customers, then for fill_product_form, then answers.
+	loopChain = "find my Toronto customers, then write an SEO description for the jacket"
 )
 
 // loopModel is the stand-in model: answers from sidekick/model.
@@ -1034,6 +1112,15 @@ func (p *loopModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.Co
 		if m.GetRole() == "tool" {
 			results = append(results, m.GetContent())
 		}
+	}
+	if user == loopChain {
+		switch len(results) {
+		case 0:
+			return &pb.CompleteReply{ToolCall: &pb.ToolCall{Name: "segment_customers", ArgsJson: \`{"query":"default_address_city = Toronto"}\`}}, nil
+		case 1:
+			return &pb.CompleteReply{ToolCall: &pb.ToolCall{Name: "fill_product_form", ArgsJson: \`{"product_id":"p-1","field":"seo_description"}\`}}, nil
+		}
+		return &pb.CompleteReply{Text: "Done: " + results[len(results)-1], ToolCall: &pb.ToolCall{}}, nil
 	}
 	r := model.Respond(user, results)
 	return &pb.CompleteReply{Text: r.Text, ToolCall: &pb.ToolCall{Name: r.ToolName, ArgsJson: r.ArgsJSON}}, nil
@@ -1067,6 +1154,25 @@ func loopRequests(ctx *harness.Ctx) []*pb.CompleteRequest {
 	return out
 }
 
+// loopToolList is one call's tool list as sorted "name | description" lines.
+func loopToolList(r *pb.CompleteRequest) []string {
+	out := []string{}
+	for _, t := range r.GetTools() {
+		out = append(out, t.GetName()+" | "+t.GetDescription())
+	}
+	sort.Strings(out)
+	return out
+}
+
+// loopInstructions lists the instructions each call carried, from call number from on (0-based).
+func loopInstructions(ctx *harness.Ctx, from int) []string {
+	out := []string{}
+	for _, r := range loopRequests(ctx)[from:] {
+		out = append(out, r.GetInstructions())
+	}
+	return out
+}
+
 func CheckCompactPrompt(ctx *harness.Ctx) {
 	loopWorld(ctx)
 	loopRun(ctx, []string{"read_customers"}, loopCustomers, "customers", "t-1")
@@ -1079,15 +1185,14 @@ func CheckCompactPrompt(ctx *harness.Ctx) {
 	for _, t := range catalog.Tools {
 		ctx.Assert(!strings.Contains(all[0].GetSystemPrompt(), t.Instructions), "the system prompt carries %s's instructions: every tool's guidance in every call is the prompt that grows with the catalog", t.Name)
 	}
-	listed := [][2]string{}
-	for _, t := range all[0].GetTools() {
-		listed = append(listed, [2]string{t.GetName(), t.GetDescription()})
-	}
-	expected := [][2]string{}
+	expected := []string{}
 	for _, t := range catalog.Tools {
-		expected = append(expected, [2]string{t.Name, t.Description})
+		expected = append(expected, t.Name+" | "+t.Description)
 	}
-	ctx.Equal(listed, expected, "the tool list must be the catalog's names with their one-line descriptions")
+	sort.Strings(expected)
+	for i, r := range all {
+		ctx.Equal(loopToolList(r), expected, "call %d: the tool list must be the catalog's names with their one-line descriptions, every call", i+1)
+	}
 }
 
 func CheckJitInstructions(ctx *harness.Ctx) {
@@ -1104,6 +1209,15 @@ func CheckJitInstructions(ctx *harness.Ctx) {
 	for _, r := range later {
 		ctx.Equal(r.GetInstructions(), "", "a refused tool call ran nothing, so the next call carries no instructions")
 	}
+	seen := len(loopRequests(ctx))
+	chained := loopRun(ctx, []string{"read_customers"}, loopChain, "customers", "t-3")
+	chain := loopInstructions(ctx, seen)
+	ctx.Assert(len(chain) == 3, "segment_customers, then a refused fill_product_form, then the answer: 3 Complete calls, saw %d and %+v", len(chain), chained)
+	ctx.Equal(chain, []string{"", seg.Instructions, ""}, "instructions travel in the one call after their tool ran: segment_customers ran, then fill_product_form was refused, so the third call carries none; the calls' instructions")
+	seen = len(loopRequests(ctx))
+	loopRun(ctx, []string{"read_customers", "write_products"}, loopChain, "products", "t-4")
+	form, _ := catalog.Lookup("fill_product_form")
+	ctx.Equal(loopInstructions(ctx, seen), []string{"", seg.Instructions, form.Instructions}, "after segment_customers and then fill_product_form ran, each next call carries only the instructions of the tool that just ran; the calls' instructions")
 }
 
 func CheckTurnLimit(ctx *harness.Ctx) {
@@ -1112,6 +1226,10 @@ func CheckTurnLimit(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.GRPC.CallsTo("Complete", "")), 6, "a model that asks for a tool on every turn: the loop stops at maxTurns = 6; Complete calls")
 	ctx.Equal(out.Status, "turn_limit", "the outcome's status")
 	ctx.Equal(len(out.ToolsUsed), 6, "ToolsUsed lists the six tool calls made")
+	out = loopRun(ctx, []string{"read_customers"}, loopEndless, "analytics", "t-2")
+	calls := len(ctx.GRPC.CallsTo("Complete", "")) - 6
+	ctx.Assert(calls == 6 && out.Status == "turn_limit", "a model that asks on every turn for a tool the merchant may not use got %d Complete calls and status %q: a refused call is a turn too, the loop stops at maxTurns = 6", calls, out.Status)
+	ctx.Assert(len(out.ToolsUsed) == 0, "every call was refused, so ToolsUsed stays empty, got %v", out.ToolsUsed)
 }
 
 func CheckCallDeadline(ctx *harness.Ctx) {
@@ -1129,13 +1247,21 @@ func CheckCallDeadline(ctx *harness.Ctx) {
 	waited = float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 30.5, "a model that takes 8 s per call held the loop %.0f s: the whole loop has loopBudget = 30 s", waited)
 	ctx.Equal(out.Status, "deadline", "a loop that ran out of time; status")
+	calls := ctx.GRPC.CallsTo("Complete", "")
+	for i, c := range calls {
+		ctx.Assert(c.HasDeadline() && c.Timeout.Seconds() <= 10.5, "every Complete carries a deadline of at most 10 s, call %d carried %v", i+1, c.Timeout)
+	}
+	ctx.GRPC.SetLatency("Complete", 4, config.ModelAddr)
+	out = loopRun(ctx, []string{"read_reports"}, loopEndless, "analytics", "t-3")
+	made := len(ctx.GRPC.CallsTo("Complete", "")) - len(calls)
+	ctx.Assert(out.Status == "turn_limit" && made == 6, "a model that takes 4 s per call fits six calls in the 30 s budget (24 s), got %d calls and status %q: the loop's budget is loopBudget = 30 s, each call's deadline is modelDeadline = 10 s", made, out.Status)
 }
 
 func CheckScopeGate(ctx *harness.Ctx) {
 	invoked := loopWorld(ctx)
 	out := loopRun(ctx, []string{"read_customers"}, loopForm, "products", "t-1")
 	ctx.Equal(*invoked, []string{}, "a staff account with only read_customers: fill_product_form needs write_products; invoked")
-	ctx.Equal(out.ToolsUsed, []string{}, "ToolsUsed when the call was refused")
+	ctx.Assert(len(out.ToolsUsed) == 0, "ToolsUsed must stay empty when the call was refused, got %v", out.ToolsUsed)
 	all := loopRequests(ctx)
 	var told *pb.Message
 	for _, m := range all[len(all)-1].GetMessages() {
@@ -1144,14 +1270,25 @@ func CheckScopeGate(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(told != nil && told.GetContent() == catalog.PermissionDenied && told.GetToolName() == "fill_product_form", "the model must hear PERMISSION_DENIED for fill_product_form, its messages were %v", all[len(all)-1].GetMessages())
-	loopRun(ctx, []string{"read_customers", "write_products"}, "delete my shop", "home", "t-2")
+	out = loopRun(ctx, []string{"read_reports"}, loopCustomers, "customers", "t-2")
+	ctx.Assert(len(*invoked) == 0 && len(out.ToolsUsed) == 0, "a staff account with only read_reports got %v invoked: segment_customers reads customers and needs read_customers, read tools are gated too", *invoked)
+	loopRun(ctx, []string{"read_customers", "write_products"}, "delete my shop", "home", "t-3")
 	ctx.Equal(*invoked, []string{}, "delete_shop is not in the catalog; invoked")
-	out = loopRun(ctx, []string{"read_customers", "write_products"}, loopForm, "products", "t-3")
+	all = loopRequests(ctx)
+	told = nil
+	for _, m := range all[len(all)-1].GetMessages() {
+		if m.GetRole() == "tool" {
+			told = m
+		}
+	}
+	ctx.Assert(told != nil && told.GetContent() == catalog.PermissionDenied && told.GetToolName() == "delete_shop", "the model must hear PERMISSION_DENIED for delete_shop and answer, its last call's messages were %v", all[len(all)-1].GetMessages())
+	out = loopRun(ctx, []string{"read_customers", "write_products"}, loopForm, "products", "t-4")
 	ctx.Assert(len(*invoked) == 1 && (*invoked)[0] == "fill_product_form" && len(out.ToolsUsed) == 1, "with write_products the form is filled once: invoked %v, outcome %+v", *invoked, out)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -1167,6 +1304,8 @@ constexpr int kLoopCap = 12;  // the stand-in model answers in text after this m
 const std::string kCustomers = "which of my customers are from Toronto?";
 const std::string kForm = "write an SEO description for the jacket I have open";
 const std::string kEndless = "loop: compare this week's sales with every week this year";
+// The stand-in model asks for segment_customers, then for fill_product_form, then answers.
+const std::string kChain = "find my Toronto customers, then write an SEO description for the jacket";
 
 std::vector<std::string> loopInvoked;
 
@@ -1184,7 +1323,17 @@ class LoopModel final : public sidekickrpc::Model::Service {
     for (const auto& m : req->messages()) {
       if (m.role() == "tool") results.push_back(m.content());
     }
-    const auto r = model::respond(req->messages_size() > 0 ? req->messages(0).content() : "", results);
+    const std::string user = req->messages_size() > 0 ? req->messages(0).content() : "";
+    if (user == kChain) {
+      if (results.size() < 2) {
+        reply->mutable_tool_call()->set_name(results.empty() ? "segment_customers" : "fill_product_form");
+        reply->mutable_tool_call()->set_args_json(results.empty() ? R"({"query":"default_address_city = Toronto"})" : R"({"product_id":"p-1","field":"seo_description"})");
+      } else {
+        reply->set_text("Done: " + results.back());
+      }
+      return grpc::Status::OK;
+    }
+    const auto r = model::respond(user, results);
     reply->set_text(r.text);
     reply->mutable_tool_call()->set_name(r.tool_name);
     reply->mutable_tool_call()->set_args_json(r.args_json);
@@ -1210,6 +1359,22 @@ std::vector<sidekickrpc::CompleteRequest> loopRequests(harness::Ctx& ctx) {
   return out;
 }
 
+// One call's tool list as sorted "name | description" lines.
+std::vector<std::string> loopToolList(const sidekickrpc::CompleteRequest& r) {
+  std::vector<std::string> out;
+  for (const auto& t : r.tools()) out.push_back(t.name() + " | " + t.description());
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// The instructions each call carried, from call number from on (0-based).
+std::vector<std::string> loopInstructions(harness::Ctx& ctx, size_t from) {
+  std::vector<std::string> out;
+  const auto all = loopRequests(ctx);
+  for (size_t i = from; i < all.size(); ++i) out.push_back(all[i].instructions());
+  return out;
+}
+
 }  // namespace
 
 // Stands in for step 3: every reservation fits, and a tool is answered by sidekick/tools.h and recorded.
@@ -1231,10 +1396,11 @@ void CheckCompactPrompt(harness::Ctx& ctx) {
     ctx.Assert(all[0].system_prompt().find(t.instructions) == std::string::npos,
                "the system prompt carries %s's instructions: every tool's guidance in every call is the prompt that grows with the catalog", t.name);
   }
-  std::vector<std::string> listed, expected;
-  for (const auto& t : all[0].tools()) listed.push_back(t.name() + " | " + t.description());
+  std::vector<std::string> expected;
   for (const auto& t : catalog::tools()) expected.push_back(t.name + " | " + t.description);
-  ctx.Equal(listed, expected, "the tool list must be the catalog's names with their one-line descriptions");
+  std::sort(expected.begin(), expected.end());
+  for (size_t i = 0; i < all.size(); ++i)
+    ctx.Equal(loopToolList(all[i]), expected, "call %d: the tool list must be the catalog's names with their one-line descriptions, every call", i + 1);
 }
 
 void CheckJitInstructions(harness::Ctx& ctx) {
@@ -1248,14 +1414,29 @@ void CheckJitInstructions(harness::Ctx& ctx) {
   const auto later = loopRequests(ctx);
   ctx.Assert(later.size() > 2, "the refused turn made no Complete call");
   for (size_t i = 2; i < later.size(); ++i) ctx.Equal(later[i].instructions(), "", "a refused tool call ran nothing, so the next call carries no instructions");
+  const std::string seg = catalog::lookup("segment_customers")->instructions;
+  size_t seen = later.size();
+  const auto chained = loopRun({"read_customers"}, kChain, "customers", "t-3");
+  auto chain = loopInstructions(ctx, seen);
+  ctx.Assert(chain.size() == 3, "segment_customers, then a refused fill_product_form, then the answer: 3 Complete calls, saw %d (status %q)", chain.size(), chained.status);
+  ctx.Equal(chain, std::vector<std::string>{"", seg, ""},
+            "instructions travel in the one call after their tool ran: segment_customers ran, then fill_product_form was refused, so the third call carries none; the calls' instructions");
+  seen = loopRequests(ctx).size();
+  loopRun({"read_customers", "write_products"}, kChain, "products", "t-4");
+  ctx.Equal(loopInstructions(ctx, seen), std::vector<std::string>{"", seg, catalog::lookup("fill_product_form")->instructions},
+            "after segment_customers and then fill_product_form ran, each next call carries only the instructions of the tool that just ran; the calls' instructions");
 }
 
 void CheckTurnLimit(harness::Ctx& ctx) {
   loopWorld(ctx);
-  const auto out = loopRun({"read_reports"}, kEndless, "analytics", "t-1");
+  auto out = loopRun({"read_reports"}, kEndless, "analytics", "t-1");
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 6, "a model that asks for a tool on every turn: the loop stops at kMaxTurns = 6; Complete calls");
   ctx.Equal(out.status, "turn_limit", "the outcome's status");
   ctx.Equal(out.tools_used.size(), 6, "tools_used lists the six tool calls made");
+  out = loopRun({"read_customers"}, kEndless, "analytics", "t-2");
+  const size_t calls = ctx.GRPC.CallsTo("Complete").size() - 6;
+  ctx.Assert(calls == 6 && out.status == "turn_limit", "a model that asks on every turn for a tool the merchant may not use got %d Complete calls and status %q: a refused call is a turn too, the loop stops at kMaxTurns = 6", calls, out.status);
+  ctx.Equal(out.tools_used, std::vector<std::string>{}, "every call was refused, so tools_used stays empty");
 }
 
 void CheckCallDeadline(harness::Ctx& ctx) {
@@ -1273,6 +1454,13 @@ void CheckCallDeadline(harness::Ctx& ctx) {
   waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 30.5, "a model that takes 8 s per call held the loop %.0f s: the whole loop has kLoopBudget = 30 s", waited);
   ctx.Equal(out.status, "deadline", "a loop that ran out of time; status");
+  const auto calls = ctx.GRPC.CallsTo("Complete");
+  for (size_t i = 0; i < calls.size(); ++i)
+    ctx.Assert(calls[i].HasDeadline() && calls[i].TimeoutSeconds() <= 10.5, "every Complete carries a deadline of at most 10 s, call %d carried %vs", i + 1, calls[i].TimeoutSeconds());
+  ctx.GRPC.SetLatency("Complete", 4, config::kModelAddr);
+  out = loopRun({"read_reports"}, kEndless, "analytics", "t-3");
+  const size_t made = ctx.GRPC.CallsTo("Complete").size() - calls.size();
+  ctx.Assert(out.status == "turn_limit" && made == 6, "a model that takes 4 s per call fits six calls in the 30 s budget (24 s), got %d calls and status %q: the loop's budget is kLoopBudget = 30 s, each call's deadline is kModelDeadline = 10 s", made, out.status);
 }
 
 void CheckScopeGate(harness::Ctx& ctx) {
@@ -1287,9 +1475,18 @@ void CheckScopeGate(harness::Ctx& ctx) {
   }
   ctx.Assert(told != nullptr && told->content() == catalog::kPermissionDenied && told->tool_name() == "fill_product_form",
              "the model must hear PERMISSION_DENIED for fill_product_form after the refused call");
-  loopRun({"read_customers", "write_products"}, "delete my shop", "home", "t-2");
+  out = loopRun({"read_reports"}, kCustomers, "customers", "t-2");
+  ctx.Assert(loopInvoked.empty() && out.tools_used.empty(), "a staff account with only read_reports got %v invoked: segment_customers reads customers and needs read_customers, read tools are gated too", loopInvoked);
+  loopRun({"read_customers", "write_products"}, "delete my shop", "home", "t-3");
   ctx.Equal(loopInvoked, std::vector<std::string>{}, "delete_shop is not in the catalog; invoked");
-  out = loopRun({"read_customers", "write_products"}, kForm, "products", "t-3");
+  const auto after = loopRequests(ctx);
+  told = nullptr;
+  for (const auto& m : after.back().messages()) {
+    if (m.role() == "tool") told = &m;
+  }
+  ctx.Assert(told != nullptr && told->content() == catalog::kPermissionDenied && told->tool_name() == "delete_shop",
+             "the model must hear PERMISSION_DENIED for delete_shop and answer");
+  out = loopRun({"read_customers", "write_products"}, kForm, "products", "t-4");
   ctx.Assert(loopInvoked == std::vector<std::string>{"fill_product_form"} && out.tools_used.size() == 1, "with write_products the form is filled once: invoked %v", loopInvoked);
 }
 `,

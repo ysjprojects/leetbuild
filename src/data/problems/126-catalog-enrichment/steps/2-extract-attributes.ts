@@ -103,7 +103,7 @@ fails the job; and no result ever reaches a reviewer.
       id: 'deadline-retry',
       title: 'A 5-second deadline per attempt; one retry, only on UNAVAILABLE',
       detail:
-        'Every attempt carries a 5-second deadline; a second attempt follows only an `UNAVAILABLE`, and any other error (a deadline, `INVALID_ARGUMENT`) is raised after one call. The starter makes one call with no deadline.',
+        'Every attempt carries its own full 5-second deadline, also the one after a slow `UNAVAILABLE`; a second attempt follows only an `UNAVAILABLE`, at most two attempts are made, and any other error (a deadline, `INVALID_ARGUMENT`, `INTERNAL`, `RESOURCE_EXHAUSTED`) is raised after one call. The starter makes one call with no deadline.',
       match: {
         python: {
           all: [
@@ -152,7 +152,7 @@ fails the job; and no result ever reaches a reviewer.
       id: 'taxonomy-validate',
       title: 'Nulls a brand, unit or category the taxonomy does not know',
       detail:
-        'A brand outside the retrieved candidates, a unit outside `ALLOWED_UNITS` and a category `has_category` rejects become null, and the problem sends the result to review. The starter copies whatever the model said.',
+        'A brand outside the candidates retrieved for this SKU (even one the taxonomy lists elsewhere), a unit outside `ALLOWED_UNITS` and a category `has_category` rejects become null while the accepted attributes stay, and the problem sends the result to review. The starter copies whatever the model said.',
       match: {
         python: {all: [/taxonomy\.ALLOWED_UNITS/, /not in candidates/, /taxonomy\.has_category\(/]},
         typescript: {all: [/ALLOWED_UNITS\.includes\(/, /candidates\.includes\(/, /hasCategory\(/]},
@@ -165,7 +165,7 @@ fails the job; and no result ever reaches a reviewer.
       id: 'confidence-gate',
       title: 'Routes problems and low confidence to human review',
       detail:
-        'A result with a problem, or with a confidence below `MIN_CONFIDENCE` (0.85), is marked `review` and parked with `store.enqueue_review(result, reason)`; a clean, confident one is `accepted`. The starter accepts everything.',
+        'A result with a problem, or with a confidence below `MIN_CONFIDENCE` (0.85), is marked `review` and parked with `store.enqueue_review(result, reason)`; a clean one at 0.85 or above is `accepted`. The starter accepts everything.',
       match: {
         python: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /store\.enqueue_review\(/, /["']review["']/]},
         typescript: {all: [/MIN_CONFIDENCE\s*=\s*0\.85/, /enqueueReview\(/, /'review'/]},
@@ -883,6 +883,11 @@ GOOD = {"sku_id": "sku-1", "merchant": "m-1", "title": "DOVE SILK GLOW BODY WASH
 INVENTED = {"sku_id": "sku-2", "merchant": "m-1", "title": "GLOWRA OAT DRINK 1L", "description": "Oat drink"}
 BAD_UNIT = {"sku_id": "sku-3", "merchant": "m-1", "title": "BARILLA SPAGHETTI 12PACK", "description": "Durum wheat pasta"}
 NO_DESCRIPTION = {"sku_id": "sku-4", "merchant": "m-1", "title": "OATLY OAT MILK 1L", "description": ""}
+SPRING = {"sku_id": "sku-5", "merchant": "m-1", "title": "NATURAL SPRING WATER 1L", "description": "Evian, bottled at the source"}
+OFF_LIST = {"sku_id": "sku-6", "merchant": "m-1", "title": "STILL MINERAL WATER 500ML", "description": "Still water"}
+BAD_CATEGORY = {"sku_id": "sku-7", "merchant": "m-1", "title": "HEINZ TOMATO KETCHUP 500ML", "description": "Tomato ketchup"}
+AT_GATE = {"sku_id": "sku-8", "merchant": "m-1", "title": "OATLY OAT MILK 1L", "description": "confidence 0.85"}
+BELOW_GATE = {"sku_id": "sku-9", "merchant": "m-1", "title": "OATLY OAT MILK 1L", "description": "confidence 0.84"}
 GOOD_ATTRIBUTES = {"brand": "Dove", "size": 500, "unit": "ml", "organic": False, "category": "body-wash"}
 
 
@@ -895,14 +900,28 @@ def _size(title):
 
 
 class Extractor(pb_grpc.ExtractorServicer):
-    """The model: picks the first candidate brand in the title, or names the title's first word; prose without a schema."""
+    """
+    The model: picks the first candidate brand in the title, or names the title's first word, and
+    names Evian for any water, listed or not; prose without a schema. A description "confidence x"
+    sets its confidence. While \`unavailable\` is above 0 it answers UNAVAILABLE (after the latency).
+    """
+
+    unavailable = 0
 
     def Extract(self, request, context):
+        if Extractor.unavailable > 0:
+            Extractor.unavailable -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "extractor restarting")
         title = request.title.upper()
         brand = next((c for c in request.candidate_brands if c.lower() in request.title.lower()), None) or request.title.split()[0].capitalize()
+        if "WATER" in title:
+            brand = "Evian"
         size, unit = _size(title)
-        category = "body-wash" if "BODY WASH" in title else "plant-milk" if "OAT" in title else "pasta" if "SPAGHETTI" in title else "grocery"
-        confidence = 0.95 if request.description else 0.6
+        category = "water" if "WATER" in title else "body-wash" if "BODY WASH" in title else "plant-milk" if "OAT" in title else "pasta" if "SPAGHETTI" in title else "grocery"
+        if request.description.startswith("confidence "):
+            confidence = float(request.description.split()[1])
+        else:
+            confidence = 0.95 if request.description else 0.6
         if not request.schema:
             return pb.ExtractReply(output=f"Looks like {brand} {category}, {size} {unit}.", confidence=confidence)
         attributes = {"brand": brand, "size": size, "unit": unit, "organic": "ORGANIC" in title, "category": category}
@@ -910,6 +929,7 @@ class Extractor(pb_grpc.ExtractorServicer):
 
 
 def _module(ctx):
+    Extractor.unavailable = 0
     ctx.grpc.serve(pb_grpc.add_ExtractorServicer_to_server, Extractor())
     return ctx.load("extract_attributes")
 
@@ -938,6 +958,11 @@ def check_retrieve_first(ctx):
     candidates = list(calls[0].request.candidate_brands)
     assert 0 < len(candidates) <= 20, f"the request carried {len(candidates)} candidate brands: retrieve the 20 nearest from the taxonomy before the call"
     assert "Dove" in candidates and all(c in taxonomy.BRANDS for c in candidates), f"the candidates must be taxonomy.nearest_brands of the title and description, got {candidates}"
+    result = _extract(m, SPRING, "with the brand named only in the description")
+    candidates = list(ctx.grpc.calls_to("Extract")[-1].request.candidate_brands)
+    expected = taxonomy.nearest_brands(f"{SPRING['title']} {SPRING['description']}", 20)
+    assert sorted(candidates) == sorted(expected), f"for {SPRING['title']!r} with the description {SPRING['description']!r} the candidates missed {sorted(set(expected) - set(candidates))}: retrieve the 20 brands nearest to the title and the description"
+    assert result.get("attributes", {}).get("brand") == "Evian", f"Evian is among the candidates retrieved from the description and the model named it, yet the brand came out as {result.get('attributes', {}).get('brand')!r}"
 
 
 def check_structured_output(ctx):
@@ -954,15 +979,26 @@ def check_deadline_retry(ctx):
     _extract(m, GOOD, "after one UNAVAILABLE")
     calls = ctx.grpc.calls_to("Extract")
     assert len(calls) == 2, f"one UNAVAILABLE then a healthy extractor took {len(calls)} calls, expected 2"
+    ctx.grpc.set_latency("Extract", 4.0)
+    Extractor.unavailable = 1
+    _extract(m, GOOD, "when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s")
+    calls = ctx.grpc.calls_to("Extract")
+    assert len(calls) == 4, f"a slow UNAVAILABLE then a slow answer took {len(calls) - 2} calls, expected 2"
     for call in calls:
-        assert call.timeout is not None and 4.5 <= call.timeout <= 5.5, f"an Extract call carried a {call.timeout} s deadline, expected 5"
+        assert call.timeout is not None and 4.5 <= call.timeout <= 5.5, f"an Extract call carried a {call.timeout} s deadline, expected 5: every attempt gets the full deadline"
+    ctx.grpc.set_latency("Extract", 0.0)
+    ctx.grpc.fail("Extract", grpc.StatusCode.UNAVAILABLE, "extractor restarting", 2)
+    _raises(m, GOOD, "with two UNAVAILABLEs in a row")
+    assert len(ctx.grpc.calls_to("Extract")) == 6, f"two UNAVAILABLEs in a row took {len(ctx.grpc.calls_to('Extract')) - 4} calls: at most MAX_ATTEMPTS (2)"
     ctx.grpc.set_latency("Extract", 10.0)
     _raises(m, GOOD, "with an extractor slower than the deadline")
-    assert len(ctx.grpc.calls_to("Extract")) == 3, f"a deadline must not be retried: {len(ctx.grpc.calls_to('Extract')) - 2} calls after the slow one started"
+    assert len(ctx.grpc.calls_to("Extract")) == 7, f"a deadline must not be retried: {len(ctx.grpc.calls_to('Extract')) - 6} calls after the slow one started"
     ctx.grpc.set_latency("Extract", 0.0)
-    ctx.grpc.fail("Extract", grpc.StatusCode.INVALID_ARGUMENT, "title too long", 2)
-    _raises(m, GOOD, "with INVALID_ARGUMENT")
-    assert len(ctx.grpc.calls_to("Extract")) == 4, "INVALID_ARGUMENT must not be retried"
+    for code in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED):
+        before = len(ctx.grpc.calls_to("Extract"))
+        ctx.grpc.fail("Extract", code, "rejected", 1)
+        _raises(m, GOOD, f"with {code.name}")
+        assert len(ctx.grpc.calls_to("Extract")) == before + 1, f"{code.name} must not be retried: only UNAVAILABLE earns a second attempt"
 
 
 def check_taxonomy_validate(ctx):
@@ -976,6 +1012,16 @@ def check_taxonomy_validate(ctx):
     unit = result.get("attributes", {}).get("unit")
     assert unit is None and result.get("status") == "review", f"unit {unit!r} is not in ALLOWED_UNITS: it must be nulled and the SKU reviewed, got {result}"
     assert store.pending("sku-3") is not None, "the SKU with an unknown unit was not parked with store.enqueue_review"
+    assert result.get("attributes", {}).get("brand") == "Barilla", f"only what the taxonomy rejects is nulled: the candidate brand Barilla must stay, got {result.get('attributes')}"
+    result = _extract(m, OFF_LIST, "with a taxonomy brand that is not among the retrieved candidates")
+    brand = result.get("attributes", {}).get("brand")
+    assert brand is None and result.get("status") == "review", f"the model named {brand!r}, a taxonomy brand outside the 20 candidates retrieved for this SKU: it must be nulled and the SKU reviewed, got {result}"
+    assert store.pending("sku-6") is not None, "the SKU with a brand outside its candidates was not parked with store.enqueue_review"
+    result = _extract(m, BAD_CATEGORY, "with a category has_category rejects")
+    attributes = result.get("attributes", {})
+    assert attributes.get("category") is None and result.get("status") == "review", f"category 'grocery' is not in the taxonomy: it must be nulled and the SKU reviewed, got {result}"
+    assert attributes.get("brand") == "Heinz", f"only what the taxonomy rejects is nulled: the candidate brand Heinz must stay, got {attributes}"
+    assert store.pending("sku-7") is not None, "the SKU with an unknown category was not parked with store.enqueue_review"
 
 
 def check_confidence_gate(ctx):
@@ -988,11 +1034,20 @@ def check_confidence_gate(ctx):
     result = _extract(m, GOOD, "with a confident, valid answer")
     assert result.get("status") == "accepted", f"a clean answer at 0.95 must be accepted, status is {result.get('status')!r}"
     assert store.pending("sku-1") is None, "a clean, confident answer must not be sent to review"
+    result = _extract(m, AT_GATE, "with a confidence of exactly 0.85")
+    assert result.get("status") == "accepted" and store.pending("sku-8") is None, f"a clean answer at exactly MIN_CONFIDENCE (0.85) must be accepted, status is {result.get('status')!r}"
+    result = _extract(m, BELOW_GATE, "with a confidence of 0.84")
+    assert result.get("status") == "review" and store.pending("sku-9") is not None, f"a clean answer at 0.84 is below MIN_CONFIDENCE and must be parked for review, status is {result.get('status')!r}"
 `,
     typescript: `const GOOD = {sku_id: 'sku-1', merchant: 'm-1', content_hash: 'h1', title: 'DOVE SILK GLOW BODY WASH 500ML', description: 'Nourishing body wash', images: []};
 const INVENTED = {...GOOD, sku_id: 'sku-2', title: 'GLOWRA OAT DRINK 1L', description: 'Oat drink'};
 const BAD_UNIT = {...GOOD, sku_id: 'sku-3', title: 'BARILLA SPAGHETTI 12PACK', description: 'Durum wheat pasta'};
 const NO_DESCRIPTION = {...GOOD, sku_id: 'sku-4', title: 'OATLY OAT MILK 1L', description: ''};
+const SPRING = {...GOOD, sku_id: 'sku-5', title: 'NATURAL SPRING WATER 1L', description: 'Evian, bottled at the source'};
+const OFF_LIST = {...GOOD, sku_id: 'sku-6', title: 'STILL MINERAL WATER 500ML', description: 'Still water'};
+const BAD_CATEGORY = {...GOOD, sku_id: 'sku-7', title: 'HEINZ TOMATO KETCHUP 500ML', description: 'Tomato ketchup'};
+const AT_GATE = {...GOOD, sku_id: 'sku-8', title: 'OATLY OAT MILK 1L', description: 'confidence 0.85'};
+const BELOW_GATE = {...GOOD, sku_id: 'sku-9', title: 'OATLY OAT MILK 1L', description: 'confidence 0.84'};
 const GOOD_ATTRIBUTES = {brand: 'Dove', size: 500, unit: 'ml', organic: false, category: 'body-wash'};
 
 function sizeOf(title: string): [number | null, string | null] {
@@ -1003,23 +1058,33 @@ function sizeOf(title: string): [number | null, string | null] {
   return [null, null];
 }
 
-/** The model: picks the first candidate brand in the title, or names the title's first word; prose without a schema. */
+/**
+ * The model: picks the first candidate brand in the title, or names the title's first word, and names
+ * Evian for any water, listed or not; prose without a schema. A description "confidence x" sets its
+ * confidence. While peer.unavailable is above 0 it answers UNAVAILABLE (after the latency).
+ */
 function module(ctx) {
+  const peer = {unavailable: 0};
   const pkg = ctx.proto('catalog_enrichment.proto');
   ctx.grpc.serve(pkg.catalogenrich.Extractor.service, {
     Extract(call, callback) {
+      if (peer.unavailable > 0) {
+        peer.unavailable -= 1;
+        return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'extractor restarting'});
+      }
       const {title, description, candidate_brands, schema} = call.request;
       const upper = title.toUpperCase();
       const first = title.split(' ')[0];
-      const brand = (candidate_brands ?? []).find(c => title.toLowerCase().includes(c.toLowerCase())) ?? first[0].toUpperCase() + first.slice(1).toLowerCase();
+      const listed = (candidate_brands ?? []).find(c => title.toLowerCase().includes(c.toLowerCase())) ?? first[0].toUpperCase() + first.slice(1).toLowerCase();
+      const brand = upper.includes('WATER') ? 'Evian' : listed;
       const [size, unit] = sizeOf(upper);
-      const category = upper.includes('BODY WASH') ? 'body-wash' : upper.includes('OAT') ? 'plant-milk' : upper.includes('SPAGHETTI') ? 'pasta' : 'grocery';
-      const confidence = description ? 0.95 : 0.6;
+      const category = upper.includes('WATER') ? 'water' : upper.includes('BODY WASH') ? 'body-wash' : upper.includes('OAT') ? 'plant-milk' : upper.includes('SPAGHETTI') ? 'pasta' : 'grocery';
+      const confidence = description.startsWith('confidence ') ? Number(description.split(' ')[1]) : description ? 0.95 : 0.6;
       if (!schema) return callback(null, {output: \`Looks like \${brand} \${category}, \${size} \${unit}.\`, confidence});
       callback(null, {output: JSON.stringify({brand, size, unit, organic: upper.includes('ORGANIC'), category}), confidence});
     },
   });
-  return {m: ctx.load('extract_attributes'), store: ctx.load('/support/enrich/store.ts'), taxonomy: ctx.load('/support/enrich/taxonomy.ts')};
+  return {m: ctx.load('extract_attributes'), store: ctx.load('/support/enrich/store.ts'), taxonomy: ctx.load('/support/enrich/taxonomy.ts'), peer};
 }
 
 async function extract(m, job, why: string) {
@@ -1048,6 +1113,12 @@ export async function check_retrieve_first(ctx) {
   const candidates: string[] = calls[0].request.candidate_brands ?? [];
   assert(candidates.length > 0 && candidates.length <= 20, \`the request carried \${candidates.length} candidate brands: retrieve the 20 nearest from the taxonomy before the call\`);
   assert(candidates.includes('Dove') && candidates.every(c => taxonomy.BRANDS.includes(c)), \`the candidates must be nearestBrands of the title and description, got \${JSON.stringify(candidates)}\`);
+  const spring = await extract(m, SPRING, 'with the brand named only in the description');
+  const sent: string[] = ctx.grpc.callsTo('Extract').at(-1).request.candidate_brands ?? [];
+  const expected: string[] = taxonomy.nearestBrands(\`\${SPRING.title} \${SPRING.description}\`, 20);
+  const missed = expected.filter(b => !sent.includes(b));
+  assert(missed.length === 0 && sent.length === expected.length, \`for \${SPRING.title} with the description "\${SPRING.description}" the candidates missed \${JSON.stringify(missed)}: retrieve the 20 brands nearest to the title and the description\`);
+  assert.equal(spring.attributes.brand, 'Evian', \`Evian is among the candidates retrieved from the description and the model named it, yet the brand came out as \${JSON.stringify(spring.attributes.brand)}\`);
 }
 
 export async function check_structured_output(ctx) {
@@ -1059,19 +1130,30 @@ export async function check_structured_output(ctx) {
 }
 
 export async function check_deadline_retry(ctx) {
-  const {m} = module(ctx);
+  const {m, peer} = module(ctx);
+  const count = () => ctx.grpc.callsTo('Extract').length;
   ctx.grpc.fail('Extract', ctx.grpc.status.UNAVAILABLE, 'extractor restarting', 1);
   await extract(m, GOOD, 'after one UNAVAILABLE');
-  const calls = ctx.grpc.callsTo('Extract');
-  assert.equal(calls.length, 2, \`one UNAVAILABLE then a healthy extractor took \${calls.length} calls, expected 2\`);
-  for (const call of calls) assert(call.timeout !== null && call.timeout >= 4.5 && call.timeout <= 5.5, \`an Extract call carried a \${call.timeout} s deadline, expected 5\`);
+  assert.equal(count(), 2, \`one UNAVAILABLE then a healthy extractor took \${count()} calls, expected 2\`);
+  ctx.grpc.setLatency('Extract', 4);
+  peer.unavailable = 1;
+  await extract(m, GOOD, 'when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s');
+  assert.equal(count(), 4, \`a slow UNAVAILABLE then a slow answer took \${count() - 2} calls, expected 2\`);
+  for (const call of ctx.grpc.callsTo('Extract')) assert(call.timeout !== null && call.timeout >= 4.5 && call.timeout <= 5.5, \`an Extract call carried a \${call.timeout} s deadline, expected 5: every attempt gets the full deadline\`);
+  ctx.grpc.setLatency('Extract', 0);
+  ctx.grpc.fail('Extract', ctx.grpc.status.UNAVAILABLE, 'extractor restarting', 2);
+  await throws(m, GOOD, 'with two UNAVAILABLEs in a row');
+  assert.equal(count(), 6, \`two UNAVAILABLEs in a row took \${count() - 4} calls: at most MAX_ATTEMPTS (2)\`);
   ctx.grpc.setLatency('Extract', 10);
   await throws(m, GOOD, 'with an extractor slower than the deadline');
-  assert.equal(ctx.grpc.callsTo('Extract').length, 3, 'a deadline must not be retried');
+  assert.equal(count(), 7, 'a deadline must not be retried');
   ctx.grpc.setLatency('Extract', 0);
-  ctx.grpc.fail('Extract', ctx.grpc.status.INVALID_ARGUMENT, 'title too long', 2);
-  await throws(m, GOOD, 'with INVALID_ARGUMENT');
-  assert.equal(ctx.grpc.callsTo('Extract').length, 4, 'INVALID_ARGUMENT must not be retried');
+  for (const code of ['INVALID_ARGUMENT', 'INTERNAL', 'RESOURCE_EXHAUSTED']) {
+    const before = count();
+    ctx.grpc.fail('Extract', ctx.grpc.status[code], 'rejected', 1);
+    await throws(m, GOOD, \`with \${code}\`);
+    assert.equal(count(), before + 1, \`\${code} must not be retried: only UNAVAILABLE earns a second attempt\`);
+  }
 }
 
 export async function check_taxonomy_validate(ctx) {
@@ -1083,6 +1165,14 @@ export async function check_taxonomy_validate(ctx) {
   result = await extract(m, BAD_UNIT, 'with a unit outside ALLOWED_UNITS');
   assert(result.attributes.unit === null && result.status === 'review', \`a unit outside ALLOWED_UNITS must be nulled and the SKU reviewed, got \${JSON.stringify(result)}\`);
   assert.notEqual(await store.pending('sku-3'), null, 'the SKU with an unknown unit was not parked with enqueueReview');
+  assert.equal(result.attributes.brand, 'Barilla', \`only what the taxonomy rejects is nulled: the candidate brand Barilla must stay, got \${JSON.stringify(result.attributes)}\`);
+  result = await extract(m, OFF_LIST, 'with a taxonomy brand that is not among the retrieved candidates');
+  assert(result.attributes.brand === null && result.status === 'review', \`the model named Evian, a taxonomy brand outside the 20 candidates retrieved for this SKU: it must be nulled and the SKU reviewed, got \${JSON.stringify(result)}\`);
+  assert.notEqual(await store.pending('sku-6'), null, 'the SKU with a brand outside its candidates was not parked with enqueueReview');
+  result = await extract(m, BAD_CATEGORY, 'with a category hasCategory rejects');
+  assert(result.attributes.category === null && result.status === 'review', \`category "grocery" is not in the taxonomy: it must be nulled and the SKU reviewed, got \${JSON.stringify(result)}\`);
+  assert.equal(result.attributes.brand, 'Heinz', \`only what the taxonomy rejects is nulled: the candidate brand Heinz must stay, got \${JSON.stringify(result.attributes)}\`);
+  assert.notEqual(await store.pending('sku-7'), null, 'the SKU with an unknown category was not parked with enqueueReview');
 }
 
 export async function check_confidence_gate(ctx) {
@@ -1095,6 +1185,10 @@ export async function check_confidence_gate(ctx) {
   result = await extract(m, GOOD, 'with a confident, valid answer');
   assert.equal(result.status, 'accepted', 'a clean answer at 0.95 must be accepted');
   assert.equal(await store.pending('sku-1'), null, 'a clean, confident answer must not be sent to review');
+  result = await extract(m, AT_GATE, 'with a confidence of exactly 0.85');
+  assert(result.status === 'accepted' && (await store.pending('sku-8')) === null, \`a clean answer at exactly MIN_CONFIDENCE (0.85) must be accepted, status is \${result.status}\`);
+  result = await extract(m, BELOW_GATE, 'with a confidence of 0.84');
+  assert(result.status === 'review' && (await store.pending('sku-9')) !== null, \`a clean answer at 0.84 is below MIN_CONFIDENCE and must be parked for review, status is \${result.status}\`);
 }
 `,
     go: `package main
@@ -1103,11 +1197,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc/codes"
+	hstatus "google.golang.org/grpc/status"
 
 	pb "enrich/gen/catalog_enrichment"
 	"enrich/store"
@@ -1122,14 +1219,23 @@ var (
 	inventedJob   = store.Job{SkuID: "sku-2", Merchant: "m-1", Title: "GLOWRA OAT DRINK 1L", Description: "Oat drink"}
 	badUnitJob    = store.Job{SkuID: "sku-3", Merchant: "m-1", Title: "BARILLA SPAGHETTI 12PACK", Description: "Durum wheat pasta"}
 	noDescription = store.Job{SkuID: "sku-4", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: ""}
+	springJob     = store.Job{SkuID: "sku-5", Merchant: "m-1", Title: "NATURAL SPRING WATER 1L", Description: "Evian, bottled at the source"}
+	offListJob    = store.Job{SkuID: "sku-6", Merchant: "m-1", Title: "STILL MINERAL WATER 500ML", Description: "Still water"}
+	badCategory   = store.Job{SkuID: "sku-7", Merchant: "m-1", Title: "HEINZ TOMATO KETCHUP 500ML", Description: "Tomato ketchup"}
+	atGateJob     = store.Job{SkuID: "sku-8", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: "confidence 0.85"}
+	belowGateJob  = store.Job{SkuID: "sku-9", Merchant: "m-1", Title: "OATLY OAT MILK 1L", Description: "confidence 0.84"}
 )
 
-// extractorPeer is the model: it picks the first candidate brand in the title, or names the title's first word; prose without a schema.
+// extractorPeer is the model: it picks the first candidate brand in the title, or names the title's
+// first word, and names Evian for any water, listed or not; prose without a schema. A description
+// "confidence x" sets its confidence. While unavailable is above 0 it answers UNAVAILABLE (after the latency).
 type extractorPeer struct {
 	pb.UnimplementedExtractorServer
+	mu          sync.Mutex
+	unavailable int
 }
 
-func sizeOf(title string) (any, any) {
+func harnessSizeOf(title string) (any, any) {
 	for _, token := range strings.Fields(title) {
 		digits := strings.TrimRight(token, "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 		if n, err := strconv.ParseFloat(digits, 64); err == nil && digits != token {
@@ -1139,7 +1245,16 @@ func sizeOf(title string) (any, any) {
 	return nil, nil
 }
 
-func (extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.ExtractReply, error) {
+func (p *extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.ExtractReply, error) {
+	p.mu.Lock()
+	down := p.unavailable > 0
+	if down {
+		p.unavailable--
+	}
+	p.mu.Unlock()
+	if down {
+		return nil, hstatus.Error(codes.Unavailable, "extractor restarting")
+	}
 	upper := strings.ToUpper(req.GetTitle())
 	first := strings.Fields(req.GetTitle())[0]
 	brand := strings.ToUpper(first[:1]) + strings.ToLower(first[1:])
@@ -1149,9 +1264,11 @@ func (extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.Ext
 			break
 		}
 	}
-	size, unit := sizeOf(upper)
+	size, unit := harnessSizeOf(upper)
 	category := "grocery"
 	switch {
+	case strings.Contains(upper, "WATER"):
+		brand, category = "Evian", "water"
 	case strings.Contains(upper, "BODY WASH"):
 		category = "body-wash"
 	case strings.Contains(upper, "OAT"):
@@ -1160,7 +1277,9 @@ func (extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.Ext
 		category = "pasta"
 	}
 	confidence := 0.95
-	if req.GetDescription() == "" {
+	if level, ok := strings.CutPrefix(req.GetDescription(), "confidence "); ok {
+		confidence, _ = strconv.ParseFloat(level, 64)
+	} else if req.GetDescription() == "" {
 		confidence = 0.6
 	}
 	if req.GetSchema() == "" {
@@ -1170,8 +1289,10 @@ func (extractorPeer) Extract(_ context.Context, req *pb.ExtractRequest) (*pb.Ext
 	return &pb.ExtractReply{Output: string(output), Confidence: confidence}, nil
 }
 
-func extractPeer(ctx *harness.Ctx) {
-	pb.RegisterExtractorServer(ctx.GRPC.Server(""), extractorPeer{})
+func extractPeer(ctx *harness.Ctx) *extractorPeer {
+	peer := &extractorPeer{}
+	pb.RegisterExtractorServer(ctx.GRPC.Server(""), peer)
+	return peer
 }
 
 func mustExtract(ctx *harness.Ctx, job store.Job, why string) store.Result {
@@ -1202,6 +1323,14 @@ func CheckRetrieveFirst(ctx *harness.Ctx) {
 		hasDove = hasDove || c == "Dove"
 	}
 	ctx.Assert(hasDove, "the candidates must be taxonomy.NearestBrands of the title and description, got %v", candidates)
+	spring := mustExtract(ctx, springJob, "with the brand named only in the description")
+	calls = ctx.GRPC.CallsTo("Extract", "")
+	sent := append([]string{}, calls[len(calls)-1].Request.(*pb.ExtractRequest).GetCandidateBrands()...)
+	expected := append([]string{}, taxonomy.NearestBrands(springJob.Title+" "+springJob.Description, 20)...)
+	sort.Strings(sent)
+	sort.Strings(expected)
+	ctx.Equal(sent, expected, "for %s with the description %q, retrieve the 20 brands nearest to the title and the description; the candidates", springJob.Title, springJob.Description)
+	ctx.Equal(spring.Attributes["brand"], any("Evian"), "Evian is among the candidates retrieved from the description and the model named it; the brand")
 }
 
 func CheckStructuredOutput(ctx *harness.Ctx) {
@@ -1213,21 +1342,34 @@ func CheckStructuredOutput(ctx *harness.Ctx) {
 }
 
 func CheckDeadlineRetry(ctx *harness.Ctx) {
-	extractPeer(ctx)
+	peer := extractPeer(ctx)
+	count := func() int { return len(ctx.GRPC.CallsTo("Extract", "")) }
 	ctx.GRPC.Fail("Extract", codes.Unavailable, "extractor restarting", 1, "")
 	mustExtract(ctx, goodJob, "after one UNAVAILABLE")
-	calls := ctx.GRPC.CallsTo("Extract", "")
-	ctx.Equal(len(calls), 2, "one UNAVAILABLE then a healthy extractor; the calls")
-	for _, call := range calls {
-		ctx.Assert(call.HasDeadline() && call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "an Extract call carried a %v deadline, expected 5 s", call.Timeout)
+	ctx.Equal(count(), 2, "one UNAVAILABLE then a healthy extractor; the calls")
+	ctx.GRPC.SetLatency("Extract", 4.0, "")
+	peer.mu.Lock()
+	peer.unavailable = 1
+	peer.mu.Unlock()
+	mustExtract(ctx, goodJob, "when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s")
+	ctx.Equal(count(), 4, "a slow UNAVAILABLE then a slow answer; the calls so far")
+	for _, call := range ctx.GRPC.CallsTo("Extract", "") {
+		ctx.Assert(call.HasDeadline() && call.Timeout >= 4500*time.Millisecond && call.Timeout <= 5500*time.Millisecond, "an Extract call carried a %v deadline, expected 5 s: every attempt gets the full deadline", call.Timeout)
 	}
+	ctx.GRPC.SetLatency("Extract", 0, "")
+	ctx.GRPC.Fail("Extract", codes.Unavailable, "extractor restarting", 2, "")
+	mustFail(ctx, goodJob, "with two UNAVAILABLEs in a row")
+	ctx.Equal(count(), 6, "two UNAVAILABLEs in a row: at most maxAttempts (2); the calls so far")
 	ctx.GRPC.SetLatency("Extract", 10.0, "")
 	mustFail(ctx, goodJob, "with an extractor slower than the deadline")
-	ctx.Equal(len(ctx.GRPC.CallsTo("Extract", "")), 3, "a deadline must not be retried; the calls")
+	ctx.Equal(count(), 7, "a deadline must not be retried; the calls so far")
 	ctx.GRPC.SetLatency("Extract", 0, "")
-	ctx.GRPC.Fail("Extract", codes.InvalidArgument, "title too long", 2, "")
-	mustFail(ctx, goodJob, "with INVALID_ARGUMENT")
-	ctx.Equal(len(ctx.GRPC.CallsTo("Extract", "")), 4, "INVALID_ARGUMENT must not be retried; the calls")
+	for _, code := range []codes.Code{codes.InvalidArgument, codes.Internal, codes.ResourceExhausted} {
+		before := count()
+		ctx.GRPC.Fail("Extract", code, "rejected", 1, "")
+		mustFail(ctx, goodJob, "with "+code.String())
+		ctx.Equal(count(), before+1, "%s must not be retried: only UNAVAILABLE earns a second attempt; the calls so far", code)
+	}
 }
 
 func CheckTaxonomyValidate(ctx *harness.Ctx) {
@@ -1239,6 +1381,14 @@ func CheckTaxonomyValidate(ctx *harness.Ctx) {
 	result = mustExtract(ctx, badUnitJob, "with a unit outside AllowedUnits")
 	ctx.Assert(result.Attributes["unit"] == nil && result.Status == "review", "a unit outside AllowedUnits must be nulled and the SKU reviewed, got %+v", result)
 	ctx.Assert(store.Pending(extractBg, "sku-3") != nil, "the SKU with an unknown unit was not parked with store.EnqueueReview")
+	ctx.Equal(result.Attributes["brand"], any("Barilla"), "only what the taxonomy rejects is nulled: the candidate brand Barilla must stay; the brand")
+	result = mustExtract(ctx, offListJob, "with a taxonomy brand that is not among the retrieved candidates")
+	ctx.Assert(result.Attributes["brand"] == nil && result.Status == "review", "the model named Evian, a taxonomy brand outside the 20 candidates retrieved for this SKU: it must be nulled and the SKU reviewed, got %+v", result)
+	ctx.Assert(store.Pending(extractBg, "sku-6") != nil, "the SKU with a brand outside its candidates was not parked with store.EnqueueReview")
+	result = mustExtract(ctx, badCategory, "with a category HasCategory rejects")
+	ctx.Assert(result.Attributes["category"] == nil && result.Status == "review", "category grocery is not in the taxonomy: it must be nulled and the SKU reviewed, got %+v", result)
+	ctx.Equal(result.Attributes["brand"], any("Heinz"), "only what the taxonomy rejects is nulled: the candidate brand Heinz must stay; the brand")
+	ctx.Assert(store.Pending(extractBg, "sku-7") != nil, "the SKU with an unknown category was not parked with store.EnqueueReview")
 }
 
 func CheckConfidenceGate(ctx *harness.Ctx) {
@@ -1251,6 +1401,10 @@ func CheckConfidenceGate(ctx *harness.Ctx) {
 	result = mustExtract(ctx, goodJob, "with a confident, valid answer")
 	ctx.Equal(result.Status, "accepted", "a clean answer at 0.95 must be accepted; the status")
 	ctx.Assert(store.Pending(extractBg, "sku-1") == nil, "a clean, confident answer must not be sent to review")
+	result = mustExtract(ctx, atGateJob, "with a confidence of exactly 0.85")
+	ctx.Assert(result.Status == "accepted" && store.Pending(extractBg, "sku-8") == nil, "a clean answer at exactly minConfidence (0.85) must be accepted, status is %q", result.Status)
+	result = mustExtract(ctx, belowGateJob, "with a confidence of 0.84")
+	ctx.Assert(result.Status == "review" && store.Pending(extractBg, "sku-9") != nil, "a clean answer at 0.84 is below minConfidence and must be parked for review, status is %q", result.Status)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1258,9 +1412,11 @@ func CheckConfidenceGate(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "catalog_enrichment.grpc.pb.h"
@@ -1277,27 +1433,43 @@ const nlohmann::json kGood = extractJob("sku-1", "DOVE SILK GLOW BODY WASH 500ML
 const nlohmann::json kInvented = extractJob("sku-2", "GLOWRA OAT DRINK 1L", "Oat drink");
 const nlohmann::json kBadUnit = extractJob("sku-3", "BARILLA SPAGHETTI 12PACK", "Durum wheat pasta");
 const nlohmann::json kNoDescription = extractJob("sku-4", "OATLY OAT MILK 1L", "");
+const nlohmann::json kSpring = extractJob("sku-5", "NATURAL SPRING WATER 1L", "Evian, bottled at the source");
+const nlohmann::json kOffList = extractJob("sku-6", "STILL MINERAL WATER 500ML", "Still water");
+const nlohmann::json kBadCategory = extractJob("sku-7", "HEINZ TOMATO KETCHUP 500ML", "Tomato ketchup");
+const nlohmann::json kAtGate = extractJob("sku-8", "OATLY OAT MILK 1L", "confidence 0.85");
+const nlohmann::json kBelowGate = extractJob("sku-9", "OATLY OAT MILK 1L", "confidence 0.84");
 
-std::string lower(std::string s) {
+// While above 0 the extractor answers UNAVAILABLE (after the latency).
+std::atomic<int> hUnavailable{0};
+
+std::string hLower(std::string s) {
   for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   return s;
 }
 
-// The model: picks the first candidate brand in the title, or names the title's first word; prose without a schema.
+// The model: picks the first candidate brand in the title, or names the title's first word, and
+// names Evian for any water, listed or not; prose without a schema. A description "confidence x"
+// sets its confidence.
 class ExtractorPeer final : public catalogenrich::Extractor::Service {
  public:
   grpc::Status Extract(grpc::ServerContext*, const catalogenrich::ExtractRequest* req, catalogenrich::ExtractReply* out) override {
+    if (hUnavailable.load() > 0) {
+      hUnavailable--;
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "extractor restarting");
+    }
     const std::string title = req->title();
+    const auto has = [&title](const char* word) { return title.find(word) != std::string::npos; };
     std::istringstream words(title);
     std::string first, token;
     words >> first;
-    std::string brand = std::string(1, first[0]) + lower(first.substr(1));
+    std::string brand = std::string(1, first[0]) + hLower(first.substr(1));
     for (const std::string& c : req->candidate_brands()) {
-      if (lower(title).find(lower(c)) != std::string::npos) {
+      if (hLower(title).find(hLower(c)) != std::string::npos) {
         brand = c;
         break;
       }
     }
+    if (has("WATER")) brand = "Evian";
     nlohmann::json size = nullptr, unit = nullptr;
     std::istringstream tokens(title);
     while (tokens >> token) {
@@ -1305,13 +1477,15 @@ class ExtractorPeer final : public catalogenrich::Extractor::Service {
       while (digits < token.size() && (std::isdigit(static_cast<unsigned char>(token[digits])) || token[digits] == '.')) digits++;
       if (digits > 0 && digits < token.size()) {
         size = std::stod(token.substr(0, digits));
-        unit = lower(token.substr(digits));
+        unit = hLower(token.substr(digits));
         break;
       }
     }
-    const auto has = [&title](const char* word) { return title.find(word) != std::string::npos; };
-    const std::string category = has("BODY WASH") ? "body-wash" : has("OAT") ? "plant-milk" : has("SPAGHETTI") ? "pasta" : "grocery";
-    out->set_confidence(req->description().empty() ? 0.6 : 0.95);
+    const std::string category = has("WATER") ? "water" : has("BODY WASH") ? "body-wash" : has("OAT") ? "plant-milk" : has("SPAGHETTI") ? "pasta" : "grocery";
+    const std::string& description = req->description();
+    double confidence = description.empty() ? 0.6 : 0.95;
+    if (description.rfind("confidence ", 0) == 0) confidence = std::stod(description.substr(11));
+    out->set_confidence(confidence);
     if (req->schema().empty()) {
       out->set_output("Looks like " + brand + " " + category + ", " + size.dump() + " " + unit.dump() + ".");
     } else {
@@ -1325,6 +1499,7 @@ void extractPeer(harness::Ctx& ctx) {
   static ExtractorPeer* peer = nullptr;
   delete peer;
   peer = new ExtractorPeer;
+  hUnavailable = 0;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
@@ -1362,6 +1537,14 @@ void CheckRetrieveFirst(harness::Ctx& ctx) {
     dove = dove || c == "Dove";
   }
   ctx.Assert(dove, "the candidates must be taxonomy::nearest_brands of the title and description, and Dove is missing");
+  auto spring = mustExtract(ctx, kSpring, "with the brand named only in the description");
+  const auto last = ctx.GRPC.CallsTo("Extract").back().Request<catalogenrich::ExtractRequest>();
+  std::vector<std::string> sent(last.candidate_brands().begin(), last.candidate_brands().end());
+  auto expected = taxonomy::nearest_brands(kSpring["title"].get<std::string>() + " " + kSpring["description"].get<std::string>(), 20);
+  std::sort(sent.begin(), sent.end());
+  std::sort(expected.begin(), expected.end());
+  ctx.Equal(sent, expected, "for NATURAL SPRING WATER 1L with the description \\"Evian, bottled at the source\\", retrieve the 20 brands nearest to the title and the description; the candidates");
+  ctx.Assert(spring["attributes"]["brand"] == "Evian", "Evian is among the candidates retrieved from the description and the model named it, yet the brand came out as %s", spring["attributes"]["brand"].dump());
 }
 
 void CheckStructuredOutput(harness::Ctx& ctx) {
@@ -1377,18 +1560,30 @@ void CheckDeadlineRetry(harness::Ctx& ctx) {
   extractPeer(ctx);
   ctx.GRPC.Fail("Extract", grpc::StatusCode::UNAVAILABLE, "extractor restarting", 1);
   mustExtract(ctx, kGood, "after one UNAVAILABLE");
-  const auto calls = ctx.GRPC.CallsTo("Extract");
-  ctx.Equal(calls.size(), 2, "one UNAVAILABLE then a healthy extractor; the calls");
-  for (const auto& call : calls) {
-    ctx.Assert(call.HasDeadline() && call.TimeoutSeconds() >= 4.5 && call.TimeoutSeconds() <= 5.5, "an Extract call carried a %v s deadline, expected 5", call.TimeoutSeconds());
+  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 2, "one UNAVAILABLE then a healthy extractor; the calls");
+  ctx.GRPC.SetLatency("Extract", 4.0);
+  hUnavailable = 1;
+  mustExtract(ctx, kGood, "when the first attempt answers UNAVAILABLE after 4 s and the second answers after 4 s");
+  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 4, "a slow UNAVAILABLE then a slow answer; the calls so far");
+  for (const auto& call : ctx.GRPC.CallsTo("Extract")) {
+    ctx.Assert(call.HasDeadline() && call.TimeoutSeconds() >= 4.5 && call.TimeoutSeconds() <= 5.5, "an Extract call carried a %v s deadline, expected 5: every attempt gets the full deadline", call.TimeoutSeconds());
   }
+  ctx.GRPC.SetLatency("Extract", 0);
+  ctx.GRPC.Fail("Extract", grpc::StatusCode::UNAVAILABLE, "extractor restarting", 2);
+  mustThrow(ctx, kGood, "with two UNAVAILABLEs in a row");
+  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 6, "two UNAVAILABLEs in a row: at most kMaxAttempts (2); the calls so far");
   ctx.GRPC.SetLatency("Extract", 10.0);
   mustThrow(ctx, kGood, "with an extractor slower than the deadline");
-  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 3, "a deadline must not be retried; the calls");
+  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 7, "a deadline must not be retried; the calls so far");
   ctx.GRPC.SetLatency("Extract", 0);
-  ctx.GRPC.Fail("Extract", grpc::StatusCode::INVALID_ARGUMENT, "title too long", 2);
-  mustThrow(ctx, kGood, "with INVALID_ARGUMENT");
-  ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), 4, "INVALID_ARGUMENT must not be retried; the calls");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}};
+  for (const auto& [code, name] : terminal) {
+    const size_t before = ctx.GRPC.CallsTo("Extract").size();
+    ctx.GRPC.Fail("Extract", code, "rejected", 1);
+    mustThrow(ctx, kGood, "with " + name);
+    ctx.Equal(ctx.GRPC.CallsTo("Extract").size(), before + 1, "%s must not be retried: only UNAVAILABLE earns a second attempt; the calls so far", name);
+  }
 }
 
 void CheckTaxonomyValidate(harness::Ctx& ctx) {
@@ -1400,6 +1595,14 @@ void CheckTaxonomyValidate(harness::Ctx& ctx) {
   result = mustExtract(ctx, kBadUnit, "with a unit outside kAllowedUnits");
   ctx.Assert(result["attributes"]["unit"].is_null() && result.value("status", "") == "review", "a unit outside kAllowedUnits must be nulled and the SKU reviewed, got %s", result.dump());
   ctx.Assert(store::pending("sku-3").has_value(), "the SKU with an unknown unit was not parked with store::enqueue_review");
+  ctx.Assert(result["attributes"]["brand"] == "Barilla", "only what the taxonomy rejects is nulled: the candidate brand Barilla must stay, got %s", result["attributes"].dump());
+  result = mustExtract(ctx, kOffList, "with a taxonomy brand that is not among the retrieved candidates");
+  ctx.Assert(result["attributes"]["brand"].is_null() && result.value("status", "") == "review", "the model named Evian, a taxonomy brand outside the 20 candidates retrieved for this SKU: it must be nulled and the SKU reviewed, got %s", result.dump());
+  ctx.Assert(store::pending("sku-6").has_value(), "the SKU with a brand outside its candidates was not parked with store::enqueue_review");
+  result = mustExtract(ctx, kBadCategory, "with a category has_category rejects");
+  ctx.Assert(result["attributes"]["category"].is_null() && result.value("status", "") == "review", "category grocery is not in the taxonomy: it must be nulled and the SKU reviewed, got %s", result.dump());
+  ctx.Assert(result["attributes"]["brand"] == "Heinz", "only what the taxonomy rejects is nulled: the candidate brand Heinz must stay, got %s", result["attributes"].dump());
+  ctx.Assert(store::pending("sku-7").has_value(), "the SKU with an unknown category was not parked with store::enqueue_review");
 }
 
 void CheckConfidenceGate(harness::Ctx& ctx) {
@@ -1412,6 +1615,10 @@ void CheckConfidenceGate(harness::Ctx& ctx) {
   result = mustExtract(ctx, kGood, "with a confident, valid answer");
   ctx.Equal(result.value("status", ""), "accepted", "a clean answer at 0.95 must be accepted; the status");
   ctx.Assert(!store::pending("sku-1").has_value(), "a clean, confident answer must not be sent to review");
+  result = mustExtract(ctx, kAtGate, "with a confidence of exactly 0.85");
+  ctx.Assert(result.value("status", "") == "accepted" && !store::pending("sku-8").has_value(), "a clean answer at exactly kMinConfidence (0.85) must be accepted, status is %s", result.value("status", ""));
+  result = mustExtract(ctx, kBelowGate, "with a confidence of 0.84");
+  ctx.Assert(result.value("status", "") == "review" && store::pending("sku-9").has_value(), "a clean answer at 0.84 is below kMinConfidence and must be parked for review, status is %s", result.value("status", ""));
 }
 `,
   },

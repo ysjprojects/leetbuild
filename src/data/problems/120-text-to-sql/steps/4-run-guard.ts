@@ -58,7 +58,7 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
       id: 'single-select',
       title: 'Runs only a single SELECT',
       detail:
-        'A second statement after a semicolon, a DELETE and an UPDATE are 422 and never reach the warehouse; a SELECT with a trailing semicolon runs. The starter executes whatever the model wrote.',
+        'A second statement after a semicolon, a DELETE, an UPDATE and a CREATE TABLE … AS SELECT are 422 and never reach the warehouse; a SELECT with a trailing semicolon, a lower-case select and a WITH run. The starter executes whatever the model wrote.',
       match: {
         python: {all: [/is_single_select\(/, /status_code\s*=\s*422/]},
         typescript: {all: [/isSingleSelect\(/, /code\(\s*422\s*\)/]},
@@ -71,7 +71,7 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
       id: 'tables-acked',
       title: 'Rejects tables outside the ACKed list',
       detail:
-        'A JOIN on drivers when only trips was ACKed is 422 with no warehouse call; the same SQL runs once drivers is ACKed, and FROM TRIPS matches trips. The starter lets any table through.',
+        'A JOIN on drivers when only trips was ACKed is 422 with no warehouse call, also when the table agent proposed drivers; the same SQL runs once drivers is ACKed, and FROM TRIPS matches trips. The starter lets any table through.',
       match: {
         python: {all: [/referenced_tables\(/, /tables_acked/]},
         typescript: {all: [/referencedTables\(/, /tables_acked/]},
@@ -84,7 +84,7 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
       id: 'partition-filter',
       title: 'Requires a filter on the partition column',
       detail:
-        'A query with no WHERE, or a WHERE without datestr, is 422 instead of a scan of every partition; a datestr range in any case runs. The starter sends both to the warehouse.',
+        'A query with no WHERE, a WHERE without datestr, or datestr named only in the select list is 422 instead of a scan of every partition; a datestr range in any case runs. The starter sends them all to the warehouse.',
       match: {
         python: {all: [/has_partition_filter\(/, /PARTITION_COLUMN/]},
         typescript: {all: [/hasPartitionFilter\(/, /PARTITION_COLUMN/]},
@@ -97,7 +97,7 @@ Requirements, all before the warehouse sees a byte (**422** otherwise):
       id: 'limit-timeout',
       title: 'Caps rows at 1000 and the statement at 60 s',
       detail:
-        'The warehouse receives the statement ending in LIMIT 1000 (a LIMIT 5000 lowered, a LIMIT 10 kept), the call carries a deadline of about 60 s, and a statement that runs 90 s answers 504 at the deadline. The starter runs the query unbounded in rows and time.',
+        'The warehouse receives the statement ending in LIMIT 1000 (a LIMIT 5000 lowered, also when written limit 5000 before a trailing semicolon; a LIMIT 10 kept), the call carries a deadline of about 60 s, and a statement that runs 90 s answers 504 at the deadline. The starter runs the query unbounded in rows and time.',
       match: {
         python: {all: [/with_limit\(/, /timeout\s*=\s*STATEMENT_TIMEOUT_S/]},
         typescript: {all: [/withLimit\(/, /deadline:\s*Date\.now\(\)\s*\+\s*STATEMENT_TIMEOUT_MS/]},
@@ -977,10 +977,10 @@ class WarehouseServicer(text_to_sql_pb2_grpc.WarehouseServicer):
         return text_to_sql_pb2.ExecuteReply(columns=warehouse.COLUMNS, rows=[text_to_sql_pb2.Row(values=r) for r in rows])
 
 
-def _seed(ctx, query_id="q1", sql=GOOD_SQL, acked=("trips",), user="ana"):
+def _seed(ctx, query_id="q1", sql=GOOD_SQL, acked=("trips",), user="ana", proposed=None):
     record = {
         "query_id": query_id, "user": user, "workspace": "mobility", "question": "How many trips yesterday?",
-        "status": "generated", "tables_proposed": list(acked), "tables_acked": list(acked), "sql": sql,
+        "status": "generated", "tables_proposed": list(acked if proposed is None else proposed), "tables_acked": list(acked), "sql": sql,
         "run_ok": False, "has_output": False,
     }
     ctx.redis.set(f"query:{query_id}", json.dumps(record))
@@ -1030,15 +1030,23 @@ async def check_single_select(ctx):
         GOOD_SQL + "; DROP TABLE trips",
         "DELETE FROM trips WHERE datestr = '2026-11-01'",
         "UPDATE trips SET status = 'void' WHERE datestr = '2026-11-01'",
+        "CREATE TABLE trips_copy AS SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
+    ]
+    good = [
+        GOOD_SQL + ";",
+        "select trip_uuid from trips where datestr = '2026-11-01'",
+        "WITH day AS (SELECT '2026-11-01' AS d) SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
     ]
     for i, sql in enumerate(bad):
         _seed(ctx, f"q{i}", sql)
-    _seed(ctx, "ok", GOOD_SQL + ";")
+    for i, sql in enumerate(good):
+        _seed(ctx, f"ok{i}", sql)
     async with _api(ctx) as c:
         for i, sql in enumerate(bad):
-            await _expect_refused(ctx, c, f"q{i}", sql, "only one SELECT may run")
-        r = await _run(c, "ok")
-        assert r.status_code == 200, f"a single SELECT with a trailing semicolon must run, got {r.status_code}: {r.text}"
+            await _expect_refused(ctx, c, f"q{i}", sql, "only one SELECT (or WITH) may run, whatever other statement the model wrote")
+        for i, sql in enumerate(good):
+            r = await _run(c, f"ok{i}")
+            assert r.status_code == 200, f"a single read must run: {sql!r} answered {r.status_code}: {r.text}"
 
 
 async def check_tables_acked(ctx):
@@ -1046,8 +1054,10 @@ async def check_tables_acked(ctx):
     _seed(ctx, "q1", join, acked=("trips",))
     _seed(ctx, "q2", join, acked=("trips", "drivers"))
     _seed(ctx, "q3", "SELECT trip_uuid FROM TRIPS WHERE datestr = '2026-11-01'", acked=("trips",))
+    _seed(ctx, "q4", join, acked=("trips",), proposed=("trips", "drivers"))
     async with _api(ctx) as c:
         await _expect_refused(ctx, c, "q1", join, "drivers was never ACKed")
+        await _expect_refused(ctx, c, "q4", join, "drivers was proposed but the user ACKed only trips")
         r = await _run(c, "q2")
         assert r.status_code == 200, f"with trips and drivers ACKed the join must run, got {r.status_code}: {r.text}"
         r = await _run(c, "q3")
@@ -1058,9 +1068,11 @@ async def check_partition_filter(ctx):
     _seed(ctx, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'")
     _seed(ctx, "q2", "SELECT trip_uuid FROM trips")
     _seed(ctx, "q3", "SELECT trip_uuid FROM trips WHERE DATESTR >= '2026-10-01'")
+    _seed(ctx, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'")
     async with _api(ctx) as c:
         await _expect_refused(ctx, c, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", "a WHERE without datestr scans every partition")
         await _expect_refused(ctx, c, "q2", "SELECT trip_uuid FROM trips", "no WHERE at all scans every partition")
+        await _expect_refused(ctx, c, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", "datestr in the select list filters nothing: the WHERE clause must name it")
         r = await _run(c, "q3")
         assert r.status_code == 200, f"a datestr range (any case) is a partition filter, got {r.status_code}: {r.text}"
 
@@ -1069,6 +1081,7 @@ async def check_limit_timeout(ctx):
     _seed(ctx, "q1")
     _seed(ctx, "q2", GOOD_SQL + " LIMIT 5000")
     _seed(ctx, "q3", GOOD_SQL + " LIMIT 10")
+    _seed(ctx, "q4", GOOD_SQL + " limit 5000;")
     async with _api(ctx) as c:
         r = await _run(c, "q1")
         sent = _executed(ctx)[-1]
@@ -1081,6 +1094,10 @@ async def check_limit_timeout(ctx):
         assert re.search(r"(?i)\\blimit\\s+1000\\s*$", sent) and "5000" not in sent, f"a LIMIT 5000 must be lowered to 1000, the warehouse received {sent!r}"
         r = await _run(c, "q3")
         assert r.json().get("row_count") == 10, f"a LIMIT 10 under the cap stays, got {r.json().get('row_count')} rows"
+        r = await _run(c, "q4")
+        sent = _executed(ctx)[-1]
+        assert re.search(r"(?i)\\blimit\\s+1000\\s*$", sent) and "5000" not in sent, f"a lower-case limit 5000 before a trailing semicolon must be lowered to 1000 too, the warehouse received {sent!r}"
+        assert r.json().get("row_count") == 1000, f"a limit 5000 capped at 1000 returns 1000 rows, got {r.json().get('row_count')}"
         ctx.grpc.set_latency("Execute", 90.0, config.WAREHOUSE)
         started = ctx.clock.offset
         r = await _run(c, "q1")
@@ -1106,10 +1123,10 @@ async def check_run_signals(ctx):
 `,
     typescript: `const GOOD_SQL = "SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'";
 
-function seed(ctx, queryId = 'q1', sql = GOOD_SQL, acked = ['trips'], user = 'ana') {
+function seed(ctx, queryId = 'q1', sql = GOOD_SQL, acked = ['trips'], user = 'ana', proposed = acked) {
   const record = {
     query_id: queryId, user, workspace: 'mobility', question: 'How many trips yesterday?', status: 'generated',
-    tables_proposed: acked, tables_acked: acked, sql, run_ok: false, has_output: false,
+    tables_proposed: proposed, tables_acked: acked, sql, run_ok: false, has_output: false,
   };
   ctx.redis.set(\`query:\${queryId}\`, JSON.stringify(record));
 }
@@ -1157,13 +1174,21 @@ export async function check_single_select(ctx) {
     GOOD_SQL + '; DROP TABLE trips',
     "DELETE FROM trips WHERE datestr = '2026-11-01'",
     "UPDATE trips SET status = 'void' WHERE datestr = '2026-11-01'",
+    "CREATE TABLE trips_copy AS SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
+  ];
+  const good = [
+    GOOD_SQL + ';',
+    "select trip_uuid from trips where datestr = '2026-11-01'",
+    "WITH day AS (SELECT '2026-11-01' AS d) SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
   ];
   bad.forEach((sql, i) => seed(ctx, \`q\${i}\`, sql));
-  seed(ctx, 'ok', GOOD_SQL + ';');
+  good.forEach((sql, i) => seed(ctx, \`ok\${i}\`, sql));
   const {c} = api(ctx);
-  for (const [i, sql] of bad.entries()) await expectRefused(ctx, c, \`q\${i}\`, sql, 'only one SELECT may run');
-  const r = await run(c, 'ok');
-  assert.equal(r.status, 200, \`a single SELECT with a trailing semicolon must run, got \${r.status}: \${r.text}\`);
+  for (const [i, sql] of bad.entries()) await expectRefused(ctx, c, \`q\${i}\`, sql, 'only one SELECT (or WITH) may run, whatever other statement the model wrote');
+  for (const [i, sql] of good.entries()) {
+    const r = await run(c, \`ok\${i}\`);
+    assert.equal(r.status, 200, \`a single read must run: \${JSON.stringify(sql)} answered \${r.status}: \${r.text}\`);
+  }
 }
 
 export async function check_tables_acked(ctx) {
@@ -1171,8 +1196,10 @@ export async function check_tables_acked(ctx) {
   seed(ctx, 'q1', join, ['trips']);
   seed(ctx, 'q2', join, ['trips', 'drivers']);
   seed(ctx, 'q3', "SELECT trip_uuid FROM TRIPS WHERE datestr = '2026-11-01'", ['trips']);
+  seed(ctx, 'q4', join, ['trips'], 'ana', ['trips', 'drivers']);
   const {c} = api(ctx);
   await expectRefused(ctx, c, 'q1', join, 'drivers was never ACKed');
+  await expectRefused(ctx, c, 'q4', join, 'drivers was proposed but the user ACKed only trips');
   let r = await run(c, 'q2');
   assert.equal(r.status, 200, \`with trips and drivers ACKed the join must run, got \${r.status}: \${r.text}\`);
   r = await run(c, 'q3');
@@ -1183,9 +1210,11 @@ export async function check_partition_filter(ctx) {
   seed(ctx, 'q1', "SELECT trip_uuid FROM trips WHERE status = 'completed'");
   seed(ctx, 'q2', 'SELECT trip_uuid FROM trips');
   seed(ctx, 'q3', "SELECT trip_uuid FROM trips WHERE DATESTR >= '2026-10-01'");
+  seed(ctx, 'q4', "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'");
   const {c} = api(ctx);
   await expectRefused(ctx, c, 'q1', "SELECT trip_uuid FROM trips WHERE status = 'completed'", 'a WHERE without datestr scans every partition');
   await expectRefused(ctx, c, 'q2', 'SELECT trip_uuid FROM trips', 'no WHERE at all scans every partition');
+  await expectRefused(ctx, c, 'q4', "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", 'datestr in the select list filters nothing: the WHERE clause must name it');
   const r = await run(c, 'q3');
   assert.equal(r.status, 200, \`a datestr range (any case) is a partition filter, got \${r.status}: \${r.text}\`);
 }
@@ -1194,6 +1223,7 @@ export async function check_limit_timeout(ctx) {
   seed(ctx, 'q1');
   seed(ctx, 'q2', GOOD_SQL + ' LIMIT 5000');
   seed(ctx, 'q3', GOOD_SQL + ' LIMIT 10');
+  seed(ctx, 'q4', GOOD_SQL + ' limit 5000;');
   const {c, config} = api(ctx);
   let r = await run(c, 'q1');
   let sent = executed(ctx).at(-1);
@@ -1206,6 +1236,10 @@ export async function check_limit_timeout(ctx) {
   assert(/\\blimit\\s+1000\\s*$/i.test(sent) && !sent.includes('5000'), \`a LIMIT 5000 must be lowered to 1000, the warehouse received \${JSON.stringify(sent)}\`);
   r = await run(c, 'q3');
   assert.equal(r.json().row_count, 10, \`a LIMIT 10 under the cap stays, got \${r.json().row_count} rows\`);
+  r = await run(c, 'q4');
+  sent = executed(ctx).at(-1);
+  assert(/\\blimit\\s+1000\\s*$/i.test(sent) && !sent.includes('5000'), \`a lower-case limit 5000 before a trailing semicolon must be lowered to 1000 too, the warehouse received \${JSON.stringify(sent)}\`);
+  assert.equal(r.json().row_count, 1000, \`a limit 5000 capped at 1000 returns 1000 rows, got \${r.json().row_count}\`);
   ctx.grpc.setLatency('Execute', 90, config.WAREHOUSE);
   const started = ctx.clock.now();
   r = await run(c, 'q1');
@@ -1331,17 +1365,27 @@ func CheckSingleSelect(ctx *harness.Ctx) {
 		runGoodSQL + "; DROP TABLE trips",
 		"DELETE FROM trips WHERE datestr = '2026-11-01'",
 		"UPDATE trips SET status = 'void' WHERE datestr = '2026-11-01'",
+		"CREATE TABLE trips_copy AS SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
+	}
+	good := []string{
+		runGoodSQL + ";",
+		"select trip_uuid from trips where datestr = '2026-11-01'",
+		"WITH day AS (SELECT '2026-11-01' AS d) SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'",
 	}
 	for i, sql := range bad {
 		runSeed(ctx, "q"+string(rune('0'+i)), sql, []string{"trips"})
 	}
-	runSeed(ctx, "ok", runGoodSQL+";", []string{"trips"})
+	for i, sql := range good {
+		runSeed(ctx, "ok"+string(rune('0'+i)), sql, []string{"trips"})
+	}
 	c := runClient(ctx)
 	for i, sql := range bad {
-		runRefused(ctx, c, "q"+string(rune('0'+i)), sql, "only one SELECT may run")
+		runRefused(ctx, c, "q"+string(rune('0'+i)), sql, "only one SELECT (or WITH) may run, whatever other statement the model wrote")
 	}
-	r := runPost(c, "ok", "ana")
-	ctx.Equal(r.Status, 200, "a single SELECT with a trailing semicolon must run (%s)", r.Text())
+	for i, sql := range good {
+		r := runPost(c, "ok"+string(rune('0'+i)), "ana")
+		ctx.Equal(r.Status, 200, "a single read must run: %q (%s)", sql, r.Text())
+	}
 }
 
 func CheckTablesAcked(ctx *harness.Ctx) {
@@ -1349,8 +1393,10 @@ func CheckTablesAcked(ctx *harness.Ctx) {
 	runSeed(ctx, "q1", join, []string{"trips"})
 	runSeed(ctx, "q2", join, []string{"trips", "drivers"})
 	runSeed(ctx, "q3", "SELECT trip_uuid FROM TRIPS WHERE datestr = '2026-11-01'", []string{"trips"})
+	queries.Save(context.Background(), queries.Record{QueryID: "q4", User: "ana", Workspace: "mobility", Question: "How many trips yesterday?", Status: "generated", TablesProposed: []string{"trips", "drivers"}, TablesAcked: []string{"trips"}, SQL: join})
 	c := runClient(ctx)
 	runRefused(ctx, c, "q1", join, "drivers was never ACKed")
+	runRefused(ctx, c, "q4", join, "drivers was proposed but the user ACKed only trips")
 	r := runPost(c, "q2", "ana")
 	ctx.Equal(r.Status, 200, "with trips and drivers ACKed the join must run (%s)", r.Text())
 	r = runPost(c, "q3", "ana")
@@ -1361,9 +1407,11 @@ func CheckPartitionFilter(ctx *harness.Ctx) {
 	runSeed(ctx, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", []string{"trips"})
 	runSeed(ctx, "q2", "SELECT trip_uuid FROM trips", []string{"trips"})
 	runSeed(ctx, "q3", "SELECT trip_uuid FROM trips WHERE DATESTR >= '2026-10-01'", []string{"trips"})
+	runSeed(ctx, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", []string{"trips"})
 	c := runClient(ctx)
 	runRefused(ctx, c, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", "a WHERE without datestr scans every partition")
 	runRefused(ctx, c, "q2", "SELECT trip_uuid FROM trips", "no WHERE at all scans every partition")
+	runRefused(ctx, c, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", "datestr in the select list filters nothing: the WHERE clause must name it")
 	r := runPost(c, "q3", "ana")
 	ctx.Equal(r.Status, 200, "a datestr range (any case) is a partition filter (%s)", r.Text())
 }
@@ -1372,6 +1420,7 @@ func CheckLimitTimeout(ctx *harness.Ctx) {
 	runSeed(ctx, "q1", runGoodSQL, []string{"trips"})
 	runSeed(ctx, "q2", runGoodSQL+" LIMIT 5000", []string{"trips"})
 	runSeed(ctx, "q3", runGoodSQL+" LIMIT 10", []string{"trips"})
+	runSeed(ctx, "q4", runGoodSQL+" limit 5000;", []string{"trips"})
 	c := runClient(ctx)
 	r := runPost(c, "q1", "ana")
 	sent := runExecuted(ctx)
@@ -1385,6 +1434,10 @@ func CheckLimitTimeout(ctx *harness.Ctx) {
 	ctx.Assert(runLimit1000.MatchString(sent[len(sent)-1]) && !strings.Contains(sent[len(sent)-1], "5000"), "a LIMIT 5000 must be lowered to 1000, the warehouse received %q", sent[len(sent)-1])
 	r = runPost(c, "q3", "ana")
 	ctx.Equal(runBody(ctx, r)["row_count"], float64(10), "a LIMIT 10 under the cap stays; row_count")
+	r = runPost(c, "q4", "ana")
+	sent = runExecuted(ctx)
+	ctx.Assert(runLimit1000.MatchString(sent[len(sent)-1]) && !strings.Contains(sent[len(sent)-1], "5000"), "a lower-case limit 5000 before a trailing semicolon must be lowered to 1000 too, the warehouse received %q", sent[len(sent)-1])
+	ctx.Equal(runBody(ctx, r)["row_count"], float64(1000), "a limit 5000 capped at 1000 returns 1000 rows; row_count")
 	ctx.GRPC.SetLatency("Execute", 90, config.Warehouse)
 	started := ctx.Clock.Now()
 	r = runPost(c, "q1", "ana")
@@ -1422,11 +1475,11 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kGoodSql = "SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'";
-const std::regex kLimit1000(R"(\\blimit\\s+1000\\s*$)", std::regex::icase);
+const std::string kHarnessGoodSql = "SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'";
+const std::regex kHarnessLimit1000(R"(\\blimit\\s+1000\\s*$)", std::regex::icase);
 
 // The stand-in warehouse: answers from querygen/warehouse.h.
-class WarehousePeer final : public sqlagents::Warehouse::Service {
+class HarnessWarehousePeer final : public sqlagents::Warehouse::Service {
  public:
   grpc::Status Execute(grpc::ServerContext*, const sqlagents::ExecuteRequest* req, sqlagents::ExecuteReply* reply) override {
     for (const auto& c : warehouse::kColumns) reply->add_columns(c);
@@ -1438,20 +1491,21 @@ class WarehousePeer final : public sqlagents::Warehouse::Service {
   }
 };
 
-void seed(harness::Ctx& ctx, const std::string& id, const std::string& sql = kGoodSql, const std::vector<std::string>& acked = {"trips"}) {
+void harness_seed(harness::Ctx& ctx, const std::string& id, const std::string& sql = kHarnessGoodSql, const std::vector<std::string>& acked = {"trips"},
+          const std::vector<std::string>& proposed = {}) {
   const json record = {{"query_id", id}, {"user", "ana"}, {"workspace", "mobility"}, {"question", "How many trips yesterday?"},
-                       {"status", "generated"}, {"tables_proposed", acked}, {"tables_acked", acked}, {"sql", sql},
+                       {"status", "generated"}, {"tables_proposed", proposed.empty() ? acked : proposed}, {"tables_acked", acked}, {"sql", sql},
                        {"run_ok", false}, {"has_output", false}};
   ctx.Redis.Set("query:" + id, record.dump());
 }
 
-json stored(harness::Ctx& ctx, const std::string& id) { return json::parse(ctx.Redis.Get("query:" + id).value_or("{}"), nullptr, false); }
+json harness_stored(harness::Ctx& ctx, const std::string& id) { return json::parse(ctx.Redis.Get("query:" + id).value_or("{}"), nullptr, false); }
 
-struct Api {
-  WarehousePeer peer;
+struct HarnessApi {
+  HarnessWarehousePeer peer;
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+  explicit HarnessApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
     ctx.GRPC.Server(config::kWarehouse)->RegisterService(&peer);
     register_routes(svr);
   }
@@ -1461,39 +1515,39 @@ struct Api {
   }
 };
 
-Api& api(harness::Ctx& ctx) {
-  static Api* current = nullptr;
+HarnessApi& harness_api(harness::Ctx& ctx) {
+  static HarnessApi* current = nullptr;
   delete current;
-  current = new Api(ctx);
+  current = new HarnessApi(ctx);
   return *current;
 }
 
-std::vector<std::string> executed(harness::Ctx& ctx) {
+std::vector<std::string> harness_executed(harness::Ctx& ctx) {
   std::vector<std::string> sqls;
   for (const auto& call : ctx.GRPC.CallsTo("Execute")) sqls.push_back(call.Request<sqlagents::ExecuteRequest>().sql());
   return sqls;
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json harness_body(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the body must be a JSON object: %s", r.Text());
   return body;
 }
 
-void refused(harness::Ctx& ctx, Api& a, const std::string& id, const std::string& sql, const std::string& why) {
-  const size_t before = executed(ctx).size();
+void harness_refused(harness::Ctx& ctx, HarnessApi& a, const std::string& id, const std::string& sql, const std::string& why) {
+  const size_t before = harness_executed(ctx).size();
   ctx.Equal(a.run(id).Status, 422, "%s: %q", why, sql);
-  ctx.Equal(executed(ctx).size(), before, "%s: %q reached the warehouse; warehouse calls", why, sql);
+  ctx.Equal(harness_executed(ctx).size(), before, "%s: %q reached the warehouse; warehouse calls", why, sql);
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  seed(ctx, "q1");
-  auto& a = api(ctx);
+  harness_seed(ctx, "q1");
+  auto& a = harness_api(ctx);
   const auto r = a.run();
   ctx.Equal(r.Status, 200, "the owner's run (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = harness_body(ctx, r);
   ctx.Assert(body["columns"] == json({"datestr", "trip_uuid"}), "the answer carries the warehouse's columns: %s", body["columns"].dump());
   ctx.Assert(body["rows"].is_array() && !body["rows"].empty() && body.value("row_count", -1) == static_cast<int>(body["rows"].size()), "row_count must count the rows returned: %s", body.value("row_count", json()).dump());
   ctx.Equal(a.run("q1", "").Status, 401, "without X-User-Id the run");
@@ -1502,23 +1556,30 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckSingleSelect(harness::Ctx& ctx) {
-  const std::vector<std::string> bad = {kGoodSql + "; DROP TABLE trips", "DELETE FROM trips WHERE datestr = '2026-11-01'",
-                                        "UPDATE trips SET status = 'void' WHERE datestr = '2026-11-01'"};
-  for (size_t i = 0; i < bad.size(); i++) seed(ctx, "q" + std::to_string(i), bad[i]);
-  seed(ctx, "ok", kGoodSql + ";");
-  auto& a = api(ctx);
-  for (size_t i = 0; i < bad.size(); i++) refused(ctx, a, "q" + std::to_string(i), bad[i], "only one SELECT may run");
-  const auto r = a.run("ok");
-  ctx.Equal(r.Status, 200, "a single SELECT with a trailing semicolon must run (%s)", r.Text());
+  const std::vector<std::string> bad = {kHarnessGoodSql + "; DROP TABLE trips", "DELETE FROM trips WHERE datestr = '2026-11-01'",
+                                        "UPDATE trips SET status = 'void' WHERE datestr = '2026-11-01'",
+                                        "CREATE TABLE trips_copy AS SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'"};
+  const std::vector<std::string> good = {kHarnessGoodSql + ";", "select trip_uuid from trips where datestr = '2026-11-01'",
+                                         "WITH day AS (SELECT '2026-11-01' AS d) SELECT trip_uuid FROM trips WHERE datestr = '2026-11-01'"};
+  for (size_t i = 0; i < bad.size(); i++) harness_seed(ctx, "q" + std::to_string(i), bad[i]);
+  for (size_t i = 0; i < good.size(); i++) harness_seed(ctx, "ok" + std::to_string(i), good[i]);
+  auto& a = harness_api(ctx);
+  for (size_t i = 0; i < bad.size(); i++) harness_refused(ctx, a, "q" + std::to_string(i), bad[i], "only one SELECT (or WITH) may run, whatever other statement the model wrote");
+  for (size_t i = 0; i < good.size(); i++) {
+    const auto r = a.run("ok" + std::to_string(i));
+    ctx.Equal(r.Status, 200, "a single read must run: %q (%s)", good[i], r.Text());
+  }
 }
 
 void CheckTablesAcked(harness::Ctx& ctx) {
   const std::string join = "SELECT t.trip_uuid, d.rating FROM trips t JOIN drivers d ON t.driver_uuid = d.driver_uuid WHERE t.datestr = '2026-11-01'";
-  seed(ctx, "q1", join, {"trips"});
-  seed(ctx, "q2", join, {"trips", "drivers"});
-  seed(ctx, "q3", "SELECT trip_uuid FROM TRIPS WHERE datestr = '2026-11-01'", {"trips"});
-  auto& a = api(ctx);
-  refused(ctx, a, "q1", join, "drivers was never ACKed");
+  harness_seed(ctx, "q1", join, {"trips"});
+  harness_seed(ctx, "q2", join, {"trips", "drivers"});
+  harness_seed(ctx, "q3", "SELECT trip_uuid FROM TRIPS WHERE datestr = '2026-11-01'", {"trips"});
+  harness_seed(ctx, "q4", join, {"trips"}, {"trips", "drivers"});
+  auto& a = harness_api(ctx);
+  harness_refused(ctx, a, "q1", join, "drivers was never ACKed");
+  harness_refused(ctx, a, "q4", join, "drivers was proposed but the user ACKed only trips");
   auto r = a.run("q2");
   ctx.Equal(r.Status, 200, "with trips and drivers ACKed the join must run (%s)", r.Text());
   r = a.run("q3");
@@ -1526,32 +1587,39 @@ void CheckTablesAcked(harness::Ctx& ctx) {
 }
 
 void CheckPartitionFilter(harness::Ctx& ctx) {
-  seed(ctx, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'");
-  seed(ctx, "q2", "SELECT trip_uuid FROM trips");
-  seed(ctx, "q3", "SELECT trip_uuid FROM trips WHERE DATESTR >= '2026-10-01'");
-  auto& a = api(ctx);
-  refused(ctx, a, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", "a WHERE without datestr scans every partition");
-  refused(ctx, a, "q2", "SELECT trip_uuid FROM trips", "no WHERE at all scans every partition");
+  harness_seed(ctx, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'");
+  harness_seed(ctx, "q2", "SELECT trip_uuid FROM trips");
+  harness_seed(ctx, "q3", "SELECT trip_uuid FROM trips WHERE DATESTR >= '2026-10-01'");
+  harness_seed(ctx, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'");
+  auto& a = harness_api(ctx);
+  harness_refused(ctx, a, "q1", "SELECT trip_uuid FROM trips WHERE status = 'completed'", "a WHERE without datestr scans every partition");
+  harness_refused(ctx, a, "q2", "SELECT trip_uuid FROM trips", "no WHERE at all scans every partition");
+  harness_refused(ctx, a, "q4", "SELECT datestr, trip_uuid FROM trips WHERE status = 'completed'", "datestr in the select list filters nothing: the WHERE clause must name it");
   const auto r = a.run("q3");
   ctx.Equal(r.Status, 200, "a datestr range (any case) is a partition filter (%s)", r.Text());
 }
 
 void CheckLimitTimeout(harness::Ctx& ctx) {
-  seed(ctx, "q1");
-  seed(ctx, "q2", kGoodSql + " LIMIT 5000");
-  seed(ctx, "q3", kGoodSql + " LIMIT 10");
-  auto& a = api(ctx);
+  harness_seed(ctx, "q1");
+  harness_seed(ctx, "q2", kHarnessGoodSql + " LIMIT 5000");
+  harness_seed(ctx, "q3", kHarnessGoodSql + " LIMIT 10");
+  harness_seed(ctx, "q4", kHarnessGoodSql + " limit 5000;");
+  auto& a = harness_api(ctx);
   auto r = a.run("q1");
-  auto sent = executed(ctx);
-  ctx.Assert(!sent.empty() && std::regex_search(sent.back(), kLimit1000), "the warehouse received %v: it must end in LIMIT 1000", sent);
-  ctx.Equal(bodyOf(ctx, r).value("row_count", -1), 1000, "a capped query returns at most 1000 rows; row_count");
+  auto sent = harness_executed(ctx);
+  ctx.Assert(!sent.empty() && std::regex_search(sent.back(), kHarnessLimit1000), "the warehouse received %v: it must end in LIMIT 1000", sent);
+  ctx.Equal(harness_body(ctx, r).value("row_count", -1), 1000, "a capped query returns at most 1000 rows; row_count");
   const auto last = ctx.GRPC.CallsTo("Execute").back();
   ctx.Assert(last.HasDeadline() && 59 <= last.TimeoutSeconds() && last.TimeoutSeconds() <= 61, "the Execute call must carry a 60 s statement timeout, got %vs", last.TimeoutSeconds());
   a.run("q2");
-  sent = executed(ctx);
-  ctx.Assert(std::regex_search(sent.back(), kLimit1000) && sent.back().find("5000") == std::string::npos, "a LIMIT 5000 must be lowered to 1000, the warehouse received %q", sent.back());
+  sent = harness_executed(ctx);
+  ctx.Assert(std::regex_search(sent.back(), kHarnessLimit1000) && sent.back().find("5000") == std::string::npos, "a LIMIT 5000 must be lowered to 1000, the warehouse received %q", sent.back());
   r = a.run("q3");
-  ctx.Equal(bodyOf(ctx, r).value("row_count", -1), 10, "a LIMIT 10 under the cap stays; row_count");
+  ctx.Equal(harness_body(ctx, r).value("row_count", -1), 10, "a LIMIT 10 under the cap stays; row_count");
+  r = a.run("q4");
+  sent = harness_executed(ctx);
+  ctx.Assert(std::regex_search(sent.back(), kHarnessLimit1000) && sent.back().find("5000") == std::string::npos, "a lower-case limit 5000 before a trailing semicolon must be lowered to 1000 too, the warehouse received %q", sent.back());
+  ctx.Equal(harness_body(ctx, r).value("row_count", -1), 1000, "a limit 5000 capped at 1000 returns 1000 rows; row_count");
   ctx.GRPC.SetLatency("Execute", 90, config::kWarehouse);
   const int64_t started = ctx.Clock.Now();
   r = a.run("q1");
@@ -1561,19 +1629,19 @@ void CheckLimitTimeout(harness::Ctx& ctx) {
 }
 
 void CheckRunSignals(harness::Ctx& ctx) {
-  seed(ctx, "q1", kGoodSql + " AND status = 'Finished'");
-  seed(ctx, "q2");
-  auto& a = api(ctx);
+  harness_seed(ctx, "q1", kHarnessGoodSql + " AND status = 'Finished'");
+  harness_seed(ctx, "q2");
+  auto& a = harness_api(ctx);
   auto r = a.run("q1");
   ctx.Equal(r.Status, 200, "a query whose filter matches nothing still runs (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = harness_body(ctx, r);
   ctx.Assert(body.value("row_count", -1) == 0 && body.contains("has_output") && body["has_output"] == false, "no rows: has_output must be false: %s", r.Text());
-  const json s = stored(ctx, "q1");
+  const json s = harness_stored(ctx, "q1");
   ctx.Assert(s.value("status", "") == "ran" && s.value("run_ok", false) == true && s.value("has_output", true) == false, "the record must say ran, run_ok true, has_output false: %s", s.dump());
   r = a.run("q2");
-  const json second = bodyOf(ctx, r);
+  const json second = harness_body(ctx, r);
   ctx.Assert(second.contains("has_output") && second["has_output"] == true, "rows came back: has_output must be true: %s", r.Text().substr(0, 120));
-  ctx.Assert(stored(ctx, "q2").value("has_output", false) == true, "the record must keep has_output true: %s", stored(ctx, "q2").dump());
+  ctx.Assert(harness_stored(ctx, "q2").value("has_output", false) == true, "the record must keep has_output true: %s", harness_stored(ctx, "q2").dump());
 }
 `,
   },
