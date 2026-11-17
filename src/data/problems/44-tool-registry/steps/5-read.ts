@@ -19,10 +19,11 @@ newest definitions mid-plan; any tenant resolves any tool, including irreversibl
 granted; and every caller receives the owner team's internal endpoint and credential reference.
 
 - The run's pin comes from \`X-Run-Id\`: \`catalog.resolve(name, run_id)\`.
-- The allowlist is the authenticated tenant's, \`store.allowlist(tenant)\`. A tool outside it is
-  **404** with the same body as a missing tool; a 403 would tell a caller which tools exist.
+- The allowlist is the authenticated tenant's, \`store.allowlist(tenant)\`. A tool outside it, whatever
+  its side effect, is **404** with the same body as a missing tool; a 403 would tell a caller which
+  tools exist.
 - The response is \`PUBLIC_FIELDS\` only: \`name\`, \`version\` (the version served), \`side_effect\`
-  and \`schema\`.`,
+  and \`schema\`, whatever else the stored entry carries.`,
   sequence: {
     participants: ['Agent run', 'toolsd', 'Redis'],
     messages: [
@@ -62,7 +63,7 @@ granted; and every caller receives the owner team's internal endpoint and creden
       id: 'allowlist-404',
       title: 'A tool outside the allowlist is a 404',
       detail:
-        "The tenant's allowlist (`store.allowlist(tenant)`) is checked before resolving, and a tool outside it answers exactly as a missing one, **404**; the starter skips the allowlist, so any authenticated caller resolves any tool.",
+        "The tenant's allowlist (`store.allowlist(tenant)`) is checked before resolving, and a tool outside it, read-only tools included, answers exactly as a missing one, **404**, as does a granted tool missing from the catalog; the starter skips the allowlist, so any authenticated caller resolves any tool.",
       match: {
         python: {
           all: [/store\.allowlist\(\s*tenant\s*\)/],
@@ -95,7 +96,7 @@ granted; and every caller receives the owner team's internal endpoint and creden
       id: 'public-fields',
       title: 'Answers the public contract only',
       detail:
-        'The response is built from `PUBLIC_FIELDS` (`name`, `version`, `side_effect`, `schema`); the starter returns the stored entry, so the internal endpoint and credential reference reach every caller.',
+        'The response is built from `PUBLIC_FIELDS` (`name`, `version`, `side_effect`, `schema`), so no other field of the stored entry, today or added later, reaches a caller; the starter returns the stored entry, so the internal endpoint and credential reference reach every caller.',
       match: {
         python: {all: [/PUBLIC_FIELDS/], none: [/JSONResponse\(\s*entry\s*\)/]},
         typescript: {all: [/PUBLIC_FIELDS/], none: [/send\(\s*entry\s*\)|return entry;/]},
@@ -420,19 +421,19 @@ FIELDS = {"name", "version", "side_effect", "schema"}
 
 
 def _entry(name, version, side_effect, owner):
-    return {"name": name, "version": version, "side_effect": side_effect, "owner": owner, "schema": {"type": "object", "properties": {"q": {"type": "string"}}}, "endpoint": f"https://{owner}.internal/{name}", "credential_ref": f"vault://{owner}/{name}"}
+    return {"name": name, "version": version, "side_effect": side_effect, "owner": owner, "schema": {"type": "object", "properties": {"q": {"type": "string"}}}, "endpoint": f"https://{owner}.internal/{name}", "credential_ref": f"vault://{owner}/{name}", "review_ticket": f"SEC-{version}"}
 
 
 def _api(ctx):
-    """Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void."""
-    v7 = {"search": _entry("search", "a1", "read", "search"), "payments.refund": _entry("payments.refund", "b1", "irreversible", "payments"), "payments.void": _entry("payments.void", "d1", "write", "payments")}
-    v9 = {"search": _entry("search", "a2", "read", "search"), "payments.refund": _entry("payments.refund", "b2", "irreversible", "payments"), "payments.void": _entry("payments.void", "d2", "write", "payments")}
+    """Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund (and payments.retired, in no catalog), not payments.void or docs.lookup."""
+    v7 = {"search": _entry("search", "a1", "read", "search"), "payments.refund": _entry("payments.refund", "b1", "irreversible", "payments"), "payments.void": _entry("payments.void", "d1", "write", "payments"), "docs.lookup": _entry("docs.lookup", "l1", "read", "docs")}
+    v9 = {"search": _entry("search", "a2", "read", "search"), "payments.refund": _entry("payments.refund", "b2", "irreversible", "payments"), "payments.void": _entry("payments.void", "d2", "write", "payments"), "docs.lookup": _entry("docs.lookup", "l2", "read", "docs")}
     for cv in ("7", "9"):
         catalog.record_validation(cv, "passed", "")
     catalog.promote("7", v7)
     catalog.pin_run("run-1", "7")
     catalog.promote("9", v9)
-    store.grant("acme", "search", "payments.refund")
+    store.grant("acme", "search", "payments.refund", "payments.retired")
     return ctx.client(ctx.load("read").app)
 
 
@@ -464,6 +465,10 @@ async def check_allowlist_404(ctx):
         assert missing.status_code == 404, f"a missing tool answered {missing.status_code}, expected 404"
         assert denied.status_code == 404, f"payments.void, which acme was never granted, answered {denied.status_code}: a tool outside the allowlist is 404"
         assert denied.text == missing.text, f"a tool outside the allowlist answered {denied.text!r}, a missing tool {missing.text!r}: the two must be indistinguishable"
+        docs = await c.get("/v1/tools/docs.lookup", headers=ACME)
+        assert docs.status_code == 404 and docs.text == missing.text, f"docs.lookup, a read-only tool acme was never granted, answered {docs.status_code} {docs.text}: every tool outside the allowlist is a 404 like a missing one, whatever its side effect"
+        retired = await c.get("/v1/tools/payments.retired", headers=ACME)
+        assert retired.status_code == 404 and retired.text == missing.text, f"payments.retired, granted to acme but in no catalog, answered {retired.status_code} {retired.text}, expected the 404 of a missing tool"
         other = await c.get("/v1/tools/payments.refund", headers={"X-Tenant-Id": "globex"})
     assert other.status_code == 404, f"globex, granted nothing, resolved payments.refund with {other.status_code}: the allowlist is the caller's tenant's"
 
@@ -473,7 +478,7 @@ async def check_public_fields(ctx):
         r = await c.get("/v1/tools/payments.refund", headers=ACME)
     assert r.status_code == 200, f"GET /v1/tools/payments.refund answered {r.status_code}: {r.text}"
     body = r.json()
-    assert set(body) == FIELDS, f"the response carries {sorted(body)}, expected exactly {sorted(FIELDS)}"
+    assert set(body) == FIELDS, f"the response carries {sorted(body)}, expected exactly {sorted(FIELDS)}: build it from the public fields, so an internal field the registry keeps never reaches a caller"
     assert "vault://" not in r.text and ".internal" not in r.text, f"the response leaks the owner's endpoint or credential reference: {r.text}"
     assert body["schema"] == {"type": "object", "properties": {"q": {"type": "string"}}}, f"the schema served is {body['schema']}"
 `,
@@ -481,20 +486,20 @@ async def check_public_fields(ctx):
 const FIELDS = ['name', 'schema', 'side_effect', 'version'];
 
 function entry(name: string, version: string, sideEffect: string, owner: string) {
-  return {name, version, side_effect: sideEffect, owner, schema: {type: 'object', properties: {q: {type: 'string'}}}, endpoint: \`https://\${owner}.internal/\${name}\`, credential_ref: \`vault://\${owner}/\${name}\`};
+  return {name, version, side_effect: sideEffect, owner, schema: {type: 'object', properties: {q: {type: 'string'}}}, endpoint: \`https://\${owner}.internal/\${name}\`, credential_ref: \`vault://\${owner}/\${name}\`, review_ticket: \`SEC-\${version}\`};
 }
 
-/** Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void. */
+/** Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund (and payments.retired, in no catalog), not payments.void or docs.lookup. */
 async function api(ctx) {
   const catalog = ctx.load('/support/toolsd/catalog.ts');
   const store = ctx.load('/support/toolsd/store.ts');
-  const v7 = {search: entry('search', 'a1', 'read', 'search'), 'payments.refund': entry('payments.refund', 'b1', 'irreversible', 'payments'), 'payments.void': entry('payments.void', 'd1', 'write', 'payments')};
-  const v9 = {search: entry('search', 'a2', 'read', 'search'), 'payments.refund': entry('payments.refund', 'b2', 'irreversible', 'payments'), 'payments.void': entry('payments.void', 'd2', 'write', 'payments')};
+  const v7 = {search: entry('search', 'a1', 'read', 'search'), 'payments.refund': entry('payments.refund', 'b1', 'irreversible', 'payments'), 'payments.void': entry('payments.void', 'd1', 'write', 'payments'), 'docs.lookup': entry('docs.lookup', 'l1', 'read', 'docs')};
+  const v9 = {search: entry('search', 'a2', 'read', 'search'), 'payments.refund': entry('payments.refund', 'b2', 'irreversible', 'payments'), 'payments.void': entry('payments.void', 'd2', 'write', 'payments'), 'docs.lookup': entry('docs.lookup', 'l2', 'read', 'docs')};
   for (const cv of ['7', '9']) await catalog.recordValidation(cv, 'passed', '');
   await catalog.promote('7', v7);
   await catalog.pinRun('run-1', '7');
   await catalog.promote('9', v9);
-  await store.grant('acme', 'search', 'payments.refund');
+  await store.grant('acme', 'search', 'payments.refund', 'payments.retired');
   return ctx.client(ctx.load('read').app);
 }
 
@@ -526,6 +531,10 @@ export async function check_allowlist_404(ctx) {
   assert.equal(missing.status, 404, \`a missing tool answered \${missing.status}, expected 404\`);
   assert.equal(denied.status, 404, \`payments.void, which acme was never granted, answered \${denied.status}: a tool outside the allowlist is 404\`);
   assert.equal(denied.text, missing.text, \`a tool outside the allowlist answered \${denied.text}, a missing tool \${missing.text}: the two must be indistinguishable\`);
+  const docs = await c.get('/v1/tools/docs.lookup', {headers: ACME});
+  assert(docs.status === 404 && docs.text === missing.text, \`docs.lookup, a read-only tool acme was never granted, answered \${docs.status} \${docs.text}: every tool outside the allowlist is a 404 like a missing one, whatever its side effect\`);
+  const retired = await c.get('/v1/tools/payments.retired', {headers: ACME});
+  assert(retired.status === 404 && retired.text === missing.text, \`payments.retired, granted to acme but in no catalog, answered \${retired.status} \${retired.text}, expected the 404 of a missing tool\`);
   const other = await c.get('/v1/tools/payments.refund', {headers: {'X-Tenant-Id': 'globex'}});
   assert.equal(other.status, 404, \`globex, granted nothing, resolved payments.refund with \${other.status}: the allowlist is the caller's tenant's\`);
 }
@@ -535,7 +544,7 @@ export async function check_public_fields(ctx) {
   const r = await c.get('/v1/tools/payments.refund', {headers: ACME});
   assert.equal(r.status, 200, \`GET /v1/tools/payments.refund answered \${r.status}: \${r.text}\`);
   const body = r.json();
-  assert.deepStrictEqual(Object.keys(body).sort(), FIELDS, \`the response carries \${JSON.stringify(Object.keys(body).sort())}, expected exactly \${JSON.stringify(FIELDS)}\`);
+  assert.deepStrictEqual(Object.keys(body).sort(), FIELDS, \`the response carries \${JSON.stringify(Object.keys(body).sort())}, expected exactly \${JSON.stringify(FIELDS)}: build it from the public fields, so an internal field the registry keeps never reaches a caller\`);
   assert(!r.text.includes('vault://') && !r.text.includes('.internal'), \`the response leaks the owner's endpoint or credential reference: \${r.text}\`);
   assert.deepStrictEqual(body.schema, {type: 'object', properties: {q: {type: 'string'}}}, \`the schema served is \${JSON.stringify(body.schema)}\`);
 }
@@ -557,20 +566,20 @@ import (
 var readBg = context.Background()
 
 func entry(name, version, sideEffect, owner string) catalog.Entry {
-	return catalog.Entry{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}}}, "endpoint": "https://" + owner + ".internal/" + name, "credential_ref": "vault://" + owner + "/" + name}
+	return catalog.Entry{"name": name, "version": version, "side_effect": sideEffect, "owner": owner, "schema": map[string]any{"type": "object", "properties": map[string]any{"q": map[string]any{"type": "string"}}}, "endpoint": "https://" + owner + ".internal/" + name, "credential_ref": "vault://" + owner + "/" + name, "review_ticket": "SEC-" + version}
 }
 
-// api: catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void.
+// api: catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund (and payments.retired, in no catalog), not payments.void or docs.lookup.
 func api(ctx *harness.Ctx) *harness.HTTP {
-	v7 := map[string]catalog.Entry{"search": entry("search", "a1", "read", "search"), "payments.refund": entry("payments.refund", "b1", "irreversible", "payments"), "payments.void": entry("payments.void", "d1", "write", "payments")}
-	v9 := map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "payments.refund": entry("payments.refund", "b2", "irreversible", "payments"), "payments.void": entry("payments.void", "d2", "write", "payments")}
+	v7 := map[string]catalog.Entry{"search": entry("search", "a1", "read", "search"), "payments.refund": entry("payments.refund", "b1", "irreversible", "payments"), "payments.void": entry("payments.void", "d1", "write", "payments"), "docs.lookup": entry("docs.lookup", "l1", "read", "docs")}
+	v9 := map[string]catalog.Entry{"search": entry("search", "a2", "read", "search"), "payments.refund": entry("payments.refund", "b2", "irreversible", "payments"), "payments.void": entry("payments.void", "d2", "write", "payments"), "docs.lookup": entry("docs.lookup", "l2", "read", "docs")}
 	for _, cv := range []string{"7", "9"} {
 		ctx.NoError(catalog.RecordValidation(readBg, cv, "passed", ""), "seeding failed")
 	}
 	ctx.NoError(catalog.Promote(readBg, "7", v7), "seeding failed")
 	ctx.NoError(catalog.PinRun(readBg, "run-1", "7"), "seeding failed")
 	ctx.NoError(catalog.Promote(readBg, "9", v9), "seeding failed")
-	ctx.NoError(store.Grant(readBg, "acme", "search", "payments.refund"), "seeding failed")
+	ctx.NoError(store.Grant(readBg, "acme", "search", "payments.refund", "payments.retired"), "seeding failed")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
@@ -607,6 +616,10 @@ func CheckAllowlist404(ctx *harness.Ctx) {
 	ctx.Equal(missing.Status, 404, "a missing tool")
 	ctx.Equal(denied.Status, 404, "payments.void, which acme was never granted: a tool outside the allowlist is 404")
 	ctx.Equal(denied.Text(), missing.Text(), "a tool outside the allowlist and a missing tool must be indistinguishable; the body")
+	docs := c.Get("/v1/tools/docs.lookup", "X-Tenant-Id", "acme")
+	ctx.Assert(docs.Status == 404 && docs.Text() == missing.Text(), "docs.lookup, a read-only tool acme was never granted, answered %d %s: every tool outside the allowlist is a 404 like a missing one, whatever its side effect", docs.Status, docs.Text())
+	retired := c.Get("/v1/tools/payments.retired", "X-Tenant-Id", "acme")
+	ctx.Assert(retired.Status == 404 && retired.Text() == missing.Text(), "payments.retired, granted to acme but in no catalog, answered %d %s, expected the 404 of a missing tool", retired.Status, retired.Text())
 	ctx.Equal(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "globex").Status, 404, "globex, granted nothing, resolving payments.refund (the allowlist is the caller's tenant's)")
 }
 
@@ -620,7 +633,7 @@ func CheckPublicFields(ctx *harness.Ctx) {
 		fields = append(fields, k)
 	}
 	sort.Strings(fields)
-	ctx.Equal(fields, []string{"name", "schema", "side_effect", "version"}, "the response's fields")
+	ctx.Equal(fields, []string{"name", "schema", "side_effect", "version"}, "build the response from the public fields, so an internal field the registry keeps never reaches a caller; the response's fields")
 	ctx.Assert(!strings.Contains(r.Text(), "vault://") && !strings.Contains(r.Text(), ".internal"), "the response leaks the owner's endpoint or credential reference: %s", r.Text())
 }
 `,
@@ -642,23 +655,26 @@ json entry(const std::string& name, const std::string& version, const std::strin
               {"owner", owner},
               {"schema", {{"type", "object"}, {"properties", {{"q", {{"type", "string"}}}}}}},
               {"endpoint", "https://" + owner + ".internal/" + name},
-              {"credential_ref", "vault://" + owner + "/" + name}};
+              {"credential_ref", "vault://" + owner + "/" + name},
+              {"review_ticket", "SEC-" + version}};
 }
 
-// Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund, not payments.void.
+// Catalog 7, then 9 active; run-1 pinned 7; acme may resolve search and payments.refund (and payments.retired, in no catalog), not payments.void or docs.lookup.
 harness::HTTP api(harness::Ctx& ctx) {
   const json v7 = {{"search", entry("search", "a1", "read", "search")},
                    {"payments.refund", entry("payments.refund", "b1", "irreversible", "payments")},
-                   {"payments.void", entry("payments.void", "d1", "write", "payments")}};
+                   {"payments.void", entry("payments.void", "d1", "write", "payments")},
+                   {"docs.lookup", entry("docs.lookup", "l1", "read", "docs")}};
   const json v9 = {{"search", entry("search", "a2", "read", "search")},
                    {"payments.refund", entry("payments.refund", "b2", "irreversible", "payments")},
-                   {"payments.void", entry("payments.void", "d2", "write", "payments")}};
+                   {"payments.void", entry("payments.void", "d2", "write", "payments")},
+                   {"docs.lookup", entry("docs.lookup", "l2", "read", "docs")}};
   catalog::recordValidation("7", "passed", "");
   catalog::recordValidation("9", "passed", "");
   catalog::promote("7", v7);
   catalog::pinRun("run-1", "7");
   catalog::promote("9", v9);
-  store::grant("acme", {"search", "payments.refund"});
+  store::grant("acme", {"search", "payments.refund", "payments.retired"});
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -697,6 +713,10 @@ void CheckAllowlist404(harness::Ctx& ctx) {
   ctx.Equal(missing.Status, 404, "a missing tool");
   ctx.Equal(denied.Status, 404, "payments.void, which acme was never granted: a tool outside the allowlist is 404");
   ctx.Equal(denied.Text(), missing.Text(), "a tool outside the allowlist and a missing tool must be indistinguishable; the body");
+  const auto docs = c.Get("/v1/tools/docs.lookup", "X-Tenant-Id", "acme");
+  ctx.Assert(docs.Status == 404 && docs.Text() == missing.Text(), "docs.lookup, a read-only tool acme was never granted, answered %d %s: every tool outside the allowlist is a 404 like a missing one, whatever its side effect", docs.Status, docs.Text());
+  const auto retired = c.Get("/v1/tools/payments.retired", "X-Tenant-Id", "acme");
+  ctx.Assert(retired.Status == 404 && retired.Text() == missing.Text(), "payments.retired, granted to acme but in no catalog, answered %d %s, expected the 404 of a missing tool", retired.Status, retired.Text());
   ctx.Equal(c.Get("/v1/tools/payments.refund", "X-Tenant-Id", "globex").Status, 404, "globex, granted nothing, resolving payments.refund (the allowlist is the caller's tenant's)");
 }
 
@@ -709,7 +729,7 @@ void CheckPublicFields(harness::Ctx& ctx) {
   if (body.is_object()) {
     for (const auto& [k, v] : body.items()) fields.push_back(k);
   }
-  ctx.Equal(fields, {"name", "schema", "side_effect", "version"}, "the response's fields");
+  ctx.Equal(fields, {"name", "schema", "side_effect", "version"}, "build the response from the public fields, so an internal field the registry keeps never reaches a caller; the response's fields");
   ctx.Assert(r.Text().find("vault://") == std::string::npos && r.Text().find(".internal") == std::string::npos, "the response leaks the owner's endpoint or credential reference: %s", r.Text());
 }
 `,

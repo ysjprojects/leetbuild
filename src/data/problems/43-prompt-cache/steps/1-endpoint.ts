@@ -872,6 +872,8 @@ async def check_version_required(ctx):
         assert r.status_code == 400, f"a body without prompt_version answered {r.status_code}: {r.text[:200]}. A missing version must be 400, not version 1"
         r = await _post(c, _body(version="7"))
         assert r.status_code == 400, f"prompt_version '7' (a string) answered {r.status_code}, expected 400"
+        r = await _post(c, _body(version=True))
+        assert r.status_code == 400, f"prompt_version true (a boolean) answered {r.status_code}, expected 400"
         assert _model_calls(ctx) == 0 and _entries(ctx) == [], f"a rejected request must not reach the model or the cache: {_model_calls(ctx)} calls, entries {_entries(ctx)}"
 
 
@@ -882,6 +884,8 @@ async def check_no_echo(ctx):
         assert r.status_code == 413, f"a {len(secret) * 300}-byte prefix answered {r.status_code}, expected 413"
         assert "ACME-INTERNAL" not in r.text, f"the 413 body quotes the prompt: {r.text[:200]}. Error bodies end up in logs and trackers; say the limit, not the text"
         assert r.json().get("error") == "prefix_too_large", f"the 413 body carries error prefix_too_large, got {r.text[:200]}"
+        limit = r.json().get("limit_bytes")
+        assert type(limit) is int and limit == 8192, f"the 413 body states the limit, limit_bytes 8192, got {r.text[:200]}"
         assert _model_calls(ctx) == 0 and _entries(ctx) == [], "an oversized prefix must not reach the model or the cache"
         exact = await _post(c, _body(prefix="a" * 8192))
         assert exact.status_code == 200, f"exactly 8192 bytes is within the cap, got {exact.status_code}"
@@ -953,6 +957,8 @@ export async function check_version_required(ctx) {
   assert.equal(r.status, 400, \`a body without prompt_version answered \${r.status}: \${r.text.slice(0, 200)}. A missing version must be 400, not version 1\`);
   r = await post(c, body({prompt_version: '7'}));
   assert.equal(r.status, 400, \`prompt_version '7' (a string) answered \${r.status}, expected 400\`);
+  r = await post(c, body({prompt_version: true}));
+  assert.equal(r.status, 400, \`prompt_version true (a boolean) answered \${r.status}, expected 400\`);
   assert(modelCalls(ctx) === 0 && entries(ctx).length === 0, \`a rejected request must not reach the model or the cache: \${modelCalls(ctx)} calls, entries \${JSON.stringify(entries(ctx))}\`);
 }
 
@@ -963,6 +969,7 @@ export async function check_no_echo(ctx) {
   assert.equal(r.status, 413, \`a \${secret.length * 300}-byte prefix answered \${r.status}, expected 413\`);
   assert(!r.text.includes('ACME-INTERNAL'), \`the 413 body quotes the prompt: \${r.text.slice(0, 200)}. Error bodies end up in logs and trackers; say the limit, not the text\`);
   assert.equal(r.json().error, 'prefix_too_large', \`the 413 body carries error prefix_too_large, got \${r.text.slice(0, 200)}\`);
+  assert.equal(r.json().limit_bytes, 8192, \`the 413 body states the limit, limit_bytes 8192, got \${r.text.slice(0, 200)}\`);
   assert(modelCalls(ctx) === 0 && entries(ctx).length === 0, 'an oversized prefix must not reach the model or the cache');
   assert.equal((await post(c, body({prefix: 'a'.repeat(8192)}))).status, 200, 'exactly 8192 bytes is within the cap');
   assert.equal((await post(c, body({prefix: 'é'.repeat(4097)}))).status, 413, '4097 two-byte characters are 8194 bytes and must be 413');
@@ -1078,6 +1085,8 @@ func CheckVersionRequired(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 400, "a body without prompt_version (%s): a missing version must be 400, not version 1", r.Text())
 	r = c.Post("/v1/completions/cached", apiBody(apiPrefix, "7"), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 400, "prompt_version \\"7\\" (a string)")
+	r = c.Post("/v1/completions/cached", apiBody(apiPrefix, true), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 400, "prompt_version true (a boolean)")
 	ctx.Assert(apiModelCalls == 0 && len(apiEntries(ctx)) == 0, "a rejected request must not reach the model or the cache: %d calls, entries %v", apiModelCalls, apiEntries(ctx))
 }
 
@@ -1090,6 +1099,7 @@ func CheckNoEcho(ctx *harness.Ctx) {
 	var out map[string]any
 	r.Decode(&out)
 	ctx.Equal(out["error"], "prefix_too_large", "the 413 body's error")
+	ctx.Assert(out["limit_bytes"] == float64(8192), "the 413 body states the limit, limit_bytes 8192, got %.200s", r.Text())
 	ctx.Assert(apiModelCalls == 0 && len(apiEntries(ctx)) == 0, "an oversized prefix must not reach the model or the cache")
 	ctx.Equal(c.Post("/v1/completions/cached", apiBody(strings.Repeat("a", 8192), 7), "X-Tenant-Id", "t1").Status, 200, "exactly 8192 bytes is within the cap")
 	ctx.Equal(c.Post("/v1/completions/cached", apiBody(strings.Repeat("é", 4097), 7), "X-Tenant-Id", "t1").Status, 413, "4097 two-byte characters are 8194 bytes")
@@ -1208,6 +1218,8 @@ void CheckVersionRequired(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 400, "a body without prompt_version (%s): a missing version must be 400, not version 1", r.Text());
   r = api.post(apiBody(kPrefix, "7"));
   ctx.Equal(r.Status, 400, "prompt_version \\"7\\" (a string)");
+  r = api.post(apiBody(kPrefix, true));
+  ctx.Equal(r.Status, 400, "prompt_version true (a boolean)");
   ctx.Assert(apiModelCalls == 0 && apiEntries(ctx).empty(), "a rejected request must not reach the model or the cache: %d calls, entries %v", apiModelCalls, apiEntries(ctx));
 }
 
@@ -1220,6 +1232,7 @@ void CheckNoEcho(harness::Ctx& ctx) {
   ctx.Assert(r.Text().find("ACME-INTERNAL") == std::string::npos, "the 413 body quotes the prompt: %s. Error bodies end up in logs and trackers; say the limit, not the text", r.Text().substr(0, 200));
   const json out = json::parse(r.Text(), nullptr, false);
   ctx.Assert(out.is_object() && out.value("error", "") == "prefix_too_large", "the 413 body carries error prefix_too_large, got %s", r.Text().substr(0, 200));
+  ctx.Assert(out.is_object() && out.contains("limit_bytes") && out["limit_bytes"].is_number_integer() && out["limit_bytes"].get<long long>() == 8192, "the 413 body states the limit, limit_bytes 8192, got %s", r.Text().substr(0, 200));
   ctx.Assert(apiModelCalls == 0 && apiEntries(ctx).empty(), "an oversized prefix must not reach the model or the cache");
   ctx.Equal(api.post(apiBody(std::string(8192, 'a'), 7)).Status, 200, "exactly 8192 bytes is within the cap");
   std::string wide;

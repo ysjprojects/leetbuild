@@ -76,7 +76,7 @@ carrying different bytes is accepted. Each one resumes as wrong weights.
       id: 'chunk-at-index',
       title: 'Stages a chunk at its own index',
       detail:
-        'The chunk is written with `put_chunk(upload_id, index, …)`, the index the request names. The starter writes it to the next free slot, so a redelivered chunk is staged twice.',
+        'The chunk is written with `put_chunk(upload_id, index, …)`, the index the request names, and a redelivery with the same bytes answers 200 and stages nothing, the last chunk of a complete upload included. The starter writes it to the next free slot, so a redelivered chunk is staged twice.',
       match: {
         python: {all: [/store\.put_chunk\(\s*upload_id,\s*index\b/], none: [/put_chunk\(\s*upload_id,\s*slot\b/]},
         typescript: {all: [/putChunk\(\s*uploadId,\s*index\b/], none: [/putChunk\(\s*uploadId,\s*slot\b/]},
@@ -114,7 +114,7 @@ carrying different bytes is accepted. Each one resumes as wrong weights.
       id: 'chunk-conflict',
       title: 'A replay with different bytes is 409',
       detail:
-        'A chunk below the expected index is compared by digest with what `chunk_digest`/`chunkDigest` holds: the same bytes stage nothing new, different bytes answer **409**. The starter never compares.',
+        'A chunk below the expected index, any staged index and not only the last one, is compared by digest with what `chunk_digest`/`chunkDigest` holds: the same bytes answer 200 and stage nothing new, different bytes answer **409**. The starter never compares.',
       match: {
         python: {all: [/\b409\b/], order: [/store\.chunk_digest\(\s*upload_id,\s*index/, /store\.put_chunk\(/]},
         typescript: {all: [/\b409\b/], order: [/chunkDigest\(\s*uploadId,\s*index/, /putChunk\(/]},
@@ -761,6 +761,9 @@ async def check_chunk_at_index(ctx):
         assert count == 2, f"after chunks 0, 1 and a redelivery of chunk 1 the upload stages {count} chunks: the redelivered chunk was staged a second time, in another slot. Stage a chunk at its own index"
         r = await _put(c, upload_id, 2, C)
         assert r.status_code == 200, f"chunk 2 after the redelivery answered {r.status_code}: {r.text}"
+        r = await _put(c, upload_id, 2, C)  # the last chunk again, once the upload is complete
+        assert r.status_code == 200, f"a redelivery of the last chunk of a complete upload answered {r.status_code}: {r.text}, expected 200: the same bytes at a staged index are a replay"
+        assert store.stored_count(upload_id) == 3, f"after a redelivery of the last chunk the upload stages {store.stored_count(upload_id)} chunks, expected 3"
     staged = _staged(upload_id, 3)
     assert staged == [A, B, C], f"the upload stages {staged}, expected the three chunks in index order"
 
@@ -784,12 +787,14 @@ async def check_chunk_conflict(ctx):
     async with _api(ctx) as c:
         upload_id = await _open(c)
         await _put(c, upload_id, 0, A)
-        r = await _put(c, upload_id, 0, b"tampered weights")
+        await _put(c, upload_id, 1, B)
+        r = await _put(c, upload_id, 0, b"tampered weights")  # chunk 0 again, behind the last staged chunk
         assert r.status_code == 409, f"a replay of chunk 0 with different bytes answered {r.status_code}, expected 409"
         assert store.chunk(upload_id, 0) == A and store.chunk_digest(upload_id, 0) == store.digest(A), f"chunk 0 now stages {store.chunk(upload_id, 0)!r}: the replay with different bytes overwrote it"
-        assert store.stored_count(upload_id) == 1, f"the conflicting replay was staged as another chunk: {store.stored_count(upload_id)} staged"
+        assert store.stored_count(upload_id) == 2, f"the conflicting replay was staged as another chunk: {store.stored_count(upload_id)} staged"
         r = await _put(c, upload_id, 0, A)
-    assert r.status_code == 200, f"a replay of chunk 0 with the same bytes answered {r.status_code}, expected 200"
+    assert r.status_code == 200, f"a replay of chunk 0 with the same bytes answered {r.status_code}, expected 200: any staged index, not only the last one, can be redelivered"
+    assert store.stored_count(upload_id) == 2, f"the replay of chunk 0 with the same bytes left {store.stored_count(upload_id)} chunks staged, expected 2"
 `,
     typescript: `const A = 'layer-0 weights';
 const B = 'layer-1 weights';
@@ -848,6 +853,9 @@ export async function check_chunk_at_index(ctx) {
   assert.equal(count, 2, \`after chunks 0, 1 and a redelivery of chunk 1 the upload stages \${count} chunks: the redelivered chunk was staged a second time, in another slot. Stage a chunk at its own index\`);
   r = await put(c, uploadId, 2, C);
   assert.equal(r.status, 200, \`chunk 2 after the redelivery answered \${r.status}: \${r.text}\`);
+  r = await put(c, uploadId, 2, C); // the last chunk again, once the upload is complete
+  assert.equal(r.status, 200, \`a redelivery of the last chunk of a complete upload answered \${r.status}: \${r.text}, expected 200: the same bytes at a staged index are a replay\`);
+  assert.equal(await store.storedCount(uploadId), 3, 'after a redelivery of the last chunk the upload must stage 3 chunks');
   assert.deepEqual(await staged(store, uploadId, 3), [A, B, C], 'the upload must stage the three chunks in index order');
 }
 
@@ -869,13 +877,15 @@ export async function check_chunk_conflict(ctx) {
   const {c, store} = api(ctx);
   const uploadId = await open(c, store);
   await put(c, uploadId, 0, A);
-  let r = await put(c, uploadId, 0, 'tampered weights');
+  await put(c, uploadId, 1, B);
+  let r = await put(c, uploadId, 0, 'tampered weights'); // chunk 0 again, behind the last staged chunk
   assert.equal(r.status, 409, \`a replay of chunk 0 with different bytes answered \${r.status}, expected 409\`);
-  assert.deepEqual(await staged(store, uploadId, 1), [A], 'the replay with different bytes overwrote chunk 0');
+  assert.deepEqual(await staged(store, uploadId, 2), [A, B], 'the replay with different bytes overwrote chunk 0');
   assert.equal(await store.chunkDigest(uploadId, 0), store.digest(Buffer.from(A)), 'chunk 0 must keep its own sha256');
-  assert.equal(await store.storedCount(uploadId), 1, 'the conflicting replay was staged as another chunk');
+  assert.equal(await store.storedCount(uploadId), 2, 'the conflicting replay was staged as another chunk');
   r = await put(c, uploadId, 0, A);
-  assert.equal(r.status, 200, \`a replay of chunk 0 with the same bytes answered \${r.status}, expected 200\`);
+  assert.equal(r.status, 200, \`a replay of chunk 0 with the same bytes answered \${r.status}, expected 200: any staged index, not only the last one, can be redelivered\`);
+  assert.equal(await store.storedCount(uploadId), 2, 'the replay of chunk 0 with the same bytes must leave 2 chunks staged');
 }
 `,
     go: `package main
@@ -891,20 +901,20 @@ import (
 )
 
 var (
-	bg     = context.Background()
-	chunkA = []byte("layer-0 weights")
-	chunkB = []byte("layer-1 weights")
-	chunkC = []byte("layer-2 weights")
+	hBg     = context.Background()
+	hChunkA = []byte("layer-0 weights")
+	hChunkB = []byte("layer-1 weights")
+	hChunkC = []byte("layer-2 weights")
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func openUpload(ctx *harness.Ctx, c *harness.HTTP) string {
-	store.CreateRun(bg, "r1", "t1")
+func hOpenUpload(ctx *harness.Ctx, c *harness.HTTP) string {
+	store.CreateRun(hBg, "r1", "t1")
 	r := c.Post("/v1/checkpoints", map[string]any{"run_id": "r1", "step": 1200, "chunks": 3}, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/checkpoints (%s)", r.Text())
 	var body struct {
@@ -914,18 +924,18 @@ func openUpload(ctx *harness.Ctx, c *harness.HTTP) string {
 	return body.UploadID
 }
 
-func putAs(c *harness.HTTP, uploadID string, index int, payload []byte, header ...string) *harness.Response {
+func hPutAs(c *harness.HTTP, uploadID string, index int, payload []byte, header ...string) *harness.Response {
 	return c.Put(fmt.Sprintf("/v1/checkpoints/%s/chunks/%d", uploadID, index), map[string]string{"data": store.Encode(payload)}, header...)
 }
 
-func put(c *harness.HTTP, uploadID string, index int, payload []byte) *harness.Response {
-	return putAs(c, uploadID, index, payload, "X-Tenant-Id", "t1")
+func hPut(c *harness.HTTP, uploadID string, index int, payload []byte) *harness.Response {
+	return hPutAs(c, uploadID, index, payload, "X-Tenant-Id", "t1")
 }
 
-func staged(uploadID string, n int) []string {
+func hStaged(uploadID string, n int) []string {
 	out := make([]string, n)
 	for i := range out {
-		if chunk := store.Chunk(bg, uploadID, int64(i)); chunk != nil {
+		if chunk := store.Chunk(hBg, uploadID, int64(i)); chunk != nil {
 			out[i] = string(chunk)
 		}
 	}
@@ -933,9 +943,9 @@ func staged(uploadID string, n int) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	uploadID := openUpload(ctx, c)
-	r := put(c, uploadID, 0, chunkA)
+	c := hAPI(ctx)
+	uploadID := hOpenUpload(ctx, c)
+	r := hPut(c, uploadID, 0, hChunkA)
 	ctx.Equal(r.Status, 200, "PUT chunk 0 (%s)", r.Text())
 	var body struct {
 		Index    int64 \`json:"index"\`
@@ -943,56 +953,61 @@ func CheckRoute(ctx *harness.Ctx) {
 	}
 	r.Decode(&body)
 	ctx.Assert(body.Index == 0 && body.Received == 1, "chunk 0 of a fresh upload must answer index 0, received 1, got %s", r.Text())
-	ctx.Equal(staged(uploadID, 1), []string{string(chunkA)}, "chunk 0 must be staged")
-	ctx.Equal(store.ChunkDigest(bg, uploadID, 0), store.Digest(chunkA), "chunk 0 must be staged with its sha256")
-	r = putAs(c, uploadID, 1, chunkB)
+	ctx.Equal(hStaged(uploadID, 1), []string{string(hChunkA)}, "chunk 0 must be staged")
+	ctx.Equal(store.ChunkDigest(hBg, uploadID, 0), store.Digest(hChunkA), "chunk 0 must be staged with its sha256")
+	r = hPutAs(c, uploadID, 1, hChunkB)
 	ctx.Equal(r.Status, 401, "a chunk without X-Tenant-Id")
-	r = putAs(c, uploadID, 1, chunkB, "X-Tenant-Id", "t2")
+	r = hPutAs(c, uploadID, 1, hChunkB, "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "another tenant's chunk")
-	store.CreateRun(bg, "r2", "t2")
+	store.CreateRun(hBg, "r2", "t2")
 	r = c.Post("/v1/checkpoints", map[string]any{"run_id": "r2", "step": 1, "chunks": 1}, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 404, "opening an upload of another tenant's run")
 }
 
 func CheckChunkAtIndex(ctx *harness.Ctx) {
-	c := api(ctx)
-	uploadID := openUpload(ctx, c)
-	put(c, uploadID, 0, chunkA)
-	put(c, uploadID, 1, chunkB)
-	r := put(c, uploadID, 1, chunkB) // the uploader timed out and sent chunk 1 again
+	c := hAPI(ctx)
+	uploadID := hOpenUpload(ctx, c)
+	hPut(c, uploadID, 0, hChunkA)
+	hPut(c, uploadID, 1, hChunkB)
+	r := hPut(c, uploadID, 1, hChunkB) // the uploader timed out and sent chunk 1 again
 	ctx.Equal(r.Status, 200, "a redelivery of chunk 1 with the same bytes (%s)", r.Text())
-	count := store.StoredCount(bg, uploadID)
+	count := store.StoredCount(hBg, uploadID)
 	ctx.Equal(count, 2, "after chunks 0, 1 and a redelivery of chunk 1 the redelivered chunk must not be staged a second time, in another slot (stage a chunk at its own index); the staged chunks")
-	r = put(c, uploadID, 2, chunkC)
+	r = hPut(c, uploadID, 2, hChunkC)
 	ctx.Equal(r.Status, 200, "chunk 2 after the redelivery (%s)", r.Text())
-	ctx.Equal(staged(uploadID, 3), []string{string(chunkA), string(chunkB), string(chunkC)}, "the upload must stage the three chunks in index order")
+	r = hPut(c, uploadID, 2, hChunkC) // the last chunk again, once the upload is complete
+	ctx.Equal(r.Status, 200, "a redelivery of the last chunk of a complete upload (the same bytes at a staged index are a replay) (%s)", r.Text())
+	ctx.Equal(store.StoredCount(hBg, uploadID), 3, "after a redelivery of the last chunk; the staged chunks")
+	ctx.Equal(hStaged(uploadID, 3), []string{string(hChunkA), string(hChunkB), string(hChunkC)}, "the upload must stage the three chunks in index order")
 }
 
 func CheckChunkOrder(ctx *harness.Ctx) {
-	c := api(ctx)
-	uploadID := openUpload(ctx, c)
-	put(c, uploadID, 0, chunkA)
-	r := put(c, uploadID, 2, chunkC) // chunk 2 overtook chunk 1
+	c := hAPI(ctx)
+	uploadID := hOpenUpload(ctx, c)
+	hPut(c, uploadID, 0, hChunkA)
+	r := hPut(c, uploadID, 2, hChunkC) // chunk 2 overtook chunk 1
 	ctx.Equal(r.Status, 409, "chunk 2 arriving before chunk 1 (chunk 1 is the expected index)")
-	ctx.Equal(staged(uploadID, 3), []string{string(chunkA), "", ""}, "the out-of-order chunk must not be staged")
-	put(c, uploadID, 1, chunkB)
-	put(c, uploadID, 2, chunkC)
-	r = put(c, uploadID, 3, []byte("one chunk too many"))
+	ctx.Equal(hStaged(uploadID, 3), []string{string(hChunkA), "", ""}, "the out-of-order chunk must not be staged")
+	hPut(c, uploadID, 1, hChunkB)
+	hPut(c, uploadID, 2, hChunkC)
+	r = hPut(c, uploadID, 3, []byte("one chunk too many"))
 	ctx.Equal(r.Status, 409, "a chunk past the upload's 3 chunks")
-	ctx.Equal(staged(uploadID, 4), []string{string(chunkA), string(chunkB), string(chunkC), ""}, "the upload must stage chunks 0, 1, 2 and nothing past them")
+	ctx.Equal(hStaged(uploadID, 4), []string{string(hChunkA), string(hChunkB), string(hChunkC), ""}, "the upload must stage chunks 0, 1, 2 and nothing past them")
 }
 
 func CheckChunkConflict(ctx *harness.Ctx) {
-	c := api(ctx)
-	uploadID := openUpload(ctx, c)
-	put(c, uploadID, 0, chunkA)
-	r := put(c, uploadID, 0, []byte("tampered weights"))
+	c := hAPI(ctx)
+	uploadID := hOpenUpload(ctx, c)
+	hPut(c, uploadID, 0, hChunkA)
+	hPut(c, uploadID, 1, hChunkB)
+	r := hPut(c, uploadID, 0, []byte("tampered weights")) // chunk 0 again, behind the last staged chunk
 	ctx.Equal(r.Status, 409, "a replay of chunk 0 with different bytes")
-	ctx.Equal(staged(uploadID, 1), []string{string(chunkA)}, "the replay with different bytes must not overwrite chunk 0")
-	ctx.Equal(store.ChunkDigest(bg, uploadID, 0), store.Digest(chunkA), "chunk 0 must keep its own sha256")
-	ctx.Equal(store.StoredCount(bg, uploadID), 1, "the conflicting replay must not be staged as another chunk; the staged chunks")
-	r = put(c, uploadID, 0, chunkA)
-	ctx.Equal(r.Status, 200, "a replay of chunk 0 with the same bytes")
+	ctx.Equal(hStaged(uploadID, 2), []string{string(hChunkA), string(hChunkB)}, "the replay with different bytes must not overwrite chunk 0")
+	ctx.Equal(store.ChunkDigest(hBg, uploadID, 0), store.Digest(hChunkA), "chunk 0 must keep its own sha256")
+	ctx.Equal(store.StoredCount(hBg, uploadID), 2, "the conflicting replay must not be staged as another chunk; the staged chunks")
+	r = hPut(c, uploadID, 0, hChunkA)
+	ctx.Equal(r.Status, 200, "a replay of chunk 0 with the same bytes (any staged index, not only the last one, can be redelivered)")
+	ctx.Equal(store.StoredCount(hBg, uploadID), 2, "after the replay of chunk 0 with the same bytes; the staged chunks")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1006,11 +1021,11 @@ func CheckChunkConflict(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kA = "layer-0 weights";
-const std::string kB = "layer-1 weights";
-const std::string kC = "layer-2 weights";
+const std::string hA = "layer-0 weights";
+const std::string hB = "layer-1 weights";
+const std::string hC = "layer-2 weights";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1018,22 +1033,22 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string openUpload(harness::Ctx& ctx, harness::HTTP& c) {
+std::string hOpenUpload(harness::Ctx& ctx, harness::HTTP& c) {
   store::createRun("r1", "t1");
   const auto r = c.Post("/v1/checkpoints", R"({"run_id": "r1", "step": 1200, "chunks": 3})", "Content-Type", "application/json", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 201, "POST /v1/checkpoints (%s)", r.Text());
   return nlohmann::json::parse(r.Text()).value("upload_id", "");
 }
 
-std::string chunkBody(const std::string& payload) { return nlohmann::json{{"data", store::encode(payload)}}.dump(); }
+std::string hChunkBody(const std::string& payload) { return nlohmann::json{{"data", store::encode(payload)}}.dump(); }
 
-harness::Response put(harness::HTTP& c, const std::string& upload_id, int index, const std::string& payload, const std::string& tenant = "t1") {
+harness::Response hPut(harness::HTTP& c, const std::string& upload_id, int index, const std::string& payload, const std::string& tenant = "t1") {
   const std::string path = "/v1/checkpoints/" + upload_id + "/chunks/" + std::to_string(index);
-  if (tenant.empty()) return c.Put(path, chunkBody(payload), "Content-Type", "application/json");
-  return c.Put(path, chunkBody(payload), "Content-Type", "application/json", "X-Tenant-Id", tenant);
+  if (tenant.empty()) return c.Put(path, hChunkBody(payload), "Content-Type", "application/json");
+  return c.Put(path, hChunkBody(payload), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-std::vector<std::string> staged(const std::string& upload_id, int n) {
+std::vector<std::string> hStaged(const std::string& upload_id, int n) {
   std::vector<std::string> out;
   for (int i = 0; i < n; i++) out.push_back(store::chunk(upload_id, i).value_or(""));
   return out;
@@ -1042,18 +1057,18 @@ std::vector<std::string> staged(const std::string& upload_id, int n) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string upload_id = openUpload(ctx, c);
-  auto r = put(c, upload_id, 0, kA);
+  auto c = hApi(ctx);
+  const std::string upload_id = hOpenUpload(ctx, c);
+  auto r = hPut(c, upload_id, 0, hA);
   ctx.Equal(r.Status, 200, "PUT chunk 0 (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object() && body.value("index", -1L) == 0 && body.value("received", -1L) == 1,
              "chunk 0 of a fresh upload must answer index 0, received 1, got %s", r.Text());
-  ctx.Equal(staged(upload_id, 1), std::vector<std::string>{kA}, "chunk 0 must be staged");
-  ctx.Equal(store::chunkDigest(upload_id, 0), store::digest(kA), "chunk 0 must be staged with its sha256");
-  r = put(c, upload_id, 1, kB, "");
+  ctx.Equal(hStaged(upload_id, 1), std::vector<std::string>{hA}, "chunk 0 must be staged");
+  ctx.Equal(store::chunkDigest(upload_id, 0), store::digest(hA), "chunk 0 must be staged with its sha256");
+  r = hPut(c, upload_id, 1, hB, "");
   ctx.Equal(r.Status, 401, "a chunk without X-Tenant-Id");
-  r = put(c, upload_id, 1, kB, "t2");
+  r = hPut(c, upload_id, 1, hB, "t2");
   ctx.Equal(r.Status, 404, "another tenant's chunk");
   store::createRun("r2", "t2");
   r = c.Post("/v1/checkpoints", R"({"run_id": "r2", "step": 1, "chunks": 1})", "Content-Type", "application/json", "X-Tenant-Id", "t1");
@@ -1061,44 +1076,49 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckChunkAtIndex(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string upload_id = openUpload(ctx, c);
-  put(c, upload_id, 0, kA);
-  put(c, upload_id, 1, kB);
-  auto r = put(c, upload_id, 1, kB);  // the uploader timed out and sent chunk 1 again
+  auto c = hApi(ctx);
+  const std::string upload_id = hOpenUpload(ctx, c);
+  hPut(c, upload_id, 0, hA);
+  hPut(c, upload_id, 1, hB);
+  auto r = hPut(c, upload_id, 1, hB);  // the uploader timed out and sent chunk 1 again
   ctx.Equal(r.Status, 200, "a redelivery of chunk 1 with the same bytes (%s)", r.Text());
   ctx.Equal(store::storedCount(upload_id), 2,
             "after chunks 0, 1 and a redelivery of chunk 1 the redelivered chunk must not be staged a second time, in another slot (stage a chunk at its own index); the staged chunks");
-  r = put(c, upload_id, 2, kC);
+  r = hPut(c, upload_id, 2, hC);
   ctx.Equal(r.Status, 200, "chunk 2 after the redelivery (%s)", r.Text());
-  ctx.Equal(staged(upload_id, 3), std::vector<std::string>{kA, kB, kC}, "the upload must stage the three chunks in index order");
+  r = hPut(c, upload_id, 2, hC);  // the last chunk again, once the upload is complete
+  ctx.Equal(r.Status, 200, "a redelivery of the last chunk of a complete upload (the same bytes at a staged index are a replay) (%s)", r.Text());
+  ctx.Equal(store::storedCount(upload_id), 3, "after a redelivery of the last chunk; the staged chunks");
+  ctx.Equal(hStaged(upload_id, 3), std::vector<std::string>{hA, hB, hC}, "the upload must stage the three chunks in index order");
 }
 
 void CheckChunkOrder(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string upload_id = openUpload(ctx, c);
-  put(c, upload_id, 0, kA);
-  auto r = put(c, upload_id, 2, kC);  // chunk 2 overtook chunk 1
+  auto c = hApi(ctx);
+  const std::string upload_id = hOpenUpload(ctx, c);
+  hPut(c, upload_id, 0, hA);
+  auto r = hPut(c, upload_id, 2, hC);  // chunk 2 overtook chunk 1
   ctx.Equal(r.Status, 409, "chunk 2 arriving before chunk 1 (chunk 1 is the expected index)");
-  ctx.Equal(staged(upload_id, 3), std::vector<std::string>{kA, "", ""}, "the out-of-order chunk must not be staged");
-  put(c, upload_id, 1, kB);
-  put(c, upload_id, 2, kC);
-  r = put(c, upload_id, 3, "one chunk too many");
+  ctx.Equal(hStaged(upload_id, 3), std::vector<std::string>{hA, "", ""}, "the out-of-order chunk must not be staged");
+  hPut(c, upload_id, 1, hB);
+  hPut(c, upload_id, 2, hC);
+  r = hPut(c, upload_id, 3, "one chunk too many");
   ctx.Equal(r.Status, 409, "a chunk past the upload's 3 chunks");
-  ctx.Equal(staged(upload_id, 4), std::vector<std::string>{kA, kB, kC, ""}, "the upload must stage chunks 0, 1, 2 and nothing past them");
+  ctx.Equal(hStaged(upload_id, 4), std::vector<std::string>{hA, hB, hC, ""}, "the upload must stage chunks 0, 1, 2 and nothing past them");
 }
 
 void CheckChunkConflict(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string upload_id = openUpload(ctx, c);
-  put(c, upload_id, 0, kA);
-  auto r = put(c, upload_id, 0, "tampered weights");
+  auto c = hApi(ctx);
+  const std::string upload_id = hOpenUpload(ctx, c);
+  hPut(c, upload_id, 0, hA);
+  hPut(c, upload_id, 1, hB);
+  auto r = hPut(c, upload_id, 0, "tampered weights");  // chunk 0 again, behind the last staged chunk
   ctx.Equal(r.Status, 409, "a replay of chunk 0 with different bytes");
-  ctx.Equal(staged(upload_id, 1), std::vector<std::string>{kA}, "the replay with different bytes must not overwrite chunk 0");
-  ctx.Equal(store::chunkDigest(upload_id, 0), store::digest(kA), "chunk 0 must keep its own sha256");
-  ctx.Equal(store::storedCount(upload_id), 1, "the conflicting replay must not be staged as another chunk; the staged chunks");
-  r = put(c, upload_id, 0, kA);
-  ctx.Equal(r.Status, 200, "a replay of chunk 0 with the same bytes");
+  ctx.Equal(hStaged(upload_id, 2), std::vector<std::string>{hA, hB}, "the replay with different bytes must not overwrite chunk 0");
+  ctx.Equal(store::chunkDigest(upload_id, 0), store::digest(hA), "chunk 0 must keep its own sha256");
+  ctx.Equal(store::storedCount(upload_id), 2, "the conflicting replay must not be staged as another chunk; the staged chunks");
+  r = hPut(c, upload_id, 0, hA);
+  ctx.Equal(r.Status, 200, "a replay of chunk 0 with the same bytes (any staged index, not only the last one, can be redelivered)");
+  ctx.Equal(store::storedCount(upload_id), 2, "after the replay of chunk 0 with the same bytes; the staged chunks");
 }
 `,
   },

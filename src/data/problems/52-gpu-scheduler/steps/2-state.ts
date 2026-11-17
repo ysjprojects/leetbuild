@@ -126,7 +126,7 @@ a refused placement leaves its record behind.
       id: 'heartbeat-liveness',
       title: 'A node whose heartbeat lapsed is refused',
       detail:
-        '`heartbeat:{id}` is set with `EX HEARTBEAT_TTL_S` and the script refuses the node with `NO_HEARTBEAT` when the key is gone. The starter sets the key without a TTL, so a dead node stays schedulable.',
+        '`heartbeat:{id}` is written with `EX HEARTBEAT_TTL_S` in the same command, on registration and on every `heartbeat`, and the booking script itself refuses the node with `NO_HEARTBEAT` when the key is gone, so a heartbeat that lapses while `allocate` runs cannot slip a booking through. The starter sets the key without a TTL, so a dead node stays schedulable.',
       match: {
         python: {
           all: [
@@ -174,7 +174,7 @@ a refused placement leaves its record behind.
       id: 'idempotent-release',
       title: 'Release moves the counters once per placement id',
       detail:
-        'The release script checks `SISMEMBER node:{id}:placements` first and returns 0 when the id is gone; the counters move only on the first call. The starter decrements on every call, so a retry inflates free capacity.',
+        'The release script checks `SISMEMBER node:{id}:placements` first and returns 0 when the id is gone; the counters move only on the first call, also when two releases of one id race, and any id in the set releases whatever its `status`. The starter decrements on every call, so a retry inflates free capacity.',
       match: {
         python: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]SISMEMBER['"]/, /redis\.call\(\s*['"]SREM['"]/]},
@@ -854,7 +854,12 @@ def check_atomic_allocation(ctx):
 
 
 def check_heartbeat_liveness(ctx):
-    m = _ledger(ctx)
+    m = ctx.load("state")
+    # The TTL as it stands right after the first command that wrote the heartbeat.
+    born = ctx.redis_after("heartbeat:gpu-1", lambda: ctx.redis.ttl("heartbeat:gpu-1"))
+    m.register_node("gpu-1", "a100", 8)
+    assert born.fired, "register_node never wrote heartbeat:gpu-1"
+    assert 0 < (born.result or 0) <= 30, f"right after the command that wrote heartbeat:gpu-1 its TTL was {born.result}: set it with EX HEARTBEAT_TTL_S in the same command, or a crash before the second command leaves a heartbeat that never lapses"
     ttl = ctx.redis.ttl("heartbeat:gpu-1")
     assert 0 < ttl <= 30, f"heartbeat:gpu-1 has TTL {ttl}: register_node must set it with EX HEARTBEAT_TTL_S (30), or a dead node stays schedulable"
     ctx.clock.advance(31)
@@ -862,10 +867,25 @@ def check_heartbeat_liveness(ctx):
     result = m.allocate("gpu-1", "p-1", 2)
     assert result == "NO_HEARTBEAT", f"a node whose heartbeat lapsed answered {result}, expected NO_HEARTBEAT"
     assert _allocated(ctx) == 0 and not ctx.redis.exists("placement:p-1"), "a refused placement must write nothing"
+    beat = ctx.redis_after("heartbeat:gpu-1", lambda: ctx.redis.ttl("heartbeat:gpu-1"))
     m.heartbeat("gpu-1")
+    assert beat.fired and 0 < (beat.result or 0) <= 30, f"right after heartbeat() wrote heartbeat:gpu-1 its TTL was {beat.result}, expected EX HEARTBEAT_TTL_S in the same command"
     ttl = ctx.redis.ttl("heartbeat:gpu-1")
     assert 0 < ttl <= 30, f"heartbeat() left TTL {ttl} on heartbeat:gpu-1, expected EX HEARTBEAT_TTL_S"
     assert m.allocate("gpu-1", "p-1", 2) == "ALLOCATED", "once the agent reports in again the node takes placements"
+
+    def lapse():
+        """The heartbeat lapses the instant allocate first touches it; was p-2 booked by then?"""
+        booked = bool(ctx.redis.exists("placement:p-2"))
+        ctx.redis.delete("heartbeat:gpu-1")
+        return booked
+
+    gone = ctx.redis_after("heartbeat:gpu-1", lapse)
+    result = m.allocate("gpu-1", "p-2", 2)
+    assert gone.fired, "allocate never looked at heartbeat:gpu-1"
+    expected = "ALLOCATED" if gone.result else "NO_HEARTBEAT"
+    assert result == expected, f"the heartbeat lapsed right after allocate first read it (p-2 {'already' if gone.result else 'not yet'} booked) and allocate answered {result}, expected {expected}: check the heartbeat inside the script that books, not in a round trip before it"
+    assert bool(ctx.redis.exists("placement:p-2")) == (expected == "ALLOCATED"), "a placement refused for a lapsed heartbeat must write nothing"
 
 
 def check_idempotent_release(ctx):
@@ -877,6 +897,24 @@ def check_idempotent_release(ctx):
     assert second is False, f"the second release of p-1 reported {second!r}, expected False"
     assert m.release("gpu-1", "ghost") is False and _allocated(ctx) == 0, "releasing an unknown placement moves nothing"
     assert m.allocate("gpu-1", "p-2", 8) == "ALLOCATED", "the node has all 8 GPUs free after one real release"
+    ctx.redis.hset("placement:p-2", "status", "running")  # the start path (step 3) marked it running
+    assert m.release("gpu-1", "p-2") is True and _allocated(ctx) == 0, f"releasing a running placement left allocated at {_allocated(ctx)}: every id in node:gpu-1:placements is open, whatever its status"
+    assert m.allocate("gpu-1", "p-3", 4) == "ALLOCATED"
+
+    def retry():
+        """Another replica's retry of the same release lands the instant this one first touches the open set."""
+        if not ctx.redis.sismember("node:gpu-1:placements", "p-3"):
+            return "already released"
+        ctx.redis.hincrby(NODE, "allocated", -4)
+        ctx.redis.hset("placement:p-3", "status", "released")
+        ctx.redis.srem("node:gpu-1:placements", "p-3")
+        return "released"
+
+    probe = ctx.redis_after("node:gpu-1:placements", retry)
+    mine = m.release("gpu-1", "p-3")
+    assert probe.fired, "release never touched node:gpu-1:placements"
+    assert _allocated(ctx) == 0, f"allocated is {_allocated(ctx)} after two concurrent releases of p-3 (4 GPUs): the other one ({probe.result}) landed between your membership check and your write. Check SISMEMBER and move the counters in one script"
+    assert mine is (probe.result == "already released"), f"release reported {mine!r} while the other replica's {probe.result}: exactly one of the two moves the counters and reports True"
 
 
 def check_honest_contention(ctx):
@@ -934,7 +972,12 @@ export async function check_atomic_allocation(ctx) {
 }
 
 export async function check_heartbeat_liveness(ctx) {
-  const m = await ledger(ctx);
+  const m = ctx.load('state');
+  // The TTL as it stands right after the first command that wrote the heartbeat.
+  const born = ctx.redisAfter('heartbeat:gpu-1', () => ctx.redis.ttl('heartbeat:gpu-1'));
+  await m.registerNode('gpu-1', 'a100', 8);
+  assert(born.fired, 'registerNode never wrote heartbeat:gpu-1');
+  assert(0 < born.result && born.result <= 30, \`right after the command that wrote heartbeat:gpu-1 its TTL was \${born.result}: set it with EX HEARTBEAT_TTL_S in the same command, or a crash before the second command leaves a heartbeat that never lapses\`);
   let ttl = ctx.redis.ttl('heartbeat:gpu-1');
   assert(0 < ttl && ttl <= 30, \`heartbeat:gpu-1 has TTL \${ttl}: registerNode must set it with EX HEARTBEAT_TTL_S (30), or a dead node stays schedulable\`);
   ctx.clock.advance(31);
@@ -942,10 +985,23 @@ export async function check_heartbeat_liveness(ctx) {
   const result = await m.allocate('gpu-1', 'p-1', 2);
   assert.equal(result, 'NO_HEARTBEAT', 'a node whose heartbeat lapsed');
   assert(allocated(ctx) === 0 && ctx.redis.exists('placement:p-1') === 0, 'a refused placement must write nothing');
+  const beat = ctx.redisAfter('heartbeat:gpu-1', () => ctx.redis.ttl('heartbeat:gpu-1'));
   await m.heartbeat('gpu-1');
+  assert(beat.fired && 0 < beat.result && beat.result <= 30, \`right after heartbeat() wrote heartbeat:gpu-1 its TTL was \${beat.result}, expected EX HEARTBEAT_TTL_S in the same command\`);
   ttl = ctx.redis.ttl('heartbeat:gpu-1');
   assert(0 < ttl && ttl <= 30, \`heartbeat() left TTL \${ttl} on heartbeat:gpu-1, expected EX HEARTBEAT_TTL_S\`);
   assert.equal(await m.allocate('gpu-1', 'p-1', 2), 'ALLOCATED', 'once the agent reports in again the node takes placements');
+  // The heartbeat lapses the instant allocate first touches it; was p-2 booked by then?
+  const gone = ctx.redisAfter('heartbeat:gpu-1', () => {
+    const booked = ctx.redis.exists('placement:p-2') === 1;
+    ctx.redis.del('heartbeat:gpu-1');
+    return booked;
+  });
+  const raced = await m.allocate('gpu-1', 'p-2', 2);
+  assert(gone.fired, 'allocate never looked at heartbeat:gpu-1');
+  const expected = gone.result ? 'ALLOCATED' : 'NO_HEARTBEAT';
+  assert.equal(raced, expected, \`the heartbeat lapsed right after allocate first read it (p-2 \${gone.result ? 'already' : 'not yet'} booked): check the heartbeat inside the script that books, not in a round trip before it\`);
+  assert.equal(ctx.redis.exists('placement:p-2'), gone.result ? 1 : 0, 'a placement refused for a lapsed heartbeat must write nothing');
 }
 
 export async function check_idempotent_release(ctx) {
@@ -957,6 +1013,21 @@ export async function check_idempotent_release(ctx) {
   assert.equal(second, false, 'the second release of p-1');
   assert((await m.release('gpu-1', 'ghost')) === false && allocated(ctx) === 0, 'releasing an unknown placement moves nothing');
   assert.equal(await m.allocate('gpu-1', 'p-2', 8), 'ALLOCATED', 'the node has all 8 GPUs free after one real release');
+  ctx.redis.hset('placement:p-2', 'status', 'running'); // the start path (step 3) marked it running
+  assert((await m.release('gpu-1', 'p-2')) === true && allocated(ctx) === 0, \`releasing a running placement left allocated at \${allocated(ctx)}: every id in node:gpu-1:placements is open, whatever its status\`);
+  assert.equal(await m.allocate('gpu-1', 'p-3', 4), 'ALLOCATED');
+  // Another replica's retry of the same release lands the instant this one first touches the open set.
+  const probe = ctx.redisAfter('node:gpu-1:placements', () => {
+    if (ctx.redis.sismember('node:gpu-1:placements', 'p-3') === 0) return 'already released';
+    ctx.redis.hincrby(NODE, 'allocated', -4);
+    ctx.redis.hset('placement:p-3', 'status', 'released');
+    ctx.redis.srem('node:gpu-1:placements', 'p-3');
+    return 'released';
+  });
+  const mine = await m.release('gpu-1', 'p-3');
+  assert(probe.fired, 'release never touched node:gpu-1:placements');
+  assert.equal(allocated(ctx), 0, \`allocated after two concurrent releases of p-3 (4 GPUs): the other one (\${probe.result}) landed between your membership check and your write. Check SISMEMBER and move the counters in one script\`);
+  assert.equal(mine, probe.result === 'already released', \`release reported \${mine} while the other replica's \${probe.result}: exactly one of the two moves the counters and reports true\`);
 }
 
 export async function check_honest_contention(ctx) {
@@ -1051,17 +1122,41 @@ func CheckAtomicAllocation(ctx *harness.Ctx) {
 }
 
 func CheckHeartbeatLiveness(ctx *harness.Ctx) {
+	// The TTL as it stands right after the first command that wrote the heartbeat.
+	var bornTTL any = "never written"
+	ctx.Redis.After("heartbeat:gpu-1", func() any { bornTTL = ctx.Redis.TTL("heartbeat:gpu-1"); return nil })
 	stateLedger(ctx)
+	born, _ := bornTTL.(int64)
+	ctx.Assert(0 < born && born <= 30, "right after the command that wrote heartbeat:gpu-1 its TTL was %v: set it with EX config.HeartbeatTTL in the same command, or a crash before the second command leaves a heartbeat that never lapses", bornTTL)
 	ttl := ctx.Redis.TTL("heartbeat:gpu-1")
 	ctx.Assert(0 < ttl && ttl <= 30, "heartbeat:gpu-1 has TTL %d: registerNode must set it with config.HeartbeatTTL (30 s), or a dead node stays schedulable", ttl)
 	ctx.Clock.Advance(31)
 	ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 0, "31 s after registration the heartbeat must have lapsed; its existence")
 	ctx.Equal(stateAllocate(ctx, "p-1", 2), "NO_HEARTBEAT", "a node whose heartbeat lapsed")
 	ctx.Assert(stateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing")
+	var beatTTL any = "never written"
+	ctx.Redis.After("heartbeat:gpu-1", func() any { beatTTL = ctx.Redis.TTL("heartbeat:gpu-1"); return nil })
 	ctx.NoError(heartbeat(context.Background(), "gpu-1"), "heartbeat")
+	beat, _ := beatTTL.(int64)
+	ctx.Assert(0 < beat && beat <= 30, "right after heartbeat() wrote heartbeat:gpu-1 its TTL was %v, expected config.HeartbeatTTL in the same command", beatTTL)
 	ttl = ctx.Redis.TTL("heartbeat:gpu-1")
 	ctx.Assert(0 < ttl && ttl <= 30, "heartbeat() left TTL %d on heartbeat:gpu-1, expected config.HeartbeatTTL", ttl)
 	ctx.Equal(stateAllocate(ctx, "p-1", 2), "ALLOCATED", "once the agent reports in again the node takes placements")
+	// The heartbeat lapses the instant allocate first touches it; was p-2 booked by then?
+	fired, booked := false, false
+	ctx.Redis.After("heartbeat:gpu-1", func() any {
+		fired, booked = true, ctx.Redis.Exists("placement:p-2") == 1
+		ctx.Redis.Del("heartbeat:gpu-1")
+		return nil
+	})
+	raced := stateAllocate(ctx, "p-2", 2)
+	ctx.Assert(fired, "allocate never looked at heartbeat:gpu-1")
+	expected, when := "NO_HEARTBEAT", "not yet"
+	if booked {
+		expected, when = "ALLOCATED", "already"
+	}
+	ctx.Equal(raced, expected, "the heartbeat lapsed right after allocate first read it (p-2 %s booked): check the heartbeat inside the script that books, not in a round trip before it; allocate", when)
+	ctx.Equal(ctx.Redis.Exists("placement:p-2") == 1, booked, "a placement refused for a lapsed heartbeat must write nothing; placement:p-2 exists")
 }
 
 func CheckIdempotentRelease(ctx *harness.Ctx) {
@@ -1073,6 +1168,26 @@ func CheckIdempotentRelease(ctx *harness.Ctx) {
 	ctx.Equal(second, false, "the second release of p-1")
 	ctx.Assert(!stateRelease(ctx, "ghost") && stateAllocated(ctx) == 0, "releasing an unknown placement moves nothing")
 	ctx.Equal(stateAllocate(ctx, "p-2", 8), "ALLOCATED", "the node has all 8 GPUs free after one real release")
+	ctx.Redis.Do("HSET", "placement:p-2", "status", "running") // the start path (step 3) marked it running
+	ctx.Assert(stateRelease(ctx, "p-2") && stateAllocated(ctx) == 0, "releasing a running placement left allocated at %d: every id in node:gpu-1:placements is open, whatever its status", stateAllocated(ctx))
+	ctx.Equal(stateAllocate(ctx, "p-3", 4), "ALLOCATED", "booking 4")
+	// Another replica's retry of the same release lands the instant this one first touches the open set.
+	other := ""
+	ctx.Redis.After("node:gpu-1:placements", func() any {
+		if !ctx.Redis.SIsMember("node:gpu-1:placements", "p-3") {
+			other = "already released"
+			return nil
+		}
+		ctx.Redis.Do("HINCRBY", stateNode, "allocated", -4)
+		ctx.Redis.Do("HSET", "placement:p-3", "status", "released")
+		ctx.Redis.Do("SREM", "node:gpu-1:placements", "p-3")
+		other = "released"
+		return nil
+	})
+	mine := stateRelease(ctx, "p-3")
+	ctx.Assert(other != "", "release never touched node:gpu-1:placements")
+	ctx.Equal(stateAllocated(ctx), 0, "allocated after two concurrent releases of p-3 (4 GPUs): the other one (%s) landed between your membership check and your write. Check SISMEMBER and move the counters in one script; allocated", other)
+	ctx.Equal(mine, other == "already released", "release reported %v while the other replica's %s: exactly one of the two moves the counters and reports true; release", mine, other)
 }
 
 func CheckHonestContention(ctx *harness.Ctx) {
@@ -1155,17 +1270,41 @@ void CheckAtomicAllocation(harness::Ctx& ctx) {
 }
 
 void CheckHeartbeatLiveness(harness::Ctx& ctx) {
+  // The TTL as it stands right after the first command that wrote the heartbeat.
+  long long born = -3;
+  ctx.Redis.After("heartbeat:gpu-1", [&] { born = ctx.Redis.TTL("heartbeat:gpu-1"); });
   stateLedger();
+  ctx.Assert(0 < born && born <= 30,
+             "right after the command that wrote heartbeat:gpu-1 its TTL was %d (-3: never written): set it with EX kHeartbeatTtlS in the same "
+             "command, or a crash before the second command leaves a heartbeat that never lapses",
+             born);
   long long ttl = ctx.Redis.TTL("heartbeat:gpu-1");
   ctx.Assert(0 < ttl && ttl <= 30, "heartbeat:gpu-1 has TTL %d: register_node must set it with kHeartbeatTtlS (30), or a dead node stays schedulable", ttl);
   ctx.Clock.Advance(31);
   ctx.Equal(ctx.Redis.Exists("heartbeat:gpu-1"), 0, "31 s after registration the heartbeat must have lapsed; its existence");
   ctx.Equal(allocate("gpu-1", "p-1", 2), "NO_HEARTBEAT", "a node whose heartbeat lapsed");
   ctx.Assert(stateAllocated(ctx) == 0 && ctx.Redis.Exists("placement:p-1") == 0, "a refused placement must write nothing");
+  long long beat = -3;
+  ctx.Redis.After("heartbeat:gpu-1", [&] { beat = ctx.Redis.TTL("heartbeat:gpu-1"); });
   heartbeat("gpu-1");
+  ctx.Assert(0 < beat && beat <= 30, "right after heartbeat() wrote heartbeat:gpu-1 its TTL was %d (-3: never written), expected kHeartbeatTtlS in the same command", beat);
   ttl = ctx.Redis.TTL("heartbeat:gpu-1");
   ctx.Assert(0 < ttl && ttl <= 30, "heartbeat() left TTL %d on heartbeat:gpu-1, expected kHeartbeatTtlS", ttl);
   ctx.Equal(allocate("gpu-1", "p-1", 2), "ALLOCATED", "once the agent reports in again the node takes placements");
+  // The heartbeat lapses the instant allocate first touches it; was p-2 booked by then?
+  bool fired = false, booked = false;
+  ctx.Redis.After("heartbeat:gpu-1", [&] {
+    fired = true;
+    booked = ctx.Redis.Exists("placement:p-2") == 1;
+    ctx.Redis.Del("heartbeat:gpu-1");
+  });
+  const std::string raced = allocate("gpu-1", "p-2", 2);
+  ctx.Assert(fired, "allocate never looked at heartbeat:gpu-1");
+  ctx.Equal(raced, booked ? "ALLOCATED" : "NO_HEARTBEAT",
+            "the heartbeat lapsed right after allocate first read it (p-2 %s booked): check the heartbeat inside the script that books, not in a "
+            "round trip before it; allocate",
+            booked ? "already" : "not yet");
+  ctx.Equal(ctx.Redis.Exists("placement:p-2") == 1, booked, "a placement refused for a lapsed heartbeat must write nothing; placement:p-2 exists");
 }
 
 void CheckIdempotentRelease(harness::Ctx& ctx) {
@@ -1177,6 +1316,29 @@ void CheckIdempotentRelease(harness::Ctx& ctx) {
   ctx.Equal(second, false, "the second release of p-1");
   ctx.Assert(!release("gpu-1", "ghost") && stateAllocated(ctx) == 0, "releasing an unknown placement moves nothing");
   ctx.Equal(allocate("gpu-1", "p-2", 8), "ALLOCATED", "the node has all 8 GPUs free after one real release");
+  ctx.Redis.Do("HSET", "placement:p-2", "status", "running");  // the start path (step 3) marked it running
+  ctx.Assert(release("gpu-1", "p-2") && stateAllocated(ctx) == 0,
+             "releasing a running placement left allocated at %d: every id in node:gpu-1:placements is open, whatever its status", stateAllocated(ctx));
+  ctx.Equal(allocate("gpu-1", "p-3", 4), "ALLOCATED", "booking 4");
+  // Another replica's retry of the same release lands the instant this one first touches the open set.
+  std::string other;
+  ctx.Redis.After("node:gpu-1:placements", [&] {
+    if (!ctx.Redis.SIsMember("node:gpu-1:placements", "p-3")) {
+      other = "already released";
+      return;
+    }
+    ctx.Redis.Do("HINCRBY", kStateNode, "allocated", -4);
+    ctx.Redis.Do("HSET", "placement:p-3", "status", "released");
+    ctx.Redis.Do("SREM", "node:gpu-1:placements", "p-3");
+    other = "released";
+  });
+  const bool mine = release("gpu-1", "p-3");
+  ctx.Assert(!other.empty(), "release never touched node:gpu-1:placements");
+  ctx.Equal(stateAllocated(ctx), 0,
+            "allocated after two concurrent releases of p-3 (4 GPUs): the other one (%s) landed between your membership check and your "
+            "write. Check SISMEMBER and move the counters in one script; allocated",
+            other);
+  ctx.Equal(mine, other == "already released", "release reported %v while the other replica's %s: exactly one of the two moves the counters and reports true; release", mine, other);
 }
 
 void CheckHonestContention(harness::Ctx& ctx) {

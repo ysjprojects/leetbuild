@@ -79,7 +79,7 @@ service Sandbox { rpc Validate(ValidateRequest) returns (ValidateReport); }  // 
       id: 'fail-closed',
       title: 'An unanswered validation is not a pass',
       detail:
-        'A deadline or `UNAVAILABLE` records `unavailable` with a reason and returns before any promotion, so the active catalog stays where it was. The starter retries, then records `passed` and promotes whatever happened.',
+        'A deadline, `UNAVAILABLE` or any other error but `INVALID_ARGUMENT` (`INTERNAL`, `RESOURCE_EXHAUSTED`) records `unavailable` with a reason and returns before any promotion, so the active catalog stays where it was. The starter retries, then records `passed` and promotes whatever happened.',
       match: {
         python: {all: [/record_validation\(\s*cv,\s*["']unavailable["']/], none: [/for attempt in/]},
         typescript: {all: [/recordValidation\(\s*cv,\s*['"]unavailable['"]/], none: [/for \(let attempt/]},
@@ -92,7 +92,7 @@ service Sandbox { rpc Validate(ValidateRequest) returns (ValidateReport); }  // 
       id: 'terminal-rejection',
       title: 'A schema rejection is terminal for the candidate',
       detail:
-        '`INVALID_ARGUMENT` records `rejected` with the details, and a re-request is answered from `catalog.validation(cv)` before any call; an `unavailable` candidate is asked about again. The starter resends a rejection and never consults the record.',
+        '`INVALID_ARGUMENT` records `rejected` with the details, and a re-request for a `rejected` or `passed` candidate is answered from `catalog.validation(cv)` before any call; an `unavailable` candidate is asked about again. The starter resends a rejection and never consults the record.',
       match: {
         python: {
           all: [/INVALID_ARGUMENT/, /record_validation\(\s*cv,\s*["']rejected["']/],
@@ -753,6 +753,8 @@ def check_deadline(ctx):
     outcome = m.validate_and_promote("10", V10)
     assert outcome == "unavailable", f"a sandbox slower than the deadline left the outcome {outcome!r}, expected 'unavailable'"
     assert _active(ctx) == "9", f"catalog:active is {_active(ctx)!r} after a timed-out validation, expected '9'"
+    verdict = catalog.validation("10")
+    assert verdict is not None and verdict.get("outcome") == "unavailable", f"catalog:validation:10 is {verdict} after a timed-out validation, expected outcome 'unavailable'"
 
 
 def check_scoped_credential(ctx):
@@ -776,6 +778,15 @@ def check_fail_closed(ctx):
     verdict = catalog.validation("9")
     assert verdict is not None and verdict.get("outcome") == "unavailable" and verdict.get("reason"), f"catalog:validation:9 is {verdict}, expected outcome 'unavailable' with a reason"
     assert catalog.resolve("search") == S1, "agents must still resolve catalog 7"
+    # Only INVALID_ARGUMENT judges the candidate: any other error says nothing about it.
+    for cv, code in (("11", grpc.StatusCode.INTERNAL), ("12", grpc.StatusCode.RESOURCE_EXHAUSTED)):
+        ctx.grpc.failures.clear()
+        ctx.grpc.fail("Validate", code, "sandbox error", times=5)
+        outcome = m.validate_and_promote(cv, V10)
+        assert outcome == "unavailable", f"a sandbox that answered {code.name} left candidate {cv} {outcome!r}, expected 'unavailable': only INVALID_ARGUMENT judges the candidate, any other error says nothing about it"
+        verdict = catalog.validation(cv)
+        assert verdict is not None and verdict.get("outcome") == "unavailable", f"catalog:validation:{cv} is {verdict} after {code.name}, expected outcome 'unavailable'"
+        assert _active(ctx) == "7", f"catalog:active is {_active(ctx)!r} after {code.name}: a candidate nobody validated went live"
 
 
 def check_terminal_rejection(ctx):
@@ -796,6 +807,10 @@ def check_terminal_rejection(ctx):
     second = m.validate_and_promote("10", V10)
     assert second == "passed", f"after an outage the next request for candidate 10 answered {second!r}: unavailable says nothing about the candidate, ask the sandbox again"
     assert _active(ctx) == "10", f"catalog:active is {_active(ctx)!r}, expected the validated candidate 10"
+    calls = len(ctx.grpc.calls_to("Validate"))
+    third = m.validate_and_promote("10", V10)
+    assert third == "passed", f"a re-request for candidate 10, which passed, answered {third!r}"
+    assert len(ctx.grpc.calls_to("Validate")) == calls, "a re-request for candidate 10, which passed, called the sandbox again: answer it from catalog:validation:10"
 `,
     typescript: `function entry(name: string, version: string, sideEffect: string, owner: string) {
   return {name, version, side_effect: sideEffect, owner, schema: {type: 'object'}, endpoint: \`https://\${owner}.internal\`, credential_ref: \`vault://\${owner}\`};
@@ -829,7 +844,7 @@ async function client(ctx) {
 const active = ctx => ctx.redis.get('catalog:active');
 
 export async function check_deadline(ctx) {
-  const {m} = await client(ctx);
+  const {m, catalog} = await client(ctx);
   const outcome = await m.validateAndPromote('9', V9);
   assert.equal(outcome, 'passed', 'with the sandbox healthy the outcome must be passed');
   const calls = ctx.grpc.callsTo('Validate');
@@ -842,6 +857,8 @@ export async function check_deadline(ctx) {
   const late = await m.validateAndPromote('10', V10);
   assert.equal(late, 'unavailable', \`a sandbox slower than the deadline left the outcome \${late}, expected unavailable\`);
   assert.equal(active(ctx), '9', 'catalog:active after a timed-out validation');
+  const verdict = await catalog.validation('10');
+  assert(verdict !== null && verdict.outcome === 'unavailable', \`catalog:validation:10 is \${JSON.stringify(verdict)} after a timed-out validation, expected outcome unavailable\`);
 }
 
 export async function check_scoped_credential(ctx) {
@@ -866,6 +883,16 @@ export async function check_fail_closed(ctx) {
   const verdict = await catalog.validation('9');
   assert(verdict !== null && verdict.outcome === 'unavailable' && verdict.reason, \`catalog:validation:9 is \${JSON.stringify(verdict)}, expected outcome unavailable with a reason\`);
   assert.equal((await catalog.resolve('search')).version, 'a1', 'agents must still resolve catalog 7');
+  // Only INVALID_ARGUMENT judges the candidate: any other error says nothing about it.
+  for (const [cv, code] of [['11', 'INTERNAL'], ['12', 'RESOURCE_EXHAUSTED']]) {
+    ctx.grpc.clearFailures();
+    ctx.grpc.fail('Validate', ctx.grpc.status[code], 'sandbox error', 5);
+    const late = await m.validateAndPromote(cv, V10);
+    assert.equal(late, 'unavailable', \`a sandbox that answered \${code} left candidate \${cv} \${late}, expected unavailable: only INVALID_ARGUMENT judges the candidate, any other error says nothing about it\`);
+    const recorded = await catalog.validation(cv);
+    assert(recorded !== null && recorded.outcome === 'unavailable', \`catalog:validation:\${cv} is \${JSON.stringify(recorded)} after \${code}, expected outcome unavailable\`);
+    assert.equal(active(ctx), '7', \`a candidate nobody validated went live after \${code}: catalog:active\`);
+  }
 }
 
 export async function check_terminal_rejection(ctx) {
@@ -884,6 +911,9 @@ export async function check_terminal_rejection(ctx) {
   const second = await m.validateAndPromote('10', V10);
   assert.equal(second, 'passed', \`after an outage the next request for candidate 10 answered \${second}: unavailable says nothing about the candidate, ask the sandbox again\`);
   assert.equal(active(ctx), '10', 'catalog:active after validating candidate 10');
+  const before = ctx.grpc.callsTo('Validate').length;
+  assert.equal(await m.validateAndPromote('10', V10), 'passed', 'a re-request for candidate 10, which passed');
+  assert.equal(ctx.grpc.callsTo('Validate').length, before, 'a re-request for candidate 10, which passed, called the sandbox again: answer it from catalog:validation:10');
 }
 `,
     go: `package main
@@ -958,6 +988,8 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("Validate", 60.0, "")
 	ctx.Equal(outcomeOf(ctx, "10", v10), "unavailable", "a sandbox slower than the deadline; the outcome")
 	ctx.Equal(active(ctx), "9", "catalog:active after a timed-out validation")
+	verdict, _ := catalog.Validation(clientBg, "10")
+	ctx.Equal(verdict["outcome"], "unavailable", "catalog:validation:10 after a timed-out validation; its outcome")
 }
 
 func CheckScopedCredential(ctx *harness.Ctx) {
@@ -985,6 +1017,18 @@ func CheckFailClosed(ctx *harness.Ctx) {
 	ctx.Assert(verdict["outcome"] == "unavailable" && verdict["reason"] != "", "catalog:validation:9 is %v, expected outcome unavailable with a reason", verdict)
 	e, _ := catalog.Resolve(clientBg, "search", "")
 	ctx.Equal(e["version"], "a1", "agents must still resolve catalog 7; the search version")
+	// Only INVALID_ARGUMENT judges the candidate: any other error says nothing about it.
+	for _, c := range []struct {
+		cv   string
+		code codes.Code
+	}{{"11", codes.Internal}, {"12", codes.ResourceExhausted}} {
+		ctx.GRPC.ClearFailures()
+		ctx.GRPC.Fail("Validate", c.code, "sandbox error", 5, "")
+		ctx.Equal(outcomeOf(ctx, c.cv, v10), "unavailable", "a sandbox that answered %s says nothing about the candidate (only INVALID_ARGUMENT judges it); candidate %s's outcome", c.code, c.cv)
+		recorded, _ := catalog.Validation(clientBg, c.cv)
+		ctx.Equal(recorded["outcome"], "unavailable", "catalog:validation:%s after %s; its outcome", c.cv, c.code)
+		ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live after %s; catalog:active", c.code)
+	}
 }
 
 func CheckTerminalRejection(ctx *harness.Ctx) {
@@ -1000,6 +1044,9 @@ func CheckTerminalRejection(ctx *harness.Ctx) {
 	ctx.Equal(outcomeOf(ctx, "10", v10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome")
 	ctx.Equal(outcomeOf(ctx, "10", v10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome")
 	ctx.Equal(active(ctx), "10", "catalog:active after validating candidate 10")
+	before := len(ctx.GRPC.CallsTo("Validate", ""))
+	ctx.Equal(outcomeOf(ctx, "10", v10), "passed", "a re-request for candidate 10, which passed")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Validate", "")), before, "a re-request for candidate 10, which passed, must be answered from catalog:validation:10; the Validate calls")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1008,6 +1055,8 @@ func CheckTerminalRejection(ctx *harness.Ctx) {
 
 #include <optional>
 #include <string>
+#include <tuple>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -1069,6 +1118,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Validate", 60.0);
   ctx.Equal(validateAndPromote("10", kV10), "unavailable", "a sandbox slower than the deadline; the outcome");
   ctx.Equal(active(ctx), "9", "catalog:active after a timed-out validation");
+  ctx.Equal(verdictOf("10", "outcome"), "unavailable", "catalog:validation:10 after a timed-out validation; its outcome");
 }
 
 void CheckScopedCredential(harness::Ctx& ctx) {
@@ -1094,6 +1144,16 @@ void CheckFailClosed(harness::Ctx& ctx) {
   ctx.Assert(verdictOf("9", "outcome") == "unavailable" && !verdictOf("9", "reason").empty(), "catalog:validation:9 has outcome %q and reason %q, expected unavailable with a reason", verdictOf("9", "outcome"), verdictOf("9", "reason"));
   const auto search = catalog::resolve("search");
   ctx.Equal(search ? search->value("version", "") : "", "a1", "agents must still resolve catalog 7; the search version");
+  // Only INVALID_ARGUMENT judges the candidate: any other error says nothing about it.
+  const std::vector<std::tuple<std::string, grpc::StatusCode, std::string>> others = {
+      {"11", grpc::StatusCode::INTERNAL, "INTERNAL"}, {"12", grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}};
+  for (const auto& [cv, code, name] : others) {
+    ctx.GRPC.ClearFailures();
+    ctx.GRPC.Fail("Validate", code, "sandbox error", 5);
+    ctx.Equal(validateAndPromote(cv, kV10), "unavailable", "a sandbox that answered %s says nothing about the candidate (only INVALID_ARGUMENT judges it); candidate %s's outcome", name, cv);
+    ctx.Equal(verdictOf(cv, "outcome"), "unavailable", "catalog:validation:%s after %s; its outcome", cv, name);
+    ctx.Equal(active(ctx), "7", "a candidate nobody validated must not go live after %s; catalog:active", name);
+  }
 }
 
 void CheckTerminalRejection(harness::Ctx& ctx) {
@@ -1108,6 +1168,9 @@ void CheckTerminalRejection(harness::Ctx& ctx) {
   ctx.Equal(validateAndPromote("10", kV10), "unavailable", "an UNAVAILABLE sandbox; candidate 10's outcome");
   ctx.Equal(validateAndPromote("10", kV10), "passed", "after an outage the next request must ask the sandbox again (unavailable says nothing about the candidate); candidate 10's outcome");
   ctx.Equal(active(ctx), "10", "catalog:active after validating candidate 10");
+  const auto before = ctx.GRPC.CallsTo("Validate").size();
+  ctx.Equal(validateAndPromote("10", kV10), "passed", "a re-request for candidate 10, which passed");
+  ctx.Equal(ctx.GRPC.CallsTo("Validate").size(), before, "a re-request for candidate 10, which passed, must be answered from catalog:validation:10; the Validate calls");
 }
 `,
   },

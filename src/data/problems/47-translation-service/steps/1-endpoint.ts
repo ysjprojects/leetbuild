@@ -26,7 +26,8 @@ caller pinning glossary version 1 is translated with version 2.
   **400**, before anything reaches the model.
 - When detection says the text is in the target language, answer 200 with the text and
   \`"marker": UNTRANSLATED\`, without calling the model.
-- \`glossary_version\`, when given, is the version resolved; an unknown one is **404**.`,
+- \`glossary_version\`, when given, is the version resolved; an unknown one (versions start at 1) is
+  **404**.`,
   sequence: {
     participants: ['Client', 'translationd', 'Redis', 'Translator'],
     messages: [
@@ -115,7 +116,7 @@ caller pinning glossary version 1 is translated with version 2.
       id: 'glossary-binding',
       title: 'Resolves the pinned glossary version, 404 when unknown',
       detail:
-        "`glossary_version` is passed to `resolve_glossary`, the model gets that version's terms, and an unknown version is **404**. The starter always resolves the active version.",
+        "`glossary_version` is passed to `resolve_glossary`, the model gets that version's terms, and an unknown version, 0 included, is **404**. The starter always resolves the active version.",
       match: {
         python: {all: [/resolve_glossary\([^\n]*version\)/, /\b404\b/]},
         typescript: {all: [/resolveGlossary\([^\n]*version\)/, /\b404\b/]},
@@ -767,6 +768,8 @@ async def check_glossary_binding(ctx):
         assert unknown.status_code == 404, f"an unknown glossary version answered {unknown.status_code}, expected 404: {unknown.text}"
         other = await _post(c, {"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 1}, headers={"X-Tenant-Id": "globex"})
         assert other.status_code == 404, f"globex pinning acme's version 1 answered {other.status_code}, expected 404"
+        zero = await _post(c, {"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 0})
+        assert zero.status_code == 404, f"glossary version 0 answered {zero.status_code}, expected 404: versions start at 1, and a pinned 0 is not the active version"
     assert _calls(ctx) == before, "a request with an unknown glossary version must not reach the model"
 `,
     typescript: `const SERVED = ['en', 'fr', 'de', 'es', 'ja', 'pt'];
@@ -852,6 +855,8 @@ export async function check_glossary_binding(ctx) {
   assert.equal(unknown.status, 404, \`an unknown glossary version answered \${unknown.status}, expected 404: \${unknown.text}\`);
   const other = await post(c, {text: 'Open the Dashboard', source: 'en', target: 'fr', glossary_version: 1}, {'X-Tenant-Id': 'globex'});
   assert.equal(other.status, 404, \`globex pinning acme's version 1 answered \${other.status}, expected 404\`);
+  const zero = await post(c, {text: 'Open the Dashboard', source: 'en', target: 'fr', glossary_version: 0});
+  assert.equal(zero.status, 404, \`glossary version 0 answered \${zero.status}, expected 404: versions start at 1, and a pinned 0 is not the active version\`);
   assert.equal(calls(ctx), before, 'a request with an unknown glossary version must not reach the model');
 }
 `,
@@ -978,6 +983,8 @@ func CheckGlossaryBinding(ctx *harness.Ctx) {
 	ctx.Equal(unknown.Status, 404, "an unknown glossary version (%s)", unknown.Text())
 	other := post(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 1}, "globex")
 	ctx.Equal(other.Status, 404, "globex pinning acme's version 1")
+	zero := post(c, map[string]any{"text": "Open the Dashboard", "source": "en", "target": "fr", "glossary_version": 0}, "acme")
+	ctx.Equal(zero.Status, 404, "versions start at 1, and a pinned 0 is not the active version; glossary version 0")
 	ctx.Equal(apiCalls(ctx), before, "a request with an unknown glossary version must not reach the model; the Translate calls")
 }
 `,
@@ -1104,6 +1111,8 @@ void CheckGlossaryBinding(harness::Ctx& ctx) {
   ctx.Equal(unknown.Status, 404, "an unknown glossary version (%s)", unknown.Text());
   const auto other = post(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 1}}, "globex");
   ctx.Equal(other.Status, 404, "globex pinning acme's version 1");
+  const auto zero = post(c, {{"text", "Open the Dashboard"}, {"source", "en"}, {"target", "fr"}, {"glossary_version", 0}});
+  ctx.Equal(zero.Status, 404, "versions start at 1, and a pinned 0 is not the active version; glossary version 0");
   ctx.Equal(calls(ctx), before, "a request with an unknown glossary version must not reach the model; the Translate calls");
 }
 `,

@@ -48,7 +48,7 @@ the item of a closed tab never comes back.
       id: 'lease-ttl',
       title: 'Claims carry a 15-minute lease',
       detail:
-        'A claim leases the item until now + 900 000 ms (`LEASE_TTL_S` = 900 times 1000) and writes that deadline as the lease score. The starter adds `LEASE_TTL_MS = 900` to a millisecond clock, so a lease lapses after 0.9 s.',
+        'A claim leases the item until now + 900 000 ms (`LEASE_TTL_S` = 900 times 1000) and writes that deadline as the lease score in the same script that pops it, so the item is never out of the pool without a lease; a second before the deadline nothing has expired, half a second after it the lease has. The starter adds `LEASE_TTL_MS = 900` to a millisecond clock, so a lease lapses after 0.9 s.',
       match: {
         python: {all: [/LEASE_TTL_S\s*=\s*900\b/, /LEASE_TTL_S\s*\*\s*1000/], none: [/LEASE_TTL_MS\s*=\s*900\b/]},
         typescript: {all: [/LEASE_TTL_S\s*=\s*900\b/, /LEASE_TTL_S\s*\*\s*1000/], none: [/LEASE_TTL_MS\s*=\s*900\b/]},
@@ -89,7 +89,7 @@ the item of a closed tab never comes back.
       id: 'holder-only',
       title: 'Only the holder renews a lease',
       detail:
-        'The renew script reads the holder (`HGET holder:{task_id} item_id`) and moves the deadline only when it is the caller; anyone else, and an item nobody holds, gets nothing. The starter writes the new deadline for whoever asks.',
+        "The renew script reads the holder (`HGET holder:{task_id} item_id`) and moves the deadline to now + 900 000 ms only when it is the caller; anyone else, and an item nobody holds, gets nothing. The check runs the sweeper right after the renew's first command on the holder, so a check and a write in two round trips lease a returned item again. The starter writes the new deadline for whoever asks.",
       match: {
         python: {all: [/redis\.call\(\s*['"]HGET['"]/], none: [/def renew(?:(?!\ndef )[\s\S])*?\.zadd\(/]},
         typescript: {
@@ -108,7 +108,7 @@ the item of a closed tab never comes back.
       id: 'expired-return',
       title: 'Expired leases return their items to the pool',
       detail:
-        'An expired lease (`ZRANGEBYSCORE lease -inf now`) is removed with its holder and the item is added back to the pool, by the sweeper and by every claim before it pops. The starter drops the lease and keeps the item out of the pool, so the work of a closed tab is lost.',
+        'An expired lease (`ZRANGEBYSCORE lease -inf now`) is removed with its holder and the item is added back at the front of the pool, ahead of items never claimed, by the sweeper and by every claim before it pops. The starter drops the lease and keeps the item out of the pool, so the work of a closed tab is lost.',
       match: {
         python: {
           all: [/ZRANGEBYSCORE/, /redis\.call\(\s*['"]ZADD['"]\s*,\s*KEYS\[1\]/, /redis\.call\(\s*['"]HDEL['"]/],
@@ -764,6 +764,8 @@ def _now(ctx):
 def check_lease_ttl(ctx):
     m = ctx.load("state")
     task_id = _task()
+    # Right after the claim's first command on the pool, the popped item must already carry its lease.
+    probe = ctx.redis_after(f"pool:{task_id}", lambda: ctx.redis.zscore(f"lease:{task_id}", "i-1"))
     lease = m.claim(task_id, "ana")
     assert lease is not None and lease.get("item_id") == "i-1", f"the first claim on a fresh pool returned {lease}, expected item i-1"
     want = _now(ctx) + TTL_MS
@@ -771,9 +773,13 @@ def check_lease_ttl(ctx):
     assert got == want, f"the lease runs until {got}, {got - _now(ctx)} ms from now: expected now + 900 000 ms (LEASE_TTL_S = 900)"
     score = ctx.redis.zscore(f"lease:{task_id}", "i-1")
     assert score == want, f"lease:{task_id} scores i-1 at {score}, expected the deadline {want}"
-    ctx.clock.advance(600)
-    assert m.reclaim_expired(task_id) == 0, "ten minutes into a fifteen-minute lease nothing has expired, yet reclaim_expired found an expired lease"
+    assert probe.fired, f"claim never touched pool:{task_id}"
+    assert probe.result == want, f"right after the claim took i-1 from pool:{task_id}, lease:{task_id} scored it {probe.result}: the item was in neither the pool nor a lease. Pop and lease in the same script"
+    ctx.clock.advance(899)
+    assert m.reclaim_expired(task_id) == 0, "a second before the fifteen-minute deadline nothing has expired, yet reclaim_expired found an expired lease"
     assert ctx.redis.hget(f"holder:{task_id}", "i-1") == "ana", "a live lease must stay with its holder"
+    ctx.clock.advance(1.5)
+    assert m.reclaim_expired(task_id) == 1, "half a second after its deadline ana's lease has expired, yet reclaim_expired did not return it"
 
 
 def check_atomic_claim(ctx):
@@ -806,13 +812,24 @@ def check_holder_only(ctx):
     ghost = m.renew(task_id, "i-2", "bo")
     assert ghost is None and ctx.redis.zscore(f"lease:{task_id}", "i-2") is None, f"renewing i-2, which nobody holds, answered {ghost} and left lease score {ctx.redis.zscore(f'lease:{task_id}', 'i-2')}: a renew must not lease an item still in the pool"
     renewed = m.renew(task_id, "i-1", "ana")
-    assert renewed is not None and renewed > lease["leased_until_ms"], f"ana's own renew answered {renewed}, expected a deadline later than {lease['leased_until_ms']}"
+    assert renewed == _now(ctx) + TTL_MS, f"ana's own renew answered {renewed}, expected now + 900 000 ms = {_now(ctx) + TTL_MS}"
     assert ctx.redis.zscore(f"lease:{task_id}", "i-1") == renewed, "the renewed deadline must be the lease score"
+    # The sweeper returns i-1 right after the renew's first command on the holder: the renew must not lease it again.
+    def sweep_i1():
+        ctx.clock.advance(901)
+        ctx.redis.zrem(f"lease:{task_id}", "i-1")
+        ctx.redis.hdel(f"holder:{task_id}", "i-1")
+        ctx.redis.zadd(f"pool:{task_id}", {"i-1": 0})
+
+    sweep = ctx.redis_after(f"holder:{task_id}", sweep_i1)
+    m.renew(task_id, "i-1", "ana")
+    assert sweep.fired, f"renew never touched holder:{task_id}"
+    assert ctx.redis.zscore(f"lease:{task_id}", "i-1") is None, f"the sweeper returned i-1 to pool:{task_id} between the renew's holder check and its write, and the renew leased it again: check the holder and move the deadline in one script"
 
 
 def check_expired_return(ctx):
     m = ctx.load("state")
-    task_id = _task(["a cat"])
+    task_id = _task()
     m.claim(task_id, "ana")
     ctx.clock.advance(901)  # ana closed the tab
     returned = m.reclaim_expired(task_id)
@@ -820,10 +837,10 @@ def check_expired_return(ctx):
     assert ctx.redis.zscore(f"pool:{task_id}", "i-1") is not None, f"the expired lease on i-1 was dropped but the item never went back to pool:{task_id}: abandoned work is lost"
     assert ctx.redis.hget(f"holder:{task_id}", "i-1") is None, "an expired lease must lose its holder"
     again = m.claim(task_id, "bo")
-    assert again is not None and again["item_id"] == "i-1", f"after the sweeper ran bo's claim returned {again}, expected the returned item i-1"
+    assert again is not None and again["item_id"] == "i-1", f"after the sweeper ran bo's claim returned {again}, expected the returned item i-1 at the front of the pool"
     ctx.clock.advance(901)  # bo leaves too, and no sweeper runs
     third = m.claim(task_id, "cy")
-    assert third is not None and third["item_id"] == "i-1", f"bo's lease expired and no sweeper ran: cy's claim returned {third}. A claim must return expired leases before it pops"
+    assert third is not None and third["item_id"] == "i-1", f"bo's lease expired and no sweeper ran: cy's claim returned {third}. A claim must return expired leases to the front of the pool before it pops"
     assert ctx.redis.hget(f"holder:{task_id}", "i-1") == "cy", "i-1 must now be held by cy"
 `,
     typescript: `const TTL_MS = 900_000;
@@ -842,14 +859,20 @@ const score = (ctx, key: string, member: string): number | null => {
 export async function check_lease_ttl(ctx) {
   const {m, task} = setup(ctx);
   const taskId = await task;
+  // Right after the claim's first command on the pool, the popped item must already carry its lease.
+  const probe = ctx.redisAfter(\`pool:\${taskId}\`, () => score(ctx, \`lease:\${taskId}\`, 'i-1'));
   const lease = await m.claim(taskId, 'ana');
   assert(lease !== null && lease.item_id === 'i-1', \`the first claim on a fresh pool returned \${JSON.stringify(lease)}, expected item i-1\`);
   const want = ctx.clock.now() + TTL_MS;
   assert.equal(lease.leased_until_ms, want, \`the lease runs until \${lease.leased_until_ms}, \${lease.leased_until_ms - ctx.clock.now()} ms from now: expected now + 900 000 ms (LEASE_TTL_S = 900)\`);
   assert.equal(score(ctx, \`lease:\${taskId}\`, 'i-1'), want, \`lease:\${taskId} must score i-1 at the deadline \${want}\`);
-  ctx.clock.advance(600);
-  assert.equal(await m.reclaimExpired(taskId), 0, 'ten minutes into a fifteen-minute lease nothing has expired, yet reclaimExpired found an expired lease');
+  assert(probe.fired, \`claim never touched pool:\${taskId}\`);
+  assert.equal(probe.result, want, \`right after the claim took i-1 from pool:\${taskId}, lease:\${taskId} scored it \${probe.result}: the item was in neither the pool nor a lease. Pop and lease in the same script\`);
+  ctx.clock.advance(899);
+  assert.equal(await m.reclaimExpired(taskId), 0, 'a second before the fifteen-minute deadline nothing has expired, yet reclaimExpired found an expired lease');
   assert.equal(ctx.redis.hget(\`holder:\${taskId}\`, 'i-1'), 'ana', 'a live lease must stay with its holder');
+  ctx.clock.advance(1.5);
+  assert.equal(await m.reclaimExpired(taskId), 1, "half a second after its deadline ana's lease has expired, yet reclaimExpired did not return it");
 }
 
 export async function check_atomic_claim(ctx) {
@@ -880,12 +903,22 @@ export async function check_holder_only(ctx) {
   const ghost = await m.renew(taskId, 'i-2', 'bo');
   assert(ghost === null && score(ctx, \`lease:\${taskId}\`, 'i-2') === null, \`renewing i-2, which nobody holds, answered \${ghost}: a renew must not lease an item still in the pool\`);
   const renewed = await m.renew(taskId, 'i-1', 'ana');
-  assert(renewed !== null && renewed > lease.leased_until_ms, \`ana's own renew answered \${renewed}, expected a deadline later than \${lease.leased_until_ms}\`);
+  assert.equal(renewed, ctx.clock.now() + TTL_MS, \`ana's own renew answered \${renewed}, expected now + 900 000 ms = \${ctx.clock.now() + TTL_MS}\`);
   assert.equal(score(ctx, \`lease:\${taskId}\`, 'i-1'), renewed, 'the renewed deadline must be the lease score');
+  // The sweeper returns i-1 right after the renew's first command on the holder: the renew must not lease it again.
+  const sweep = ctx.redisAfter(\`holder:\${taskId}\`, () => {
+    ctx.clock.advance(901);
+    ctx.redis.zrem(\`lease:\${taskId}\`, 'i-1');
+    ctx.redis.hdel(\`holder:\${taskId}\`, 'i-1');
+    ctx.redis.zadd(\`pool:\${taskId}\`, 0, 'i-1');
+  });
+  await m.renew(taskId, 'i-1', 'ana');
+  assert(sweep.fired, \`renew never touched holder:\${taskId}\`);
+  assert.equal(score(ctx, \`lease:\${taskId}\`, 'i-1'), null, \`the sweeper returned i-1 to pool:\${taskId} between the renew's holder check and its write, and the renew leased it again: check the holder and move the deadline in one script\`);
 }
 
 export async function check_expired_return(ctx) {
-  const {m, task} = setup(ctx, ['a cat']);
+  const {m, task} = setup(ctx);
   const taskId = await task;
   await m.claim(taskId, 'ana');
   ctx.clock.advance(901); // ana closed the tab
@@ -894,10 +927,10 @@ export async function check_expired_return(ctx) {
   assert.notEqual(score(ctx, \`pool:\${taskId}\`, 'i-1'), null, \`the expired lease on i-1 was dropped but the item never went back to pool:\${taskId}: abandoned work is lost\`);
   assert.equal(ctx.redis.hget(\`holder:\${taskId}\`, 'i-1'), null, 'an expired lease must lose its holder');
   const again = await m.claim(taskId, 'bo');
-  assert(again !== null && again.item_id === 'i-1', \`after the sweeper ran bo's claim returned \${JSON.stringify(again)}, expected the returned item i-1\`);
+  assert(again !== null && again.item_id === 'i-1', \`after the sweeper ran bo's claim returned \${JSON.stringify(again)}, expected the returned item i-1 at the front of the pool\`);
   ctx.clock.advance(901); // bo leaves too, and no sweeper runs
   const third = await m.claim(taskId, 'cy');
-  assert(third !== null && third.item_id === 'i-1', \`bo's lease expired and no sweeper ran: cy's claim returned \${JSON.stringify(third)}. A claim must return expired leases before it pops\`);
+  assert(third !== null && third.item_id === 'i-1', \`bo's lease expired and no sweeper ran: cy's claim returned \${JSON.stringify(third)}. A claim must return expired leases to the front of the pool before it pops\`);
   assert.equal(ctx.redis.hget(\`holder:\${taskId}\`, 'i-1'), 'cy', 'i-1 must now be held by cy');
 }
 `,
@@ -947,15 +980,26 @@ func holderOf(ctx *harness.Ctx, taskID, itemID string) string {
 
 func CheckLeaseTtl(ctx *harness.Ctx) {
 	taskID := poolTask()
+	// Right after the claim's first command on the pool, the popped item must already carry its lease.
+	probe := ctx.Redis.After("pool:"+taskID, func() any {
+		if s, ok := ctx.Redis.ZScore("lease:"+taskID, "i-1"); ok {
+			return int64(s)
+		}
+		return nil
+	})
 	lease := mustClaim(ctx, taskID, "ana")
 	ctx.Assert(lease != nil && lease.ItemID == "i-1", "the first claim on a fresh pool returned %+v, expected item i-1", lease)
 	want := ctx.Clock.Now() + ttlMs
 	ctx.Assert(lease.LeasedUntilMs == want, "the lease runs until %d, %d ms from now: expected now + 900 000 ms (leaseTTL = 15 minutes)", lease.LeasedUntilMs, lease.LeasedUntilMs-ctx.Clock.Now())
 	score, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Equal(int64(score), want, "lease:%s must score i-1 at the deadline", taskID)
-	ctx.Clock.Advance(600)
-	ctx.Equal(mustReclaim(ctx, taskID), 0, "ten minutes into a fifteen-minute lease nothing has expired; reclaimExpired")
+	ctx.Assert(probe.Fired, "claim never touched pool:%s", taskID)
+	ctx.Assert(probe.Result == any(want), "right after the claim took i-1 from pool:%s, lease:%s scored it %v: the item was in neither the pool nor a lease. Pop and lease in the same script", taskID, taskID, probe.Result)
+	ctx.Clock.Advance(899)
+	ctx.Equal(mustReclaim(ctx, taskID), 0, "a second before the fifteen-minute deadline nothing has expired; reclaimExpired")
 	ctx.Equal(holderOf(ctx, taskID, "i-1"), "ana", "a live lease must stay with its holder")
+	ctx.Clock.Advance(1.5)
+	ctx.Equal(mustReclaim(ctx, taskID), 1, "half a second after its deadline ana's lease has expired; reclaimExpired")
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
@@ -990,13 +1034,25 @@ func CheckHolderOnly(ctx *harness.Ctx) {
 	_, leased := ctx.Redis.ZScore("lease:"+taskID, "i-2")
 	ctx.Assert(ghost == 0 && !leased, "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost)
 	renewed := mustRenew(ctx, taskID, "i-1", "ana")
-	ctx.Assert(renewed > lease.LeasedUntilMs, "ana's own renew answered %d, expected a deadline later than %d", renewed, lease.LeasedUntilMs)
+	ctx.Equal(renewed, ctx.Clock.Now()+ttlMs, "ana's own renew must answer now + 900 000 ms; the deadline")
 	score, _ := ctx.Redis.ZScore("lease:"+taskID, "i-1")
 	ctx.Equal(int64(score), renewed, "the renewed deadline must be the lease score")
+	// The sweeper returns i-1 right after the renew's first command on the holder: the renew must not lease it again.
+	sweep := ctx.Redis.After("holder:"+taskID, func() any {
+		ctx.Clock.Advance(901)
+		ctx.Redis.Do("ZREM", "lease:"+taskID, "i-1")
+		ctx.Redis.Do("HDEL", "holder:"+taskID, "i-1")
+		ctx.Redis.Do("ZADD", "pool:"+taskID, 0, "i-1")
+		return nil
+	})
+	mustRenew(ctx, taskID, "i-1", "ana")
+	ctx.Assert(sweep.Fired, "renew never touched holder:%s", taskID)
+	_, released := ctx.Redis.ZScore("lease:"+taskID, "i-1")
+	ctx.Assert(!released, "the sweeper returned i-1 to pool:%s between the renew's holder check and its write, and the renew leased it again: check the holder and move the deadline in one script", taskID)
 }
 
 func CheckExpiredReturn(ctx *harness.Ctx) {
-	taskID := poolTask("a cat")
+	taskID := poolTask()
 	mustClaim(ctx, taskID, "ana")
 	ctx.Clock.Advance(901) // ana closed the tab
 	ctx.Equal(mustReclaim(ctx, taskID), 1, "after ana's lease expired, reclaimExpired")
@@ -1004,10 +1060,10 @@ func CheckExpiredReturn(ctx *harness.Ctx) {
 	ctx.Assert(inPool, "the expired lease on i-1 was dropped but the item never went back to pool:%s: abandoned work is lost", taskID)
 	ctx.Equal(holderOf(ctx, taskID, "i-1"), "", "an expired lease must lose its holder")
 	again := mustClaim(ctx, taskID, "bo")
-	ctx.Assert(again != nil && again.ItemID == "i-1", "after the sweeper ran bo's claim returned %+v, expected the returned item i-1", again)
+	ctx.Assert(again != nil && again.ItemID == "i-1", "after the sweeper ran bo's claim returned %+v, expected the returned item i-1 at the front of the pool", again)
 	ctx.Clock.Advance(901) // bo leaves too, and no sweeper runs
 	third := mustClaim(ctx, taskID, "cy")
-	ctx.Assert(third != nil && third.ItemID == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %+v. A claim must return expired leases before it pops", third)
+	ctx.Assert(third != nil && third.ItemID == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %+v. A claim must return expired leases to the front of the pool before it pops", third)
 	ctx.Equal(holderOf(ctx, taskID, "i-1"), "cy", "i-1 must now be held by cy")
 }
 `,
@@ -1037,14 +1093,25 @@ std::string holderOf(harness::Ctx& ctx, const std::string& task_id, const std::s
 
 void CheckLeaseTtl(harness::Ctx& ctx) {
   const std::string task_id = poolTask();
+  // Right after the claim's first command on the pool, the popped item must already carry its lease.
+  auto fired = std::make_shared<bool>(false);
+  auto seen = std::make_shared<std::optional<double>>();
+  ctx.Redis.After("pool:" + task_id, [=, &ctx] {
+    *fired = true;
+    *seen = ctx.Redis.ZScore("lease:" + task_id, "i-1");
+  });
   const auto lease = claim(task_id, "ana");
   ctx.Assert(lease && lease->item_id == "i-1", "the first claim on a fresh pool returned %q, expected item i-1", lease ? lease->item_id : "nothing");
   const long long want = ctx.Clock.Now() + kTtlMs;
   ctx.Assert(lease->leased_until_ms == want, "the lease runs until %d, %d ms from now: expected now + 900 000 ms (kLeaseTtl = 900 s)", lease->leased_until_ms, lease->leased_until_ms - ctx.Clock.Now());
   ctx.Equal(static_cast<long long>(ctx.Redis.ZScore("lease:" + task_id, "i-1").value_or(0)), want, "lease:%s must score i-1 at the deadline", task_id);
-  ctx.Clock.Advance(600);
-  ctx.Equal(reclaimExpired(task_id), 0LL, "ten minutes into a fifteen-minute lease nothing has expired; reclaimExpired");
+  ctx.Assert(*fired, "claim never touched pool:%s", task_id);
+  ctx.Assert(seen->has_value() && static_cast<long long>(**seen) == want, "right after the claim took i-1 from pool:%s, lease:%s scored it %s: the item was in neither the pool nor a lease. Pop and lease in the same script", task_id, task_id, seen->has_value() ? std::to_string(static_cast<long long>(**seen)) : "nothing");
+  ctx.Clock.Advance(899);
+  ctx.Equal(reclaimExpired(task_id), 0LL, "a second before the fifteen-minute deadline nothing has expired; reclaimExpired");
   ctx.Equal(holderOf(ctx, task_id, "i-1"), "ana", "a live lease must stay with its holder");
+  ctx.Clock.Advance(1.5);
+  ctx.Equal(reclaimExpired(task_id), 1LL, "half a second after its deadline ana's lease has expired; reclaimExpired");
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
@@ -1083,22 +1150,34 @@ void CheckHolderOnly(harness::Ctx& ctx) {
   const long long ghost = renew(task_id, "i-2", "bo");
   ctx.Assert(ghost == 0 && !ctx.Redis.ZScore("lease:" + task_id, "i-2"), "renewing i-2, which nobody holds, answered %d: a renew must not lease an item still in the pool", ghost);
   const long long renewed = renew(task_id, "i-1", "ana");
-  ctx.Assert(renewed > lease->leased_until_ms, "ana's own renew answered %d, expected a deadline later than %d", renewed, lease->leased_until_ms);
+  ctx.Equal(renewed, ctx.Clock.Now() + kTtlMs, "ana's own renew must answer now + 900 000 ms; the deadline");
   ctx.Equal(static_cast<long long>(ctx.Redis.ZScore("lease:" + task_id, "i-1").value_or(0)), renewed, "the renewed deadline must be the lease score");
+  // The sweeper returns i-1 right after the renew's first command on the holder: the renew must not lease it again.
+  auto swept = std::make_shared<bool>(false);
+  ctx.Redis.After("holder:" + task_id, [=, &ctx] {
+    *swept = true;
+    ctx.Clock.Advance(901);
+    ctx.Redis.Do("ZREM", "lease:" + task_id, "i-1");
+    ctx.Redis.Do("HDEL", "holder:" + task_id, "i-1");
+    ctx.Redis.Do("ZADD", "pool:" + task_id, 0, "i-1");
+  });
+  renew(task_id, "i-1", "ana");
+  ctx.Assert(*swept, "renew never touched holder:%s", task_id);
+  ctx.Assert(!ctx.Redis.ZScore("lease:" + task_id, "i-1").has_value(), "the sweeper returned i-1 to pool:%s between the renew's holder check and its write, and the renew leased it again: check the holder and move the deadline in one script", task_id);
 }
 
 void CheckExpiredReturn(harness::Ctx& ctx) {
-  const std::string task_id = poolTask({"a cat"});
+  const std::string task_id = poolTask();
   claim(task_id, "ana");
   ctx.Clock.Advance(901);  // ana closed the tab
   ctx.Equal(reclaimExpired(task_id), 1LL, "after ana's lease expired, reclaimExpired");
   ctx.Assert(ctx.Redis.ZScore("pool:" + task_id, "i-1").has_value(), "the expired lease on i-1 was dropped but the item never went back to pool:%s: abandoned work is lost", task_id);
   ctx.Equal(holderOf(ctx, task_id, "i-1"), "", "an expired lease must lose its holder");
   const auto again = claim(task_id, "bo");
-  ctx.Assert(again && again->item_id == "i-1", "after the sweeper ran bo's claim returned %q, expected the returned item i-1", again ? again->item_id : "nothing");
+  ctx.Assert(again && again->item_id == "i-1", "after the sweeper ran bo's claim returned %q, expected the returned item i-1 at the front of the pool", again ? again->item_id : "nothing");
   ctx.Clock.Advance(901);  // bo leaves too, and no sweeper runs
   const auto third = claim(task_id, "cy");
-  ctx.Assert(third && third->item_id == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %q. A claim must return expired leases before it pops", third ? third->item_id : "nothing");
+  ctx.Assert(third && third->item_id == "i-1", "bo's lease expired and no sweeper ran: cy's claim returned %q. A claim must return expired leases to the front of the pool before it pops", third ? third->item_id : "nothing");
   ctx.Equal(holderOf(ctx, task_id, "i-1"), "cy", "i-1 must now be held by cy");
 }
 `,

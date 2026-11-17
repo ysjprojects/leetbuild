@@ -69,7 +69,7 @@ one, so no reader can tell a stale value from a fresh one.
       id: 'computation-ref',
       title: 'A computation_ref that resolves to nothing is 422',
       detail:
-        '`computation_ref` is looked up in the compute registry (`computation_exists`/`computationExists`) before the write; one it does not know answers **422** and nothing is stored. The starter stores any string.',
+        '`computation_ref` is looked up in the compute registry (`computation_exists`/`computationExists`) before the write; one it does not know answers **422** and nothing is stored, not even for a moment. The starter stores any string.',
       match: {
         python: {
           all: [/registry\.computation_exists\(/, /\b422\b/],
@@ -574,9 +574,12 @@ async def check_immutable_version(ctx):
 
 async def check_computation_ref(ctx):
     async with _api(ctx) as c:
-        r = await _register(c, computation_ref="window_avg_7days")
+        # Nothing is stored, not even for a moment: a probe reads the key when the request first touches it.
+        probe = ctx.redis_after("definition:amount_7d:5", lambda: ctx.redis.exists("definition:amount_7d:5"))
+        r = await _register(c, version=5, computation_ref="window_avg_7days")
         assert r.status_code == 422, f"a computation_ref the compute registry does not know answered {r.status_code}, expected 422"
-        assert registry.get_definition("amount_7d", 2) is None, f"a definition with a dangling computation_ref was stored: {registry.get_definition('amount_7d', 2)}"
+        assert registry.get_definition("amount_7d", 5) is None, f"a definition with a dangling computation_ref was stored: {registry.get_definition('amount_7d', 5)}"
+        assert not probe.fired or probe.result == 0, "a definition with a dangling computation_ref was written and then removed: for a moment the registry served it. Resolve the computation_ref before the write"
         r = await _register(c)
     assert r.status_code == 201, f"with a computation_ref that resolves the registration answered {r.status_code}: {r.text}"
 
@@ -644,9 +647,12 @@ export async function check_immutable_version(ctx) {
 
 export async function check_computation_ref(ctx) {
   const {c, registry} = await api(ctx);
-  let r = await register(c, {...BODY, computation_ref: 'window_avg_7days'});
+  // Nothing is stored, not even for a moment: a probe reads the key when the request first touches it.
+  const probe = ctx.redisAfter('definition:amount_7d:5', () => ctx.redis.exists('definition:amount_7d:5'));
+  let r = await register(c, {...BODY, version: 5, computation_ref: 'window_avg_7days'});
   assert.equal(r.status, 422, \`a computation_ref the compute registry does not know answered \${r.status}, expected 422\`);
-  assert.equal(await registry.getDefinition('amount_7d', 2), null, 'a definition with a dangling computation_ref was stored');
+  assert.equal(await registry.getDefinition('amount_7d', 5), null, 'a definition with a dangling computation_ref was stored');
+  assert(!probe.fired || Number(await probe.result) === 0, 'a definition with a dangling computation_ref was written and then removed: for a moment the registry served it. Resolve the computation_ref before the write');
   r = await register(c, BODY);
   assert.equal(r.status, 201, \`with a computation_ref that resolves the registration answered \${r.status}: \${r.text}\`);
 }
@@ -682,9 +688,9 @@ import (
 	"leetbuild/harness"
 )
 
-var bg = context.Background()
+var hBg = context.Background()
 
-func body(changes map[string]any) map[string]any {
+func hBody(changes map[string]any) map[string]any {
 	out := map[string]any{"name": "amount_7d", "version": 2, "dtype": "float64", "computation_ref": "window_avg_7d", "freshness_slo": 300}
 	for k, v := range changes {
 		if v == "-" {
@@ -696,91 +702,94 @@ func body(changes map[string]any) map[string]any {
 	return out
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	registry.RegisterComputation(bg, "window_avg_7d")
-	registry.RegisterComputation(bg, "window_sum_1d")
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
+	registry.RegisterComputation(hBg, "window_avg_7d")
+	registry.RegisterComputation(hBg, "window_sum_1d")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func stored(ctx *harness.Ctx, version int) *registry.Definition {
-	d, err := registry.GetDefinition(bg, "amount_7d", version)
+func hStored(ctx *harness.Ctx, version int) *registry.Definition {
+	d, err := registry.GetDefinition(hBg, "amount_7d", version)
 	ctx.NoError(err, "GetDefinition(amount_7d, %d)", version)
 	return d
 }
 
-func answered(ctx *harness.Ctx, r *harness.Response) registry.Definition {
+func hAnswered(ctx *harness.Ctx, r *harness.Response) registry.Definition {
 	var d registry.Definition
 	ctx.NoError(json.Unmarshal(r.Body, &d), "the response must be the definition as JSON, got %s", r.Text())
 	return d
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/features/definitions", body(nil))
+	c := hAPI(ctx)
+	r := c.Post("/v1/features/definitions", hBody(nil))
 	ctx.Equal(r.Status, 201, "POST /v1/features/definitions (%s)", r.Text())
-	d := stored(ctx, 2)
+	d := hStored(ctx, 2)
 	ctx.Assert(d != nil, "after a 201 the registry holds no definition:amount_7d:2")
-	ctx.Equal(answered(ctx, r), *d, "the response must be the definition as stored")
+	ctx.Equal(hAnswered(ctx, r), *d, "the response must be the definition as stored")
 	ctx.Assert(d.Dtype == "float64" && d.ComputationRef == "window_avg_7d" && d.FreshnessSLO == 300, "the stored definition %+v lost a field of the request", *d)
 	age := time.Now().Unix() - d.CreatedAt
 	ctx.Assert(age >= -5 && age <= 5, "created_at is %d, expected the registration time in epoch seconds", d.CreatedAt)
-	bad := c.Post("/v1/features/definitions", body(map[string]any{"name": "amount_30d", "dtype": "float32"}))
+	bad := c.Post("/v1/features/definitions", hBody(map[string]any{"name": "amount_30d", "dtype": "float32"}))
 	ctx.Equal(bad.Status, 400, "a dtype outside dtypes")
-	missing, _ := registry.GetDefinition(bg, "amount_30d", 2)
+	missing, _ := registry.GetDefinition(hBg, "amount_30d", 2)
 	ctx.Assert(missing == nil, "a definition with an unknown dtype was stored")
 }
 
 func CheckImmutableVersion(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := c.Post("/v1/features/definitions", body(nil))
+	c := hAPI(ctx)
+	first := c.Post("/v1/features/definitions", hBody(nil))
 	ctx.Equal(first.Status, 201, "the first registration of amount_7d v2 (%s)", first.Text())
-	again := c.Post("/v1/features/definitions", body(map[string]any{"dtype": "int64", "computation_ref": "window_sum_1d"}))
+	again := c.Post("/v1/features/definitions", hBody(map[string]any{"dtype": "int64", "computation_ref": "window_sum_1d"}))
 	ctx.Equal(again.Status, 409, "a second registration of amount_7d v2 (a version is immutable)")
-	ctx.Equal(*stored(ctx, 2), answered(ctx, first), "the second registration must not rewrite amount_7d v2; the registry holds")
+	ctx.Equal(*hStored(ctx, 2), hAnswered(ctx, first), "the second registration must not rewrite amount_7d v2; the registry holds")
 	// A rival registration of v3 lands right after this one first touches the key.
 	rival := registry.Definition{Name: "amount_7d", Version: 3, Dtype: "int64", ComputationRef: "window_avg_7d", FreshnessSLO: 300, CreatedAt: time.Now().Unix()}
 	probe := ctx.Redis.After("definition:amount_7d:3", func() any {
-		won, err := registry.CreateDefinition(bg, rival)
+		won, err := registry.CreateDefinition(hBg, rival)
 		ctx.NoError(err, "the rival registration failed")
 		return won
 	})
-	r := c.Post("/v1/features/definitions", body(map[string]any{"version": 3}))
+	r := c.Post("/v1/features/definitions", hBody(map[string]any{"version": 3}))
 	ctx.Assert(probe.Fired, "the registration of amount_7d v3 never touched definition:amount_7d:3")
 	ctx.Assert(probe.Err == nil, "the rival registration failed: %v", probe.Err)
-	now := stored(ctx, 3)
+	now := hStored(ctx, 3)
 	if probe.Result == true {
 		ctx.Assert(r.Status == 409 && now != nil && *now == rival, "a rival registration of amount_7d v3 landed between the check and the write; the endpoint answered %d and the registry holds %+v, expected 409 with the rival kept. Store with one SET NX", r.Status, now)
 	} else {
 		ctx.Equal(r.Status, 201, "the registration won the race")
-		ctx.Equal(*now, answered(ctx, r), "the registry must hold the definition the endpoint answered")
+		ctx.Equal(*now, hAnswered(ctx, r), "the registry must hold the definition the endpoint answered")
 	}
 }
 
 func CheckComputationRef(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/features/definitions", body(map[string]any{"computation_ref": "window_avg_7days"}))
+	c := hAPI(ctx)
+	// Nothing is stored, not even for a moment: a probe reads the key when the request first touches it.
+	probe := ctx.Redis.After("definition:amount_7d:5", func() any { return ctx.Redis.Exists("definition:amount_7d:5") })
+	r := c.Post("/v1/features/definitions", hBody(map[string]any{"version": 5, "computation_ref": "window_avg_7days"}))
 	ctx.Equal(r.Status, 422, "a computation_ref the compute registry does not know")
-	ctx.Assert(stored(ctx, 2) == nil, "a definition with a dangling computation_ref was stored: %+v", stored(ctx, 2))
-	r = c.Post("/v1/features/definitions", body(nil))
+	ctx.Assert(hStored(ctx, 5) == nil, "a definition with a dangling computation_ref was stored: %+v", hStored(ctx, 5))
+	ctx.Assert(!probe.Fired || probe.Result == int64(0), "a definition with a dangling computation_ref was written and then removed: for a moment the registry served it. Resolve the computation_ref before the write")
+	r = c.Post("/v1/features/definitions", hBody(nil))
 	ctx.Equal(r.Status, 201, "with a computation_ref that resolves, the registration (%s)", r.Text())
 }
 
 func CheckFreshnessSlo(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	cases := []struct {
 		version int
 		slo     any
 		what    string
 	}{{10, "-", "missing"}, {11, nil, "null"}, {12, 0, "0"}, {13, -5, "-5"}}
 	for _, tc := range cases {
-		r := c.Post("/v1/features/definitions", body(map[string]any{"version": tc.version, "freshness_slo": tc.slo}))
+		r := c.Post("/v1/features/definitions", hBody(map[string]any{"version": tc.version, "freshness_slo": tc.slo}))
 		ctx.Equal(r.Status, 400, "a freshness_slo that is %s", tc.what)
-		ctx.Assert(stored(ctx, tc.version) == nil, "a definition whose freshness_slo is %s was stored: %+v", tc.what, stored(ctx, tc.version))
+		ctx.Assert(hStored(ctx, tc.version) == nil, "a definition whose freshness_slo is %s was stored: %+v", tc.what, hStored(ctx, tc.version))
 	}
-	r := c.Post("/v1/features/definitions", body(map[string]any{"version": 14}))
-	ctx.Assert(r.Status == 201 && answered(ctx, r).FreshnessSLO == 300, "a definition with freshness_slo 300 answered %d %s", r.Status, r.Text())
+	r := c.Post("/v1/features/definitions", hBody(map[string]any{"version": 14}))
+	ctx.Assert(r.Status == 201 && hAnswered(ctx, r).FreshnessSLO == 300, "a definition with freshness_slo 300 answered %d %s", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -800,7 +809,7 @@ namespace {
 
 const json kBody = {{"name", "amount_7d"}, {"version", 2}, {"dtype", "float64"}, {"computation_ref", "window_avg_7d"}, {"freshness_slo", 300}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   registry::registerComputation("window_avg_7d");
   registry::registerComputation("window_sum_1d");
   static httplib::Server* svr = nullptr;
@@ -810,98 +819,102 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json with(json body, const json& changes) {
+json hWith(json body, const json& changes) {
   for (const auto& [k, v] : changes.items()) body[k] = v;
   return body;
 }
 
-harness::Response post(harness::HTTP& c, const json& body) {
+harness::Response hPost(harness::HTTP& c, const json& body) {
   return c.Post("/v1/features/definitions", body.dump(), "Content-Type", "application/json");
 }
 
-std::optional<json> stored(long version) {
+std::optional<json> hStored(long version) {
   const auto d = registry::getDefinition("amount_7d", version);
   if (!d) return std::nullopt;
   return registry::toJson(*d);
 }
 
-json parsed(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
+json hParsed(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
 
-long long nowSeconds() {
+long long hNowSeconds() {
   return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kBody);
+  auto c = hAPI(ctx);
+  const auto r = hPost(c, kBody);
   ctx.Equal(r.Status, 201, "POST /v1/features/definitions (%s)", r.Text());
-  const auto d = stored(2);
+  const auto d = hStored(2);
   ctx.Assert(d.has_value(), "after a 201 the registry holds no definition:amount_7d:2");
-  ctx.Equal(parsed(r), *d, "the response must be the definition as stored");
+  ctx.Equal(hParsed(r), *d, "the response must be the definition as stored");
   for (const auto& [k, v] : kBody.items()) ctx.Equal((*d)[k], v, "the stored definition lost the field %s of the request", k);
-  const long long age = nowSeconds() - d->value("created_at", 0LL);
+  const long long age = hNowSeconds() - d->value("created_at", 0LL);
   ctx.Assert(age >= -5 && age <= 5, "created_at is %s, expected the registration time in epoch seconds", (*d)["created_at"].dump());
-  const auto bad = post(c, with(kBody, {{"name", "amount_30d"}, {"dtype", "float32"}}));
+  const auto bad = hPost(c, hWith(kBody, {{"name", "amount_30d"}, {"dtype", "float32"}}));
   ctx.Equal(bad.Status, 400, "a dtype outside kDtypes");
   ctx.Assert(!registry::getDefinition("amount_30d", 2), "a definition with an unknown dtype was stored");
 }
 
 void CheckImmutableVersion(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, kBody);
+  auto c = hAPI(ctx);
+  const auto first = hPost(c, kBody);
   ctx.Equal(first.Status, 201, "the first registration of amount_7d v2 (%s)", first.Text());
-  const auto again = post(c, with(kBody, {{"dtype", "int64"}, {"computation_ref", "window_sum_1d"}}));
+  const auto again = hPost(c, hWith(kBody, {{"dtype", "int64"}, {"computation_ref", "window_sum_1d"}}));
   ctx.Equal(again.Status, 409, "a second registration of amount_7d v2 (a version is immutable)");
-  ctx.Equal(stored(2).value_or(json()), parsed(first), "the second registration must not rewrite amount_7d v2; the registry holds");
+  ctx.Equal(hStored(2).value_or(json()), hParsed(first), "the second registration must not rewrite amount_7d v2; the registry holds");
   // A rival registration of v3 lands right after this one first touches the key.
-  const registry::Definition rival{"amount_7d", 3, "int64", "window_avg_7d", 300, nowSeconds()};
+  const registry::Definition rival{"amount_7d", 3, "int64", "window_avg_7d", 300, hNowSeconds()};
   auto fired = std::make_shared<bool>(false);
   auto won = std::make_shared<bool>(false);
   ctx.Redis.After("definition:amount_7d:3", [fired, won, rival] {
     *fired = true;
     *won = registry::createDefinition(rival);
   });
-  const auto r = post(c, with(kBody, {{"version", 3}}));
+  const auto r = hPost(c, hWith(kBody, {{"version", 3}}));
   ctx.Assert(*fired, "the registration of amount_7d v3 never touched definition:amount_7d:3");
-  const json now = stored(3).value_or(json());
+  const json now = hStored(3).value_or(json());
   if (*won) {
     ctx.Assert(r.Status == 409 && now == registry::toJson(rival),
                "a rival registration of amount_7d v3 landed between the check and the write; the endpoint answered %d and the registry holds %s, expected 409 with the rival kept. Store with one SET NX",
                r.Status, now.dump());
   } else {
     ctx.Equal(r.Status, 201, "the registration won the race");
-    ctx.Equal(now, parsed(r), "the registry must hold the definition the endpoint answered");
+    ctx.Equal(now, hParsed(r), "the registry must hold the definition the endpoint answered");
   }
 }
 
 void CheckComputationRef(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, with(kBody, {{"computation_ref", "window_avg_7days"}}));
+  auto c = hAPI(ctx);
+  // Nothing is stored, not even for a moment: a probe reads the key when the request first touches it.
+  auto existed = std::make_shared<long long>(0);
+  ctx.Redis.After("definition:amount_7d:5", [&ctx, existed] { *existed = ctx.Redis.Exists("definition:amount_7d:5"); });
+  auto r = hPost(c, hWith(kBody, {{"version", 5}, {"computation_ref", "window_avg_7days"}}));
   ctx.Equal(r.Status, 422, "a computation_ref the compute registry does not know");
-  ctx.Assert(!stored(2), "a definition with a dangling computation_ref was stored: %s", stored(2).value_or(json()).dump());
-  r = post(c, kBody);
+  ctx.Assert(!hStored(5), "a definition with a dangling computation_ref was stored: %s", hStored(5).value_or(json()).dump());
+  ctx.Assert(*existed == 0, "a definition with a dangling computation_ref was written and then removed: for a moment the registry served it. Resolve the computation_ref before the write");
+  r = hPost(c, kBody);
   ctx.Equal(r.Status, 201, "with a computation_ref that resolves, the registration (%s)", r.Text());
 }
 
 void CheckFreshnessSlo(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hAPI(ctx);
   json without = kBody;
   without.erase("freshness_slo");
   const std::vector<std::pair<json, std::string>> cases = {
-      {with(without, {{"version", 10}}), "missing"},
-      {with(kBody, {{"version", 11}, {"freshness_slo", nullptr}}), "null"},
-      {with(kBody, {{"version", 12}, {"freshness_slo", 0}}), "0"},
-      {with(kBody, {{"version", 13}, {"freshness_slo", -5}}), "-5"},
+      {hWith(without, {{"version", 10}}), "missing"},
+      {hWith(kBody, {{"version", 11}, {"freshness_slo", nullptr}}), "null"},
+      {hWith(kBody, {{"version", 12}, {"freshness_slo", 0}}), "0"},
+      {hWith(kBody, {{"version", 13}, {"freshness_slo", -5}}), "-5"},
   };
   for (const auto& [body, what] : cases) {
-    const auto r = post(c, body);
+    const auto r = hPost(c, body);
     ctx.Equal(r.Status, 400, "a freshness_slo that is %s", what);
-    ctx.Assert(!stored(body["version"].get<long>()), "a definition whose freshness_slo is %s was stored", what);
+    ctx.Assert(!hStored(body["version"].get<long>()), "a definition whose freshness_slo is %s was stored", what);
   }
-  const auto r = post(c, with(kBody, {{"version", 14}}));
-  ctx.Assert(r.Status == 201 && parsed(r).value("freshness_slo", 0) == 300, "a definition with freshness_slo 300 answered %d %s", r.Status, r.Text());
+  const auto r = hPost(c, hWith(kBody, {{"version", 14}}));
+  ctx.Assert(r.Status == 201 && hParsed(r).value("freshness_slo", 0) == 300, "a definition with freshness_slo 300 answered %d %s", r.Status, r.Text());
 }
 `,
   },

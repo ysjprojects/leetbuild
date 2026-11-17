@@ -22,10 +22,11 @@ acknowledgement writes a record twice.
 
 - The key is the **tool name**.
 - The value is \`tool\`, \`version\`, \`side_effect\`, \`catalog_version\` and \`outcome\`, nothing else.
-- \`outcome\` is the recorded verdict, \`catalog.validation(cv)\`; with none recorded, raise
-  \`NoVerdict\` and produce nothing.
-- A record whose delivery fails goes to \`store.to_outbox(topic, key, value)\`, from the delivery
-  outcome: \`on_delivery\`, a rejected \`send\`, a \`WriteMessages\` error, \`dr_cb\`, a \`Callback\`.
+- \`outcome\` is the recorded verdict, \`catalog.validation(cv)\`, whatever it is (\`unavailable\`
+  included); with none recorded, raise \`NoVerdict\` and produce nothing.
+- A record whose delivery fails goes, unchanged, to \`store.to_outbox(topic, key, value)\`, from the
+  delivery outcome: \`on_delivery\`, a rejected \`send\`, a \`WriteMessages\` error, \`dr_cb\`, a
+  \`Callback\`.
 - The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\`, \`acks: -1\`). kafka-go has no
   idempotent producer: Go uses \`RequireAll\` and the consumer deduplicates by tool, version and
   catalog version.`,
@@ -77,7 +78,7 @@ acknowledgement writes a record twice.
       id: 'verdict-outcome',
       title: 'Announces the recorded verdict, and only once there is one',
       detail:
-        '`outcome` comes from `catalog.validation(cv)`, read before anything is produced; a candidate with no verdict raises and produces nothing. The starter writes the literal `promoted` for every candidate, rejected or not.',
+        '`outcome` comes from `catalog.validation(cv)`, read before anything is produced, whatever it says (`unavailable` included); a candidate with no verdict raises `NoVerdict` and produces nothing. The starter writes the literal `promoted` for every candidate, rejected or not.',
       match: {
         python: {
           all: [/raise NoVerdict/],
@@ -110,7 +111,7 @@ acknowledgement writes a record twice.
       id: 'outbox',
       title: 'A refused record lands in the outbox',
       detail:
-        'The delivery outcome decides: a record the broker refused goes to `store.to_outbox` for the relay. The starter logs the failure, so a broker outage leaves a gap in the audit trail.',
+        'The delivery outcome decides: a record the broker refused goes to `store.to_outbox` for the relay, its value exactly the record that was refused. The starter logs the failure, so a broker outage leaves a gap in the audit trail.',
       match: {
         python: {all: [/if err is not None:[\s\S]{0,200}?store\.to_outbox\(/]},
         typescript: {all: [/catch[\s\S]{0,200}?toOutbox\(/]},
@@ -686,11 +687,17 @@ def check_verdict_outcome(ctx):
     m.announce("9", V9)
     latest = {_payload(r).get("outcome") for r in ctx.kafka.records(TOPIC)[3:]}
     assert latest == {"passed"}, f"a validated candidate was announced with outcome {sorted(map(str, latest))}"
+    catalog.record_validation("10", "unavailable", "UNAVAILABLE")
+    m.announce("10", V10)
+    latest = [_payload(r).get("outcome") for r in ctx.kafka.records(TOPIC)[6:]]
+    assert latest == ["unavailable"], f"a candidate the sandbox never answered on was announced with outcome {latest}: announce the recorded verdict, unavailable included"
     before = len(ctx.kafka.records(TOPIC))
     try:
         m.announce("11", V9)
-    except Exception:
+    except getattr(m, "NoVerdict", ()):
         pass
+    except Exception as exc:
+        raise AssertionError(f"announce for catalog 11, which has no recorded verdict, raised {type(exc).__name__}: {exc}, expected NoVerdict")
     else:
         raise AssertionError("announce for catalog 11, which has no recorded verdict, went through: raise NoVerdict, there is nothing true to announce yet")
     assert len(ctx.kafka.records(TOPIC)) == before, "a candidate with no verdict must produce nothing"
@@ -704,6 +711,9 @@ def check_outbox(ctx):
     assert len(parked) == 1, f"the broker refused one record and tools:outbox holds {len(parked)}: a refused record must be parked for the relay, not logged and dropped"
     row = parked[0]
     assert row.get("topic") == TOPIC and json.loads(row.get("value", "{}")).get("tool") == row.get("key"), f"the outbox row is {row}, expected the topic, the key and the record's value"
+    entry = V9.get(row["key"], {})
+    expected = {"tool": row["key"], "version": entry.get("version"), "side_effect": entry.get("side_effect"), "catalog_version": "9", "outcome": "passed"}
+    assert json.loads(row["value"]) == expected, f"the parked value is {row['value']}, expected the record that was refused, {json.dumps(expected)}: the relay republishes it as is"
     delivered = {(r.key or b"").decode() for r in ctx.kafka.records(TOPIC)}
     assert delivered | {row["key"]} == set(V9), f"delivered {sorted(delivered)} plus parked {row['key']} must cover every tool"
 
@@ -787,11 +797,16 @@ export async function check_verdict_outcome(ctx) {
   await m.announce('9', V9);
   const latest = [...new Set(ctx.kafka.records(TOPIC).slice(3).map(r => payload(r).outcome))];
   assert.deepStrictEqual(latest, ['passed'], \`a validated candidate was announced with outcome \${JSON.stringify(latest)}\`);
+  await catalog.recordValidation('10', 'unavailable', 'UNAVAILABLE');
+  await m.announce('10', V10);
+  const unjudged = ctx.kafka.records(TOPIC).slice(6).map(r => payload(r).outcome);
+  assert.deepStrictEqual(unjudged, ['unavailable'], \`a candidate the sandbox never answered on was announced with outcome \${JSON.stringify(unjudged)}: announce the recorded verdict, unavailable included\`);
   const before = ctx.kafka.records(TOPIC).length;
   let refused = false;
   try {
     await m.announce('11', V9);
-  } catch {
+  } catch (e) {
+    assert(m.NoVerdict !== undefined && e instanceof m.NoVerdict, \`announce for catalog 11, which has no recorded verdict, threw \${e}, expected NoVerdict\`);
     refused = true;
   }
   assert(refused, 'announce for catalog 11, which has no recorded verdict, went through: throw NoVerdict, there is nothing true to announce yet');
@@ -806,6 +821,9 @@ export async function check_outbox(ctx) {
   assert.equal(parked.length, 1, \`the broker refused one record and tools:outbox holds \${parked.length}: a refused record must be parked for the relay, not logged and dropped\`);
   const row = parked[0];
   assert(row.topic === TOPIC && JSON.parse(row.value ?? '{}').tool === row.key, \`the outbox row is \${JSON.stringify(row)}, expected the topic, the key and the record's value\`);
+  const parkedEntry = V9[row.key];
+  const expected = {tool: row.key, version: parkedEntry?.version, side_effect: parkedEntry?.side_effect, catalog_version: '9', outcome: 'passed'};
+  assert.deepStrictEqual(JSON.parse(row.value), expected, \`the parked value is \${row.value}, expected the record that was refused, \${JSON.stringify(expected)}: the relay republishes it as is\`);
   const covered = [...new Set([...ctx.kafka.records(TOPIC).map(keyOf), row.key])].sort();
   assert.deepStrictEqual(covered, Object.keys(V9).sort(), \`delivered plus parked records cover \${JSON.stringify(covered)}, expected every tool\`);
 }
@@ -919,6 +937,13 @@ func CheckVerdictOutcome(ctx *harness.Ctx) {
 	for _, r := range ctx.Kafka.Records(topic)[3:] {
 		ctx.Equal(payloadOf(ctx, r.Value)["outcome"], "passed", "a validated candidate's outcome")
 	}
+	ctx.NoError(catalog.RecordValidation(eventsBg, "10", "unavailable", "UNAVAILABLE"), "seeding failed")
+	mustAnnounce(ctx, "10", v10)
+	unjudged := ctx.Kafka.Records(topic)[6:]
+	ctx.Equal(len(unjudged), 1, "candidate 10 has one tool; its records")
+	for _, r := range unjudged {
+		ctx.Equal(payloadOf(ctx, r.Value)["outcome"], "unavailable", "a candidate the sandbox never answered on must be announced with the recorded verdict, unavailable included; the outcome")
+	}
 	before := len(ctx.Kafka.Records(topic))
 	_, err := announce(eventsBg, "11", v9)
 	ctx.Assert(err != nil, "announce for catalog 11, which has no recorded verdict, went through: return ErrNoVerdict, there is nothing true to announce yet")
@@ -935,6 +960,11 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Assert(json.Unmarshal([]byte(parked[0]), &row) == nil, "the outbox row is not JSON: %s", parked[0])
 	value := payloadOf(ctx, []byte(row["value"]))
 	ctx.Assert(row["topic"] == topic && value["tool"] == row["key"], "the outbox row is %v, expected the topic, the key and the record's value", row)
+	parkedEntry := v9[row["key"]]
+	expected := map[string]any{"tool": row["key"], "version": parkedEntry["version"], "side_effect": parkedEntry["side_effect"], "catalog_version": "9", "outcome": "passed"}
+	got, _ := json.Marshal(value)
+	want, _ := json.Marshal(expected)
+	ctx.Equal(string(got), string(want), "the relay republishes the parked value as is, so it must be the record that was refused; the parked value")
 	covered := map[string]bool{row["key"]: true}
 	for _, k := range ctx.Kafka.Keys(topic) {
 		covered[k] = true
@@ -1039,7 +1069,14 @@ void CheckVerdictOutcome(harness::Ctx& ctx) {
   announce("9", kV9);
   const auto records = ctx.Kafka.Records(kTopic);
   for (size_t i = 3; i < records.size(); i++) ctx.Equal(payloadOf(ctx, records[i]).value("outcome", ""), "passed", "a validated candidate's outcome");
-  const size_t before = records.size();
+  catalog::recordValidation("10", "unavailable", "UNAVAILABLE");
+  announce("10", kV10);
+  const auto all = ctx.Kafka.Records(kTopic);
+  ctx.Equal(all.size(), records.size() + 1, "candidate 10 has one tool; the records");
+  for (size_t i = records.size(); i < all.size(); i++) {
+    ctx.Equal(payloadOf(ctx, all[i]).value("outcome", ""), "unavailable", "a candidate the sandbox never answered on must be announced with the recorded verdict, unavailable included; the outcome");
+  }
+  const size_t before = all.size();
   bool refused = false;
   try {
     announce("11", kV9);
@@ -1059,6 +1096,14 @@ void CheckOutbox(harness::Ctx& ctx) {
   const json row = json::parse(parked[0], nullptr, false);
   ctx.Assert(row.is_object() && row.value("topic", "") == kTopic && json::parse(row.value("value", "{}")).value("tool", "") == row.value("key", ""),
              "the outbox row is %s, expected the topic, the key and the record's value", parked[0]);
+  const std::string key = row.is_object() ? row.value("key", "") : "";
+  const json parkedEntry = kV9.contains(key) ? kV9[key] : json::object();
+  const json expected = {{"tool", key},
+                         {"version", parkedEntry.value("version", "")},
+                         {"side_effect", parkedEntry.value("side_effect", "")},
+                         {"catalog_version", "9"},
+                         {"outcome", "passed"}};
+  ctx.Equal(json::parse(row.value("value", "{}"), nullptr, false), expected, "the relay republishes the parked value as is, so it must be the record that was refused; the parked value");
   std::set<std::string> covered = {row.value("key", "")};
   for (const auto& k : ctx.Kafka.Keys(kTopic)) covered.insert(k);
   ctx.Equal(covered.size(), 3, "delivered plus parked records must cover every tool; the tools covered");

@@ -77,7 +77,7 @@ time.
       id: 'commit-persist',
       title: 'A committed checkpoint outlives the upload TTL',
       detail:
-        'The commit script `PERSIST`s the upload and its chunks and digests, so a day later the committed weights are still there while abandoned uploads have expired. The starter leaves the TTL in place.',
+        'The commit script `PERSIST`s the upload and its chunks and digests, so no TTL is left on them once `checkpoint:{id}` exists, and a day later the committed chunks and digests are still there while abandoned uploads have expired. The starter leaves the TTL in place.',
       match: {
         python: {all: [/PERSIST/]},
         typescript: {all: [/PERSIST/]},
@@ -90,7 +90,7 @@ time.
       id: 'latest-by-step',
       title: 'The latest checkpoint is the highest step, not the last commit',
       detail:
-        'Records are indexed in `run:{run_id}:checkpoints` by step (`ZADD`) and `latest_committed` reads the top score. The starter overwrites `run:{run_id}:latest` on every commit, so a slow older step wins.',
+        'The same script indexes the record in `run:{run_id}:checkpoints` with its step as the score (`ZADD`), and `latest_committed` reads the top score. The starter overwrites `run:{run_id}:latest` on every commit, so a slow older step wins.',
       match: {
         python: {all: [/ZADD/, /zrevrange\(/], none: [/:latest/]},
         typescript: {all: [/ZADD/, /zrevrange\(/], none: [/:latest/]},
@@ -572,13 +572,21 @@ def check_commit_persist(ctx):
     m = ctx.load("state")
     upload_id = _upload()
     abandoned = _upload(step=900, staged=1)
+    keys = [f"upload:{upload_id}", f"upload:{upload_id}:chunks", f"upload:{upload_id}:digests"]
+    # The moment the record exists, the upload it points at must already be kept: a crash between
+    # the record and a later PERSIST leaves a record whose chunks expire.
+    probe = ctx.redis_after(f"checkpoint:{upload_id}", lambda: [ctx.redis.ttl(k) for k in keys] if ctx.redis.exists(f"checkpoint:{upload_id}") else None)
     record = m.commit(upload_id)
     assert record is not None, "a complete upload did not commit"
+    assert probe.fired, f"commit never wrote checkpoint:{upload_id}"
+    if probe.result is not None:
+        assert probe.result == [-1, -1, -1], f"when checkpoint:{upload_id} was written the upload's keys still had TTLs {probe.result}: PERSIST them in the same script that writes the record"
     ctx.clock.advance(store.UPLOAD_TTL + 1)
     assert store.stored_count(abandoned) == 0, "an abandoned upload must still expire after store.UPLOAD_TTL"
     staged = store.stored_count(upload_id)
     assert staged == 3, f"a day after the commit the checkpoint stages {staged} of its 3 chunks: the commit left the upload's TTL in place, so the committed weights expired with the abandoned uploads. PERSIST them in the commit script"
     assert store.upload(upload_id) is not None, f"upload:{upload_id} expired after it was committed"
+    assert store.manifest(upload_id) == record["digest"], f"a day after the commit the chunk digests of {upload_id} are {store.manifest(upload_id)}, expected the manifest {record['digest']}: upload:{upload_id}:digests expired, PERSIST it with the chunks"
     assert m.latest_committed("r1") == record, f"a day later latest_committed('r1') answers {m.latest_committed('r1')}, expected {record}"
 
 
@@ -586,7 +594,13 @@ def check_latest_by_step(ctx):
     m = ctx.load("state")
     newer = _upload(step=1200)
     older = _upload(step=1000)  # a slow upload of an earlier step finishes last
+    index = "run:r1:checkpoints"
+    probe = ctx.redis_after(f"checkpoint:{newer}", lambda: ctx.redis.zscore(index, newer) if ctx.redis.exists(f"checkpoint:{newer}") else "unwritten")
     assert m.commit(newer) is not None and m.commit(older) is not None, "both complete uploads must commit"
+    assert probe.fired, f"commit never wrote checkpoint:{newer}"
+    assert probe.result in ("unwritten", 1200), f"when checkpoint:{newer} was written {index} scored it {probe.result}: index the record by step (ZADD) in the same script that writes it"
+    scores = {u: ctx.redis.zscore(index, u) for u in (newer, older)}
+    assert scores == {newer: 1200, older: 1000}, f"{index} holds {scores}, expected each committed upload scored by its step: {newer} 1200, {older} 1000"
     latest = m.latest_committed("r1")
     assert latest is not None and latest["step"] == 1200, f"latest_committed('r1') answers step {latest and latest['step']} after steps 1200 and 1000 committed in that order: the latest checkpoint is the highest step, not the last commit"
     assert m.latest_committed("r9") is None, "a run without a commit must have no latest checkpoint"
@@ -647,13 +661,24 @@ export async function check_commit_persist(ctx) {
   const {store, m, upload} = setup(ctx);
   const uploadId = await upload();
   const abandoned = await upload(900, 1);
+  const keys = [\`upload:\${uploadId}\`, \`upload:\${uploadId}:chunks\`, \`upload:\${uploadId}:digests\`];
+  // The moment the record exists, the upload it points at must already be kept: a crash between
+  // the record and a later PERSIST leaves a record whose chunks expire.
+  const probe = ctx.redisAfter(\`checkpoint:\${uploadId}\`, () =>
+    ctx.redis.exists(\`checkpoint:\${uploadId}\`) === 1 ? keys.map(k => ctx.redis.ttl(k)) : null,
+  );
   const record = await m.commit(uploadId);
   assert(record !== null, 'a complete upload did not commit');
+  assert(probe.fired, \`commit never wrote checkpoint:\${uploadId}\`);
+  if (probe.result !== null) {
+    assert.deepEqual(probe.result, [-1, -1, -1], \`when checkpoint:\${uploadId} was written the upload's keys still had TTLs \${JSON.stringify(probe.result)}: PERSIST them in the same script that writes the record\`);
+  }
   ctx.clock.advance(store.UPLOAD_TTL + 1);
   assert.equal(await store.storedCount(abandoned), 0, 'an abandoned upload must still expire after UPLOAD_TTL');
   const staged = await store.storedCount(uploadId);
   assert.equal(staged, 3, \`a day after the commit the checkpoint stages \${staged} of its 3 chunks: the commit left the upload's TTL in place, so the committed weights expired with the abandoned uploads. PERSIST them in the commit script\`);
   assert((await store.upload(uploadId)) !== null, \`upload:\${uploadId} expired after it was committed\`);
+  assert.equal(await store.manifest(uploadId), record.digest, \`a day after the commit upload:\${uploadId}:digests must still hold the chunk digests (PERSIST it with the chunks)\`);
   assert.deepEqual(await m.latestCommitted('r1'), record, "a day later latestCommitted('r1') must still answer the record");
 }
 
@@ -661,7 +686,15 @@ export async function check_latest_by_step(ctx) {
   const {m, upload} = setup(ctx);
   const newer = await upload(1200);
   const older = await upload(1000); // a slow upload of an earlier step finishes last
+  const index = 'run:r1:checkpoints';
+  const probe = ctx.redisAfter(\`checkpoint:\${newer}\`, () =>
+    ctx.redis.exists(\`checkpoint:\${newer}\`) === 1 ? ctx.redis.zscore(index, newer) : 'unwritten',
+  );
   assert((await m.commit(newer)) !== null && (await m.commit(older)) !== null, 'both complete uploads must commit');
+  assert(probe.fired, \`commit never wrote checkpoint:\${newer}\`);
+  assert(probe.result === 'unwritten' || probe.result === '1200', \`when checkpoint:\${newer} was written \${index} scored it \${probe.result}: index the record by step (ZADD) in the same script that writes it\`);
+  const scores = [ctx.redis.zscore(index, newer), ctx.redis.zscore(index, older)];
+  assert.deepEqual(scores, ['1200', '1000'], \`\${index} scores \${newer} and \${older} \${JSON.stringify(scores)}, expected each committed upload scored by its step: 1200, 1000\`);
   const latest = await m.latestCommitted('r1');
   assert(latest !== null && latest.step === 1200, \`latestCommitted('r1') answers step \${latest?.step} after steps 1200 and 1000 committed in that order: the latest checkpoint is the highest step, not the last commit\`);
   assert.equal(await m.latestCommitted('r9'), null, 'a run without a commit must have no latest checkpoint');
@@ -678,42 +711,42 @@ import (
 	"leetbuild/harness"
 )
 
-var bg = context.Background()
+var hBg = context.Background()
 
 // stageUpload opens an upload of run's checkpoint at step in 3 chunks and stages the first staged of them.
-func stageUpload(runID string, step int64, staged int) string {
-	store.CreateRun(bg, runID, "t1")
-	upload := store.OpenUpload(bg, runID, "t1", step, 3)
+func hStageUpload(runID string, step int64, staged int) string {
+	store.CreateRun(hBg, runID, "t1")
+	upload := store.OpenUpload(hBg, runID, "t1", step, 3)
 	for i := 0; i < staged; i++ {
 		payload := []byte(fmt.Sprintf("step %d layer %d", step, i))
-		store.PutChunk(bg, upload.UploadID, int64(i), payload, store.Digest(payload))
+		store.PutChunk(hBg, upload.UploadID, int64(i), payload, store.Digest(payload))
 	}
 	return upload.UploadID
 }
 
-func mustCommit(ctx *harness.Ctx, uploadID string) *store.Record {
-	record, err := commit(bg, uploadID)
+func hMustCommit(ctx *harness.Ctx, uploadID string) *store.Record {
+	record, err := commit(hBg, uploadID)
 	ctx.NoError(err, "commit(%s)", uploadID)
 	return record
 }
 
 func CheckCommit(ctx *harness.Ctx) {
-	partial := stageUpload("r1", 1200, 2)
-	ctx.Assert(mustCommit(ctx, partial) == nil, "an upload with chunk 2 missing committed")
+	partial := hStageUpload("r1", 1200, 2)
+	ctx.Assert(hMustCommit(ctx, partial) == nil, "an upload with chunk 2 missing committed")
 	ctx.Equal(ctx.Redis.Exists("checkpoint:"+partial), 0, "an incomplete upload must leave no checkpoint record")
-	ctx.Assert(mustCommit(ctx, "u-404") == nil, "an unknown upload committed")
-	full := stageUpload("r1", 1300, 3)
-	record := mustCommit(ctx, full)
+	ctx.Assert(hMustCommit(ctx, "u-404") == nil, "an unknown upload committed")
+	full := hStageUpload("r1", 1300, 3)
+	record := hMustCommit(ctx, full)
 	ctx.Assert(record != nil, "a complete upload did not commit")
-	expected := store.Record{UploadID: full, RunID: "r1", Step: 1300, Chunks: 3, Digest: store.Manifest(bg, full)}
+	expected := store.Record{UploadID: full, RunID: "r1", Step: 1300, Chunks: 3, Digest: store.Manifest(hBg, full)}
 	ctx.Equal(*record, expected, "commit's record")
-	ctx.Equal(*store.GetRecord(bg, full), expected, "checkpoint:%s", full)
-	latest := latestCommitted(bg, "r1")
+	ctx.Equal(*store.GetRecord(hBg, full), expected, "checkpoint:%s", full)
+	latest := latestCommitted(hBg, "r1")
 	ctx.Assert(latest != nil && *latest == expected, "latestCommitted(r1) answered %+v, expected %+v", latest, expected)
 }
 
 func CheckCommitAtomic(ctx *harness.Ctx) {
-	uploadID := stageUpload("r1", 1200, 3)
+	uploadID := hStageUpload("r1", 1200, 3)
 	marker := "checkpoint:" + uploadID
 	// The upload's TTL runs out right after commit first reads its digests: Redis drops the staged
 	// chunks, unless a commit already persisted them.
@@ -724,7 +757,7 @@ func CheckCommitAtomic(ctx *harness.Ctx) {
 		ctx.Redis.Del("upload:"+uploadID+":chunks", "upload:"+uploadID+":digests")
 		return "expired"
 	})
-	record := mustCommit(ctx, uploadID)
+	record := hMustCommit(ctx, uploadID)
 	ctx.Assert(probe.Fired, "commit never read upload:%s:digests", uploadID)
 	staged := ctx.Redis.HLen("upload:" + uploadID + ":chunks")
 	exists := ctx.Redis.Exists(marker) == 1
@@ -735,39 +768,70 @@ func CheckCommitAtomic(ctx *harness.Ctx) {
 }
 
 func CheckCommitPersist(ctx *harness.Ctx) {
-	uploadID := stageUpload("r1", 1200, 3)
-	abandoned := stageUpload("r1", 900, 1)
-	record := mustCommit(ctx, uploadID)
+	uploadID := hStageUpload("r1", 1200, 3)
+	abandoned := hStageUpload("r1", 900, 1)
+	marker := "checkpoint:" + uploadID
+	// The moment the record exists, the upload it points at must already be kept: a crash between
+	// the record and a later PERSIST leaves a record whose chunks expire.
+	probe := ctx.Redis.After(marker, func() any {
+		if ctx.Redis.Exists(marker) == 0 {
+			return nil
+		}
+		return []int64{ctx.Redis.TTL("upload:" + uploadID), ctx.Redis.TTL("upload:" + uploadID + ":chunks"), ctx.Redis.TTL("upload:" + uploadID + ":digests")}
+	})
+	record := hMustCommit(ctx, uploadID)
 	ctx.Assert(record != nil, "a complete upload did not commit")
+	ctx.Assert(probe.Fired, "commit never wrote %s", marker)
+	if probe.Result != nil {
+		ctx.Equal(probe.Result, []int64{-1, -1, -1}, "when %s was written the upload's keys must already be persisted (PERSIST them in the same script that writes the record); their TTLs", marker)
+	}
 	ctx.Clock.AdvanceBy(store.UploadTTL + 1e9)
-	ctx.Equal(store.StoredCount(bg, abandoned), 0, "an abandoned upload must still expire after UploadTTL; its staged chunks")
-	staged := store.StoredCount(bg, uploadID)
+	ctx.Equal(store.StoredCount(hBg, abandoned), 0, "an abandoned upload must still expire after UploadTTL; its staged chunks")
+	staged := store.StoredCount(hBg, uploadID)
 	ctx.Equal(staged, 3, "a day after the commit the commit must have persisted the upload (PERSIST in the commit script), or the committed weights expire with the abandoned uploads; the staged chunks")
-	ctx.Assert(store.GetUpload(bg, uploadID) != nil, "upload:%s expired after it was committed", uploadID)
-	latest := latestCommitted(bg, "r1")
+	ctx.Assert(store.GetUpload(hBg, uploadID) != nil, "upload:%s expired after it was committed", uploadID)
+	ctx.Equal(store.Manifest(hBg, uploadID), record.Digest, "a day after the commit upload:%s:digests must still hold the chunk digests (PERSIST it with the chunks); the manifest", uploadID)
+	latest := latestCommitted(hBg, "r1")
 	ctx.Assert(latest != nil && *latest == *record, "a day later latestCommitted(r1) answers %+v, expected %+v", latest, record)
 }
 
 func CheckLatestByStep(ctx *harness.Ctx) {
-	newer := stageUpload("r1", 1200, 3)
-	older := stageUpload("r1", 1000, 3) // a slow upload of an earlier step finishes last
-	ctx.Assert(mustCommit(ctx, newer) != nil && mustCommit(ctx, older) != nil, "both complete uploads must commit")
-	latest := latestCommitted(bg, "r1")
+	newer := hStageUpload("r1", 1200, 3)
+	older := hStageUpload("r1", 1000, 3) // a slow upload of an earlier step finishes last
+	index := "run:r1:checkpoints"
+	probe := ctx.Redis.After("checkpoint:"+newer, func() any {
+		if ctx.Redis.Exists("checkpoint:"+newer) == 0 {
+			return "unwritten"
+		}
+		score, ok := ctx.Redis.ZScore(index, newer)
+		if !ok {
+			return "absent"
+		}
+		return score
+	})
+	ctx.Assert(hMustCommit(ctx, newer) != nil && hMustCommit(ctx, older) != nil, "both complete uploads must commit")
+	ctx.Assert(probe.Fired, "commit never wrote checkpoint:%s", newer)
+	ctx.Assert(probe.Result == "unwritten" || probe.Result == 1200.0, "when checkpoint:%s was written %s scored it %v: index the record by step (ZADD) in the same script that writes it", newer, index, probe.Result)
+	newerScore, newerOK := ctx.Redis.ZScore(index, newer)
+	olderScore, olderOK := ctx.Redis.ZScore(index, older)
+	ctx.Assert(newerOK && olderOK && newerScore == 1200 && olderScore == 1000, "%s must score each committed upload by its step (%s 1200, %s 1000), got %v %t, %v %t", index, newer, older, newerScore, newerOK, olderScore, olderOK)
+	latest := latestCommitted(hBg, "r1")
 	ctx.Assert(latest != nil && latest.Step == 1200, "latestCommitted(r1) answers %+v after steps 1200 and 1000 committed in that order: the latest checkpoint is the highest step, not the last commit", latest)
-	ctx.Assert(latestCommitted(bg, "r9") == nil, "a run without a commit must have no latest checkpoint")
+	ctx.Assert(latestCommitted(hBg, "r9") == nil, "a run without a commit must have no latest checkpoint")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "checkpoint/store.h"
 
 namespace {
 
 // An upload of run's checkpoint at step in 3 chunks, the first staged of them staged.
-std::string stageUpload(const std::string& run_id, long step, int staged) {
+std::string hStageUpload(const std::string& run_id, long step, int staged) {
   store::createRun(run_id, "t1");
   const store::Upload upload = store::openUpload(run_id, "t1", step, 3);
   for (int i = 0; i < staged; i++) {
@@ -777,12 +841,12 @@ std::string stageUpload(const std::string& run_id, long step, int staged) {
   return upload.upload_id;
 }
 
-bool same(const std::optional<store::Record>& a, const std::optional<store::Record>& b) {
+bool hSame(const std::optional<store::Record>& a, const std::optional<store::Record>& b) {
   if (!a || !b) return !a && !b;
   return a->upload_id == b->upload_id && a->run_id == b->run_id && a->step == b->step && a->chunks == b->chunks && a->digest == b->digest;
 }
 
-std::string show(const std::optional<store::Record>& r) {
+std::string hShow(const std::optional<store::Record>& r) {
   if (!r) return "none";
   return r->upload_id + " run " + r->run_id + " step " + std::to_string(r->step) + " chunks " + std::to_string(r->chunks) + " digest " + r->digest;
 }
@@ -790,21 +854,21 @@ std::string show(const std::optional<store::Record>& r) {
 }  // namespace
 
 void CheckCommit(harness::Ctx& ctx) {
-  const std::string partial = stageUpload("r1", 1200, 2);
+  const std::string partial = hStageUpload("r1", 1200, 2);
   ctx.Assert(!commit(partial), "an upload with chunk 2 missing committed");
   ctx.Equal(ctx.Redis.Exists("checkpoint:" + partial), 0, "an incomplete upload must leave no checkpoint record");
   ctx.Assert(!commit("u-404"), "an unknown upload committed");
-  const std::string full = stageUpload("r1", 1300, 3);
+  const std::string full = hStageUpload("r1", 1300, 3);
   const auto record = commit(full);
   ctx.Assert(record.has_value(), "a complete upload did not commit");
   const std::optional<store::Record> expected = store::Record{full, "r1", 1300, 3, store::manifest(full)};
-  ctx.Assert(same(record, expected), "commit answered %s, expected %s", show(record), show(expected));
-  ctx.Assert(same(store::record(full), expected), "checkpoint:%s holds %s, expected %s", full, show(store::record(full)), show(expected));
-  ctx.Assert(same(latestCommitted("r1"), expected), "latestCommitted(r1) answered %s, expected %s", show(latestCommitted("r1")), show(expected));
+  ctx.Assert(hSame(record, expected), "commit answered %s, expected %s", hShow(record), hShow(expected));
+  ctx.Assert(hSame(store::record(full), expected), "checkpoint:%s holds %s, expected %s", full, hShow(store::record(full)), hShow(expected));
+  ctx.Assert(hSame(latestCommitted("r1"), expected), "latestCommitted(r1) answered %s, expected %s", hShow(latestCommitted("r1")), hShow(expected));
 }
 
 void CheckCommitAtomic(harness::Ctx& ctx) {
-  const std::string upload_id = stageUpload("r1", 1200, 3);
+  const std::string upload_id = hStageUpload("r1", 1200, 3);
   const std::string marker = "checkpoint:" + upload_id;
   bool fired = false;
   // The upload's TTL runs out right after commit first reads its digests: Redis drops the staged
@@ -823,30 +887,65 @@ void CheckCommitAtomic(harness::Ctx& ctx) {
                "commit wrote %s although the upload's chunks expired between its completeness check and its write (%d of 3 staged): the check and the write must be one Lua script",
                marker, staged);
   }
-  ctx.Assert(record.has_value() == exists, "commit answered %s but %s exists: %t", show(record), marker, exists);
+  ctx.Assert(record.has_value() == exists, "commit answered %s but %s exists: %t", hShow(record), marker, exists);
 }
 
 void CheckCommitPersist(harness::Ctx& ctx) {
-  const std::string upload_id = stageUpload("r1", 1200, 3);
-  const std::string abandoned = stageUpload("r1", 900, 1);
+  const std::string upload_id = hStageUpload("r1", 1200, 3);
+  const std::string abandoned = hStageUpload("r1", 900, 1);
+  const std::string marker = "checkpoint:" + upload_id;
+  bool fired = false;
+  bool written = false;
+  std::vector<long long> ttls;
+  // The moment the record exists, the upload it points at must already be kept: a crash between
+  // the record and a later PERSIST leaves a record whose chunks expire.
+  ctx.Redis.After(marker, [&] {
+    fired = true;
+    written = ctx.Redis.Exists(marker) == 1;
+    if (!written) return;
+    for (const std::string& key : {"upload:" + upload_id, "upload:" + upload_id + ":chunks", "upload:" + upload_id + ":digests"}) ttls.push_back(ctx.Redis.TTL(key));
+  });
   const auto record = commit(upload_id);
   ctx.Assert(record.has_value(), "a complete upload did not commit");
+  ctx.Assert(fired, "commit never wrote %s", marker);
+  if (written) {
+    ctx.Equal(ttls, std::vector<long long>{-1, -1, -1},
+              "when %s was written the upload's keys must already be persisted (PERSIST them in the same script that writes the record); their TTLs", marker);
+  }
   ctx.Clock.Advance(store::kUploadTtl + 1);
   ctx.Equal(store::storedCount(abandoned), 0, "an abandoned upload must still expire after kUploadTtl; its staged chunks");
   ctx.Equal(store::storedCount(upload_id), 3,
             "a day after the commit the commit must have persisted the upload (PERSIST in the commit script), or the committed weights expire with the abandoned uploads; the staged chunks");
   ctx.Assert(store::upload(upload_id).has_value(), "upload:%s expired after it was committed", upload_id);
-  ctx.Assert(same(latestCommitted("r1"), record), "a day later latestCommitted(r1) answers %s, expected %s", show(latestCommitted("r1")), show(record));
+  ctx.Equal(store::manifest(upload_id), record->digest,
+            "a day after the commit upload:%s:digests must still hold the chunk digests (PERSIST it with the chunks); the manifest", upload_id);
+  ctx.Assert(hSame(latestCommitted("r1"), record), "a day later latestCommitted(r1) answers %s, expected %s", hShow(latestCommitted("r1")), hShow(record));
 }
 
 void CheckLatestByStep(harness::Ctx& ctx) {
-  const std::string newer = stageUpload("r1", 1200, 3);
-  const std::string older = stageUpload("r1", 1000, 3);  // a slow upload of an earlier step finishes last
+  const std::string newer = hStageUpload("r1", 1200, 3);
+  const std::string older = hStageUpload("r1", 1000, 3);  // a slow upload of an earlier step finishes last
+  const std::string index = "run:r1:checkpoints";
+  bool fired = false;
+  bool written = false;
+  std::optional<double> atCommit;
+  ctx.Redis.After("checkpoint:" + newer, [&] {
+    fired = true;
+    written = ctx.Redis.Exists("checkpoint:" + newer) == 1;
+    if (written) atCommit = ctx.Redis.ZScore(index, newer);
+  });
   ctx.Assert(commit(newer).has_value() && commit(older).has_value(), "both complete uploads must commit");
+  ctx.Assert(fired, "commit never wrote checkpoint:%s", newer);
+  ctx.Assert(!written || atCommit == 1200.0, "when checkpoint:%s was written %s scored it %s: index the record by step (ZADD) in the same script that writes it", newer, index,
+             atCommit ? std::to_string(*atCommit) : "nothing");
+  const auto newerScore = ctx.Redis.ZScore(index, newer);
+  const auto olderScore = ctx.Redis.ZScore(index, older);
+  ctx.Assert(newerScore == 1200.0 && olderScore == 1000.0, "%s must score each committed upload by its step (%s 1200, %s 1000), got %s, %s", index, newer, older,
+             newerScore ? std::to_string(*newerScore) : "nothing", olderScore ? std::to_string(*olderScore) : "nothing");
   const auto latest = latestCommitted("r1");
   ctx.Assert(latest && latest->step == 1200,
              "latestCommitted(r1) answers %s after steps 1200 and 1000 committed in that order: the latest checkpoint is the highest step, not the last commit",
-             show(latest));
+             hShow(latest));
   ctx.Assert(!latestCommitted("r9"), "a run without a commit must have no latest checkpoint");
 }
 `,

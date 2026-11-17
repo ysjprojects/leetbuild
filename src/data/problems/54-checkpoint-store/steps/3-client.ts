@@ -45,7 +45,7 @@ service ObjectStore { rpc PutObject(PutObjectRequest) returns (PutObjectReply); 
       id: 'store-deadline',
       title: 'Every PutObject carries a 30-second deadline',
       detail:
-        'Each call is made with `DEADLINE_S` (30 s), so a store that stops answering costs at most three deadlines. The starter calls with no deadline, so one hung store pins the copier.',
+        'Each call, every retry included, is made with its own full `DEADLINE_S` (30 s), so a store that stops answering gets three attempts and costs at most three deadlines. The starter calls with no deadline, so one hung store pins the copier.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*30\b/, /PutObject\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*30_?000\b/, /PutObject\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -71,7 +71,7 @@ service ObjectStore { rpc PutObject(PutObjectRequest) returns (PutObjectReply); 
       id: 'bounded-retry',
       title: 'Retries UNAVAILABLE and DEADLINE_EXCEEDED, three attempts in all',
       detail:
-        'Two `UNAVAILABLE` answers and a success store the chunk on the third attempt; a store that stays down gets exactly three attempts, then `StoreUnavailable`. The starter makes five.',
+        'Two `UNAVAILABLE` answers and a success store the chunk on the third attempt, and a `DEADLINE_EXCEEDED` answer and a success on the second; a store that stays down gets exactly three attempts, then `StoreUnavailable`. The starter makes five.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/range\(5\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/attempt\s*<\s*5/]},
@@ -87,7 +87,7 @@ service ObjectStore { rpc PutObject(PutObjectRequest) returns (PutObjectReply); 
       id: 'permission-stops',
       title: 'PERMISSION_DENIED stops at once with the store’s reason',
       detail:
-        'A status outside the retryable pair raises `UploadRejected` after one call, its message carrying the store’s details. The starter retries it like a busy store and drops the reason.',
+        'A status outside the retryable pair (`PERMISSION_DENIED`, `INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `INTERNAL`) raises `UploadRejected` after one call, its message carrying the store’s details. The starter retries it like a busy store and drops the reason.',
       match: {
         python: {all: [/raise UploadRejected\([^\n]*details\(\)/]},
         typescript: {all: [/throw new UploadRejected\([^\n]*details/]},
@@ -632,6 +632,10 @@ def check_store_deadline(ctx):
     _raises(m, m.StoreUnavailable, "with a store that answers after two minutes", index=1)
     waited = ctx.clock.time() - before
     assert waited <= 95, f"store_chunk waited {waited:.0f} s on a store that does not answer: three attempts of 30 s at most"
+    hung = ctx.grpc.calls_to("PutObject")[1:]
+    assert len(hung) == 3, f"a store that never answers in time got {len(hung)} attempts at one chunk, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retried like UNAVAILABLE"
+    timeouts = [call.timeout for call in hung]
+    assert all(t is not None and 29.5 <= t <= 30.5 for t in timeouts), f"the attempts at a hung store carried deadlines of {timeouts} s: every attempt gets its own full DEADLINE_S = 30, not what is left of the first"
 
 
 def check_checksum_confirmed(ctx):
@@ -651,6 +655,10 @@ def check_bounded_retry(ctx):
     _raises(m, m.StoreUnavailable, "with a store that keeps answering UNAVAILABLE", index=1)
     attempts = _calls(ctx) - 3
     assert attempts == 3, f"a store that stays UNAVAILABLE got {attempts} attempts at one chunk, expected MAX_ATTEMPTS = 3"
+    ctx.grpc.failures.clear()
+    ctx.grpc.fail("PutObject", grpc.StatusCode.DEADLINE_EXCEEDED, "object store busy", times=1)
+    assert m.store_chunk("u-1", 2, PAYLOAD) == DIGEST, "a DEADLINE_EXCEEDED answer and then a success: the second attempt must store the chunk"
+    assert _calls(ctx) - 6 == 2, f"a DEADLINE_EXCEEDED answer and a success took {_calls(ctx) - 6} calls, expected 2"
 
 
 def check_permission_stops(ctx):
@@ -659,6 +667,12 @@ def check_permission_stops(ctx):
     e = _raises(m, m.UploadRejected, "with the bucket refusing the service account")
     assert _calls(ctx) == 1, f"PERMISSION_DENIED was retried ({_calls(ctx)} calls): another attempt cannot change the store's answer"
     assert "read-only" in str(e), f"UploadRejected says {str(e)!r}: the store's details (the bucket is read-only) must reach the operator"
+    for code, details in ((grpc.StatusCode.INVALID_ARGUMENT, "object key u-1/0 is malformed"), (grpc.StatusCode.RESOURCE_EXHAUSTED, "bucket ckpt-prod is over its quota"), (grpc.StatusCode.INTERNAL, "object store write path failed")):
+        before = _calls(ctx)
+        ctx.grpc.fail("PutObject", code, details, times=1)
+        e = _raises(m, m.UploadRejected, f"with the store answering {code.name}")
+        assert _calls(ctx) - before == 1, f"{code.name} was retried ({_calls(ctx) - before} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status stops at once"
+        assert details in str(e), f"UploadRejected for {code.name} says {str(e)!r}: the store's details ({details}) must reach the operator"
 `,
     typescript: `const PAYLOAD = Buffer.from('layer-0 weights');
 
@@ -705,6 +719,10 @@ export async function check_store_deadline(ctx) {
   await raises(m, m.StoreUnavailable, 'with a store that answers after two minutes', 1);
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited <= 95, \`storeChunk waited \${waited.toFixed(0)} s on a store that does not answer: three attempts of 30 s at most\`);
+  const hung = ctx.grpc.callsTo('PutObject').slice(1);
+  assert.equal(hung.length, 3, \`a store that never answers in time got \${hung.length} attempts at one chunk, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retried like UNAVAILABLE\`);
+  const timeouts = hung.map(call => call.timeout);
+  assert(timeouts.every(t => t !== null && 29.5 <= t && t <= 30.5), \`the attempts at a hung store carried deadlines of \${JSON.stringify(timeouts)} s: every attempt gets its own full 30 s, not what is left of the first\`);
 }
 
 export async function check_checksum_confirmed(ctx) {
@@ -724,6 +742,10 @@ export async function check_bounded_retry(ctx) {
   await raises(m, m.StoreUnavailable, 'with a store that keeps answering UNAVAILABLE', 1);
   const attempts = calls(ctx) - 3;
   assert.equal(attempts, 3, \`a store that stays UNAVAILABLE got \${attempts} attempts at one chunk, expected MAX_ATTEMPTS = 3\`);
+  ctx.grpc.clearFailures();
+  ctx.grpc.fail('PutObject', ctx.grpc.status.DEADLINE_EXCEEDED, 'object store busy', 1);
+  assert.equal(await m.storeChunk('u-1', 2, PAYLOAD), digest, 'a DEADLINE_EXCEEDED answer and then a success: the second attempt must store the chunk');
+  assert.equal(calls(ctx) - 6, 2, \`a DEADLINE_EXCEEDED answer and a success took \${calls(ctx) - 6} calls, expected 2\`);
 }
 
 export async function check_permission_stops(ctx) {
@@ -732,6 +754,18 @@ export async function check_permission_stops(ctx) {
   const e = await raises(m, m.UploadRejected, 'with the bucket refusing the service account');
   assert.equal(calls(ctx), 1, \`PERMISSION_DENIED was retried (\${calls(ctx)} calls): another attempt cannot change the store's answer\`);
   assert((e as Error).message.includes('read-only'), \`UploadRejected says \${JSON.stringify((e as Error).message)}: the store's details (the bucket is read-only) must reach the operator\`);
+  const terminal: [string, string][] = [
+    ['INVALID_ARGUMENT', 'object key u-1/0 is malformed'],
+    ['RESOURCE_EXHAUSTED', 'bucket ckpt-prod is over its quota'],
+    ['INTERNAL', 'object store write path failed'],
+  ];
+  for (const [name, details] of terminal) {
+    const before = calls(ctx);
+    ctx.grpc.fail('PutObject', ctx.grpc.status[name], details, 1);
+    const rejected = await raises(m, m.UploadRejected, \`with the store answering \${name}\`);
+    assert.equal(calls(ctx) - before, 1, \`\${name} was retried (\${calls(ctx) - before} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status stops at once\`);
+    assert((rejected as Error).message.includes(details), \`UploadRejected for \${name} says \${JSON.stringify((rejected as Error).message)}: the store's details (\${details}) must reach the operator\`);
+  }
 }
 `,
     go: `package main
@@ -752,17 +786,17 @@ import (
 
 var (
 	harnessBg = context.Background()
-	payload   = []byte("layer-0 weights")
+	hPayload  = []byte("layer-0 weights")
 )
 
-// objectPeer stores every object; the keys in corrupt arrive with their last byte flipped.
-type objectPeer struct {
+// hObjectPeer stores every object; the keys in corrupt arrive with their last byte flipped.
+type hObjectPeer struct {
 	pb.UnimplementedObjectStoreServer
 	objects map[string][]byte
 	corrupt map[string]bool
 }
 
-func (p *objectPeer) PutObject(_ context.Context, req *pb.PutObjectRequest) (*pb.PutObjectReply, error) {
+func (p *hObjectPeer) PutObject(_ context.Context, req *pb.PutObjectRequest) (*pb.PutObjectReply, error) {
 	data := append([]byte{}, req.GetData()...)
 	if p.corrupt[req.GetKey()] && len(data) > 0 {
 		data[len(data)-1] ^= 1
@@ -771,66 +805,90 @@ func (p *objectPeer) PutObject(_ context.Context, req *pb.PutObjectRequest) (*pb
 	return &pb.PutObjectReply{Key: req.GetKey(), Sha256: store.Digest(data), Size: int64(len(data))}, nil
 }
 
-func objectStore(ctx *harness.Ctx) *objectPeer {
-	peer := &objectPeer{objects: map[string][]byte{}, corrupt: map[string]bool{}}
+func hObjectStore(ctx *harness.Ctx) *hObjectPeer {
+	peer := &hObjectPeer{objects: map[string][]byte{}, corrupt: map[string]bool{}}
 	pb.RegisterObjectStoreServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func mustStore(ctx *harness.Ctx, why string) {
-	got, err := storeChunk(harnessBg, "u-1", 0, payload)
+func hMustStore(ctx *harness.Ctx, why string) {
+	got, err := storeChunk(harnessBg, "u-1", 0, hPayload)
 	ctx.NoError(err, "%s: storeChunk failed", why)
-	ctx.Equal(got, store.Digest(payload), "%s: the checksum storeChunk returned", why)
+	ctx.Equal(got, store.Digest(hPayload), "%s: the checksum storeChunk returned", why)
 }
 
-func mustFail(ctx *harness.Ctx, target error, why string, index int64) error {
-	got, err := storeChunk(harnessBg, "u-1", index, payload)
+func hMustFail(ctx *harness.Ctx, target error, why string, index int64) error {
+	got, err := storeChunk(harnessBg, "u-1", index, hPayload)
 	ctx.Assert(err != nil, "%s: storeChunk returned %q instead of an error wrapping %v", why, got, target)
 	ctx.ErrorIs(err, target, "%s: storeChunk returned %v", why, err)
 	return err
 }
 
-func calls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("PutObject", "")) }
+func hCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("PutObject", "")) }
 
 func CheckStoreDeadline(ctx *harness.Ctx) {
-	peer := objectStore(ctx)
-	mustStore(ctx, "with a healthy store")
-	ctx.Equal(string(peer.objects["u-1/0"]), string(payload), "the store must hold the chunk under u-1/0")
+	peer := hObjectStore(ctx)
+	hMustStore(ctx, "with a healthy store")
+	ctx.Equal(string(peer.objects["u-1/0"]), string(hPayload), "the store must hold the chunk under u-1/0")
 	for _, call := range ctx.GRPC.CallsTo("PutObject", "") {
 		ctx.Assert(call.HasDeadline(), "a PutObject call carries no deadline: a store that stops answering pins the copier for good")
 		ctx.Assert(29500*time.Millisecond <= call.Timeout && call.Timeout <= 30500*time.Millisecond, "a PutObject call carries a %v deadline, expected 30 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("PutObject", 120.0, "")
 	before := ctx.Clock.Now()
-	mustFail(ctx, ErrStoreUnavailable, "with a store that answers after two minutes", 1)
+	hMustFail(ctx, ErrStoreUnavailable, "with a store that answers after two minutes", 1)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 95, "storeChunk waited %.0f s on a store that does not answer: three attempts of 30 s at most", waited)
+	hung := ctx.GRPC.CallsTo("PutObject", "")[1:]
+	ctx.Equal(len(hung), 3, "a store that never answers in time gets maxAttempts = 3 attempts at one chunk (DEADLINE_EXCEEDED is retried like UNAVAILABLE); the attempts")
+	for _, call := range hung {
+		ctx.Assert(call.HasDeadline() && 29500*time.Millisecond <= call.Timeout && call.Timeout <= 30500*time.Millisecond, "an attempt at a hung store carried a %v deadline: every attempt gets its own full 30 s, not what is left of the first", call.Timeout)
+	}
 }
 
 func CheckChecksumConfirmed(ctx *harness.Ctx) {
-	peer := objectStore(ctx)
+	peer := hObjectStore(ctx)
 	peer.corrupt["u-1/0"] = true
-	mustFail(ctx, ErrChecksumMismatch, "with the store receiving chunk u-1/0 with a byte flipped", 0)
+	hMustFail(ctx, ErrChecksumMismatch, "with the store receiving chunk u-1/0 with a byte flipped", 0)
 	delete(peer.corrupt, "u-1/0")
-	mustStore(ctx, "once the bytes arrive intact")
+	hMustStore(ctx, "once the bytes arrive intact")
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	objectStore(ctx)
+	hObjectStore(ctx)
 	ctx.GRPC.Fail("PutObject", codes.Unavailable, "object store restarting", 2, "")
-	mustStore(ctx, "two UNAVAILABLE answers and then a success: the third attempt")
-	ctx.Equal(calls(ctx), 3, "two UNAVAILABLE answers and a success; the calls")
+	hMustStore(ctx, "two UNAVAILABLE answers and then a success: the third attempt")
+	ctx.Equal(hCalls(ctx), 3, "two UNAVAILABLE answers and a success; the calls")
 	ctx.GRPC.Fail("PutObject", codes.Unavailable, "object store overloaded", 10, "")
-	mustFail(ctx, ErrStoreUnavailable, "with a store that keeps answering UNAVAILABLE", 1)
-	ctx.Equal(calls(ctx)-3, 3, "a store that stays UNAVAILABLE gets maxAttempts = 3 attempts at one chunk; the attempts")
+	hMustFail(ctx, ErrStoreUnavailable, "with a store that keeps answering UNAVAILABLE", 1)
+	ctx.Equal(hCalls(ctx)-3, 3, "a store that stays UNAVAILABLE gets maxAttempts = 3 attempts at one chunk; the attempts")
+	ctx.GRPC.ClearFailures()
+	ctx.GRPC.Fail("PutObject", codes.DeadlineExceeded, "object store busy", 1, "")
+	hMustStore(ctx, "a DEADLINE_EXCEEDED answer and then a success: the second attempt")
+	ctx.Equal(hCalls(ctx)-6, 2, "a DEADLINE_EXCEEDED answer and a success; the calls")
 }
 
 func CheckPermissionStops(ctx *harness.Ctx) {
-	objectStore(ctx)
+	hObjectStore(ctx)
 	ctx.GRPC.Fail("PutObject", codes.PermissionDenied, "bucket ckpt-prod is read-only for this service account", 1, "")
-	err := mustFail(ctx, ErrUploadRejected, "with the bucket refusing the service account", 0)
-	ctx.Equal(calls(ctx), 1, "PERMISSION_DENIED must not be retried (another attempt cannot change the store's answer); the calls")
+	err := hMustFail(ctx, ErrUploadRejected, "with the bucket refusing the service account", 0)
+	ctx.Equal(hCalls(ctx), 1, "PERMISSION_DENIED must not be retried (another attempt cannot change the store's answer); the calls")
 	ctx.Assert(strings.Contains(err.Error(), "read-only"), "the error says %q: the store's details (the bucket is read-only) must reach the operator", err.Error())
+	terminal := []struct {
+		code    codes.Code
+		details string
+	}{
+		{codes.InvalidArgument, "object key u-1/0 is malformed"},
+		{codes.ResourceExhausted, "bucket ckpt-prod is over its quota"},
+		{codes.Internal, "object store write path failed"},
+	}
+	for _, t := range terminal {
+		before := hCalls(ctx)
+		ctx.GRPC.Fail("PutObject", t.code, t.details, 1, "")
+		err := hMustFail(ctx, ErrUploadRejected, "with the store answering "+t.code.String(), 0)
+		ctx.Equal(hCalls(ctx)-before, 1, "%v must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status stops at once); the calls", t.code)
+		ctx.Assert(strings.Contains(err.Error(), t.details), "the error for %v says %q: the store's details (%s) must reach the operator", t.code, err.Error(), t.details)
+	}
 	_ = errors.Is
 }
 `,
@@ -839,16 +897,18 @@ func CheckPermissionStops(ctx *harness.Ctx) {
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "checkpoint/store.h"
 #include "checkpoint_store.grpc.pb.h"
 
 namespace {
 
-const std::string kPayload = "layer-0 weights";
+const std::string hPayload = "layer-0 weights";
 
 // Stores every object; the keys in corrupt arrive with their last byte flipped.
-class ObjectPeer final : public ckptstore::ObjectStore::Service {
+class HObjectPeer final : public ckptstore::ObjectStore::Service {
  public:
   std::map<std::string, std::string> objects;
   std::set<std::string> corrupt;
@@ -863,29 +923,29 @@ class ObjectPeer final : public ckptstore::ObjectStore::Service {
   }
 };
 
-ObjectPeer& objectStore(harness::Ctx& ctx) {
-  static ObjectPeer* peer = nullptr;
+HObjectPeer& hObjectStore(harness::Ctx& ctx) {
+  static HObjectPeer* peer = nullptr;
   delete peer;
-  peer = new ObjectPeer;
+  peer = new HObjectPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-void mustStore(harness::Ctx& ctx, const std::string& why) {
+void hMustStore(harness::Ctx& ctx, const std::string& why) {
   std::string got;
   try {
-    got = storeChunk("u-1", 0, kPayload);
+    got = storeChunk("u-1", 0, hPayload);
   } catch (const std::exception& e) {
     ctx.Fatalf("%s: storeChunk threw %s: %s", why, harness::CurrentExceptionType(), e.what());
   }
-  ctx.Equal(got, store::digest(kPayload), "%s: the checksum storeChunk returned", why);
+  ctx.Equal(got, store::digest(hPayload), "%s: the checksum storeChunk returned", why);
 }
 
 template <class E>
-std::string mustThrow(harness::Ctx& ctx, const std::string& expected, const std::string& why, long index = 0) {
+std::string hMustThrow(harness::Ctx& ctx, const std::string& expected, const std::string& why, long index = 0) {
   std::string got;
   try {
-    got = storeChunk("u-1", index, kPayload);
+    got = storeChunk("u-1", index, hPayload);
   } catch (const E& e) {
     return e.what();
   } catch (const std::exception& e) {
@@ -894,49 +954,72 @@ std::string mustThrow(harness::Ctx& ctx, const std::string& expected, const std:
   ctx.Fatalf("%s: storeChunk returned %q instead of throwing %s", why, got, expected);
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("PutObject").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("PutObject").size(); }
 
 }  // namespace
 
 void CheckStoreDeadline(harness::Ctx& ctx) {
-  ObjectPeer& peer = objectStore(ctx);
-  mustStore(ctx, "with a healthy store");
-  ctx.Equal(peer.objects["u-1/0"], kPayload, "the store must hold the chunk under u-1/0");
+  HObjectPeer& peer = hObjectStore(ctx);
+  hMustStore(ctx, "with a healthy store");
+  ctx.Equal(peer.objects["u-1/0"], hPayload, "the store must hold the chunk under u-1/0");
   for (const auto& call : ctx.GRPC.CallsTo("PutObject")) {
     ctx.Assert(call.HasDeadline(), "a PutObject call carries no deadline: a store that stops answering pins the copier for good");
     ctx.Assert(29.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 30.5, "a PutObject call carries a %v s deadline, expected kDeadline = 30 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("PutObject", 120.0);
   const int64_t before = ctx.Clock.Now();
-  mustThrow<StoreUnavailable>(ctx, "StoreUnavailable", "with a store that answers after two minutes", 1);
+  hMustThrow<StoreUnavailable>(ctx, "StoreUnavailable", "with a store that answers after two minutes", 1);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 95, "storeChunk waited %.0f s on a store that does not answer: three attempts of 30 s at most", waited);
+  const auto calls_so_far = ctx.GRPC.CallsTo("PutObject");
+  const std::vector<harness::Call> hung(calls_so_far.begin() + 1, calls_so_far.end());
+  ctx.Equal(hung.size(), 3, "a store that never answers in time gets kMaxAttempts = 3 attempts at one chunk (DEADLINE_EXCEEDED is retried like UNAVAILABLE); the attempts");
+  for (const auto& call : hung) {
+    ctx.Assert(call.HasDeadline() && 29.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 30.5,
+               "an attempt at a hung store carried a %v s deadline: every attempt gets its own full 30 s, not what is left of the first", call.TimeoutSeconds());
+  }
 }
 
 void CheckChecksumConfirmed(harness::Ctx& ctx) {
-  ObjectPeer& peer = objectStore(ctx);
+  HObjectPeer& peer = hObjectStore(ctx);
   peer.corrupt.insert("u-1/0");
-  mustThrow<ChecksumMismatch>(ctx, "ChecksumMismatch", "with the store receiving chunk u-1/0 with a byte flipped");
+  hMustThrow<ChecksumMismatch>(ctx, "ChecksumMismatch", "with the store receiving chunk u-1/0 with a byte flipped");
   peer.corrupt.clear();
-  mustStore(ctx, "once the bytes arrive intact");
+  hMustStore(ctx, "once the bytes arrive intact");
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  objectStore(ctx);
+  hObjectStore(ctx);
   ctx.GRPC.Fail("PutObject", grpc::StatusCode::UNAVAILABLE, "object store restarting", 2);
-  mustStore(ctx, "two UNAVAILABLE answers and then a success: the third attempt");
-  ctx.Equal(calls(ctx), 3, "two UNAVAILABLE answers and a success; the calls");
+  hMustStore(ctx, "two UNAVAILABLE answers and then a success: the third attempt");
+  ctx.Equal(hCalls(ctx), 3, "two UNAVAILABLE answers and a success; the calls");
   ctx.GRPC.Fail("PutObject", grpc::StatusCode::UNAVAILABLE, "object store overloaded", 10);
-  mustThrow<StoreUnavailable>(ctx, "StoreUnavailable", "with a store that keeps answering UNAVAILABLE", 1);
-  ctx.Equal(calls(ctx) - 3, 3, "a store that stays UNAVAILABLE gets kMaxAttempts = 3 attempts at one chunk; the attempts");
+  hMustThrow<StoreUnavailable>(ctx, "StoreUnavailable", "with a store that keeps answering UNAVAILABLE", 1);
+  ctx.Equal(hCalls(ctx) - 3, 3, "a store that stays UNAVAILABLE gets kMaxAttempts = 3 attempts at one chunk; the attempts");
+  ctx.GRPC.ClearFailures();
+  ctx.GRPC.Fail("PutObject", grpc::StatusCode::DEADLINE_EXCEEDED, "object store busy", 1);
+  hMustStore(ctx, "a DEADLINE_EXCEEDED answer and then a success: the second attempt");
+  ctx.Equal(hCalls(ctx) - 6, 2, "a DEADLINE_EXCEEDED answer and a success; the calls");
 }
 
 void CheckPermissionStops(harness::Ctx& ctx) {
-  objectStore(ctx);
+  hObjectStore(ctx);
   ctx.GRPC.Fail("PutObject", grpc::StatusCode::PERMISSION_DENIED, "bucket ckpt-prod is read-only for this service account", 1);
-  const std::string message = mustThrow<UploadRejected>(ctx, "UploadRejected", "with the bucket refusing the service account");
-  ctx.Equal(calls(ctx), 1, "PERMISSION_DENIED must not be retried (another attempt cannot change the store's answer); the calls");
+  const std::string message = hMustThrow<UploadRejected>(ctx, "UploadRejected", "with the bucket refusing the service account");
+  ctx.Equal(hCalls(ctx), 1, "PERMISSION_DENIED must not be retried (another attempt cannot change the store's answer); the calls");
   ctx.Assert(message.find("read-only") != std::string::npos, "UploadRejected says %q: the store's details (the bucket is read-only) must reach the operator", message);
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INVALID_ARGUMENT, "object key u-1/0 is malformed"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "bucket ckpt-prod is over its quota"},
+      {grpc::StatusCode::INTERNAL, "object store write path failed"},
+  };
+  for (const auto& [code, details] : terminal) {
+    const size_t before = hCalls(ctx);
+    ctx.GRPC.Fail("PutObject", code, details, 1);
+    const std::string rejected = hMustThrow<UploadRejected>(ctx, "UploadRejected", harness::Sprintf("with the store answering %v", code));
+    ctx.Equal(hCalls(ctx) - before, 1, "%v must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status stops at once); the calls", code);
+    ctx.Assert(rejected.find(details) != std::string::npos, "UploadRejected for %v says %q: the store's details (%s) must reach the operator", code, rejected, details);
+  }
 }
 `,
   },

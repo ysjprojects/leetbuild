@@ -22,7 +22,7 @@ queued under the spec is queued again, so annotators are paid twice for one answ
 - \`Idempotency-Key\` is required (400). When \`store.create_result(tenant, key)\` holds an answer,
   reply with it and 200; record a fresh 201 answer with \`store.record_create\`.
 - \`spec_version\` is required and not blank (400); the task is pinned to it.
-- \`items\` is 1..\`MAX_BATCH_ITEMS\` = 200 non-empty strings, \`overlap\` 1..\`MAX_OVERLAP\` = 5 (400).
+- \`items\` is 1..\`MAX_BATCH_ITEMS\` = 200 non-empty strings as sent, \`overlap\` 1..\`MAX_OVERLAP\` = 5 (400).
 - \`content_hash(item)\` is the SHA-256 hex of the UTF-8 bytes. Drop items whose hash
   \`store.seen_hashes(spec_version)\` holds or the batch repeats, count them in \`deduped\` and register
   the new ones with \`store.add_hashes\`; when nothing new is left, answer 409
@@ -75,7 +75,7 @@ queued under the spec is queued again, so annotators are paid twice for one answ
       id: 'batch-bounds',
       title: 'Bounds the batch size and the overlap',
       detail:
-        '`items` is 1..`MAX_BATCH_ITEMS` (200) non-empty strings and `overlap` 1..`MAX_OVERLAP` (5), both **400** outside the range with no task written. The starter takes any size, so one request can queue an empty task or ask for zero annotators per item.',
+        '`items` is 1..`MAX_BATCH_ITEMS` (200) non-empty strings as sent, repeats included, and `overlap` 1..`MAX_OVERLAP` (5), both **400** outside the range with no task written; both ends of each range are tested. The starter takes any size, so one request can queue an empty task or ask for zero annotators per item.',
       match: {
         python: {
           all: [/MAX_BATCH_ITEMS\s*=\s*200/, /MAX_OVERLAP\s*=\s*5/, /[<>]=?\s*MAX_BATCH_ITEMS/, /[<>]=?\s*MAX_OVERLAP/],
@@ -96,7 +96,7 @@ queued under the spec is queued again, so annotators are paid twice for one answ
       id: 'content-dedupe',
       title: 'Dedupes items by content hash under the spec',
       detail:
-        'Items are hashed (SHA-256 hex of the UTF-8 bytes) and dropped when `seen_hashes` holds the hash or the batch repeats it; drops are counted in `deduped`, the new hashes registered with `add_hashes`, and a batch with nothing new answers **409 `{"error": "no_new_items"}`**. The starter hashes nothing, so every retry and overlapping batch is queued again.',
+        'Items are hashed (SHA-256 hex of the exact UTF-8 bytes, no normalizing) and dropped when `seen_hashes` holds the hash or the batch repeats it; drops are counted in `deduped`, the new hashes registered with `add_hashes`, and a batch with nothing new answers **409 `{"error": "no_new_items"}`**. The check registers a hash beforehand and reads the registered ones back. The starter hashes nothing, so every retry and overlapping batch is queued again.',
       match: {
         python: {all: [/hashlib\.sha256\(/, /store\.seen_hashes\(/, /store\.add_hashes\(/, /no_new_items/, /\b409\b/]},
         typescript: {
@@ -127,7 +127,7 @@ queued under the spec is queued again, so annotators are paid twice for one answ
       id: 'idempotent-create',
       title: 'A retried create answers the recorded task',
       detail:
-        '`Idempotency-Key` is required (**400**); the answer recorded for `(tenant, key)` is looked up before a task is created and replayed with **200**, and a fresh create records its answer. The starter ignores the header, so every client retry queues a second task.',
+        '`Idempotency-Key` is required (**400**); the answer recorded for `(tenant, key)` is looked up before a task is created and replayed with **200**, and only a fresh 201 records its answer, so the retry of a 409 is answered 409 again. The starter ignores the header, so every client retry queues a second task.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.create_result\(/, /store\.record_create\(/],
@@ -714,6 +714,10 @@ void register_routes(httplib::Server& svr) { svr.Post("/v1/tasks", create_task);
     python: `from labeling import store
 
 BODY = {"items": ["a cat on a mat", "a dog in the fog"], "spec_version": "2026-10", "overlap": 3}
+# SHA-256 hex of the UTF-8 bytes of "a fox", "a cat" and "a dog".
+FOX = "5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c"
+CAT = "51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22"
+DOG = "7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401"
 
 
 def _api(ctx):
@@ -759,6 +763,7 @@ async def check_batch_bounds(ctx):
     cases = [
         ({"items": []}, "an empty batch"),
         ({"items": [f"item {n}" for n in range(201)]}, "a batch of 201 items"),
+        ({"items": [f"item {n}" for n in range(200)] + ["item 0"]}, "a batch of 201 items with one repeat"),
         ({"items": ["a cat", ""]}, "a batch with an empty item"),
         ({"overlap": 0}, "overlap 0"),
         ({"overlap": 6}, "overlap 6"),
@@ -770,18 +775,24 @@ async def check_batch_bounds(ctx):
         assert _tasks(ctx) == [], f"the rejected creates left tasks behind: {_tasks(ctx)}"
         r = await _create(c, {**BODY, "items": [f"item {n}" for n in range(200)], "overlap": 5}, "k-ok")
     assert r.status_code == 201, f"200 items with overlap 5 are within bounds, the create answered {r.status_code}: {r.text}"
+    async with _api(ctx) as c:
+        r = await _create(c, {**BODY, "items": ["one item"], "overlap": 1}, "k-one")
+    assert r.status_code == 201, f"one item with overlap 1 is within bounds, the create answered {r.status_code}: {r.text}"
 
 
 async def check_content_dedupe(ctx):
+    store.add_hashes("2026-10", [FOX])  # "a fox" was queued under 2026-10 by an earlier create
     async with _api(ctx) as c:
-        r = await _create(c, {**BODY, "items": ["a cat", "a dog", "a cat"]}, "k-1")
+        r = await _create(c, {**BODY, "items": ["a cat", "a dog", "a cat", "a fox"]}, "k-1")
         assert r.status_code == 201, f"the first create answered {r.status_code}: {r.text}"
         first = r.json()
-        assert first.get("accepted") == 2 and first.get("deduped") == 1, f"a batch repeating 'a cat' answered {first}: the repeat must be dropped and counted (accepted 2, deduped 1)"
+        assert first.get("accepted") == 2 and first.get("deduped") == 2, f"a batch repeating 'a cat', with 'a fox' already queued under its SHA-256 hash, answered {first}: both must be dropped and counted (accepted 2, deduped 2)"
         assert store.get_task(first["task_id"])["total_items"] == 2, f"the task holds {store.get_task(first['task_id'])['total_items']} items, expected 2"
-        r = await _create(c, {**BODY, "items": ["a dog", "a bird"]}, "k-2")
+        hashes = store.seen_hashes("2026-10")
+        assert hashes == {FOX, CAT, DOG}, f"the spec's registered hashes are {sorted(hashes)}, expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'"
+        r = await _create(c, {**BODY, "items": ["a dog", "a bird", "A bird "]}, "k-2")
         second = r.json()
-        assert r.status_code == 201 and second.get("accepted") == 1 and second.get("deduped") == 1, f"'a dog' is already queued under 2026-10: the second batch answered {r.status_code} {second}, expected accepted 1, deduped 1"
+        assert r.status_code == 201 and second.get("accepted") == 2 and second.get("deduped") == 1, f"'a dog' is already queued under 2026-10 and 'A bird ' is other bytes than 'a bird': the second batch answered {r.status_code} {second}, expected accepted 2, deduped 1"
         r = await _create(c, {**BODY, "items": ["a cat", "a bird"]}, "k-3")
         assert r.status_code == 409 and r.json().get("error") == "no_new_items", f"a batch whose items are all queued answered {r.status_code} {r.text}, expected 409 {{'error': 'no_new_items'}}"
         assert len(_tasks(ctx)) == 2, f"the all-duplicate batch left a task: {_tasks(ctx)}"
@@ -800,9 +811,17 @@ async def check_idempotent_create(ctx):
         assert replay.status_code == 200 and replay.json() == first.json(), f"a retry with the same Idempotency-Key answered {replay.status_code} {replay.text}, expected 200 and the first answer {first.text}"
         assert len(_tasks(ctx)) == 1, f"a retried create made a second task: {_tasks(ctx)}"
         other = await _create(c, {**BODY, "items": ["a bird"]}, "k-1", tenant="t2")
-    assert other.status_code == 201 and other.json().get("task_id") != first.json()["task_id"], f"key k-1 of tenant t2 is another create, it answered {other.status_code} {other.text}"
+        assert other.status_code == 201 and other.json().get("task_id") != first.json()["task_id"], f"key k-1 of tenant t2 is another create, it answered {other.status_code} {other.text}"
+        r = await _create(c, BODY, "k-2")
+        assert r.status_code == 409, f"a batch whose items are all queued answered {r.status_code} {r.text}, expected 409"
+        retry = await _create(c, BODY, "k-2")
+    assert retry.status_code == 409 and retry.json().get("error") == "no_new_items", f"only a 201 answer is recorded: the retry of a create that answered 409 answered {retry.status_code} {retry.text}, expected 409 no_new_items again"
 `,
     typescript: `const BODY = {items: ['a cat on a mat', 'a dog in the fog'], spec_version: '2026-10', overlap: 3};
+// SHA-256 hex of the UTF-8 bytes of "a fox", "a cat" and "a dog".
+const FOX = '5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c';
+const CAT = '51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22';
+const DOG = '7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401';
 
 function api(ctx) {
   return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/labeling/store.ts')};
@@ -844,6 +863,7 @@ export async function check_batch_bounds(ctx) {
   const cases: [Record<string, unknown>, string][] = [
     [{items: []}, 'an empty batch'],
     [{items: Array.from({length: 201}, (_, n) => \`item \${n}\`)}, 'a batch of 201 items'],
+    [{items: [...Array.from({length: 200}, (_, n) => \`item \${n}\`), 'item 0']}, 'a batch of 201 items with one repeat'],
     [{items: ['a cat', '']}, 'a batch with an empty item'],
     [{overlap: 0}, 'overlap 0'],
     [{overlap: 6}, 'overlap 6'],
@@ -855,17 +875,22 @@ export async function check_batch_bounds(ctx) {
   assert.deepEqual(tasks(ctx), [], \`the rejected creates left tasks behind: \${JSON.stringify(tasks(ctx))}\`);
   const r = await create(c, {...BODY, items: Array.from({length: 200}, (_, n) => \`item \${n}\`), overlap: 5}, 'k-ok');
   assert.equal(r.status, 201, \`200 items with overlap 5 are within bounds, the create answered \${r.status}: \${r.text}\`);
+  const one = await create(c, {...BODY, items: ['one item'], overlap: 1}, 'k-one');
+  assert.equal(one.status, 201, \`one item with overlap 1 is within bounds, the create answered \${one.status}: \${one.text}\`);
 }
 
 export async function check_content_dedupe(ctx) {
   const {c, store} = api(ctx);
-  let r = await create(c, {...BODY, items: ['a cat', 'a dog', 'a cat']}, 'k-1');
+  await store.addHashes('2026-10', [FOX]); // "a fox" was queued under 2026-10 by an earlier create
+  let r = await create(c, {...BODY, items: ['a cat', 'a dog', 'a cat', 'a fox']}, 'k-1');
   assert.equal(r.status, 201, \`the first create answered \${r.status}: \${r.text}\`);
   const first = r.json();
-  assert(first.accepted === 2 && first.deduped === 1, \`a batch repeating 'a cat' answered \${r.text}: the repeat must be dropped and counted (accepted 2, deduped 1)\`);
+  assert(first.accepted === 2 && first.deduped === 2, \`a batch repeating 'a cat', with 'a fox' already queued under its SHA-256 hash, answered \${r.text}: both must be dropped and counted (accepted 2, deduped 2)\`);
   assert.equal((await store.getTask(first.task_id)).total_items, 2, 'the task must hold the 2 distinct items');
-  r = await create(c, {...BODY, items: ['a dog', 'a bird']}, 'k-2');
-  assert(r.status === 201 && r.json().accepted === 1 && r.json().deduped === 1, \`'a dog' is already queued under 2026-10: the second batch answered \${r.status} \${r.text}, expected accepted 1, deduped 1\`);
+  const hashes = [...(await store.seenHashes('2026-10'))].sort();
+  assert.deepEqual(hashes, [FOX, CAT, DOG].sort(), \`the spec's registered hashes are \${JSON.stringify(hashes)}, expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'\`);
+  r = await create(c, {...BODY, items: ['a dog', 'a bird', 'A bird ']}, 'k-2');
+  assert(r.status === 201 && r.json().accepted === 2 && r.json().deduped === 1, \`'a dog' is already queued under 2026-10 and 'A bird ' is other bytes than 'a bird': the second batch answered \${r.status} \${r.text}, expected accepted 2, deduped 1\`);
   r = await create(c, {...BODY, items: ['a cat', 'a bird']}, 'k-3');
   assert(r.status === 409 && r.json().error === 'no_new_items', \`a batch whose items are all queued answered \${r.status} \${r.text}, expected 409 {"error": "no_new_items"}\`);
   assert.equal(tasks(ctx).length, 2, \`the all-duplicate batch left a task: \${JSON.stringify(tasks(ctx))}\`);
@@ -885,6 +910,10 @@ export async function check_idempotent_create(ctx) {
   assert.equal(tasks(ctx).length, 1, \`a retried create made a second task: \${JSON.stringify(tasks(ctx))}\`);
   const other = await create(c, {...BODY, items: ['a bird']}, 'k-1', 't2');
   assert(other.status === 201 && other.json().task_id !== first.json().task_id, \`key k-1 of tenant t2 is another create, it answered \${other.status} \${other.text}\`);
+  const dup = await create(c, BODY, 'k-2');
+  assert.equal(dup.status, 409, \`a batch whose items are all queued answered \${dup.status} \${dup.text}, expected 409\`);
+  const retry = await create(c, BODY, 'k-2');
+  assert(retry.status === 409 && retry.json().error === 'no_new_items', \`only a 201 answer is recorded: the retry of a create that answered 409 answered \${retry.status} \${retry.text}, expected 409 no_new_items again\`);
 }
 `,
     go: `package main
@@ -900,6 +929,13 @@ import (
 )
 
 var apiBody = map[string]any{"items": []string{"a cat on a mat", "a dog in the fog"}, "spec_version": "2026-10", "overlap": 3}
+
+// SHA-256 hex of the UTF-8 bytes of "a fox", "a cat" and "a dog".
+const (
+	foxHash = "5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c"
+	catHash = "51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22"
+	dogHash = "7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401"
+)
 
 func api(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
@@ -979,6 +1015,7 @@ func CheckBatchBounds(ctx *harness.Ctx) {
 	}{
 		{map[string]any{"items": []string{}}, "an empty batch"},
 		{map[string]any{"items": items(201)}, "a batch of 201 items"},
+		{map[string]any{"items": append(items(200), "item 0")}, "a batch of 201 items with one repeat"},
 		{map[string]any{"items": []string{"a cat", ""}}, "a batch with an empty item"},
 		{map[string]any{"overlap": 0}, "overlap 0"},
 		{map[string]any{"overlap": 6}, "overlap 6"},
@@ -990,19 +1027,24 @@ func CheckBatchBounds(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 0, "the rejected creates must leave no task; tasks")
 	r := create(c, with(map[string]any{"items": items(200), "overlap": 5}), "k-ok", "t1")
 	ctx.Equal(r.Status, 201, "200 items with overlap 5 are within bounds (%s)", r.Text())
+	one := create(c, with(map[string]any{"items": []string{"one item"}, "overlap": 1}), "k-one", "t1")
+	ctx.Equal(one.Status, 201, "one item with overlap 1 is within bounds (%s)", one.Text())
 }
 
 func CheckContentDedupe(ctx *harness.Ctx) {
 	c := api(ctx)
-	r := create(c, with(map[string]any{"items": []string{"a cat", "a dog", "a cat"}}), "k-1", "t1")
+	store.AddHashes(context.Background(), "2026-10", []string{foxHash}) // "a fox" was queued under 2026-10 by an earlier create
+	r := create(c, with(map[string]any{"items": []string{"a cat", "a dog", "a cat", "a fox"}}), "k-1", "t1")
 	ctx.Equal(r.Status, 201, "the first create (%s)", r.Text())
 	first := answer(ctx, r)
-	ctx.Assert(first["accepted"] == float64(2) && first["deduped"] == float64(1), "a batch repeating 'a cat' answered %s: the repeat must be dropped and counted (accepted 2, deduped 1)", r.Text())
+	ctx.Assert(first["accepted"] == float64(2) && first["deduped"] == float64(2), "a batch repeating 'a cat', with 'a fox' already queued under its SHA-256 hash, answered %s: both must be dropped and counted (accepted 2, deduped 2)", r.Text())
 	taskID, _ := first["task_id"].(string)
 	ctx.Equal(store.GetTask(context.Background(), taskID).TotalItems, 2, "the task must hold the 2 distinct items; its items")
-	r = create(c, with(map[string]any{"items": []string{"a dog", "a bird"}}), "k-2", "t1")
+	hashes := store.SeenHashes(context.Background(), "2026-10")
+	ctx.Assert(len(hashes) == 3 && hashes[foxHash] && hashes[catHash] && hashes[dogHash], "the spec's registered hashes are %v, expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'", hashes)
+	r = create(c, with(map[string]any{"items": []string{"a dog", "a bird", "A bird "}}), "k-2", "t1")
 	second := answer(ctx, r)
-	ctx.Assert(r.Status == 201 && second["accepted"] == float64(1) && second["deduped"] == float64(1), "'a dog' is already queued under 2026-10: the second batch answered %d %s, expected accepted 1, deduped 1", r.Status, r.Text())
+	ctx.Assert(r.Status == 201 && second["accepted"] == float64(2) && second["deduped"] == float64(1), "'a dog' is already queued under 2026-10 and 'A bird ' is other bytes than 'a bird': the second batch answered %d %s, expected accepted 2, deduped 1", r.Status, r.Text())
 	r = create(c, with(map[string]any{"items": []string{"a cat", "a bird"}}), "k-3", "t1")
 	ctx.Assert(r.Status == 409 && answer(ctx, r)["error"] == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text())
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 2, "the all-duplicate batch must leave no task; tasks")
@@ -1023,12 +1065,17 @@ func CheckIdempotentCreate(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.Keys("task:t-*")), 1, "a retried create must not make a second task; tasks")
 	other := create(c, with(map[string]any{"items": []string{"a bird"}}), "k-1", "t2")
 	ctx.Assert(other.Status == 201 && answer(ctx, other)["task_id"] != answer(ctx, first)["task_id"], "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text())
+	dup := create(c, apiBody, "k-2", "t1")
+	ctx.Equal(dup.Status, 409, "a batch whose items are all queued (%s)", dup.Text())
+	retry := create(c, apiBody, "k-2", "t1")
+	ctx.Assert(retry.Status == 409 && answer(ctx, retry)["error"] == "no_new_items", "only a 201 answer is recorded: the retry of a create that answered 409 answered %d %s, expected 409 no_new_items again", retry.Status, retry.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -1037,6 +1084,10 @@ using json = nlohmann::json;
 namespace {
 
 const json kBody = {{"items", {"a cat on a mat", "a dog in the fog"}}, {"spec_version", "2026-10"}, {"overlap", 3}};
+// SHA-256 hex of the UTF-8 bytes of "a fox", "a cat" and "a dog".
+const std::string kFox = "5ebbe2a2650a5e157c4f8e6720167485236ce883498722718171efe14efab41c";
+const std::string kCat = "51e467415607798220a3776f6ae1a2a09ddc7e5dcdc955d685477b4cf05ade22";
+const std::string kDog = "7dbdf68ac0bb3482a281e2672b08773f99a4315d6e6fe02d3317d50a28d18401";
 
 harness::HTTP api(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
@@ -1112,6 +1163,7 @@ void CheckBatchBounds(harness::Ctx& ctx) {
   const std::vector<std::pair<json, std::string>> cases = {
       {json{{"items", json::array()}}, "an empty batch"},
       {json{{"items", items(201)}}, "a batch of 201 items"},
+      {json{{"items", [] { json out = items(200); out.push_back("item 0"); return out; }()}}, "a batch of 201 items with one repeat"},
       {json{{"items", {"a cat", ""}}}, "a batch with an empty item"},
       {json{{"overlap", 0}}, "overlap 0"},
       {json{{"overlap", 6}}, "overlap 6"},
@@ -1123,18 +1175,25 @@ void CheckBatchBounds(harness::Ctx& ctx) {
   ctx.Equal(taskCount(ctx), 0, "the rejected creates must leave no task; tasks");
   const auto r = create(c, with(json{{"items", items(200)}, {"overlap", 5}}), "k-ok");
   ctx.Equal(r.Status, 201, "200 items with overlap 5 are within bounds (%s)", r.Text());
+  const auto one = create(c, with(json{{"items", {"one item"}}, {"overlap", 1}}), "k-one");
+  ctx.Equal(one.Status, 201, "one item with overlap 1 is within bounds (%s)", one.Text());
 }
 
 void CheckContentDedupe(harness::Ctx& ctx) {
   auto c = api(ctx);
-  auto r = create(c, with(json{{"items", {"a cat", "a dog", "a cat"}}}), "k-1");
+  store::addHashes("2026-10", {kFox});  // "a fox" was queued under 2026-10 by an earlier create
+  auto r = create(c, with(json{{"items", {"a cat", "a dog", "a cat", "a fox"}}}), "k-1");
   ctx.Equal(r.Status, 201, "the first create (%s)", r.Text());
   const json first = answer(ctx, r);
-  ctx.Assert(first.value("accepted", 0L) == 2 && first.value("deduped", 0L) == 1, "a batch repeating 'a cat' answered %s: the repeat must be dropped and counted (accepted 2, deduped 1)", r.Text());
+  ctx.Assert(first.value("accepted", 0L) == 2 && first.value("deduped", 0L) == 2, "a batch repeating 'a cat', with 'a fox' already queued under its SHA-256 hash, answered %s: both must be dropped and counted (accepted 2, deduped 2)", r.Text());
   ctx.Equal(store::getTask(first.value("task_id", ""))->total_items, 2L, "the task must hold the 2 distinct items; its items");
-  r = create(c, with(json{{"items", {"a dog", "a bird"}}}), "k-2");
+  const auto hashes = store::seenHashes("2026-10");
+  std::string listed;
+  for (const auto& h : hashes) listed += (listed.empty() ? "" : ", ") + h;
+  ctx.Assert(hashes == std::set<std::string>{kFox, kCat, kDog}, "the spec's registered hashes are [%s], expected the SHA-256 hex of the UTF-8 bytes of 'a fox', 'a cat' and 'a dog'", listed);
+  r = create(c, with(json{{"items", {"a dog", "a bird", "A bird "}}}), "k-2");
   const json second = answer(ctx, r);
-  ctx.Assert(r.Status == 201 && second.value("accepted", 0L) == 1 && second.value("deduped", 0L) == 1, "'a dog' is already queued under 2026-10: the second batch answered %d %s, expected accepted 1, deduped 1", r.Status, r.Text());
+  ctx.Assert(r.Status == 201 && second.value("accepted", 0L) == 2 && second.value("deduped", 0L) == 1, "'a dog' is already queued under 2026-10 and 'A bird ' is other bytes than 'a bird': the second batch answered %d %s, expected accepted 2, deduped 1", r.Status, r.Text());
   r = create(c, with(json{{"items", {"a cat", "a bird"}}}), "k-3");
   ctx.Assert(r.Status == 409 && answer(ctx, r).value("error", "") == "no_new_items", "a batch whose items are all queued answered %d %s, expected 409 {\\"error\\": \\"no_new_items\\"}", r.Status, r.Text());
   ctx.Equal(taskCount(ctx), 2, "the all-duplicate batch must leave no task; tasks");
@@ -1155,6 +1214,10 @@ void CheckIdempotentCreate(harness::Ctx& ctx) {
   ctx.Equal(taskCount(ctx), 1, "a retried create must not make a second task; tasks");
   const auto other = create(c, with(json{{"items", {"a bird"}}}), "k-1", "t2");
   ctx.Assert(other.Status == 201 && answer(ctx, other).value("task_id", "") != answer(ctx, first).value("task_id", ""), "key k-1 of tenant t2 is another create, it answered %d %s", other.Status, other.Text());
+  const auto dup = create(c, kBody, "k-2");
+  ctx.Equal(dup.Status, 409, "a batch whose items are all queued (%s)", dup.Text());
+  const auto retry = create(c, kBody, "k-2");
+  ctx.Assert(retry.Status == 409 && answer(ctx, retry).value("error", "") == "no_new_items", "only a 201 answer is recorded: the retry of a create that answered 409 answered %d %s, expected 409 no_new_items again", retry.Status, retry.Text());
 }
 `,
   },

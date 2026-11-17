@@ -61,7 +61,7 @@ working for a week.
       id: 'committed-only',
       title: 'Serves only a committed checkpoint',
       detail:
-        'The checkpoint comes from `latest_committed`/`latestCommitted`, so a newer upload that is still missing a chunk stays invisible and a run with nothing committed is **404**. The starter serves the newest upload, committed or not.',
+        'The checkpoint comes from `latest_committed`/`latestCommitted`, so a newer upload that is still missing a chunk stays invisible, the read URL names the committed upload, and a run with nothing committed is **404**. The starter serves the newest upload, committed or not.',
       match: {
         python: {all: [/latest_committed\(\s*run_id\s*\)/], none: [/latest_upload\(/]},
         typescript: {all: [/latestCommitted\(\s*runId\s*\)/], none: [/latestUpload\(/]},
@@ -74,7 +74,7 @@ working for a week.
       id: 'tenant-404',
       title: 'Another tenant’s run is 404',
       detail:
-        'The run’s tenant (`run_tenant`/`runTenant`) is compared with `X-Tenant-Id` before any checkpoint is read, and a foreign run answers **404** like a missing one. The starter serves any run to any tenant.',
+        'The run’s tenant (`run_tenant`/`runTenant`) is compared with `X-Tenant-Id` before any checkpoint is read, and a foreign run answers **404** with the same body as a missing one. The starter serves any run to any tenant.',
       match: {
         python: {
           all: [/store\.run_tenant\(\s*run_id\s*\)/, /\b404\b/],
@@ -529,6 +529,8 @@ async def check_committed_only(ctx):
         body = r.json()
         assert r.status_code == 200 and body.get("step") == 1200 and body.get("upload_id") == committed, f"r1 has step 1200 committed and step 1300 missing a chunk; the read answered {r.status_code} {body}: a trainer would resume from weights that were never complete"
         assert body.get("digest") == store.manifest(committed), f"the read must carry the committed digest {store.manifest(committed)}, got {body.get('digest')!r}"
+        url = body.get("url", "")
+        assert url.startswith(f"{store.BASE_URL}/{committed}?") and store.verify_url(url), f"the read URL {url!r} must be a working URL for the committed upload {committed}, not the newer incomplete one"
         r = await _latest(c, "r3")
     assert r.status_code == 404, f"a run with nothing committed answered {r.status_code}: {r.text}, expected 404"
 
@@ -538,6 +540,8 @@ async def check_tenant_404(ctx):
     async with _api(ctx) as c:
         foreign = await _latest(c, "r2")
         assert foreign.status_code == 404, f"tenant t1 reading tenant t2's run answered {foreign.status_code}: {foreign.text}, expected 404 (the same answer as a missing run)"
+        missing = await _latest(c, "r404")
+        assert foreign.text == missing.text, f"tenant t1 reading tenant t2's run answered {foreign.text}, a missing run {missing.text}: a different body tells a caller which run ids exist"
         own = await _latest(c, "r2", headers={"X-Tenant-Id": "t2"})
     assert own.status_code == 200 and own.json().get("step") == 700, f"tenant t2 reading its own run answered {own.status_code}: {own.text}"
 
@@ -599,6 +603,7 @@ export async function check_committed_only(ctx) {
   const body = r.json();
   assert(r.status === 200 && body.step === 1200 && body.upload_id === committed, \`r1 has step 1200 committed and step 1300 missing a chunk; the read answered \${r.status} \${r.text}: a trainer would resume from weights that were never complete\`);
   assert.equal(body.digest, await store.manifest(committed), 'the read must carry the committed digest');
+  assert(String(body.url).startsWith(\`\${store.BASE_URL}/\${committed}?\`) && store.verifyUrl(body.url), \`the read URL \${body.url} must be a working URL for the committed upload \${committed}, not the newer incomplete one\`);
   r = await latest(c, 'r3');
   assert.equal(r.status, 404, \`a run with nothing committed answered \${r.status}: \${r.text}, expected 404\`);
 }
@@ -608,6 +613,8 @@ export async function check_tenant_404(ctx) {
   await checkpoint('r2', 't2', 700);
   const foreign = await latest(c, 'r2');
   assert.equal(foreign.status, 404, \`tenant t1 reading tenant t2's run answered \${foreign.status}: \${foreign.text}, expected 404 (the same answer as a missing run)\`);
+  const missing = await latest(c, 'r404');
+  assert.equal(foreign.text, missing.text, \`tenant t1 reading tenant t2's run answered \${foreign.text}, a missing run \${missing.text}: a different body tells a caller which run ids exist\`);
   const own = await latest(c, 'r2', {'X-Tenant-Id': 't2'});
   assert(own.status === 200 && own.json().step === 700, \`tenant t2 reading its own run answered \${own.status}: \${own.text}\`);
 }
@@ -640,30 +647,30 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hBg = context.Background()
 
 // readCheckpoint opens an upload of run's checkpoint at step in 2 chunks, committed when both are staged.
-func readCheckpoint(ctx *harness.Ctx, runID, tenant string, step int64, staged int) string {
-	store.CreateRun(readBg, runID, tenant)
-	upload := store.OpenUpload(readBg, runID, tenant, step, 2)
+func hCheckpoint(ctx *harness.Ctx, runID, tenant string, step int64, staged int) string {
+	store.CreateRun(hBg, runID, tenant)
+	upload := store.OpenUpload(hBg, runID, tenant, step, 2)
 	for i := 0; i < staged; i++ {
 		payload := []byte(fmt.Sprintf("%s step %d layer %d", runID, step, i))
-		store.PutChunk(readBg, upload.UploadID, int64(i), payload, store.Digest(payload))
+		store.PutChunk(hBg, upload.UploadID, int64(i), payload, store.Digest(payload))
 	}
 	if staged == 2 {
-		record, err := commit.Commit(readBg, upload.UploadID)
+		record, err := commit.Commit(hBg, upload.UploadID)
 		ctx.Assert(err == nil && record != nil, "the harness could not commit its own upload: %v", err)
 	}
 	return upload.UploadID
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type readBody struct {
+type hReadBody struct {
 	UploadID  string \`json:"upload_id"\`
 	Step      int64  \`json:"step"\`
 	Chunks    int64  \`json:"chunks"\`
@@ -672,9 +679,9 @@ type readBody struct {
 	ExpiresAt int64  \`json:"expires_at"\`
 }
 
-func readLatest(c *harness.HTTP, runID string, header ...string) (*harness.Response, readBody) {
+func hLatest(c *harness.HTTP, runID string, header ...string) (*harness.Response, hReadBody) {
 	r := c.Get("/v1/runs/"+runID+"/checkpoints/latest", header...)
-	var body readBody
+	var body hReadBody
 	if r.Status == 200 {
 		r.Decode(&body)
 	}
@@ -682,42 +689,45 @@ func readLatest(c *harness.HTTP, runID string, header ...string) (*harness.Respo
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	uploadID := readCheckpoint(ctx, "r1", "t1", 1200, 2)
-	c := readAPI(ctx)
-	r, body := readLatest(c, "r1", "X-Tenant-Id", "t1")
+	uploadID := hCheckpoint(ctx, "r1", "t1", 1200, 2)
+	c := hReadAPI(ctx)
+	r, body := hLatest(c, "r1", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/runs/r1/checkpoints/latest (%s)", r.Text())
 	ctx.Assert(body.UploadID == uploadID && body.Step == 1200 && body.Chunks == 2, "the latest checkpoint of r1 is %s at step 1200 in 2 chunks, got %s", uploadID, r.Text())
 	ctx.Assert(store.VerifyURL(body.URL), "the object store refuses the read URL %q", body.URL)
-	none, _ := readLatest(c, "r1")
+	none, _ := hLatest(c, "r1")
 	ctx.Equal(none.Status, 401, "a read without X-Tenant-Id")
-	missing, _ := readLatest(c, "r404", "X-Tenant-Id", "t1")
+	missing, _ := hLatest(c, "r404", "X-Tenant-Id", "t1")
 	ctx.Equal(missing.Status, 404, "an unknown run")
 }
 
 func CheckCommittedOnly(ctx *harness.Ctx) {
-	committed := readCheckpoint(ctx, "r1", "t1", 1200, 2)
-	readCheckpoint(ctx, "r1", "t1", 1300, 1) // the newer upload is still missing a chunk
-	readCheckpoint(ctx, "r3", "t1", 50, 1)
-	c := readAPI(ctx)
-	r, body := readLatest(c, "r1", "X-Tenant-Id", "t1")
+	committed := hCheckpoint(ctx, "r1", "t1", 1200, 2)
+	hCheckpoint(ctx, "r1", "t1", 1300, 1) // the newer upload is still missing a chunk
+	hCheckpoint(ctx, "r3", "t1", 50, 1)
+	c := hReadAPI(ctx)
+	r, body := hLatest(c, "r1", "X-Tenant-Id", "t1")
 	ctx.Assert(r.Status == 200 && body.Step == 1200 && body.UploadID == committed, "r1 has step 1200 committed and step 1300 missing a chunk; the read answered %d %s: a trainer would resume from weights that were never complete", r.Status, r.Text())
-	ctx.Equal(body.Digest, store.Manifest(readBg, committed), "the read must carry the committed digest")
-	r, _ = readLatest(c, "r3", "X-Tenant-Id", "t1")
+	ctx.Equal(body.Digest, store.Manifest(hBg, committed), "the read must carry the committed digest")
+	ctx.Assert(strings.HasPrefix(body.URL, store.BaseURL+"/"+committed+"?") && store.VerifyURL(body.URL), "the read URL %q must be a working URL for the committed upload %s, not the newer incomplete one", body.URL, committed)
+	r, _ = hLatest(c, "r3", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 404, "a run with nothing committed (%s)", r.Text())
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	readCheckpoint(ctx, "r2", "t2", 700, 2)
-	c := readAPI(ctx)
-	foreign, _ := readLatest(c, "r2", "X-Tenant-Id", "t1")
+	hCheckpoint(ctx, "r2", "t2", 700, 2)
+	c := hReadAPI(ctx)
+	foreign, _ := hLatest(c, "r2", "X-Tenant-Id", "t1")
 	ctx.Equal(foreign.Status, 404, "tenant t1 reading tenant t2's run must get the same answer as a missing run (%s)", foreign.Text())
-	own, body := readLatest(c, "r2", "X-Tenant-Id", "t2")
+	missing, _ := hLatest(c, "r404", "X-Tenant-Id", "t1")
+	ctx.Equal(foreign.Text(), missing.Text(), "tenant t1 reading tenant t2's run must get the same body as a missing run (a different body tells a caller which run ids exist)")
+	own, body := hLatest(c, "r2", "X-Tenant-Id", "t2")
 	ctx.Assert(own.Status == 200 && body.Step == 700, "tenant t2 reading its own run answered %d %s", own.Status, own.Text())
 }
 
 func CheckUrlTtl(ctx *harness.Ctx) {
-	readCheckpoint(ctx, "r1", "t1", 1200, 2)
-	r, body := readLatest(readAPI(ctx), "r1", "X-Tenant-Id", "t1")
+	hCheckpoint(ctx, "r1", "t1", 1200, 2)
+	r, body := hLatest(hReadAPI(ctx), "r1", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "the read (%s)", r.Text())
 	lifetime := float64(body.ExpiresAt) - float64(ctx.Clock.Now())/1000
 	ctx.Assert(895 <= lifetime && lifetime <= 905, "the read URL lives %.0f s, expected 900 (15 minutes): a link pasted into a ticket must not keep working for days", lifetime)
@@ -739,7 +749,7 @@ func CheckUrlTtl(ctx *harness.Ctx) {
 namespace {
 
 // An upload of run's checkpoint at step in 2 chunks, committed when both are staged.
-std::string readCheckpoint(harness::Ctx& ctx, const std::string& run_id, const std::string& tenant, long step, int staged = 2) {
+std::string hCheckpoint(harness::Ctx& ctx, const std::string& run_id, const std::string& tenant, long step, int staged = 2) {
   store::createRun(run_id, tenant);
   const store::Upload upload = store::openUpload(run_id, tenant, step, 2);
   for (int i = 0; i < staged; i++) {
@@ -750,7 +760,7 @@ std::string readCheckpoint(harness::Ctx& ctx, const std::string& run_id, const s
   return upload.upload_id;
 }
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -758,13 +768,13 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readLatest(harness::HTTP& c, const std::string& run_id, const std::string& tenant = "t1") {
+harness::Response hLatest(harness::HTTP& c, const std::string& run_id, const std::string& tenant = "t1") {
   const std::string path = "/v1/runs/" + run_id + "/checkpoints/latest";
   if (tenant.empty()) return c.Get(path);
   return c.Get(path, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) {
+nlohmann::json hBodyOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
@@ -772,48 +782,53 @@ nlohmann::json bodyOf(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::string upload_id = readCheckpoint(ctx, "r1", "t1", 1200);
-  auto c = readApi(ctx);
-  const auto r = readLatest(c, "r1");
+  const std::string upload_id = hCheckpoint(ctx, "r1", "t1", 1200);
+  auto c = hReadApi(ctx);
+  const auto r = hLatest(c, "r1");
   ctx.Equal(r.Status, 200, "GET /v1/runs/r1/checkpoints/latest (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.value("upload_id", "") == upload_id && body.value("step", 0L) == 1200 && body.value("chunks", 0L) == 2,
              "the latest checkpoint of r1 is %s at step 1200 in 2 chunks, got %s", upload_id, r.Text());
   ctx.Assert(store::verifyUrl(body.value("url", "")), "the object store refuses the read URL %q", body.value("url", ""));
-  ctx.Equal(readLatest(c, "r1", "").Status, 401, "a read without X-Tenant-Id");
-  ctx.Equal(readLatest(c, "r404").Status, 404, "an unknown run");
+  ctx.Equal(hLatest(c, "r1", "").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(hLatest(c, "r404").Status, 404, "an unknown run");
 }
 
 void CheckCommittedOnly(harness::Ctx& ctx) {
-  const std::string committed = readCheckpoint(ctx, "r1", "t1", 1200);
-  readCheckpoint(ctx, "r1", "t1", 1300, 1);  // the newer upload is still missing a chunk
-  readCheckpoint(ctx, "r3", "t1", 50, 1);
-  auto c = readApi(ctx);
-  auto r = readLatest(c, "r1");
-  const auto body = bodyOf(r);
+  const std::string committed = hCheckpoint(ctx, "r1", "t1", 1200);
+  hCheckpoint(ctx, "r1", "t1", 1300, 1);  // the newer upload is still missing a chunk
+  hCheckpoint(ctx, "r3", "t1", 50, 1);
+  auto c = hReadApi(ctx);
+  auto r = hLatest(c, "r1");
+  const auto body = hBodyOf(r);
   ctx.Assert(r.Status == 200 && body.value("step", 0L) == 1200 && body.value("upload_id", "") == committed,
              "r1 has step 1200 committed and step 1300 missing a chunk; the read answered %d %s: a trainer would resume from weights that were never complete",
              r.Status, r.Text());
   ctx.Equal(body.value("digest", ""), store::manifest(committed), "the read must carry the committed digest");
-  r = readLatest(c, "r3");
+  const std::string url = body.value("url", "");
+  ctx.Assert(url.rfind(store::kBaseUrl + "/" + committed + "?", 0) == 0 && store::verifyUrl(url),
+             "the read URL %q must be a working URL for the committed upload %s, not the newer incomplete one", url, committed);
+  r = hLatest(c, "r3");
   ctx.Equal(r.Status, 404, "a run with nothing committed (%s)", r.Text());
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
-  readCheckpoint(ctx, "r2", "t2", 700);
-  auto c = readApi(ctx);
-  const auto foreign = readLatest(c, "r2", "t1");
+  hCheckpoint(ctx, "r2", "t2", 700);
+  auto c = hReadApi(ctx);
+  const auto foreign = hLatest(c, "r2", "t1");
   ctx.Equal(foreign.Status, 404, "tenant t1 reading tenant t2's run must get the same answer as a missing run (%s)", foreign.Text());
-  const auto own = readLatest(c, "r2", "t2");
-  ctx.Assert(own.Status == 200 && bodyOf(own).value("step", 0L) == 700, "tenant t2 reading its own run answered %d %s", own.Status, own.Text());
+  const auto missing = hLatest(c, "r404", "t1");
+  ctx.Equal(foreign.Text(), missing.Text(), "tenant t1 reading tenant t2's run must get the same body as a missing run (a different body tells a caller which run ids exist)");
+  const auto own = hLatest(c, "r2", "t2");
+  ctx.Assert(own.Status == 200 && hBodyOf(own).value("step", 0L) == 700, "tenant t2 reading its own run answered %d %s", own.Status, own.Text());
 }
 
 void CheckUrlTtl(harness::Ctx& ctx) {
-  readCheckpoint(ctx, "r1", "t1", 1200);
-  auto c = readApi(ctx);
-  const auto r = readLatest(c, "r1");
+  hCheckpoint(ctx, "r1", "t1", 1200);
+  auto c = hReadApi(ctx);
+  const auto r = hLatest(c, "r1");
   ctx.Equal(r.Status, 200, "the read (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   const long long expires_at = body.value("expires_at", 0LL);
   const std::string url = body.value("url", "");
   const double lifetime = static_cast<double>(expires_at) - static_cast<double>(ctx.Clock.Now()) / 1000;

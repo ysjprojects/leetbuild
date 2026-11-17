@@ -88,7 +88,7 @@ for good.
       id: 'digest-only',
       title: 'Carries the prefix digest, not the prefix',
       detail:
-        'The event carries prefix_digest, the SHA-256 hex of the prefix, and no prefix text in any field. The starter ships the first 512 characters of the prompt.',
+        'The event carries prefix_digest, the SHA-256 hex of the whole prefix (a prefix past 512 characters included), and no prefix text in any field. The starter ships the first 512 characters of the prompt.',
       match: {
         python: {all: [/prefix_digest/, /hashlib\.sha256\(/], none: [/["']prefix["']\s*:/, /prefix\[:/]},
         typescript: {
@@ -117,7 +117,7 @@ for good.
       id: 'count-before-commit',
       title: 'Counts before it commits the offset',
       detail:
-        'At the first offset commit the decision is already in the counters, and every processed record is committed. The starter commits first, so a crash in between loses the decision.',
+        'At the first offset commit the decision is already counted, at every commit each counted decision has moved all its counters and pc-versions, and every processed record is committed. The starter commits first, so a crash in between loses the decision.',
       match: {
         python: {order: [/r\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/redis\.hincrby\(/, /commitOffsets\(/]},
@@ -838,6 +838,9 @@ import json
 TOPIC = "cache.result"
 PREFIX = "You are the support assistant for Acme Bank. Customer account 4111-2222: why was my card declined?"
 DIGEST = hashlib.sha256(PREFIX.encode("utf-8")).hexdigest()
+LONG = "Summarise the indemnity clause of this master services agreement for a procurement lead. " * 8
+LONG_DIGEST = hashlib.sha256(LONG.encode("utf-8")).hexdigest()
+LATENCIES = (900, 700, 800)
 
 
 def _settle(m):
@@ -862,6 +865,13 @@ def _hash(ctx, key):
 def _counted(ctx):
     """Decisions in the stats right now, whatever key they were counted under."""
     return sum(_hash(ctx, key).get("hits", 0) + _hash(ctx, key).get("misses", 0) for key in ctx.redis.keys("pc-stats:*"))
+
+
+def _snapshot(ctx):
+    """At a commit: the decisions counted, the fill_ms summed over every stats key, and whether pc-versions:t1 lists 7."""
+    hashes = [_hash(ctx, key) for key in ctx.redis.keys("pc-stats:*")]
+    counted = sum(h.get("hits", 0) + h.get("misses", 0) for h in hashes)
+    return counted, sum(h.get("fill_ms", 0) for h in hashes), "7" in ctx.redis.smembers("pc-versions:t1")
 
 
 def check_decision_event(ctx):
@@ -892,13 +902,16 @@ def check_tenant_key(ctx):
 def check_digest_only(ctx):
     m = ctx.load("events")
     m.emit_decision("t1", 7, PREFIX, "miss", 840, 42)
+    m.emit_decision("t1", 7, LONG, "miss", 900, 42)
     _settle(m)
     values = ctx.kafka.values(TOPIC)
-    assert len(values) == 1, f"one decision produced {len(values)} records"
+    assert len(values) == 2, f"two decisions produced {len(values)} records"
     event = json.loads(values[0])
     assert event.get("prefix_digest") == DIGEST, f"the event must carry prefix_digest, the SHA-256 hex of the prefix ({DIGEST[:12]}...), got {event}"
     assert b"Acme Bank" not in values[0] and b"4111" not in values[0], f"the event carries prompt text: {values[0][:120]!r}; the topic is retained and replicated, and the digest is enough to join on"
     assert "prefix" not in event, f"the event has a prefix field: {sorted(event)}"
+    digest = json.loads(values[1]).get("prefix_digest")
+    assert digest == LONG_DIGEST, f"a {len(LONG)}-character prefix must be digested whole: prefix_digest is the SHA-256 hex of the entire prefix ({LONG_DIGEST[:12]}...), got {digest}"
 
 
 def check_tenant_stats(ctx):
@@ -918,14 +931,17 @@ def check_tenant_stats(ctx):
 
 
 def check_count_before_commit(ctx):
-    for latency in (900, 700, 800):
+    for latency in LATENCIES:
         _seed(ctx, "t1", 7, "miss", latency_ms=latency, tokens=40)
     at_commit = []
-    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(_counted(ctx)))
+    ctx.kafka.on_commit(lambda group, offsets: at_commit.append(_snapshot(ctx)))
     m = ctx.load("events")
     ctx.drain(m.run_stats)
     assert at_commit, "the consumer never committed an offset"
-    assert at_commit[0] >= 1, f"at the first commit the stats held {at_commit[0]} decisions: the offset moved before the counters, so a crash in between loses the decision for good"
+    assert at_commit[0][0] >= 1, f"at the first commit the stats held {at_commit[0][0]} decisions: the offset moved before the counters, so a crash in between loses the decision for good"
+    for counted, fill_ms, listed in at_commit:
+        want = sum(LATENCIES[:counted])
+        assert fill_ms == want and listed, f"at a commit the stats held {counted} decisions with fill_ms {fill_ms} (expected {want}) and pc-versions:t1 {'listing' if listed else 'not listing'} version 7: every counter and the versions set must move before the offset is committed"
     assert _counted(ctx) == 3, f"three decisions were consumed and {_counted(ctx)} counted"
     assert ctx.kafka.lag("cache-stats", TOPIC) == 0, "every processed record must be committed"
 `,
@@ -934,6 +950,9 @@ def check_count_before_commit(ctx):
 const TOPIC = 'cache.result';
 const PREFIX = 'You are the support assistant for Acme Bank. Customer account 4111-2222: why was my card declined?';
 const DIGEST = createHash('sha256').update(PREFIX, 'utf8').digest('hex');
+const LONG = 'Summarise the indemnity clause of this master services agreement for a procurement lead. '.repeat(8);
+const LONG_DIGEST = createHash('sha256').update(LONG, 'utf8').digest('hex');
+const LATENCIES = [900, 700, 800];
 
 /** A real macrotask: every pending promise continuation has run. */
 const settle = (): Promise<void> => {
@@ -955,6 +974,16 @@ const hash = (ctx, key: string): Record<string, number> =>
 /** Decisions in the stats right now, whatever key they were counted under. */
 const counted = (ctx): number =>
   (ctx.redis.keys('pc-stats:*') as string[]).reduce((sum, key) => sum + (hash(ctx, key).hits ?? 0) + (hash(ctx, key).misses ?? 0), 0);
+
+/** At a commit: the decisions counted, the fill_ms summed over every stats key, and whether pc-versions:t1 lists 7. */
+function snapshot(ctx): {counted: number; fillMs: number; listed: boolean} {
+  const hashes = (ctx.redis.keys('pc-stats:*') as string[]).map(key => hash(ctx, key));
+  return {
+    counted: hashes.reduce((sum, h) => sum + (h.hits ?? 0) + (h.misses ?? 0), 0),
+    fillMs: hashes.reduce((sum, h) => sum + (h.fill_ms ?? 0), 0),
+    listed: (ctx.redis.smembers('pc-versions:t1') as string[]).includes('7'),
+  };
+}
 
 export async function check_decision_event(ctx) {
   const m = ctx.load('events');
@@ -986,13 +1015,16 @@ export async function check_tenant_key(ctx) {
 export async function check_digest_only(ctx) {
   const m = ctx.load('events');
   await m.emitDecision('t1', 7, PREFIX, 'miss', 840, 42);
+  await m.emitDecision('t1', 7, LONG, 'miss', 900, 42);
   await settle();
   const values = ctx.kafka.values(TOPIC);
-  assert.equal(values.length, 1, \`one decision produced \${values.length} records\`);
+  assert.equal(values.length, 2, \`two decisions produced \${values.length} records\`);
   const event = JSON.parse(values[0]);
   assert.equal(event.prefix_digest, DIGEST, \`the event must carry prefix_digest, the SHA-256 hex of the prefix, got \${values[0]}\`);
   assert(!values[0].includes('Acme Bank') && !values[0].includes('4111'), \`the event carries prompt text: \${values[0].slice(0, 120)}; the topic is retained and replicated, and the digest is enough to join on\`);
   assert(!('prefix' in event), \`the event has a prefix field: \${Object.keys(event).sort().join(', ')}\`);
+  const digest = JSON.parse(values[1]).prefix_digest;
+  assert.equal(digest, LONG_DIGEST, \`a \${LONG.length}-character prefix must be digested whole: prefix_digest is the SHA-256 hex of the entire prefix, got \${digest}\`);
 }
 
 export async function check_tenant_stats(ctx) {
@@ -1010,13 +1042,17 @@ export async function check_tenant_stats(ctx) {
 }
 
 export async function check_count_before_commit(ctx) {
-  for (const latency of [900, 700, 800]) seed(ctx, 't1', 7, 'miss', latency, 40);
-  const atCommit: number[] = [];
-  ctx.kafka.onCommit(() => atCommit.push(counted(ctx)));
+  for (const latency of LATENCIES) seed(ctx, 't1', 7, 'miss', latency, 40);
+  const atCommit: {counted: number; fillMs: number; listed: boolean}[] = [];
+  ctx.kafka.onCommit(() => atCommit.push(snapshot(ctx)));
   const m = ctx.load('events');
   await ctx.drain(m.runStats());
   assert(atCommit.length > 0, 'the consumer never committed an offset');
-  assert(atCommit[0] >= 1, \`at the first commit the stats held \${atCommit[0]} decisions: the offset moved before the counters, so a crash in between loses the decision for good\`);
+  assert(atCommit[0].counted >= 1, \`at the first commit the stats held \${atCommit[0].counted} decisions: the offset moved before the counters, so a crash in between loses the decision for good\`);
+  for (const {counted: n, fillMs, listed} of atCommit) {
+    const want = LATENCIES.slice(0, n).reduce((a, b) => a + b, 0);
+    assert(fillMs === want && listed, \`at a commit the stats held \${n} decisions with fill_ms \${fillMs} (expected \${want}) and pc-versions:t1 \${listed ? 'listing' : 'not listing'} version 7: every counter and the versions set must move before the offset is committed\`);
+  }
   assert.equal(counted(ctx), 3, \`three decisions were consumed and \${counted(ctx)} counted\`);
   assert.equal(ctx.kafka.lag('cache-stats', TOPIC), 0, 'every processed record must be committed');
 }
@@ -1037,6 +1073,11 @@ import (
 const (
 	eventsTopic  = "cache.result"
 	eventsPrefix = "You are the support assistant for Acme Bank. Customer account 4111-2222: why was my card declined?"
+)
+
+var (
+	eventsLong      = strings.Repeat("Summarise the indemnity clause of this master services agreement for a procurement lead. ", 8)
+	eventsLatencies = []int{900, 700, 800}
 )
 
 func eventsAll(ctx *harness.Ctx) []map[string]any {
@@ -1064,6 +1105,31 @@ func eventsCounted(ctx *harness.Ctx) int {
 		total += hits + misses
 	}
 	return total
+}
+
+// eventsSnapshot is, at a commit, the decisions counted, the fill_ms summed over every stats key,
+// and whether pc-versions:t1 lists 7.
+type eventsSnapshot struct {
+	counted, fillMs int
+	listed          bool
+}
+
+func eventsSnap(ctx *harness.Ctx) eventsSnapshot {
+	var s eventsSnapshot
+	for _, key := range ctx.Redis.Keys("pc-stats:*") {
+		h := ctx.Redis.HGetAll(key)
+		hits, _ := strconv.Atoi(h["hits"])
+		misses, _ := strconv.Atoi(h["misses"])
+		fillMs, _ := strconv.Atoi(h["fill_ms"])
+		s.counted += hits + misses
+		s.fillMs += fillMs
+	}
+	for _, v := range ctx.Redis.SMembers("pc-versions:t1") {
+		if v == "7" {
+			s.listed = true
+		}
+	}
+	return s
 }
 
 func CheckDecisionEvent(ctx *harness.Ctx) {
@@ -1095,9 +1161,10 @@ func CheckTenantKey(ctx *harness.Ctx) {
 
 func CheckDigestOnly(ctx *harness.Ctx) {
 	emitDecision(context.Background(), "t1", 7, eventsPrefix, "miss", 840, 42)
+	emitDecision(context.Background(), "t1", 7, eventsLong, "miss", 900, 42)
 	ctx.Settle()
 	values := ctx.Kafka.Values(eventsTopic)
-	ctx.Equal(len(values), 1, "one decision; records")
+	ctx.Equal(len(values), 2, "two decisions; records")
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event is JSON: %s", values[0])
 	sum := sha256.Sum256([]byte(eventsPrefix))
@@ -1105,6 +1172,10 @@ func CheckDigestOnly(ctx *harness.Ctx) {
 	ctx.Assert(!strings.Contains(values[0], "Acme Bank") && !strings.Contains(values[0], "4111"), "the event carries prompt text: %s; the topic is retained and replicated, and the digest is enough to join on", values[0])
 	_, has := event["prefix"]
 	ctx.Assert(!has, "the event has a prefix field: %s", values[0])
+	var long map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[1]), &long), "the event is JSON: %s", values[1])
+	longSum := sha256.Sum256([]byte(eventsLong))
+	ctx.Equal(long["prefix_digest"], hex.EncodeToString(longSum[:]), "a %d-character prefix must be digested whole: prefix_digest is the SHA-256 hex of the entire prefix", len(eventsLong))
 }
 
 func CheckTenantStats(ctx *harness.Ctx) {
@@ -1121,14 +1192,21 @@ func CheckTenantStats(ctx *harness.Ctx) {
 }
 
 func CheckCountBeforeCommit(ctx *harness.Ctx) {
-	for _, latency := range []int{900, 700, 800} {
+	for _, latency := range eventsLatencies {
 		eventsSeed(ctx, "t1", 7, "miss", latency, 40)
 	}
-	var atCommit []int
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, eventsCounted(ctx)) })
+	var atCommit []eventsSnapshot
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, eventsSnap(ctx)) })
 	ctx.Drain(func() { runStats(context.Background()) })
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
-	ctx.Assert(atCommit[0] >= 1, "at the first commit the stats held %d decisions: the offset moved before the counters, so a crash in between loses the decision for good", atCommit[0])
+	ctx.Assert(atCommit[0].counted >= 1, "at the first commit the stats held %d decisions: the offset moved before the counters, so a crash in between loses the decision for good", atCommit[0].counted)
+	for _, s := range atCommit {
+		want := 0
+		for i := 0; i < s.counted && i < len(eventsLatencies); i++ {
+			want += eventsLatencies[i]
+		}
+		ctx.Assert(s.fillMs == want && s.listed, "at a commit the stats held %d decisions with fill_ms %d (expected %d) and pc-versions:t1 listing version 7: %v. Every counter and the versions set must move before the offset is committed", s.counted, s.fillMs, want, s.listed)
+	}
 	ctx.Equal(eventsCounted(ctx), 3, "three decisions were consumed; decisions counted")
 	ctx.Equal(ctx.Kafka.Lag("cache-stats", eventsTopic), int64(0), "every processed record must be committed; lag")
 }
@@ -1147,6 +1225,13 @@ namespace {
 
 const std::string kTopic = "cache.result";
 const std::string kPrefix = "You are the support assistant for Acme Bank. Customer account 4111-2222: why was my card declined?";
+const std::vector<int> kLatencies = {900, 700, 800};
+
+std::string longPrefix() {
+  std::string out;
+  for (int i = 0; i < 8; i++) out += "Summarise the indemnity clause of this master services agreement for a procurement lead. ";
+  return out;
+}
 
 std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
@@ -1170,6 +1255,28 @@ long long eventsCounted(harness::Ctx& ctx) {
     }
   }
   return total;
+}
+
+// At a commit: the decisions counted, the fill_ms summed over every stats key, and whether pc-versions:t1 lists 7.
+struct Snapshot {
+  long long counted = 0;
+  long long fill_ms = 0;
+  bool listed = false;
+};
+
+Snapshot snapshot(harness::Ctx& ctx) {
+  Snapshot s;
+  for (const auto& key : ctx.Redis.Keys("pc-stats:*")) {
+    const auto h = ctx.Redis.HGetAll(key);
+    for (const char* field : {"hits", "misses"}) {
+      const auto it = h.find(field);
+      if (it != h.end()) s.counted += std::strtoll(it->second.c_str(), nullptr, 10);
+    }
+    const auto fill = h.find("fill_ms");
+    if (fill != h.end()) s.fill_ms += std::strtoll(fill->second.c_str(), nullptr, 10);
+  }
+  for (const auto& v : ctx.Redis.SMembers("pc-versions:t1")) s.listed = s.listed || v == "7";
+  return s;
 }
 
 }  // namespace
@@ -1203,15 +1310,19 @@ void CheckTenantKey(harness::Ctx& ctx) {
 }
 
 void CheckDigestOnly(harness::Ctx& ctx) {
+  const std::string longText = longPrefix();
   emit_decision("t1", 7, kPrefix, "miss", 840, 42);
+  emit_decision("t1", 7, longText, "miss", 900, 42);
   ctx.Settle();
   producer->poll(0);
   const auto values = ctx.Kafka.Values(kTopic);
-  ctx.Equal(values.size(), 1, "one decision; records");
+  ctx.Equal(values.size(), 2, "two decisions; records");
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(event.is_object() && event.value("prefix_digest", "") == sha256_hex(kPrefix), "the event must carry prefix_digest, the SHA-256 hex of the prefix, got %s", values[0]);
   ctx.Assert(values[0].find("Acme Bank") == std::string::npos && values[0].find("4111") == std::string::npos, "the event carries prompt text: %s; the topic is retained and replicated, and the digest is enough to join on", values[0]);
   ctx.Assert(!event.contains("prefix"), "the event has a prefix field: %s", values[0]);
+  const auto long_event = nlohmann::json::parse(values[1], nullptr, false);
+  ctx.Assert(long_event.is_object() && long_event.value("prefix_digest", "") == sha256_hex(longText), "a %d-character prefix must be digested whole: prefix_digest is the SHA-256 hex of the entire prefix, got %s", longText.size(), values[1]);
 }
 
 void CheckTenantStats(harness::Ctx& ctx) {
@@ -1228,12 +1339,17 @@ void CheckTenantStats(harness::Ctx& ctx) {
 }
 
 void CheckCountBeforeCommit(harness::Ctx& ctx) {
-  for (int latency : {900, 700, 800}) eventsSeed(ctx, "t1", 7, "miss", latency, 40);
-  std::vector<long long> atCommit;
-  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(eventsCounted(ctx)); });
+  for (int latency : kLatencies) eventsSeed(ctx, "t1", 7, "miss", latency, 40);
+  std::vector<Snapshot> atCommit;
+  ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(snapshot(ctx)); });
   ctx.Drain([] { run_stats(); });
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
-  ctx.Assert(atCommit[0] >= 1, "at the first commit the stats held %d decisions: the offset moved before the counters, so a crash in between loses the decision for good", atCommit[0]);
+  ctx.Assert(atCommit[0].counted >= 1, "at the first commit the stats held %d decisions: the offset moved before the counters, so a crash in between loses the decision for good", atCommit[0].counted);
+  for (const Snapshot& s : atCommit) {
+    long long want = 0;
+    for (long long i = 0; i < s.counted && i < static_cast<long long>(kLatencies.size()); i++) want += kLatencies[i];
+    ctx.Assert(s.fill_ms == want && s.listed, "at a commit the stats held %d decisions with fill_ms %d (expected %d) and pc-versions:t1 listing version 7: %v. Every counter and the versions set must move before the offset is committed", s.counted, s.fill_ms, want, s.listed);
+  }
   ctx.Equal(eventsCounted(ctx), 3, "three decisions were consumed; decisions counted");
   ctx.Equal(ctx.Kafka.Lag("cache-stats", kTopic), 0, "every processed record must be committed; lag");
 }

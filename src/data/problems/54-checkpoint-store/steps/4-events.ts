@@ -55,7 +55,7 @@ and a broker outage loses it.
       id: 'event-payload',
       title: 'Carries the step, the chunk count and the digest',
       detail:
-        'The value is the type, the run, the upload, the step, the chunk count and the manifest digest of the committed record. The starter sends the type, the upload id and the run.',
+        'The value is the type, the run, the upload, the step, the chunk count and the manifest digest of the committed record, and a delivered event leaves no outbox row. The starter sends the type, the upload id and the run.',
       match: {
         python: {all: [/["']step["']\s*:/, /["']chunks["']\s*:/, /["']digest["']\s*:/]},
         typescript: {all: [/step:\s*record\.step/, /chunks:\s*record\.chunks/, /digest:\s*record\.digest/]},
@@ -94,7 +94,7 @@ and a broker outage loses it.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, while the checkpoint stays committed. The starter fires and forgets.',
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the run as key and the event’s payload, while the checkpoint stays committed. The starter fires and forgets.',
       match: {
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
@@ -602,6 +602,8 @@ def check_event_payload(ctx):
     value = json.loads(records[0].value)
     expected = {"type": "checkpoint.committed", "run_id": "r1", "upload_id": upload_id, "step": 1200, "chunks": 2, "digest": store.manifest(upload_id)}
     assert value == expected, f"the payload is {value}, expected {expected}: a consumer needs the step, the chunk count and the digest without reading the weights"
+    rows = _outbox(ctx)
+    assert rows == [], f"the broker took the event and the outbox still holds {rows}: write a row only when the delivery fails or no report comes, or the relay publishes the checkpoint twice"
 
 
 def check_commit_before_event(ctx):
@@ -635,16 +637,18 @@ def check_outbox_on_failure(ctx):
     record = m.finish_upload(first)
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row no consumer ever learns of the checkpoint"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "r1" and rows[0].get("payload", {}).get("upload_id") == first, f"the outbox row is {rows[0]}, expected the topic, the key r1 and the payload"
+    payload = {"type": "checkpoint.committed", "run_id": "r1", "upload_id": first, "step": 1200, "chunks": 2, "digest": store.manifest(first)}
+    assert rows[0] == {"topic": TOPIC, "key": "r1", "payload": payload}, f"the outbox row is {rows[0]}, expected the topic, the key r1 and the event's payload {payload}"
     assert record is not None and store.record(first) is not None, "the checkpoint must stay committed when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     second = _upload(step=1300)
     before = ctx.clock.time()
     m.finish_upload(second)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"finish_upload waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"finish_upload waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
-    assert len(rows) == 2 and rows[1].get("payload", {}).get("upload_id") == second, f"no delivery report within the window and the outbox holds {rows}"
+    payload = {"type": "checkpoint.committed", "run_id": "r1", "upload_id": second, "step": 1300, "chunks": 2, "digest": store.manifest(second)}
+    assert len(rows) == 2 and rows[1] == {"topic": TOPIC, "key": "r1", "payload": payload}, f"no delivery report within the window and the outbox holds {rows}, expected a second row with the key r1 and the payload {payload}"
 `,
     typescript: `const TOPIC = 'checkpoint.event';
 
@@ -694,6 +698,8 @@ export async function check_event_payload(ctx) {
   assert.equal(values.length, 1, \`one finished upload produced \${values.length} records\`);
   const expected = {type: 'checkpoint.committed', run_id: 'r1', upload_id: uploadId, step: 1200, chunks: 2, digest: await store.manifest(uploadId)};
   assert.deepEqual(JSON.parse(values[0]), expected, \`the payload is \${values[0]}: a consumer needs the step, the chunk count and the digest without reading the weights\`);
+  const rows = outboxRows(ctx);
+  assert.deepEqual(rows, [], \`the broker took the event and the outbox still holds \${JSON.stringify(rows)}: write a row only when the delivery fails or no report comes, or the relay publishes the checkpoint twice\`);
 }
 
 export async function check_commit_before_event(ctx) {
@@ -732,16 +738,19 @@ export async function check_outbox_on_failure(ctx) {
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row no consumer ever learns of the checkpoint\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'r1' && rows[0].payload?.upload_id === first, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key r1 and the payload\`);
+  const firstPayload = {type: 'checkpoint.committed', run_id: 'r1', upload_id: first, step: 1200, chunks: 2, digest: await store.manifest(first)};
+  assert.deepEqual(rows[0], {topic: TOPIC, key: 'r1', payload: firstPayload}, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key r1 and the event's payload\`);
   assert(record !== null && (await store.record(first)) !== null, 'the checkpoint must stay committed when only the produce failed');
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const second = await upload('r1', 1300);
   const before = ctx.clock.now();
   await m.finishUpload(second);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`finishUpload waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`finishUpload waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
-  assert(rows.length === 2 && rows[1].payload?.upload_id === second, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  const secondPayload = {type: 'checkpoint.committed', run_id: 'r1', upload_id: second, step: 1300, chunks: 2, digest: await store.manifest(second)};
+  assert(rows.length === 2, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}, expected a second row\`);
+  assert.deepEqual(rows[1], {topic: TOPIC, key: 'r1', payload: secondPayload}, \`the outbox row for the stalled broker is \${JSON.stringify(rows[1])}, expected the topic, the key r1 and the event's payload\`);
 }
 `,
     go: `package main
@@ -814,6 +823,7 @@ func CheckEventPayload(ctx *harness.Ctx) {
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
 	expected := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": uploadID, "step": 1200.0, "chunks": 2.0, "digest": store.Manifest(eventsBg, uploadID)}
 	ctx.Equal(value, expected, "the payload (a consumer needs the step, the chunk count and the digest without reading the weights)")
+	ctx.Equal(len(eventsOutbox(ctx)), 0, "the broker took the event: write an outbox row only when the delivery fails or no report comes, or the relay publishes the checkpoint twice; the outbox rows")
 }
 
 func CheckCommitBeforeEvent(ctx *harness.Ctx) {
@@ -848,16 +858,19 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row no consumer ever learns of the checkpoint; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "r1" && rows[0].Payload["upload_id"] == first, "the outbox row is %v, expected the topic, the key r1 and the payload", rows[0])
+	firstPayload := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": first, "step": 1200.0, "chunks": 2.0, "digest": store.Manifest(eventsBg, first)}
+	ctx.Equal(rows[0], eventsRow{Topic: eventsTopic, Key: "r1", Payload: firstPayload}, "the outbox row must hold the topic, the key r1 and the event's payload")
 	ctx.Assert(record != nil && store.GetRecord(eventsBg, first) != nil, "the checkpoint must stay committed when only the produce failed")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	second := eventsUpload("r1", 1300, 2)
 	before := ctx.Clock.Now()
 	eventsFinish(ctx, second)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "finishUpload waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "finishUpload waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
-	ctx.Assert(len(rows) == 2 && rows[1].Payload["upload_id"] == second, "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Equal(len(rows), 2, "no delivery report within the window: the outbox must hold a second row; the rows")
+	secondPayload := map[string]any{"type": "checkpoint.committed", "run_id": "r1", "upload_id": second, "step": 1300.0, "chunks": 2.0, "digest": store.Manifest(eventsBg, second)}
+	ctx.Equal(rows[1], eventsRow{Topic: eventsTopic, Key: "r1", Payload: secondPayload}, "the outbox row for the stalled broker must hold the topic, the key r1 and the event's payload")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -894,10 +907,6 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
-  return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
-}
-
 }  // namespace
 
 void CheckRunKey(harness::Ctx& ctx) {
@@ -923,6 +932,8 @@ void CheckEventPayload(harness::Ctx& ctx) {
                                    {"step", 1200},                   {"chunks", 2},     {"digest", store::manifest(upload_id)}};
   ctx.Assert(value == expected, "the payload is %s, expected %s: a consumer needs the step, the chunk count and the digest without reading the weights",
              values[0], expected.dump());
+  ctx.Equal(eventsOutbox(ctx).size(), 0,
+            "the broker took the event: write an outbox row only when the delivery fails or no report comes, or the relay publishes the checkpoint twice; the outbox rows");
 }
 
 void CheckCommitBeforeEvent(harness::Ctx& ctx) {
@@ -964,19 +975,25 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row no consumer ever learns of the checkpoint; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "r1" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "upload_id") == first,
-             "the outbox row is %s, expected the topic, the key r1 and the payload", rows[0].dump());
+  const nlohmann::json firstRow = {{"topic", kEventsTopic},
+                                   {"key", "r1"},
+                                   {"payload",
+                                    {{"type", "checkpoint.committed"}, {"run_id", "r1"}, {"upload_id", first}, {"step", 1200}, {"chunks", 2}, {"digest", store::manifest(first)}}}};
+  ctx.Assert(rows[0] == firstRow, "the outbox row is %s, expected the topic, the key r1 and the event's payload: %s", rows[0].dump(), firstRow.dump());
   ctx.Assert(record.has_value() && store::record(first).has_value(), "the checkpoint must stay committed when only the produce failed");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const std::string second = eventsUpload("r1", 1300);
   const int64_t before = ctx.Clock.Now();
   finishUpload(second);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "finishUpload waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "finishUpload waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "upload_id") == second,
-             "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Equal(rows.size(), 2, "no delivery report within the window: the outbox must hold a second row; the rows");
+  const nlohmann::json secondRow = {{"topic", kEventsTopic},
+                                    {"key", "r1"},
+                                    {"payload",
+                                     {{"type", "checkpoint.committed"}, {"run_id", "r1"}, {"upload_id", second}, {"step", 1300}, {"chunks", 2}, {"digest", store::manifest(second)}}}};
+  ctx.Assert(rows[1] == secondRow, "the outbox row for the stalled broker is %s, expected the topic, the key r1 and the event's payload: %s", rows[1].dump(), secondRow.dump());
 }
 `,
   },

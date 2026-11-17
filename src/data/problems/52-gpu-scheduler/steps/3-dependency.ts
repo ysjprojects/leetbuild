@@ -61,7 +61,7 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
       id: 'deadline',
       title: 'Start carries the 20-second deadline',
       detail:
-        'The `Start` call sets a deadline of `START_DEADLINE_S` (20 s). An agent slower than that answers `DEADLINE_EXCEEDED`, which is retryable; the starter has no deadline and waits as long as the agent takes.',
+        'The `Start` call sets a deadline of `START_DEADLINE_S` (20 s), not shorter: an agent that answers in 15 s still gets the placement. Every `Health` call carries what is left of the same budget. An agent slower than that answers `DEADLINE_EXCEEDED`, which is retryable; the starter has no deadline and waits as long as the agent takes.',
       match: {
         python: {all: [/stub\.Start\([\s\S]{0,200}?timeout\s*=/, /START_DEADLINE_S/]},
         typescript: {all: [/\.Start\([\s\S]{0,200}?deadline/, /START_DEADLINE_MS/]},
@@ -112,7 +112,7 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
       id: 'rollback',
       title: 'Every failed start releases its booking',
       detail:
-        'Before any return other than `running`, `release(node_id, placement_id)` returns the GPUs. The starter never releases, so a node that timed out or refused keeps the booking.',
+        'Before any return other than `running`, `release(node_id, placement_id)` returns the GPUs. One node’s 20 s budget covers the `Start` call and the `Health` polling together, so a slow `Start` leaves less time to poll before the next node is tried. The starter never releases, so a node that timed out or refused keeps the booking.',
       match: {
         python: {all: [/\brelease\(/], order: [/stub\.Start\(/, /\brelease\(/]},
         typescript: {all: [/\brelease\(/], order: [/\.Start\(/, /\brelease\(/]},
@@ -125,7 +125,7 @@ enum HealthStatus { STARTING = 0; HEALTHY = 1; FAILED = 2; }
       id: 'retry-classification',
       title: 'Only retryable outcomes move to another node, at most three starts',
       detail:
-        '`DEADLINE_EXCEEDED`, `UNAVAILABLE` and a spent budget are retried on the next node, counted against `MAX_START_ATTEMPTS`; any other status fails at once. The starter retries every error on every node.',
+        '`DEADLINE_EXCEEDED`, `UNAVAILABLE` and a spent budget are retried on the next node, counted against `MAX_START_ATTEMPTS`, so the third start still happens and a fourth never does; any other status (`RESOURCE_EXHAUSTED`, `ABORTED`, `INTERNAL` and the rest) fails at once. The starter retries every error on every node.',
       match: {
         python: {all: [/RETRYABLE_CODES/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/, /MAX_START_ATTEMPTS/]},
         typescript: {all: [/RETRYABLE_CODES/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/, /MAX_START_ATTEMPTS/]},
@@ -820,6 +820,12 @@ def _starts(ctx, node_id):
     return ctx.grpc.calls_to("Start", target=f"{node_id}:50051")
 
 
+def _beat(ctx, nodes=("gpu-1", "gpu-2")):
+    """The agents keep reporting in while the virtual clock runs on: heartbeats that outlast the next slow start."""
+    for node_id in nodes:
+        ctx.redis.set(f"heartbeat:{node_id}", "1", ex=90)
+
+
 def check_deadline(ctx):
     m, _ = _world(ctx)
     outcome = m.start_placement("p-1", INFER, 4, ["gpu-1", "gpu-2"])
@@ -832,6 +838,17 @@ def check_deadline(ctx):
     outcome = m.start_placement("p-2", INFER, 4, ["gpu-1", "gpu-2"])
     assert outcome == {"status": "running", "node_id": "gpu-2"}, f"with gpu-1's agent 25 s slow the placement must run on gpu-2 after DEADLINE_EXCEEDED, got {outcome}"
     assert ctx.clock.time() - before < 25, f"the scheduler waited {ctx.clock.time() - before:.0f} s for gpu-1's agent: the deadline is 20 s"
+    _beat(ctx)
+    ctx.grpc.set_latency("Start", 15.0, target="gpu-1:50051")
+    outcome = m.start_placement("p-3", INFER, 2, ["gpu-1", "gpu-2"])
+    assert outcome == {"status": "running", "node_id": "gpu-1"}, f"with gpu-1's agent answering Start in 15 s the placement must run on gpu-1, inside its 20 s deadline, got {outcome}"
+    ctx.grpc.set_latency("Start", 0.0, target="gpu-1:50051")
+    ctx.grpc.set_latency("Health", 30.0, target="gpu-1:50051")
+    _beat(ctx)
+    before = ctx.clock.time()
+    outcome = m.start_placement("p-4", INFER, 2, ["gpu-1", "gpu-2"])
+    assert outcome == {"status": "running", "node_id": "gpu-2"}, f"with gpu-1's Health answering in 30 s the placement must run on gpu-2 once the 20 s budget is spent, got {outcome}"
+    assert ctx.clock.time() - before < 25, f"the scheduler waited {ctx.clock.time() - before:.0f} s on gpu-1's Health: every Health call carries what is left of the node's 20 s budget"
 
 
 def check_health_gate(ctx):
@@ -867,6 +884,15 @@ def check_rollback(ctx):
     outcome = m.start_placement("p-2", INFER, 2, ["gpu-2", "gpu-1"])
     assert outcome == {"status": "running", "node_id": "gpu-1"}, f"with gpu-2's agent UNAVAILABLE the placement must run on gpu-1, got {outcome}"
     assert _allocated(ctx, "gpu-2") == 4, f"gpu-2 holds {_allocated(ctx, 'gpu-2')} GPUs after a refused start, expected the 4 of p-1 only"
+    # gpu-1's agent takes 15 s to acknowledge Start, then the hang image never turns healthy there.
+    _beat(ctx)
+    ctx.grpc.set_latency("Start", 15.0, target="gpu-1:50051")
+    before = ctx.clock.time()
+    outcome = m.start_placement("p-3", HANG, 4, ["gpu-1", "gpu-2"])
+    assert outcome == {"status": "running", "node_id": "gpu-2"}, f"a slow Start followed by a container that never reports healthy on gpu-1 must be retried on gpu-2, got {outcome}"
+    retried = _starts(ctx, "gpu-2")[-1].started - before
+    assert retried < 22, f"gpu-2 was tried {retried:.0f} s after the start on gpu-1 began: one node's budget is START_DEADLINE_S (20 s) for the Start call and the Health polling together"
+    assert _allocated(ctx, "gpu-1") == 2, f"gpu-1 holds {_allocated(ctx, 'gpu-1')} GPUs, expected the 2 of p-2 only: release p-3 when its budget is spent"
 
 
 def check_retry_classification(ctx):
@@ -876,12 +902,23 @@ def check_retry_classification(ctx):
     assert outcome.get("status") == "failed", f"INVALID_ARGUMENT from the agent answered {outcome}: an argument error is the same on every node"
     assert len(_starts(ctx, "gpu-2")) == 0, "an argument error must not be retried on gpu-2"
     assert _allocated(ctx, "gpu-1") == 0, "the booking on gpu-1 must be released"
+    for code in (grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.ABORTED, grpc.StatusCode.INTERNAL):
+        ctx.grpc.fail("Start", code, "refused by the agent", times=1, target="gpu-1:50051")
+        tried = len(_starts(ctx, "gpu-2"))
+        outcome = m.start_placement(f"p-{code.name.lower()}", INFER, 4, ["gpu-1", "gpu-2"])
+        assert outcome.get("status") == "failed" and len(_starts(ctx, "gpu-2")) == tried, f"{code.name} from gpu-1's agent answered {outcome} and was {'retried on gpu-2' if len(_starts(ctx, 'gpu-2')) > tried else 'not retried'}: only DEADLINE_EXCEEDED, UNAVAILABLE and a spent budget move to another node"
+        assert _allocated(ctx, "gpu-1") == 0, f"the booking on gpu-1 must be released after {code.name}"
+    ctx.grpc.fail("Start", grpc.StatusCode.UNAVAILABLE, "agent restarting", times=2)
+    outcome = m.start_placement("p-2", INFER, 4, ["gpu-1", "gpu-2", "gpu-3", "gpu-4"])
+    assert outcome == {"status": "running", "node_id": "gpu-3"}, f"with gpu-1 and gpu-2 UNAVAILABLE the third start (MAX_START_ATTEMPTS = 3) must run on gpu-3, got {outcome}"
+    assert _allocated(ctx, "gpu-1") == 0 and _allocated(ctx, "gpu-2") == 0, "the unavailable nodes must be released"
     ctx.grpc.fail("Start", grpc.StatusCode.UNAVAILABLE, "agent restarting", times=5)
-    outcome = m.start_placement("p-2", INFER, 4, ["gpu-1", "gpu-2", "gpu-3", "gpu-4", "gpu-5"])
+    before = len(ctx.grpc.calls_to("Start"))
+    outcome = m.start_placement("p-3", INFER, 4, ["gpu-1", "gpu-2", "gpu-4", "gpu-5", "gpu-3"])
     assert outcome.get("status") == "failed", f"five agents UNAVAILABLE answered {outcome}"
-    starts = len(ctx.grpc.calls_to("Start")) - 1
-    assert starts <= 3, f"{starts} Start calls for one placement across unavailable agents: MAX_START_ATTEMPTS is 3"
-    assert all(_allocated(ctx, n) == 0 for n in ("gpu-1", "gpu-2", "gpu-3")), "every failed node must be released"
+    starts = len(ctx.grpc.calls_to("Start")) - before
+    assert 1 <= starts <= 3, f"{starts} Start calls for one placement across unavailable agents: MAX_START_ATTEMPTS is 3"
+    assert all(_allocated(ctx, n) == 0 for n in ("gpu-1", "gpu-2", "gpu-4", "gpu-5")), "every failed node must be released"
 `,
     typescript: `const INFER = 'registry/infer:1';
 const MISSING = 'registry/missing:9';
@@ -933,6 +970,11 @@ function world(ctx, nodes = ['gpu-1', 'gpu-2']) {
 const allocated = (ctx, id: string): number => Number(ctx.redis.hget(\`node:\${id}\`, 'allocated') ?? 0);
 const starts = (ctx, id: string): number => ctx.grpc.callsTo('Start', \`\${id}:50051\`).length;
 
+/** The agents keep reporting in while the virtual clock runs on: heartbeats that outlast the next slow start. */
+function beat(ctx, nodes = ['gpu-1', 'gpu-2']): void {
+  for (const id of nodes) ctx.redis.set(\`heartbeat:\${id}\`, '1', 'EX', 90);
+}
+
 export async function check_deadline(ctx) {
   const {m} = world(ctx);
   let outcome = await m.startPlacement('p-1', INFER, 4, ['gpu-1', 'gpu-2']);
@@ -944,8 +986,20 @@ export async function check_deadline(ctx) {
   const before = ctx.clock.now();
   outcome = await m.startPlacement('p-2', INFER, 4, ['gpu-1', 'gpu-2']);
   assert.deepEqual(outcome, {status: 'running', node_id: 'gpu-2'}, "with gpu-1's agent 25 s slow the placement must run on gpu-2 after DEADLINE_EXCEEDED");
-  const waited = (ctx.clock.now() - before) / 1000;
+  let waited = (ctx.clock.now() - before) / 1000;
   assert(waited < 25, \`the scheduler waited \${waited.toFixed(0)} s for gpu-1's agent: the deadline is 20 s\`);
+  beat(ctx);
+  ctx.grpc.setLatency('Start', 15, 'gpu-1:50051');
+  outcome = await m.startPlacement('p-3', INFER, 2, ['gpu-1', 'gpu-2']);
+  assert.deepEqual(outcome, {status: 'running', node_id: 'gpu-1'}, "with gpu-1's agent answering Start in 15 s the placement must run on gpu-1, inside its 20 s deadline");
+  ctx.grpc.setLatency('Start', 0, 'gpu-1:50051');
+  ctx.grpc.setLatency('Health', 30, 'gpu-1:50051');
+  beat(ctx);
+  const healthBefore = ctx.clock.now();
+  outcome = await m.startPlacement('p-4', INFER, 2, ['gpu-1', 'gpu-2']);
+  assert.deepEqual(outcome, {status: 'running', node_id: 'gpu-2'}, "with gpu-1's Health answering in 30 s the placement must run on gpu-2 once the 20 s budget is spent");
+  waited = (ctx.clock.now() - healthBefore) / 1000;
+  assert(waited < 25, \`the scheduler waited \${waited.toFixed(0)} s on gpu-1's Health: every Health call carries what is left of the node's 20 s budget\`);
 }
 
 export async function check_health_gate(ctx) {
@@ -981,6 +1035,15 @@ export async function check_rollback(ctx) {
   outcome = await m.startPlacement('p-2', INFER, 2, ['gpu-2', 'gpu-1']);
   assert.deepEqual(outcome, {status: 'running', node_id: 'gpu-1'}, "with gpu-2's agent UNAVAILABLE the placement must run on gpu-1");
   assert.equal(allocated(ctx, 'gpu-2'), 4, 'GPUs gpu-2 holds after a refused start (the 4 of p-1 only)');
+  // gpu-1's agent takes 15 s to acknowledge Start, then the hang image never turns healthy there.
+  beat(ctx);
+  ctx.grpc.setLatency('Start', 15, 'gpu-1:50051');
+  const before = ctx.clock.now();
+  outcome = await m.startPlacement('p-3', HANG, 4, ['gpu-1', 'gpu-2']);
+  assert.deepEqual(outcome, {status: 'running', node_id: 'gpu-2'}, 'a slow Start followed by a container that never reports healthy on gpu-1 must be retried on gpu-2');
+  const retried = (ctx.grpc.callsTo('Start', 'gpu-2:50051').at(-1).started - before) / 1000;
+  assert(retried < 22, \`gpu-2 was tried \${retried.toFixed(0)} s after the start on gpu-1 began: one node's budget is START_DEADLINE_MS (20 s) for the Start call and the Health polling together\`);
+  assert.equal(allocated(ctx, 'gpu-1'), 2, 'GPUs gpu-1 holds (the 2 of p-2 only): release p-3 when its budget is spent');
 }
 
 export async function check_retry_classification(ctx) {
@@ -990,12 +1053,24 @@ export async function check_retry_classification(ctx) {
   assert.equal(outcome.status, 'failed', \`INVALID_ARGUMENT from the agent answered \${JSON.stringify(outcome)}: an argument error is the same on every node\`);
   assert.equal(starts(ctx, 'gpu-2'), 0, 'an argument error must not be retried on gpu-2: Start calls to gpu-2');
   assert.equal(allocated(ctx, 'gpu-1'), 0, 'the booking on gpu-1 must be released');
+  for (const code of ['RESOURCE_EXHAUSTED', 'FAILED_PRECONDITION', 'ABORTED', 'INTERNAL']) {
+    ctx.grpc.fail('Start', ctx.grpc.status[code], 'refused by the agent', 1, 'gpu-1:50051');
+    const tried = starts(ctx, 'gpu-2');
+    outcome = await m.startPlacement(\`p-\${code.toLowerCase()}\`, INFER, 4, ['gpu-1', 'gpu-2']);
+    assert(outcome.status === 'failed' && starts(ctx, 'gpu-2') === tried, \`\${code} from gpu-1's agent answered \${JSON.stringify(outcome)} and was \${starts(ctx, 'gpu-2') > tried ? 'retried on gpu-2' : 'not retried'}: only DEADLINE_EXCEEDED, UNAVAILABLE and a spent budget move to another node\`);
+    assert.equal(allocated(ctx, 'gpu-1'), 0, \`the booking on gpu-1 must be released after \${code}\`);
+  }
+  ctx.grpc.fail('Start', ctx.grpc.status.UNAVAILABLE, 'agent restarting', 2);
+  outcome = await m.startPlacement('p-2', INFER, 4, ['gpu-1', 'gpu-2', 'gpu-3', 'gpu-4']);
+  assert.deepEqual(outcome, {status: 'running', node_id: 'gpu-3'}, 'with gpu-1 and gpu-2 UNAVAILABLE the third start (MAX_START_ATTEMPTS = 3) must run on gpu-3');
+  assert(allocated(ctx, 'gpu-1') === 0 && allocated(ctx, 'gpu-2') === 0, 'the unavailable nodes must be released');
   ctx.grpc.fail('Start', ctx.grpc.status.UNAVAILABLE, 'agent restarting', 5);
-  outcome = await m.startPlacement('p-2', INFER, 4, ['gpu-1', 'gpu-2', 'gpu-3', 'gpu-4', 'gpu-5']);
+  const before = ctx.grpc.callsTo('Start').length;
+  outcome = await m.startPlacement('p-3', INFER, 4, ['gpu-1', 'gpu-2', 'gpu-4', 'gpu-5', 'gpu-3']);
   assert.equal(outcome.status, 'failed', \`five agents UNAVAILABLE answered \${JSON.stringify(outcome)}\`);
-  const total = ctx.grpc.callsTo('Start').length - 1;
-  assert(total <= 3, \`\${total} Start calls for one placement across unavailable agents: MAX_START_ATTEMPTS is 3\`);
-  for (const id of ['gpu-1', 'gpu-2', 'gpu-3']) assert.equal(allocated(ctx, id), 0, \`every failed node must be released: \${id}\`);
+  const total = ctx.grpc.callsTo('Start').length - before;
+  assert(1 <= total && total <= 3, \`\${total} Start calls for one placement across unavailable agents: MAX_START_ATTEMPTS is 3\`);
+  for (const id of ['gpu-1', 'gpu-2', 'gpu-4', 'gpu-5']) assert.equal(allocated(ctx, id), 0, \`every failed node must be released: \${id}\`);
 }
 `,
     go: `package main
@@ -1119,6 +1194,13 @@ func clientAllocated(ctx *harness.Ctx, id string) int {
 
 func clientStarts(ctx *harness.Ctx, id string) int { return len(ctx.GRPC.CallsTo("Start", id+":50051")) }
 
+// clientBeat: the agents keep reporting in while the virtual clock runs on, heartbeats that outlast the next slow start.
+func clientBeat(ctx *harness.Ctx) {
+	for _, id := range []string{"gpu-1", "gpu-2"} {
+		ctx.Redis.Do("SET", "heartbeat:"+id, "1", "EX", 90)
+	}
+}
+
 func CheckDeadline(ctx *harness.Ctx) {
 	clientWorld(ctx)
 	outcome := startPlacement(context.Background(), "p-1", clientInfer, 4, []string{"gpu-1", "gpu-2"})
@@ -1132,6 +1214,18 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-2"}, "with gpu-1's agent 25 s slow the placement must run on gpu-2 after DEADLINE_EXCEEDED")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited < 25, "the scheduler waited %.0f s for gpu-1's agent: the deadline is 20 s", waited)
+	clientBeat(ctx)
+	ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051")
+	outcome = startPlacement(context.Background(), "p-3", clientInfer, 2, []string{"gpu-1", "gpu-2"})
+	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-1"}, "with gpu-1's agent answering Start in 15 s the placement must run on gpu-1, inside its 20 s deadline")
+	ctx.GRPC.SetLatency("Start", 0, "gpu-1:50051")
+	ctx.GRPC.SetLatency("Health", 30, "gpu-1:50051")
+	clientBeat(ctx)
+	before = ctx.Clock.Now()
+	outcome = startPlacement(context.Background(), "p-4", clientInfer, 2, []string{"gpu-1", "gpu-2"})
+	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-2"}, "with gpu-1's Health answering in 30 s the placement must run on gpu-2 once the 20 s budget is spent")
+	waited = float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited < 25, "the scheduler waited %.0f s on gpu-1's Health: every Health call carries what is left of the node's 20 s budget", waited)
 }
 
 func CheckHealthGate(ctx *harness.Ctx) {
@@ -1169,6 +1263,16 @@ func CheckRollback(ctx *harness.Ctx) {
 	outcome = startPlacement(context.Background(), "p-2", clientInfer, 2, []string{"gpu-2", "gpu-1"})
 	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-1"}, "with gpu-2's agent UNAVAILABLE the placement must run on gpu-1")
 	ctx.Equal(clientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds after a refused start (the 4 of p-1 only)")
+	// gpu-1's agent takes 15 s to acknowledge Start, then the hang image never turns healthy there.
+	clientBeat(ctx)
+	ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051")
+	before := ctx.Clock.Now()
+	outcome = startPlacement(context.Background(), "p-3", clientHang, 4, []string{"gpu-1", "gpu-2"})
+	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-2"}, "a slow Start followed by a container that never reports healthy on gpu-1 must be retried on gpu-2")
+	onGPU2 := ctx.GRPC.CallsTo("Start", "gpu-2:50051")
+	retried := float64(onGPU2[len(onGPU2)-1].Started.UnixMilli()-before) / 1000
+	ctx.Assert(retried < 22, "gpu-2 was tried %.0f s after the start on gpu-1 began: one node's budget is config.StartDeadline (20 s) for the Start call and the Health polling together", retried)
+	ctx.Equal(clientAllocated(ctx, "gpu-1"), 2, "GPUs gpu-1 holds (the 2 of p-2 only): release p-3 when its budget is spent")
 }
 
 func CheckRetryClassification(ctx *harness.Ctx) {
@@ -1178,18 +1282,31 @@ func CheckRetryClassification(ctx *harness.Ctx) {
 	ctx.Equal(outcome.Status, "failed", "INVALID_ARGUMENT from the agent (%+v): an argument error is the same on every node; the status", outcome)
 	ctx.Equal(clientStarts(ctx, "gpu-2"), 0, "an argument error must not be retried on gpu-2: Start calls to gpu-2")
 	ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released")
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.FailedPrecondition, codes.Aborted, codes.Internal} {
+		ctx.GRPC.Fail("Start", code, "refused by the agent", 1, "gpu-1:50051")
+		tried := clientStarts(ctx, "gpu-2")
+		outcome = startPlacement(context.Background(), "p-"+strings.ToLower(code.String()), clientInfer, 4, []string{"gpu-1", "gpu-2"})
+		ctx.Assert(outcome.Status == "failed" && clientStarts(ctx, "gpu-2") == tried, "%v from gpu-1's agent answered %+v (Start calls to gpu-2: %d before, %d after): only DEADLINE_EXCEEDED, UNAVAILABLE and a spent budget move to another node", code, outcome, tried, clientStarts(ctx, "gpu-2"))
+		ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released after %v", code)
+	}
+	ctx.GRPC.Fail("Start", codes.Unavailable, "agent restarting", 2, "")
+	outcome = startPlacement(context.Background(), "p-2", clientInfer, 4, []string{"gpu-1", "gpu-2", "gpu-3", "gpu-4"})
+	ctx.Equal(outcome, Outcome{Status: "running", NodeID: "gpu-3"}, "with gpu-1 and gpu-2 UNAVAILABLE the third start (config.MaxStartAttempts = 3) must run on gpu-3")
+	ctx.Assert(clientAllocated(ctx, "gpu-1") == 0 && clientAllocated(ctx, "gpu-2") == 0, "the unavailable nodes must be released")
 	ctx.GRPC.Fail("Start", codes.Unavailable, "agent restarting", 5, "")
-	outcome = startPlacement(context.Background(), "p-2", clientInfer, 4, []string{"gpu-1", "gpu-2", "gpu-3", "gpu-4", "gpu-5"})
+	before := len(ctx.GRPC.CallsTo("Start", ""))
+	outcome = startPlacement(context.Background(), "p-3", clientInfer, 4, []string{"gpu-1", "gpu-2", "gpu-4", "gpu-5", "gpu-3"})
 	ctx.Equal(outcome.Status, "failed", "five agents UNAVAILABLE (%+v); the status", outcome)
-	total := len(ctx.GRPC.CallsTo("Start", "")) - 1
-	ctx.Assert(total <= 3, "%d Start calls for one placement across unavailable agents: config.MaxStartAttempts is 3", total)
-	for _, id := range []string{"gpu-1", "gpu-2", "gpu-3"} {
+	total := len(ctx.GRPC.CallsTo("Start", "")) - before
+	ctx.Assert(1 <= total && total <= 3, "%d Start calls for one placement across unavailable agents: config.MaxStartAttempts is 3", total)
+	for _, id := range []string{"gpu-1", "gpu-2", "gpu-4", "gpu-5"} {
 		ctx.Equal(clientAllocated(ctx, id), 0, "every failed node must be released: %s", id)
 	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <chrono>
 #include <map>
 #include <string>
 #include <vector>
@@ -1264,6 +1381,11 @@ int clientAllocated(harness::Ctx& ctx, const std::string& id) {
 
 size_t clientStarts(harness::Ctx& ctx, const std::string& id) { return ctx.GRPC.CallsTo("Start", id + ":50051").size(); }
 
+// The agents keep reporting in while the virtual clock runs on: heartbeats that outlast the next slow start.
+void clientBeat(harness::Ctx& ctx) {
+  for (const std::string id : {"gpu-1", "gpu-2"}) ctx.Redis.Do("SET", "heartbeat:" + id, "1", "EX", 90);
+}
+
 }  // namespace
 
 // The ledger (state.cpp, step 2) as the harness stands in for it.
@@ -1302,8 +1424,24 @@ void CheckDeadline(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   outcome = start_placement("p-2", kInfer, 4, {"gpu-1", "gpu-2"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-2", "with gpu-1's agent 25 s slow the placement must run on gpu-2 after DEADLINE_EXCEEDED, got %s on %q", outcome.status, outcome.node_id);
-  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited < 25, "the scheduler waited %.0f s for gpu-1's agent: the deadline is 20 s", waited);
+  clientBeat(ctx);
+  ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051");
+  outcome = start_placement("p-3", kInfer, 2, {"gpu-1", "gpu-2"});
+  ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-1",
+             "with gpu-1's agent answering Start in 15 s the placement must run on gpu-1, inside its 20 s deadline, got %s on %q (%s)", outcome.status,
+             outcome.node_id, outcome.reason);
+  ctx.GRPC.SetLatency("Start", 0, "gpu-1:50051");
+  ctx.GRPC.SetLatency("Health", 30, "gpu-1:50051");
+  clientBeat(ctx);
+  const int64_t healthBefore = ctx.Clock.Now();
+  outcome = start_placement("p-4", kInfer, 2, {"gpu-1", "gpu-2"});
+  ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-2",
+             "with gpu-1's Health answering in 30 s the placement must run on gpu-2 once the 20 s budget is spent, got %s on %q (%s)", outcome.status,
+             outcome.node_id, outcome.reason);
+  waited = static_cast<double>(ctx.Clock.Now() - healthBefore) / 1000;
+  ctx.Assert(waited < 25, "the scheduler waited %.0f s on gpu-1's Health: every Health call carries what is left of the node's 20 s budget", waited);
 }
 
 void CheckHealthGate(harness::Ctx& ctx) {
@@ -1339,6 +1477,19 @@ void CheckRollback(harness::Ctx& ctx) {
   outcome = start_placement("p-2", kInfer, 2, {"gpu-2", "gpu-1"});
   ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-1", "with gpu-2's agent UNAVAILABLE the placement must run on gpu-1, got %s on %q", outcome.status, outcome.node_id);
   ctx.Equal(clientAllocated(ctx, "gpu-2"), 4, "GPUs gpu-2 holds after a refused start (the 4 of p-1 only)");
+  // gpu-1's agent takes 15 s to acknowledge Start, then the hang image never turns healthy there.
+  clientBeat(ctx);
+  ctx.GRPC.SetLatency("Start", 15, "gpu-1:50051");
+  const int64_t before = ctx.Clock.Now();
+  outcome = start_placement("p-3", kHang, 4, {"gpu-1", "gpu-2"});
+  ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-2",
+             "a slow Start followed by a container that never reports healthy on gpu-1 must be retried on gpu-2, got %s on %q (%s)", outcome.status,
+             outcome.node_id, outcome.reason);
+  const auto onGpu2 = ctx.GRPC.CallsTo("Start", "gpu-2:50051");
+  const int64_t startedMs = std::chrono::duration_cast<std::chrono::milliseconds>(onGpu2.back().Started.time_since_epoch()).count();
+  const double retried = static_cast<double>(startedMs - before) / 1000;
+  ctx.Assert(retried < 22, "gpu-2 was tried %.0f s after the start on gpu-1 began: one node's budget is kStartDeadline (20 s) for the Start call and the Health polling together", retried);
+  ctx.Equal(clientAllocated(ctx, "gpu-1"), 2, "GPUs gpu-1 holds (the 2 of p-2 only): release p-3 when its budget is spent");
 }
 
 void CheckRetryClassification(harness::Ctx& ctx) {
@@ -1348,12 +1499,33 @@ void CheckRetryClassification(harness::Ctx& ctx) {
   ctx.Equal(outcome.status, "failed", "INVALID_ARGUMENT from the agent: an argument error is the same on every node; the status");
   ctx.Equal(clientStarts(ctx, "gpu-2"), 0, "an argument error must not be retried on gpu-2: Start calls to gpu-2");
   ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+                                                                          {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+                                                                          {grpc::StatusCode::ABORTED, "ABORTED"},
+                                                                          {grpc::StatusCode::INTERNAL, "INTERNAL"}};
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.Fail("Start", code, "refused by the agent", 1, "gpu-1:50051");
+    const size_t tried = clientStarts(ctx, "gpu-2");
+    outcome = start_placement("p-" + name, kInfer, 4, {"gpu-1", "gpu-2"});
+    ctx.Assert(outcome.status == "failed" && clientStarts(ctx, "gpu-2") == tried,
+               "%s from gpu-1's agent answered %s on %q (Start calls to gpu-2: %d before, %d after): only DEADLINE_EXCEEDED, UNAVAILABLE and a "
+               "spent budget move to another node",
+               name, outcome.status, outcome.node_id, tried, clientStarts(ctx, "gpu-2"));
+    ctx.Equal(clientAllocated(ctx, "gpu-1"), 0, "the booking on gpu-1 must be released after %s", name);
+  }
+  ctx.GRPC.Fail("Start", grpc::StatusCode::UNAVAILABLE, "agent restarting", 2);
+  outcome = start_placement("p-2", kInfer, 4, {"gpu-1", "gpu-2", "gpu-3", "gpu-4"});
+  ctx.Assert(outcome.status == "running" && outcome.node_id == "gpu-3",
+             "with gpu-1 and gpu-2 UNAVAILABLE the third start (kMaxStartAttempts = 3) must run on gpu-3, got %s on %q (%s)", outcome.status, outcome.node_id,
+             outcome.reason);
+  ctx.Assert(clientAllocated(ctx, "gpu-1") == 0 && clientAllocated(ctx, "gpu-2") == 0, "the unavailable nodes must be released");
   ctx.GRPC.Fail("Start", grpc::StatusCode::UNAVAILABLE, "agent restarting", 5);
-  outcome = start_placement("p-2", kInfer, 4, {"gpu-1", "gpu-2", "gpu-3", "gpu-4", "gpu-5"});
+  const int before = static_cast<int>(ctx.GRPC.CallsTo("Start").size());
+  outcome = start_placement("p-3", kInfer, 4, {"gpu-1", "gpu-2", "gpu-4", "gpu-5", "gpu-3"});
   ctx.Equal(outcome.status, "failed", "five agents UNAVAILABLE; the status");
-  const int total = static_cast<int>(ctx.GRPC.CallsTo("Start").size()) - 1;
-  ctx.Assert(total <= 3, "%d Start calls for one placement across unavailable agents: kMaxStartAttempts is 3", total);
-  for (const std::string id : {"gpu-1", "gpu-2", "gpu-3"}) ctx.Equal(clientAllocated(ctx, id), 0, "every failed node must be released: %s", id);
+  const int total = static_cast<int>(ctx.GRPC.CallsTo("Start").size()) - before;
+  ctx.Assert(1 <= total && total <= 3, "%d Start calls for one placement across unavailable agents: kMaxStartAttempts is 3", total);
+  for (const std::string id : {"gpu-1", "gpu-2", "gpu-4", "gpu-5"}) ctx.Equal(clientAllocated(ctx, id), 0, "every failed node must be released: %s", id);
 }
 `,
   },

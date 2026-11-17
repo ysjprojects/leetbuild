@@ -101,7 +101,7 @@ broker outage drops it.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A delivery the broker refuses leaves an outbox row with the topic, the key and the payload, `materialize` returns false, and the partition stays committed. The starter logs the refusal and returns true.',
+        'A delivery the broker refuses, or never acknowledges within `ACK_TIMEOUT_S` (2 s, and no longer), leaves an outbox row with the topic, the key and the full payload, `materialize` returns false, and the partition stays committed; an acknowledged delivery returns true and leaves no row. The starter logs the refusal and returns true.',
       match: {
         python: {
           all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -301,6 +301,7 @@ func materialize(ctx context.Context, name string, version int, partition string
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/segmentio/kafka-go"
 
@@ -310,7 +311,10 @@ import (
 	"features/stats"
 )
 
-const topic = "feature.event"
+const (
+	topic      = "feature.event"
+	ackTimeout = 2 * time.Second
+)
 
 var writer = &kafka.Writer{
 	Addr:         kafka.TCP("kafka:9092"),
@@ -345,7 +349,10 @@ func materialize(ctx context.Context, name string, version int, partition string
 	// The partition is committed: the event describes state that exists.
 	payload := map[string]any{"feature": name, "version": version, "partition": partition, "rows": written}
 	value, _ := json.Marshal(payload)
-	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(name), Value: value}); err != nil {
+	// Wait for the acknowledgement at most ackTimeout: no answer counts as a refusal.
+	sendCtx, cancel := context.WithTimeout(ctx, ackTimeout)
+	defer cancel()
+	if err := writer.WriteMessages(sendCtx, kafka.Message{Key: []byte(name), Value: value}); err != nil {
 		// The broker did not take it: the relay produces the row later, so lineage is late, not lost.
 		if err := outbox.Insert(ctx, topic, name, payload); err != nil {
 			return false, err
@@ -615,13 +622,28 @@ def check_acks_all(ctx):
 def check_outbox_on_failure(ctx):
     m, now = _events(ctx)
     ctx.kafka.fail_next(TOPIC, 1)
-    ok = m.materialize("amount_7d", 2, "2026-10-01", _rows(now, "a1"))
+    # Two values and a null: the outbox payload counts the two rows written, as the event would.
+    ok = m.materialize("amount_7d", 2, "2026-10-01", _rows(now, "a1") + [{"entity": "a1/e-3", "value": None, "event_ts": now - 60}])
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the partition's lineage is lost"
     row = rows[0]
-    assert row.get("topic") == TOPIC and row.get("key") == "amount_7d" and row.get("payload", {}).get("partition") == "2026-10-01", f"the outbox row is {row}, expected the topic, the key amount_7d and the payload"
+    expected = {"feature": "amount_7d", "version": 2, "partition": "2026-10-01", "rows": 2}
+    assert row.get("topic") == TOPIC and row.get("key") == "amount_7d" and row.get("payload") == expected, f"the outbox row is {row}, expected the topic, the key amount_7d and the payload {expected}"
     assert ok is False, f"materialize returned {ok!r} after a failed delivery, expected False"
     assert registry.committed_partitions("amount_7d", 2) == {"2026-10-01": 2}, "the partition must stay committed when only the produce failed"
+    # A delivery the broker acknowledges leaves no outbox row and returns True.
+    ok = m.materialize("amount_7d", 2, "2026-10-02", _rows(now, "a2"))
+    extra = len(_outbox(ctx)) - 1
+    assert ok is True and extra == 0, f"a delivery the broker acknowledged returned {ok!r} and added {extra} outbox row(s), expected True and none"
+    # A broker that never answers: wait ACK_TIMEOUT_S, no longer, then fall back to the outbox.
+    ctx.kafka.stall(TOPIC)
+    before = time.time()
+    ok = m.materialize("amount_7d", 2, "2026-10-03", _rows(now, "a3"))
+    waited = time.time() - before
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("payload", {}).get("partition") == "2026-10-03", f"the broker never acknowledged 2026-10-03 and the outbox holds {rows}: no answer within ACK_TIMEOUT_S is a failed delivery"
+    assert ok is False, f"materialize returned {ok!r} when the broker never answered, expected False"
+    assert waited <= 2.5, f"materialize waited {waited:.1f} s for a broker that does not answer, expected at most ACK_TIMEOUT_S (2 s)"
 `,
     typescript: `const TOPIC = 'feature.event';
 
@@ -703,14 +725,32 @@ export async function check_acks_all(ctx) {
 export async function check_outbox_on_failure(ctx) {
   const {m, registry, now} = await events(ctx);
   ctx.kafka.failNext(TOPIC, 1);
-  const ok = await m.materialize('amount_7d', 2, '2026-10-01', rowsOf(now, 'a1'));
+  // Two values and a null: the outbox payload counts the two rows written, as the event would.
+  const ok = await m.materialize('amount_7d', 2, '2026-10-01', [...rowsOf(now, 'a1'), {entity: 'a1/e-3', value: null, event_ts: now - 60}]);
   await settle();
   const rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the partition's lineage is lost\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'amount_7d' && rows[0].payload?.partition === '2026-10-01', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key amount_7d and the payload\`);
+  const p = rows[0].payload ?? {};
+  const payloadOk = p.feature === 'amount_7d' && p.version === 2 && p.partition === '2026-10-01' && p.rows === 2 && Object.keys(p).length === 4;
+  assert(rows[0].topic === TOPIC && rows[0].key === 'amount_7d' && payloadOk, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key amount_7d and the payload {feature: amount_7d, version: 2, partition: 2026-10-01, rows: 2}\`);
   assert.equal(ok, false, \`materialize resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   const committed = await registry.committedPartitions('amount_7d', 2);
   assert.equal(JSON.stringify(committed), '{"2026-10-01":2}', 'the partition must stay committed when only the produce failed');
+  // A delivery the broker acknowledges leaves no outbox row and resolves true.
+  const delivered = await m.materialize('amount_7d', 2, '2026-10-02', rowsOf(now, 'a2'));
+  await settle();
+  const extra = outboxRows(ctx).length - 1;
+  assert(delivered === true && extra === 0, \`a delivery the broker acknowledged resolved \${JSON.stringify(delivered)} and added \${extra} outbox row(s), expected true and none\`);
+  // A broker that never answers: wait ACK_TIMEOUT_MS, no longer, then fall back to the outbox.
+  ctx.kafka.stall(TOPIC);
+  const before = ctx.clock.now();
+  const stalled = await m.materialize('amount_7d', 2, '2026-10-03', rowsOf(now, 'a3'));
+  const waited = (ctx.clock.now() - before) / 1000;
+  await settle();
+  const after = outboxRows(ctx);
+  assert(after.length === 2 && after[1].payload?.partition === '2026-10-03', \`the broker never acknowledged 2026-10-03 and the outbox holds \${JSON.stringify(after)}: no answer within ACK_TIMEOUT_MS is a failed delivery\`);
+  assert.equal(stalled, false, \`materialize resolved \${JSON.stringify(stalled)} when the broker never answered, expected false\`);
+  assert(waited <= 2.5, \`materialize waited \${waited.toFixed(1)} s for a broker that does not answer, expected at most ACK_TIMEOUT_MS (2000 ms)\`);
 }
 `,
     go: `package main
@@ -718,7 +758,6 @@ export async function check_outbox_on_failure(ctx) {
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	"features/online"
@@ -727,101 +766,124 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "feature.event"
+const hEventsTopic = "feature.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func events(ctx *harness.Ctx) int64 {
+func hEvents(ctx *harness.Ctx) int64 {
 	now := time.Now().Unix()
 	for _, name := range []string{"amount_7d", "clicks_1h"} {
-		_, err := registry.CreateDefinition(eventsBg, registry.Definition{Name: name, Version: 2, Dtype: "float64", ComputationRef: "window_avg_7d", FreshnessSLO: 3600, CreatedAt: now})
+		_, err := registry.CreateDefinition(hEventsBg, registry.Definition{Name: name, Version: 2, Dtype: "float64", ComputationRef: "window_avg_7d", FreshnessSLO: 3600, CreatedAt: now})
 		ctx.NoError(err, "CreateDefinition")
 	}
 	return now
 }
 
-func num(v float64) *float64 { return &v }
+func hNum(v float64) *float64 { return &v }
 
-func rowsOf(now int64, prefix string) []online.Row {
-	return []online.Row{{Entity: prefix + "/e-1", Value: num(1), EventTs: now - 60}, {Entity: prefix + "/e-2", Value: num(2), EventTs: now - 60}}
+func hRowsOf(now int64, prefix string) []online.Row {
+	return []online.Row{{Entity: prefix + "/e-1", Value: hNum(1), EventTs: now - 60}, {Entity: prefix + "/e-2", Value: hNum(2), EventTs: now - 60}}
 }
 
-func mustMaterialize(ctx *harness.Ctx, name, partition string, rows []online.Row) bool {
-	ok, err := materialize(eventsBg, name, 2, partition, rows)
+func hMaterialize(ctx *harness.Ctx, name, partition string, rows []online.Row) bool {
+	ok, err := materialize(hEventsBg, name, 2, partition, rows)
 	ctx.NoError(err, "materialize(%s, %s) failed", name, partition)
 	return ok
 }
 
-func payloadOf(ctx *harness.Ctx, value string) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value string) map[string]any {
 	var payload map[string]any
 	ctx.NoError(json.Unmarshal([]byte(value), &payload), "the event must be JSON, got %s", value)
 	return payload
 }
 
+func hOutbox(ctx *harness.Ctx) []map[string]any {
+	var rows []map[string]any
+	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
+		rows = append(rows, hPayloadOf(ctx, text))
+	}
+	return rows
+}
+
 func CheckFeatureKey(ctx *harness.Ctx) {
-	now := events(ctx)
-	mustMaterialize(ctx, "amount_7d", "2026-10-01", rowsOf(now, "a1"))
-	mustMaterialize(ctx, "clicks_1h", "2026-10-01", rowsOf(now, "c1"))
-	mustMaterialize(ctx, "amount_7d", "2026-10-02", rowsOf(now, "a2"))
+	now := hEvents(ctx)
+	hMaterialize(ctx, "amount_7d", "2026-10-01", hRowsOf(now, "a1"))
+	hMaterialize(ctx, "clicks_1h", "2026-10-01", hRowsOf(now, "c1"))
+	hMaterialize(ctx, "amount_7d", "2026-10-02", hRowsOf(now, "a2"))
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(hEventsTopic)
 	ctx.Equal(len(records), 3, "three partitions materialized must produce three records on feature.event; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"amount_7d", "clicks_1h", "amount_7d"}, "the records must be keyed by the feature names")
+	ctx.Equal(ctx.Kafka.Keys(hEventsTopic), []string{"amount_7d", "clicks_1h", "amount_7d"}, "the records must be keyed by the feature names")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both amount_7d events must land on one partition, or a consumer reads one feature's lineage out of order; the partitions")
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
-	now := events(ctx)
-	probe := ctx.Redis.After("partitions:amount_7d:2", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	mustMaterialize(ctx, "amount_7d", "2026-10-01", rowsOf(now, "a1"))
+	now := hEvents(ctx)
+	probe := ctx.Redis.After("partitions:amount_7d:2", func() any { return len(ctx.Kafka.Records(hEventsTopic)) })
+	hMaterialize(ctx, "amount_7d", "2026-10-01", hRowsOf(now, "a1"))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "materialize never committed the partition (no write to partitions:amount_7d:2)")
 	ctx.Equal(probe.Result, 0, "when the partition was committed the topic already held events: a consumer can learn about a partition that does not exist yet. Commit first, then produce; the events at commit time")
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(hEventsTopic)
 	ctx.Equal(len(values), 1, "the event must still be produced after the commit; the records")
-	payload := payloadOf(ctx, values[0])
+	payload := hPayloadOf(ctx, values[0])
 	ctx.Assert(payload["feature"] == "amount_7d" && payload["partition"] == "2026-10-01", "the event is %s, expected feature, version and partition", values[0])
 }
 
 func CheckRowsWritten(ctx *harness.Ctx) {
-	now := events(ctx)
+	now := hEvents(ctx)
 	// The streaming path already wrote a newer value of e-2; e-3 has no value.
-	_, err := online.WriteValue(eventsBg, "amount_7d", 2, "a1/e-2", 7, now-5)
+	_, err := online.WriteValue(hEventsBg, "amount_7d", 2, "a1/e-2", 7, now-5)
 	ctx.NoError(err, "online.WriteValue")
-	rows := []online.Row{{Entity: "a1/e-1", Value: num(1), EventTs: now - 60}, {Entity: "a1/e-2", Value: num(2), EventTs: now - 60}, {Entity: "a1/e-3", EventTs: now - 60}}
-	mustMaterialize(ctx, "amount_7d", "2026-10-01", rows)
+	rows := []online.Row{{Entity: "a1/e-1", Value: hNum(1), EventTs: now - 60}, {Entity: "a1/e-2", Value: hNum(2), EventTs: now - 60}, {Entity: "a1/e-3", EventTs: now - 60}}
+	hMaterialize(ctx, "amount_7d", "2026-10-01", rows)
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(hEventsTopic)
 	ctx.Equal(len(values), 1, "one partition materialized must produce one record; the records")
-	ctx.Equal(payloadOf(ctx, values[0])["rows"], 1, "one row was written (e-2 lost to a newer stored value, e-3 is null): count what WriteValue stored; the event's rows")
-	ctx.Equal(registry.CommittedPartitions(eventsBg, "amount_7d", 2), map[string]int{"2026-10-01": 1}, "the partition must be committed with the 1 row written; committed")
-	kept, _ := online.ReadValue(eventsBg, "amount_7d", 2, "a1/e-2")
+	ctx.Equal(hPayloadOf(ctx, values[0])["rows"], 1, "one row was written (e-2 lost to a newer stored value, e-3 is null): count what WriteValue stored; the event's rows")
+	ctx.Equal(registry.CommittedPartitions(hEventsBg, "amount_7d", 2), map[string]int{"2026-10-01": 1}, "the partition must be committed with the 1 row written; committed")
+	kept, _ := online.ReadValue(hEventsBg, "amount_7d", 2, "a1/e-2")
 	ctx.Assert(kept != nil && kept.Value == 7, "the newer value of e-2 must survive the backfill, it reads %+v", kept)
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
-	now := events(ctx)
-	mustMaterialize(ctx, "amount_7d", "2026-10-01", rowsOf(now, "a1"))
+	now := hEvents(ctx)
+	hMaterialize(ctx, "amount_7d", "2026-10-01", hRowsOf(now, "a1"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "a leader failover must not lose the lineage event (RequireAll waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "a leader failover must not lose the lineage event (RequireAll waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	now := events(ctx)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := mustMaterialize(ctx, "amount_7d", "2026-10-01", rowsOf(now, "a1"))
+	now := hEvents(ctx)
+	ctx.Kafka.FailNext(hEventsTopic, 1)
+	// Two values and a null: the outbox payload counts the two rows written, as the event would.
+	ok := hMaterialize(ctx, "amount_7d", "2026-10-01", append(hRowsOf(now, "a1"), online.Row{Entity: "a1/e-3", EventTs: now - 60}))
 	ctx.Settle()
-	var rows []map[string]any
-	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		rows = append(rows, payloadOf(ctx, text))
-	}
+	rows := hOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the partition's lineage is lost; the rows")
 	payload, _ := rows[0]["payload"].(map[string]any)
-	ctx.Assert(rows[0]["topic"] == eventsTopic && rows[0]["key"] == "amount_7d" && payload["partition"] == "2026-10-01", "the outbox row is %v, expected the topic, the key amount_7d and the payload", rows[0])
+	payloadOK := len(payload) == 4 && payload["feature"] == "amount_7d" && payload["version"] == 2.0 && payload["partition"] == "2026-10-01" && payload["rows"] == 2.0
+	ctx.Assert(rows[0]["topic"] == hEventsTopic && rows[0]["key"] == "amount_7d" && payloadOK, "the outbox row is %v, expected the topic, the key amount_7d and the payload {feature: amount_7d, version: 2, partition: 2026-10-01, rows: 2}", rows[0])
 	ctx.Equal(ok, false, "materialize's result after a failed delivery")
-	ctx.Equal(registry.CommittedPartitions(eventsBg, "amount_7d", 2), map[string]int{"2026-10-01": 2}, "the partition must stay committed when only the produce failed; committed")
-	_ = fmt.Sprint
+	ctx.Equal(registry.CommittedPartitions(hEventsBg, "amount_7d", 2), map[string]int{"2026-10-01": 2}, "the partition must stay committed when only the produce failed; committed")
+	// A delivery the broker acknowledges leaves no outbox row and returns true.
+	delivered := hMaterialize(ctx, "amount_7d", "2026-10-02", hRowsOf(now, "a2"))
+	ctx.Settle()
+	extra := len(hOutbox(ctx)) - 1
+	ctx.Assert(delivered && extra == 0, "a delivery the broker acknowledged returned %v and added %d outbox row(s), expected true and none", delivered, extra)
+	// A broker that never answers: wait ackTimeout (2 s), no longer, then fall back to the outbox.
+	ctx.Kafka.Stall(hEventsTopic)
+	before := ctx.Clock.Now()
+	stalled := hMaterialize(ctx, "amount_7d", "2026-10-03", hRowsOf(now, "a3"))
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Settle()
+	after := hOutbox(ctx)
+	ctx.Equal(len(after), 2, "the broker never acknowledged 2026-10-03: no answer within 2 s is a failed delivery and needs an outbox row; the rows")
+	late, _ := after[1]["payload"].(map[string]any)
+	ctx.Assert(late["partition"] == "2026-10-03", "the second outbox row is %v, expected the payload of 2026-10-03", after[1])
+	ctx.Equal(stalled, false, "materialize's result when the broker never answered")
+	ctx.Assert(waited <= 2.5, "materialize waited %.1f s for a broker that does not answer, expected at most 2 s", waited)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -842,29 +904,35 @@ namespace {
 
 const std::string kEventsTopic = "feature.event";
 
-long long events() {
+long long hEvents() {
   const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   for (const std::string name : {"amount_7d", "clicks_1h"}) registry::createDefinition(registry::Definition{name, 2, "float64", "window_avg_7d", 3600, now});
   return now;
 }
 
-std::vector<online::Row> rowsOf(long long now, const std::string& prefix) {
+std::vector<online::Row> hRowsOf(long long now, const std::string& prefix) {
   return {online::Row{prefix + "/e-1", 1.0, now - 60}, online::Row{prefix + "/e-2", 2.0, now - 60}};
 }
 
-json parsed(const std::string& text) { return json::parse(text, nullptr, false); }
+json hParsed(const std::string& text) { return json::parse(text, nullptr, false); }
 
-std::string field(const json& j, const std::string& name) {
+std::string hField(const json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+std::vector<json> hOutbox(harness::Ctx& ctx) {
+  std::vector<json> rows;
+  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) rows.push_back(hParsed(text));
+  return rows;
 }
 
 }  // namespace
 
 void CheckFeatureKey(harness::Ctx& ctx) {
-  const long long now = events();
-  materialize("amount_7d", 2, "2026-10-01", rowsOf(now, "a1"));
-  materialize("clicks_1h", 2, "2026-10-01", rowsOf(now, "c1"));
-  materialize("amount_7d", 2, "2026-10-02", rowsOf(now, "a2"));
+  const long long now = hEvents();
+  materialize("amount_7d", 2, "2026-10-01", hRowsOf(now, "a1"));
+  materialize("clicks_1h", 2, "2026-10-01", hRowsOf(now, "c1"));
+  materialize("amount_7d", 2, "2026-10-02", hRowsOf(now, "a2"));
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kEventsTopic);
   ctx.Equal(records.size(), 3, "three partitions materialized must produce three records on feature.event; the records");
@@ -873,25 +941,25 @@ void CheckFeatureKey(harness::Ctx& ctx) {
 }
 
 void CheckPublishAfterCommit(harness::Ctx& ctx) {
-  const long long now = events();
+  const long long now = hEvents();
   size_t atCommit = 999;
   bool fired = false;
   ctx.Redis.After("partitions:amount_7d:2", [&] {
     fired = true;
     atCommit = ctx.Kafka.Records(kEventsTopic).size();
   });
-  materialize("amount_7d", 2, "2026-10-01", rowsOf(now, "a1"));
+  materialize("amount_7d", 2, "2026-10-01", hRowsOf(now, "a1"));
   ctx.Settle();
   ctx.Assert(fired, "materialize never committed the partition (no write to partitions:amount_7d:2)");
   ctx.Equal(atCommit, 0, "when the partition was committed the topic already held events: a consumer can learn about a partition that does not exist yet. Commit first, then produce; the events at commit time");
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 1, "the event must still be produced after the commit; the records");
-  const json payload = parsed(values[0]);
-  ctx.Assert(field(payload, "feature") == "amount_7d" && field(payload, "partition") == "2026-10-01", "the event is %s, expected feature, version and partition", values[0]);
+  const json payload = hParsed(values[0]);
+  ctx.Assert(hField(payload, "feature") == "amount_7d" && hField(payload, "partition") == "2026-10-01", "the event is %s, expected feature, version and partition", values[0]);
 }
 
 void CheckRowsWritten(harness::Ctx& ctx) {
-  const long long now = events();
+  const long long now = hEvents();
   // The streaming path already wrote a newer value of e-2; e-3 has no value.
   online::writeValue("amount_7d", 2, "a1/e-2", 7.0, now - 5);
   const std::vector<online::Row> rows = {online::Row{"a1/e-1", 1.0, now - 60}, online::Row{"a1/e-2", 2.0, now - 60}, online::Row{"a1/e-3", std::nullopt, now - 60}};
@@ -899,7 +967,7 @@ void CheckRowsWritten(harness::Ctx& ctx) {
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 1, "one partition materialized must produce one record; the records");
-  const json payload = parsed(values[0]);
+  const json payload = hParsed(values[0]);
   ctx.Equal(payload.is_object() ? payload.value("rows", -1L) : -1L, 1L, "one row was written (e-2 lost to a newer stored value, e-3 is null): count what writeValue stored; the event's rows");
   ctx.Equal(registry::committedPartitions("amount_7d", 2), std::map<std::string, long>{{"2026-10-01", 1}}, "the partition must be committed with the 1 row written; committed");
   const auto kept = online::readValue("amount_7d", 2, "a1/e-2");
@@ -907,25 +975,44 @@ void CheckRowsWritten(harness::Ctx& ctx) {
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {
-  const long long now = events();
-  materialize("amount_7d", 2, "2026-10-01", rowsOf(now, "a1"));
+  const long long now = hEvents();
+  materialize("amount_7d", 2, "2026-10-01", hRowsOf(now, "a1"));
   ctx.Settle();
   ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "a leader failover must not lose the lineage event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  const long long now = events();
+  const long long now = hEvents();
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  const bool ok = materialize("amount_7d", 2, "2026-10-01", rowsOf(now, "a1"));
+  // Two values and a null: the outbox payload counts the two rows written, as the event would.
+  std::vector<online::Row> refused = hRowsOf(now, "a1");
+  refused.push_back(online::Row{"a1/e-3", std::nullopt, now - 60});
+  const bool ok = materialize("amount_7d", 2, "2026-10-01", refused);
   ctx.Settle();
-  std::vector<json> rows;
-  for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) rows.push_back(parsed(text));
+  const std::vector<json> rows = hOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the partition's lineage is lost; the rows");
-  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "amount_7d" && rows[0].contains("payload") && field(rows[0]["payload"], "partition") == "2026-10-01",
-             "the outbox row is %s, expected the topic, the key amount_7d and the payload", rows[0].dump());
+  const json expected = {{"feature", "amount_7d"}, {"version", 2}, {"partition", "2026-10-01"}, {"rows", 2}};
+  ctx.Assert(hField(rows[0], "topic") == kEventsTopic && hField(rows[0], "key") == "amount_7d" && rows[0].contains("payload") && rows[0]["payload"] == expected,
+             "the outbox row is %s, expected the topic, the key amount_7d and the payload %s", rows[0].dump(), expected.dump());
   ctx.Equal(ok, false, "materialize's result after a failed delivery");
   ctx.Equal(registry::committedPartitions("amount_7d", 2), std::map<std::string, long>{{"2026-10-01", 2}}, "the partition must stay committed when only the produce failed; committed");
+  // A delivery the broker acknowledges leaves no outbox row and returns true.
+  const bool delivered = materialize("amount_7d", 2, "2026-10-02", hRowsOf(now, "a2"));
+  ctx.Settle();
+  const size_t extra = hOutbox(ctx).size() - 1;
+  ctx.Assert(delivered && extra == 0, "a delivery the broker acknowledged returned %v and added %d outbox row(s), expected true and none", delivered, extra);
+  // A broker that never answers: wait kAckTimeoutMs, no longer, then fall back to the outbox.
+  ctx.Kafka.Stall(kEventsTopic);
+  const int64_t before = ctx.Clock.Now();
+  const bool stalled = materialize("amount_7d", 2, "2026-10-03", hRowsOf(now, "a3"));
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Settle();
+  const std::vector<json> after = hOutbox(ctx);
+  ctx.Equal(after.size(), 2, "the broker never acknowledged 2026-10-03: no answer within kAckTimeoutMs is a failed delivery and needs an outbox row; the rows");
+  ctx.Assert(after[1].contains("payload") && hField(after[1]["payload"], "partition") == "2026-10-03", "the second outbox row is %s, expected the payload of 2026-10-03", after[1].dump());
+  ctx.Equal(stalled, false, "materialize's result when the broker never answered");
+  ctx.Assert(waited <= 2.5, "materialize waited %.1f s for a broker that does not answer, expected at most kAckTimeoutMs (2 s)", waited);
 }
 `,
   },

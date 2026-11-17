@@ -24,10 +24,12 @@ below the active one.
   **one** \`HSET\`; only then does \`ACTIVE_KEY\` move. Older versions stay untouched.
 - \`promote\` raises \`NotValidated\`, writing nothing, unless \`validation_key(cv)\`
   (\`catalog:validation:{cv}\`) has \`outcome\` \`passed\`.
-- \`pin_run\` writes \`pin_key(run_id)\` with a \`PIN_TTL_S\` (6 h) TTL; \`resolve\` reads the pin,
-  falls back to \`ACTIVE_KEY\`, then does one \`HGET\` on that version.
-- \`promote\` records the replaced version at \`PREVIOUS_KEY\` (\`catalog:previous\`); \`rollback()\` sets
-  \`ACTIVE_KEY\` back to it in one write and returns it (\`None\` when there is none).`,
+- \`pin_run\` writes \`pin_key(run_id)\` with a \`PIN_TTL_S\` (6 h) TTL in the same write; \`resolve\` reads
+  the pin, falls back to \`ACTIVE_KEY\`, then does one \`HGET\` on that version (a pinned run sees only
+  its pinned version).
+- \`promote\` records the replaced version at \`PREVIOUS_KEY\` (\`catalog:previous\`), when it replaces
+  one; \`rollback()\` sets \`ACTIVE_KEY\` back to it in one write and returns it (\`None\` when there is
+  none).`,
   sequence: {
     participants: ['Registry', 'Redis', 'Agent run'],
     messages: [
@@ -44,7 +46,7 @@ below the active one.
       id: 'version-swap',
       title: 'Writes a whole version, then moves the pointer',
       detail:
-        'A version is written whole under `version_key(cv)` with one `HSET`, before `catalog:active` moves; the starter edits one live hash field by field, so a reader can see two catalogs at once.',
+        'A version is written whole under `version_key(cv)` with one `HSET`, before `catalog:active` moves, so an agent resolving at any moment of a promotion sees one version whole; the starter edits one live hash field by field, so a reader can see two catalogs at once.',
       match: {
         python: {
           all: [/\.hset\(\s*version_key\(cv\)\s*,\s*mapping=/],
@@ -99,7 +101,7 @@ below the active one.
       id: 'run-pin',
       title: 'Keeps a run on the version it pinned',
       detail:
-        '`pin_run` writes `pin_key(run_id)` with the 6-hour `PIN_TTL_S`, and `resolve` reads the pin before falling back to the active version; the starter writes the pin without a TTL and never reads it.',
+        '`pin_run` writes `pin_key(run_id)` with the 6-hour `PIN_TTL_S` in the same write, and `resolve` reads the pin before falling back to the active version, resolving a pinned run in its pinned version only; the starter writes the pin without a TTL and never reads it.',
       match: {
         python: {all: [/\.set\(\s*pin_key\(run_id\)[^\n]*ex\s*=\s*PIN_TTL_S/, /\.get\(\s*pin_key\(run_id\)/]},
         typescript: {all: [/\.set\(\s*pinKey\(runId\)[^\n]*['"]EX['"],\s*PIN_TTL_S/, /\.get\(\s*pinKey\(runId\)/]},
@@ -112,7 +114,7 @@ below the active one.
       id: 'rollback',
       title: 'Rolls back to the version the promotion replaced',
       detail:
-        '`promote` records the version it replaced at `PREVIOUS_KEY` and `rollback` sets the pointer back to it in one write; the starter decrements the pointer, which lands on a rejected candidate when versions are not consecutive.',
+        '`promote` records the version it replaced at `PREVIOUS_KEY` (nothing when it replaced none, the first promotion or a repeat of the active version) and `rollback` sets the pointer back to it in one write; the starter decrements the pointer, which lands on a rejected candidate when versions are not consecutive.',
       match: {
         python: {all: [/\.set\(\s*PREVIOUS_KEY/, /\.get\(\s*PREVIOUS_KEY\)/], none: [/\.decr\(/]},
         typescript: {all: [/\.set\(\s*PREVIOUS_KEY/, /\.get\(\s*PREVIOUS_KEY\)/], none: [/\.decr\(/]},
@@ -664,6 +666,7 @@ R1 = {"name": "refund", "version": "b1", "side_effect": "irreversible", "owner":
 R2 = {**R1, "version": "b2"}
 V7 = {"search": S1, "refund": R1}
 V9 = {"search": S2, "refund": R2}
+X1 = {"name": "export", "version": "e1", "side_effect": "read", "owner": "data", "schema": {"type": "object"}, "endpoint": "https://data.internal", "credential_ref": "vault://data"}
 
 
 def _verdict(ctx, cv, outcome):
@@ -678,21 +681,35 @@ def _versions(pair):
     return tuple(None if e is None else e.get("version") for e in pair)
 
 
+def _watch(ctx, m, key, seen, left=4):
+    """An agent resolves both tools right after each of the next few commands touching key."""
+
+    def fire():
+        try:
+            seen.append(_pair(m))
+        except Exception as exc:
+            seen.append(exc)
+        if left > 1:
+            _watch(ctx, m, key, seen, left - 1)
+
+    ctx.redis_after(key, fire)
+
+
 def check_version_swap(ctx):
     m = ctx.load("state")
     _verdict(ctx, "7", "passed")
     _verdict(ctx, "9", "passed")
     m.promote("7", V7)
     assert _pair(m) == (S1, R1), f"after promoting catalog 7 agents resolve versions {_versions(_pair(m))}, expected ('a1', 'b1')"
-    # An agent resolves both tools while catalog 9 is being written.
-    probes = [ctx.redis_after(key, lambda: _pair(m)) for key in ("catalog:tools", "catalog:version:9")]
+    # An agent resolves both tools while catalog 9 is being written and the pointer moves.
+    seen = []
+    for key in ("catalog:tools", "catalog:version:9", "catalog:active"):
+        _watch(ctx, m, key, seen)
     m.promote("9", V9)
-    for probe in probes:
-        if not probe.fired:
-            continue
-        if probe.error is not None:
-            raise probe.error
-        assert probe.result in ((S1, R1), (S2, R2)), f"an agent resolving during the promotion of catalog 9 got versions {_versions(probe.result)}: one tool from catalog 7, one from 9. Write catalog:version:9 whole, then move catalog:active"
+    for result in list(seen):
+        if isinstance(result, Exception):
+            raise result
+        assert result in ((S1, R1), (S2, R2)), f"an agent resolving during the promotion of catalog 9 got versions {_versions(result)}: it must see catalog 7 whole or catalog 9 whole. Write catalog:version:9 whole, then move catalog:active"
     assert _pair(m) == (S2, R2), f"after promoting catalog 9 agents resolve versions {_versions(_pair(m))}, expected ('a2', 'b2')"
     assert ctx.redis.get("catalog:active") == "9", f"catalog:active is {ctx.redis.get('catalog:active')!r}, expected '9'"
     kept = {name: json.loads(raw) for name, raw in ctx.redis.hgetall("catalog:version:7").items()}
@@ -725,14 +742,20 @@ def check_run_pin(ctx):
     _verdict(ctx, "7", "passed")
     _verdict(ctx, "9", "passed")
     m.promote("7", V7)
+    ttl_at_write = []
+    ctx.redis_after("catalog:pin:run-1", lambda: ttl_at_write.append(ctx.redis.ttl("catalog:pin:run-1")))
     m.pin_run("run-1", "7")
-    m.promote("9", V9)
+    m.promote("9", {**V9, "export": X1})
     pinned = m.resolve("search", "run-1")
     assert pinned == S1, f"run-1 pinned catalog 7 and now resolves search version {None if pinned is None else pinned.get('version')}: a promotion moved a running agent onto new definitions mid-plan"
+    added = m.resolve("export", "run-1")
+    assert added is None, f"run-1 pinned catalog 7, which has no export tool, and resolves export version {added.get('version') if isinstance(added, dict) else added}: a pinned run resolves in its pinned version only"
+    assert m.resolve("export") == X1, "a caller without a run resolves export in the active catalog 9"
     assert m.resolve("search") == S2, "a caller without a run resolves the active catalog 9"
     assert m.resolve("search", "run-2") == S2, "a run that pinned nothing resolves the active catalog 9"
     ttl = ctx.redis.ttl("catalog:pin:run-1")
     assert 6 * 3600 - 60 <= ttl <= 6 * 3600, f"catalog:pin:run-1 has TTL {ttl}, expected PIN_TTL_S (6 hours): a pin without a TTL keeps every old catalog alive"
+    assert ttl_at_write and 6 * 3600 - 60 <= ttl_at_write[0] <= 6 * 3600, f"right after the command that wrote catalog:pin:run-1 its TTL was {ttl_at_write[0] if ttl_at_write else None}: a pin written without its TTL lives forever if the next command never runs. Set it in the same command"
 
 
 def check_rollback(ctx):
@@ -742,9 +765,13 @@ def check_rollback(ctx):
     _verdict(ctx, "8", "rejected")
     _verdict(ctx, "9", "passed")
     m.promote("7", V7)
+    first = m.rollback()
+    assert first is None, f"with only catalog 7 ever promoted, rollback answered {first!r}: there is no replaced version to go back to, answer None"
+    assert ctx.redis.get("catalog:active") == "7", f"catalog:active is {ctx.redis.get('catalog:active')!r} after a rollback with nothing to go back to, expected '7'"
     m.promote("9", V9)  # 8 was a candidate the sandbox rejected: it never went live
+    m.promote("9", V9)  # a retried promotion of the active version replaces nothing
     back = m.rollback()
-    assert back == "7", f"rollback answered {back!r}: the version catalog 9 replaced is 7 (8 was a rejected candidate). Record it at promotion"
+    assert back == "7", f"rollback answered {back!r}: the version catalog 9 replaced is 7 (8 was a rejected candidate, and promoting 9 again replaced nothing). Record it at promotion"
     assert ctx.redis.get("catalog:active") == "7", f"catalog:active is {ctx.redis.get('catalog:active')!r} after the rollback, expected '7'"
     assert _pair(m) == (S1, R1), f"after the rollback agents resolve versions {_versions(_pair(m))}, expected catalog 7"
 `,
@@ -754,6 +781,7 @@ const R1 = {name: 'refund', version: 'b1', side_effect: 'irreversible', owner: '
 const R2 = {...R1, version: 'b2'};
 const V7 = {search: S1, refund: R1};
 const V9 = {search: S2, refund: R2};
+const X1 = {name: 'export', version: 'e1', side_effect: 'read', owner: 'data', schema: {type: 'object'}, endpoint: 'https://data.internal', credential_ref: 'vault://data'};
 
 const verdict = (ctx, cv: string, outcome: string) => ctx.redis.hset(\`catalog:validation:\${cv}\`, 'outcome', outcome, 'reason', '');
 const versions = pair => JSON.stringify(pair.map(e => (e === null ? null : e.version)));
@@ -766,20 +794,39 @@ function same(a, b): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/**
+ * The versions an agent sees at this instant, read synchronously inside a probe: catalog:active, then that
+ * version's hash (or, for a catalog kept in the one live hash catalog:tools, that hash).
+ */
+function snapshot(ctx, key: string): (string | null)[] {
+  const cv = ctx.redis.get('catalog:active');
+  return ['search', 'refund'].map(name => {
+    const hash = key === 'catalog:tools' ? key : cv === null ? null : \`catalog:version:\${cv}\`;
+    const raw = hash === null ? null : ctx.redis.hget(hash, name);
+    return raw === null || raw === undefined ? null : JSON.parse(raw).version;
+  });
+}
+
+/** The snapshot right after each of the next few commands touching key. */
+function watch(ctx, key: string, seen: (string | null)[][], left = 4): void {
+  ctx.redisAfter(key, () => {
+    seen.push(snapshot(ctx, key));
+    if (left > 1) watch(ctx, key, seen, left - 1);
+  });
+}
+
 export async function check_version_swap(ctx) {
   const m = ctx.load('state');
   verdict(ctx, '7', 'passed');
   verdict(ctx, '9', 'passed');
   await m.promote('7', V7);
   assert(same(await pair(m), [S1, R1]), \`after promoting catalog 7 agents resolve versions \${versions(await pair(m))}, expected a1, b1\`);
-  // An agent resolves both tools while catalog 9 is being written.
-  const probes = ['catalog:tools', 'catalog:version:9'].map(key => ctx.redisAfter(key, () => pair(m)));
+  // An agent resolves both tools while catalog 9 is being written and the pointer moves.
+  const seen: (string | null)[][] = [];
+  for (const key of ['catalog:tools', 'catalog:version:9', 'catalog:active']) watch(ctx, key, seen);
   await m.promote('9', V9);
-  for (const probe of probes) {
-    if (!probe.fired) continue;
-    if (probe.error !== undefined) throw probe.error;
-    const seen = await probe.result;
-    assert(same(seen, [S1, R1]) || same(seen, [S2, R2]), \`an agent resolving during the promotion of catalog 9 got versions \${versions(seen)}: one tool from catalog 7, one from 9. Write catalog:version:9 whole, then move catalog:active\`);
+  for (const versions of [...seen]) {
+    assert(same(versions, ['a1', 'b1']) || same(versions, ['a2', 'b2']), \`an agent resolving during the promotion of catalog 9 got versions \${JSON.stringify(versions)}: it must see catalog 7 whole or catalog 9 whole. Write catalog:version:9 whole, then move catalog:active\`);
   }
   assert(same(await pair(m), [S2, R2]), \`after promoting catalog 9 agents resolve versions \${versions(await pair(m))}, expected a2, b2\`);
   assert.equal(ctx.redis.get('catalog:active'), '9', 'catalog:active after promoting 9');
@@ -816,14 +863,21 @@ export async function check_run_pin(ctx) {
   verdict(ctx, '7', 'passed');
   verdict(ctx, '9', 'passed');
   await m.promote('7', V7);
+  const ttlAtWrite: number[] = [];
+  ctx.redisAfter('catalog:pin:run-1', () => ttlAtWrite.push(ctx.redis.ttl('catalog:pin:run-1')));
   await m.pinRun('run-1', '7');
-  await m.promote('9', V9);
+  await m.promote('9', {...V9, export: X1});
   const pinned = await m.resolve('search', 'run-1');
   assert(same(pinned, S1), \`run-1 pinned catalog 7 and now resolves search version \${pinned?.version}: a promotion moved a running agent onto new definitions mid-plan\`);
+  const added = await m.resolve('export', 'run-1');
+  assert.equal(added, null, \`run-1 pinned catalog 7, which has no export tool, and resolves export version \${added?.version}: a pinned run resolves in its pinned version only\`);
+  assert.equal((await m.resolve('export'))?.version, 'e1', 'a caller without a run resolves export in the active catalog 9');
   assert(same(await m.resolve('search'), S2), 'a caller without a run resolves the active catalog 9');
   assert(same(await m.resolve('search', 'run-2'), S2), 'a run that pinned nothing resolves the active catalog 9');
   const ttl = ctx.redis.ttl('catalog:pin:run-1');
   assert(6 * 3600 - 60 <= ttl && ttl <= 6 * 3600, \`catalog:pin:run-1 has TTL \${ttl}, expected PIN_TTL_S (6 hours): a pin without a TTL keeps every old catalog alive\`);
+  const first = ttlAtWrite[0];
+  assert(first !== undefined && 6 * 3600 - 60 <= first && first <= 6 * 3600, \`right after the command that wrote catalog:pin:run-1 its TTL was \${first}: a pin written without its TTL lives forever if the next command never runs. Set it in the same command\`);
 }
 
 export async function check_rollback(ctx) {
@@ -833,9 +887,13 @@ export async function check_rollback(ctx) {
   verdict(ctx, '8', 'rejected');
   verdict(ctx, '9', 'passed');
   await m.promote('7', V7);
+  const first = await m.rollback();
+  assert.equal(first, null, \`with only catalog 7 ever promoted, rollback answered \${JSON.stringify(first)}: there is no replaced version to go back to, answer null\`);
+  assert.equal(ctx.redis.get('catalog:active'), '7', 'catalog:active after a rollback with nothing to go back to');
   await m.promote('9', V9); // 8 was a candidate the sandbox rejected: it never went live
+  await m.promote('9', V9); // a retried promotion of the active version replaces nothing
   const back = await m.rollback();
-  assert.equal(back, '7', \`rollback answered \${JSON.stringify(back)}: the version catalog 9 replaced is 7 (8 was a rejected candidate). Record it at promotion\`);
+  assert.equal(back, '7', \`rollback answered \${JSON.stringify(back)}: the version catalog 9 replaced is 7 (8 was a rejected candidate, and promoting 9 again replaced nothing). Record it at promotion\`);
   assert.equal(ctx.redis.get('catalog:active'), '7', 'catalog:active after the rollback');
   assert(same(await pair(m), [S1, R1]), \`after the rollback agents resolve versions \${versions(await pair(m))}, expected catalog 7\`);
 }
@@ -863,6 +921,7 @@ var (
 	r2 = entry("refund", "b2", "irreversible", "payments")
 	v7 = map[string]map[string]any{"search": s1, "refund": r1}
 	v9 = map[string]map[string]any{"search": s2, "refund": r2}
+	x1 = entry("export", "e1", "read", "data")
 )
 
 func verdict(ctx *harness.Ctx, cv, outcome string) {
@@ -887,6 +946,17 @@ func pair(runID string) [2]string {
 	return out
 }
 
+// watch records what an agent resolves right after each of the next left commands touching key.
+func watch(ctx *harness.Ctx, key string, seen *[][2]string, left int) {
+	ctx.Redis.After(key, func() any {
+		*seen = append(*seen, pair(""))
+		if left > 1 {
+			watch(ctx, key, seen, left-1)
+		}
+		return nil
+	})
+}
+
 func mustPromote(ctx *harness.Ctx, cv string, entries map[string]map[string]any) {
 	ctx.NoError(promote(stateBg, cv, entries), "promote(%s) of a validated candidate failed", cv)
 }
@@ -896,17 +966,14 @@ func CheckVersionSwap(ctx *harness.Ctx) {
 	verdict(ctx, "9", "passed")
 	mustPromote(ctx, "7", v7)
 	ctx.Equal(pair(""), [2]string{"a1", "b1"}, "after promoting catalog 7, the versions agents resolve")
-	// An agent resolves both tools while catalog 9 is being written.
+	// An agent resolves both tools while catalog 9 is being written and the pointer moves.
 	var seen [][2]string
-	for _, key := range []string{"catalog:tools", "catalog:version:9"} {
-		ctx.Redis.After(key, func() any {
-			seen = append(seen, pair(""))
-			return nil
-		})
+	for _, key := range []string{"catalog:tools", "catalog:version:9", "catalog:active"} {
+		watch(ctx, key, &seen, 4)
 	}
 	mustPromote(ctx, "9", v9)
-	for _, s := range seen {
-		ctx.Assert(s == [2]string{"a1", "b1"} || s == [2]string{"a2", "b2"}, "an agent resolving during the promotion of catalog 9 got versions %v: one tool from catalog 7, one from 9. Write catalog:version:9 whole, then move catalog:active", s)
+	for _, s := range append([][2]string(nil), seen...) {
+		ctx.Assert(s == [2]string{"a1", "b1"} || s == [2]string{"a2", "b2"}, "an agent resolving during the promotion of catalog 9 got versions %v: it must see catalog 7 whole or catalog 9 whole. Write catalog:version:9 whole, then move catalog:active", s)
 	}
 	ctx.Equal(pair(""), [2]string{"a2", "b2"}, "after promoting catalog 9, the versions agents resolve")
 	active, _ := ctx.Redis.Get("catalog:active")
@@ -942,13 +1009,23 @@ func CheckRunPin(ctx *harness.Ctx) {
 	verdict(ctx, "7", "passed")
 	verdict(ctx, "9", "passed")
 	mustPromote(ctx, "7", v7)
+	var ttlAtWrite []int64
+	ctx.Redis.After("catalog:pin:run-1", func() any {
+		ttlAtWrite = append(ttlAtWrite, ctx.Redis.TTL("catalog:pin:run-1"))
+		return nil
+	})
 	ctx.NoError(pinRun(stateBg, "run-1", "7"), "pinRun failed")
-	mustPromote(ctx, "9", v9)
+	mustPromote(ctx, "9", map[string]map[string]any{"search": s2, "refund": r2, "export": x1})
 	ctx.Equal(pair("run-1"), [2]string{"a1", "b1"}, "run-1 pinned catalog 7: a promotion must not move a running agent onto new definitions mid-plan; the versions run-1 resolves")
+	added, _ := resolve(stateBg, "export", "run-1")
+	ctx.Assert(added == nil, "run-1 pinned catalog 7, which has no export tool, and resolves export %v: a pinned run resolves in its pinned version only", added)
+	active, _ := resolve(stateBg, "export", "")
+	ctx.Assert(active != nil && active["version"] == "e1", "a caller without a run resolves export in the active catalog 9, got %v", active)
 	ctx.Equal(pair(""), [2]string{"a2", "b2"}, "a caller without a run resolves the active catalog 9")
 	ctx.Equal(pair("run-2"), [2]string{"a2", "b2"}, "a run that pinned nothing resolves the active catalog 9")
 	ttl := ctx.Redis.TTL("catalog:pin:run-1")
 	ctx.Assert(6*3600-60 <= ttl && ttl <= 6*3600, "catalog:pin:run-1 has TTL %d, expected pinTTL (6 hours): a pin without a TTL keeps every old catalog alive", ttl)
+	ctx.Assert(len(ttlAtWrite) > 0 && 6*3600-60 <= ttlAtWrite[0] && ttlAtWrite[0] <= 6*3600, "right after the command that wrote catalog:pin:run-1 its TTL was %v: a pin written without its TTL lives forever if the next command never runs. Set it in the same command", ttlAtWrite)
 }
 
 func CheckRollback(ctx *harness.Ctx) {
@@ -959,11 +1036,17 @@ func CheckRollback(ctx *harness.Ctx) {
 	verdict(ctx, "8", "rejected")
 	verdict(ctx, "9", "passed")
 	mustPromote(ctx, "7", v7)
-	mustPromote(ctx, "9", v9) // 8 was a candidate the sandbox rejected: it never went live
 	back, err = rollback(stateBg)
 	ctx.NoError(err, "rollback failed")
-	ctx.Equal(back, "7", "the version catalog 9 replaced is 7 (8 was a rejected candidate); record it at promotion. rollback answered")
+	ctx.Equal(back, "", "with only catalog 7 ever promoted there is no replaced version to go back to; rollback must answer \\"\\"")
 	active, _ := ctx.Redis.Get("catalog:active")
+	ctx.Equal(active, "7", "catalog:active after a rollback with nothing to go back to")
+	mustPromote(ctx, "9", v9) // 8 was a candidate the sandbox rejected: it never went live
+	mustPromote(ctx, "9", v9) // a retried promotion of the active version replaces nothing
+	back, err = rollback(stateBg)
+	ctx.NoError(err, "rollback failed")
+	ctx.Equal(back, "7", "the version catalog 9 replaced is 7 (8 was a rejected candidate, and promoting 9 again replaced nothing); record it at promotion. rollback answered")
+	active, _ = ctx.Redis.Get("catalog:active")
 	ctx.Equal(active, "7", "catalog:active after the rollback")
 	ctx.Equal(pair(""), [2]string{"a1", "b1"}, "after the rollback, the versions agents resolve")
 }
@@ -972,7 +1055,9 @@ func CheckRollback(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -988,6 +1073,7 @@ json entry(const std::string& name, const std::string& version, const std::strin
 
 const json kV7 = {{"search", entry("search", "a1", "read", "search")}, {"refund", entry("refund", "b1", "irreversible", "payments")}};
 const json kV9 = {{"search", entry("search", "a2", "read", "search")}, {"refund", entry("refund", "b2", "irreversible", "payments")}};
+const json kX1 = entry("export", "e1", "read", "data");
 
 void verdict(harness::Ctx& ctx, const std::string& cv, const std::string& outcome) {
   ctx.Redis.Do("HSET", "catalog:validation:" + cv, "outcome", outcome, "reason", "");
@@ -1007,22 +1093,24 @@ const std::vector<std::string> k7 = {"a1", "b1"};
 const std::vector<std::string> k9 = {"a2", "b2"};
 
 struct Seen {
-  bool fired = false;
-  std::vector<std::string> versions;
-  std::optional<std::string> err;
+  std::mutex mu;
+  std::vector<std::vector<std::string>> versions;
+  std::vector<std::string> errs;
 };
 
-std::shared_ptr<Seen> watch(harness::Ctx& ctx, const std::string& key) {
-  auto out = std::make_shared<Seen>();
-  ctx.Redis.After(key, [out] {
-    out->fired = true;
+// What an agent resolves right after each of the next \`left\` commands touching key.
+void watch(harness::Ctx& ctx, const std::string& key, const std::shared_ptr<Seen>& out, int left = 4) {
+  ctx.Redis.After(key, [&ctx, key, out, left] {
     try {
-      out->versions = pair();
+      auto versions = pair();
+      std::lock_guard<std::mutex> lock(out->mu);
+      out->versions.push_back(std::move(versions));
     } catch (const std::exception& e) {
-      out->err = e.what();
+      std::lock_guard<std::mutex> lock(out->mu);
+      out->errs.push_back(e.what());
     }
+    if (left > 1) watch(ctx, key, out, left - 1);
   });
-  return out;
 }
 
 }  // namespace
@@ -1032,14 +1120,20 @@ void CheckVersionSwap(harness::Ctx& ctx) {
   verdict(ctx, "9", "passed");
   promote("7", kV7);
   ctx.Equal(pair(), k7, "after promoting catalog 7, the versions agents resolve");
-  // An agent resolves both tools while catalog 9 is being written.
-  const auto live = watch(ctx, "catalog:tools");
-  const auto versioned = watch(ctx, "catalog:version:9");
+  // An agent resolves both tools while catalog 9 is being written and the pointer moves.
+  const auto seen = std::make_shared<Seen>();
+  for (const std::string key : {"catalog:tools", "catalog:version:9", "catalog:active"}) watch(ctx, key, seen);
   promote("9", kV9);
-  for (const auto& probe : {live, versioned}) {
-    if (!probe->fired) continue;
-    ctx.Assert(!probe->err, "a resolve during the promotion failed: %s", probe->err.value_or(""));
-    ctx.Assert(probe->versions == k7 || probe->versions == k9, "an agent resolving during the promotion of catalog 9 got versions %q: one tool from catalog 7, one from 9. Write catalog:version:9 whole, then move catalog:active", probe->versions);
+  std::vector<std::vector<std::string>> during;
+  std::vector<std::string> errs;
+  {
+    std::lock_guard<std::mutex> lock(seen->mu);
+    during = seen->versions;
+    errs = seen->errs;
+  }
+  ctx.Assert(errs.empty(), "a resolve during the promotion failed: %s", errs.empty() ? "" : errs.front());
+  for (const auto& versions : during) {
+    ctx.Assert(versions == k7 || versions == k9, "an agent resolving during the promotion of catalog 9 got versions %q: it must see catalog 7 whole or catalog 9 whole. Write catalog:version:9 whole, then move catalog:active", versions);
   }
   ctx.Equal(pair(), k9, "after promoting catalog 9, the versions agents resolve");
   ctx.Equal(ctx.Redis.Get("catalog:active"), std::optional<std::string>("9"), "catalog:active after promoting 9");
@@ -1075,13 +1169,23 @@ void CheckRunPin(harness::Ctx& ctx) {
   verdict(ctx, "7", "passed");
   verdict(ctx, "9", "passed");
   promote("7", kV7);
+  auto ttl_at_write = std::make_shared<std::atomic<long long>>(-3);
+  ctx.Redis.After("catalog:pin:run-1", [&ctx, ttl_at_write] { *ttl_at_write = ctx.Redis.TTL("catalog:pin:run-1"); });
   pinRun("run-1", "7");
-  promote("9", kV9);
+  json v9x = kV9;
+  v9x["export"] = kX1;
+  promote("9", v9x);
   ctx.Equal(pair("run-1"), k7, "run-1 pinned catalog 7: a promotion must not move a running agent onto new definitions mid-plan; the versions run-1 resolves");
+  const auto added = resolve("export", "run-1");
+  ctx.Assert(!added, "run-1 pinned catalog 7, which has no export tool, and resolves export %s: a pinned run resolves in its pinned version only", added ? added->dump() : "");
+  const auto active = resolve("export", "");
+  ctx.Assert(active && active->value("version", "") == "e1", "a caller without a run resolves export in the active catalog 9, got %s", active ? active->dump() : "nothing");
   ctx.Equal(pair(), k9, "a caller without a run resolves the active catalog 9");
   ctx.Equal(pair("run-2"), k9, "a run that pinned nothing resolves the active catalog 9");
   const long long ttl = ctx.Redis.TTL("catalog:pin:run-1");
   ctx.Assert(6 * 3600 - 60 <= ttl && ttl <= 6 * 3600, "catalog:pin:run-1 has TTL %d, expected kPinTtl (6 hours): a pin without a TTL keeps every old catalog alive", ttl);
+  const long long first = *ttl_at_write;
+  ctx.Assert(6 * 3600 - 60 <= first && first <= 6 * 3600, "right after the command that wrote catalog:pin:run-1 its TTL was %d: a pin written without its TTL lives forever if the next command never runs. Set it in the same command", first);
 }
 
 void CheckRollback(harness::Ctx& ctx) {
@@ -1090,9 +1194,13 @@ void CheckRollback(harness::Ctx& ctx) {
   verdict(ctx, "8", "rejected");
   verdict(ctx, "9", "passed");
   promote("7", kV7);
+  const auto first = rollback();
+  ctx.Assert(!first, "with only catalog 7 ever promoted there is no replaced version to go back to, and rollback answered %s: answer nothing", first.value_or(""));
+  ctx.Equal(ctx.Redis.Get("catalog:active"), std::optional<std::string>("7"), "catalog:active after a rollback with nothing to go back to");
   promote("9", kV9);  // 8 was a candidate the sandbox rejected: it never went live
+  promote("9", kV9);  // a retried promotion of the active version replaces nothing
   const auto back = rollback();
-  ctx.Equal(back, std::optional<std::string>("7"), "the version catalog 9 replaced is 7 (8 was a rejected candidate); record it at promotion. rollback answered");
+  ctx.Equal(back, std::optional<std::string>("7"), "the version catalog 9 replaced is 7 (8 was a rejected candidate, and promoting 9 again replaced nothing); record it at promotion. rollback answered");
   ctx.Equal(ctx.Redis.Get("catalog:active"), std::optional<std::string>("7"), "catalog:active after the rollback");
   ctx.Equal(pair(), k7, "after the rollback, the versions agents resolve");
 }

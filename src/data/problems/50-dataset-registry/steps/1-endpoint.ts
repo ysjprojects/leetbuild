@@ -57,7 +57,7 @@ number.
       id: 'immutable',
       title: 'Re-registering an existing version is 409',
       detail:
-        'The record is written with `create_version`/`createVersion`, whose HSETNX refuses an existing `(dataset, version)`; that answer is **409** and the record keeps its first hash. `put_version` writes over it.',
+        'The record is written with `create_version`/`createVersion`, whose HSETNX refuses an existing `(dataset, version)`; that answer is **409** and the record keeps its first hash. Two registers racing for one version get answers that match what the store holds: one 201, one 409. `put_version` writes over it.',
       match: {
         python: {all: [/store\.create_version\(/, /\b409\b/], none: [/put_version\(/]},
         typescript: {all: [/createVersion\(/, /\b409\b/], none: [/putVersion\(/]},
@@ -70,7 +70,7 @@ number.
       id: 'license',
       title: 'A license off the allowlist is 422',
       detail:
-        '`ALLOWED_LICENSES` is checked on the server and an unknown or missing license is **422** with nothing stored. The starter stores whatever license string arrived, including none.',
+        '`ALLOWED_LICENSES` is checked on the server and any license off it (`proprietary`, `cc-by-nc-4.0`) or a missing one is **422** with nothing stored. The starter stores whatever license string arrived, including none.',
       match: {
         python: {all: [/ALLOWED_LICENSES/, /\b422\b/]},
         typescript: {all: [/ALLOWED_LICENSES/, /\b422\b/]},
@@ -96,7 +96,7 @@ number.
       id: 'required-fields',
       title: 'A tenant and an owner before anything is written',
       detail:
-        'A request without `X-Tenant-Id` is **401** and an empty `owner` is **422**, both before the store is touched. The starter files a missing tenant under `public` and stores a record with no owner.',
+        'A request without `X-Tenant-Id` is **401**, even when its body names a tenant, and an empty `owner` is **422**, both before the store is touched. The starter files a missing tenant under `public` and stores a record with no owner.',
       match: {
         python: {
           all: [/\b401\b/, /["']content_sha256["'],\s*["']owner["']|not body\.get\(\s*["']owner["']\)/],
@@ -628,6 +628,26 @@ async def check_immutable(ctx):
     assert again.status_code == 409, f"re-registering imdb-reviews@2026-01 with other bytes answered {again.status_code}, expected 409"
     record = store.version("imdb-reviews", "2026-01")
     assert record["content_sha256"] == first, f"imdb-reviews@2026-01 now names {record['content_sha256'][:12]}…, not the first object {first[:12]}…: a run that quoted the version reads other bytes"
+    # Another replica registers imdb-reviews@2026-02 right after the handler's first command on that
+    # key: whoever HSETNX picked as the winner, the answer must agree with what the store holds.
+    key = store.version_key("imdb-reviews", "2026-02")
+
+    def rival():
+        if ctx.redis.hsetnx(key, "dataset", "imdb-reviews"):
+            ctx.redis.hset(key, mapping={"tenant": "t9", "version": "2026-02", "content_sha256": second, "license": "mit", "owner": "team-rival", "size_bytes": "1", "row_count": "1", "status": "registered", "report": ""})
+            ctx.redis.sadd(store.versions_key("imdb-reviews"), "2026-02")
+
+    probe = ctx.redis_after(key, rival)
+    async with _api(ctx) as c:
+        raced = await c.post("/v1/datasets", json=_body(first, version="2026-02"), headers=TENANT)
+    assert probe.fired, "the register of imdb-reviews@2026-02 never touched its version record"
+    assert probe.error is None, f"the racing register failed: {probe.error}"
+    record = store.version("imdb-reviews", "2026-02")
+    if raced.status_code == 201:
+        assert record["content_sha256"] == first and record["tenant"] == "t1", "two registers of imdb-reviews@2026-02 raced and both were told 201, but the store holds the other one's object: the existence check and the write are two round trips"
+    else:
+        assert raced.status_code == 409, f"a register that lost the race for imdb-reviews@2026-02 answered {raced.status_code}, expected 409"
+        assert record["content_sha256"] == second, "a register answered 409 although no other register holds imdb-reviews@2026-02"
 
 
 async def check_license(ctx):
@@ -635,6 +655,9 @@ async def check_license(ctx):
     async with _api(ctx) as c:
         r = await c.post("/v1/datasets", json=_body(sha, license="proprietary"), headers=TENANT)
         assert r.status_code == 422, f"a register under license proprietary answered {r.status_code}, expected 422"
+        assert store.version("imdb-reviews", "2026-01") is None, "a refused license must leave nothing in the store"
+        r = await c.post("/v1/datasets", json=_body(sha, license="cc-by-nc-4.0"), headers=TENANT)
+        assert r.status_code == 422, f"a register under license cc-by-nc-4.0, which is not on the allowlist, answered {r.status_code}, expected 422"
         assert store.version("imdb-reviews", "2026-01") is None, "a refused license must leave nothing in the store"
         r = await c.post("/v1/datasets", json=_body(sha, version="2026-02", license=None), headers=TENANT)
         assert r.status_code == 422, f"a register with no license answered {r.status_code}, expected 422"
@@ -660,8 +683,8 @@ async def check_required_fields(ctx):
         r = await c.post("/v1/datasets", json=_body(sha, owner=None), headers=TENANT)
         assert r.status_code == 422, f"a register with no owner answered {r.status_code}, expected 422"
         assert store.version("imdb-reviews", "2026-01") is None, "a version with no owner must not be stored"
-        r = await c.post("/v1/datasets", json=_body(sha, version="2026-02"))
-        assert r.status_code == 401, f"a register without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await c.post("/v1/datasets", json=_body(sha, version="2026-02", tenant="t1"))
+        assert r.status_code == 401, f"a register without X-Tenant-Id (its body naming tenant t1) answered {r.status_code}, expected 401: the tenant comes from the header only"
         assert store.version("imdb-reviews", "2026-02") is None, "a version with no tenant must not be stored"
         r = await c.post("/v1/datasets", json=_body(sha, version="2026-03"), headers={"X-Tenant-Id": "t2"})
     assert r.status_code == 201, f"a complete register answered {r.status_code}: {r.text}"
@@ -700,6 +723,25 @@ export async function check_immutable(ctx) {
   assert.equal(again.status, 409, \`re-registering imdb-reviews@2026-01 with other bytes answered \${again.status}, expected 409\`);
   const record = await store.version('imdb-reviews', '2026-01');
   assert.equal(record.content_sha256, first, 'imdb-reviews@2026-01 now names another object: a run that quoted the version reads other bytes');
+  // Another replica registers imdb-reviews@2026-02 right after the handler's first command on that
+  // key: whoever HSETNX picked as the winner, the answer must agree with what the store holds.
+  const key = 'dataset:imdb-reviews:v:2026-02';
+  const probe = ctx.redisAfter(key, () => {
+    if (ctx.redis.hsetnx(key, 'dataset', 'imdb-reviews') === 1) {
+      ctx.redis.hset(key, {tenant: 't9', version: '2026-02', content_sha256: second, license: 'mit', owner: 'team-rival', size_bytes: '1', row_count: '1', status: 'registered', report: ''});
+      ctx.redis.sadd('dataset:imdb-reviews:versions', '2026-02');
+    }
+  });
+  const raced = await c.post('/v1/datasets', {json: body(first, {version: '2026-02'}), headers: TENANT});
+  assert(probe.fired, 'the register of imdb-reviews@2026-02 never touched its version record');
+  assert.equal(probe.error, undefined, \`the racing register failed: \${probe.error}\`);
+  const held = await store.version('imdb-reviews', '2026-02');
+  if (raced.status === 201) {
+    assert(held.content_sha256 === first && held.tenant === 't1', "two registers of imdb-reviews@2026-02 raced and both were told 201, but the store holds the other one's object: the existence check and the write are two round trips");
+  } else {
+    assert.equal(raced.status, 409, \`a register that lost the race for imdb-reviews@2026-02 answered \${raced.status}, expected 409\`);
+    assert.equal(held.content_sha256, second, 'a register answered 409 although no other register holds imdb-reviews@2026-02');
+  }
 }
 
 export async function check_license(ctx) {
@@ -707,6 +749,9 @@ export async function check_license(ctx) {
   const sha = await store.putObject(ROWS);
   let r = await c.post('/v1/datasets', {json: body(sha, {license: 'proprietary'}), headers: TENANT});
   assert.equal(r.status, 422, \`a register under license proprietary answered \${r.status}, expected 422\`);
+  assert.equal(await store.version('imdb-reviews', '2026-01'), null, 'a refused license must leave nothing in the store');
+  r = await c.post('/v1/datasets', {json: body(sha, {license: 'cc-by-nc-4.0'}), headers: TENANT});
+  assert.equal(r.status, 422, \`a register under license cc-by-nc-4.0, which is not on the allowlist, answered \${r.status}, expected 422\`);
   assert.equal(await store.version('imdb-reviews', '2026-01'), null, 'a refused license must leave nothing in the store');
   r = await c.post('/v1/datasets', {json: body(sha, {version: '2026-02', license: null}), headers: TENANT});
   assert.equal(r.status, 422, \`a register with no license answered \${r.status}, expected 422\`);
@@ -732,8 +777,8 @@ export async function check_required_fields(ctx) {
   let r = await c.post('/v1/datasets', {json: body(sha, {owner: null}), headers: TENANT});
   assert.equal(r.status, 422, \`a register with no owner answered \${r.status}, expected 422\`);
   assert.equal(await store.version('imdb-reviews', '2026-01'), null, 'a version with no owner must not be stored');
-  r = await c.post('/v1/datasets', {json: body(sha, {version: '2026-02'})});
-  assert.equal(r.status, 401, \`a register without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await c.post('/v1/datasets', {json: body(sha, {version: '2026-02', tenant: 't1'})});
+  assert.equal(r.status, 401, \`a register without X-Tenant-Id (its body naming tenant t1) answered \${r.status}, expected 401: the tenant comes from the header only\`);
   assert.equal(await store.version('imdb-reviews', '2026-02'), null, 'a version with no tenant must not be stored');
   r = await c.post('/v1/datasets', {json: body(sha, {version: '2026-03'}), headers: {'X-Tenant-Id': 't2'}});
   assert.equal(r.status, 201, \`a complete register answered \${r.status}: \${r.text}\`);
@@ -808,6 +853,26 @@ func CheckImmutable(ctx *harness.Ctx) {
 	ctx.Equal(again.Status, 409, "re-registering imdb-reviews@2026-01 with other bytes")
 	rec := store.Version(apiBg, "imdb-reviews", "2026-01")
 	ctx.Equal(rec.ContentSHA256, first, "imdb-reviews@2026-01 must keep its first object (a run that quoted the version would read other bytes); its content_sha256")
+	// Another replica registers imdb-reviews@2026-02 right after the handler's first command on that
+	// key: whoever HSETNX picked as the winner, the answer must agree with what the store holds.
+	key := store.VersionKey("imdb-reviews", "2026-02")
+	probe := ctx.Redis.After(key, func() any {
+		if ctx.Redis.Do("HSETNX", key, "dataset", "imdb-reviews").(int64) == 1 {
+			ctx.Redis.Do("HSET", key, "tenant", "t9", "version", "2026-02", "content_sha256", second, "license", "mit", "owner", "team-rival", "size_bytes", "1", "row_count", "1", "status", "registered", "report", "")
+			ctx.Redis.Do("SADD", "dataset:imdb-reviews:versions", "2026-02")
+		}
+		return nil
+	})
+	raced := c.Post("/v1/datasets", apiBody(first, map[string]any{"version": "2026-02"}), "X-Tenant-Id", "t1")
+	ctx.Assert(probe.Fired, "the register of imdb-reviews@2026-02 never touched its version record")
+	ctx.NoError(probe.Err, "the racing register")
+	held := store.Version(apiBg, "imdb-reviews", "2026-02")
+	if raced.Status == 201 {
+		ctx.Assert(held.ContentSHA256 == first && held.Tenant == "t1", "two registers of imdb-reviews@2026-02 raced and both were told 201, but the store holds the other one's object: the existence check and the write are two round trips")
+	} else {
+		ctx.Equal(raced.Status, 409, "a register that lost the race for imdb-reviews@2026-02")
+		ctx.Equal(held.ContentSHA256, second, "a register answered 409 although no other register holds imdb-reviews@2026-02; its content_sha256")
+	}
 }
 
 func CheckLicense(ctx *harness.Ctx) {
@@ -815,6 +880,9 @@ func CheckLicense(ctx *harness.Ctx) {
 	sha := store.PutObject(apiBg, apiRows(12))
 	r := c.Post("/v1/datasets", apiBody(sha, map[string]any{"license": "proprietary"}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register under license proprietary")
+	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-01") == nil, "a refused license must leave nothing in the store")
+	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"license": "cc-by-nc-4.0"}), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 422, "a register under license cc-by-nc-4.0 (not on the allowlist)")
 	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-01") == nil, "a refused license must leave nothing in the store")
 	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-02", "license": nil}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register with no license")
@@ -841,8 +909,8 @@ func CheckRequiredFields(ctx *harness.Ctx) {
 	r := c.Post("/v1/datasets", apiBody(sha, map[string]any{"owner": nil}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 422, "a register with no owner")
 	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-01") == nil, "a version with no owner must not be stored")
-	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-02"}))
-	ctx.Equal(r.Status, 401, "a register without X-Tenant-Id")
+	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-02", "tenant": "t1"}))
+	ctx.Equal(r.Status, 401, "a register without X-Tenant-Id (its body naming tenant t1; the tenant comes from the header only)")
 	ctx.Assert(store.Version(apiBg, "imdb-reviews", "2026-02") == nil, "a version with no tenant must not be stored")
 	r = c.Post("/v1/datasets", apiBody(sha, map[string]any{"version": "2026-03"}), "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 201, "a complete register (%s)", r.Text())
@@ -910,6 +978,29 @@ void CheckImmutable(harness::Ctx& ctx) {
   ctx.Equal(again.Status, 409, "re-registering imdb-reviews@2026-01 with other bytes");
   ctx.Equal(store::version("imdb-reviews", "2026-01")->content_sha256, first,
             "imdb-reviews@2026-01 must keep its first object (a run that quoted the version would read other bytes); its content_sha256");
+  // Another replica registers imdb-reviews@2026-02 right after the handler's first command on that
+  // key: whoever HSETNX picked as the winner, the answer must agree with what the store holds.
+  const std::string key = store::versionKey("imdb-reviews", "2026-02");
+  bool fired = false;
+  ctx.Redis.After(key, [&] {
+    fired = true;
+    if (ctx.Redis.Do("HSETNX", key, "dataset", "imdb-reviews").Int() == 1) {
+      ctx.Redis.Do("HSET", key, "tenant", "t9", "version", "2026-02", "content_sha256", second, "license", "mit", "owner", "team-rival", "size_bytes", "1",
+                   "row_count", "1", "status", "registered", "report", "");
+      ctx.Redis.Do("SADD", "dataset:imdb-reviews:versions", "2026-02");
+    }
+  });
+  const auto raced = post(c, body(first, {{"version", "2026-02"}}), "t1");
+  ctx.Assert(fired, "the register of imdb-reviews@2026-02 never touched its version record");
+  const auto held = store::version("imdb-reviews", "2026-02");
+  ctx.Assert(held.has_value(), "imdb-reviews@2026-02 is not in the store after two registers");
+  if (raced.Status == 201) {
+    ctx.Assert(held->content_sha256 == first && held->tenant == "t1",
+               "two registers of imdb-reviews@2026-02 raced and both were told 201, but the store holds the other one's object: the existence check and the write are two round trips");
+  } else {
+    ctx.Equal(raced.Status, 409, "a register that lost the race for imdb-reviews@2026-02");
+    ctx.Equal(held->content_sha256, second, "a register answered 409 although no other register holds imdb-reviews@2026-02; its content_sha256");
+  }
 }
 
 void CheckLicense(harness::Ctx& ctx) {
@@ -917,6 +1008,9 @@ void CheckLicense(harness::Ctx& ctx) {
   const std::string sha = store::putObject(rows(12));
   auto r = post(c, body(sha, {{"license", "proprietary"}}), "t1");
   ctx.Equal(r.Status, 422, "a register under license proprietary");
+  ctx.Assert(!store::version("imdb-reviews", "2026-01"), "a refused license must leave nothing in the store");
+  r = post(c, body(sha, {{"license", "cc-by-nc-4.0"}}), "t1");
+  ctx.Equal(r.Status, 422, "a register under license cc-by-nc-4.0 (not on the allowlist)");
   ctx.Assert(!store::version("imdb-reviews", "2026-01"), "a refused license must leave nothing in the store");
   r = post(c, body(sha, {{"version", "2026-02"}, {"license", nullptr}}), "t1");
   ctx.Equal(r.Status, 422, "a register with no license");
@@ -945,8 +1039,8 @@ void CheckRequiredFields(harness::Ctx& ctx) {
   auto r = post(c, body(sha, {{"owner", nullptr}}), "t1");
   ctx.Equal(r.Status, 422, "a register with no owner");
   ctx.Assert(!store::version("imdb-reviews", "2026-01"), "a version with no owner must not be stored");
-  r = post(c, body(sha, {{"version", "2026-02"}}), "");
-  ctx.Equal(r.Status, 401, "a register without X-Tenant-Id");
+  r = post(c, body(sha, {{"version", "2026-02"}, {"tenant", "t1"}}), "");
+  ctx.Equal(r.Status, 401, "a register without X-Tenant-Id (its body naming tenant t1; the tenant comes from the header only)");
   ctx.Assert(!store::version("imdb-reviews", "2026-02"), "a version with no tenant must not be stored");
   r = post(c, body(sha, {{"version", "2026-03"}}), "t2");
   ctx.Equal(r.Status, 201, "a complete register (%s)", r.Text());

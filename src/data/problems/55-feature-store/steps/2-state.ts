@@ -67,7 +67,7 @@ today's value and replaces it; a value whose freshness SLO passed hours ago is s
       id: 'newer-wins',
       title: 'Stores a value only when it is newer, in one script',
       detail:
-        'The write compares the stored `event_ts` and writes inside one Lua script (`register_script`/`eval`, `defineCommand`, `NewScript`), returning whether it stored; an older or equal `event_ts` is refused, also when a newer value lands between a read and a write. The starter writes with a plain `HSET`.',
+        'The write compares the stored `event_ts` and writes inside one Lua script (`register_script`/`eval`, `defineCommand`, `NewScript`), returning whether it stored; a newer `event_ts` replaces the stored value, an older or equal one is refused, also when a newer value lands between a read and a write. The starter writes with a plain `HSET`.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/, /tonumber\(/],
@@ -86,7 +86,7 @@ today's value and replaces it; a value whose freshness SLO passed hours ago is s
       id: 'expire-at-slo',
       title: 'Expires a value when its freshness SLO passes',
       detail:
-        "The key expires at `event_ts + freshness_slo` (`EXPIREAT`), the SLO read from the version's definition, so a value computed 200 s ago with a 300 s SLO is gone 100 s later. The starter gives every key the same 24-hour TTL counted from the write.",
+        "The key expires at `event_ts + freshness_slo` (`EXPIREAT`), the SLO read from the version's definition, so a value computed 200 s ago with a 300 s SLO is gone 100 s later. The expiry is set by the write that creates the key, never in a later command, and a refused write leaves it alone. The starter gives every key the same 24-hour TTL counted from the write.",
       match: {
         python: {all: [/EXPIREAT/, /registry\.get_definition\(/, /freshness_slo/], none: [/TTL_S/, /\.expire\(/]},
         typescript: {all: [/EXPIREAT/, /getDefinition\(/, /freshness_slo/], none: [/TTL_S/, /\.expire\(/]},
@@ -552,6 +552,9 @@ def check_newer_wins(ctx):
     assert late is False, f"write_value returned {late!r} for a value older than the stored one, expected False"
     replay = m.write_value("amount_7d", 2, "e-1", 5.0, now - 10)
     assert replay is False, f"a replay of the stored event_ts returned {replay!r}, expected False"
+    newer = m.write_value("amount_7d", 2, "e-1", 6.0, now - 2)
+    seen = m.read_value("amount_7d", 2, "e-1")
+    assert newer is True and seen is not None and seen["value"] == 6.0 and seen["event_ts"] == now - 2, f"a value from 2 s ago must replace the stored one from 10 s ago: write_value returned {newer!r} and e-1 reads {seen}"
     # The streaming path writes e-2 from 5 s ago right after this write from 50 s ago first touches the key.
     key = "feature:amount_7d:2:e-2"
     probe = ctx.redis_after(key, lambda: ctx.redis.hset(key, mapping={"value": 7.0, "event_ts": now - 5}))
@@ -564,9 +567,16 @@ def check_newer_wins(ctx):
 def check_expire_at_slo(ctx):
     m = _state(ctx)
     now = int(time.time())
+    key = "feature:amount_7d:2:e-1"
+    # The TTL is read right after the write first touches the key: a key that exists must already expire.
+    created = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
     m.write_value("amount_7d", 2, "e-1", 5.0, now - 200)
-    ttl = ctx.redis.ttl("feature:amount_7d:2:e-1")
-    assert 95 <= ttl <= 101, f"feature:amount_7d:2:e-1 has a TTL of {ttl} s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo"
+    assert not created.fired or created.result != -1, f"right after the write first touched {key} the key existed without a TTL: set the expiry in the same script as the write"
+    ttl = ctx.redis.ttl(key)
+    assert 95 <= ttl <= 101, f"{key} has a TTL of {ttl} s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo"
+    m.write_value("amount_7d", 2, "e-1", 4.0, now - 250)
+    ttl = ctx.redis.ttl(key)
+    assert 95 <= ttl <= 101, f"a refused row from 250 s ago moved the expiry of {key} to {ttl} s: a write that does not store must leave the TTL alone"
     m.write_value("amount_7d", 4, "e-1", 5.0, now)
     ttl = ctx.redis.ttl("feature:amount_7d:4:e-1")
     assert 3595 <= ttl <= 3601, f"feature:amount_7d:4:e-1 has a TTL of {ttl} s, expected its definition's freshness_slo of 3600 s"
@@ -606,6 +616,9 @@ export async function check_newer_wins(ctx) {
   assert.equal(late, false, \`writeValue returned \${late} for a value older than the stored one, expected false\`);
   const replay = await m.writeValue('amount_7d', 2, 'e-1', 5.0, now - 10);
   assert.equal(replay, false, \`a replay of the stored event_ts returned \${replay}, expected false\`);
+  const newer = await m.writeValue('amount_7d', 2, 'e-1', 6.0, now - 2);
+  seen = await m.readValue('amount_7d', 2, 'e-1');
+  assert(newer === true && seen !== null && seen.value === 6 && seen.event_ts === now - 2, \`a value from 2 s ago must replace the stored one from 10 s ago: writeValue returned \${newer} and e-1 reads \${JSON.stringify(seen)}\`);
   // The streaming path writes e-2 from 5 s ago right after this write from 50 s ago first touches the key.
   const key = 'feature:amount_7d:2:e-2';
   const probe = ctx.redisAfter(key, () => ctx.redis.hset(key, 'value', '7', 'event_ts', String(now - 5)));
@@ -617,9 +630,16 @@ export async function check_newer_wins(ctx) {
 
 export async function check_expire_at_slo(ctx) {
   const {m, now} = await state(ctx);
+  const key = 'feature:amount_7d:2:e-1';
+  // The TTL is read right after the write first touches the key: a key that exists must already expire.
+  const created = ctx.redisAfter(key, () => ctx.redis.ttl(key));
   await m.writeValue('amount_7d', 2, 'e-1', 5.0, now - 200);
-  let ttl = ctx.redis.ttl('feature:amount_7d:2:e-1') as number;
-  assert(95 <= ttl && ttl <= 101, \`feature:amount_7d:2:e-1 has a TTL of \${ttl} s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo\`);
+  assert(!created.fired || Number(await created.result) !== -1, \`right after the write first touched \${key} the key existed without a TTL: set the expiry in the same script as the write\`);
+  let ttl = ctx.redis.ttl(key) as number;
+  assert(95 <= ttl && ttl <= 101, \`\${key} has a TTL of \${ttl} s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo\`);
+  await m.writeValue('amount_7d', 2, 'e-1', 4.0, now - 250);
+  ttl = ctx.redis.ttl(key) as number;
+  assert(95 <= ttl && ttl <= 101, \`a refused row from 250 s ago moved the expiry of \${key} to \${ttl} s: a write that does not store must leave the TTL alone\`);
   await m.writeValue('amount_7d', 4, 'e-1', 5.0, now);
   ttl = ctx.redis.ttl('feature:amount_7d:4:e-1') as number;
   assert(3595 <= ttl && ttl <= 3601, \`feature:amount_7d:4:e-1 has a TTL of \${ttl} s, expected its definition's freshness_slo of 3600 s\`);
@@ -640,35 +660,35 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func state(ctx *harness.Ctx) int64 {
+func hState(ctx *harness.Ctx) int64 {
 	now := time.Now().Unix()
 	for version, slo := range map[int]int64{2: 300, 3: 300, 4: 3600} {
-		_, err := registry.CreateDefinition(stateBg, registry.Definition{Name: "amount_7d", Version: version, Dtype: "float64", ComputationRef: "window_avg_7d", FreshnessSLO: slo, CreatedAt: now})
+		_, err := registry.CreateDefinition(hStateBg, registry.Definition{Name: "amount_7d", Version: version, Dtype: "float64", ComputationRef: "window_avg_7d", FreshnessSLO: slo, CreatedAt: now})
 		ctx.NoError(err, "CreateDefinition")
 	}
 	return now
 }
 
-func mustWrite(ctx *harness.Ctx, version int, entity string, value float64, eventTs int64) bool {
-	stored, err := writeValue(stateBg, "amount_7d", version, entity, value, eventTs)
+func hWrite(ctx *harness.Ctx, version int, entity string, value float64, eventTs int64) bool {
+	stored, err := writeValue(hStateBg, "amount_7d", version, entity, value, eventTs)
 	ctx.NoError(err, "writeValue(amount_7d, %d, %s) failed", version, entity)
 	return stored
 }
 
-func mustRead(ctx *harness.Ctx, version int, entity string) *Value {
-	v, err := readValue(stateBg, "amount_7d", version, entity)
+func hRead(ctx *harness.Ctx, version int, entity string) *Value {
+	v, err := readValue(hStateBg, "amount_7d", version, entity)
 	ctx.NoError(err, "readValue(amount_7d, %d, %s) failed", version, entity)
 	return v
 }
 
 func CheckVersionedKey(ctx *harness.Ctx) {
-	now := state(ctx)
-	ctx.Equal(mustWrite(ctx, 2, "e-1", 12.5, now-10), true, "the first write of e-1 for version 2 must store; stored")
-	ctx.Equal(mustWrite(ctx, 3, "e-1", 40.0, now-5), true, "the first write of e-1 for version 3 must store; stored")
-	v2 := mustRead(ctx, 2, "e-1")
-	v3 := mustRead(ctx, 3, "e-1")
+	now := hState(ctx)
+	ctx.Equal(hWrite(ctx, 2, "e-1", 12.5, now-10), true, "the first write of e-1 for version 2 must store; stored")
+	ctx.Equal(hWrite(ctx, 3, "e-1", 40.0, now-5), true, "the first write of e-1 for version 3 must store; stored")
+	v2 := hRead(ctx, 2, "e-1")
+	v3 := hRead(ctx, 3, "e-1")
 	ctx.Assert(v2 != nil && v2.Value == 12.5, "version 2 of e-1 reads %+v: the write of version 3 replaced it. Key the value by (name, version, entity)", v2)
 	ctx.Assert(v3 != nil && v3.Value == 40.0, "version 3 of e-1 reads %+v, expected 40", v3)
 	ctx.Assert(v2.EventTs == now-10 && v2.AgeS == 10, "version 2 of e-1 reads %+v, expected event_ts %d and age_s 10", *v2, now-10)
@@ -676,34 +696,44 @@ func CheckVersionedKey(ctx *harness.Ctx) {
 }
 
 func CheckNewerWins(ctx *harness.Ctx) {
-	now := state(ctx)
-	ctx.Equal(mustWrite(ctx, 2, "e-1", 5.0, now-10), true, "the first write of e-1 must store; stored")
-	late := mustWrite(ctx, 2, "e-1", 3.0, now-100)
-	seen := mustRead(ctx, 2, "e-1")
+	now := hState(ctx)
+	ctx.Equal(hWrite(ctx, 2, "e-1", 5.0, now-10), true, "the first write of e-1 must store; stored")
+	late := hWrite(ctx, 2, "e-1", 3.0, now-100)
+	seen := hRead(ctx, 2, "e-1")
 	ctx.Assert(seen != nil && seen.Value == 5.0 && seen.EventTs == now-10, "a backfill row from 100 s ago replaced the value from 10 s ago: e-1 reads %+v", seen)
 	ctx.Equal(late, false, "writeValue for a value older than the stored one; stored")
-	ctx.Equal(mustWrite(ctx, 2, "e-1", 5.0, now-10), false, "a replay of the stored event_ts; stored")
+	ctx.Equal(hWrite(ctx, 2, "e-1", 5.0, now-10), false, "a replay of the stored event_ts; stored")
+	newer := hWrite(ctx, 2, "e-1", 6.0, now-2)
+	seen = hRead(ctx, 2, "e-1")
+	ctx.Assert(newer && seen != nil && seen.Value == 6.0 && seen.EventTs == now-2, "a value from 2 s ago must replace the stored one from 10 s ago: writeValue returned %v and e-1 reads %+v", newer, seen)
 	// The streaming path writes e-2 from 5 s ago right after this write from 50 s ago first touches the key.
 	key := "feature:amount_7d:2:e-2"
 	probe := ctx.Redis.After(key, func() any { return ctx.Redis.Do("HSET", key, "value", "7", "event_ts", now-5) })
-	mustWrite(ctx, 2, "e-2", 4.0, now-50)
+	hWrite(ctx, 2, "e-2", 4.0, now-50)
 	ctx.Assert(probe.Fired, "the write of e-2 never touched %s", key)
-	seen = mustRead(ctx, 2, "e-2")
+	seen = hRead(ctx, 2, "e-2")
 	ctx.Assert(seen != nil && seen.Value == 7, "a value from 5 s ago landed between this write's read and its write and was replaced by one from 50 s ago: e-2 reads %+v. Compare and write in one Lua script", seen)
 }
 
 func CheckExpireAtSlo(ctx *harness.Ctx) {
-	now := state(ctx)
-	mustWrite(ctx, 2, "e-1", 5.0, now-200)
-	ttl := ctx.Redis.TTL("feature:amount_7d:2:e-1")
-	ctx.Assert(95 <= ttl && ttl <= 101, "feature:amount_7d:2:e-1 has a TTL of %d s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo", ttl)
-	mustWrite(ctx, 4, "e-1", 5.0, now)
+	now := hState(ctx)
+	key := "feature:amount_7d:2:e-1"
+	// The TTL is read right after the write first touches the key: a key that exists must already expire.
+	created := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
+	hWrite(ctx, 2, "e-1", 5.0, now-200)
+	ctx.Assert(!created.Fired || created.Result != int64(-1), "right after the write first touched %s the key existed without a TTL: set the expiry in the same script as the write", key)
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(95 <= ttl && ttl <= 101, "%s has a TTL of %d s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo", key, ttl)
+	hWrite(ctx, 2, "e-1", 4.0, now-250)
+	ttl = ctx.Redis.TTL(key)
+	ctx.Assert(95 <= ttl && ttl <= 101, "a refused row from 250 s ago moved the expiry of %s to %d s: a write that does not store must leave the TTL alone", key, ttl)
+	hWrite(ctx, 4, "e-1", 5.0, now)
 	ttl = ctx.Redis.TTL("feature:amount_7d:4:e-1")
 	ctx.Assert(3595 <= ttl && ttl <= 3601, "feature:amount_7d:4:e-1 has a TTL of %d s, expected its definition's freshness_slo of 3600 s", ttl)
 	ctx.Clock.Advance(101)
-	seen := mustRead(ctx, 2, "e-1")
+	seen := hRead(ctx, 2, "e-1")
 	ctx.Assert(seen == nil, "101 s later the value is past its freshness SLO and still served: %+v", seen)
-	ctx.Assert(mustRead(ctx, 4, "e-1") != nil, "the value of version 4 is within its SLO and must still be served")
+	ctx.Assert(hRead(ctx, 4, "e-1") != nil, "the value of version 4 is within its SLO and must still be served")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -716,7 +746,7 @@ func CheckExpireAtSlo(ctx *harness.Ctx) {
 
 namespace {
 
-long long state() {
+long long hState() {
   const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   for (const auto& [version, slo] : {std::pair<long, long long>{2, 300}, {3, 300}, {4, 3600}}) {
     registry::createDefinition(registry::Definition{"amount_7d", version, "float64", "window_avg_7d", slo, now});
@@ -724,7 +754,7 @@ long long state() {
   return now;
 }
 
-std::string show(const std::optional<Value>& v) {
+std::string hShow(const std::optional<Value>& v) {
   if (!v) return "none";
   return "{value " + std::to_string(v->value) + ", event_ts " + std::to_string(v->event_ts) + ", age_s " + std::to_string(v->age_s) + "}";
 }
@@ -732,25 +762,28 @@ std::string show(const std::optional<Value>& v) {
 }  // namespace
 
 void CheckVersionedKey(harness::Ctx& ctx) {
-  const long long now = state();
+  const long long now = hState();
   ctx.Equal(writeValue("amount_7d", 2, "e-1", 12.5, now - 10), true, "the first write of e-1 for version 2 must store; stored");
   ctx.Equal(writeValue("amount_7d", 3, "e-1", 40.0, now - 5), true, "the first write of e-1 for version 3 must store; stored");
   const auto v2 = readValue("amount_7d", 2, "e-1");
   const auto v3 = readValue("amount_7d", 3, "e-1");
-  ctx.Assert(v2 && v2->value == 12.5, "version 2 of e-1 reads %s: the write of version 3 replaced it. Key the value by (name, version, entity)", show(v2));
-  ctx.Assert(v3 && v3->value == 40.0, "version 3 of e-1 reads %s, expected 40", show(v3));
-  ctx.Assert(v2->event_ts == now - 10 && v2->age_s == 10, "version 2 of e-1 reads %s, expected event_ts %d and age_s 10", show(v2), now - 10);
+  ctx.Assert(v2 && v2->value == 12.5, "version 2 of e-1 reads %s: the write of version 3 replaced it. Key the value by (name, version, entity)", hShow(v2));
+  ctx.Assert(v3 && v3->value == 40.0, "version 3 of e-1 reads %s, expected 40", hShow(v3));
+  ctx.Assert(v2->event_ts == now - 10 && v2->age_s == 10, "version 2 of e-1 reads %s, expected event_ts %d and age_s 10", hShow(v2), now - 10);
   ctx.Equal(ctx.Redis.Keys("feature:*"), {"feature:amount_7d:2:e-1", "feature:amount_7d:3:e-1"}, "the online store must hold one hash per version; it holds");
 }
 
 void CheckNewerWins(harness::Ctx& ctx) {
-  const long long now = state();
+  const long long now = hState();
   ctx.Equal(writeValue("amount_7d", 2, "e-1", 5.0, now - 10), true, "the first write of e-1 must store; stored");
   const bool late = writeValue("amount_7d", 2, "e-1", 3.0, now - 100);
   auto seen = readValue("amount_7d", 2, "e-1");
-  ctx.Assert(seen && seen->value == 5.0 && seen->event_ts == now - 10, "a backfill row from 100 s ago replaced the value from 10 s ago: e-1 reads %s", show(seen));
+  ctx.Assert(seen && seen->value == 5.0 && seen->event_ts == now - 10, "a backfill row from 100 s ago replaced the value from 10 s ago: e-1 reads %s", hShow(seen));
   ctx.Equal(late, false, "writeValue for a value older than the stored one; stored");
   ctx.Equal(writeValue("amount_7d", 2, "e-1", 5.0, now - 10), false, "a replay of the stored event_ts; stored");
+  const bool newer = writeValue("amount_7d", 2, "e-1", 6.0, now - 2);
+  seen = readValue("amount_7d", 2, "e-1");
+  ctx.Assert(newer && seen && seen->value == 6.0 && seen->event_ts == now - 2, "a value from 2 s ago must replace the stored one from 10 s ago: writeValue returned %v and e-1 reads %s", newer, hShow(seen));
   // The streaming path writes e-2 from 5 s ago right after this write from 50 s ago first touches the key.
   const std::string key = "feature:amount_7d:2:e-2";
   auto fired = std::make_shared<bool>(false);
@@ -761,20 +794,28 @@ void CheckNewerWins(harness::Ctx& ctx) {
   writeValue("amount_7d", 2, "e-2", 4.0, now - 50);
   ctx.Assert(*fired, "the write of e-2 never touched %s", key);
   seen = readValue("amount_7d", 2, "e-2");
-  ctx.Assert(seen && seen->value == 7, "a value from 5 s ago landed between this write's read and its write and was replaced by one from 50 s ago: e-2 reads %s. Compare and write in one Lua script", show(seen));
+  ctx.Assert(seen && seen->value == 7, "a value from 5 s ago landed between this write's read and its write and was replaced by one from 50 s ago: e-2 reads %s. Compare and write in one Lua script", hShow(seen));
 }
 
 void CheckExpireAtSlo(harness::Ctx& ctx) {
-  const long long now = state();
+  const long long now = hState();
+  const std::string key = "feature:amount_7d:2:e-1";
+  // The TTL is read right after the write first touches the key: a key that exists must already expire.
+  auto created = std::make_shared<long long>(-2);
+  ctx.Redis.After(key, [&ctx, created, key] { *created = ctx.Redis.TTL(key); });
   writeValue("amount_7d", 2, "e-1", 5.0, now - 200);
-  long long ttl = ctx.Redis.TTL("feature:amount_7d:2:e-1");
-  ctx.Assert(95 <= ttl && ttl <= 101, "feature:amount_7d:2:e-1 has a TTL of %d s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo", ttl);
+  ctx.Assert(*created != -1, "right after the write first touched %s the key existed without a TTL: set the expiry in the same script as the write", key);
+  long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(95 <= ttl && ttl <= 101, "%s has a TTL of %d s; computed 200 s ago under a 300 s freshness SLO it goes stale in 100 s: EXPIREAT event_ts + freshness_slo", key, ttl);
+  writeValue("amount_7d", 2, "e-1", 4.0, now - 250);
+  ttl = ctx.Redis.TTL(key);
+  ctx.Assert(95 <= ttl && ttl <= 101, "a refused row from 250 s ago moved the expiry of %s to %d s: a write that does not store must leave the TTL alone", key, ttl);
   writeValue("amount_7d", 4, "e-1", 5.0, now);
   ttl = ctx.Redis.TTL("feature:amount_7d:4:e-1");
   ctx.Assert(3595 <= ttl && ttl <= 3601, "feature:amount_7d:4:e-1 has a TTL of %d s, expected its definition's freshness_slo of 3600 s", ttl);
   ctx.Clock.Advance(101);
   const auto seen = readValue("amount_7d", 2, "e-1");
-  ctx.Assert(!seen, "101 s later the value is past its freshness SLO and still served: %s", show(seen));
+  ctx.Assert(!seen, "101 s later the value is past its freshness SLO and still served: %s", hShow(seen));
   ctx.Assert(readValue("amount_7d", 4, "e-1").has_value(), "the value of version 4 is within its SLO and must still be served");
 }
 `,

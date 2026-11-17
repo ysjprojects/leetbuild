@@ -23,12 +23,14 @@ acknowledgement doubles a record and a failover drops one; and a consumer that d
 leaves the counters short.
 
 - The key is the locale pair \`{source}->{target}\`.
-- The payload carries \`source_sha256\` and \`target_sha256\` (\`sha256_hex\`), never the text.
+- The payload carries \`source_sha256\` and \`target_sha256\` (\`sha256_hex\`), never the text or any
+  part of it.
 - A refused produce reaches the outbox from the delivery report (callback, rejected send, returned
   write error); \`publish_done\` does not raise.
 - The producer is idempotent with \`acks=all\` (kafka-go has no idempotent producer: its writer uses
   \`RequireAll\`).
-- The consumer updates both counters in one \`MULTI\`, then commits.`,
+- The consumer updates both counters in one \`MULTI\`, then commits; a record whose counts failed is
+  not committed.`,
   sequence: {
     participants: ['translationd', 'translation.done', 'outbox', 'Quality consumer', 'Redis'],
     messages: [
@@ -71,7 +73,7 @@ leaves the counters short.
       id: 'no-text',
       title: 'Carries text hashes, not the text',
       detail:
-        'The payload carries `source_sha256` and `target_sha256` and no field holds the source or the translated text: the topic is retained and replicated, so customer text there outlives every deletion request. The starter copies both texts in.',
+        'The payload carries `source_sha256` and `target_sha256` and no field holds the source or the translated text, whole, cut short or nested: the topic is retained and replicated, so customer text there outlives every deletion request. The starter copies both texts in.',
       match: {
         python: {all: [/source_sha256/, /target_sha256/], none: [/["']source_text["']|["']target_text["']/]},
         typescript: {all: [/source_sha256/, /target_sha256/], none: [/source_text|target_text/]},
@@ -110,7 +112,7 @@ leaves the counters short.
       id: 'counters-before-commit',
       title: 'Counts the record before committing its offset',
       detail:
-        'The consumer applies both `HINCRBY`s in one transaction and commits the offset after it, so a crash in between replays the record instead of losing it. The starter commits first.',
+        'The consumer applies both `HINCRBY`s in one transaction, so no moment shows one counter without the other, and commits the offset after it, so a crash in between replays the record instead of losing it; a record whose counts failed (an error in the `EXEC` replies) is not committed. The starter commits first.',
       match: {
         python: {order: [/def run\(/, /\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/function run\(/, /\.hincrby\(/, /commitOffsets\(/]},
@@ -410,7 +412,9 @@ export async function run(): Promise<void> {
         await consumer.commitOffsets([{topic, partition, offset: next}]);
         return;
       }
-      await redis.multi().hincrby(key, 'segments', 1).hincrby(key, 'score_milli', score).exec(); // both counters or neither
+      const replies = await redis.multi().hincrby(key, 'segments', 1).hincrby(key, 'score_milli', score).exec(); // both counters or neither
+      const failed = replies?.find(([err]) => err !== null);
+      if (failed !== undefined) throw failed[0]; // not counted, so not committed: replayed after a restart
       await consumer.commitOffsets([{topic, partition, offset: next}]); // counted: a crash before this replays the record
     },
   });
@@ -774,7 +778,8 @@ object Events {
             val tx = jedis.multi() // both counters or neither
             tx.hincrBy(key, "segments", 1)
             tx.hincrBy(key, "score_milli", score)
-            tx.exec()
+            // A failed count is thrown, not committed: the batch is replayed after a restart.
+            tx.exec().asScala.collectFirst { case e: Exception => e }.foreach(e => throw e)
           case _ => System.err.println(s"skipping malformed record at offset \${record.offset()}")
         }
       }
@@ -993,7 +998,9 @@ void run() {
     const std::string key = "quality:" + localePair(event["source"].get<std::string>(), event["target"].get<std::string>());
     const long long score = std::llround(event["quality_score"].get<double>() * 1000);
     auto tx = redis.transaction();  // MULTI/EXEC: both counters or neither
-    tx.hincrby(key, "segments", 1).hincrby(key, "score_milli", score).exec();
+    auto replies = tx.hincrby(key, "segments", 1).hincrby(key, "score_milli", score).exec();
+    replies.get<long long>(0);  // an error reply throws: not counted, so not committed
+    replies.get<long long>(1);
     consumer->commitSync(msg.get());  // counted: a crash before this replays the record
   }
 }
@@ -1061,6 +1068,9 @@ def check_no_text(ctx):
     payload = _payload(records[0])
     for name, value in payload.items():
         assert value not in (SEGMENT["text"], SEGMENT["translation"]), f"the event carries customer text in {name}: {payload}. The topic is retained and replicated; carry hashes"
+    raw = records[0].value.decode("utf-8", "replace") if isinstance(records[0].value, bytes) else str(records[0].value)
+    for word in ("Open", "Dashboard", "Tableau"):
+        assert word not in raw, f"the event carries customer text ({word!r}) in {raw}: no field, nested or cut short, may hold the text. The topic is retained and replicated; carry hashes"
     assert payload.get("source_sha256") == _sha(SEGMENT["text"]) and payload.get("target_sha256") == _sha(SEGMENT["translation"]), f"the event must carry source_sha256 and target_sha256 of the two texts, got {payload}"
     assert payload.get("glossary_version") == 2 and payload.get("quality_score") == 0.92 and payload.get("tenant") == "acme", f"the event lost its fields: {payload}"
 
@@ -1102,19 +1112,32 @@ def check_counters_before_commit(ctx):
     _seed(ctx, "en", "fr", 0.9)
     _seed(ctx, "en", "fr", 0.8)
     _seed(ctx, "en", "de", 0.5)
+    _seed(ctx, "en", "es", 0.7)
     m = ctx.load("events")
     counted = []  # records counted in Redis at the moment of each commit
+    # en->es as the consumer's first command on it left it (the harness reads it only once this fired).
+    first = ctx.redis_after("quality:en->es", lambda: ctx.redis.hgetall("quality:en->es"))
 
     def at_commit(group, offsets):
-        counted.append(sum(int(ctx.redis.hget(k, "segments") or 0) for k in ("quality:en->fr", "quality:en->de")))
+        keys = ("quality:en->fr", "quality:en->de") + (("quality:en->es",) if first.fired else ())
+        counted.append(sum(int(ctx.redis.hget(k, "segments") or 0) for k in keys))
 
     ctx.kafka.on_commit(at_commit)
     ctx.drain(m.run)
+    assert first.fired and first.result == {"segments": "1", "score_milli": "700"}, f"right after the consumer's first command on quality:en->es the hash held {first.result}: a crash there leaves segments and score_milli disagreeing. Apply both HINCRBYs in one MULTI/EXEC"
     fr, de = ctx.redis.hgetall("quality:en->fr"), ctx.redis.hgetall("quality:en->de")
     assert fr == {"segments": "2", "score_milli": "1700"} and de == {"segments": "1", "score_milli": "500"}, f"the counters are en->fr {fr}, en->de {de}; expected en->fr 2 segments / 1700, en->de 1 / 500"
     assert ctx.kafka.lag("quality", TOPIC) == 0, "every record must be committed"
     short = [n for i, n in enumerate(counted) if n < i + 1]
     assert not short, f"at the commits the counters held {counted} records: a commit ran before its record was counted, so a crash between them loses the record. Count, then commit"
+    # A count that fails (quality:en->ja is not a hash) leaves its record uncommitted, to be replayed.
+    ctx.redis.set("quality:en->ja", "corrupt")
+    _seed(ctx, "en", "ja", 0.6)
+    try:
+        ctx.drain(m.run)
+    except Exception:
+        pass  # the consumer stopping on the failure is a correct outcome
+    assert ctx.kafka.lag("quality", TOPIC) == 1, f"the count of an en->ja record failed (WRONGTYPE) and the consumer left a lag of {ctx.kafka.lag('quality', TOPIC)}, expected 1: a record whose counts failed must not be committed, or it is lost"
 `,
     typescript: `import {createHash} from 'node:crypto';
 
@@ -1170,6 +1193,10 @@ export async function check_no_text(ctx) {
   for (const [name, value] of Object.entries(p)) {
     assert(value !== SEGMENT.text && value !== SEGMENT.translation, \`the event carries customer text in \${name}: \${JSON.stringify(p)}. The topic is retained and replicated; carry hashes\`);
   }
+  const raw = String(records[0].value);
+  for (const word of ['Open', 'Dashboard', 'Tableau']) {
+    assert(!raw.includes(word), \`the event carries customer text (\${word}) in \${raw}: no field, nested or cut short, may hold the text. The topic is retained and replicated; carry hashes\`);
+  }
   assert(p.source_sha256 === sha(SEGMENT.text) && p.target_sha256 === sha(SEGMENT.translation), \`the event must carry source_sha256 and target_sha256 of the two texts, got \${JSON.stringify(p)}\`);
   assert(p.glossary_version === 2 && p.quality_score === 0.92 && p.tenant === 'acme', \`the event lost its fields: \${JSON.stringify(p)}\`);
 }
@@ -1207,16 +1234,36 @@ export async function check_counters_before_commit(ctx) {
   seed(ctx, 'en', 'fr', 0.9);
   seed(ctx, 'en', 'fr', 0.8);
   seed(ctx, 'en', 'de', 0.5);
+  seed(ctx, 'en', 'es', 0.7);
   const m = ctx.load('events');
   const counted: number[] = []; // records counted in Redis at the moment of each commit
-  ctx.kafka.onCommit(() => counted.push(['quality:en->fr', 'quality:en->de'].reduce((n, k) => n + Number(ctx.redis.hget(k, 'segments') ?? 0), 0)));
+  // en->es as the consumer's first command on it left it (the harness reads it only once this fired).
+  const first = ctx.redisAfter('quality:en->es', () => ctx.redis.hgetall('quality:en->es'));
+  ctx.kafka.onCommit(() => {
+    const keys = ['quality:en->fr', 'quality:en->de', ...(first.fired ? ['quality:en->es'] : [])];
+    counted.push(keys.reduce((n, k) => n + Number(ctx.redis.hget(k, 'segments') ?? 0), 0));
+  });
   await ctx.drain(m.run());
+  assert(
+    first.fired && first.result?.segments === '1' && first.result?.score_milli === '700' && Object.keys(first.result).length === 2,
+    \`right after the consumer's first command on quality:en->es the hash held \${JSON.stringify(first.result)}: a crash there leaves segments and score_milli disagreeing. Apply both HINCRBYs in one MULTI/EXEC\`,
+  );
   const fr = ctx.redis.hgetall('quality:en->fr');
   const de = ctx.redis.hgetall('quality:en->de');
   assert(fr.segments === '2' && fr.score_milli === '1700' && de.segments === '1' && de.score_milli === '500', \`the counters are en->fr \${JSON.stringify(fr)}, en->de \${JSON.stringify(de)}; expected en->fr 2 segments / 1700, en->de 1 / 500\`);
   assert.equal(ctx.kafka.lag('quality', TOPIC), 0, 'every record must be committed');
   const short = counted.filter((n, i) => n < i + 1);
   assert.equal(short.length, 0, \`at the commits the counters held \${JSON.stringify(counted)} records: a commit ran before its record was counted, so a crash between them loses the record. Count, then commit\`);
+  // A count that fails (quality:en->ja is not a hash) leaves its record uncommitted, to be replayed.
+  ctx.redis.set('quality:en->ja', 'corrupt');
+  seed(ctx, 'en', 'ja', 0.6);
+  try {
+    await ctx.drain(m.run());
+  } catch {
+    // the consumer stopping on the failure is a correct outcome
+  }
+  const lag = ctx.kafka.lag('quality', TOPIC);
+  assert.equal(lag, 1, \`the count of an en->ja record failed (WRONGTYPE) and the consumer left a lag of \${lag}, expected 1: a record whose counts failed must not be committed, or it is lost\`);
 }
 `,
     go: `package main
@@ -1226,6 +1273,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 
 	"leetbuild/harness"
 )
@@ -1272,6 +1320,9 @@ func CheckNoText(ctx *harness.Ctx) {
 	for name, value := range p {
 		ctx.Assert(value != segment.Text && value != segment.Translation, "the event carries customer text in %s: %v. The topic is retained and replicated; carry hashes", name, p)
 	}
+	for _, word := range []string{"Open", "Dashboard", "Tableau"} {
+		ctx.Assert(!strings.Contains(string(records[0].Value), word), "the event carries customer text (%s) in %s: no field, nested or cut short, may hold the text. The topic is retained and replicated; carry hashes", word, records[0].Value)
+	}
 	ctx.Assert(p["source_sha256"] == eventsSha(segment.Text) && p["target_sha256"] == eventsSha(segment.Translation), "the event must carry source_sha256 and target_sha256 of the two texts, got %v", p)
 	ctx.Assert(p["glossary_version"] == float64(2) && p["quality_score"] == 0.92 && p["tenant"] == "acme", "the event lost its fields: %v", p)
 }
@@ -1309,10 +1360,18 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 	seedDone(ctx, "en", "fr", 0.9)
 	seedDone(ctx, "en", "fr", 0.8)
 	seedDone(ctx, "en", "de", 0.5)
+	seedDone(ctx, "en", "es", 0.7)
 	var counted []int // records counted in Redis at the moment of each commit
+	// en->es as the consumer's first command on it left it (the harness reads it only once this fired).
+	var firstSeen map[string]string
+	first := ctx.Redis.After("quality:en->es", func() any { firstSeen = ctx.Redis.HGetAll("quality:en->es"); return nil })
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
+		keys := []string{"quality:en->fr", "quality:en->de"}
+		if first.Fired {
+			keys = append(keys, "quality:en->es")
+		}
 		total := 0
-		for _, key := range []string{"quality:en->fr", "quality:en->de"} {
+		for _, key := range keys {
 			if n, ok := ctx.Redis.HGet(key, "segments"); ok {
 				v := 0
 				for _, c := range n {
@@ -1324,12 +1383,18 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 		counted = append(counted, total)
 	})
 	ctx.Drain(func() { run(context.Background()) })
+	ctx.Assert(first.Fired && len(firstSeen) == 2 && firstSeen["segments"] == "1" && firstSeen["score_milli"] == "700", "right after the consumer's first command on quality:en->es the hash held %v: a crash there leaves segments and score_milli disagreeing. Apply both HINCRBYs in one MULTI/EXEC", firstSeen)
 	ctx.Equal(ctx.Redis.HGetAll("quality:en->fr"), map[string]string{"segments": "2", "score_milli": "1700"}, "en->fr's counters")
 	ctx.Equal(ctx.Redis.HGetAll("quality:en->de"), map[string]string{"segments": "1", "score_milli": "500"}, "en->de's counters")
 	ctx.Equal(ctx.Kafka.Lag("quality", topic), int64(0), "every record must be committed; the lag")
 	for i, n := range counted {
 		ctx.Assert(n >= i+1, "at the commits the counters held %v records: a commit ran before its record was counted, so a crash between them loses the record. Count, then commit", counted)
 	}
+	// A count that fails (quality:en->ja is not a hash) leaves its record uncommitted, to be replayed.
+	ctx.Redis.Set("quality:en->ja", "corrupt")
+	seedDone(ctx, "en", "ja", 0.6)
+	ctx.Drain(func() { run(context.Background()) }) // returning the error is a correct outcome
+	ctx.Equal(ctx.Kafka.Lag("quality", topic), int64(1), "the count of an en->ja record failed (WRONGTYPE): a record whose counts failed must not be committed, or it is lost; the lag")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1337,6 +1402,8 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 #include <openssl/sha.h>
 
+#include <atomic>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -1400,6 +1467,10 @@ void CheckNoText(harness::Ctx& ctx) {
   for (const auto& [name, value] : p.items()) {
     ctx.Assert(value != kSegment.text && value != kSegment.translation, "the event carries customer text in %s: %s. The topic is retained and replicated; carry hashes", name, p.dump());
   }
+  const std::string raw = records[0].Value.value_or("");
+  for (const std::string word : {"Open", "Dashboard", "Tableau"}) {
+    ctx.Assert(raw.find(word) == std::string::npos, "the event carries customer text (%s) in %s: no field, nested or cut short, may hold the text. The topic is retained and replicated; carry hashes", word, raw);
+  }
   ctx.Assert(p.value("source_sha256", "") == sha(kSegment.text) && p.value("target_sha256", "") == sha(kSegment.translation), "the event must carry source_sha256 and target_sha256 of the two texts, got %s", p.dump());
   ctx.Assert(p.value("glossary_version", 0L) == 2 && p.value("tenant", "") == "acme", "the event lost its fields: %s", p.dump());
 }
@@ -1433,19 +1504,42 @@ void CheckCountersBeforeCommit(harness::Ctx& ctx) {
   seedDone(ctx, "en", "fr", 0.9);
   seedDone(ctx, "en", "fr", 0.8);
   seedDone(ctx, "en", "de", 0.5);
+  seedDone(ctx, "en", "es", 0.7);
   std::vector<long> counted;  // records counted in Redis at the moment of each commit
+  // en->es as the consumer's first command on it left it (the harness reads it only once this fired).
+  std::atomic<bool> fired{false};
+  std::map<std::string, std::string> firstSeen;
+  ctx.Redis.After("quality:en->es", [&] {
+    firstSeen = ctx.Redis.HGetAll("quality:en->es");
+    fired = true;
+  });
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
+    std::vector<std::string> keys = {"quality:en->fr", "quality:en->de"};
+    if (fired) keys.push_back("quality:en->es");
     long total = 0;
-    for (const std::string key : {"quality:en->fr", "quality:en->de"}) total += std::stol(ctx.Redis.HGet(key, "segments").value_or("0"));
+    for (const auto& key : keys) total += std::stol(ctx.Redis.HGet(key, "segments").value_or("0"));
     counted.push_back(total);
   });
   ctx.Drain([] { run(); });
+  std::string seen;
+  for (const auto& [field, value] : firstSeen) seen += " " + field + "=" + value;
+  ctx.Assert(fired && firstSeen == std::map<std::string, std::string>{{"segments", "1"}, {"score_milli", "700"}},
+             "right after the consumer's first command on quality:en->es the hash held {%s }: a crash there leaves segments and score_milli disagreeing. Apply both HINCRBYs in one MULTI/EXEC", seen);
   ctx.Equal(ctx.Redis.HGetAll("quality:en->fr"), std::map<std::string, std::string>{{"segments", "2"}, {"score_milli", "1700"}}, "en->fr's counters");
   ctx.Equal(ctx.Redis.HGetAll("quality:en->de"), std::map<std::string, std::string>{{"segments", "1"}, {"score_milli", "500"}}, "en->de's counters");
   ctx.Equal(ctx.Kafka.Lag("quality", kTopic), 0, "every record must be committed; the lag");
   for (size_t i = 0; i < counted.size(); i++) {
     ctx.Assert(counted[i] >= static_cast<long>(i + 1), "at the commits the counters held %v records: a commit ran before its record was counted, so a crash between them loses the record. Count, then commit", counted);
   }
+  // A count that fails (quality:en->ja is not a hash) leaves its record uncommitted, to be replayed.
+  ctx.Redis.Set("quality:en->ja", "corrupt");
+  seedDone(ctx, "en", "ja", 0.6);
+  try {
+    ctx.Drain([] { run(); });
+  } catch (const std::exception&) {
+    // the consumer stopping on the failure is a correct outcome
+  }
+  ctx.Equal(ctx.Kafka.Lag("quality", kTopic), 1, "the count of an en->ja record failed (WRONGTYPE): a record whose counts failed must not be committed, or it is lost; the lag");
 }
 `,
   },

@@ -26,7 +26,7 @@ service Translator { rpc Translate(TranslateRequest) returns (TranslateReply); }
 
 - Every attempt carries a **\`DEADLINE_S\` = 2 s** deadline.
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried, within \`MAX_ATTEMPTS\` = 3;
-  \`INVALID_ARGUMENT\` raises \`PairRejected\` at once.
+  \`INVALID_ARGUMENT\` raises \`PairRejected\` at once; any other code stops after that one call.
 - When no attempt answered, return \`{"text": text, "marker": UNTRANSLATED}\` (\`"untranslated"\`)
   and remember nothing: only a reply from the model goes to \`tm_put\`.`,
   sequence: {
@@ -62,7 +62,7 @@ service Translator { rpc Translate(TranslateRequest) returns (TranslateReply); }
       id: 'retriable-only',
       title: 'Retries an outage, never a rejected language pair',
       detail:
-        '`UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; `INVALID_ARGUMENT` raises `PairRejected` after one call. The starter retries every status code and then returns the source text.',
+        '`UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; `INVALID_ARGUMENT` raises `PairRejected` after one call; any other code (`INTERNAL`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`) gets one call and the marked fallback. The starter retries every status code and then returns the source text.',
       match: {
         python: {all: [/INVALID_ARGUMENT/, /raise PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/INVALID_ARGUMENT/, /throw new PairRejected/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
@@ -723,6 +723,18 @@ def check_retriable_only(ctx):
     result = _translate(m)
     assert result == {"text": TRANSLATED, "marker": None}, f"two UNAVAILABLE answers then a reply: translate_segment answered {result}, expected the translation from the third attempt"
     assert len(ctx.grpc.calls_to("Translate")) == 4, "UNAVAILABLE is retried: three attempts for the second segment"
+    # Any other failure is final: one call, then the marked fallback (one code per segment).
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.RESOURCE_EXHAUSTED):
+        before = len(ctx.grpc.calls_to("Translate"))
+        ctx.grpc.fail("Translate", code, times=1)
+        text = f"Open the {code.name} report"
+        try:
+            result = _translate(m, text)
+        except Exception as exc:
+            raise AssertionError(f"{code.name} from the model raised {type(exc).__name__}: {exc}; only INVALID_ARGUMENT is PairRejected, another failure ends in the marked fallback")
+        sent = len(ctx.grpc.calls_to("Translate")) - before
+        assert sent == 1, f"{code.name} was sent to the model {sent} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert result == {"text": text, "marker": "untranslated"}, f"after {code.name} translate_segment answered {result}, expected the source text marked untranslated"
 
 
 def check_marked_fallback(ctx):
@@ -800,6 +812,21 @@ export async function check_retriable_only(ctx) {
   result = await translate(m);
   assert.deepStrictEqual(result, {text: TRANSLATED, marker: null}, \`two UNAVAILABLE answers then a reply: translateSegment answered \${JSON.stringify(result)}, expected the translation from the third attempt\`);
   assert.equal(ctx.grpc.callsTo('Translate').length, 4, 'UNAVAILABLE is retried: three attempts for the second segment');
+  // Any other failure is final: one call, then the marked fallback (one code per segment).
+  for (const name of ['INTERNAL', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED']) {
+    const before = ctx.grpc.callsTo('Translate').length;
+    ctx.grpc.fail('Translate', ctx.grpc.status[name], '', 1);
+    const text = \`Open the \${name} report\`;
+    let after;
+    try {
+      after = await translate(m, text);
+    } catch (e) {
+      assert.fail(\`\${name} from the model threw \${(e as Error).constructor.name}: \${(e as Error).message}; only INVALID_ARGUMENT is PairRejected, another failure ends in the marked fallback\`);
+    }
+    const sent = ctx.grpc.callsTo('Translate').length - before;
+    assert.equal(sent, 1, \`\${name} was sent to the model \${sent} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert.deepStrictEqual(after, {text, marker: 'untranslated'}, \`after \${name} translateSegment answered \${JSON.stringify(after)}, expected the source text marked untranslated\`);
+  }
 }
 
 export async function check_marked_fallback(ctx) {
@@ -903,6 +930,16 @@ func CheckRetriableOnly(ctx *harness.Ctx) {
 	second := mustTranslate(ctx, clientSample)
 	ctx.Assert(second.Text == clientTranslated && second.Marker == "", "two Unavailable answers then a reply: translateSegment answered %+v, expected the translation from the third attempt", second)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Translate", "")), 4, "Unavailable is retried: three attempts for the second segment; the calls")
+	// Any other failure is final: one call, then the marked fallback (one code per segment).
+	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.ResourceExhausted} {
+		before := len(ctx.GRPC.CallsTo("Translate", ""))
+		ctx.GRPC.Fail("Translate", code, "", 1, "")
+		text := "Open the " + code.String() + " report"
+		after, err := translateSegment(clientBg, "acme", text, "en", "fr", pinned)
+		ctx.NoError(err, "%v from the model must end in the marked fallback, not an error: only InvalidArgument is ErrPairRejected", code)
+		ctx.Equal(len(ctx.GRPC.CallsTo("Translate", ""))-before, 1, "only Unavailable and DeadlineExceeded are retried; the calls for %v", code)
+		ctx.Assert(after.Text == text && after.Marker == "untranslated", "after %v translateSegment answered %+v, expected the source text marked untranslated", code, after)
+	}
 }
 
 func CheckMarkedFallback(ctx *harness.Ctx) {
@@ -1008,6 +1045,21 @@ void CheckRetriableOnly(harness::Ctx& ctx) {
   const Translation second = mustTranslate(ctx, kSample);
   ctx.Assert(second.text == kTranslated && second.marker.empty(), "two UNAVAILABLE answers then a reply: translateSegment answered %q (marker %q), expected the translation from the third attempt", second.text, second.marker);
   ctx.Equal(ctx.GRPC.CallsTo("Translate").size(), 4, "UNAVAILABLE is retried: three attempts for the second segment; the calls");
+  // Any other failure is final: one call, then the marked fallback (one code per segment).
+  for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{
+           {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
+    const size_t before = ctx.GRPC.CallsTo("Translate").size();
+    ctx.GRPC.Fail("Translate", code, "", 1);
+    const std::string text = "Open the " + name + " report";
+    Translation after;
+    try {
+      after = translateSegment("acme", text, "en", "fr", kPinned);
+    } catch (const std::exception& e) {
+      ctx.Fatalf("%s from the model threw %s: %s; only INVALID_ARGUMENT is PairRejected, another failure ends in the marked fallback", name, harness::CurrentExceptionType(), e.what());
+    }
+    ctx.Equal(ctx.GRPC.CallsTo("Translate").size() - before, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for %s", name);
+    ctx.Assert(after.text == text && after.marker == "untranslated", "after %s translateSegment answered %q (marker %q), expected the source text marked untranslated", name, after.text, after.marker);
+  }
 }
 
 void CheckMarkedFallback(harness::Ctx& ctx) {

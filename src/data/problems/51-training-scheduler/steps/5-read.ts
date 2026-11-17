@@ -63,7 +63,7 @@ a run whose job died is reported running forever, so nobody restarts it.
       id: 'tenant-scoped-404',
       title: "Answers 404 for another tenant's run",
       detail:
-        "Tenant t2 reading t1's run gets **404**, the same as for an id that does not exist, and a request without `X-Tenant-Id` gets **401**. The starter looks the run up by id alone.",
+        "Tenant t2 reading t1's run gets **404** with the same body as an id that does not exist, and a request without `X-Tenant-Id` gets **401**. The starter looks the run up by id alone.",
       match: {
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*run\[["']tenant["']\]/, /\b404\b/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*run\.tenant/, /\b404\b/]},
@@ -89,7 +89,7 @@ a run whose job died is reported running forever, so nobody restarts it.
       id: 'cluster-nodes',
       title: "Reports a running run's nodes from the cluster's view",
       detail:
-        'A running run whose row still names n1 and n2, while the cluster reports it on n3, answers `nodes: ["n3"]`. The starter echoes the row.',
+        'A running run whose row still names n1 and n2, while the cluster reports it on n3, answers `nodes: ["n3"]`; a queued run whose row still names its old nodes answers `nodes: []`. The starter echoes the row.',
       match: {
         python: {all: [/cluster\.assignment\(/]},
         typescript: {all: [/assignment\(runId\)/]},
@@ -102,7 +102,7 @@ a run whose job died is reported running forever, so nobody restarts it.
       id: 'orphaned-failed',
       title: 'Reports a running run the cluster lost as failed',
       detail:
-        'A run whose row says running but which the cluster does not know answers `state: "failed"` and `reason: "not_on_cluster"`; a running run the cluster knows carries no `reason`. The starter reports the row.',
+        'A run whose row says running but which the cluster does not know answers `state: "failed"`, `reason: "not_on_cluster"` and `nodes: []`; a running run the cluster knows answers its nodes and no `reason`, and a starting run the cluster does not hold yet stays `starting` with no `reason`. The starter reports the row.',
       match: {
         python: {all: [/not_on_cluster/, /["']failed["']/]},
         typescript: {all: [/not_on_cluster/, /['"]failed['"]/]},
@@ -531,10 +531,12 @@ def _api(ctx):
     return ctx.client(ctx.load("read").app)
 
 
-def _put(run_id, state, band=1, at=0, tenant="t1"):
+def _put(run_id, state, band=1, at=0, tenant="t1", nodes=None):
+    if nodes is None:
+        nodes = ["n1", "n2"] if state == "running" else []
     runs.put({"run_id": run_id, "tenant": tenant, "recipe_version": "llama-ft-v3", "dataset_version": "ds-1", "priority": 8 - 3 * band,
               "band": band, "state": state, "enqueued_at_ms": at, "worker": "w-1" if state == "running" else "",
-              "nodes": ["n1", "n2"] if state == "running" else [], "checkpoint_id": "ckpt-7"})
+              "nodes": nodes, "checkpoint_id": "ckpt-7"})
     if state == "queued":
         queue.enqueue(run_id, band, at)
 
@@ -563,6 +565,7 @@ async def check_tenant_scoped_404(ctx):
         assert other.status_code == 404, f"tenant t2 reading t1's run answered {other.status_code}: {other.text}. Another tenant's run is 404, as if it did not exist"
         unknown = await _read(c, "run-zzz")
         assert unknown.status_code == 404, f"an unknown run answered {unknown.status_code}, expected 404"
+        assert other.text.replace("run-a", "{id}") == unknown.text.replace("run-zzz", "{id}"), f"another tenant's run answered {other.text}, an unknown id {unknown.text}: answer both the same, or the difference tells t2 the id exists"
         anonymous = await _read(c, "run-a", tenant=None)
         assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
         _ok(await _read(c, "run-a"), "the owner's read")
@@ -581,29 +584,36 @@ async def check_queue_position(ctx):
 async def check_cluster_nodes(ctx):
     _put("run-a", "running")
     ctx.redis.hset("cluster:assignments", "run-a", "n3")  # the cluster moved the run; the row still says n1, n2
+    _put("run-b", "queued", at=int(ctx.clock.time() * 1000), nodes=["n1", "n2"])  # preempted and queued again; the row still names its old nodes
     async with _api(ctx) as c:
         body = _ok(await _read(c, "run-a"), "the read of a running run")
+        requeued = _ok(await _read(c, "run-b"), "the read of a queued run")
     assert body.get("nodes") == ["n3"], f"the read answered nodes {body.get('nodes')}: the cluster reports run-a on ['n3']; the row's list is stale"
     assert body.get("state") == "running" and "reason" not in body, f"a running run the cluster knows must read running with no reason, got {body}"
+    assert requeued.get("nodes") == [], f"a queued run whose row still names n1, n2 answered nodes {requeued.get('nodes')}: a run that is not running holds no nodes ([])"
 
 
 async def check_orphaned_failed(ctx):
     _put("run-a", "running")
     _put("run-b", "running")
+    _put("run-c", "starting", nodes=["n1"])  # claimed; its worker has not placed it yet
     ctx.redis.hset("cluster:assignments", "run-b", "n5,n6")
     async with _api(ctx) as c:
         lost = _ok(await _read(c, "run-a"), "the read of a run the cluster lost")
         alive = _ok(await _read(c, "run-b"), "the read of a run the cluster knows")
+        starting = _ok(await _read(c, "run-c"), "the read of a starting run")
     assert lost.get("state") == "failed" and lost.get("reason") == "not_on_cluster", f"a running run the cluster does not know answered {lost}: report it failed with reason not_on_cluster, or nobody restarts it"
-    assert alive.get("state") == "running" and "reason" not in alive, f"a running run the cluster knows must read running with no reason, got {alive}"
+    assert lost.get("nodes") == [], f"a run the cluster lost answered nodes {lost.get('nodes')}: it holds none ([])"
+    assert alive.get("state") == "running" and "reason" not in alive and alive.get("nodes") == ["n5", "n6"], f"a running run the cluster knows on n5, n6 must read running on those nodes with no reason, got {alive}"
+    assert starting.get("state") == "starting" and "reason" not in starting and starting.get("nodes") == [], f"a starting run, which the cluster does not hold yet, answered {starting}: only a running run the cluster lost is failed"
 `,
     typescript: `function api(ctx) {
   return {c: ctx.client(ctx.load('read').app), runs: ctx.load('/support/trainsched/runs.ts'), queue: ctx.load('/support/trainsched/queue.ts')};
 }
 
-async function put(runs, queue, runId: string, state: string, band = 1, at = 0, tenant = 't1'): Promise<void> {
+async function put(runs, queue, runId: string, state: string, band = 1, at = 0, tenant = 't1', nodes: string[] | null = null): Promise<void> {
   const running = state === 'running';
-  await runs.put({run_id: runId, tenant, recipe_version: 'llama-ft-v3', dataset_version: 'ds-1', priority: 8 - 3 * band, band, state, enqueued_at_ms: at, worker: running ? 'w-1' : '', nodes: running ? ['n1', 'n2'] : [], checkpoint_id: 'ckpt-7'});
+  await runs.put({run_id: runId, tenant, recipe_version: 'llama-ft-v3', dataset_version: 'ds-1', priority: 8 - 3 * band, band, state, enqueued_at_ms: at, worker: running ? 'w-1' : '', nodes: nodes ?? (running ? ['n1', 'n2'] : []), checkpoint_id: 'ckpt-7'});
   if (state === 'queued') await queue.enqueue(runId, band, at);
 }
 
@@ -628,6 +638,7 @@ export async function check_tenant_scoped_404(ctx) {
   assert.equal(other.status, 404, \`tenant t2 reading t1's run answered \${other.status}: \${other.text}. Another tenant's run is 404, as if it did not exist\`);
   const unknown = await read(c, 'run-zzz');
   assert.equal(unknown.status, 404, \`an unknown run answered \${unknown.status}, expected 404\`);
+  assert.equal(other.text.replaceAll('run-a', '{id}'), unknown.text.replaceAll('run-zzz', '{id}'), \`another tenant's run answered \${other.text}, an unknown id \${unknown.text}: answer both the same, or the difference tells t2 the id exists\`);
   const anonymous = await read(c, 'run-a', null);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
   ok(await read(c, 'run-a'), "the owner's read");
@@ -648,20 +659,27 @@ export async function check_cluster_nodes(ctx) {
   const {c, runs, queue} = api(ctx);
   await put(runs, queue, 'run-a', 'running');
   ctx.redis.hset('cluster:assignments', 'run-a', 'n3'); // the cluster moved the run; the row still says n1, n2
+  await put(runs, queue, 'run-b', 'queued', 1, ctx.clock.now(), 't1', ['n1', 'n2']); // preempted and queued again; the row still names its old nodes
   const body = ok(await read(c, 'run-a'), 'the read of a running run');
+  const requeued = ok(await read(c, 'run-b'), 'the read of a queued run');
   assert.deepEqual(body.nodes, ['n3'], \`the read answered nodes \${JSON.stringify(body.nodes)}: the cluster reports run-a on ["n3"]; the row's list is stale\`);
   assert(body.state === 'running' && !('reason' in body), \`a running run the cluster knows must read running with no reason, got \${JSON.stringify(body)}\`);
+  assert.deepEqual(requeued.nodes, [], \`a queued run whose row still names n1, n2 answered nodes \${JSON.stringify(requeued.nodes)}: a run that is not running holds no nodes ([])\`);
 }
 
 export async function check_orphaned_failed(ctx) {
   const {c, runs, queue} = api(ctx);
   await put(runs, queue, 'run-a', 'running');
   await put(runs, queue, 'run-b', 'running');
+  await put(runs, queue, 'run-c', 'starting', 1, 0, 't1', ['n1']); // claimed; its worker has not placed it yet
   ctx.redis.hset('cluster:assignments', 'run-b', 'n5,n6');
   const lost = ok(await read(c, 'run-a'), 'the read of a run the cluster lost');
   const alive = ok(await read(c, 'run-b'), 'the read of a run the cluster knows');
+  const starting = ok(await read(c, 'run-c'), 'the read of a starting run');
   assert(lost.state === 'failed' && lost.reason === 'not_on_cluster', \`a running run the cluster does not know answered \${JSON.stringify(lost)}: report it failed with reason not_on_cluster, or nobody restarts it\`);
-  assert(alive.state === 'running' && !('reason' in alive), \`a running run the cluster knows must read running with no reason, got \${JSON.stringify(alive)}\`);
+  assert.deepEqual(lost.nodes, [], \`a run the cluster lost answered nodes \${JSON.stringify(lost.nodes)}: it holds none ([])\`);
+  assert(alive.state === 'running' && !('reason' in alive) && JSON.stringify(alive.nodes) === '["n5","n6"]', \`a running run the cluster knows on n5, n6 must read running on those nodes with no reason, got \${JSON.stringify(alive)}\`);
+  assert(starting.state === 'starting' && !('reason' in starting) && JSON.stringify(starting.nodes) === '[]', \`a starting run, which the cluster does not hold yet, answered \${JSON.stringify(starting)}: only a running run the cluster lost is failed\`);
 }
 `,
     go: `package main
@@ -669,6 +687,7 @@ export async function check_orphaned_failed(ctx) {
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"trainsched/queue"
 	"trainsched/runs"
@@ -684,11 +703,13 @@ func readAPI(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func putRun(ctx *harness.Ctx, runID, state string, band int, at int64) {
-	run := &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band, State: state, EnqueuedAtMs: at, CheckpointID: "ckpt-7"}
+func putRun(ctx *harness.Ctx, runID, state string, band int, at int64, nodes ...string) {
+	run := &runs.Run{RunID: runID, Tenant: "t1", RecipeVersion: "llama-ft-v3", DatasetVersion: "ds-1", Priority: 8 - 3*band, Band: band, State: state, EnqueuedAtMs: at, CheckpointID: "ckpt-7", Nodes: nodes}
 	if state == "running" {
 		run.Worker = "w-1"
-		run.Nodes = []string{"n1", "n2"}
+		if len(nodes) == 0 {
+			run.Nodes = []string{"n1", "n2"}
+		}
 	}
 	ctx.NoError(runs.Put(readBg, run), "runs.Put")
 	if state == "queued" {
@@ -730,7 +751,9 @@ func CheckTenantScoped404(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	other := readAs(c, "run-a", "t2")
 	ctx.Equal(other.Status, 404, "tenant t2 reading t1's run (%s): another tenant's run is 404, as if it did not exist; the status", other.Text())
-	ctx.Equal(readAs(c, "run-zzz", "t1").Status, 404, "an unknown run; the status")
+	unknown := readAs(c, "run-zzz", "t1")
+	ctx.Equal(unknown.Status, 404, "an unknown run; the status")
+	ctx.Equal(strings.ReplaceAll(other.Text(), "run-a", "{id}"), strings.ReplaceAll(unknown.Text(), "run-zzz", "{id}"), "another tenant's run must answer as an unknown id does, or the difference tells t2 the id exists; the 404 body")
 	ctx.Equal(readAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status")
 	readOK(ctx, readAs(c, "run-a", "t1"), "the owner's read")
 }
@@ -756,20 +779,30 @@ func CheckQueuePosition(ctx *harness.Ctx) {
 func CheckClusterNodes(ctx *harness.Ctx) {
 	putRun(ctx, "run-a", "running", 1, 0)
 	ctx.Redis.Do("HSET", "cluster:assignments", "run-a", "n3") // the cluster moved the run; the row still says n1, n2
-	v := readOK(ctx, readAs(readAPI(ctx), "run-a", "t1"), "the read of a running run")
+	// run-b was preempted and queued again; its row still names its old nodes.
+	putRun(ctx, "run-b", "queued", 1, ctx.Clock.Now(), "n1", "n2")
+	c := readAPI(ctx)
+	v := readOK(ctx, readAs(c, "run-a", "t1"), "the read of a running run")
+	requeued := readOK(ctx, readAs(c, "run-b", "t1"), "the read of a queued run")
 	ctx.Equal(v.Nodes, []string{"n3"}, "the cluster reports run-a on n3 and the row's list is stale; the nodes")
 	ctx.Assert(v.State == "running" && v.Reason == nil, "a running run the cluster knows must read running with no reason, got %+v", v)
+	ctx.Assert(len(requeued.Nodes) == 0, "a queued run whose row still names n1, n2 answered nodes %v: a run that is not running holds no nodes ([])", requeued.Nodes)
 }
 
 func CheckOrphanedFailed(ctx *harness.Ctx) {
 	putRun(ctx, "run-a", "running", 1, 0)
 	putRun(ctx, "run-b", "running", 1, 0)
+	putRun(ctx, "run-c", "starting", 1, 0, "n1") // claimed; its worker has not placed it yet
 	ctx.Redis.Do("HSET", "cluster:assignments", "run-b", "n5,n6")
 	c := readAPI(ctx)
 	lost := readOK(ctx, readAs(c, "run-a", "t1"), "the read of a run the cluster lost")
 	alive := readOK(ctx, readAs(c, "run-b", "t1"), "the read of a run the cluster knows")
+	starting := readOK(ctx, readAs(c, "run-c", "t1"), "the read of a starting run")
 	ctx.Assert(lost.State == "failed" && lost.Reason != nil && *lost.Reason == "not_on_cluster", "a running run the cluster does not know answered state %q: report it failed with reason not_on_cluster, or nobody restarts it", lost.State)
+	ctx.Assert(len(lost.Nodes) == 0, "a run the cluster lost answered nodes %v: it holds none ([])", lost.Nodes)
 	ctx.Assert(alive.State == "running" && alive.Reason == nil, "a running run the cluster knows must read running with no reason, got %+v", alive)
+	ctx.Equal(alive.Nodes, []string{"n5", "n6"}, "the cluster reports run-b on n5, n6; the nodes")
+	ctx.Assert(starting.State == "starting" && starting.Reason == nil && len(starting.Nodes) == 0, "a starting run, which the cluster does not hold yet, answered %+v: only a running run the cluster lost is failed", starting)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -777,6 +810,7 @@ func CheckOrphanedFailed(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -788,7 +822,7 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-void putRun(const std::string& run_id, const std::string& state, int band, long long at) {
+void putRun(const std::string& run_id, const std::string& state, int band, long long at, const std::vector<std::string>& nodes = {}) {
   runs::Run run;
   run.run_id = run_id;
   run.tenant = "t1";
@@ -799,9 +833,10 @@ void putRun(const std::string& run_id, const std::string& state, int band, long 
   run.state = state;
   run.enqueued_at_ms = at;
   run.checkpoint_id = "ckpt-7";
+  run.nodes = nodes;
   if (state == "running") {
     run.worker = "w-1";
-    run.nodes = {"n1", "n2"};
+    if (nodes.empty()) run.nodes = {"n1", "n2"};
   }
   runs::put(run);
   if (state == "queued") queue::enqueue(run_id, band, at);
@@ -817,8 +852,19 @@ nlohmann::json readOk(harness::Ctx& ctx, const harness::Response& r, const std::
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
 
-std::string text(const nlohmann::json& j, const std::string& field) {
+std::string hText(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+// A view whose nodes are empty (a null list reads as empty).
+bool hNoNodes(const nlohmann::json& v) {
+  const auto nodes = v.is_object() ? v.value("nodes", nlohmann::json()) : nlohmann::json();
+  return nodes.is_null() || nodes == nlohmann::json::array();
+}
+
+std::string hReplaceAll(std::string s, const std::string& from, const std::string& to) {
+  for (size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size())) s.replace(at, from.size(), to);
+  return s;
 }
 
 }  // namespace
@@ -827,7 +873,7 @@ void CheckStatusRoute(harness::Ctx& ctx) {
   putRun("run-a", "queued", 1, ctx.Clock.Now());
   auto c = readApi(ctx);
   const auto v = readOk(ctx, readAs(c, "run-a", "t1"), "the owner's read of a queued run");
-  ctx.Assert(text(v, "run_id") == "run-a" && text(v, "state") == "queued" && v.value("band", -1) == 1, "the read answered %s, expected run-a, state queued, band 1", v.dump());
+  ctx.Assert(hText(v, "run_id") == "run-a" && hText(v, "state") == "queued" && v.value("band", -1) == 1, "the read answered %s, expected run-a, state queued, band 1", v.dump());
 }
 
 void CheckTenantScoped404(harness::Ctx& ctx) {
@@ -835,7 +881,10 @@ void CheckTenantScoped404(harness::Ctx& ctx) {
   auto c = readApi(ctx);
   const auto other = readAs(c, "run-a", "t2");
   ctx.Equal(other.Status, 404, "tenant t2 reading t1's run (%s): another tenant's run is 404, as if it did not exist; the status", other.Text());
-  ctx.Equal(readAs(c, "run-zzz", "t1").Status, 404, "an unknown run; the status");
+  const auto unknown = readAs(c, "run-zzz", "t1");
+  ctx.Equal(unknown.Status, 404, "an unknown run; the status");
+  ctx.Equal(hReplaceAll(other.Text(), "run-a", "{id}"), hReplaceAll(unknown.Text(), "run-zzz", "{id}"),
+            "another tenant's run must answer as an unknown id does, or the difference tells t2 the id exists; the 404 body");
   ctx.Equal(readAs(c, "run-a", "").Status, 401, "a read without X-Tenant-Id; the status");
   readOk(ctx, readAs(c, "run-a", "t1"), "the owner's read");
 }
@@ -857,22 +906,31 @@ void CheckQueuePosition(harness::Ctx& ctx) {
 void CheckClusterNodes(harness::Ctx& ctx) {
   putRun("run-a", "running", 1, 0);
   ctx.Redis.Do("HSET", "cluster:assignments", "run-a", "n3");  // the cluster moved the run; the row still says n1, n2
+  putRun("run-b", "queued", 1, ctx.Clock.Now(), {"n1", "n2"});  // preempted and queued again; the row still names its old nodes
   auto c = readApi(ctx);
   const auto v = readOk(ctx, readAs(c, "run-a", "t1"), "the read of a running run");
+  const auto requeued = readOk(ctx, readAs(c, "run-b", "t1"), "the read of a queued run");
   ctx.Equal(v.value("nodes", nlohmann::json()), nlohmann::json{"n3"}, "the cluster reports run-a on n3 and the row's list is stale; the nodes");
-  ctx.Assert(text(v, "state") == "running" && !v.contains("reason"), "a running run the cluster knows must read running with no reason, got %s", v.dump());
+  ctx.Assert(hText(v, "state") == "running" && !v.contains("reason"), "a running run the cluster knows must read running with no reason, got %s", v.dump());
+  ctx.Assert(hNoNodes(requeued), "a queued run whose row still names n1, n2 answered %s: a run that is not running holds no nodes ([])", requeued.dump());
 }
 
 void CheckOrphanedFailed(harness::Ctx& ctx) {
   putRun("run-a", "running", 1, 0);
   putRun("run-b", "running", 1, 0);
+  putRun("run-c", "starting", 1, 0, {"n1"});  // claimed; its worker has not placed it yet
   ctx.Redis.Do("HSET", "cluster:assignments", "run-b", "n5,n6");
   auto c = readApi(ctx);
   const auto lost = readOk(ctx, readAs(c, "run-a", "t1"), "the read of a run the cluster lost");
   const auto alive = readOk(ctx, readAs(c, "run-b", "t1"), "the read of a run the cluster knows");
-  ctx.Assert(text(lost, "state") == "failed" && text(lost, "reason") == "not_on_cluster",
+  const auto starting = readOk(ctx, readAs(c, "run-c", "t1"), "the read of a starting run");
+  ctx.Assert(hText(lost, "state") == "failed" && hText(lost, "reason") == "not_on_cluster",
              "a running run the cluster does not know answered %s: report it failed with reason not_on_cluster, or nobody restarts it", lost.dump());
-  ctx.Assert(text(alive, "state") == "running" && !alive.contains("reason"), "a running run the cluster knows must read running with no reason, got %s", alive.dump());
+  ctx.Assert(hNoNodes(lost), "a run the cluster lost answered %s: it holds no nodes ([])", lost.dump());
+  ctx.Assert(hText(alive, "state") == "running" && !alive.contains("reason") && alive.value("nodes", nlohmann::json()) == nlohmann::json{"n5", "n6"},
+             "a running run the cluster knows on n5, n6 must read running on those nodes with no reason, got %s", alive.dump());
+  ctx.Assert(hText(starting, "state") == "starting" && !starting.contains("reason") && hNoNodes(starting),
+             "a starting run, which the cluster does not hold yet, answered %s: only a running run the cluster lost is failed", starting.dump());
 }
 `,
   },

@@ -58,7 +58,7 @@ prompt version and must die with it, however often it is read.
       id: 'first-writer-wins',
       title: 'A concurrent fill cannot overwrite the winner',
       detail:
-        "Another replica's fill lands between the starter's read and its write; the entry must stay the first writer's and the losing fill must answer it. The starter reads, then writes unconditionally, and answers its own record.",
+        "Another replica's fill lands between the starter's read and its write; the entry must stay the first writer's and the losing fill must answer it. A fill over an existing entry leaves its value and its expiry alone. The starter reads, then writes unconditionally, and answers its own record.",
       match: {
         python: {all: [/nx\s*=\s*True/]},
         typescript: {all: [/['"]NX['"]/]},
@@ -71,7 +71,7 @@ prompt version and must die with it, however often it is read.
       id: 'version-ttl',
       title: 'The fill sets the version lifetime',
       detail:
-        'A filled entry expires VERSION_TTL_S (six hours) after the fill, set by the fill itself. The starter writes it without an expiry.',
+        'A filled entry expires VERSION_TTL_S (six hours) after the fill, and it already has that expiry the moment the command that creates it returns. The starter writes it without an expiry.',
       match: {
         python: {all: [/ex\s*=\s*VERSION_TTL_S/]},
         typescript: {all: [/['"]EX['"],\s*VERSION_TTL_S/]},
@@ -433,17 +433,30 @@ def check_first_writer_wins(ctx):
         assert returned == rival, f"this fill lost the race and answered its own completion {returned.get('completion')!r}: the loser must answer the stored record"
     else:
         assert stored == returned == _record("Answer from replica A"), f"this fill won the race: the entry and the answer must both be its record, got entry {stored!r} and answer {returned!r}"
-    ctx.redis.set(OTHER, json.dumps(rival), ex=TTL)
+    ctx.redis.set(OTHER, json.dumps(rival), ex=120)  # two minutes before its version retires
     late = m.fill(OTHER, _record("late answer"))
     assert late == rival and _stored(ctx, OTHER) == rival, f"a fill over an existing entry must leave it and answer it, got {late!r}"
+    ttl = ctx.redis.ttl(OTHER)
+    assert 0 < ttl <= 120, f"a fill that found an entry moved its expiry to {ttl} s: the entry must die with its prompt version"
 
 
 def check_version_ttl(ctx):
     m = ctx.load("cache")
+    created = {}
+
+    def watch():
+        # The TTL the entry has right after the command that created it (a read of the empty key waits).
+        if ctx.redis.exists(KEY):
+            created["ttl"] = ctx.redis.ttl(KEY)
+        else:
+            ctx.redis_after(KEY, watch)
+
+    ctx.redis_after(KEY, watch)
     m.fill(KEY, _record())
     ttl = ctx.redis.ttl(KEY)
     assert ttl != -1, f"the entry under {KEY} has no expiry: it outlives its prompt version and keeps serving a retired template"
     assert TTL - 5 <= ttl <= TTL, f"the entry expires in {ttl} s, expected VERSION_TTL_S = {TTL} s set by the fill"
+    assert created.get("ttl", -1) != -1, "the entry existed without an expiry right after the command that wrote it: a TTL set by a second command is lost if the process dies in between. The write itself must carry EX"
 
 
 def check_hit_keeps_ttl(ctx):
@@ -488,17 +501,27 @@ export async function check_first_writer_wins(ctx) {
   } else {
     assert(JSON.stringify(now) === JSON.stringify(returned) && JSON.stringify(returned) === JSON.stringify(rec('Answer from replica A')), \`this fill won the race: the entry and the answer must both be its record, got entry \${JSON.stringify(now)} and answer \${JSON.stringify(returned)}\`);
   }
-  ctx.redis.set(OTHER, JSON.stringify(rival), 'EX', TTL);
+  ctx.redis.set(OTHER, JSON.stringify(rival), 'EX', 120); // two minutes before its version retires
   const late = await m.fill(OTHER, rec('late answer'));
   assert(JSON.stringify(late) === JSON.stringify(rival) && JSON.stringify(stored(ctx, OTHER)) === JSON.stringify(rival), \`a fill over an existing entry must leave it and answer it, got \${JSON.stringify(late)}\`);
+  const ttl = ctx.redis.ttl(OTHER);
+  assert(0 < ttl && ttl <= 120, \`a fill that found an entry moved its expiry to \${ttl} s: the entry must die with its prompt version\`);
 }
 
 export async function check_version_ttl(ctx) {
   const m = ctx.load('cache');
+  let created: number | undefined;
+  // The TTL the entry has right after the command that created it (a read of the empty key waits).
+  const watch = () => {
+    if (ctx.redis.exists(KEY)) created = ctx.redis.ttl(KEY);
+    else ctx.redisAfter(KEY, watch);
+  };
+  ctx.redisAfter(KEY, watch);
   await m.fill(KEY, rec());
   const ttl = ctx.redis.ttl(KEY);
   assert(ttl !== -1, \`the entry under \${KEY} has no expiry: it outlives its prompt version and keeps serving a retired template\`);
   assert(TTL - 5 <= ttl && ttl <= TTL, \`the entry expires in \${ttl} s, expected VERSION_TTL_S = \${TTL} s set by the fill\`);
+  assert(created !== undefined && created !== -1, 'the entry existed without an expiry right after the command that wrote it: a TTL set by a second command is lost if the process dies in between. The write itself must carry EX');
 }
 
 export async function check_hit_keeps_ttl(ctx) {
@@ -578,18 +601,34 @@ func CheckFirstWriterWins(ctx *harness.Ctx) {
 	} else {
 		ctx.Assert(now == returned && returned == stateRecord("Answer from replica A"), "this fill won the race: the entry and the answer must both be its record, got entry %+v and answer %+v", now, returned)
 	}
-	ctx.Redis.Set(stateOther, stateJSON(rival), "EX", stateTTL)
+	ctx.Redis.Set(stateOther, stateJSON(rival), "EX", 120) // two minutes before its version retires
 	late, err := fill(bg, stateOther, stateRecord("late answer"))
 	ctx.NoError(err, "fill over an existing entry")
 	ctx.Assert(late == rival && stateStored(ctx, stateOther) == rival, "a fill over an existing entry must leave it and answer it, got %+v", late)
+	ttl := ctx.Redis.TTL(stateOther)
+	ctx.Assert(0 < ttl && ttl <= 120, "a fill that found an entry moved its expiry to %d s: the entry must die with its prompt version", ttl)
 }
 
 func CheckVersionTtl(ctx *harness.Ctx) {
+	created := int64(-1)
+	seen := false
+	// The TTL the entry has right after the command that created it (a read of the empty key waits).
+	var watch func() any
+	watch = func() any {
+		if ctx.Redis.Exists(stateKey) == 1 {
+			created, seen = ctx.Redis.TTL(stateKey), true
+		} else {
+			ctx.Redis.After(stateKey, watch)
+		}
+		return nil
+	}
+	ctx.Redis.After(stateKey, watch)
 	_, err := fill(context.Background(), stateKey, stateRecord("Answer: hello"))
 	ctx.NoError(err, "fill")
 	ttl := ctx.Redis.TTL(stateKey)
 	ctx.Assert(ttl != -1, "the entry under %s has no expiry: it outlives its prompt version and keeps serving a retired template", stateKey)
 	ctx.Assert(stateTTL-5 <= ttl && ttl <= stateTTL, "the entry expires in %d s, expected VERSION_TTL_S = %d s set by the fill", ttl, stateTTL)
+	ctx.Assert(seen && created != -1, "the entry existed without an expiry right after the command that wrote it: a TTL set by a second command is lost if the process dies in between. The write itself must carry EX")
 }
 
 func CheckHitKeepsTtl(ctx *harness.Ctx) {
@@ -603,6 +642,7 @@ func CheckHitKeepsTtl(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <functional>
 #include <string>
 
 namespace {
@@ -652,16 +692,31 @@ void CheckFirstWriterWins(harness::Ctx& ctx) {
   } else {
     ctx.Assert(same(now, returned) && same(returned, stateRecord("Answer from replica A")), "this fill won the race: the entry and the answer must both be its record, got entry %q and answer %q", now.completion, returned.completion);
   }
-  ctx.Redis.Set(kOther, record::encode(rival), "EX", kTtl);
+  ctx.Redis.Set(kOther, record::encode(rival), "EX", 120);  // two minutes before its version retires
   const record::Record late = fill(kOther, stateRecord("late answer"));
   ctx.Assert(same(late, rival) && same(stored(ctx, kOther), rival), "a fill over an existing entry must leave it and answer it, got %q", late.completion);
+  const long long otherTtl = ctx.Redis.TTL(kOther);
+  ctx.Assert(0 < otherTtl && otherTtl <= 120, "a fill that found an entry moved its expiry to %d s: the entry must die with its prompt version", otherTtl);
 }
 
 void CheckVersionTtl(harness::Ctx& ctx) {
+  bool seen = false;
+  long long created = -1;
+  // The TTL the entry has right after the command that created it (a read of the empty key waits).
+  std::function<void()> watch = [&] {
+    if (ctx.Redis.Exists(kKey) == 1) {
+      created = ctx.Redis.TTL(kKey);
+      seen = true;
+    } else {
+      ctx.Redis.After(kKey, watch);
+    }
+  };
+  ctx.Redis.After(kKey, watch);
   fill(kKey, stateRecord("Answer: hello"));
   const long long ttl = ctx.Redis.TTL(kKey);
   ctx.Assert(ttl != -1, "the entry under %s has no expiry: it outlives its prompt version and keeps serving a retired template", kKey);
   ctx.Assert(kTtl - 5 <= ttl && ttl <= kTtl, "the entry expires in %d s, expected VERSION_TTL_S = %d s set by the fill", ttl, kTtl);
+  ctx.Assert(seen && created != -1, "the entry existed without an expiry right after the command that wrote it: a TTL set by a second command is lost if the process dies in between. The write itself must carry EX");
 }
 
 void CheckHitKeepsTtl(harness::Ctx& ctx) {

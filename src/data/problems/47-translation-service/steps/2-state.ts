@@ -20,13 +20,13 @@ a translation made under last quarter's glossary is served forever; a glossary e
 version a request in flight pinned; and an edit landing mid-read labels the old terms with the new
 version number.
 
-- \`tm_key\` is \`tm:{tenant}:{source}:{target}:v{version}:{sha256(text)}\`, and \`tm_put\` sets
-  \`TM_TTL_S\` = 3600 s.
+- \`tm_key\` is \`tm:{tenant}:{source}:{target}:v{version}:{sha256(text)}\`, and \`tm_put\` writes the
+  entry with its \`TM_TTL_S\` = 3600 s expiry in the same command.
 - A version is immutable. \`publish_terms\` copies the active terms, applies the changes under the
   next number from \`:seq\` and moves \`:active\`, in one Lua script, so two editors publishing at
-  once both land.
+  once both land and \`:active\` always names the newest version.
 - \`resolve_glossary\` reads \`:active\` once and loads exactly that version; a version or tenant
-  with no glossary is \`None\`.`,
+  with no glossary is \`None\`, and only an absent version (no pin) means the active one.`,
   sequence: {
     participants: ['Translation API', 'Redis'],
     messages: [
@@ -64,7 +64,7 @@ version number.
       id: 'tm-ttl',
       title: 'Expires translation memory after an hour',
       detail:
-        '`tm_put` writes the entry with `TM_TTL_S` = 3600 s, so a wrong entry ages out instead of waiting for someone to flush Redis. The starter writes it with no expiry.',
+        '`tm_put` writes the entry with `TM_TTL_S` = 3600 s in the same command, so a wrong entry ages out instead of waiting for someone to flush Redis, and no crash leaves it without an expiry. The starter writes it with no expiry.',
       match: {
         python: {all: [/TM_TTL_S\s*=\s*3600\b/, /ex\s*=\s*TM_TTL_S/]},
         typescript: {all: [/TM_TTL_S\s*=\s*3600\b/, /['"]EX['"],\s*TM_TTL_S/]},
@@ -77,7 +77,7 @@ version number.
       id: 'new-version',
       title: 'Publishes an edit as the next version, in one script',
       detail:
-        'One Lua script mints the next version (`INCR` on `:seq`), copies the active terms (`HGETALL`), applies the changes and moves `:active`; no code writes into an existing version. The starter `HSET`s the changes into the active version.',
+        'One Lua script mints the next version (`INCR` on `:seq`), copies the active terms (`HGETALL`), applies the changes and moves `:active`; no code writes into an existing version, and an editor landing mid-publish neither loses a change nor leaves `:active` behind the newest version. The starter `HSET`s the changes into the active version.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /INCR/, /HGETALL/], none: [/r\.hset\(\s*glossary_key/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /INCR/, /HGETALL/], none: [/\.hset\(\s*glossaryKey/]},
@@ -90,7 +90,7 @@ version number.
       id: 'pointer-once',
       title: 'Reads the active pointer once per resolve',
       detail:
-        "`resolve_glossary` reads `:active` once and returns the version it loaded, so an edit landing mid-read cannot pair one version number with another version's terms. The starter calls `active_version()` twice.",
+        "`resolve_glossary` reads `:active` once and returns the version it loaded, so an edit landing mid-read cannot pair one version number with another version's terms; a pinned version, even one that does not exist, is never swapped for the active one. The starter calls `active_version()` twice.",
       match: {
         python: {
           all: [/def resolve_glossary/],
@@ -877,11 +877,14 @@ def check_tm_key(ctx):
 
 def check_tm_ttl(ctx):
     m = ctx.load("state")
+    key = m.tm_key("acme", "en", "fr", 1, SAMPLE)
+    born = ctx.redis_after(key, lambda: ctx.redis.ttl(key))  # the entry as the command that created it left it
     m.tm_put("acme", "en", "fr", 1, SAMPLE, "Ouvrir le Tableau de bord")
     keys = ctx.redis.keys("tm:*")
     assert len(keys) == 1, f"one tm_put wrote {keys}"
     ttl = ctx.redis.ttl(keys[0])
     assert 3500 < ttl <= 3600, f"the translation-memory entry {keys[0]} has TTL {ttl}: it must expire after an hour (TM_TTL_S = 3600), or a wrong entry is served until someone flushes Redis"
+    assert born.fired and 3500 < born.result <= 3600, f"right after the command that wrote {key} its TTL was {born.result}: a process dying before a second EXPIRE leaves an entry that never expires. Write the entry and its TTL in one command"
 
 
 def check_new_version(ctx):
@@ -901,6 +904,14 @@ def check_new_version(ctx):
     final = m.resolve_glossary("acme", "en", "fr")
     terms = final["terms"] if final else {}
     assert terms.get("Invoice") == "Note" and terms.get("Refund") == "Remboursement", f"two editors published at once and the active glossary is {final}: one change was lost. Copy, write and move the pointer in one script"
+    # A second editor publishes right after this one mints its version number.
+    race = ctx.redis_after(f"{BASE}:seq", lambda: _publish_raw(ctx, {"Credit": "Avoir"}))
+    mine = m.publish_terms("acme", "en", "fr", {"Refund": "Rembourser"})
+    assert race.fired, "publish_terms never touched the :seq counter"
+    newest = int(ctx.redis.get(f"{BASE}:seq"))
+    final = m.resolve_glossary("acme", "en", "fr")
+    terms = final["terms"] if final else {}
+    assert final is not None and final["version"] == newest and terms.get("Refund") == "Rembourser" and terms.get("Credit") == "Avoir", f"another editor published version {newest} while publish_terms (version {mine}) was in flight, and the active glossary is {final}: :active must name the newest version, with both changes. Mint, copy, write and move the pointer in one script"
 
 
 def check_pointer_once(ctx):
@@ -916,6 +927,7 @@ def check_pointer_once(ctx):
     assert got is not None and got["terms"] == expected.get(got["version"]), f"an edit landed mid-read and resolve_glossary answered {got}: one version's number with another version's terms. Read the pointer once and load exactly that version"
     assert m.resolve_glossary("acme", "en", "fr", 1) == {"version": 1, "terms": {"Dashboard": "Tableau de bord"}}, "a pinned version 1 must load version 1's terms"
     assert m.resolve_glossary("acme", "en", "fr", 7) is None, "a version that does not exist must resolve to None"
+    assert m.resolve_glossary("acme", "en", "fr", 0) is None, "a pinned version 0 must resolve to None: versions start at 1, and only None means the active version"
     assert m.resolve_glossary("globex", "en", "fr") is None, "globex has no en->fr glossary and must resolve to None"
 `,
     typescript: `import {createHash} from 'node:crypto';
@@ -949,11 +961,14 @@ export async function check_tm_key(ctx) {
 
 export async function check_tm_ttl(ctx) {
   const m = ctx.load('state');
+  const key = m.tmKey('acme', 'en', 'fr', 1, SAMPLE);
+  const born = ctx.redisAfter(key, () => ctx.redis.ttl(key)); // the entry as the command that created it left it
   await m.tmPut('acme', 'en', 'fr', 1, SAMPLE, 'Ouvrir le Tableau de bord');
   const keys = ctx.redis.keys('tm:*');
   assert.equal(keys.length, 1, \`one tmPut wrote \${JSON.stringify(keys)}\`);
   const ttl = ctx.redis.ttl(keys[0]);
   assert(3500 < ttl && ttl <= 3600, \`the translation-memory entry \${keys[0]} has TTL \${ttl}: it must expire after an hour (TM_TTL_S = 3600), or a wrong entry is served until someone flushes Redis\`);
+  assert(born.fired && 3500 < born.result && born.result <= 3600, \`right after the command that wrote \${key} its TTL was \${born.result}: a process dying before a second EXPIRE leaves an entry that never expires. Write the entry and its TTL in one command\`);
 }
 
 export async function check_new_version(ctx) {
@@ -973,6 +988,16 @@ export async function check_new_version(ctx) {
   const final = await m.resolveGlossary('acme', 'en', 'fr');
   const terms = final?.terms ?? {};
   assert(terms.Invoice === 'Note' && terms.Refund === 'Remboursement', \`two editors published at once and the active glossary is \${JSON.stringify(final)}: one change was lost. Copy, write and move the pointer in one script\`);
+  // A second editor publishes right after this one mints its version number.
+  const race = ctx.redisAfter(\`\${BASE}:seq\`, () => publishRaw(ctx, {Credit: 'Avoir'}));
+  const mine = await m.publishTerms('acme', 'en', 'fr', {Refund: 'Rembourser'});
+  assert(race.fired, 'publishTerms never touched the :seq counter');
+  const newest = Number(ctx.redis.get(\`\${BASE}:seq\`));
+  const latest = await m.resolveGlossary('acme', 'en', 'fr');
+  assert(
+    latest !== null && latest.version === newest && latest.terms.Refund === 'Rembourser' && latest.terms.Credit === 'Avoir',
+    \`another editor published version \${newest} while publishTerms (version \${mine}) was in flight, and the active glossary is \${JSON.stringify(latest)}: :active must name the newest version, with both changes. Mint, copy, write and move the pointer in one script\`,
+  );
 }
 
 export async function check_pointer_once(ctx) {
@@ -988,6 +1013,7 @@ export async function check_pointer_once(ctx) {
   assert(got !== null && JSON.stringify(got.terms) === JSON.stringify(expected[got.version]), \`an edit landed mid-read and resolveGlossary answered \${JSON.stringify(got)}: one version's number with another version's terms. Read the pointer once and load exactly that version\`);
   assert.deepStrictEqual(await m.resolveGlossary('acme', 'en', 'fr', 1), {version: 1, terms: {Dashboard: 'Tableau de bord'}}, "a pinned version 1 must load version 1's terms");
   assert.equal(await m.resolveGlossary('acme', 'en', 'fr', 7), null, 'a version that does not exist must resolve to null');
+  assert.equal(await m.resolveGlossary('acme', 'en', 'fr', 0), null, 'a pinned version 0 must resolve to null: versions start at 1, and only null means the active version');
   assert.equal(await m.resolveGlossary('globex', 'en', 'fr'), null, 'globex has no en->fr glossary and must resolve to null');
 }
 `,
@@ -1055,11 +1081,15 @@ func CheckTmKey(ctx *harness.Ctx) {
 }
 
 func CheckTmTtl(ctx *harness.Ctx) {
+	key := tmKey("acme", "en", "fr", 1, stateSample)
+	born := int64(-3)
+	probe := ctx.Redis.After(key, func() any { born = ctx.Redis.TTL(key); return nil }) // the entry as the command that created it left it
 	ctx.NoError(tmPut(stateBg, "acme", "en", "fr", 1, stateSample, "Ouvrir le Tableau de bord"), "tmPut failed")
 	keys := ctx.Redis.Keys("tm:*")
 	ctx.Equal(len(keys), 1, "one tmPut wrote %q; the keys", keys)
 	ttl := ctx.Redis.TTL(keys[0])
 	ctx.Assert(3500 < ttl && ttl <= 3600, "the translation-memory entry %s has TTL %d: it must expire after an hour (tmTTL), or a wrong entry is served until someone flushes Redis", keys[0], ttl)
+	ctx.Assert(probe.Fired && 3500 < born && born <= 3600, "right after the command that wrote %s its TTL was %d: a process dying before a second EXPIRE leaves an entry that never expires. Write the entry and its TTL in one command", key, born)
 }
 
 func CheckNewVersion(ctx *harness.Ctx) {
@@ -1080,6 +1110,14 @@ func CheckNewVersion(ctx *harness.Ctx) {
 	ctx.Assert(probe.Fired, "publishTerms never touched the :active pointer")
 	final := mustResolve(ctx, "acme", 0)
 	ctx.Assert(final != nil && final.Terms["Invoice"] == "Note" && final.Terms["Refund"] == "Remboursement", "two editors published at once and the active glossary is %+v: one change was lost. Copy, write and move the pointer in one script", final)
+	// A second editor publishes right after this one mints its version number.
+	race := ctx.Redis.After(stateBase+":seq", func() any { return publishRaw(ctx, map[string]string{"Credit": "Avoir"}) })
+	mine, err := publishTerms(stateBg, "acme", "en", "fr", map[string]string{"Refund": "Rembourser"})
+	ctx.NoError(err, "the fourth publish failed")
+	ctx.Assert(race.Fired, "publishTerms never touched the :seq counter")
+	seq, _ := ctx.Redis.Get(stateBase + ":seq")
+	latest := mustResolve(ctx, "acme", 0)
+	ctx.Assert(latest != nil && strconv.FormatInt(latest.Version, 10) == seq && latest.Terms["Refund"] == "Rembourser" && latest.Terms["Credit"] == "Avoir", "another editor published version %s while publishTerms (version %d) was in flight, and the active glossary is %+v: :active must name the newest version, with both changes. Mint, copy, write and move the pointer in one script", seq, mine, latest)
 }
 
 func CheckPointerOnce(ctx *harness.Ctx) {
@@ -1161,11 +1199,19 @@ void CheckTmKey(harness::Ctx& ctx) {
 }
 
 void CheckTmTtl(harness::Ctx& ctx) {
+  const std::string key = tmKey("acme", "en", "fr", 1, kSample);
+  bool fired = false;
+  long long born = -3;
+  ctx.Redis.After(key, [&] {  // the entry as the command that created it left it
+    fired = true;
+    born = ctx.Redis.TTL(key);
+  });
   tmPut("acme", "en", "fr", 1, kSample, "Ouvrir le Tableau de bord");
   const auto keys = ctx.Redis.Keys("tm:*");
   ctx.Equal(keys.size(), 1, "one tmPut wrote %q; the keys", keys);
   const auto ttl = ctx.Redis.TTL(keys[0]);
   ctx.Assert(3500 < ttl && ttl <= 3600, "the translation-memory entry %s has TTL %d: it must expire after an hour (kTmTtl), or a wrong entry is served until someone flushes Redis", keys[0], ttl);
+  ctx.Assert(fired && 3500 < born && born <= 3600, "right after the command that wrote %s its TTL was %d: a process dying before a second EXPIRE leaves an entry that never expires. Write the entry and its TTL in one command", key, born);
 }
 
 void CheckNewVersion(harness::Ctx& ctx) {
@@ -1189,6 +1235,19 @@ void CheckNewVersion(harness::Ctx& ctx) {
   const auto final = resolveGlossary("acme", "en", "fr");
   ctx.Assert(final && final->terms.count("Invoice") && final->terms.at("Invoice") == "Note" && final->terms.count("Refund"),
              "two editors published at once and the active glossary is %s: one change was lost. Copy, write and move the pointer in one script", describe(final));
+  // A second editor publishes right after this one mints its version number.
+  bool raced = false;
+  ctx.Redis.After(kBase + ":seq", [&] {
+    raced = true;
+    publishRaw(ctx, {{"Credit", "Avoir"}});
+  });
+  const long mine = publishTerms("acme", "en", "fr", {{"Refund", "Rembourser"}});
+  ctx.Assert(raced, "publishTerms never touched the :seq counter");
+  const std::string newest = ctx.Redis.Get(kBase + ":seq").value_or("none");
+  const auto latest = resolveGlossary("acme", "en", "fr");
+  ctx.Assert(latest && std::to_string(latest->version) == newest && latest->terms.count("Refund") && latest->terms.at("Refund") == "Rembourser" && latest->terms.count("Credit"),
+             "another editor published version %s while publishTerms (version %d) was in flight, and the active glossary is %s: :active must name the newest version, with both changes. Mint, copy, write and move the pointer in one script", newest, mine,
+             describe(latest));
 }
 
 void CheckPointerOnce(harness::Ctx& ctx) {

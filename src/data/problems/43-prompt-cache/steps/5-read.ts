@@ -58,7 +58,7 @@ over hits that never called the model, savings priced at one model's rate for ev
       id: 'foreign-tenant',
       title: "Another tenant's stats are 403",
       detail:
-        "With X-Tenant-Id t1, ?tenant=t2 answers 403 and none of t2's numbers; ?tenant=t1 answers t1's slices. The starter serves whichever tenant the query names.",
+        'With X-Tenant-Id t1, ?tenant=t2 answers 403 {"error": "forbidden"} and none of t2\'s numbers, and ?tenant=t3, a tenant with no stats, is 403 too; ?tenant=t1 answers t1\'s slices. The starter serves whichever tenant the query names.',
       match: {
         python: {all: [/status_code\s*=\s*403/]},
         typescript: {all: [/code\(\s*403\s*\)/]},
@@ -84,7 +84,7 @@ over hits that never called the model, savings priced at one model's rate for ev
       id: 'fill-latency',
       title: 'Fill latency averages the misses only',
       detail:
-        'fill_ms 900 over 3 misses and 7 hits reads 300 ms; a version with no misses reads 0. The starter divides by every lookup and reports 90.',
+        'fill_ms 900 over 3 misses and 7 hits reads 300 ms, fill_ms 1000 over 3 misses reads 333.33... (not a whole number), and a version with no misses reads 0. The starter divides by every lookup and reports 90.',
       match: {
         python: {all: [/fill_ms\s*\/\s*misses/], none: [/fill_ms\s*\/\s*lookups/]},
         typescript: {all: [/fillMs\s*\/\s*misses/], none: [/fillMs\s*\/\s*lookups/]},
@@ -766,6 +766,9 @@ async def check_foreign_tenant(ctx):
         r = await _get(c, "t1", asked="t2")
         assert r.status_code == 403, f"t1 asking for ?tenant=t2 answered {r.status_code}: {r.text[:200]}. Another tenant's traffic is theirs; answer 403"
         assert "50" not in r.text, f"the refusal carries t2's numbers: {r.text}"
+        assert r.json() == {"error": "forbidden"}, f"the 403 body must be {{\\"error\\": \\"forbidden\\"}}, got {r.text[:200]}"
+        unknown = await _get(c, "t1", asked="t3")
+        assert unknown.status_code == 403, f"t1 asking for ?tenant=t3, a tenant with no stats, answered {unknown.status_code}: naming any other tenant is 403, whether or not it has traffic"
         own = _slices(await _get(c, "t1", asked="t1"))
         assert own[7].get("hits") == 3, f"?tenant= naming the caller answers the caller's stats, got {own}"
 
@@ -784,10 +787,12 @@ async def check_hit_ratio(ctx):
 async def check_fill_latency(ctx):
     _seed(ctx, "t1", 7, hits=7, misses=3, fill_ms=900)
     _seed(ctx, "t1", 8, hits=5)
+    _seed(ctx, "t1", 9, misses=3, fill_ms=1000)
     async with _api(ctx) as c:
         slices = _slices(await _get(c))
     assert _close(slices[7].get("fill_latency_ms"), 300.0), f"fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got {slices[7].get('fill_latency_ms')}"
     assert _close(slices[8].get("fill_latency_ms"), 0.0), f"a version with no misses reads fill_latency_ms 0, got {slices[8].get('fill_latency_ms')}"
+    assert _close(slices[9].get("fill_latency_ms"), 1000 / 3), f"fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got {slices[9].get('fill_latency_ms')}"
 
 
 async def check_version_price(ctx):
@@ -838,6 +843,9 @@ export async function check_foreign_tenant(ctx) {
   const r = await get(ctx, 't1', 't2');
   assert.equal(r.status, 403, \`t1 asking for ?tenant=t2 answered \${r.status}: \${r.text.slice(0, 200)}. Another tenant's traffic is theirs; answer 403\`);
   assert(!r.text.includes('50'), \`the refusal carries t2's numbers: \${r.text}\`);
+  assert.deepEqual(r.json(), {error: 'forbidden'}, \`the 403 body must be {"error": "forbidden"}, got \${r.text.slice(0, 200)}\`);
+  const unknown = await get(ctx, 't1', 't3');
+  assert.equal(unknown.status, 403, \`t1 asking for ?tenant=t3, a tenant with no stats, answered \${unknown.status}: naming any other tenant is 403, whether or not it has traffic\`);
   const own = slices(await get(ctx, 't1', 't1'));
   assert.equal(own[7].hits, 3, \`?tenant= naming the caller answers the caller's stats, got \${JSON.stringify(own)}\`);
 }
@@ -855,9 +863,11 @@ export async function check_hit_ratio(ctx) {
 export async function check_fill_latency(ctx) {
   seed(ctx, 't1', 7, {hits: 7, misses: 3, fill_ms: 900});
   seed(ctx, 't1', 8, {hits: 5});
+  seed(ctx, 't1', 9, {misses: 3, fill_ms: 1000});
   const s = slices(await get(ctx));
   assert(close(s[7].fill_latency_ms, 300), \`fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got \${s[7].fill_latency_ms}\`);
   assert(close(s[8].fill_latency_ms, 0), \`a version with no misses reads fill_latency_ms 0, got \${s[8].fill_latency_ms}\`);
+  assert(close(s[9].fill_latency_ms, 1000 / 3), \`fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got \${s[9].fill_latency_ms}\`);
 }
 
 export async function check_version_price(ctx) {
@@ -933,6 +943,10 @@ func CheckForeignTenant(ctx *harness.Ctx) {
 	r := statsGet(ctx, "t1", "?tenant=t2")
 	ctx.Equal(r.Status, 403, "t1 asking for ?tenant=t2 (%s): another tenant's traffic is theirs", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "50"), "the refusal carries t2's numbers: %s", r.Text())
+	var refusal map[string]any
+	r.Decode(&refusal)
+	ctx.Assert(len(refusal) == 1 && refusal["error"] == "forbidden", "the 403 body must be {\\"error\\": \\"forbidden\\"}, got %.200s", r.Text())
+	ctx.Equal(statsGet(ctx, "t1", "?tenant=t3").Status, 403, "t1 asking for ?tenant=t3, a tenant with no stats: naming any other tenant is 403, whether or not it has traffic")
 	own := statsRead(ctx, statsGet(ctx, "t1", "?tenant=t1"))
 	ctx.Assert(len(own.Slices) == 1 && own.Slices[0].Hits == 3, "?tenant= naming the caller answers the caller's stats, got %+v", own)
 }
@@ -951,10 +965,12 @@ func CheckHitRatio(ctx *harness.Ctx) {
 func CheckFillLatency(ctx *harness.Ctx) {
 	statsSeed(ctx, "t1", 7, "hits", 7, "misses", 3, "fill_ms", 900)
 	statsSeed(ctx, "t1", 8, "hits", 5)
+	statsSeed(ctx, "t1", 9, "misses", 3, "fill_ms", 1000)
 	view := statsRead(ctx, statsGet(ctx, "t1", ""))
-	ctx.Equal(len(view.Slices), 2, "slices for versions 7 and 8")
+	ctx.Equal(len(view.Slices), 3, "slices for versions 7, 8 and 9")
 	ctx.Assert(statsClose(view.Slices[0].FillLatencyMs, 300), "fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got %v", view.Slices[0].FillLatencyMs)
 	ctx.Assert(statsClose(view.Slices[1].FillLatencyMs, 0), "a version with no misses reads fill_latency_ms 0, got %v", view.Slices[1].FillLatencyMs)
+	ctx.Assert(statsClose(view.Slices[2].FillLatencyMs, 1000.0/3), "fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got %v", view.Slices[2].FillLatencyMs)
 }
 
 func CheckVersionPrice(ctx *harness.Ctx) {
@@ -1027,6 +1043,9 @@ void CheckForeignTenant(harness::Ctx& ctx) {
   const auto r = statsGet(ctx, "t1", "?tenant=t2");
   ctx.Equal(r.Status, 403, "t1 asking for ?tenant=t2 (%s): another tenant's traffic is theirs", r.Text());
   ctx.Assert(r.Text().find("50") == std::string::npos, "the refusal carries t2's numbers: %s", r.Text());
+  const json refusal = json::parse(r.Text(), nullptr, false);
+  ctx.Assert(refusal == json{{"error", "forbidden"}}, "the 403 body must be {\\"error\\": \\"forbidden\\"}, got %s", r.Text().substr(0, 200));
+  ctx.Equal(statsGet(ctx, "t1", "?tenant=t3").Status, 403, "t1 asking for ?tenant=t3, a tenant with no stats: naming any other tenant is 403, whether or not it has traffic");
   const json own = statsSlices(ctx, statsGet(ctx, "t1", "?tenant=t1"));
   ctx.Assert(own.size() == 1 && own[0].value("hits", -1) == 3, "?tenant= naming the caller answers the caller's stats, got %s", own.dump());
 }
@@ -1045,10 +1064,12 @@ void CheckHitRatio(harness::Ctx& ctx) {
 void CheckFillLatency(harness::Ctx& ctx) {
   statsSeed(ctx, "t1", 7, 7, 3, 900);
   statsSeed(ctx, "t1", 8, 5);
+  statsSeed(ctx, "t1", 9, -1, 3, 1000);
   const json s = statsSlices(ctx, statsGet(ctx, "t1"));
-  ctx.Equal(s.size(), 2, "slices for versions 7 and 8");
+  ctx.Equal(s.size(), 3, "slices for versions 7, 8 and 9");
   ctx.Assert(statsClose(s[0]["fill_latency_ms"], 300), "fill_ms 900 over 3 misses must read fill_latency_ms 300 (hits never called the model), got %s", s[0]["fill_latency_ms"].dump());
   ctx.Assert(statsClose(s[1]["fill_latency_ms"], 0), "a version with no misses reads fill_latency_ms 0, got %s", s[1]["fill_latency_ms"].dump());
+  ctx.Assert(statsClose(s[2]["fill_latency_ms"], 1000.0 / 3), "fill_ms 1000 over 3 misses must read fill_latency_ms 333.33..., not a whole number, got %s", s[2]["fill_latency_ms"].dump());
 }
 
 void CheckVersionPrice(harness::Ctx& ctx) {

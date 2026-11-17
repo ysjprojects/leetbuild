@@ -55,7 +55,7 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
       id: 'cached-answer',
       title: 'A deterministic, finished answer is stored',
       detail:
-        'At temperature 0 with finish_reason stop, one call is made, the record {tenant, version, completion, tokens} is filled under the key, and the miss answers status cached with that completion.',
+        'At temperature 0 with finish_reason stop, one call is made, the record {tenant, version, completion, tokens} is filled under the key, and the miss answers status cached with that completion. When another replica filled the key first, the miss answers the stored completion.',
       match: {
         python: {all: [/stub\.Complete\(/, /fill\(\s*key\s*,/]},
         typescript: {all: [/stub\.Complete\(/, /fill\(\s*key\s*,/]},
@@ -81,7 +81,7 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
       id: 'temperature-gate',
       title: 'A sampled answer is served, not stored',
       detail:
-        "At temperature 0.7 the miss answers status uncached with the sampled completion and leaves no entry. The starter stores it, so the first caller's sample becomes every caller's answer.",
+        "At temperature 0.7, and at 0.05, the miss answers status uncached with the sampled completion and leaves no entry. The starter stores it, so the first caller's sample becomes every caller's answer.",
       match: {
         python: {all: [/temperature\s*==\s*0\b/]},
         typescript: {all: [/temperature\s*===\s*0\b/]},
@@ -94,7 +94,7 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
       id: 'stop-only',
       title: 'A truncated answer is served, not stored',
       detail:
-        'A reply that finished with length (cut at the token limit) answers status uncached and leaves no entry. The starter stores it as the answer for the prefix.',
+        'A reply that finished with length (cut at the token limit), or with any reason other than stop such as tool_calls, answers status uncached and leaves no entry. The starter stores it as the answer for the prefix.',
       match: {
         python: {all: [/finish_reason\s*==\s*["']stop["']/]},
         typescript: {all: [/finish_reason\s*===\s*['"]stop['"]/]},
@@ -120,7 +120,7 @@ message CompleteReply   { string text = 1; string finish_reason = 2; int32 compl
       id: 'error-uncached',
       title: 'A failed call stores nothing',
       detail:
-        'An UNAVAILABLE call answers status error with no completion and leaves no entry, so the next caller asks the model again. The starter fills its fallback message under the key.',
+        'An UNAVAILABLE, INTERNAL or RESOURCE_EXHAUSTED call answers status error with no completion and leaves no entry, so the next caller asks the model again. The starter fills its fallback message under the key.',
       match: {
         python: {all: [/["']error["']/], none: [/FALLBACK/]},
         typescript: {all: [/['"]error['"]/], none: [/FALLBACK/]},
@@ -590,13 +590,16 @@ import prompt_cache_pb2_grpc
 from pcache import config, llm
 
 KEY = "pc:t1:7:" + "b" * 64
+RIVAL_KEY = "pc:t1:7:" + "e" * 64
 QUESTION = "What is the capital of France?"
 
 
 class ModelServicer(prompt_cache_pb2_grpc.ModelServicer):
-    """The stand-in model server: answers from pcache.llm."""
+    """The stand-in model server: answers from pcache.llm; a "tool:" prefix ends in a tool call."""
 
     def Complete(self, request, context):
+        if request.prefix.startswith("tool:"):
+            return prompt_cache_pb2.CompleteReply(text="Answer: calling get_weather", finish_reason="tool_calls", completion_tokens=4)
         text, reason, tokens = llm.complete(request.prefix, request.temperature)
         return prompt_cache_pb2.CompleteReply(text=text, finish_reason=reason, completion_tokens=tokens)
 
@@ -631,6 +634,10 @@ def check_cached_answer(ctx):
     assert raw is not None, f"the answer must be filled under {KEY}, found {_entries(ctx)}"
     expected = {"tenant": "t1", "version": 7, "completion": text, "tokens": tokens}
     assert json.loads(raw) == expected, f"the entry must be {expected}, got {raw}"
+    rival = {"tenant": "t1", "version": 7, "completion": "Answer from replica B", "tokens": 4}
+    ctx.redis.set(RIVAL_KEY, json.dumps(rival), ex=config.VERSION_TTL_S)  # another replica filled this key first
+    lost = m.complete_miss(RIVAL_KEY, "t1", 7, QUESTION, 0.0)
+    assert isinstance(lost, dict) and lost.get("status") == "cached" and lost.get("completion") == rival["completion"], f"another replica filled the key first, so the fill keeps its record and the miss must answer the stored completion {rival['completion']!r}, got {lost!r}"
 
 
 def check_deadline(ctx):
@@ -656,6 +663,8 @@ def check_temperature_gate(ctx):
     assert result["status"] == "uncached", f"a temperature-0.7 answer is a sample, served to its caller and not stored: expected status uncached, got {result}"
     assert result.get("completion") == sampled, f"the caller still gets the sampled completion {sampled!r}, got {result}"
     assert _entries(ctx) == [], f"a sampled answer was stored ({_entries(ctx)}): every later caller of this prefix would get the first caller's sample"
+    low = _miss(m, temperature=0.05)
+    assert low["status"] == "uncached" and _entries(ctx) == [], f"temperature 0.05 is still sampled and must not be stored, got {low} and entries {_entries(ctx)}"
     assert _miss(m, temperature=0.0)["status"] == "cached", "the same prefix at temperature 0 is stored"
 
 
@@ -666,6 +675,8 @@ def check_stop_only(ctx):
     assert result["status"] == "uncached", f"a reply cut at the token limit (finish_reason length) is served and not stored: expected status uncached, got {result}"
     assert result.get("completion", "").startswith("Answer:"), f"the caller still gets the truncated completion, got {result}"
     assert _entries(ctx) == [], f"a truncated answer was stored ({_entries(ctx)}): it would be served as the whole answer for six hours"
+    tool = _miss(m, prefix="tool: what is the weather in Paris?")
+    assert tool["status"] == "uncached" and _entries(ctx) == [], f"a reply that finished with tool_calls is not a finished answer: only stop is stored, got {tool} and entries {_entries(ctx)}"
 
 
 def check_refusal_terminal(ctx):
@@ -684,19 +695,27 @@ def check_error_uncached(ctx):
     assert result["status"] == "error", f"a failed model call answers status error, got {result}"
     assert result.get("completion") == "", f"a failed call carries no completion, got {result}"
     assert ctx.redis.get(KEY) is None, f"a failed call stored {ctx.redis.get(KEY)!r} under the key: every caller of this prefix would get it for six hours"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED):
+        ctx.grpc.fail("Complete", code, "model server failed", times=1, target=config.MODEL)
+        failed = _miss(m)
+        assert failed["status"] == "error" and failed.get("completion") == "", f"a call failing with {code.name} answers status error with no completion, got {failed}"
+        assert ctx.redis.get(KEY) is None, f"a call failing with {code.name} stored {ctx.redis.get(KEY)!r} under the key"
     again = _miss(m)
     assert again["status"] == "cached" and again.get("completion", "").startswith("Answer:"), f"once the model answers again the miss is filled, got {again}"
 `,
     typescript: `const KEY = 'pc:t1:7:' + 'b'.repeat(64);
+const RIVAL_KEY = 'pc:t1:7:' + 'e'.repeat(64);
 const QUESTION = 'What is the capital of France?';
 
-/** The stand-in model server at MODEL, the learner's module. */
+/** The stand-in model server at MODEL, the learner's module; a "tool:" prefix ends in a tool call. */
 function world(ctx) {
   const {pcache} = ctx.proto('prompt_cache.proto');
   const config = ctx.load('/support/pcache/config.ts');
   const llm = ctx.load('/support/pcache/llm.ts');
   ctx.grpc.serve(pcache.Model.service, {
     Complete(call, callback) {
+      if (call.request.prefix.startsWith('tool:'))
+        return callback(null, {text: 'Answer: calling get_weather', finish_reason: 'tool_calls', completion_tokens: 4});
       callback(null, llm.complete(call.request.prefix, call.request.temperature));
     },
   }, config.MODEL);
@@ -722,6 +741,10 @@ export async function check_cached_answer(ctx) {
   const raw = ctx.redis.get(KEY);
   assert(raw !== null, \`the answer must be filled under \${KEY}, found \${JSON.stringify(entries(ctx))}\`);
   assert.deepEqual(JSON.parse(raw), {tenant: 't1', version: 7, completion: text, tokens}, \`the entry must be the record {tenant, version, completion, tokens}, got \${raw}\`);
+  const rival = {tenant: 't1', version: 7, completion: 'Answer from replica B', tokens: 4};
+  ctx.redis.set(RIVAL_KEY, JSON.stringify(rival), 'EX', 6 * 3600); // another replica filled this key first
+  const lost = await m.completeMiss(RIVAL_KEY, 't1', 7, QUESTION, 0);
+  assert(lost !== null && typeof lost === 'object' && lost.status === 'cached' && lost.completion === rival.completion, \`another replica filled the key first, so the fill keeps its record and the miss must answer the stored completion "\${rival.completion}", got \${JSON.stringify(lost)}\`);
 }
 
 export async function check_deadline(ctx) {
@@ -746,6 +769,8 @@ export async function check_temperature_gate(ctx) {
   assert.equal(result.status, 'uncached', \`a temperature-0.7 answer is a sample, served to its caller and not stored: expected status uncached, got \${JSON.stringify(result)}\`);
   assert.equal(result.completion, llm.complete(QUESTION, 0.7).text, \`the caller still gets the sampled completion, got \${JSON.stringify(result)}\`);
   assert.deepEqual(entries(ctx), [], \`a sampled answer was stored (\${JSON.stringify(entries(ctx))}): every later caller of this prefix would get the first caller's sample\`);
+  const low = await miss(m, QUESTION, 0.05);
+  assert(low.status === 'uncached' && entries(ctx).length === 0, \`temperature 0.05 is still sampled and must not be stored, got \${JSON.stringify(low)} and entries \${JSON.stringify(entries(ctx))}\`);
   assert.equal((await miss(m, QUESTION, 0)).status, 'cached', 'the same prefix at temperature 0 is stored');
 }
 
@@ -755,6 +780,8 @@ export async function check_stop_only(ctx) {
   assert.equal(result.status, 'uncached', \`a reply cut at the token limit (finish_reason length) is served and not stored: expected status uncached, got \${JSON.stringify(result)}\`);
   assert(String(result.completion).startsWith('Answer:'), \`the caller still gets the truncated completion, got \${JSON.stringify(result)}\`);
   assert.deepEqual(entries(ctx), [], \`a truncated answer was stored (\${JSON.stringify(entries(ctx))}): it would be served as the whole answer for six hours\`);
+  const tool = await miss(m, 'tool: what is the weather in Paris?');
+  assert(tool.status === 'uncached' && entries(ctx).length === 0, \`a reply that finished with tool_calls is not a finished answer: only stop is stored, got \${JSON.stringify(tool)} and entries \${JSON.stringify(entries(ctx))}\`);
 }
 
 export async function check_refusal_terminal(ctx) {
@@ -773,6 +800,12 @@ export async function check_error_uncached(ctx) {
   assert.equal(result.status, 'error', \`a failed model call answers status error, got \${JSON.stringify(result)}\`);
   assert.equal(result.completion, '', \`a failed call carries no completion, got \${JSON.stringify(result)}\`);
   assert.equal(ctx.redis.get(KEY), null, \`a failed call stored \${ctx.redis.get(KEY)} under the key: every caller of this prefix would get it for six hours\`);
+  for (const code of ['INTERNAL', 'RESOURCE_EXHAUSTED']) {
+    ctx.grpc.fail('Complete', ctx.grpc.status[code], 'model server failed', 1, config.MODEL);
+    const failed = await miss(m);
+    assert(failed.status === 'error' && failed.completion === '', \`a call failing with \${code} answers status error with no completion, got \${JSON.stringify(failed)}\`);
+    assert.equal(ctx.redis.get(KEY), null, \`a call failing with \${code} stored \${ctx.redis.get(KEY)} under the key\`);
+  }
   const again = await miss(m);
   assert(again.status === 'cached' && String(again.completion).startsWith('Answer:'), \`once the model answers again the miss is filled, got \${JSON.stringify(again)}\`);
 }
@@ -795,16 +828,22 @@ import (
 	"leetbuild/harness"
 )
 
-var missKey = "pc:t1:7:" + strings.Repeat("b", 64)
+var (
+	missKey  = "pc:t1:7:" + strings.Repeat("b", 64)
+	rivalKey = "pc:t1:7:" + strings.Repeat("e", 64)
+)
 
 const missQuestion = "What is the capital of France?"
 
-// modelPeer is the stand-in model server: answers from pcache/llm.
+// modelPeer is the stand-in model server: answers from pcache/llm; a "tool:" prefix ends in a tool call.
 type modelPeer struct {
 	pb.UnimplementedModelServer
 }
 
 func (modelPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+	if strings.HasPrefix(req.GetPrefix(), "tool:") {
+		return &pb.CompleteReply{Text: "Answer: calling get_weather", FinishReason: "tool_calls", CompletionTokens: 4}, nil
+	}
 	text, reason, tokens := llm.Complete(req.GetPrefix(), req.GetTemperature())
 	return &pb.CompleteReply{Text: text, FinishReason: reason, CompletionTokens: int32(tokens)}, nil
 }
@@ -844,6 +883,12 @@ func CheckCachedAnswer(ctx *harness.Ctx) {
 	var rec record.Record
 	ctx.NoError(json.Unmarshal([]byte(raw), &rec), "the entry is a record's JSON (%s)", raw)
 	ctx.Equal(rec, record.Record{Tenant: "t1", Version: 7, Completion: text, Tokens: tokens}, "the entry must be the record {tenant, version, completion, tokens}")
+	rival := record.Record{Tenant: "t1", Version: 7, Completion: "Answer from replica B", Tokens: 4}
+	rivalRaw, _ := json.Marshal(rival)
+	ctx.Redis.Set(rivalKey, string(rivalRaw), "EX", config.VersionTTLSeconds) // another replica filled this key first
+	lost, err := completeMiss(context.Background(), rivalKey, "t1", 7, missQuestion, 0)
+	ctx.NoError(err, "completeMiss over a key another replica filled")
+	ctx.Assert(lost.Status == "cached" && lost.Completion == rival.Completion, "another replica filled the key first, so the fill keeps its record and the miss must answer the stored completion %q, got %+v", rival.Completion, lost)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
@@ -869,6 +914,8 @@ func CheckTemperatureGate(ctx *harness.Ctx) {
 	ctx.Equal(miss.Status, "uncached", "a temperature-0.7 answer is a sample, served to its caller and not stored; the status")
 	ctx.Equal(miss.Completion, sampled, "the caller still gets the sampled completion")
 	ctx.Equal(len(ctx.Redis.Keys("pc:*")), 0, "a sampled answer was stored: every later caller of this prefix would get the first caller's sample; entries")
+	low := missCall(ctx, missQuestion, 0.05)
+	ctx.Assert(low.Status == "uncached" && len(ctx.Redis.Keys("pc:*")) == 0, "temperature 0.05 is still sampled and must not be stored, got %+v and entries %v", low, ctx.Redis.Keys("pc:*"))
 	ctx.Equal(missCall(ctx, missQuestion, 0).Status, "cached", "the same prefix at temperature 0 is stored; the status")
 }
 
@@ -878,6 +925,8 @@ func CheckStopOnly(ctx *harness.Ctx) {
 	ctx.Equal(miss.Status, "uncached", "a reply cut at the token limit (finish_reason length) is served and not stored; the status")
 	ctx.Assert(strings.HasPrefix(miss.Completion, "Answer:"), "the caller still gets the truncated completion, got %q", miss.Completion)
 	ctx.Equal(len(ctx.Redis.Keys("pc:*")), 0, "a truncated answer was stored: it would be served as the whole answer for six hours; entries")
+	tool := missCall(ctx, "tool: what is the weather in Paris?", 0)
+	ctx.Assert(tool.Status == "uncached" && len(ctx.Redis.Keys("pc:*")) == 0, "a reply that finished with tool_calls is not a finished answer: only stop is stored, got %+v and entries %v", tool, ctx.Redis.Keys("pc:*"))
 }
 
 func CheckRefusalTerminal(ctx *harness.Ctx) {
@@ -897,6 +946,13 @@ func CheckErrorUncached(ctx *harness.Ctx) {
 	ctx.Equal(miss.Completion, "", "a failed call carries no completion")
 	stored, has := ctx.Redis.Get(missKey)
 	ctx.Assert(!has, "a failed call stored %s under the key: every caller of this prefix would get it for six hours", stored)
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted} {
+		ctx.GRPC.Fail("Complete", code, "model server failed", 1, config.Model)
+		failed := missCall(ctx, missQuestion, 0)
+		ctx.Assert(failed.Status == "error" && failed.Completion == "", "a call failing with %v answers status error with no completion, got %+v", code, failed)
+		_, has = ctx.Redis.Get(missKey)
+		ctx.Assert(!has, "a call failing with %v stored an entry under the key", code)
+	}
 	again := missCall(ctx, missQuestion, 0)
 	ctx.Assert(again.Status == "cached" && strings.HasPrefix(again.Completion, "Answer:"), "once the model answers again the miss is filled, got %+v", again)
 }
@@ -911,12 +967,19 @@ func CheckErrorUncached(ctx *harness.Ctx) {
 namespace {
 
 const std::string kKey = "pc:t1:7:" + std::string(64, 'b');
+const std::string kRivalKey = "pc:t1:7:" + std::string(64, 'e');
 const std::string kQuestion = "What is the capital of France?";
 
-// The stand-in model server: answers from pcache/llm.h.
+// The stand-in model server: answers from pcache/llm.h; a "tool:" prefix ends in a tool call.
 class ModelPeer final : public pcache::Model::Service {
  public:
   grpc::Status Complete(grpc::ServerContext*, const pcache::CompleteRequest* req, pcache::CompleteReply* reply) override {
+    if (req->prefix().rfind("tool:", 0) == 0) {
+      reply->set_text("Answer: calling get_weather");
+      reply->set_finish_reason("tool_calls");
+      reply->set_completion_tokens(4);
+      return grpc::Status::OK;
+    }
     const auto completion = llm::complete(req->prefix(), req->temperature());
     reply->set_text(completion.text);
     reply->set_finish_reason(completion.finish_reason);
@@ -948,6 +1011,10 @@ void CheckCachedAnswer(harness::Ctx& ctx) {
   const record::Record rec = record::decode(*raw);
   ctx.Assert(rec.tenant == "t1" && rec.version == 7 && rec.completion == expected.text && rec.tokens == expected.tokens,
              "the entry must be the record {tenant, version, completion, tokens}, got %s", *raw);
+  const record::Record rival{"t1", 7, "Answer from replica B", 4};
+  ctx.Redis.Set(kRivalKey, record::encode(rival), "EX", config::kVersionTtlSeconds);  // another replica filled this key first
+  const record::Miss lost = complete_miss(kRivalKey, "t1", 7, kQuestion, 0);
+  ctx.Assert(lost.status == "cached" && lost.completion == rival.completion, "another replica filled the key first, so the fill keeps its record and the miss must answer the stored completion %q, got status %q completion %q", rival.completion, lost.status, lost.completion);
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
@@ -972,6 +1039,8 @@ void CheckTemperatureGate(harness::Ctx& ctx) {
   ctx.Equal(miss.status, "uncached", "a temperature-0.7 answer is a sample, served to its caller and not stored; the status");
   ctx.Equal(miss.completion, llm::complete(kQuestion, 0.7).text, "the caller still gets the sampled completion");
   ctx.Equal(ctx.Redis.Keys("pc:*").size(), 0, "a sampled answer was stored: every later caller of this prefix would get the first caller's sample; entries");
+  const record::Miss low = missCall(kQuestion, 0.05);
+  ctx.Assert(low.status == "uncached" && ctx.Redis.Keys("pc:*").empty(), "temperature 0.05 is still sampled and must not be stored, got status %q and entries %v", low.status, ctx.Redis.Keys("pc:*"));
   ctx.Equal(missCall(kQuestion, 0).status, "cached", "the same prefix at temperature 0 is stored; the status");
 }
 
@@ -981,6 +1050,8 @@ void CheckStopOnly(harness::Ctx& ctx) {
   ctx.Equal(miss.status, "uncached", "a reply cut at the token limit (finish_reason length) is served and not stored; the status");
   ctx.Assert(miss.completion.rfind("Answer:", 0) == 0, "the caller still gets the truncated completion, got %q", miss.completion);
   ctx.Equal(ctx.Redis.Keys("pc:*").size(), 0, "a truncated answer was stored: it would be served as the whole answer for six hours; entries");
+  const record::Miss tool = missCall("tool: what is the weather in Paris?", 0);
+  ctx.Assert(tool.status == "uncached" && ctx.Redis.Keys("pc:*").empty(), "a reply that finished with tool_calls is not a finished answer: only stop is stored, got status %q and entries %v", tool.status, ctx.Redis.Keys("pc:*"));
 }
 
 void CheckRefusalTerminal(harness::Ctx& ctx) {
@@ -999,6 +1070,12 @@ void CheckErrorUncached(harness::Ctx& ctx) {
   ctx.Equal(miss.status, "error", "a failed model call answers status");
   ctx.Equal(miss.completion, "", "a failed call carries no completion");
   ctx.Assert(!ctx.Redis.Get(kKey).has_value(), "a failed call stored %s under the key: every caller of this prefix would get it for six hours", ctx.Redis.Get(kKey).value_or(""));
+  for (const auto& [code, name] : {std::pair{grpc::StatusCode::INTERNAL, "INTERNAL"}, std::pair{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
+    ctx.GRPC.Fail("Complete", code, "model server failed", 1, config::kModel);
+    const record::Miss failed = missCall(kQuestion, 0);
+    ctx.Assert(failed.status == "error" && failed.completion.empty(), "a call failing with %s answers status error with no completion, got status %q", name, failed.status);
+    ctx.Assert(!ctx.Redis.Get(kKey).has_value(), "a call failing with %s stored an entry under the key", name);
+  }
   const record::Miss again = missCall(kQuestion, 0);
   ctx.Assert(again.status == "cached" && again.completion.rfind("Answer:", 0) == 0, "once the model answers again the miss is filled, got status %q", again.status);
 }

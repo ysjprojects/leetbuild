@@ -24,7 +24,7 @@ caller for an hour.
   **403**.
 - The answer carries \`tenant\`, \`source\`, \`target\`, \`version\`, \`term_count\` and \`terms\`;
   \`?version=n\` pins that version.
-- A pair or version with no glossary for the tenant is **404**.
+- A pair or version with no glossary for the tenant is **404** (versions start at 1).
 - \`Cache-Control: private, no-cache\`: no shared cache keeps it, and a browser revalidates.`,
   sequence: {
     participants: ['Client', 'translationd', 'Redis'],
@@ -84,7 +84,7 @@ caller for an hour.
       id: 'not-found',
       title: 'A missing glossary is 404, not an empty one',
       detail:
-        'When the tenant has no glossary for the pair, or no such version, the answer is **404**. The starter answers 200 with empty terms, so "no glossary" and "a glossary with no terms yet" look the same.',
+        'When the tenant has no glossary for the pair, or no such version (`?version=0` included), the answer is **404**. The starter answers 200 with empty terms, so "no glossary" and "a glossary with no terms yet" look the same.',
       match: {
         python: {all: [/\b404\b/]},
         typescript: {all: [/\b404\b/]},
@@ -517,7 +517,9 @@ async def check_not_found(ctx):
         tenant = await c.get("/v1/glossaries/en/fr", headers={"X-Tenant-Id": "globex"})
         assert tenant.status_code == 404, f"globex has no en->fr glossary and the read answered {tenant.status_code} {tenant.text}, expected 404"
         version = await c.get("/v1/glossaries/en/fr", headers=ACME, params={"version": "9"})
-    assert version.status_code == 404, f"version 9 does not exist and the read answered {version.status_code} {version.text}, expected 404"
+        assert version.status_code == 404, f"version 9 does not exist and the read answered {version.status_code} {version.text}, expected 404"
+        zero = await c.get("/v1/glossaries/en/fr", headers=ACME, params={"version": "0"})
+    assert zero.status_code == 404, f"?version=0 answered {zero.status_code} {zero.text}, expected 404: versions start at 1, and a pinned 0 is not the active version"
 
 
 async def check_freshness(ctx):
@@ -578,6 +580,8 @@ export async function check_not_found(ctx) {
   assert.equal(tenant.status, 404, \`globex has no en->fr glossary and the read answered \${tenant.status} \${tenant.text}, expected 404\`);
   const version = await c.get('/v1/glossaries/en/fr', {headers: ACME, query: {version: '9'}});
   assert.equal(version.status, 404, \`version 9 does not exist and the read answered \${version.status} \${version.text}, expected 404\`);
+  const zero = await c.get('/v1/glossaries/en/fr', {headers: ACME, query: {version: '0'}});
+  assert.equal(zero.status, 404, \`?version=0 answered \${zero.status} \${zero.text}, expected 404: versions start at 1, and a pinned 0 is not the active version\`);
 }
 
 export async function check_freshness(ctx) {
@@ -669,6 +673,8 @@ func CheckNotFound(ctx *harness.Ctx) {
 	ctx.Equal(tenant.Status, 404, "globex has no en->fr glossary (%s)", tenant.Text())
 	version := c.Get("/v1/glossaries/en/fr?version=9", "X-Tenant-Id", "acme")
 	ctx.Equal(version.Status, 404, "version 9 does not exist (%s)", version.Text())
+	zero := c.Get("/v1/glossaries/en/fr?version=0", "X-Tenant-Id", "acme")
+	ctx.Equal(zero.Status, 404, "versions start at 1, and a pinned 0 is not the active version; ?version=0 (%s)", zero.Text())
 }
 
 func CheckFreshness(ctx *harness.Ctx) {
@@ -763,6 +769,8 @@ void CheckNotFound(harness::Ctx& ctx) {
   ctx.Equal(tenant.Status, 404, "globex has no en->fr glossary (%s)", tenant.Text());
   const auto version = c.Get("/v1/glossaries/en/fr?version=9", "X-Tenant-Id", "acme");
   ctx.Equal(version.Status, 404, "version 9 does not exist (%s)", version.Text());
+  const auto zero = c.Get("/v1/glossaries/en/fr?version=0", "X-Tenant-Id", "acme");
+  ctx.Equal(zero.Status, 404, "versions start at 1, and a pinned 0 is not the active version; ?version=0 (%s)", zero.Text());
 }
 
 void CheckFreshness(harness::Ctx& ctx) {

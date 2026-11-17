@@ -70,7 +70,7 @@ log line carries the tenant's bid.
       id: 'unknown-type',
       title: 'An unknown gpu_type is 400 before any node is read',
       detail:
-        '`gpu_type` is checked against `KNOWN_GPU_TYPES` and refused with 400 before the node set is read or `allocate` runs. The starter has no such check and lands a typo on any node of the fleet.',
+        '`gpu_type` is checked against `KNOWN_GPU_TYPES` and refused with 400 before the node set is read or `allocate` runs; a known type no live node has is a 409, never a booking on another type. The starter has no such check and lands a typo on any node of the fleet.',
       match: {
         python: {all: [/status_code=400/], order: [/not in KNOWN_GPU_TYPES/, /\ballocate\(/]},
         typescript: {all: [/code\(\s*400\s*\)/], order: [/KNOWN_GPU_TYPES\[/, /\ballocate\(/]},
@@ -83,7 +83,7 @@ log line carries the tenant's bid.
       id: 'capacity-ceiling',
       title: 'count is an integer from 1 to MAX_NODE_GPUS',
       detail:
-        '`count` is compared against `MAX_NODE_GPUS` (and refused below 1) with a 400 before `allocate` runs. The starter passes any integer to the ledger, so an impossible request is a 409 and a zero is a booking.',
+        '`count` is an integer (not a boolean, not a fraction) compared against `MAX_NODE_GPUS` and refused below 1 with a 400 before `allocate` runs, however large it is. The starter passes any integer to the ledger, so an impossible request is a 409 and a zero is a booking.',
       match: {
         python: {all: [/status_code=400/], order: [/[<>]=?\s*MAX_NODE_GPUS|MAX_NODE_GPUS\s*[<>]=?/, /\ballocate\(/]},
         typescript: {
@@ -105,7 +105,7 @@ log line carries the tenant's bid.
       id: 'fresh-capacity',
       title: 'The node set is read on every request',
       detail:
-        'The handler reads `nodes` and the node hashes from Redis each time (`schedulable_nodes()` inside the handler) and the boot snapshot is gone. The starter schedules against `BOOT_NODES`, read once at import.',
+        'The handler reads `nodes` and the node hashes from Redis each time (`schedulable_nodes()` inside the handler) and the boot snapshot is gone. Candidates are tried by free GPUs, most first, and a node the ledger refuses (another replica filled it after the read) passes the request to the next one. The starter schedules against `BOOT_NODES`, read once at import.',
       match: {
         python: {all: [/def place[\s\S]*?schedulable_nodes\(\)/], none: [/BOOT_NODES/]},
         typescript: {all: [/app\.post\([\s\S]*?schedulableNodes\(\)/], none: [/BOOT_NODES/]},
@@ -869,10 +869,11 @@ void place(const httplib::Request& req, httplib::Response& res) {
   }
   const std::string gpu_type = body["gpu_type"].get<std::string>();
   if (!body["count"].is_number_integer()) return bad_request(res, "count must be an integer");
-  const int count = body["count"].get<int>();
-  if (count < 1 || count > gpusched::kMaxNodeGpus) {
+  const long long wanted = body["count"].get<long long>();
+  if (wanted < 1 || wanted > gpusched::kMaxNodeGpus) {
     return bad_request(res, "count must be an integer from 1 to " + std::to_string(gpusched::kMaxNodeGpus));
   }
+  const int count = static_cast<int>(wanted);
   if (!body["memory_gb"].is_number() || !body["max_hourly_bid"].is_number()) {
     return bad_request(res, "memory_gb and max_hourly_bid must be numbers");
   }
@@ -946,17 +947,22 @@ async def check_route_shape(ctx):
 
 async def check_unknown_type(ctx):
     m, _ = _api(ctx)
+    fleet_read = ctx.redis_after("nodes", lambda: "read")
     r = await _post(ctx, m, {**BODY, "gpu_type": "tpu"})
     assert r.status_code == 400, f"gpu_type tpu answered {r.status_code}, expected 400: an unknown type must be refused, not placed on whatever node is free"
     assert ctx.redis.hget("node:gpu-1", "allocated") == "0", "a refused request must not book a node"
     assert not ctx.redis.keys("placement:*"), f"a refused request must write no placement record, found {ctx.redis.keys('placement:*')}"
     r = await _post(ctx, m, {**BODY, "gpu_type": 7})
     assert r.status_code == 400, f"gpu_type 7 answered {r.status_code}, expected 400"
+    assert not fleet_read.fired, "a request refused for its gpu_type read the node set first: validate the body before any node is read"
+    r = await _post(ctx, m, {**BODY, "gpu_type": "h100"})
+    assert r.status_code == 409, f"gpu_type h100 with only an a100 node live answered {r.status_code}, expected 409: a known type is placed only on a node of that type, never on another type's"
+    assert ctx.redis.hget("node:gpu-1", "allocated") == "0" and not ctx.redis.keys("placement:*"), "an h100 request must not book the a100 node"
 
 
 async def check_capacity_ceiling(ctx):
     m, _ = _api(ctx)
-    for count in (9, 0, -1, 2.5, "four"):
+    for count in (9, 0, -1, 2.5, "four", True, 4294967297):
         r = await _post(ctx, m, {**BODY, "count": count})
         assert r.status_code == 400, f"count {count!r} answered {r.status_code}, expected 400 (an integer from 1 to MAX_NODE_GPUS = 8)"
     assert ctx.redis.hget("node:gpu-1", "allocated") == "0" and not ctx.redis.keys("placement:*"), "no refused count may reach the ledger"
@@ -978,6 +984,21 @@ async def check_fresh_capacity(ctx):
     ctx.redis.delete("heartbeat:gpu-2")
     r = await _post(ctx, m, BODY)
     assert r.status_code == 409, f"with gpu-1 full and gpu-2's heartbeat lapsed the request answered {r.status_code}, expected 409"
+    # gpu-2 reports in again (4 free), gpu-1 frees up to 2, gpu-3 joins idle (8 free).
+    ctx.redis.set("heartbeat:gpu-2", "1", ex=30)
+    ctx.redis.hset("node:gpu-1", "allocated", 6)
+    _node(ctx, "gpu-3")
+    r = await _post(ctx, m, {**BODY, "count": 1})
+    assert r.status_code == 201 and r.json().get("node_id") == "gpu-3", f"with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 the request answered {r.status_code} {r.text}, expected gpu-3: candidates are tried by free GPUs, most first"
+
+    def rival():
+        """Another replica fills gpu-3 right after this request read it."""
+        ctx.redis.hset("node:gpu-3", "allocated", 8)
+
+    filled = ctx.redis_after("node:gpu-3", rival)
+    r = await _post(ctx, m, {**BODY, "count": 2})
+    assert filled.fired, "the request never read node:gpu-3"
+    assert r.status_code == 201 and r.json().get("node_id") == "gpu-2", f"gpu-3 filled up between the read and allocate, so the ledger answered NO_CAPACITY there; the request answered {r.status_code} {r.text}, expected 201 on gpu-2 (4 free): the next candidate is tried, the first ALLOCATED wins"
 
 
 async def check_log_no_payload(ctx):
@@ -1033,12 +1054,17 @@ export async function check_route_shape(ctx) {
 export async function check_unknown_type(ctx) {
   const {post, restore} = api(ctx);
   try {
+    const fleetRead = ctx.redisAfter('nodes', () => 'read');
     let r = await post({...BODY, gpu_type: 'tpu'});
     assert.equal(r.status, 400, 'gpu_type tpu: an unknown type must be refused, not placed on whatever node is free');
     assert.equal(ctx.redis.hget('node:gpu-1', 'allocated'), '0', 'a refused request must not book a node');
     assert.deepEqual(ctx.redis.keys('placement:*'), [], 'a refused request must write no placement record');
     r = await post({...BODY, gpu_type: 7});
     assert.equal(r.status, 400, 'gpu_type 7');
+    assert(!fleetRead.fired, 'a request refused for its gpu_type read the node set first: validate the body before any node is read');
+    r = await post({...BODY, gpu_type: 'h100'});
+    assert.equal(r.status, 409, "gpu_type h100 with only an a100 node live: a known type is placed only on a node of that type, never on another type's");
+    assert(ctx.redis.hget('node:gpu-1', 'allocated') === '0' && ctx.redis.keys('placement:*').length === 0, 'an h100 request must not book the a100 node');
   } finally {
     restore();
   }
@@ -1047,7 +1073,7 @@ export async function check_unknown_type(ctx) {
 export async function check_capacity_ceiling(ctx) {
   const {post, restore} = api(ctx);
   try {
-    for (const count of [9, 0, -1, 2.5, 'four']) {
+    for (const count of [9, 0, -1, 2.5, 'four', true, 4294967297]) {
       const r = await post({...BODY, count});
       assert.equal(r.status, 400, \`count \${JSON.stringify(count)} (an integer from 1 to MAX_NODE_GPUS = 8)\`);
     }
@@ -1075,6 +1101,21 @@ export async function check_fresh_capacity(ctx) {
     ctx.redis.del('heartbeat:gpu-2');
     r = await post(BODY);
     assert.equal(r.status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed");
+    // gpu-2 reports in again (4 free), gpu-1 frees up to 2, gpu-3 joins idle (8 free).
+    ctx.redis.set('heartbeat:gpu-2', '1', 'EX', 30);
+    ctx.redis.hset('node:gpu-1', 'allocated', 6);
+    node(ctx, 'gpu-3');
+    const landedOn = (res: {json(): unknown}): unknown => {
+      const answer = res.json();
+      return answer !== null && typeof answer === 'object' && 'node_id' in answer ? answer.node_id : undefined;
+    };
+    r = await post({...BODY, count: 1});
+    assert(r.status === 201 && landedOn(r) === 'gpu-3', \`with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 the request answered \${r.status} \${r.text}, expected gpu-3: candidates are tried by free GPUs, most first\`);
+    // Another replica fills gpu-3 right after this request read it.
+    const filled = ctx.redisAfter('node:gpu-3', () => ctx.redis.hset('node:gpu-3', 'allocated', 8));
+    r = await post({...BODY, count: 2});
+    assert(filled.fired, 'the request never read node:gpu-3');
+    assert(r.status === 201 && landedOn(r) === 'gpu-2', \`gpu-3 filled up between the read and allocate, so the ledger answered NO_CAPACITY there; the request answered \${r.status} \${r.text}, expected 201 on gpu-2 (4 free): the next candidate is tried, the first ALLOCATED wins\`);
   } finally {
     restore();
   }
@@ -1182,6 +1223,7 @@ func CheckRouteShape(ctx *harness.Ctx) {
 func CheckUnknownType(ctx *harness.Ctx) {
 	c, _ := apiBoot(ctx)
 	defer log.SetOutput(os.Stderr)
+	fleetRead := ctx.Redis.After("nodes", func() any { return "read" })
 	r := c.Post("/v1/placements", apiWith("gpu_type", "tpu"))
 	ctx.Equal(r.Status, 400, "gpu_type tpu: an unknown type must be refused, not placed on whatever node is free")
 	allocatedGPUs, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
@@ -1189,12 +1231,17 @@ func CheckUnknownType(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.Keys("placement:*")), 0, "a refused request must write no placement record; the records")
 	r = c.Post("/v1/placements", apiWith("gpu_type", 7))
 	ctx.Equal(r.Status, 400, "gpu_type 7")
+	ctx.Assert(!fleetRead.Fired, "a request refused for its gpu_type read the node set first: validate the body before any node is read")
+	r = c.Post("/v1/placements", apiWith("gpu_type", "h100"))
+	ctx.Equal(r.Status, 409, "gpu_type h100 with only an a100 node live: a known type is placed only on a node of that type, never on another type's")
+	allocatedGPUs, _ = ctx.Redis.HGet("node:gpu-1", "allocated")
+	ctx.Assert(allocatedGPUs == "0" && len(ctx.Redis.Keys("placement:*")) == 0, "an h100 request must not book the a100 node")
 }
 
 func CheckCapacityCeiling(ctx *harness.Ctx) {
 	c, _ := apiBoot(ctx)
 	defer log.SetOutput(os.Stderr)
-	for _, count := range []any{9, 0, -1, 2.5, "four"} {
+	for _, count := range []any{9, 0, -1, 2.5, "four", true, 4294967297} {
 		r := c.Post("/v1/placements", apiWith("count", count))
 		ctx.Equal(r.Status, 400, "count %v (an integer from 1 to MaxNodeGPUs = 8)", harness.Show(count))
 	}
@@ -1221,6 +1268,21 @@ func CheckFreshCapacity(ctx *harness.Ctx) {
 	ctx.Redis.Del("heartbeat:gpu-2")
 	r = c.Post("/v1/placements", apiBody)
 	ctx.Equal(r.Status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed")
+	// gpu-2 reports in again (4 free), gpu-1 frees up to 2, gpu-3 joins idle (8 free).
+	ctx.Redis.Do("SET", "heartbeat:gpu-2", "1", "EX", 30)
+	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 6)
+	apiNode(ctx, "gpu-3", "a100", 8, 0)
+	r = c.Post("/v1/placements", apiWith("count", 1))
+	ctx.Equal(r.Status, 201, "with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 a request for 1 GPU (%s)", r.Text())
+	body, _ = r.JSON().(map[string]any)
+	ctx.Assert(body["node_id"] == "gpu-3", "with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 the request landed on %v, expected gpu-3: candidates are tried by free GPUs, most first", body["node_id"])
+	// Another replica fills gpu-3 right after this request read it.
+	filled := ctx.Redis.After("node:gpu-3", func() any { return ctx.Redis.Do("HSET", "node:gpu-3", "allocated", 8) })
+	r = c.Post("/v1/placements", apiWith("count", 2))
+	ctx.Assert(filled.Fired, "the request never read node:gpu-3")
+	ctx.Equal(r.Status, 201, "gpu-3 filled up between the read and allocate, so the ledger answered NO_CAPACITY there (%s): the next candidate is tried, the first ALLOCATED wins", r.Text())
+	body, _ = r.JSON().(map[string]any)
+	ctx.Assert(body["node_id"] == "gpu-2", "gpu-3 filled up between the read and allocate; the request landed on %v, expected gpu-2 (4 free)", body["node_id"])
 }
 
 func CheckLogNoPayload(ctx *harness.Ctx) {
@@ -1250,7 +1312,9 @@ func CheckLogNoPayload(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1340,17 +1404,24 @@ void CheckRouteShape(harness::Ctx& ctx) {
 
 void CheckUnknownType(harness::Ctx& ctx) {
   auto c = apiBoot(ctx);
+  auto fleetRead = std::make_shared<std::atomic<bool>>(false);
+  ctx.Redis.After("nodes", [fleetRead] { *fleetRead = true; });
   auto r = apiPost(c, apiWith("gpu_type", "tpu"));
   ctx.Equal(r.Status, 400, "gpu_type tpu: an unknown type must be refused, not placed on whatever node is free");
   ctx.Equal(ctx.Redis.HGet("node:gpu-1", "allocated"), "0", "a refused request must not book a node; allocated");
   ctx.Equal(ctx.Redis.Keys("placement:*").size(), 0, "a refused request must write no placement record; the records");
   r = apiPost(c, apiWith("gpu_type", 7));
   ctx.Equal(r.Status, 400, "gpu_type 7");
+  ctx.Assert(!*fleetRead, "a request refused for its gpu_type read the node set first: validate the body before any node is read");
+  r = apiPost(c, apiWith("gpu_type", "h100"));
+  ctx.Equal(r.Status, 409, "gpu_type h100 with only an a100 node live: a known type is placed only on a node of that type, never on another type's");
+  ctx.Assert(ctx.Redis.HGet("node:gpu-1", "allocated") == "0" && ctx.Redis.Keys("placement:*").empty(), "an h100 request must not book the a100 node");
 }
 
 void CheckCapacityCeiling(harness::Ctx& ctx) {
   auto c = apiBoot(ctx);
-  for (const nlohmann::json count : {nlohmann::json(9), nlohmann::json(0), nlohmann::json(-1), nlohmann::json(2.5), nlohmann::json("four")}) {
+  for (const nlohmann::json count : {nlohmann::json(9), nlohmann::json(0), nlohmann::json(-1), nlohmann::json(2.5), nlohmann::json("four"), nlohmann::json(true),
+                                     nlohmann::json(4294967297LL)}) {
     auto r = apiPost(c, apiWith("count", count));
     ctx.Equal(r.Status, 400, "count %s (an integer from 1 to kMaxNodeGpus = 8)", count.dump());
   }
@@ -1375,6 +1446,26 @@ void CheckFreshCapacity(harness::Ctx& ctx) {
   ctx.Redis.Del("heartbeat:gpu-2");
   r = apiPost(c, kApiBody);
   ctx.Equal(r.Status, 409, "with gpu-1 full and gpu-2's heartbeat lapsed");
+  // gpu-2 reports in again (4 free), gpu-1 frees up to 2, gpu-3 joins idle (8 free).
+  ctx.Redis.Do("SET", "heartbeat:gpu-2", "1", "EX", 30);
+  ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 6);
+  apiNode(ctx, "gpu-3");
+  r = apiPost(c, apiWith("count", 1));
+  ctx.Equal(r.Status, 201, "with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 a request for 1 GPU (%s)", r.Text());
+  auto landed = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Equal(landed.is_object() ? landed.value("node_id", "") : "", "gpu-3",
+            "with 2, 4 and 8 GPUs free on gpu-1, gpu-2 and gpu-3 the node the request landed on (candidates are tried by free GPUs, most first)");
+  // Another replica fills gpu-3 right after this request read it.
+  auto filled = std::make_shared<std::atomic<bool>>(false);
+  ctx.Redis.After("node:gpu-3", [&ctx, filled] {
+    *filled = true;
+    ctx.Redis.Do("HSET", "node:gpu-3", "allocated", 8);
+  });
+  r = apiPost(c, apiWith("count", 2));
+  ctx.Assert(*filled, "the request never read node:gpu-3");
+  ctx.Equal(r.Status, 201, "gpu-3 filled up between the read and allocate, so the ledger answered NO_CAPACITY there (%s): the next candidate is tried, the first ALLOCATED wins", r.Text());
+  landed = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Equal(landed.is_object() ? landed.value("node_id", "") : "", "gpu-2", "gpu-3 filled up between the read and allocate; the node the request landed on (gpu-2 has 4 free)");
 }
 
 void CheckLogNoPayload(harness::Ctx& ctx) {

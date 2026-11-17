@@ -49,7 +49,7 @@ twice, while a leader failover loses one.
       id: 'run-key',
       title: 'Keys training.run by the run id',
       detail:
-        'Three transitions for run-a, run-b, run-a carry those keys and the two run-a records share a partition. The starter keys by band, so every run of a band shares one key.',
+        'Three transitions for run-a, run-b, run-a carry those keys, the two run-a records share a partition, and each payload is exactly `{run_id, transition, band, nodes, checkpoint_id}` from the run row. The starter keys by band, so every run of a band shares one key.',
       match: {
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*run_id/]},
         typescript: {all: [/key:\s*runId/]},
@@ -62,7 +62,7 @@ twice, while a leader failover loses one.
       id: 'started-after-confirm',
       title: 'Publishes started only for a start the worker accepted',
       detail:
-        'A run the worker refuses gets no `started` record and stays `starting`; an accepted run gets exactly one, carrying the nodes from the reply. The starter publishes `started` before it asks.',
+        'A run the worker refuses gets no `started` record and stays `starting`; an accepted start whose `confirm_start` returns false (its lease names another worker) gets no `started` record and returns false; an accepted, confirmed run gets exactly one, carrying the nodes from the reply. The starter publishes `started` before it asks.',
       match: {
         python: {
           order: [/worker\.StartRun\(/, /not reply\.accepted/, /publish_transition\(\s*run_id,\s*["']started["']\)/],
@@ -85,7 +85,7 @@ twice, while a leader failover loses one.
       id: 'outbox-on-failure',
       title: 'Waits for the ack and falls back to the outbox',
       detail:
-        'A failed delivery, or no acknowledgement within 2 s, leaves an outbox row with the topic, the run id and the payload, and the call returns false. The starter fires and forgets.',
+        'A failed delivery, or no acknowledgement within 2 s (2.5 s at most on the clock), leaves an outbox row with the topic, the run id and the full payload, and the call returns false. The starter fires and forgets.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -856,6 +856,9 @@ def check_run_key(ctx):
     keys = [r.key for r in records]
     assert keys == [b"run-a", b"run-b", b"run-a"], f"the records are keyed {keys}, expected the run ids run-a, run-b, run-a"
     assert records[0].partition == records[2].partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order"
+    first = json.loads(records[0].value)
+    want = {"run_id": "run-a", "transition": "queued", "band": 1, "nodes": [], "checkpoint_id": "ckpt-7"}
+    assert first == want, f"the first record's payload is {first}, expected {want}"
 
 
 def check_started_after_confirm(ctx):
@@ -874,6 +877,15 @@ def check_started_after_confirm(ctx):
     assert len(started) == 1 and started[0].get("run_id") == "run-b", f"one accepted start must publish one started record for run-b, got {started}"
     assert started[0].get("nodes") == ["n3", "n4"], f"the started record carries nodes {started[0].get('nodes')}, the worker placed it on ['n3', 'n4']"
     assert runs.get("run-b")["state"] == "running", f"an accepted run reads {runs.get('run-b')['state']!r}, expected running"
+    want = {"run_id": "run-b", "transition": "started", "band": 1, "nodes": ["n3", "n4"], "checkpoint_id": "ckpt-7"}
+    assert started[0] == want, f"the started record is {started[0]}, expected {want}"
+    # The worker accepts run-c, but w-3's lease now names another worker: confirm_start answers false.
+    _queued(ctx, "run-c")
+    assert queue.claim_next("w-3", now) == "run-c", "run-c must be claimable"
+    lost = m.start_run("run-c", "w-9")
+    assert lost is False, f"start_run returned {lost!r} for run-c, whose lease names w-3 and not w-9, expected False"
+    started = [p for p in _payloads(ctx) if p.get("transition") == "started"]
+    assert [p.get("run_id") for p in started] == ["run-b"], f"training.run says {[p.get('run_id') for p in started]} started, but confirm_start refused w-9's start of run-c: publish started only after a confirm that returned true"
 
 
 def check_outbox_on_failure(ctx):
@@ -884,13 +896,14 @@ def check_outbox_on_failure(ctx):
     ok = m.publish_transition("run-a", "queued")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the transition is missing from every run history"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "run-a" and rows[0].get("payload", {}).get("transition") == "queued", f"the outbox row is {rows[0]}, expected the topic, the key run-a and the payload"
+    want = {"topic": TOPIC, "key": "run-a", "payload": {"run_id": "run-a", "transition": "queued", "band": 1, "nodes": [], "checkpoint_id": "ckpt-7"}}
+    assert rows[0] == want, f"the outbox row is {rows[0]}, expected {want}: the relay publishes exactly what the broker did not take"
     assert ok is False, f"publish_transition returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_transition("run-b", "queued")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_transition waited {waited:.0f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_transition waited {waited:.1f} s for a broker that does not answer: wait for the ack at most ACK_TIMEOUT_S (2 s), then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("key") == "run-b", f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish_transition returned {ok!r} without an acknowledgement, expected False"
@@ -950,6 +963,8 @@ export async function check_run_key(ctx) {
   const keys = ctx.kafka.keys(TOPIC);
   assert.deepEqual(keys, ['run-a', 'run-b', 'run-a'], \`the records are keyed \${JSON.stringify(keys)}, expected the run ids run-a, run-b, run-a\`);
   assert.equal(records[0].partition, records[2].partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order");
+  const want = {run_id: 'run-a', transition: 'queued', band: 1, nodes: [], checkpoint_id: 'ckpt-7'};
+  assert.deepEqual(payloads(ctx)[0], want, \`the first record's payload is \${JSON.stringify(payloads(ctx)[0])}, expected \${JSON.stringify(want)}\`);
 }
 
 export async function check_started_after_confirm(ctx) {
@@ -970,6 +985,16 @@ export async function check_started_after_confirm(ctx) {
   assert(started.length === 1 && started[0].run_id === 'run-b', \`one accepted start must publish one started record for run-b, got \${JSON.stringify(started)}\`);
   assert.deepEqual(started[0].nodes, ['n3', 'n4'], \`the started record carries nodes \${JSON.stringify(started[0].nodes)}, the worker placed it on ["n3","n4"]\`);
   assert.equal((await runs.get('run-b')).state, 'running', 'an accepted run must read running');
+  const want = {run_id: 'run-b', transition: 'started', band: 1, nodes: ['n3', 'n4'], checkpoint_id: 'ckpt-7'};
+  assert.deepEqual(started[0], want, \`the started record is \${JSON.stringify(started[0])}, expected \${JSON.stringify(want)}\`);
+  // The worker accepts run-c, but w-3's lease now names another worker: confirmStart answers false.
+  await queued(ctx, runs, queue, 'run-c');
+  assert.equal(await queue.claimNext('w-3', now), 'run-c', 'run-c must be claimable');
+  const lost = await m.startRun('run-c', 'w-9');
+  await settle();
+  assert.equal(lost, false, \`startRun returned \${lost} for run-c, whose lease names w-3 and not w-9, expected false\`);
+  const startedIds = payloads(ctx).filter(p => p.transition === 'started').map(p => p.run_id);
+  assert.deepEqual(startedIds, ['run-b'], \`training.run says \${JSON.stringify(startedIds)} started, but confirmStart refused w-9's start of run-c: publish started only after a confirm that returned true\`);
 }
 
 export async function check_outbox_on_failure(ctx) {
@@ -981,13 +1006,14 @@ export async function check_outbox_on_failure(ctx) {
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the transition is missing from every run history\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'run-a' && rows[0].payload?.transition === 'queued', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key run-a and the payload\`);
+  const want = {topic: TOPIC, key: 'run-a', payload: {run_id: 'run-a', transition: 'queued', band: 1, nodes: [], checkpoint_id: 'ckpt-7'}};
+  assert.deepEqual(rows[0], want, \`the outbox row is \${JSON.stringify(rows[0])}, expected \${JSON.stringify(want)}: the relay publishes exactly what the broker did not take\`);
   assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishTransition('run-b', 'queued');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishTransition waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishTransition waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the ack at most ACK_TIMEOUT_S (2 s), then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].key === 'run-b', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -1009,6 +1035,7 @@ export async function check_acks_idempotent(ctx) {
     go: `package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 
@@ -1056,16 +1083,36 @@ func eventsPublish(ctx *harness.Ctx, runID, transition string) bool {
 }
 
 type transitionRecord struct {
-	RunID      string   \`json:"run_id"\`
-	Transition string   \`json:"transition"\`
-	Nodes      []string \`json:"nodes"\`
+	RunID        string   \`json:"run_id"\`
+	Transition   string   \`json:"transition"\`
+	Band         int      \`json:"band"\`
+	Nodes        []string \`json:"nodes"\`
+	CheckpointID string   \`json:"checkpoint_id"\`
+}
+
+// decodeTransition reads one payload, which carries those five fields and no other; a null nodes list reads as an empty one.
+func decodeTransition(ctx *harness.Ctx, raw []byte) transitionRecord {
+	var r transitionRecord
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	ctx.NoError(dec.Decode(&r), "a training.run payload must be JSON with run_id, transition, band, nodes and checkpoint_id only (%s)", raw)
+	if r.Nodes == nil {
+		r.Nodes = []string{}
+	}
+	return r
+}
+
+func transitionRecords(ctx *harness.Ctx) []transitionRecord {
+	out := []transitionRecord{}
+	for _, v := range ctx.Kafka.Values(eventsTopic) {
+		out = append(out, decodeTransition(ctx, []byte(v)))
+	}
+	return out
 }
 
 func startedRecords(ctx *harness.Ctx) []transitionRecord {
 	out := []transitionRecord{}
-	for _, v := range ctx.Kafka.Values(eventsTopic) {
-		var r transitionRecord
-		ctx.NoError(json.Unmarshal([]byte(v), &r), "a training.run record must be JSON")
+	for _, r := range transitionRecords(ctx) {
 		if r.Transition == "started" {
 			out = append(out, r)
 		}
@@ -1074,9 +1121,9 @@ func startedRecords(ctx *harness.Ctx) []transitionRecord {
 }
 
 type outboxRow struct {
-	Topic   string         \`json:"topic"\`
-	Key     string         \`json:"key"\`
-	Payload map[string]any \`json:"payload"\`
+	Topic   string          \`json:"topic"\`
+	Key     string          \`json:"key"\`
+	Payload json.RawMessage \`json:"payload"\`
 }
 
 func outboxRows(ctx *harness.Ctx) []outboxRow {
@@ -1101,6 +1148,7 @@ func CheckRunKey(ctx *harness.Ctx) {
 	ctx.Equal(len(records), 3, "three publishTransition calls must produce three records on training.run; the records")
 	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order; the partitions")
+	ctx.Equal(transitionRecords(ctx)[0], transitionRecord{RunID: "run-a", Transition: "queued", Band: 1, Nodes: []string{}, CheckpointID: "ckpt-7"}, "the first record's payload")
 }
 
 func CheckStartedAfterConfirm(ctx *harness.Ctx) {
@@ -1127,6 +1175,20 @@ func CheckStartedAfterConfirm(ctx *harness.Ctx) {
 	ctx.Assert(len(started) == 1 && started[0].RunID == "run-b", "one accepted start must publish one started record for run-b, got %+v", started)
 	ctx.Equal(started[0].Nodes, []string{"n3", "n4"}, "the started record's nodes (the worker placed it on n3, n4)")
 	ctx.Equal(runs.Get(eventsBg, "run-b").State, "running", "an accepted run's state")
+	ctx.Equal(started[0], transitionRecord{RunID: "run-b", Transition: "started", Band: 1, Nodes: []string{"n3", "n4"}, CheckpointID: "ckpt-7"}, "the started record")
+	// The worker accepts run-c, but w-3's lease now names another worker: confirmStart answers false.
+	eventsQueued(ctx, "run-c")
+	third, _ := queue.ClaimNext(eventsBg, "w-3", now)
+	ctx.Equal(third, "run-c", "run-c must be claimable")
+	lost, err := startRun(eventsBg, "run-c", "w-9")
+	ctx.NoError(err, "startRun(run-c)")
+	ctx.Settle()
+	ctx.Equal(lost, false, "startRun's result for run-c, whose lease names w-3 and not w-9")
+	ids := []string{}
+	for _, r := range startedRecords(ctx) {
+		ids = append(ids, r.RunID)
+	}
+	ctx.Equal(ids, []string{"run-b"}, "confirmStart refused w-9's start of run-c: publish started only after a confirm that returned true; the runs training.run says started")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
@@ -1138,13 +1200,14 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := outboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition is missing from every run history; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "run-a" && rows[0].Payload["transition"] == "queued", "the outbox row is %+v, expected the topic, the key run-a and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "run-a", "the outbox row is %+v, expected the topic and the key run-a", rows[0])
+	ctx.Equal(decodeTransition(ctx, rows[0].Payload), transitionRecord{RunID: "run-a", Transition: "queued", Band: 1, Nodes: []string{}, CheckpointID: "ckpt-7"}, "the relay publishes exactly what the broker did not take; the outbox row's payload")
 	ctx.Equal(ok, false, "publishTransition's result after a failed delivery")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, "run-b", "queued")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishTransition waited %.1f s for a broker that does not answer: wait for the ack at most ACK_TIMEOUT_S (2 s), then write the outbox row", waited)
 	rows = outboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == "run-b", "no acknowledgement within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "publishTransition's result without an acknowledgement")
@@ -1217,15 +1280,20 @@ long long eventsQueued(harness::Ctx& ctx, const std::string& run_id) {
   return now;
 }
 
-std::string text(const nlohmann::json& j, const std::string& field) {
+std::string hText(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
+}
+
+// The payload every transition record carries.
+nlohmann::json hPayload(const std::string& run_id, const std::string& transition, const nlohmann::json& nodes) {
+  return nlohmann::json{{"run_id", run_id}, {"transition", transition}, {"band", 1}, {"nodes", nodes}, {"checkpoint_id", "ckpt-7"}};
 }
 
 std::vector<nlohmann::json> startedRecords(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& v : ctx.Kafka.Values(kEventsTopic)) {
     const auto record = nlohmann::json::parse(v, nullptr, false);
-    if (text(record, "transition") == "started") out.push_back(record);
+    if (hText(record, "transition") == "started") out.push_back(record);
   }
   return out;
 }
@@ -1254,6 +1322,7 @@ void CheckRunKey(harness::Ctx& ctx) {
   ctx.Equal(records.size(), 3, "three publishTransition calls must produce three records on training.run; the records");
   ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"run-a", "run-b", "run-a"}, "the records must be keyed by the run ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both run-a records must land on one partition, or a consumer reads one run's history out of order; the partitions");
+  ctx.Equal(nlohmann::json::parse(ctx.Kafka.Values(kEventsTopic)[0], nullptr, false), hPayload("run-a", "queued", nlohmann::json::array()), "the first record's payload");
 }
 
 void CheckStartedAfterConfirm(harness::Ctx& ctx) {
@@ -1267,14 +1336,24 @@ void CheckStartedAfterConfirm(harness::Ctx& ctx) {
   const bool refused = startRun("run-a", "w-1");
   ctx.Settle();
   ctx.Equal(refused, false, "startRun's result for a run the worker refused");
-  for (const auto& r : startedRecords(ctx)) ctx.Assert(text(r, "run_id") != "run-a", "training.run says run-a started, but the worker refused it");
+  for (const auto& r : startedRecords(ctx)) ctx.Assert(hText(r, "run_id") != "run-a", "training.run says run-a started, but the worker refused it");
   ctx.Equal(runs::get("run-a")->state, "starting", "a refused run stays starting until its lease runs out; its state");
   ctx.Equal(startRun("run-b", "w-2"), true, "startRun's result for a run the worker accepted");
   ctx.Settle();
   const auto started = startedRecords(ctx);
-  ctx.Assert(started.size() == 1 && text(started[0], "run_id") == "run-b", "one accepted start must publish one started record for run-b, got %d", started.size());
+  ctx.Assert(started.size() == 1 && hText(started[0], "run_id") == "run-b", "one accepted start must publish one started record for run-b, got %d", started.size());
   ctx.Equal(started[0]["nodes"], nlohmann::json{"n3", "n4"}, "the started record's nodes (the worker placed it on n3, n4)");
   ctx.Equal(runs::get("run-b")->state, "running", "an accepted run's state");
+  ctx.Equal(started[0], hPayload("run-b", "started", nlohmann::json{"n3", "n4"}), "the started record");
+  // The worker accepts run-c, but w-3's lease now names another worker: confirmStart answers false.
+  eventsQueued(ctx, "run-c");
+  ctx.Equal(queue::claimNext("w-3", now).value_or(""), "run-c", "run-c must be claimable");
+  const bool lost = startRun("run-c", "w-9");
+  ctx.Settle();
+  ctx.Equal(lost, false, "startRun's result for run-c, whose lease names w-3 and not w-9");
+  std::vector<std::string> ids;
+  for (const auto& r : startedRecords(ctx)) ids.push_back(hText(r, "run_id"));
+  ctx.Equal(ids, {"run-b"}, "confirmStart refused w-9's start of run-c: publish started only after a confirm that returned true; the runs training.run says started");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
@@ -1286,16 +1365,16 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = outboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition is missing from every run history; the rows");
-  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "run-a" && rows[0].contains("payload") && text(rows[0]["payload"], "transition") == "queued",
-             "the outbox row is %s, expected the topic, the key run-a and the payload", rows[0].dump());
+  ctx.Assert(hText(rows[0], "topic") == kEventsTopic && hText(rows[0], "key") == "run-a", "the outbox row is %s, expected the topic and the key run-a", rows[0].dump());
+  ctx.Equal(rows[0].value("payload", nlohmann::json()), hPayload("run-a", "queued", nlohmann::json::array()), "the relay publishes exactly what the broker did not take; the outbox row's payload");
   ctx.Equal(ok, false, "publishTransition's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const long long before = ctx.Clock.Now();
   ok = publishTransition("run-b", "queued");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishTransition waited %.1f s for a broker that does not answer: wait for the ack at most ACK_TIMEOUT_S (2 s), then write the outbox row", waited);
   rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && text(rows[1], "key") == "run-b", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(rows.size() == 2 && hText(rows[1], "key") == "run-b", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishTransition's result without an acknowledgement");
 }
 

@@ -107,7 +107,7 @@ tenant's events interleaved and no releases at all, so its picture of the node o
       id: 'outbox-relay',
       title: 'A refused delivery lands in the outbox and is relayed',
       detail:
-        'The delivery callback appends the key and value to `OUTBOX` when the broker reports an error, and `relay_outbox` produces the rows again. The starter never looks at the delivery report.',
+        'The delivery callback appends the key and value to `OUTBOX` when the broker reports an error, and `relay_outbox` produces the rows again; a relayed record the broker refuses again goes back to the outbox rather than being lost. The starter never looks at the delivery report.',
       match: {
         python: {all: [/on_delivery\s*=/, /rpush\(\s*OUTBOX/, /def relay_outbox/], none: [/except KafkaException/]},
         typescript: {all: [/\bcatch\b/, /rpush\(\s*OUTBOX/, /relayOutbox/]},
@@ -120,7 +120,7 @@ tenant's events interleaved and no releases at all, so its picture of the node o
       id: 'release-reconcile',
       title: 'Releases are in the stream, so folding it matches the ledger',
       detail:
-        '`release_and_publish` produces a `release` event when the counters moved, so a node’s folded stream equals its `allocated`. The starter publishes no release, and a rebuilt occupancy only ever grows.',
+        '`release_and_publish` produces a `release` event when the counters moved, with the same fields as the allocation (its `tenant` and `memory_gb` included), so a node’s folded stream equals its `allocated`; a release the broker refuses waits in the outbox like an allocation. The starter publishes no release, and a rebuilt occupancy only ever grows.',
       match: {
         python: {
           all: [/["']release["']/, /def release_and_publish(?:(?!\ndef )[\s\S])*?(producer\.produce\(|_publish\()/],
@@ -851,6 +851,14 @@ def check_outbox_relay(ctx):
     assert ctx.kafka.records(TOPIC)[0].key == b"gpu-1", "the relayed record keeps its node key"
     assert ctx.redis.llen(OUTBOX) == 0, "a relayed row leaves the outbox"
     assert m.relay_outbox() == 0 and len(_events(ctx)) == 1, "an empty outbox relays nothing"
+    ctx.kafka.fail_next(TOPIC, 1)
+    assert m.allocate_and_publish("gpu-1", "p-2", "beta", 2, 40) == "ALLOCATED"
+    assert ctx.redis.llen(OUTBOX) == 1, f"a second refused delivery must leave one row in {OUTBOX}, found {ctx.redis.lrange(OUTBOX, 0, -1)}"
+    ctx.kafka.fail_next(TOPIC, 1)
+    m.relay_outbox()  # the broker refuses the relayed record once
+    m.relay_outbox()
+    p2 = [e for e in _events(ctx) if e.get("placement_id") == "p-2"]
+    assert len(p2) == 1 and ctx.redis.llen(OUTBOX) == 0, f"the broker refused p-2's relayed record once; after two relays the stream holds {len(p2)} allocations of p-2 and the outbox {ctx.redis.llen(OUTBOX)} rows, expected 1 and 0: a relayed produce reports its delivery like any other, and a refused one goes back to the outbox"
 
 
 def check_release_reconcile(ctx):
@@ -862,9 +870,16 @@ def check_release_reconcile(ctx):
     assert len(events) == 3, f"two bookings and one release produced {len(events)} records, expected 3 (a release is an event too)"
     release = events[2]
     assert release.get("type") == "release" and release.get("placement_id") == "p-1" and release.get("gpu_count") == 4, f"the third event must be p-1's release with gpu_count 4, got {release}"
+    assert release.get("node_id") == "gpu-1" and release.get("tenant") == "acme" and release.get("memory_gb") == 80 and "ts" in release, f"p-1's release must carry node_id gpu-1, tenant acme, memory_gb 80 and ts, as its allocation did, got {release}"
     assert ctx.kafka.records(TOPIC)[2].key == b"gpu-1", "the release is keyed by the node id too"
     assert _folded(ctx, "gpu-1") == 2 == _allocated(ctx), f"the stream folds to {_folded(ctx, 'gpu-1')} GPUs on gpu-1, the ledger says {_allocated(ctx)}"
     assert m.release_and_publish("gpu-1", "p-1") is False and len(_events(ctx)) == 3, "a repeated release moves nothing and produces nothing"
+    ctx.kafka.fail_next(TOPIC, 1)
+    assert m.release_and_publish("gpu-1", "p-2") is True, "the first release of p-2 moves the counters"
+    rows = ctx.redis.lrange(OUTBOX, 0, -1)
+    assert len(rows) == 1 and "p-2" in rows[0], f"the broker refused p-2's release, so it must wait in {OUTBOX}, found {rows}: a release reports its delivery like an allocation"
+    m.relay_outbox()
+    assert _folded(ctx, "gpu-1") == 0 == _allocated(ctx), f"after relaying p-2's release the stream folds to {_folded(ctx, 'gpu-1')} GPUs on gpu-1, the ledger says {_allocated(ctx)}"
 `,
     typescript: `const TOPIC = 'gpu.placement';
 const OUTBOX = 'outbox:gpu.placement';
@@ -943,6 +958,14 @@ export async function check_outbox_relay(ctx) {
   assert.equal(ctx.kafka.records(TOPIC)[0].key?.toString(), 'gpu-1', 'the relayed record keeps its node key');
   assert.equal(ctx.redis.llen(OUTBOX), 0, 'a relayed row leaves the outbox');
   assert((await m.relayOutbox()) === 0 && events(ctx).length === 1, 'an empty outbox relays nothing');
+  ctx.kafka.failNext(TOPIC, 1);
+  assert.equal(await m.allocateAndPublish('gpu-1', 'p-2', 'beta', 2, 40), 'ALLOCATED');
+  assert.equal(ctx.redis.llen(OUTBOX), 1, \`a second refused delivery must leave one row in \${OUTBOX}, found \${JSON.stringify(ctx.redis.lrange(OUTBOX, 0, -1))}\`);
+  ctx.kafka.failNext(TOPIC, 1);
+  await m.relayOutbox(); // the broker refuses the relayed record once
+  await m.relayOutbox();
+  const p2 = events(ctx).filter(e => e.placement_id === 'p-2');
+  assert(p2.length === 1 && ctx.redis.llen(OUTBOX) === 0, \`the broker refused p-2's relayed record once; after two relays the stream holds \${p2.length} allocations of p-2 and the outbox \${ctx.redis.llen(OUTBOX)} rows, expected 1 and 0: a relayed send that fails goes back to the outbox like any other\`);
 }
 
 export async function check_release_reconcile(ctx) {
@@ -954,9 +977,16 @@ export async function check_release_reconcile(ctx) {
   assert.equal(all.length, 3, 'two bookings and one release produced records (a release is an event too)');
   const release = all[2];
   assert(release.type === 'release' && release.placement_id === 'p-1' && release.gpu_count === 4, \`the third event must be p-1's release with gpu_count 4, got \${JSON.stringify(release)}\`);
+  assert(release.node_id === 'gpu-1' && release.tenant === 'acme' && release.memory_gb === 80 && 'ts' in release, \`p-1's release must carry node_id gpu-1, tenant acme, memory_gb 80 and ts, as its allocation did, got \${JSON.stringify(release)}\`);
   assert.equal(ctx.kafka.records(TOPIC)[2].key?.toString(), 'gpu-1', 'the release is keyed by the node id too');
   assert(folded(ctx, 'gpu-1') === 2 && allocated(ctx) === 2, \`the stream folds to \${folded(ctx, 'gpu-1')} GPUs on gpu-1, the ledger says \${allocated(ctx)}\`);
   assert((await m.releaseAndPublish('gpu-1', 'p-1')) === false && events(ctx).length === 3, 'a repeated release moves nothing and produces nothing');
+  ctx.kafka.failNext(TOPIC, 1);
+  assert.equal(await m.releaseAndPublish('gpu-1', 'p-2'), true, 'the first release of p-2 moves the counters');
+  const rows = ctx.redis.lrange(OUTBOX, 0, -1);
+  assert(rows.length === 1 && rows[0].includes('p-2'), \`the broker refused p-2's release, so it must wait in \${OUTBOX}, found \${JSON.stringify(rows)}: a release reports a failed send like an allocation\`);
+  await m.relayOutbox();
+  assert(folded(ctx, 'gpu-1') === 0 && allocated(ctx) === 0, \`after relaying p-2's release the stream folds to \${folded(ctx, 'gpu-1')} GPUs on gpu-1, the ledger says \${allocated(ctx)}\`);
 }
 `,
     go: `package main
@@ -1123,6 +1153,21 @@ func CheckOutboxRelay(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.LLen(eventsOutbox), 0, "a relayed row leaves the outbox; rows left")
 	sent, _ = relayOutbox(context.Background())
 	ctx.Assert(sent == 0 && len(eventsAll(ctx)) == 1, "an empty outbox relays nothing")
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2")
+	ctx.Equal(ctx.Redis.LLen(eventsOutbox), 1, "a second refused delivery must leave one row in %s; the rows", eventsOutbox)
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	relayOutbox(context.Background()) // the broker refuses the relayed record once
+	ctx.Settle()
+	relayOutbox(context.Background())
+	ctx.Settle()
+	p2 := 0
+	for _, e := range eventsAll(ctx) {
+		if e["placement_id"] == "p-2" {
+			p2++
+		}
+	}
+	ctx.Assert(p2 == 1 && ctx.Redis.LLen(eventsOutbox) == 0, "the broker refused p-2's relayed record once; after two relays the stream holds %d allocations of p-2 and the outbox %d rows, expected 1 and 0: a relayed write that fails goes back to the outbox like any other", p2, ctx.Redis.LLen(eventsOutbox))
 }
 
 func CheckReleaseReconcile(ctx *harness.Ctx) {
@@ -1139,11 +1184,23 @@ func CheckReleaseReconcile(ctx *harness.Ctx) {
 	kind, _ := rel["type"].(string)
 	pid, _ := rel["placement_id"].(string)
 	ctx.Assert(kind == "release" && pid == "p-1" && rel["gpu_count"] == float64(4), "the third event must be p-1's release with gpu_count 4, got %v", rel)
+	_, relTS := rel["ts"]
+	ctx.Assert(rel["node_id"] == "gpu-1" && rel["tenant"] == "acme" && rel["memory_gb"] == float64(80) && relTS, "p-1's release must carry node_id gpu-1, tenant acme, memory_gb 80 and ts, as its allocation did, got %v", rel)
 	ctx.Equal(ctx.Kafka.Keys(eventsTopic)[2], "gpu-1", "the release is keyed by the node id too")
 	ctx.Assert(eventsFolded(ctx, "gpu-1") == 2 && eventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"))
 	moved, _ = releaseAndPublish(context.Background(), "gpu-1", "p-1")
 	ctx.Settle()
 	ctx.Assert(!moved && len(eventsAll(ctx)) == 3, "a repeated release moves nothing and produces nothing")
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	moved, err = releaseAndPublish(context.Background(), "gpu-1", "p-2")
+	ctx.NoError(err, "releaseAndPublish")
+	ctx.Settle()
+	ctx.Equal(moved, true, "the first release of p-2 moves the counters")
+	rows := ctx.Redis.LRange(eventsOutbox, 0, -1)
+	ctx.Assert(len(rows) == 1 && strings.Contains(rows[0], "p-2"), "the broker refused p-2's release, so it must wait in %s, found %q: a release reports a failed write like an allocation", eventsOutbox, rows)
+	relayOutbox(context.Background())
+	ctx.Settle()
+	ctx.Assert(eventsFolded(ctx, "gpu-1") == 0 && eventsAllocated(ctx, "gpu-1") == 0, "after relaying p-2's release the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1284,6 +1341,20 @@ void CheckOutboxRelay(harness::Ctx& ctx) {
   ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"gpu-1"}, "the relayed record keeps its node key");
   ctx.Equal(ctx.Redis.LLen(kEventsOutbox), 0, "a relayed row leaves the outbox; rows left");
   ctx.Assert(relay_outbox() == 0 && eventsAll(ctx).size() == 1, "an empty outbox relays nothing");
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Equal(eventsBook(ctx, "gpu-1", "p-2", "beta", 2, 40), "ALLOCATED", "booking p-2");
+  ctx.Equal(ctx.Redis.LLen(kEventsOutbox), 1, "a second refused delivery must leave one row in %s; the rows", kEventsOutbox);
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  relay_outbox();  // the broker refuses the relayed record once
+  ctx.Settle();
+  relay_outbox();
+  ctx.Settle();
+  int p2 = 0;
+  for (const auto& e : eventsAll(ctx)) p2 += e.is_object() && e.value("placement_id", "") == "p-2" ? 1 : 0;
+  ctx.Assert(p2 == 1 && ctx.Redis.LLen(kEventsOutbox) == 0,
+             "the broker refused p-2's relayed record once; after two relays the stream holds %d allocations of p-2 and the outbox %d rows, expected 1 and "
+             "0: a relayed record reports its delivery like any other, and a refused one goes back to the outbox",
+             p2, ctx.Redis.LLen(kEventsOutbox));
 }
 
 void CheckReleaseReconcile(harness::Ctx& ctx) {
@@ -1298,11 +1369,23 @@ void CheckReleaseReconcile(harness::Ctx& ctx) {
   const nlohmann::json& rel = all[2];
   ctx.Assert(rel.is_object() && rel.value("type", "") == "release" && rel.value("placement_id", "") == "p-1" && rel.value("gpu_count", 0) == 4,
              "the third event must be p-1's release with gpu_count 4, got %s", rel.dump());
+  ctx.Assert(rel.value("node_id", "") == "gpu-1" && rel.value("tenant", "") == "acme" && rel.value("memory_gb", -1.0) == 80.0 && rel.contains("ts"),
+             "p-1's release must carry node_id gpu-1, tenant acme, memory_gb 80 and ts, as its allocation did, got %s", rel.dump());
   ctx.Equal(ctx.Kafka.Keys(kEventsTopic)[2], "gpu-1", "the release is keyed by the node id too");
   ctx.Assert(eventsFolded(ctx, "gpu-1") == 2 && eventsAllocated(ctx, "gpu-1") == 2, "the stream folds to %d GPUs on gpu-1, the ledger says %d", eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"));
   const bool again = release_and_publish("gpu-1", "p-1");
   ctx.Settle();
   ctx.Assert(!again && eventsAll(ctx).size() == 3, "a repeated release moves nothing and produces nothing");
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ctx.Equal(release_and_publish("gpu-1", "p-2"), true, "the first release of p-2 moves the counters");
+  ctx.Settle();
+  const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
+  ctx.Assert(rows.size() == 1 && rows[0].find("p-2") != std::string::npos,
+             "the broker refused p-2's release, so it must wait in %s, found %q: a release reports its delivery like an allocation", kEventsOutbox, rows);
+  relay_outbox();
+  ctx.Settle();
+  ctx.Assert(eventsFolded(ctx, "gpu-1") == 0 && eventsAllocated(ctx, "gpu-1") == 0, "after relaying p-2's release the stream folds to %d GPUs on gpu-1, the ledger says %d",
+             eventsFolded(ctx, "gpu-1"), eventsAllocated(ctx, "gpu-1"));
 }
 `,
   },

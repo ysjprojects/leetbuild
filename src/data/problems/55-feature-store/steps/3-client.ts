@@ -51,7 +51,7 @@ service OfflineStore { rpc Scan(ScanRequest) returns (ScanResponse); }  // PERMI
       id: 'deadline',
       title: 'Every Scan carries a 60-second deadline',
       detail:
-        'Each `Scan` is made with `DEADLINE_S` (60 s), so a partition the store takes ten minutes over costs the backfill one minute. The starter gives the call no deadline.',
+        'Each `Scan` is made with `DEADLINE_S` (60 s) of its own, so a partition the store takes ten minutes over costs the backfill one minute, and partitions that each take 40 s all complete instead of sharing one budget. The starter gives the call no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*60\b/, /\.Scan\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*60_?000\b/, /\.Scan\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -77,7 +77,7 @@ service OfflineStore { rpc Scan(ScanRequest) returns (ScanResponse); }  // PERMI
       id: 'missing-partitions',
       title: 'Reports a failed partition as missing',
       detail:
-        'A partition whose `Scan` fails with `DEADLINE_EXCEEDED`, `UNAVAILABLE` or another non-permission code is listed in `missing` and absent from `scanned`. The starter records it as an empty partition.',
+        'A partition whose `Scan` fails with `DEADLINE_EXCEEDED`, `UNAVAILABLE` or another non-permission code (`INTERNAL`, `NOT_FOUND`, …) is listed in `missing` and absent from `scanned`. The starter records it as an empty partition.',
       match: {
         python: {all: [/missing\.append\(/], none: [/\[partition\]\s*=\s*\[\]/]},
         typescript: {all: [/missing\.push\(/], none: [/\[partition\]\s*=\s*\[\]/]},
@@ -658,6 +658,12 @@ def check_deadline(ctx):
     for call in calls:
         assert call.timeout is not None, "a Scan call carries no deadline: one stuck partition holds the whole backfill open"
         assert 59.5 <= call.timeout <= 60.5, f"a Scan call carries a {call.timeout} s deadline, expected DEADLINE_S = 60"
+    # Every partition is slow but within the deadline: each Scan still carries its own full 60 s.
+    ctx.grpc.set_latency("Scan", 40.0)
+    slow = m.backfill("amount_7d", 2, PARTS, CUTOFF)
+    later = [call.timeout for call in ctx.grpc.calls_to("Scan")[3:]]
+    assert len(later) == 3 and all(t is not None and 59.5 <= t <= 60.5 for t in later), f"with every partition taking 40 s the Scan deadlines were {later} s: each call carries its own 60 s, not what is left of one budget shared by the backfill"
+    assert slow["missing"] == [], f"three partitions that each answered in 40 s, inside their 60 s deadline, were reported missing: {slow['missing']}"
     ctx.grpc.set_latency("Scan", 600.0)
     before = time.time()
     m.backfill("amount_7d", 2, PARTS[:1], CUTOFF)
@@ -687,6 +693,15 @@ def check_missing_partitions(ctx):
     assert result["missing"] == ["2026-10-01", "2026-10-03"], f"two partitions failed (DEADLINE_EXCEEDED, UNAVAILABLE) and missing is {result['missing']}, expected ['2026-10-01', '2026-10-03']"
     assert sorted(result["scanned"]) == ["2026-10-02"], f"scanned holds {sorted(result['scanned'])}: a failed partition reported as scanned and empty is a hole in the training set nobody sees"
     assert len(result["scanned"]["2026-10-02"]) == 3, f"the healthy partition scanned {result['scanned']['2026-10-02']}"
+    # Any other failure is a missing partition too; only PERMISSION_DENIED aborts.
+    offline.failing.clear()
+    offline.failing["2026-10-01"] = grpc.StatusCode.INTERNAL
+    offline.failing["2026-10-03"] = grpc.StatusCode.NOT_FOUND
+    try:
+        result = m.backfill("amount_7d", 2, PARTS, CUTOFF)
+    except m.BackfillAborted:
+        raise AssertionError("a partition that failed with INTERNAL or NOT_FOUND aborted the backfill: only PERMISSION_DENIED aborts, every other failure is a missing partition") from None
+    assert result["missing"] == ["2026-10-01", "2026-10-03"] and sorted(result["scanned"]) == ["2026-10-02"], f"two partitions failed (INTERNAL, NOT_FOUND) and the backfill answered missing {result['missing']}, scanned {sorted(result['scanned'])}: expected both missing and only 2026-10-02 scanned"
 
 
 def check_permission_abort(ctx):
@@ -736,6 +751,12 @@ export async function check_deadline(ctx) {
     assert(call.timeout !== null, 'a Scan call carries no deadline: one stuck partition holds the whole backfill open');
     assert(59.5 <= call.timeout && call.timeout <= 60.5, \`a Scan call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 60000\`);
   }
+  // Every partition is slow but within the deadline: each Scan still carries its own full 60 s.
+  ctx.grpc.setLatency('Scan', 40);
+  const slow = await m.backfill('amount_7d', 2, PARTS, CUTOFF);
+  const later = ctx.grpc.callsTo('Scan').slice(3).map(call => call.timeout);
+  assert(later.length === 3 && later.every(t => t !== null && 59.5 <= t && t <= 60.5), \`with every partition taking 40 s the Scan deadlines were \${JSON.stringify(later)} s: each call carries its own 60 s, not what is left of one budget shared by the backfill\`);
+  assert.deepStrictEqual(slow.missing, [], \`three partitions that each answered in 40 s, inside their 60 s deadline, were reported missing: \${JSON.stringify(slow.missing)}\`);
   ctx.grpc.setLatency('Scan', 600);
   const before = ctx.clock.now();
   await m.backfill('amount_7d', 2, PARTS.slice(0, 1), CUTOFF);
@@ -768,6 +789,19 @@ export async function check_missing_partitions(ctx) {
   const scanned = JSON.stringify(Object.keys(result.scanned).sort());
   assert.equal(scanned, '["2026-10-02"]', \`scanned holds \${scanned}: a failed partition reported as scanned and empty is a hole in the training set nobody sees\`);
   assert.equal(result.scanned['2026-10-02']?.length, 3, \`the healthy partition must scan its three rows, got \${JSON.stringify(result.scanned['2026-10-02'])}\`);
+  // Any other failure is a missing partition too; only PERMISSION_DENIED aborts.
+  failing.clear();
+  failing.set('2026-10-01', ctx.grpc.status.INTERNAL);
+  failing.set('2026-10-03', ctx.grpc.status.NOT_FOUND);
+  let other;
+  try {
+    other = await m.backfill('amount_7d', 2, PARTS, CUTOFF);
+  } catch (e) {
+    if (e instanceof m.BackfillAborted) assert.fail('a partition that failed with INTERNAL or NOT_FOUND aborted the backfill: only PERMISSION_DENIED aborts, every other failure is a missing partition');
+    throw e;
+  }
+  const otherScanned = JSON.stringify(Object.keys(other.scanned).sort());
+  assert(JSON.stringify(other.missing) === '["2026-10-01","2026-10-03"]' && otherScanned === '["2026-10-02"]', \`two partitions failed (INTERNAL, NOT_FOUND) and the backfill answered missing \${JSON.stringify(other.missing)}, scanned \${otherScanned}: expected both missing and only 2026-10-02 scanned\`);
 }
 
 export async function check_permission_abort(ctx) {
@@ -801,78 +835,97 @@ import (
 	"leetbuild/harness"
 )
 
-const cutoff int64 = 1_790_000_000
+const hCutoff int64 = 1_790_000_000
 
 var (
-	clientBg = context.Background()
-	parts    = []string{"2026-10-01", "2026-10-02", "2026-10-03"}
+	hClientBg = context.Background()
+	hParts    = []string{"2026-10-01", "2026-10-02", "2026-10-03"}
 )
 
-// offlinePeer has two entities per partition, each with a value an hour before the cutoff and one
+// hOfflinePeer has two entities per partition, each with a value an hour before the cutoff and one
 // an hour after; a third entity is null. A partition in failing fails with its code.
-type offlinePeer struct {
+type hOfflinePeer struct {
 	pb.UnimplementedOfflineStoreServer
 	failing map[string]codes.Code
 }
 
-func (o *offlinePeer) Scan(_ context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
+func (o *hOfflinePeer) Scan(_ context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
 	if code, ok := o.failing[req.GetPartition()]; ok {
 		return nil, status.Errorf(code, "partition %s failed", req.GetPartition())
 	}
 	var rows []*pb.ScanRow
 	for i := 1; i <= 2; i++ {
-		ts, value := cutoff-3600, 10.0*float64(i)
-		if req.GetAsOf() == 0 || cutoff+3600 <= req.GetAsOf() {
-			ts, value = cutoff+3600, 99.0
+		ts, value := hCutoff-3600, 10.0*float64(i)
+		if req.GetAsOf() == 0 || hCutoff+3600 <= req.GetAsOf() {
+			ts, value = hCutoff+3600, 99.0
 		}
 		rows = append(rows, &pb.ScanRow{Entity: fmt.Sprintf("%s/e-%d", req.GetPartition(), i), Value: value, EventTs: ts})
 	}
-	rows = append(rows, &pb.ScanRow{Entity: req.GetPartition() + "/e-3", IsNull: true, EventTs: cutoff - 3600})
+	rows = append(rows, &pb.ScanRow{Entity: req.GetPartition() + "/e-3", IsNull: true, EventTs: hCutoff - 3600})
 	return &pb.ScanResponse{Rows: rows}, nil
 }
 
-func client(ctx *harness.Ctx) *offlinePeer {
-	peer := &offlinePeer{failing: map[string]codes.Code{}}
+func hServeOffline(ctx *harness.Ctx) *hOfflinePeer {
+	peer := &hOfflinePeer{failing: map[string]codes.Code{}}
 	pb.RegisterOfflineStoreServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func mustBackfill(ctx *harness.Ctx, partitions []string) *BackfillResult {
-	result, err := backfill(clientBg, "amount_7d", 2, partitions, cutoff)
+func hBackfill(ctx *harness.Ctx, partitions []string) *BackfillResult {
+	result, err := backfill(hClientBg, "amount_7d", 2, partitions, hCutoff)
 	ctx.NoError(err, "backfill failed")
 	return result
 }
 
+func hScanned(result *BackfillResult) []string {
+	var scanned []string
+	for partition := range result.Scanned {
+		scanned = append(scanned, partition)
+	}
+	sort.Strings(scanned)
+	return scanned
+}
+
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	mustBackfill(ctx, parts)
+	hServeOffline(ctx)
+	hBackfill(ctx, hParts)
 	calls := ctx.GRPC.CallsTo("Scan", "")
 	ctx.Equal(len(calls), 3, "three partitions must make one Scan call each; the calls")
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline(), "a Scan call carries no deadline: one stuck partition holds the whole backfill open")
 		ctx.Assert(59500*time.Millisecond <= call.Timeout && call.Timeout <= 60500*time.Millisecond, "a Scan call carries a %v deadline, expected 60 s", call.Timeout)
 	}
+	// Every partition is slow but within the deadline: each Scan still carries its own full 60 s.
+	ctx.GRPC.SetLatency("Scan", 40, "")
+	slow := hBackfill(ctx, hParts)
+	var later []time.Duration
+	for _, call := range ctx.GRPC.CallsTo("Scan", "")[3:] {
+		ctx.Assert(call.HasDeadline() && 59500*time.Millisecond <= call.Timeout && call.Timeout <= 60500*time.Millisecond, "with every partition taking 40 s a Scan call carried a %v deadline: each call carries its own 60 s, not what is left of one budget shared by the backfill", call.Timeout)
+		later = append(later, call.Timeout)
+	}
+	ctx.Equal(len(later), 3, "three slow partitions must make one Scan call each; the calls")
+	ctx.Equal(len(slow.Missing), 0, "three partitions that each answered in 40 s, inside their 60 s deadline, must not be missing (%v); the missing", slow.Missing)
 	ctx.GRPC.SetLatency("Scan", 600, "")
 	before := ctx.Clock.Now()
-	backfill(clientBg, "amount_7d", 2, parts[:1], cutoff)
+	backfill(hClientBg, "amount_7d", 2, hParts[:1], hCutoff)
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 61, "a partition the store took 600 s over held the backfill for %.0f s, expected at most the 60 s deadline", waited)
 }
 
 func CheckAsOfCutoff(ctx *harness.Ctx) {
-	client(ctx)
-	result := mustBackfill(ctx, parts)
+	hServeOffline(ctx)
+	result := hBackfill(ctx, hParts)
 	var asked []int64
 	for _, c := range ctx.GRPC.CallsTo("Scan", "") {
 		asked = append(asked, c.Request.(*pb.ScanRequest).GetAsOf())
 	}
-	ctx.Equal(asked, []int64{cutoff, cutoff, cutoff}, "every Scan request must carry the training cutoff as as_of; they carried")
-	for _, partition := range parts {
+	ctx.Equal(asked, []int64{hCutoff, hCutoff, hCutoff}, "every Scan request must carry the training cutoff as as_of; they carried")
+	for _, partition := range hParts {
 		rows := result.Scanned[partition]
 		ctx.Equal(len(rows), 3, "partition %s must scan its three rows; the rows", partition)
 		nulls := 0
 		for _, row := range rows {
-			ctx.Assert(row.EventTs <= cutoff, "%s was scanned from %d s after the training cutoff: the model would train on the future", row.Entity, row.EventTs-cutoff)
+			ctx.Assert(row.EventTs <= hCutoff, "%s was scanned from %d s after the training cutoff: the model would train on the future", row.Entity, row.EventTs-hCutoff)
 			if row.Value == nil {
 				nulls++
 			}
@@ -882,36 +935,39 @@ func CheckAsOfCutoff(ctx *harness.Ctx) {
 }
 
 func CheckMissingPartitions(ctx *harness.Ctx) {
-	peer := client(ctx)
+	peer := hServeOffline(ctx)
 	peer.failing["2026-10-01"] = codes.DeadlineExceeded
 	peer.failing["2026-10-03"] = codes.Unavailable
-	result := mustBackfill(ctx, parts)
+	result := hBackfill(ctx, hParts)
 	ctx.Equal(result.Missing, []string{"2026-10-01", "2026-10-03"}, "two partitions failed (DEADLINE_EXCEEDED, UNAVAILABLE); missing")
-	var scanned []string
-	for partition := range result.Scanned {
-		scanned = append(scanned, partition)
-	}
-	sort.Strings(scanned)
-	ctx.Equal(scanned, []string{"2026-10-02"}, "a failed partition reported as scanned and empty is a hole in the training set nobody sees; scanned")
+	ctx.Equal(hScanned(result), []string{"2026-10-02"}, "a failed partition reported as scanned and empty is a hole in the training set nobody sees; scanned")
 	ctx.Equal(len(result.Scanned["2026-10-02"]), 3, "the healthy partition's rows")
+	// Any other failure is a missing partition too; only PERMISSION_DENIED aborts.
+	peer.failing = map[string]codes.Code{"2026-10-01": codes.Internal, "2026-10-03": codes.NotFound}
+	other, err := backfill(hClientBg, "amount_7d", 2, hParts, hCutoff)
+	ctx.Assert(err == nil, "a partition that failed with INTERNAL or NOT_FOUND ended the backfill with %v: only PERMISSION_DENIED aborts, every other failure is a missing partition", err)
+	ctx.Assert(other != nil, "backfill returned no result")
+	ctx.Equal(other.Missing, []string{"2026-10-01", "2026-10-03"}, "two partitions failed (INTERNAL, NOT_FOUND); missing")
+	ctx.Equal(hScanned(other), []string{"2026-10-02"}, "two partitions failed (INTERNAL, NOT_FOUND); scanned")
 }
 
 func CheckPermissionAbort(ctx *harness.Ctx) {
-	peer := client(ctx)
+	peer := hServeOffline(ctx)
 	peer.failing["2026-10-02"] = codes.PermissionDenied
-	result, err := backfill(clientBg, "amount_7d", 2, parts, cutoff)
+	result, err := backfill(hClientBg, "amount_7d", 2, hParts, hCutoff)
 	ctx.Assert(err != nil, "a refused scan must return an error wrapping ErrBackfillAborted; backfill returned %+v", result)
 	ctx.ErrorIs(err, ErrBackfillAborted, "a refused scan returned %v", err)
 	var asked []string
 	for _, c := range ctx.GRPC.CallsTo("Scan", "") {
 		asked = append(asked, c.Request.(*pb.ScanRequest).GetPartition())
 	}
-	ctx.Equal(asked, parts[:2], "after PERMISSION_DENIED on 2026-10-02 the backfill must stop; it scanned")
+	ctx.Equal(asked, hParts[:2], "after PERMISSION_DENIED on 2026-10-02 the backfill must stop; it scanned")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a refusal must not be slept on and retried; the sleeps")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -925,7 +981,7 @@ const std::vector<std::string> kParts = {"2026-10-01", "2026-10-02", "2026-10-03
 
 // Two entities per partition, each with a value an hour before the cutoff and one an hour after; a
 // third entity is null. A partition in failing fails with its code.
-class OfflinePeer final : public featurestore::OfflineStore::Service {
+class HOfflinePeer final : public featurestore::OfflineStore::Service {
  public:
   std::map<std::string, grpc::StatusCode> failing;
   grpc::Status Scan(grpc::ServerContext*, const featurestore::ScanRequest* req, featurestore::ScanResponse* out) override {
@@ -946,18 +1002,25 @@ class OfflinePeer final : public featurestore::OfflineStore::Service {
   }
 };
 
-OfflinePeer& client(harness::Ctx& ctx) {
-  static OfflinePeer* peer = nullptr;
+HOfflinePeer& hServeOffline(harness::Ctx& ctx) {
+  static HOfflinePeer* peer = nullptr;
   delete peer;
-  peer = new OfflinePeer;
+  peer = new HOfflinePeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
+}
+
+std::vector<std::string> hScanned(const BackfillResult& result) {
+  std::vector<std::string> scanned;
+  for (const auto& [partition, rows] : result.scanned) scanned.push_back(partition);
+  std::sort(scanned.begin(), scanned.end());
+  return scanned;
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
+  hServeOffline(ctx);
   backfill("amount_7d", 2, kParts, kCutoff);
   const auto calls = ctx.GRPC.CallsTo("Scan");
   ctx.Equal(calls.size(), 3, "three partitions must make one Scan call each; the calls");
@@ -965,6 +1028,16 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(call.HasDeadline(), "a Scan call carries no deadline: one stuck partition holds the whole backfill open");
     ctx.Assert(59.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 60.5, "a Scan call carries a %v s deadline, expected kDeadline = 60 s", call.TimeoutSeconds());
   }
+  // Every partition is slow but within the deadline: each Scan still carries its own full 60 s.
+  ctx.GRPC.SetLatency("Scan", 40);
+  const BackfillResult slow = backfill("amount_7d", 2, kParts, kCutoff);
+  const auto all = ctx.GRPC.CallsTo("Scan");
+  ctx.Equal(all.size(), 6, "three slow partitions must make one Scan call each; the calls in both backfills");
+  for (size_t i = 3; i < all.size(); i++) {
+    ctx.Assert(all[i].HasDeadline() && 59.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 60.5,
+               "with every partition taking 40 s a Scan call carried a %v s deadline: each call carries its own 60 s, not what is left of one budget shared by the backfill", all[i].TimeoutSeconds());
+  }
+  ctx.Equal(slow.missing.size(), 0, "three partitions that each answered in 40 s, inside their 60 s deadline, must not be missing; the missing");
   ctx.GRPC.SetLatency("Scan", 600);
   const int64_t before = ctx.Clock.Now();
   backfill("amount_7d", 2, {kParts[0]}, kCutoff);
@@ -973,7 +1046,7 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckAsOfCutoff(harness::Ctx& ctx) {
-  client(ctx);
+  hServeOffline(ctx);
   const BackfillResult result = backfill("amount_7d", 2, kParts, kCutoff);
   std::vector<long long> asked;
   for (const auto& c : ctx.GRPC.CallsTo("Scan")) asked.push_back(c.Request<featurestore::ScanRequest>().as_of());
@@ -992,19 +1065,29 @@ void CheckAsOfCutoff(harness::Ctx& ctx) {
 }
 
 void CheckMissingPartitions(harness::Ctx& ctx) {
-  OfflinePeer& peer = client(ctx);
+  HOfflinePeer& peer = hServeOffline(ctx);
   peer.failing["2026-10-01"] = grpc::StatusCode::DEADLINE_EXCEEDED;
   peer.failing["2026-10-03"] = grpc::StatusCode::UNAVAILABLE;
   const BackfillResult result = backfill("amount_7d", 2, kParts, kCutoff);
   ctx.Equal(result.missing, {"2026-10-01", "2026-10-03"}, "two partitions failed (DEADLINE_EXCEEDED, UNAVAILABLE); missing");
-  std::vector<std::string> scanned;
-  for (const auto& [partition, rows] : result.scanned) scanned.push_back(partition);
-  ctx.Equal(scanned, {"2026-10-02"}, "a failed partition reported as scanned and empty is a hole in the training set nobody sees; scanned");
+  ctx.Equal(hScanned(result), {"2026-10-02"}, "a failed partition reported as scanned and empty is a hole in the training set nobody sees; scanned");
   ctx.Equal(result.scanned.at("2026-10-02").size(), 3, "the healthy partition's rows");
+  // Any other failure is a missing partition too; only PERMISSION_DENIED aborts.
+  peer.failing = {{"2026-10-01", grpc::StatusCode::INTERNAL}, {"2026-10-03", grpc::StatusCode::NOT_FOUND}};
+  BackfillResult other;
+  bool aborted = false;
+  try {
+    other = backfill("amount_7d", 2, kParts, kCutoff);
+  } catch (const BackfillAborted&) {
+    aborted = true;
+  }
+  ctx.Assert(!aborted, "a partition that failed with INTERNAL or NOT_FOUND aborted the backfill: only PERMISSION_DENIED aborts, every other failure is a missing partition");
+  ctx.Equal(other.missing, {"2026-10-01", "2026-10-03"}, "two partitions failed (INTERNAL, NOT_FOUND); missing");
+  ctx.Equal(hScanned(other), {"2026-10-02"}, "two partitions failed (INTERNAL, NOT_FOUND); scanned");
 }
 
 void CheckPermissionAbort(harness::Ctx& ctx) {
-  OfflinePeer& peer = client(ctx);
+  HOfflinePeer& peer = hServeOffline(ctx);
   peer.failing["2026-10-02"] = grpc::StatusCode::PERMISSION_DENIED;
   bool aborted = false;
   try {

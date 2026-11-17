@@ -53,7 +53,7 @@ service Prelabel { rpc Predict(PredictRequest) returns (PredictResponse); }  // 
       id: 'deadline',
       title: 'Every pre-label call carries a 2-second deadline',
       detail:
-        'Each `Predict` call is made with `DEADLINE_S` (2 s), so a hung model costs at most two deadlines. The starter sets none and waits for as long as the model takes.',
+        'Each `Predict` call is made with its own `DEADLINE_S` (2 s), the second attempt too: the check slows the model so the first attempt fails after 1.5 s, and the retry still gets a full 2 s. A hung model costs at most two deadlines. The starter sets none and waits for as long as the model takes.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*2\b/, /Predict\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*2000\b/, /Predict\([\s\S]{0,300}?deadline:[^\n]*DEADLINE_MS/]},
@@ -66,7 +66,7 @@ service Prelabel { rpc Predict(PredictRequest) returns (PredictResponse); }  // 
       id: 'retry-transient',
       title: 'Retries only a transient status, at most twice',
       detail:
-        'At most `MAX_ATTEMPTS` = 2 calls, and only `UNAVAILABLE` or `DEADLINE_EXCEEDED` earns the second one; a refusal such as `INVALID_ARGUMENT` is final. The starter retries every error three times.',
+        'At most `MAX_ATTEMPTS` = 2 calls, and only `UNAVAILABLE` or `DEADLINE_EXCEEDED` earns the second one; every other status is final, which the check tries with several codes besides `INVALID_ARGUMENT`. The starter retries every error three times.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/MAX_ATTEMPTS\s*=\s*3\b/]},
         typescript: {
@@ -85,7 +85,7 @@ service Prelabel { rpc Predict(PredictRequest) returns (PredictResponse); }  // 
       id: 'degrade-unlabeled',
       title: 'A model failure answers an unlabeled item',
       detail:
-        'When the model fails, the call answers `status: "unlabeled"` with no labels and the last status in `error`, so the annotator labels the item by hand. The starter raises, and the queue stops at the first outage.',
+        'When the model fails, the call answers `status: "unlabeled"` with no labels and `error` = `"<STATUS>: <details>"` of the last attempt, so the annotator labels the item by hand. The starter raises, and the queue stops at the first outage.',
       match: {
         python: {all: [/["']unlabeled["']/], none: [/\braise\b/]},
         typescript: {all: [/['"]unlabeled['"]/], none: [/\bthrow\b/]},
@@ -566,12 +566,18 @@ def check_deadline(ctx):
     assert calls, "no Predict call reached the model"
     for call in calls:
         assert call.timeout is not None, "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it"
-        assert 1.5 <= call.timeout <= 2.5, f"a Predict call carries a {call.timeout} s deadline, expected DEADLINE_S = 2"
+        assert 1.9 <= call.timeout <= 2.1, f"a Predict call carries a {call.timeout} s deadline, expected DEADLINE_S = 2"
+    # A slow model fails i-3 after 1.5 s: the second attempt gets a full deadline of its own, not what is left of the first.
+    ctx.grpc.set_latency("Predict", 1.5)
+    slow = _call(m, "i-3", "flaky: a bird")
+    timeouts = [c.timeout for c in ctx.grpc.calls_to("Predict") if c.request.item_id == "i-3"]
+    assert len(timeouts) == 2 and all(t is not None and 1.9 <= t <= 2.1 for t in timeouts), f"i-3 failed UNAVAILABLE after 1.5 s and its calls carried deadlines of {timeouts} s: every attempt carries its own DEADLINE_S = 2"
+    assert isinstance(slow, dict) and slow.get("status") == "prelabeled", f"the second attempt for i-3 answers within its own 2 s deadline, prelabel_item answered {slow!r}"
     ctx.grpc.set_latency("Predict", 30.0)
     before = ctx.clock.time()
     _call(m, "i-2", "a dog in the fog")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"with the model hanging, prelabel_item took {waited:.0f} s: at most two calls of DEADLINE_S = 2 s each"
+    assert waited <= 4.5, f"with the model hanging, prelabel_item took {waited:.0f} s: at most two calls of DEADLINE_S = 2 s each"
 
 
 def check_retry_transient(ctx):
@@ -583,6 +589,14 @@ def check_retry_transient(ctx):
     result = _call(m, "i-3", "flaky: a bird")
     assert _calls(ctx, "i-3") == 2, f"i-3 failed UNAVAILABLE once: it must be sent a second time, it was sent {_calls(ctx, 'i-3')} times"
     assert isinstance(result, dict) and result.get("status") == "prelabeled", f"the second attempt for i-3 succeeded, prelabel_item answered {result!r}"
+    ctx.grpc.fail("Predict", grpc.StatusCode.DEADLINE_EXCEEDED, "the model ran out of time", 1)
+    result = _call(m, "i-4", "a fox")
+    assert _calls(ctx, "i-4") == 2 and isinstance(result, dict) and result.get("status") == "prelabeled", f"i-4 failed DEADLINE_EXCEEDED once and was sent {_calls(ctx, 'i-4')} times, answering {result!r}: a timeout is retried once"
+    terminal = (grpc.StatusCode.NOT_FOUND, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.INTERNAL)
+    for n, code in enumerate(terminal, start=5):
+        ctx.grpc.fail("Predict", code, "the model said no", 1)
+        _call(m, f"i-{n}", "a fox")
+        assert _calls(ctx, f"i-{n}") == 1, f"the model failed i-{n} with {code.name} and was asked {_calls(ctx, f'i-{n}')} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final"
 
 
 def check_degrade_unlabeled(ctx):
@@ -591,8 +605,13 @@ def check_degrade_unlabeled(ctx):
         result = _call(m, item_id, text)
         assert isinstance(result, dict), f"with the model failing {code}, prelabel_item raised {type(result).__name__}: {result}. Answer an unlabeled item so the annotator labels it by hand"
         assert result.get("status") == "unlabeled" and result.get("labels") == [], f"a failed pre-label answered {result}, expected status unlabeled with no labels"
-        assert code in (result.get("error") or ""), f"the unlabeled item's error is {result.get('error')!r}, expected the last status {code}"
+        want = {"UNAVAILABLE": "UNAVAILABLE: the model is restarting", "INVALID_ARGUMENT": "INVALID_ARGUMENT: the item is outside the label spec"}[code]
+        assert result.get("error") == want, f"the unlabeled item's error is {result.get('error')!r}, expected the last status and its details: {want!r}"
         assert result.get("item_id") == item_id, f"the answer names item {result.get('item_id')!r}, expected {item_id}"
+    # The first attempt is UNAVAILABLE, the second a refusal: the error names the last status.
+    ctx.grpc.fail("Predict", grpc.StatusCode.UNAVAILABLE, "the model is restarting", 1)
+    last = _call(m, "i-4", "refuse: a bird")
+    assert isinstance(last, dict) and last.get("error") == "INVALID_ARGUMENT: the item is outside the label spec", f"i-4 failed UNAVAILABLE, then INVALID_ARGUMENT: prelabel_item answered {last!r}, expected the last status in error"
     ok = _call(m, "i-3", "a cat on a mat")
     assert isinstance(ok, dict) and ok.get("status") == "prelabeled" and ok.get("labels") == ["cat"], f"a healthy model's answer must come back prelabeled with its labels, got {ok!r}"
 `,
@@ -630,13 +649,19 @@ export async function check_deadline(ctx) {
   assert(made.length > 0, 'no Predict call reached the model');
   for (const c of made) {
     assert(c.timeout !== null, "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it");
-    assert(1.5 <= c.timeout && c.timeout <= 2.5, \`a Predict call carries a \${c.timeout} s deadline, expected DEADLINE_MS = 2000\`);
+    assert(1.9 <= c.timeout && c.timeout <= 2.1, \`a Predict call carries a \${c.timeout} s deadline, expected DEADLINE_MS = 2000\`);
   }
+  // A slow model fails i-3 after 1.5 s: the second attempt gets a full deadline of its own, not what is left of the first.
+  ctx.grpc.setLatency('Predict', 1.5);
+  const slow = await call(m, 'i-3', 'flaky: a bird');
+  const timeouts = ctx.grpc.callsTo('Predict').filter(c => c.request.item_id === 'i-3').map(c => c.timeout);
+  assert(timeouts.length === 2 && timeouts.every(t => t !== null && 1.9 <= t && t <= 2.1), \`i-3 failed UNAVAILABLE after 1.5 s and its calls carried deadlines of \${JSON.stringify(timeouts)} s: every attempt carries its own DEADLINE_MS = 2000\`);
+  assert(!(slow instanceof Error) && slow.status === 'prelabeled', \`the second attempt for i-3 answers within its own 2 s deadline, prelabelItem answered \${slow instanceof Error ? slow.message : JSON.stringify(slow)}\`);
   ctx.grpc.setLatency('Predict', 30.0);
   const before = ctx.clock.now();
   await call(m, 'i-2', 'a dog in the fog');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`with the model hanging, prelabelItem took \${waited.toFixed(0)} s: at most two calls of 2 s each\`);
+  assert(waited <= 4.5, \`with the model hanging, prelabelItem took \${waited.toFixed(0)} s: at most two calls of 2 s each\`);
 }
 
 export async function check_retry_transient(ctx) {
@@ -648,17 +673,33 @@ export async function check_retry_transient(ctx) {
   const result = await call(m, 'i-3', 'flaky: a bird');
   assert.equal(calls(ctx, 'i-3'), 2, \`i-3 failed UNAVAILABLE once: it must be sent a second time, it was sent \${calls(ctx, 'i-3')} times\`);
   assert(!(result instanceof Error) && result.status === 'prelabeled', \`the second attempt for i-3 succeeded, prelabelItem answered \${result instanceof Error ? result.message : JSON.stringify(result)}\`);
+  ctx.grpc.fail('Predict', ctx.grpc.status.DEADLINE_EXCEEDED, 'the model ran out of time', 1);
+  const timedOut = await call(m, 'i-4', 'a fox');
+  assert(calls(ctx, 'i-4') === 2 && !(timedOut instanceof Error) && timedOut.status === 'prelabeled', \`i-4 failed DEADLINE_EXCEEDED once and was sent \${calls(ctx, 'i-4')} times, answering \${timedOut instanceof Error ? timedOut.message : JSON.stringify(timedOut)}: a timeout is retried once\`);
+  const terminal = ['NOT_FOUND', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'FAILED_PRECONDITION', 'INTERNAL'];
+  for (const [n, code] of terminal.entries()) {
+    const itemId = \`i-\${n + 5}\`;
+    ctx.grpc.fail('Predict', ctx.grpc.status[code], 'the model said no', 1);
+    await call(m, itemId, 'a fox');
+    assert.equal(calls(ctx, itemId), 1, \`the model failed \${itemId} with \${code} and was asked \${calls(ctx, itemId)} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final\`);
+  }
 }
 
 export async function check_degrade_unlabeled(ctx) {
   const m = client(ctx);
+  const details = {UNAVAILABLE: 'the model is restarting', INVALID_ARGUMENT: 'the item is outside the label spec'};
   for (const [itemId, text, code] of [['i-1', 'down: a dog', 'UNAVAILABLE'], ['i-2', 'refuse: a cat', 'INVALID_ARGUMENT']]) {
     const result = await call(m, itemId, text);
     assert(!(result instanceof Error), \`with the model failing \${code}, prelabelItem threw: \${result instanceof Error ? result.message : ''}. Answer an unlabeled item so the annotator labels it by hand\`);
     assert(result.status === 'unlabeled' && result.labels.length === 0, \`a failed pre-label answered \${JSON.stringify(result)}, expected status unlabeled with no labels\`);
-    assert(String(result.error).includes(code), \`the unlabeled item's error is \${JSON.stringify(result.error)}, expected the last status \${code}\`);
+    const want = \`\${code}: \${details[code]}\`;
+    assert.equal(result.error, want, \`the unlabeled item's error is \${JSON.stringify(result.error)}, expected the last status and its details: \${JSON.stringify(want)}\`);
     assert.equal(result.item_id, itemId, 'the answer must name the item');
   }
+  // The first attempt is UNAVAILABLE, the second a refusal: the error names the last status.
+  ctx.grpc.fail('Predict', ctx.grpc.status.UNAVAILABLE, 'the model is restarting', 1);
+  const last = await call(m, 'i-4', 'refuse: a bird');
+  assert(!(last instanceof Error) && last.error === 'INVALID_ARGUMENT: the item is outside the label spec', \`i-4 failed UNAVAILABLE, then INVALID_ARGUMENT: prelabelItem answered \${last instanceof Error ? last.message : JSON.stringify(last)}, expected the last status in error\`);
   const ok = await call(m, 'i-3', 'a cat on a mat');
   assert(!(ok instanceof Error) && ok.status === 'prelabeled' && JSON.stringify(ok.labels) === '["cat"]', \`a healthy model's answer must come back prelabeled with its labels, got \${ok instanceof Error ? ok.message : JSON.stringify(ok)}\`);
 }
@@ -667,6 +708,7 @@ export async function check_degrade_unlabeled(ctx) {
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -720,13 +762,25 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(len(calls) > 0, "no Predict call reached the model")
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline(), "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it")
-		ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a Predict call carries a %v deadline, expected 2 s", call.Timeout)
+		ctx.Assert(1900*time.Millisecond <= call.Timeout && call.Timeout <= 2100*time.Millisecond, "a Predict call carries a %v deadline, expected 2 s", call.Timeout)
 	}
+	// A slow model fails i-3 after 1.5 s: the second attempt gets a full deadline of its own, not what is left of the first.
+	ctx.GRPC.SetLatency("Predict", 1.5, "")
+	slow, err := prelabelItem(clientBg, "i-3", "flaky: a bird", "2026-10")
+	var timeouts []time.Duration
+	for _, call := range ctx.GRPC.CallsTo("Predict", "") {
+		if call.Request.(*pb.PredictRequest).GetItemId() == "i-3" {
+			ctx.Assert(call.HasDeadline() && 1900*time.Millisecond <= call.Timeout && call.Timeout <= 2100*time.Millisecond, "i-3 failed UNAVAILABLE after 1.5 s and one of its calls carried a %v deadline: every attempt carries its own 2 s deadline", call.Timeout)
+			timeouts = append(timeouts, call.Timeout)
+		}
+	}
+	ctx.Equal(len(timeouts), 2, "i-3 failed UNAVAILABLE once: its calls")
+	ctx.Assert(err == nil && slow.Status == "prelabeled", "the second attempt for i-3 answers within its own 2 s deadline, prelabelItem answered %+v, %v", slow, err)
 	ctx.GRPC.SetLatency("Predict", 30.0, "")
 	before := ctx.Clock.Now()
 	prelabelItem(clientBg, "i-2", "a dog in the fog", "2026-10")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited)
+	ctx.Assert(waited <= 4.5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited)
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
@@ -738,18 +792,32 @@ func CheckRetryTransient(ctx *harness.Ctx) {
 	result, err := prelabelItem(clientBg, "i-3", "flaky: a bird", "2026-10")
 	ctx.Equal(callsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls")
 	ctx.Assert(err == nil && result.Status == "prelabeled", "the second attempt for i-3 succeeded, prelabelItem answered %+v, %v", result, err)
+	ctx.GRPC.Fail("Predict", codes.DeadlineExceeded, "the model ran out of time", 1, "")
+	timedOut, err := prelabelItem(clientBg, "i-4", "a fox", "2026-10")
+	ctx.Assert(callsFor(ctx, "i-4") == 2 && err == nil && timedOut.Status == "prelabeled", "i-4 failed DEADLINE_EXCEEDED once and was sent %d times, answering %+v, %v: a timeout is retried once", callsFor(ctx, "i-4"), timedOut, err)
+	terminal := []codes.Code{codes.NotFound, codes.PermissionDenied, codes.ResourceExhausted, codes.FailedPrecondition, codes.Internal}
+	for n, code := range terminal {
+		itemID := fmt.Sprintf("i-%d", n+5)
+		ctx.GRPC.Fail("Predict", code, "the model said no", 1, "")
+		prelabelItem(clientBg, itemID, "a fox", "2026-10")
+		ctx.Equal(callsFor(ctx, itemID), 1, "the model failed %s with %v: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final; the calls", itemID, code)
+	}
 }
 
 func CheckDegradeUnlabeled(ctx *harness.Ctx) {
 	serveModel(ctx)
-	cases := [][3]string{{"i-1", "down: a dog", "UNAVAILABLE"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT"}}
+	cases := [][4]string{{"i-1", "down: a dog", "UNAVAILABLE", "the model is restarting"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT", "the item is outside the label spec"}}
 	for _, tc := range cases {
 		result, err := prelabelItem(clientBg, tc[0], tc[1], "2026-10")
 		ctx.Assert(err == nil, "with the model failing %s, prelabelItem returned the error %v. Answer an unlabeled item so the annotator labels it by hand", tc[2], err)
 		ctx.Assert(result.Status == "unlabeled" && len(result.Labels) == 0, "a failed pre-label answered %+v, expected status unlabeled with no labels", result)
-		ctx.Assert(strings.Contains(result.Error, tc[2]), "the unlabeled item's error is %q, expected the last status %s", result.Error, tc[2])
+		ctx.Equal(result.Error, tc[2]+": "+tc[3], "the unlabeled item's error must be the last status and its details")
 		ctx.Equal(result.ItemID, tc[0], "the answer must name the item")
 	}
+	// The first attempt is UNAVAILABLE, the second a refusal: the error names the last status.
+	ctx.GRPC.Fail("Predict", codes.Unavailable, "the model is restarting", 1, "")
+	last, err := prelabelItem(clientBg, "i-4", "refuse: a bird", "2026-10")
+	ctx.Assert(err == nil && last.Error == "INVALID_ARGUMENT: the item is outside the label spec", "i-4 failed UNAVAILABLE, then INVALID_ARGUMENT: prelabelItem answered %+v, %v, expected the last status in error", last, err)
 	ok, err := prelabelItem(clientBg, "i-3", "a cat on a mat", "2026-10")
 	ctx.Assert(err == nil && ok.Status == "prelabeled" && len(ok.Labels) == 1 && ok.Labels[0] == "cat", "a healthy model's answer must come back prelabeled with its labels, got %+v, %v", ok, err)
 }
@@ -818,13 +886,24 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(!calls.empty(), "no Predict call reached the model");
   for (const auto& c : calls) {
     ctx.Assert(c.HasDeadline(), "a Predict call carries no deadline: a model that hangs holds the annotator's next item with it");
-    ctx.Assert(1.5 <= c.TimeoutSeconds() && c.TimeoutSeconds() <= 2.5, "a Predict call carries a %v s deadline, expected kDeadline = 2 s", c.TimeoutSeconds());
+    ctx.Assert(1.9 <= c.TimeoutSeconds() && c.TimeoutSeconds() <= 2.1, "a Predict call carries a %v s deadline, expected kDeadline = 2 s", c.TimeoutSeconds());
   }
+  // A slow model fails i-3 after 1.5 s: the second attempt gets a full deadline of its own, not what is left of the first.
+  ctx.GRPC.SetLatency("Predict", 1.5);
+  const Outcome slow = call("i-3", "flaky: a bird");
+  int slowCalls = 0;
+  for (const auto& c : ctx.GRPC.CallsTo("Predict")) {
+    if (c.Request<labeld::PredictRequest>().item_id() != "i-3") continue;
+    slowCalls++;
+    ctx.Assert(c.HasDeadline() && 1.9 <= c.TimeoutSeconds() && c.TimeoutSeconds() <= 2.1, "i-3 failed UNAVAILABLE after 1.5 s and one of its calls carried a %v s deadline: every attempt carries its own kDeadline = 2 s", c.TimeoutSeconds());
+  }
+  ctx.Equal(slowCalls, 2, "i-3 failed UNAVAILABLE once: its calls");
+  ctx.Assert(slow.result && slow.result->status == "prelabeled", "the second attempt for i-3 answers within its own 2 s deadline, prelabelItem answered %s", slow.result ? slow.result->status : "an exception: " + slow.thrown);
   ctx.GRPC.SetLatency("Predict", 30.0);
   const int64_t before = ctx.Clock.Now();
   call("i-2", "a dog in the fog");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited);
+  ctx.Assert(waited <= 4.5, "with the model hanging, prelabelItem took %.0f s: at most two calls of 2 s each", waited);
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
@@ -836,18 +915,38 @@ void CheckRetryTransient(harness::Ctx& ctx) {
   const Outcome flaky = call("i-3", "flaky: a bird");
   ctx.Equal(callsFor(ctx, "i-3"), 2, "i-3 failed UNAVAILABLE once: it must be sent a second time; the calls");
   ctx.Assert(flaky.result && flaky.result->status == "prelabeled", "the second attempt for i-3 succeeded, prelabelItem answered %s", flaky.result ? flaky.result->status : "an exception: " + flaky.thrown);
+  ctx.GRPC.Fail("Predict", grpc::StatusCode::DEADLINE_EXCEEDED, "the model ran out of time", 1);
+  const Outcome timedOut = call("i-4", "a fox");
+  ctx.Assert(callsFor(ctx, "i-4") == 2 && timedOut.result && timedOut.result->status == "prelabeled", "i-4 failed DEADLINE_EXCEEDED once and was sent %d times, answering %s: a timeout is retried once", callsFor(ctx, "i-4"), timedOut.result ? timedOut.result->status : "an exception: " + timedOut.thrown);
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+  };
+  for (size_t n = 0; n < terminal.size(); n++) {
+    const std::string item_id = "i-" + std::to_string(n + 5);
+    ctx.GRPC.Fail("Predict", terminal[n].first, "the model said no", 1);
+    call(item_id, "a fox");
+    ctx.Equal(callsFor(ctx, item_id), 1, "the model failed %s with %s: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, any other status is final; the calls", item_id, terminal[n].second);
+  }
 }
 
 void CheckDegradeUnlabeled(harness::Ctx& ctx) {
   serveModel(ctx);
-  const std::vector<std::vector<std::string>> cases = {{"i-1", "down: a dog", "UNAVAILABLE"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT"}};
+  const std::vector<std::vector<std::string>> cases = {{"i-1", "down: a dog", "UNAVAILABLE", "the model is restarting"}, {"i-2", "refuse: a cat", "INVALID_ARGUMENT", "the item is outside the label spec"}};
   for (const auto& tc : cases) {
     const Outcome o = call(tc[0], tc[1]);
     ctx.Assert(o.result.has_value(), "with the model failing %s, prelabelItem threw: %s. Answer an unlabeled item so the annotator labels it by hand", tc[2], o.thrown);
     ctx.Assert(o.result->status == "unlabeled" && o.result->labels.empty(), "a failed pre-label answered status %q with %d labels, expected status unlabeled with no labels", o.result->status, o.result->labels.size());
-    ctx.Assert(o.result->error.find(tc[2]) != std::string::npos, "the unlabeled item's error is %q, expected the last status %s", o.result->error, tc[2]);
+    ctx.Equal(o.result->error, tc[2] + ": " + tc[3], "the unlabeled item's error must be the last status and its details");
     ctx.Equal(o.result->item_id, tc[0], "the answer must name the item");
   }
+  // The first attempt is UNAVAILABLE, the second a refusal: the error names the last status.
+  ctx.GRPC.Fail("Predict", grpc::StatusCode::UNAVAILABLE, "the model is restarting", 1);
+  const Outcome last = call("i-4", "refuse: a bird");
+  ctx.Assert(last.result && last.result->error == "INVALID_ARGUMENT: the item is outside the label spec", "i-4 failed UNAVAILABLE, then INVALID_ARGUMENT: prelabelItem answered the error %q, expected the last status in error", last.result ? last.result->error : "an exception: " + last.thrown);
   const Outcome ok = call("i-3", "a cat on a mat");
   ctx.Assert(ok.result && ok.result->status == "prelabeled" && ok.result->labels == std::vector<std::string>{"cat"}, "a healthy model's answer must come back prelabeled with its labels, got %s", ok.result ? ok.result->status : "an exception: " + ok.thrown);
 }

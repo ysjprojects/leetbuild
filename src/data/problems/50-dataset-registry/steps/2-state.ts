@@ -43,7 +43,7 @@ deletes the version a run still reads.
       id: 'atomic-promotion',
       title: 'The pointer and its audit entry move together',
       detail:
-        'One Lua script reads the pointer, sets it and appends the audit entry, so no reader sees a moved pointer without its entry or an entry for a promotion that has not happened. The starter sends `RPUSH` and `SET` as two commands.',
+        'One Lua script reads the pointer, sets it and appends the audit entry, so no reader sees a moved pointer without its entry or an entry for a promotion that has not happened, and two racing promotions leave an audit list where each entry starts from the version the one before it promoted. The starter sends `RPUSH` and `SET` as two commands.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /RPUSH/], none: [/\.rpush\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /RPUSH/], none: [/redis\.rpush\(/]},
@@ -85,7 +85,7 @@ deletes the version a run still reads.
       id: 'pins-independent',
       title: 'Pins survive a promotion and block a purge',
       detail:
-        'A promotion never writes `dataset:{dataset}:pins`, and `purge` checks the pins (`HVALS`) and the pointer in the script that deletes, refusing with `VersionPinned`. The starter moves every pin to the new version and purges whatever it is asked to.',
+        'A promotion never writes `dataset:{dataset}:pins`, and `purge` checks the pins (`HVALS`) and the pointer in the script that deletes, refusing with `VersionPinned` and keeping the record listed; a pin or a promotion landing while `purge` runs cannot slip between its check and its delete. The starter moves every pin to the new version and purges whatever it is asked to.',
       match: {
         python: {all: [/HVALS/, /VersionPinned\(/], none: [/hkeys/i]},
         typescript: {all: [/HVALS/, /new VersionPinned/], none: [/hkeys/i]},
@@ -695,6 +695,23 @@ def _refused(m, version, why):
     raise AssertionError(f"purge({version!r}) went through while {why}: a run reading it loses its data. Raise VersionPinned")
 
 
+def _purge_raced(ctx, m, key, version, rival, what):
+    """Purge version while another client lands rival() right after the purge's first command on key."""
+    vkey = store.version_key(DS, version)
+    probe = ctx.redis_after(key, lambda: bool(ctx.redis.exists(vkey)) and (rival() or True))
+    refused = False
+    try:
+        m.purge(DS, version)
+    except m.VersionPinned:
+        refused = True
+    assert probe.fired, f"purge({version!r}) never touched {key}"
+    assert probe.error is None, f"the racing client failed: {probe.error}"
+    if probe.result:
+        assert refused and store.version(DS, version) is not None, f"{what} between the purge's check and its delete, and purge({version!r}) deleted it anyway: the check and the delete must be one script"
+    else:
+        assert not refused and store.version(DS, version) is None, f"purge({version!r}) must delete a version nobody pins and that is not the latest"
+
+
 def check_atomic_promotion(ctx):
     m = _state(ctx)
     assert m.promote(DS, "2026-01", "alice") == "", "the first promotion has no previous version: promote must return ''"
@@ -707,6 +724,23 @@ def check_atomic_promotion(ctx):
     entries = ctx.redis.lrange(AUDIT, 0, -1)
     assert entries == ["->2026-01 by alice", "2026-01->2026-02 by bob"], f"the audit list holds {entries}"
     assert ctx.redis.get(LATEST) == "2026-02", f"the pointer holds {ctx.redis.get(LATEST)!r} after promoting 2026-02"
+
+    # Another promoter lands right after this promotion's first command on the pointer: every audit
+    # entry must name the version the one before it promoted.
+    def rival():
+        before = ctx.redis.get(LATEST) or ""
+        ctx.redis.set(LATEST, "2026-03")
+        ctx.redis.rpush(AUDIT, f"{before}->2026-03 by carol")
+
+    raced = ctx.redis_after(LATEST, rival)
+    previous = m.promote(DS, "2025-12", "dave")
+    assert raced.fired and raced.error is None, f"the racing promotion did not run: {raced.error}"
+    entries = ctx.redis.lrange(AUDIT, 0, -1)
+    chain = [entry.split(" by ")[0].split("->") for entry in entries]
+    for (_, promoted), (before, _) in zip(chain, chain[1:]):
+        assert before == promoted, f"two promotions raced and the audit list reads {entries}: an entry's previous version is not what the entry before it promoted. Read the pointer inside the script that moves it"
+    assert chain[-1][1] == ctx.redis.get(LATEST), f"the pointer holds {ctx.redis.get(LATEST)!r} but the last audit entry is {entries[-1]!r}"
+    assert f"{previous}->2025-12 by dave" in entries, f"promote returned {previous!r}, which its own audit entry does not name: {entries}"
 
 
 def check_durable_pointer(ctx):
@@ -738,12 +772,21 @@ def check_pins_independent(ctx):
     pinned = ctx.redis.hget(PINS, "run-7")
     assert pinned == "2026-01", f"run-7 pinned 2026-01 and now reads {pinned}: a promotion must leave the pins alone"
     _refused(m, "2026-01", "run-7 pins it")
-    assert store.version(DS, "2026-01") is not None, "the pinned version's record is gone"
+    assert store.version(DS, "2026-01") is not None and "2026-01" in store.versions(DS), "the pinned version's record is gone or no longer listed"
     _refused(m, "2026-02", "it is the latest")
-    assert store.version(DS, "2026-02") is not None, "the latest version's record is gone"
+    assert store.version(DS, "2026-02") is not None and "2026-02" in store.versions(DS), "the latest version's record is gone or no longer listed"
     m.purge(DS, "2025-12")
     assert store.version(DS, "2025-12") is None, "a version nobody pins and that is not the latest must be purged"
     assert "2025-12" not in store.versions(DS), f"the purged version is still listed: {store.versions(DS)}"
+    for version in ("2025-10", "2025-11"):
+        store.put_version({"tenant": "t1", "dataset": DS, "version": version, "content_sha256": "0" * 64, "license": "mit", "owner": "team-lm", "size_bytes": 20, "row_count": 2, "status": "validated"})
+
+    def promote_rival():
+        ctx.redis.set(LATEST, "2025-11")
+        ctx.redis.rpush(AUDIT, "2026-02->2025-11 by carol")
+
+    _purge_raced(ctx, m, LATEST, "2025-11", promote_rival, "carol promoted 2025-11")
+    _purge_raced(ctx, m, PINS, "2025-10", lambda: ctx.redis.hset(PINS, "run-9", "2025-10"), "run-9 pinned 2025-10")
 `,
     typescript: `const DS = 'imdb-reviews';
 const LATEST = \`dataset:\${DS}:latest\`;
@@ -768,6 +811,31 @@ async function refused(m, version: string, why: string): Promise<void> {
   assert.fail(\`purge('\${version}') went through while \${why}: a run reading it loses its data. Throw VersionPinned\`);
 }
 
+/** Purge version while another client lands rival() right after the purge's first command on key. */
+async function purgeRaced(ctx, m, store, key: string, version: string, rival: () => void, what: string): Promise<void> {
+  const vkey = \`dataset:\${DS}:v:\${version}\`;
+  const probe = ctx.redisAfter(key, () => {
+    if (ctx.redis.exists(vkey) !== 1) return false;
+    rival();
+    return true;
+  });
+  let isRefused = false;
+  try {
+    await m.purge(DS, version);
+  } catch (e) {
+    if (!(e instanceof m.VersionPinned)) throw e;
+    isRefused = true;
+  }
+  assert(probe.fired, \`purge('\${version}') never touched \${key}\`);
+  assert.equal(probe.error, undefined, \`the racing client failed: \${probe.error}\`);
+  const record = await store.version(DS, version);
+  if (probe.result === true) {
+    assert(isRefused && record !== null, \`\${what} between the purge's check and its delete, and purge('\${version}') deleted it anyway: the check and the delete must be one script\`);
+  } else {
+    assert(!isRefused && record === null, \`purge('\${version}') must delete a version nobody pins and that is not the latest\`);
+  }
+}
+
 export async function check_atomic_promotion(ctx) {
   const {m} = await state(ctx);
   assert.equal(await m.promote(DS, '2026-01', 'alice'), '', 'the first promotion has no previous version: promote must return ""');
@@ -779,6 +847,22 @@ export async function check_atomic_promotion(ctx) {
   assert.equal(previous, '2026-01', 'promote must return the previous latest');
   assert.deepStrictEqual(ctx.redis.lrange(AUDIT, 0, -1), ['->2026-01 by alice', '2026-01->2026-02 by bob'], 'the audit list');
   assert.equal(ctx.redis.get(LATEST), '2026-02', 'the pointer after promoting 2026-02');
+  // Another promoter lands right after this promotion's first command on the pointer: every audit
+  // entry must name the version the one before it promoted.
+  const raced = ctx.redisAfter(LATEST, () => {
+    const before = ctx.redis.get(LATEST) ?? '';
+    ctx.redis.set(LATEST, '2026-03');
+    ctx.redis.rpush(AUDIT, \`\${before}->2026-03 by carol\`);
+  });
+  const returned = await m.promote(DS, '2025-12', 'dave');
+  assert(raced.fired && raced.error === undefined, \`the racing promotion did not run: \${raced.error}\`);
+  const all: string[] = ctx.redis.lrange(AUDIT, 0, -1);
+  const chain = all.map(entry => entry.split(' by ')[0].split('->'));
+  for (let i = 1; i < chain.length; i++) {
+    assert.equal(chain[i][0], chain[i - 1][1], \`two promotions raced and the audit list reads \${JSON.stringify(all)}: an entry's previous version is not what the entry before it promoted. Read the pointer inside the script that moves it\`);
+  }
+  assert.equal(chain[chain.length - 1][1], ctx.redis.get(LATEST), \`the pointer disagrees with the last audit entry \${all[all.length - 1]}\`);
+  assert(all.includes(\`\${returned}->2025-12 by dave\`), \`promote returned \${JSON.stringify(returned)}, which its own audit entry does not name: \${JSON.stringify(all)}\`);
 }
 
 export async function check_durable_pointer(ctx) {
@@ -812,12 +896,20 @@ export async function check_pins_independent(ctx) {
   const pinned = ctx.redis.hget(PINS, 'run-7');
   assert.equal(pinned, '2026-01', \`run-7 pinned 2026-01 and now reads \${pinned}: a promotion must leave the pins alone\`);
   await refused(m, '2026-01', 'run-7 pins it');
-  assert.notEqual(await store.version(DS, '2026-01'), null, 'the pinned version\\'s record is gone');
+  assert(await store.version(DS, '2026-01') !== null && (await store.versions(DS)).includes('2026-01'), 'the pinned version\\'s record is gone or no longer listed');
   await refused(m, '2026-02', 'it is the latest');
-  assert.notEqual(await store.version(DS, '2026-02'), null, 'the latest version\\'s record is gone');
+  assert(await store.version(DS, '2026-02') !== null && (await store.versions(DS)).includes('2026-02'), 'the latest version\\'s record is gone or no longer listed');
   await m.purge(DS, '2025-12');
   assert.equal(await store.version(DS, '2025-12'), null, 'a version nobody pins and that is not the latest must be purged');
   assert(!(await store.versions(DS)).includes('2025-12'), 'the purged version is still listed');
+  for (const version of ['2025-10', '2025-11']) {
+    await store.putVersion({tenant: 't1', dataset: DS, version, content_sha256: '0'.repeat(64), license: 'mit', owner: 'team-lm', size_bytes: 20, row_count: 2, status: 'validated', report: null});
+  }
+  await purgeRaced(ctx, m, store, LATEST, '2025-11', () => {
+    ctx.redis.set(LATEST, '2025-11');
+    ctx.redis.rpush(AUDIT, '2026-02->2025-11 by carol');
+  }, 'carol promoted 2025-11');
+  await purgeRaced(ctx, m, store, PINS, '2025-10', () => ctx.redis.hset(PINS, 'run-9', '2025-10'), 'run-9 pinned 2025-10');
 }
 `,
     go: `package main
@@ -861,6 +953,28 @@ func stateRefused(ctx *harness.Ctx, version, why string) {
 	ctx.Assert(errors.Is(err, ErrVersionPinned), "purge(%q) failed with %v, expected ErrVersionPinned", version, err)
 }
 
+// statePurgeRaced purges version while another client lands rival right after the purge's first
+// command on key.
+func statePurgeRaced(ctx *harness.Ctx, key, version string, rival func(), what string) {
+	vkey := store.VersionKey(stateDS, version)
+	probe := ctx.Redis.After(key, func() any {
+		if ctx.Redis.Exists(vkey) != 1 {
+			return false
+		}
+		rival()
+		return true
+	})
+	err := purge(stateBg, stateDS, version)
+	ctx.Assert(probe.Fired, "purge(%q) never touched %s", version, key)
+	ctx.NoError(probe.Err, "the racing client")
+	if landed, _ := probe.Result.(bool); landed {
+		ctx.Assert(errors.Is(err, ErrVersionPinned) && store.Version(stateBg, stateDS, version) != nil, "%s between the purge's check and its delete, and purge(%q) deleted it anyway: the check and the delete must be one script", what, version)
+	} else {
+		ctx.NoError(err, "purging %s, which nobody pins and is not the latest", version)
+		ctx.Assert(store.Version(stateBg, stateDS, version) == nil, "purge(%q) must delete a version nobody pins and that is not the latest", version)
+	}
+}
+
 func CheckAtomicPromotion(ctx *harness.Ctx) {
 	stateSetup(ctx)
 	ctx.Equal(mustPromote(ctx, "2026-01", "alice"), "", "the first promotion has no previous version; promote returned")
@@ -876,6 +990,29 @@ func CheckAtomicPromotion(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.LRange(stateAudit, 0, -1), []string{"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list")
 	latest, _ := ctx.Redis.Get(stateLatest)
 	ctx.Equal(latest, "2026-02", "the pointer after promoting 2026-02")
+	// Another promoter lands right after this promotion's first command on the pointer: every audit
+	// entry must name the version the one before it promoted.
+	raced := ctx.Redis.After(stateLatest, func() any {
+		before, _ := ctx.Redis.Get(stateLatest)
+		ctx.Redis.Set(stateLatest, "2026-03")
+		ctx.Redis.Do("RPUSH", stateAudit, before+"->2026-03 by carol")
+		return nil
+	})
+	returned := mustPromote(ctx, "2025-12", "dave")
+	ctx.Assert(raced.Fired, "the promotion of 2025-12 never touched the pointer")
+	ctx.NoError(raced.Err, "the racing promotion")
+	all := ctx.Redis.LRange(stateAudit, 0, -1)
+	promoted, own := "", false
+	for i, entry := range all {
+		moved := strings.SplitN(strings.SplitN(entry, " by ", 2)[0], "->", 2)
+		ctx.Assert(len(moved) == 2, "the audit entry %q is not previous->version by actor", entry)
+		ctx.Assert(i == 0 || moved[0] == promoted, "two promotions raced and the audit list reads %q: an entry's previous version is not what the entry before it promoted. Read the pointer inside the script that moves it", all)
+		promoted = moved[1]
+		own = own || entry == returned+"->2025-12 by dave"
+	}
+	latest, _ = ctx.Redis.Get(stateLatest)
+	ctx.Equal(promoted, latest, "the last audit entry against the pointer; the entry names")
+	ctx.Assert(own, "promote returned %q, which its own audit entry does not name: %q", returned, all)
 }
 
 func CheckDurablePointer(ctx *harness.Ctx) {
@@ -913,10 +1050,20 @@ func CheckPinsIndependent(ctx *harness.Ctx) {
 	ctx.NoError(purge(stateBg, stateDS, "2025-12"), "purging a version nobody pins")
 	ctx.Assert(store.Version(stateBg, stateDS, "2025-12") == nil, "a version nobody pins and that is not the latest must be purged")
 	ctx.Equal(store.Versions(stateBg, stateDS), []string{"2026-01", "2026-02"}, "the versions left after the purge")
+	for _, v := range []string{"2025-10", "2025-11"} {
+		err := store.PutVersion(stateBg, &store.VersionRecord{Tenant: "t1", Dataset: stateDS, Version: v, ContentSHA256: strings.Repeat("0", 64), License: "mit", Owner: "team-lm", SizeBytes: 20, RowCount: 2, Status: "validated"})
+		ctx.NoError(err, "seeding %s", v)
+	}
+	statePurgeRaced(ctx, stateLatest, "2025-11", func() {
+		ctx.Redis.Set(stateLatest, "2025-11")
+		ctx.Redis.Do("RPUSH", stateAudit, "2026-02->2025-11 by carol")
+	}, "carol promoted 2025-11")
+	statePurgeRaced(ctx, statePins, "2025-10", func() { ctx.Redis.Do("HSET", statePins, "run-9", "2025-10") }, "run-9 pinned 2025-10")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <functional>
 #include <string>
 
 #include "registry/store.h"
@@ -953,6 +1100,32 @@ void refused(harness::Ctx& ctx, const std::string& version, const std::string& w
   ctx.Fatalf("purge(%q) went through while %s: a run reading it loses its data. Throw VersionPinned", version, why);
 }
 
+// Purge version while another client lands rival right after the purge's first command on key.
+void purgeRaced(harness::Ctx& ctx, const std::string& key, const std::string& version, const std::function<void()>& rival, const std::string& what) {
+  const std::string vkey = store::versionKey(kDS, version);
+  bool fired = false;
+  bool landed = false;
+  ctx.Redis.After(key, [&] {
+    fired = true;
+    if (ctx.Redis.Exists(vkey) != 1) return;
+    rival();
+    landed = true;
+  });
+  bool isRefused = false;
+  try {
+    purge(kDS, version);
+  } catch (const VersionPinned&) {
+    isRefused = true;
+  }
+  ctx.Assert(fired, "purge(%q) never touched %s", version, key);
+  if (landed) {
+    ctx.Assert(isRefused && store::version(kDS, version).has_value(),
+               "%s between the purge's check and its delete, and purge(%q) deleted it anyway: the check and the delete must be one script", what, version);
+  } else {
+    ctx.Assert(!isRefused && !store::version(kDS, version), "purge(%q) must delete a version nobody pins and that is not the latest", version);
+  }
+}
+
 }  // namespace
 
 void CheckAtomicPromotion(harness::Ctx& ctx) {
@@ -967,6 +1140,31 @@ void CheckAtomicPromotion(harness::Ctx& ctx) {
   ctx.Equal(previous, "2026-01", "promote must return the previous latest");
   ctx.Equal(ctx.Redis.LRange(kAudit, 0, -1), {"->2026-01 by alice", "2026-01->2026-02 by bob"}, "the audit list");
   ctx.Equal(ctx.Redis.Get(kLatest).value_or(""), "2026-02", "the pointer after promoting 2026-02");
+  // Another promoter lands right after this promotion's first command on the pointer: every audit
+  // entry must name the version the one before it promoted.
+  bool raced = false;
+  ctx.Redis.After(kLatest, [&] {
+    raced = true;
+    const std::string before = ctx.Redis.Get(kLatest).value_or("");
+    ctx.Redis.Set(kLatest, "2026-03");
+    ctx.Redis.Do("RPUSH", kAudit, before + "->2026-03 by carol");
+  });
+  const std::string returned = promote(kDS, "2025-12", "dave");
+  ctx.Assert(raced, "the promotion of 2025-12 never touched the pointer");
+  const auto all = ctx.Redis.LRange(kAudit, 0, -1);
+  std::string promoted;
+  bool own = false;
+  for (size_t i = 0; i < all.size(); i++) {
+    const std::string moved = all[i].substr(0, all[i].find(" by "));
+    const size_t arrow = moved.find("->");
+    ctx.Assert(arrow != std::string::npos, "the audit entry %q is not previous->version by actor", all[i]);
+    ctx.Assert(i == 0 || moved.substr(0, arrow) == promoted,
+               "two promotions raced and the audit list reads %v: an entry's previous version is not what the entry before it promoted. Read the pointer inside the script that moves it", all);
+    promoted = moved.substr(arrow + 2);
+    own = own || all[i] == returned + "->2025-12 by dave";
+  }
+  ctx.Equal(promoted, ctx.Redis.Get(kLatest).value_or(""), "the last audit entry against the pointer; the entry names");
+  ctx.Assert(own, "promote returned %q, which its own audit entry does not name: %v", returned, all);
 }
 
 void CheckDurablePointer(harness::Ctx& ctx) {
@@ -1003,6 +1201,24 @@ void CheckPinsIndependent(harness::Ctx& ctx) {
   purge(kDS, "2025-12");
   ctx.Assert(!store::version(kDS, "2025-12"), "a version nobody pins and that is not the latest must be purged");
   ctx.Equal(store::versions(kDS), {"2026-01", "2026-02"}, "the versions left after the purge");
+  for (const std::string version : {"2025-10", "2025-11"}) {
+    store::VersionRecord rec;
+    rec.tenant = "t1";
+    rec.dataset = kDS;
+    rec.version = version;
+    rec.content_sha256 = std::string(64, '0');
+    rec.license = "mit";
+    rec.owner = "team-lm";
+    rec.size_bytes = 20;
+    rec.row_count = 2;
+    rec.status = "validated";
+    store::putVersion(rec);
+  }
+  purgeRaced(ctx, kLatest, "2025-11", [&] {
+    ctx.Redis.Set(kLatest, "2025-11");
+    ctx.Redis.Do("RPUSH", kAudit, "2026-02->2025-11 by carol");
+  }, "carol promoted 2025-11");
+  purgeRaced(ctx, kPins, "2025-10", [&] { ctx.Redis.Do("HSET", kPins, "run-9", "2025-10"); }, "run-9 pinned 2025-10");
 }
 `,
   },

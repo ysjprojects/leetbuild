@@ -66,7 +66,7 @@ training run a version that was never validated.
       id: 'tenant-scoped',
       title: "Another tenant's version is 404",
       detail:
-        "The record's tenant is compared with the caller's, and a foreign version answers **404** like an unknown one, so its existence is not confirmed either. The starter answers any tenant that asks.",
+        "The record's tenant is compared with the caller's, also when `latest` resolved the name, and a foreign version answers **404** with the same body as a dataset nobody registered, so its existence is not confirmed either. The starter answers any tenant that asks.",
       match: {
         python: {all: [/record\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*record\[["']tenant["']\]/]},
         typescript: {all: [/record\.tenant\s*!==\s*tenant|tenant\s*!==\s*record\.tenant/]},
@@ -79,7 +79,7 @@ training run a version that was never validated.
       id: 'signed-url',
       title: 'The download URL is signed and expires in five minutes',
       detail:
-        "`download_url` comes from `sign_url`/`signUrl`/`SignURL` over the caller's tenant, the hash and an `expires_at` 300 s ahead, which the answer carries. The starter hands out the object's permanent address.",
+        "`download_url` comes from `sign_url`/`signUrl`/`SignURL` over the caller's tenant, the hash and an `expires_at` 300 s ahead of each read, which the answer carries. The starter hands out the object's permanent address.",
       match: {
         python: {all: [/SIGNED_URL_TTL_S\s*=\s*300\b/, /store\.sign_url\(/], none: [/OBJECT_BASE/]},
         typescript: {all: [/SIGNED_URL_TTL_S\s*=\s*300\b/, /signUrl\(/], none: [/OBJECT_BASE/]},
@@ -105,7 +105,7 @@ training run a version that was never validated.
       id: 'latest-pointer',
       title: '`latest` follows the promoted pointer',
       detail:
-        '`latest` resolves through `pointer.latest`, and a dataset with no promoted version is **404**. The starter takes the newest registered name, which can be a version no validator passed.',
+        '`latest` resolves through `pointer.latest`, and a dataset with no promoted version is **404**, even when it has registered ones. The starter takes the newest registered name, which can be a version no validator passed.',
       match: {
         python: {all: [/pointer\.latest\(/], none: [/store\.versions\(/]},
         typescript: {all: [/\blatest\(\s*dataset\s*\)/], none: [/\bversions\(\s*dataset\s*\)/]},
@@ -574,17 +574,25 @@ async def check_tenant_scoped(ctx):
         foreign = await c.get("/v1/datasets/private-logs/versions/2026-01", headers=T1)
         unknown = await c.get(f"/v1/datasets/{DS}/versions/2030-01", headers=T1)
         own = await c.get("/v1/datasets/private-logs/versions/2026-01", headers={"X-Tenant-Id": "t2"})
+        ghost = await c.get("/v1/datasets/ghost-logs/versions/2026-01", headers=T1)
+        pointer.promote("private-logs", "2026-01", "bob")
+        foreign_latest = await c.get("/v1/datasets/private-logs/versions/latest", headers=T1)
     sha = store.version("private-logs", "2026-01")["content_sha256"]
     assert foreign.status_code == 404, f"tenant t1 reading t2's private-logs@2026-01 got {foreign.status_code}: another tenant's version must answer 404"
     assert sha not in foreign.text, "the answer to another tenant carries the content hash"
     assert unknown.status_code == 404, f"an unknown version answered {unknown.status_code}, expected 404"
     assert own.status_code == 200, f"t2 reading its own version answered {own.status_code}: {own.text}"
+    assert foreign.text.replace("private-logs", "{dataset}") == ghost.text.replace("ghost-logs", "{dataset}"), f"t2's private-logs@2026-01 answered {foreign.text} and a dataset nobody registered answered {ghost.text}: the difference tells t1 that the version exists"
+    assert foreign_latest.status_code == 404 and sha not in foreign_latest.text, f"tenant t1 reading t2's private-logs@latest got {foreign_latest.status_code}: {foreign_latest.text}. latest resolves to a version, and that version is another tenant's"
 
 
 async def check_signed_url(ctx):
     async with _read(ctx) as c:
         now = int(ctx.clock.time())
         r = await c.get(f"/v1/datasets/{DS}/versions/2026-01", headers=T1)
+        ctx.clock.advance(600)
+        later = int(ctx.clock.time())
+        again = await c.get(f"/v1/datasets/{DS}/versions/2026-01", headers=T1)
     assert r.status_code == 200, f"the read answered {r.status_code}: {r.text}"
     body = r.json()
     sha = store.version(DS, "2026-01")["content_sha256"]
@@ -593,6 +601,10 @@ async def check_signed_url(ctx):
     assert body.get("download_url") == store.sign_url("t1", sha, expires_at), f"download_url is {body.get('download_url')!r}: it must be store.sign_url for the caller's tenant, the hash and expires_at"
     unsigned = f"{store.OBJECT_BASE}/{sha}"
     assert not any(value == unsigned for value in body.values()), f"the answer carries the unsigned object URL {unsigned}"
+    body = again.json()
+    expires_at = body.get("expires_at")
+    assert isinstance(expires_at, int) and later + 290 <= expires_at <= later + 301, f"read again ten minutes later, the answer's expires_at is {expires_at!r}, expected about {later + 300}: every read signs a URL valid for 300 s from that read"
+    assert body.get("download_url") == store.sign_url("t1", sha, expires_at), f"read again ten minutes later, download_url is {body.get('download_url')!r}, not signed for the new expires_at"
 
 
 async def check_validator_report(ctx):
@@ -610,9 +622,12 @@ async def check_latest_pointer(ctx):
     async with _read(ctx) as c:
         r = await c.get(f"/v1/datasets/{DS}/versions/latest", headers=T1)
         none = await c.get("/v1/datasets/wiki-text/versions/latest", headers=T1)
+        _seed("wiki-text", "2026-01", "t1", "pending", None)
+        unpromoted = await c.get("/v1/datasets/wiki-text/versions/latest", headers=T1)
     assert r.status_code == 200, f"GET …/versions/latest answered {r.status_code}: {r.text}"
     assert r.json().get("version") == "2026-01", f"latest resolved to {r.json().get('version')!r}, the promoted version is 2026-01: a training run asking for latest gets a version nobody validated"
     assert none.status_code == 404, f"latest of a dataset with no promoted version answered {none.status_code}, expected 404"
+    assert unpromoted.status_code == 404, f"latest of wiki-text, which has a registered version but no promoted one, answered {unpromoted.status_code}: {unpromoted.text}. Without a promotion there is no latest"
 `,
     typescript: `const DS = 'imdb-reviews';
 const T1 = {'X-Tenant-Id': 't1'};
@@ -631,7 +646,7 @@ async function read(ctx) {
   await seed(DS, '2026-03', 't1', 'pending', null);
   await seed('private-logs', '2026-01', 't2', 'validated', PASSED);
   await pointer.promote(DS, '2026-01', 'alice');
-  return {c: ctx.client(ctx.load('read').app), store};
+  return {c: ctx.client(ctx.load('read').app), store, pointer, seed};
 }
 
 export async function check_route(ctx) {
@@ -646,21 +661,29 @@ export async function check_route(ctx) {
 }
 
 export async function check_tenant_scoped(ctx) {
-  const {c, store} = await read(ctx);
+  const {c, store, pointer} = await read(ctx);
   const foreign = await c.get('/v1/datasets/private-logs/versions/2026-01', {headers: T1});
   const unknown = await c.get(\`/v1/datasets/\${DS}/versions/2030-01\`, {headers: T1});
   const own = await c.get('/v1/datasets/private-logs/versions/2026-01', {headers: {'X-Tenant-Id': 't2'}});
+  const ghost = await c.get('/v1/datasets/ghost-logs/versions/2026-01', {headers: T1});
+  await pointer.promote('private-logs', '2026-01', 'bob');
+  const foreignLatest = await c.get('/v1/datasets/private-logs/versions/latest', {headers: T1});
   const {content_sha256} = await store.version('private-logs', '2026-01');
   assert.equal(foreign.status, 404, \`tenant t1 reading t2's private-logs@2026-01 got \${foreign.status}: another tenant's version must answer 404\`);
   assert(!foreign.text.includes(content_sha256), 'the answer to another tenant carries the content hash');
   assert.equal(unknown.status, 404, \`an unknown version answered \${unknown.status}, expected 404\`);
   assert.equal(own.status, 200, \`t2 reading its own version answered \${own.status}: \${own.text}\`);
+  assert.equal(foreign.text.split('private-logs').join('{dataset}'), ghost.text.split('ghost-logs').join('{dataset}'), \`t2's private-logs@2026-01 answered \${foreign.text} and a dataset nobody registered answered \${ghost.text}: the difference tells t1 that the version exists\`);
+  assert(foreignLatest.status === 404 && !foreignLatest.text.includes(content_sha256), \`tenant t1 reading t2's private-logs@latest got \${foreignLatest.status}: \${foreignLatest.text}. latest resolves to a version, and that version is another tenant's\`);
 }
 
 export async function check_signed_url(ctx) {
   const {c, store} = await read(ctx);
   const now = Math.floor(ctx.clock.now() / 1000);
   const r = await c.get(\`/v1/datasets/\${DS}/versions/2026-01\`, {headers: T1});
+  ctx.clock.advance(600);
+  const later = Math.floor(ctx.clock.now() / 1000);
+  const again = (await c.get(\`/v1/datasets/\${DS}/versions/2026-01\`, {headers: T1})).json();
   assert.equal(r.status, 200, \`the read answered \${r.status}: \${r.text}\`);
   const body = r.json();
   const {content_sha256} = await store.version(DS, '2026-01');
@@ -669,6 +692,8 @@ export async function check_signed_url(ctx) {
   assert.equal(body.download_url, store.signUrl('t1', content_sha256, expiresAt), 'download_url must be signUrl for the caller\\'s tenant, the hash and expires_at');
   const unsigned = \`\${store.OBJECT_BASE}/\${content_sha256}\`;
   assert(!Object.values(body).includes(unsigned), \`the answer carries the unsigned object URL \${unsigned}\`);
+  assert(Number.isInteger(again.expires_at) && later + 290 <= again.expires_at && again.expires_at <= later + 301, \`read again ten minutes later, the answer's expires_at is \${JSON.stringify(again.expires_at)}, expected about \${later + 300}: every read signs a URL valid for 300 s from that read\`);
+  assert.equal(again.download_url, store.signUrl('t1', content_sha256, again.expires_at), 'read again ten minutes later, download_url must be signed for the new expires_at');
 }
 
 export async function check_validator_report(ctx) {
@@ -683,12 +708,15 @@ export async function check_validator_report(ctx) {
 }
 
 export async function check_latest_pointer(ctx) {
-  const {c} = await read(ctx);
+  const {c, seed} = await read(ctx);
   const r = await c.get(\`/v1/datasets/\${DS}/versions/latest\`, {headers: T1});
   const none = await c.get('/v1/datasets/wiki-text/versions/latest', {headers: T1});
+  await seed('wiki-text', '2026-01', 't1', 'pending', null);
+  const unpromoted = await c.get('/v1/datasets/wiki-text/versions/latest', {headers: T1});
   assert.equal(r.status, 200, \`GET …/versions/latest answered \${r.status}: \${r.text}\`);
   assert.equal(r.json().version, '2026-01', \`latest resolved to \${r.json().version}, the promoted version is 2026-01: a training run asking for latest gets a version nobody validated\`);
   assert.equal(none.status, 404, \`latest of a dataset with no promoted version answered \${none.status}, expected 404\`);
+  assert.equal(unpromoted.status, 404, \`latest of wiki-text, which has a registered version but no promoted one, answered \${unpromoted.status}: \${unpromoted.text}. Without a promotion there is no latest\`);
 }
 `,
     go: `package main
@@ -753,11 +781,17 @@ func CheckTenantScoped(ctx *harness.Ctx) {
 	foreign := c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t1")
 	unknown := c.Get("/v1/datasets/"+readDS+"/versions/2030-01", "X-Tenant-Id", "t1")
 	own := c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t2")
+	ghost := c.Get("/v1/datasets/ghost-logs/versions/2026-01", "X-Tenant-Id", "t1")
+	_, err := pointer.Promote(readBg, "private-logs", "2026-01", "bob")
+	ctx.NoError(err, "promoting private-logs@2026-01")
+	foreignLatest := c.Get("/v1/datasets/private-logs/versions/latest", "X-Tenant-Id", "t1")
 	sha := store.Version(readBg, "private-logs", "2026-01").ContentSHA256
 	ctx.Equal(foreign.Status, 404, "tenant t1 reading t2's private-logs@2026-01: another tenant's version must answer 404")
 	ctx.Assert(!strings.Contains(foreign.Text(), sha), "the answer to another tenant carries the content hash")
 	ctx.Equal(unknown.Status, 404, "an unknown version")
 	ctx.Equal(own.Status, 200, "t2 reading its own version (%s)", own.Text())
+	ctx.Assert(strings.ReplaceAll(foreign.Text(), "private-logs", "{dataset}") == strings.ReplaceAll(ghost.Text(), "ghost-logs", "{dataset}"), "t2's private-logs@2026-01 answered %q and a dataset nobody registered answered %q: the difference tells t1 that the version exists", foreign.Text(), ghost.Text())
+	ctx.Assert(foreignLatest.Status == 404 && !strings.Contains(foreignLatest.Text(), sha), "tenant t1 reading t2's private-logs@latest got %d: %s. latest resolves to a version, and that version is another tenant's", foreignLatest.Status, foreignLatest.Text())
 }
 
 func CheckSignedUrl(ctx *harness.Ctx) {
@@ -775,6 +809,13 @@ func CheckSignedUrl(ctx *harness.Ctx) {
 	for name, value := range body {
 		ctx.Assert(value != unsigned, "the answer carries the unsigned object URL %s in %s", unsigned, name)
 	}
+	ctx.Clock.Advance(600)
+	later := ctx.Clock.Now() / 1000
+	again := readBody(ctx, c.Get("/v1/datasets/"+readDS+"/versions/2026-01", "X-Tenant-Id", "t1"))
+	raw, _ = again["expires_at"].(float64)
+	expiresAt = int64(raw)
+	ctx.Assert(later+290 <= expiresAt && expiresAt <= later+301, "read again ten minutes later, the answer's expires_at is %v, expected about %d: every read signs a URL valid for 300 s from that read", again["expires_at"], later+300)
+	ctx.Equal(again["download_url"], store.SignURL("t1", sha, expiresAt), "read again ten minutes later, download_url must be signed for the new expires_at")
 }
 
 func CheckValidatorReport(ctx *harness.Ctx) {
@@ -795,9 +836,12 @@ func CheckLatestPointer(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	r := c.Get("/v1/datasets/"+readDS+"/versions/latest", "X-Tenant-Id", "t1")
 	none := c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1")
+	readSeed(ctx, "wiki-text", "2026-01", "t1", "pending", nil)
+	unpromoted := c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "GET …/versions/latest (%s)", r.Text())
 	ctx.Equal(readBody(ctx, r)["version"], "2026-01", "latest must resolve to the promoted 2026-01 (anything else hands a training run a version nobody validated); it resolved to")
 	ctx.Equal(none.Status, 404, "latest of a dataset with no promoted version")
+	ctx.Equal(unpromoted.Status, 404, "latest of wiki-text, which has a registered version but no promoted one (without a promotion there is no latest)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -852,6 +896,12 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
   return body;
 }
 
+// text with the dataset name replaced: two answers that differ only in the name they echo are one answer.
+std::string withoutName(std::string text, const std::string& name) {
+  for (size_t at = text.find(name); at != std::string::npos; at = text.find(name, at)) text.replace(at, name.size(), "{dataset}");
+  return text;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -873,11 +923,18 @@ void CheckTenantScoped(harness::Ctx& ctx) {
   const auto foreign = c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t1");
   const auto unknown = c.Get("/v1/datasets/" + kDS + "/versions/2030-01", "X-Tenant-Id", "t1");
   const auto own = c.Get("/v1/datasets/private-logs/versions/2026-01", "X-Tenant-Id", "t2");
+  const auto ghost = c.Get("/v1/datasets/ghost-logs/versions/2026-01", "X-Tenant-Id", "t1");
+  pointer::promote("private-logs", "2026-01", "bob");
+  const auto foreignLatest = c.Get("/v1/datasets/private-logs/versions/latest", "X-Tenant-Id", "t1");
   const std::string sha = store::version("private-logs", "2026-01")->content_sha256;
   ctx.Equal(foreign.Status, 404, "tenant t1 reading t2's private-logs@2026-01: another tenant's version must answer 404");
   ctx.Assert(foreign.Text().find(sha) == std::string::npos, "the answer to another tenant carries the content hash");
   ctx.Equal(unknown.Status, 404, "an unknown version");
   ctx.Equal(own.Status, 200, "t2 reading its own version (%s)", own.Text());
+  ctx.Assert(withoutName(foreign.Text(), "private-logs") == withoutName(ghost.Text(), "ghost-logs"),
+             "t2's private-logs@2026-01 answered %q and a dataset nobody registered answered %q: the difference tells t1 that the version exists", foreign.Text(), ghost.Text());
+  ctx.Assert(foreignLatest.Status == 404 && foreignLatest.Text().find(sha) == std::string::npos,
+             "tenant t1 reading t2's private-logs@latest got %d: %s. latest resolves to a version, and that version is another tenant's", foreignLatest.Status, foreignLatest.Text());
 }
 
 void CheckSignedUrl(harness::Ctx& ctx) {
@@ -895,6 +952,13 @@ void CheckSignedUrl(harness::Ctx& ctx) {
   for (const auto& [name, value] : body.items()) {
     ctx.Assert(!(value.is_string() && value.get<std::string>() == unsigned_url), "the answer carries the unsigned object URL %s in %s", unsigned_url, name);
   }
+  ctx.Clock.Advance(600);
+  const long long later = ctx.Clock.Now() / 1000;
+  const json again = bodyOf(ctx, c.Get("/v1/datasets/" + kDS + "/versions/2026-01", "X-Tenant-Id", "t1"));
+  const long long renewed = again.contains("expires_at") && again["expires_at"].is_number() ? again["expires_at"].get<long long>() : 0;
+  ctx.Assert(later + 290 <= renewed && renewed <= later + 301,
+             "read again ten minutes later, the answer's expires_at is %d, expected about %d: every read signs a URL valid for 300 s from that read", renewed, later + 300);
+  ctx.Equal(again.value("download_url", ""), store::signUrl("t1", sha, renewed), "read again ten minutes later, download_url must be signed for the new expires_at");
 }
 
 void CheckValidatorReport(harness::Ctx& ctx) {
@@ -913,9 +977,12 @@ void CheckLatestPointer(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto r = c.Get("/v1/datasets/" + kDS + "/versions/latest", "X-Tenant-Id", "t1");
   const auto none = c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1");
+  seed("wiki-text", "2026-01", "t1", "pending", std::nullopt);
+  const auto unpromoted = c.Get("/v1/datasets/wiki-text/versions/latest", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "GET …/versions/latest (%s)", r.Text());
   ctx.Equal(bodyOf(ctx, r).value("version", ""), "2026-01", "latest must resolve to the promoted 2026-01 (anything else hands a training run a version nobody validated); it resolved to");
   ctx.Equal(none.Status, 404, "latest of a dataset with no promoted version");
+  ctx.Equal(unpromoted.Status, 404, "latest of wiki-text, which has a registered version but no promoted one (without a promotion there is no latest)");
 }
 `,
   },

@@ -58,7 +58,7 @@ annotator quality review flagged as a spammer still counts, dragging agreement a
       id: 'tenant-scope',
       title: "Another tenant's task is 404",
       detail:
-        "The task's tenant is compared with `X-Tenant-Id` and a mismatch answers **404**, as an unknown id does, so a guessed id reveals nothing. The starter serves any tenant's task.",
+        "The task's tenant is compared with `X-Tenant-Id` and a mismatch answers **404** with the same body as an unknown id, so a guessed id reveals nothing. The starter serves any tenant's task.",
       match: {
         python: {all: [/task\[["']tenant["']\]\s*!=|!=\s*task\[["']tenant["']\]/]},
         typescript: {all: [/task\.tenant\s*!==|!==\s*task\.tenant/]},
@@ -71,7 +71,7 @@ annotator quality review flagged as a spammer still counts, dragging agreement a
       id: 'blind-peers',
       title: "Shows the caller's own labels only",
       detail:
-        "`labels` is filled for the row of the caller (`X-Annotator-Id`) and `null` on every other row, so nobody can copy a peer's answer before giving their own. The starter shows every annotator's labels to everyone.",
+        "`labels` is filled for the row of the caller (`X-Annotator-Id`) and `null` on every other row, and a read without the header is nobody's, so every row is `null`; nobody can copy a peer's answer before giving their own. The starter shows every annotator's labels to everyone.",
       match: {
         python: {all: [/x-annotator-id/i, /==\s*caller\b|\bcaller\s*==/]},
         typescript: {all: [/x-annotator-id/i, /===\s*caller\b|\bcaller\s*===/]},
@@ -84,7 +84,7 @@ annotator quality review flagged as a spammer still counts, dragging agreement a
       id: 'flagged-excluded',
       title: 'Leaves flagged annotators out of the math',
       detail:
-        'Annotators in `flagged(task_id)` keep their row with `excluded: true` but count toward neither `completed` nor `agreement`. The starter never reads the flag, so a spammer drags agreement down and marks items complete.',
+        'Annotators in `flagged(task_id)` keep their row with `excluded: true` but count toward neither `completed` nor `agreement`: an item is in the agreement only with two labels from annotators who count, and `agreement` is `null` when no item has them. The starter never reads the flag, so a spammer drags agreement down and marks items complete.',
       match: {
         python: {all: [/store\.flagged\(/, /["']excluded["']/]},
         typescript: {all: [/flagged\(/, /excluded/]},
@@ -758,6 +758,7 @@ async def check_tenant_scope(ctx):
         unknown = await _get(c, "t-99")
         none = await c.get(f"/v1/tasks/{task_id}/progress", headers={"X-Annotator-Id": "ana"})
     assert foreign.status_code == 404, f"tenant t2 read tenant t1's task {task_id}: {foreign.status_code} {foreign.text}. Another tenant's task must be 404, as an unknown one"
+    assert foreign.text.replace(task_id, "<id>") == unknown.text.replace("t-99", "<id>"), f"another tenant's task answered {foreign.text!r} and an unknown one {unknown.text!r}: a different answer tells the caller the id exists"
     assert unknown.status_code == 404, f"an unknown task answered {unknown.status_code}, expected 404"
     assert none.status_code == 401, f"a read without X-Tenant-Id answered {none.status_code}, expected 401"
 
@@ -767,6 +768,7 @@ async def check_blind_peers(ctx):
     async with c:
         as_ana = (await _get(c, task_id, annotator="ana")).json()
         as_bo = (await _get(c, task_id, annotator="bo")).json()
+        anonymous = (await c.get(f"/v1/tasks/{task_id}/progress", headers={"X-Tenant-Id": "t1"})).json()
     rows = _rows(as_ana)
     assert rows["ana"].get("labels") == {"i-1": "cat", "i-2": "dog", "i-3": "cat"}, f"ana's own row carries labels {rows['ana'].get('labels')!r}, expected her three labels"
     peeked = {a: row.get("labels") for a, row in rows.items() if a != "ana" and row.get("labels") is not None}
@@ -774,17 +776,26 @@ async def check_blind_peers(ctx):
     rows = _rows(as_bo)
     assert rows["bo"].get("labels") == {"i-1": "cat", "i-2": "cat", "i-3": "cat"} and rows["ana"].get("labels") is None, f"asking as bo, bo's labels are {rows['bo'].get('labels')!r} and ana's {rows['ana'].get('labels')!r}: the caller sees only their own"
     assert rows["ana"].get("submitted") == 3, f"a peer's row must still count what they submitted, ana's row is {rows['ana']}"
+    shown = {a: row.get("labels") for a, row in _rows(anonymous).items() if row.get("labels") is not None}
+    assert len(_rows(anonymous)) == 4 and not shown, f"a read without X-Annotator-Id is nobody's: it showed the labels {shown}, expected labels null on every row"
 
 
 async def check_flagged_excluded(ctx):
     c, task_id = _task(ctx)
+    # Overlap 2, labeled by ana and the flagged spam only: no item has two labels that count.
+    lone = store.create_task("t1", "2026-10", 2, ["a fox", "a bird"])["task_id"]
+    for n, (item_id, value, annotator) in enumerate([("i-1", "cat", "ana"), ("i-2", "dog", "ana"), ("i-1", "dog", "spam"), ("i-2", "cat", "spam")], start=1):
+        store.save_label({"label_id": f"m-{n}", "task_id": lone, "item_id": item_id, "annotator": annotator, "spec_version": "2026-10", "value": value})
+    ctx.redis.sadd(f"flagged:{lone}", "spam")
     async with c:
         body = (await _get(c, task_id)).json()
+        alone = (await _get(c, lone)).json()
     rows = _rows(body)
     assert rows["spam"].get("excluded") is True, f"spam is flagged by quality review and its row is {rows['spam']}, expected excluded: true"
     assert all(rows[a].get("excluded") is False for a in ("ana", "bo", "cy")), f"only spam is flagged, the rows are {rows}"
     assert body.get("agreement") == 0.889, f"agreement is {body.get('agreement')}: without the flagged annotator ana, bo and cy agree on i-1 and i-3 and 2 of 3 on i-2, which is 0.889. The flagged annotator must not count"
     assert body.get("completed") == 2, f"completed is {body.get('completed')}: only i-1 and i-2 have three labels from annotators who count (overlap 3)"
+    assert "agreement" in alone and alone["agreement"] is None and alone.get("completed") == 0, f"task {lone} has one label per item from annotators who count, and answered agreement {alone.get('agreement')!r}, completed {alone.get('completed')!r}: expected agreement null and completed 0"
 `,
     typescript: `// Three items, overlap 3: ana, bo and cy label honestly, spam (flagged by quality review) disagrees on purpose.
 const LABELS: [string, string, string][] = [
@@ -824,6 +835,7 @@ export async function check_tenant_scope(ctx) {
   const unknown = await get(c, 't-99');
   const none = await c.get(\`/v1/tasks/\${taskId}/progress\`, {headers: {'X-Annotator-Id': 'ana'}});
   assert.equal(foreign.status, 404, \`tenant t2 read tenant t1's task \${taskId}: \${foreign.status} \${foreign.text}. Another tenant's task must be 404, as an unknown one\`);
+  assert.equal(foreign.text.replaceAll(taskId, '<id>'), unknown.text.replaceAll('t-99', '<id>'), \`another tenant's task answered \${JSON.stringify(foreign.text)} and an unknown one \${JSON.stringify(unknown.text)}: a different answer tells the caller the id exists\`);
   assert.equal(unknown.status, 404, \`an unknown task answered \${unknown.status}, expected 404\`);
   assert.equal(none.status, 401, \`a read without X-Tenant-Id answered \${none.status}, expected 401\`);
 }
@@ -837,6 +849,9 @@ export async function check_blind_peers(ctx) {
   rows = rowsOf((await get(c, taskId, 't1', 'bo')).json());
   assert(JSON.stringify(rows.bo.labels) === JSON.stringify({'i-1': 'cat', 'i-2': 'cat', 'i-3': 'cat'}) && rows.ana.labels === null, \`asking as bo, bo's labels are \${JSON.stringify(rows.bo.labels)} and ana's \${JSON.stringify(rows.ana.labels)}: the caller sees only their own\`);
   assert.equal(rows.ana.submitted, 3, "a peer's row must still count what they submitted");
+  const anonymous = rowsOf((await c.get(\`/v1/tasks/\${taskId}/progress\`, {headers: {'X-Tenant-Id': 't1'}})).json());
+  const shown = Object.entries(anonymous).filter(([, row]) => (row as {labels: unknown}).labels !== null);
+  assert(Object.keys(anonymous).length === 4 && shown.length === 0, \`a read without X-Annotator-Id is nobody's: it showed the labels \${JSON.stringify(shown)}, expected labels null on every row\`);
 }
 
 export async function check_flagged_excluded(ctx) {
@@ -847,6 +862,16 @@ export async function check_flagged_excluded(ctx) {
   assert(['ana', 'bo', 'cy'].every(a => rows[a].excluded === false), \`only spam is flagged, the rows are \${JSON.stringify(rows)}\`);
   assert.equal(body.agreement, 0.889, \`agreement is \${body.agreement}: without the flagged annotator ana, bo and cy agree on i-1 and i-3 and 2 of 3 on i-2, which is 0.889. The flagged annotator must not count\`);
   assert.equal(body.completed, 2, \`completed is \${body.completed}: only i-1 and i-2 have three labels from annotators who count (overlap 3)\`);
+  // Overlap 2, labeled by ana and the flagged spam only: no item has two labels that count.
+  const store = ctx.load('/support/labeling/store.ts');
+  const lone = (await store.createTask('t1', '2026-10', 2, ['a fox', 'a bird'])).task_id;
+  const loneLabels: [string, string, string][] = [['i-1', 'cat', 'ana'], ['i-2', 'dog', 'ana'], ['i-1', 'dog', 'spam'], ['i-2', 'cat', 'spam']];
+  for (const [n, [item_id, value, annotator]] of loneLabels.entries()) {
+    await store.saveLabel({label_id: \`m-\${n + 1}\`, task_id: lone, item_id, annotator, spec_version: '2026-10', value});
+  }
+  ctx.redis.sadd(\`flagged:\${lone}\`, 'spam');
+  const alone = (await get(c, lone)).json();
+  assert(alone.agreement === null && alone.completed === 0, \`task \${lone} has one label per item from annotators who count, and answered agreement \${JSON.stringify(alone.agreement)}, completed \${JSON.stringify(alone.completed)}: expected agreement null and completed 0\`);
 }
 `,
     go: `package main
@@ -856,6 +881,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 
 	"labeling/store"
 
@@ -918,7 +944,9 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	c, taskID := readTask(ctx)
 	foreign := readGet(c, taskID, "t2", "ana")
 	ctx.Equal(foreign.Status, 404, "tenant t2 read tenant t1's task %s (%s). Another tenant's task must be 404, as an unknown one; the status", taskID, foreign.Text())
-	ctx.Equal(readGet(c, "t-99", "t1", "ana").Status, 404, "an unknown task")
+	unknown := readGet(c, "t-99", "t1", "ana")
+	ctx.Equal(unknown.Status, 404, "an unknown task")
+	ctx.Assert(strings.ReplaceAll(foreign.Text(), taskID, "<id>") == strings.ReplaceAll(unknown.Text(), "t-99", "<id>"), "another tenant's task answered %q and an unknown one %q: a different answer tells the caller the id exists", foreign.Text(), unknown.Text())
 	ctx.Equal(c.Get("/v1/tasks/"+taskID+"/progress", "X-Annotator-Id", "ana").Status, 401, "a read without X-Tenant-Id")
 }
 
@@ -935,6 +963,11 @@ func CheckBlindPeers(ctx *harness.Ctx) {
 	ctx.Equal(rows["bo"]["labels"], map[string]any{"i-1": "cat", "i-2": "cat", "i-3": "cat"}, "asking as bo, bo's own labels")
 	ctx.Assert(rows["ana"]["labels"] == nil, "asking as bo, ana's labels are %v: the caller sees only their own", rows["ana"]["labels"])
 	ctx.Equal(rows["ana"]["submitted"], float64(3), "a peer's row must still count what they submitted; ana's submitted")
+	_, anonymous := readBody(ctx, c.Get("/v1/tasks/"+taskID+"/progress", "X-Tenant-Id", "t1"))
+	ctx.Equal(len(anonymous), 4, "a read without X-Annotator-Id must still list every annotator; the rows")
+	for name, row := range anonymous {
+		ctx.Assert(row["labels"] == nil, "a read without X-Annotator-Id is nobody's: it showed %s's labels %v, expected labels null on every row", name, row["labels"])
+	}
 }
 
 func CheckFlaggedExcluded(ctx *harness.Ctx) {
@@ -946,6 +979,16 @@ func CheckFlaggedExcluded(ctx *harness.Ctx) {
 	}
 	ctx.Equal(body["agreement"], 0.889, "without the flagged annotator ana, bo and cy agree on i-1 and i-3 and 2 of 3 on i-2, which is 0.889; the flagged annotator must not count. agreement")
 	ctx.Equal(body["completed"], float64(2), "only i-1 and i-2 have three labels from annotators who count (overlap 3); completed")
+	// Overlap 2, labeled by ana and the flagged spam only: no item has two labels that count.
+	bg := context.Background()
+	lone := store.CreateTask(bg, "t1", "2026-10", 2, []string{"a fox", "a bird"}).TaskID
+	for n, l := range [][3]string{{"i-1", "cat", "ana"}, {"i-2", "dog", "ana"}, {"i-1", "dog", "spam"}, {"i-2", "cat", "spam"}} {
+		store.SaveLabel(bg, store.Label{LabelID: fmt.Sprintf("m-%d", n+1), TaskID: lone, ItemID: l[0], Annotator: l[2], SpecVersion: "2026-10", Value: l[1]})
+	}
+	ctx.Redis.Do("SADD", "flagged:"+lone, "spam")
+	alone, _ := readBody(ctx, readGet(c, lone, "t1", "ana"))
+	agreement, present := alone["agreement"]
+	ctx.Assert(present && agreement == nil && alone["completed"] == float64(0), "task %s has one label per item from annotators who count, and answered agreement %v, completed %v: expected agreement null and completed 0", lone, agreement, alone["completed"])
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1018,7 +1061,13 @@ void CheckTenantScope(harness::Ctx& ctx) {
   auto [c, task_id] = readTask(ctx);
   const auto foreign = readGet(c, task_id, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 read tenant t1's task %s (%s). Another tenant's task must be 404, as an unknown one; the status", task_id, foreign.Text());
-  ctx.Equal(readGet(c, "t-99").Status, 404, "an unknown task");
+  const auto unknown = readGet(c, "t-99");
+  ctx.Equal(unknown.Status, 404, "an unknown task");
+  const auto masked = [](std::string text, const std::string& id) {
+    for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "<id>");
+    return text;
+  };
+  ctx.Assert(masked(foreign.Text(), task_id) == masked(unknown.Text(), "t-99"), "another tenant's task answered %q and an unknown one %q: a different answer tells the caller the id exists", foreign.Text(), unknown.Text());
   ctx.Equal(c.Get("/v1/tasks/" + task_id + "/progress", "X-Annotator-Id", "ana").Status, 401, "a read without X-Tenant-Id");
 }
 
@@ -1034,6 +1083,11 @@ void CheckBlindPeers(harness::Ctx& ctx) {
   ctx.Equal(field(rows["bo"], "labels"), json{{"i-1", "cat"}, {"i-2", "cat"}, {"i-3", "cat"}}, "asking as bo, bo's own labels");
   ctx.Assert(field(rows["ana"], "labels").is_null(), "asking as bo, ana's labels are %s: the caller sees only their own", field(rows["ana"], "labels").dump());
   ctx.Equal(field(rows["ana"], "submitted"), json(3), "a peer's row must still count what they submitted; ana's submitted");
+  const json anonymous = rowsOf(ctx, c.Get("/v1/tasks/" + task_id + "/progress", "X-Tenant-Id", "t1"));
+  ctx.Equal(anonymous.size(), 4, "a read without X-Annotator-Id must still list every annotator; the rows");
+  for (const auto& [name, row] : anonymous.items()) {
+    ctx.Assert(field(row, "labels").is_null(), "a read without X-Annotator-Id is nobody's: it showed %s's labels %s, expected labels null on every row", name, field(row, "labels").dump());
+  }
 }
 
 void CheckFlaggedExcluded(harness::Ctx& ctx) {
@@ -1045,6 +1099,16 @@ void CheckFlaggedExcluded(harness::Ctx& ctx) {
   for (const std::string name : {"ana", "bo", "cy"}) ctx.Equal(field(rows[name], "excluded"), json(false), "only spam is flagged: %s's excluded", name);
   ctx.Equal(field(body, "agreement"), json(0.889), "without the flagged annotator ana, bo and cy agree on i-1 and i-3 and 2 of 3 on i-2, which is 0.889; the flagged annotator must not count. agreement");
   ctx.Equal(field(body, "completed"), json(2), "only i-1 and i-2 have three labels from annotators who count (overlap 3); completed");
+  // Overlap 2, labeled by ana and the flagged spam only: no item has two labels that count.
+  const std::string lone = store::createTask("t1", "2026-10", 2, {"a fox", "a bird"}).task_id;
+  const std::vector<std::tuple<std::string, std::string, std::string>> loneLabels = {{"i-1", "cat", "ana"}, {"i-2", "dog", "ana"}, {"i-1", "dog", "spam"}, {"i-2", "cat", "spam"}};
+  int n = 0;
+  for (const auto& [item_id, value, annotator] : loneLabels) {
+    store::saveLabel(store::Label{"m-" + std::to_string(++n), lone, item_id, annotator, "2026-10", value});
+  }
+  ctx.Redis.Do("SADD", "flagged:" + lone, "spam");
+  const json alone = json::parse(readGet(c, lone).Text(), nullptr, false);
+  ctx.Assert(alone.is_object() && alone.contains("agreement") && alone["agreement"].is_null() && field(alone, "completed") == json(0), "task %s has one label per item from annotators who count, and answered agreement %s, completed %s: expected agreement null and completed 0", lone, field(alone, "agreement").dump(), field(alone, "completed").dump());
 }
 `,
   },

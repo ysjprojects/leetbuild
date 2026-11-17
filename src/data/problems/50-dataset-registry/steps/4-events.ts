@@ -24,9 +24,10 @@ reported as sent and lost.
 - The record key is the **dataset name**.
 - The payload carries identity and outcome only: no \`sample\`, no row of the object.
 - **Commit first**: \`pointer.promote\`, then produce.
-- Wait for the delivery report (\`on_delivery\` with \`flush\`, at most \`DELIVERY_TIMEOUT_S\` = 5 s;
-  kafkajs: the awaited \`send\`; kafka-go: the error \`WriteMessages\` returns). A failed or missing
-  report writes the outbox row with the topic, the key and the payload, and returns \`False\`.`,
+- Wait for the delivery report at most \`DELIVERY_TIMEOUT_S\` = 5 s (\`on_delivery\` with \`flush\`;
+  kafkajs: the awaited \`send\` with its \`timeout\`; kafka-go: the error \`WriteMessages\` returns under
+  a 5-second context). A failed or missing report writes the outbox row with the topic, the key and
+  the payload, and returns \`False\`.`,
   sequence: {
     participants: ['registryd', 'Redis pointer', 'dataset.event', 'Outbox'],
     messages: [
@@ -84,7 +85,7 @@ reported as sent and lost.
       id: 'outbox',
       title: 'A failed delivery lands in the outbox',
       detail:
-        'The delivery report (or the awaited send, or the returned write error) decides: a failure or no report in time writes the outbox row and returns false. The starter only catches errors from enqueueing, which a broker failure never raises.',
+        'The delivery report (or the awaited send, or the returned write error) decides, within 5 seconds: a refused delivery, or a stalled broker that gives no report in that window, writes the outbox row and returns false. The starter only catches errors from enqueueing, which a broker failure never raises.',
       match: {
         python: {
           all: [/on_delivery\s*=|callback\s*=/, /producer\.flush\(/, /store\.add_outbox\(/],
@@ -339,6 +340,9 @@ import (
 
 const eventTopic = "dataset.event"
 
+// deliveryTimeout bounds the wait for the broker's answer; past it the event goes to the outbox.
+const deliveryTimeout = 5 * time.Second
+
 // WriteMessages returns once the broker answered: its error is the delivery report.
 var writer = &kafka.Writer{Addr: kafka.TCP("kafka:9092"), Topic: eventTopic, Balancer: &kafka.Hash{}, RequiredAcks: kafka.RequireAll, BatchTimeout: 20 * time.Millisecond}
 
@@ -362,7 +366,9 @@ func publishPromotion(ctx context.Context, dataset, version, actor string) (bool
 	}
 	payload := eventPayload(record, actor)
 	value, _ := json.Marshal(payload)
-	if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(dataset), Value: value}); err != nil {
+	writeCtx, cancel := context.WithTimeout(ctx, deliveryTimeout)
+	defer cancel()
+	if err := writer.WriteMessages(writeCtx, kafka.Message{Key: []byte(dataset), Value: value}); err != nil {
 		// The broker did not take it: a relay produces the row later, so consumers are late, not wrong.
 		if err := store.AddOutbox(ctx, eventTopic, dataset, payload); err != nil {
 			return false, err
@@ -617,7 +623,7 @@ def check_no_content_sample(ctx):
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one promotion produced {len(records)} records"
     raw = records[0].value.decode()
-    assert "review 1" not in raw and "sample" not in json.loads(raw), f"the event carries rows of the dataset: {raw}. The topic is retained and replicated past the dataset's access rules; carry identity, not content"
+    assert not any(f"review {i}" in raw for i in (1, 2, 3)) and "sample" not in json.loads(raw), f"the event carries rows of the dataset: {raw}. The topic is retained and replicated past the dataset's access rules; carry identity, not content"
     payload = json.loads(raw)
     expected = {"type": "dataset.promoted", "dataset": "imdb-reviews", "version": "2026-01", "actor": "alice", "row_count": 3}
     for name, value in expected.items():
@@ -647,6 +653,16 @@ def check_outbox(ctx):
     assert pointer.latest("imdb-reviews") == "2026-01", "the promotion itself must stand when only the event failed"
     assert m.publish_promotion("imdb-reviews", "2026-02", "alice") is True, "with the broker healthy again the promotion must return True"
     assert len(_outbox(ctx)) == 1, "a delivered event must not add an outbox row"
+    ctx.kafka.stall(TOPIC)
+    before = ctx.clock.time()
+    ok = m.publish_promotion("wiki-text", "2026-01", "alice")
+    waited = ctx.clock.time() - before
+    ctx.kafka.resume(TOPIC)
+    assert waited <= 5.5, f"with the broker stalled, publish_promotion waited {waited:.1f} s for the delivery report, expected at most DELIVERY_TIMEOUT_S = 5 s"
+    rows = _outbox(ctx)
+    assert len(rows) == 2 and rows[1].get("key") == "wiki-text", f"with the broker stalled past the 5 s window, no delivery report came and the outbox holds {rows}: a missing report must write the row too"
+    assert ok is False, f"publish_promotion returned {ok!r} with no delivery report in 5 s, expected False"
+    assert pointer.latest("wiki-text") == "2026-01", "the promotion itself must stand when the broker is stalled"
 `,
     typescript: `const TOPIC = 'dataset.event';
 const ROWS = '1,review 1,pos\\n2,review 2,neg\\n3,review 3,pos\\n';
@@ -684,7 +700,7 @@ export async function check_no_content_sample(ctx) {
   assert.equal(records.length, 1, \`one promotion produced \${records.length} records\`);
   const raw = records[0].value.toString();
   const payload = JSON.parse(raw);
-  assert(!raw.includes('review 1') && !('sample' in payload), \`the event carries rows of the dataset: \${raw}. The topic is retained and replicated past the dataset's access rules; carry identity, not content\`);
+  assert(![1, 2, 3].some(i => raw.includes(\`review \${i}\`)) && !('sample' in payload), \`the event carries rows of the dataset: \${raw}. The topic is retained and replicated past the dataset's access rules; carry identity, not content\`);
   const expected = {type: 'dataset.promoted', dataset: 'imdb-reviews', version: '2026-01', actor: 'alice', row_count: 3};
   for (const [name, value] of Object.entries(expected)) assert.equal(payload[name], value, \`the event's \${name}\`);
   assert.equal(payload.content_sha256, (await store.version('imdb-reviews', '2026-01')).content_sha256, 'the event must carry the content hash');
@@ -711,6 +727,16 @@ export async function check_outbox(ctx) {
   assert.equal(await pointer.latest('imdb-reviews'), '2026-01', 'the promotion itself must stand when only the event failed');
   assert.equal(await m.publishPromotion('imdb-reviews', '2026-02', 'alice'), true, 'with the broker healthy again the promotion must return true');
   assert.equal(outbox(ctx).length, 1, 'a delivered event must not add an outbox row');
+  ctx.kafka.stall(TOPIC);
+  const before = ctx.clock.now();
+  const stalled = await m.publishPromotion('wiki-text', '2026-01', 'alice');
+  const waited = (ctx.clock.now() - before) / 1000;
+  ctx.kafka.resume(TOPIC);
+  assert(waited <= 5.5, \`with the broker stalled, publishPromotion waited \${waited} s for the delivery, expected at most DELIVERY_TIMEOUT_MS = 5000\`);
+  const after = outbox(ctx);
+  assert(after.length === 2 && after[1].key === 'wiki-text', \`with the broker stalled past the 5 s window the send never succeeded and the outbox holds \${JSON.stringify(after)}: a delivery that times out must write the row too\`);
+  assert.equal(stalled, false, 'publishPromotion must return false when the delivery times out');
+  assert.equal(await pointer.latest('wiki-text'), '2026-01', 'the promotion itself must stand when the broker is stalled');
 }
 `,
     go: `package main
@@ -783,7 +809,7 @@ func CheckNoContentSample(ctx *harness.Ctx) {
 	var payload map[string]any
 	ctx.Assert(json.Unmarshal(records[0].Value, &payload) == nil, "the record's value is not JSON: %s", raw)
 	_, sampled := payload["sample"]
-	ctx.Assert(!strings.Contains(raw, "review 1") && !sampled, "the event carries rows of the dataset: %s. The topic is retained and replicated past the dataset's access rules; carry identity, not content", raw)
+	ctx.Assert(!strings.Contains(raw, "review 1") && !strings.Contains(raw, "review 2") && !strings.Contains(raw, "review 3") && !sampled, "the event carries rows of the dataset: %s. The topic is retained and replicated past the dataset's access rules; carry identity, not content", raw)
 	ctx.Equal(payload["type"], "dataset.promoted", "the event's type")
 	ctx.Equal(payload["dataset"], "imdb-reviews", "the event's dataset")
 	ctx.Equal(payload["version"], "2026-01", "the event's version")
@@ -813,6 +839,18 @@ func CheckOutbox(ctx *harness.Ctx) {
 	ctx.Equal(eventsLatest(ctx), "2026-01", "the promotion itself must stand when only the event failed; the latest")
 	ctx.Assert(eventsPublish(ctx, "imdb-reviews", "2026-02"), "with the broker healthy again the promotion must return true")
 	ctx.Equal(len(eventsOutbox(ctx)), 1, "a delivered event must not add an outbox row; the outbox rows")
+	ctx.Kafka.Stall(eventsTopic)
+	before := ctx.Clock.Now()
+	stalled := eventsPublish(ctx, "wiki-text", "2026-01")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Kafka.Resume(eventsTopic)
+	ctx.Assert(waited <= 5.5, "with the broker stalled, publishPromotion waited %.1f s for the delivery, expected at most deliveryTimeout = 5 s", waited)
+	after := eventsOutbox(ctx)
+	ctx.Assert(len(after) == 2 && after[1]["key"] == "wiki-text", "with the broker stalled past the 5 s window the write never succeeded and the outbox holds %v: a write that times out must add the row too", after)
+	ctx.Equal(stalled, false, "publishPromotion with the broker stalled returned")
+	latest, err := pointer.Latest(eventsBg, "wiki-text")
+	ctx.NoError(err, "reading the latest wiki-text version")
+	ctx.Equal(latest, "2026-01", "the promotion itself must stand when the broker is stalled; the latest")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -875,7 +913,7 @@ void CheckNoContentSample(harness::Ctx& ctx) {
   const std::string raw = records[0].Value.value_or("");
   const json payload = json::parse(raw, nullptr, false);
   ctx.Assert(payload.is_object(), "the record's value is not JSON: %s", raw);
-  ctx.Assert(raw.find("review 1") == std::string::npos && !payload.contains("sample"),
+  ctx.Assert(raw.find("review 1") == std::string::npos && raw.find("review 2") == std::string::npos && raw.find("review 3") == std::string::npos && !payload.contains("sample"),
              "the event carries rows of the dataset: %s. The topic is retained and replicated past the dataset's access rules; carry identity, not content", raw);
   ctx.Equal(payload.value("type", ""), "dataset.promoted", "the event's type");
   ctx.Equal(payload.value("dataset", ""), "imdb-reviews", "the event's dataset");
@@ -907,6 +945,17 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Equal(pointer::latest("imdb-reviews"), "2026-01", "the promotion itself must stand when only the event failed; the latest");
   ctx.Assert(publishPromotion("imdb-reviews", "2026-02", "alice"), "with the broker healthy again the promotion must return true");
   ctx.Equal(outbox(ctx).size(), 1, "a delivered event must not add an outbox row; the outbox rows");
+  ctx.Kafka.Stall(kTopic);
+  const auto before = ctx.Clock.Now();
+  const bool stalled = publishPromotion("wiki-text", "2026-01", "alice");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Kafka.Resume(kTopic);
+  ctx.Assert(waited <= 5.5, "with the broker stalled, publishPromotion waited %v s for the delivery report, expected at most kDeliveryTimeoutMs = 5000", waited);
+  const auto after = outbox(ctx);
+  ctx.Assert(after.size() == 2 && after[1].value("key", "") == "wiki-text",
+             "with the broker stalled past the 5 s window no delivery report came and the outbox holds %s: a missing report must write the row too", json(after).dump());
+  ctx.Equal(stalled, false, "publishPromotion with the broker stalled returned");
+  ctx.Equal(pointer::latest("wiki-text"), "2026-01", "the promotion itself must stand when the broker is stalled; the latest");
 }
 `,
   },

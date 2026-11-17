@@ -87,7 +87,7 @@ millisecond share one id, so the second overwrites the first.
       id: 'recipe-version',
       title: 'Rejects an unknown recipe before anything is written',
       detail:
-        'A `recipe_version` outside `KNOWN_RECIPES` is **400**, with no run row and no queue entry. The starter queues whatever it is sent.',
+        'A `recipe_version` outside `KNOWN_RECIPES` is **400**, with no run row, no queue entry and no key bound: the same `Idempotency-Key` resent with a known recipe then creates the run. The starter queues whatever it is sent.',
       match: {
         python: {all: [/not in KNOWN_RECIPES/, /\b400\b/], order: [/not in KNOWN_RECIPES/, /queue\.enqueue\(/]},
         typescript: {all: [/KNOWN_RECIPES\.has\(/, /\b400\b/], order: [/KNOWN_RECIPES\.has\(/, /enqueue\(run/]},
@@ -106,7 +106,7 @@ millisecond share one id, so the second overwrites the first.
       id: 'idempotency',
       title: 'A retry of (tenant, Idempotency-Key) answers the run it created',
       detail:
-        '`Idempotency-Key` is required (**400**); the key is looked up with `run_for_key` before anything is queued and a new run is bound with `bind_key`, so a retry answers **200** with the same `run_id` and the queue holds one entry. The starter ignores the header.',
+        '`Idempotency-Key` is required (**400**); the key is looked up with `run_for_key` before anything is written and a new run is bound with `bind_key`, so a retry answers **200** with the run it created (its id, priority and band, even when the retry sends another priority), the store keeps one row and the queue one entry. The starter ignores the header.',
       match: {
         python: {
           all: [/idempotency-key/i, /runs\.run_for_key\(/, /runs\.bind_key\(/],
@@ -766,18 +766,24 @@ async def check_priority_band(ctx):
 async def check_recipe_version(ctx):
     async with _api(ctx) as c:
         r = await _submit(c, {**GOOD, "recipe_version": "llama-ft-v33"})
-    assert r.status_code == 400, f"an unknown recipe_version answered {r.status_code}, expected 400"
-    assert ctx.redis.zcard("training:queue") == 0, f"an unknown recipe was queued: training:queue holds {ctx.redis.zrange('training:queue', 0, -1)}"
-    assert ctx.redis.keys("run:run-*") == [], f"an unknown recipe left a run row: {ctx.redis.keys('run:run-*')}"
+        assert r.status_code == 400, f"an unknown recipe_version answered {r.status_code}, expected 400"
+        assert ctx.redis.zcard("training:queue") == 0, f"an unknown recipe was queued: training:queue holds {ctx.redis.zrange('training:queue', 0, -1)}"
+        assert ctx.redis.keys("run:run-*") == [], f"an unknown recipe left a run row: {ctx.redis.keys('run:run-*')}"
+        fixed = await _submit(c)
+    assert fixed.status_code == 201, f"the same Idempotency-Key resent with a known recipe after the 400 answered {fixed.status_code}: {fixed.text}. The rejected request must not bind the key"
+    assert ctx.redis.zcard("training:queue") == 1, f"the corrected submission left {ctx.redis.zcard('training:queue')} runs in training:queue, expected 1"
 
 
 async def check_idempotency(ctx):
     async with _api(ctx) as c:
         first = _created(await _submit(c, key="k-1"), "the first submission")
-        retry = await _submit(c, key="k-1")
+        retry = await _submit(c, {**GOOD, "priority": 1}, key="k-1")
         assert retry.status_code == 200, f"a retry with the same Idempotency-Key answered {retry.status_code}, expected 200 with the run it created"
-        assert retry.json().get("run_id") == first["run_id"], f"the retry answered run {retry.json().get('run_id')}, the first submission created {first['run_id']}"
+        replay = retry.json()
+        assert replay.get("run_id") == first["run_id"], f"the retry answered run {replay.get('run_id')}, the first submission created {first['run_id']}"
+        assert (replay.get("priority"), replay.get("band")) == (first["priority"], first["band"]), f"a retry sent with priority 1 answered {replay}: answer the stored run the key created, priority {first['priority']} in band {first['band']}"
         assert ctx.redis.zcard("training:queue") == 1, f"one submission retried once queued {ctx.redis.zcard('training:queue')} runs"
+        assert len(ctx.redis.keys("run:run-*")) == 1, f"one submission retried once left run rows {sorted(ctx.redis.keys('run:run-*'))}: look the key up before writing anything"
         other = _created(await _submit(c, tenant="t2", key="k-1"), "another tenant's submission with the same key")
         assert other["run_id"] != first["run_id"], "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant"
         none = await _submit(c, key=None)
@@ -838,15 +844,21 @@ export async function check_recipe_version(ctx) {
   assert.equal(r.status, 400, \`an unknown recipe_version answered \${r.status}, expected 400\`);
   assert.equal(ctx.redis.zcard('training:queue'), 0, \`an unknown recipe was queued: training:queue holds \${JSON.stringify(ctx.redis.zrange('training:queue', 0, -1))}\`);
   assert.deepEqual(ctx.redis.keys('run:run-*'), [], \`an unknown recipe left a run row: \${JSON.stringify(ctx.redis.keys('run:run-*'))}\`);
+  const fixed = await submit(c);
+  assert.equal(fixed.status, 201, \`the same Idempotency-Key resent with a known recipe after the 400 answered \${fixed.status}: \${fixed.text}. The rejected request must not bind the key\`);
+  assert.equal(ctx.redis.zcard('training:queue'), 1, \`the corrected submission left \${ctx.redis.zcard('training:queue')} runs in training:queue, expected 1\`);
 }
 
 export async function check_idempotency(ctx) {
   const {c} = api(ctx);
   const first = created(await submit(c, GOOD, 't1', 'k-1'), 'the first submission');
-  const retry = await submit(c, GOOD, 't1', 'k-1');
+  const retry = await submit(c, {...GOOD, priority: 1}, 't1', 'k-1');
   assert.equal(retry.status, 200, \`a retry with the same Idempotency-Key answered \${retry.status}, expected 200 with the run it created\`);
-  assert.equal(retry.json().run_id, first.run_id, \`the retry answered run \${retry.json().run_id}, the first submission created \${first.run_id}\`);
+  const replay = retry.json();
+  assert.equal(replay.run_id, first.run_id, \`the retry answered run \${replay.run_id}, the first submission created \${first.run_id}\`);
+  assert(replay.priority === first.priority && replay.band === first.band, \`a retry sent with priority 1 answered \${JSON.stringify(replay)}: answer the stored run the key created, priority \${first.priority} in band \${first.band}\`);
   assert.equal(ctx.redis.zcard('training:queue'), 1, \`one submission retried once queued \${ctx.redis.zcard('training:queue')} runs\`);
+  assert.equal(ctx.redis.keys('run:run-*').length, 1, \`one submission retried once left run rows \${JSON.stringify(ctx.redis.keys('run:run-*'))}: look the key up before writing anything\`);
   const other = created(await submit(c, GOOD, 't2', 'k-1'), "another tenant's submission with the same key");
   assert.notEqual(other.run_id, first.run_id, "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant");
   const none = await submit(c, GOOD, 't1', null);
@@ -874,24 +886,24 @@ import (
 	"leetbuild/harness"
 )
 
-var good = map[string]any{"dataset_version": "ds-2026-10", "recipe_version": "llama-ft-v3", "priority": 5}
+var hGood = map[string]any{"dataset_version": "ds-2026-10", "recipe_version": "llama-ft-v3", "priority": 5}
 
-func withField(name string, value any) map[string]any {
+func hWithField(name string, value any) map[string]any {
 	out := map[string]any{}
-	for k, v := range good {
+	for k, v := range hGood {
 		out[k] = v
 	}
 	out[name] = value
 	return out
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func post(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
+func hPost(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
 	header := []string{}
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -902,21 +914,21 @@ func post(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Res
 	return c.Post("/v1/training/runs", body, header...)
 }
 
-type answer struct {
+type hAnswer struct {
 	RunID    string \`json:"run_id"\`
 	State    string \`json:"state"\`
 	Priority int    \`json:"priority"\`
 	Band     int    \`json:"band"\`
 }
 
-func created(ctx *harness.Ctx, r *harness.Response, what string) answer {
+func hCreated(ctx *harness.Ctx, r *harness.Response, what string) hAnswer {
 	ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text())
-	var a answer
+	var a hAnswer
 	r.Decode(&a)
 	return a
 }
 
-func queued(ctx *harness.Ctx) []string {
+func hQueued(ctx *harness.Ctx) []string {
 	out := []string{}
 	for _, z := range ctx.Redis.ZRangeWithScores("training:queue", 0, -1) {
 		out = append(out, z.Member)
@@ -925,8 +937,8 @@ func queued(ctx *harness.Ctx) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	a := created(ctx, post(c, good, "t1", "k-1"), "a valid submission")
+	c := hAPI(ctx)
+	a := hCreated(ctx, hPost(c, hGood, "t1", "k-1"), "a valid submission")
 	ctx.Assert(a.State == "queued" && a.RunID != "", "the answer must carry the run id and state queued, got %+v", a)
 	run := runs.Get(context.Background(), a.RunID)
 	ctx.Assert(run != nil && run.Tenant == "t1" && run.RecipeVersion == "llama-ft-v3", "the run store holds %+v for %s", run, a.RunID)
@@ -935,48 +947,53 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckPriorityBand(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := created(ctx, post(c, withField("priority", 8), "t1", "k-1"), "a priority-8 submission")
+	c := hAPI(ctx)
+	first := hCreated(ctx, hPost(c, hWithField("priority", 8), "t1", "k-1"), "a priority-8 submission")
 	ctx.Clock.Advance(1)
-	greedy := created(ctx, post(c, withField("priority", 999999), "t1", "k-2"), "a priority-999999 submission")
-	low := created(ctx, post(c, withField("priority", -5), "t1", "k-3"), "a priority -5 submission")
+	greedy := hCreated(ctx, hPost(c, hWithField("priority", 999999), "t1", "k-2"), "a priority-999999 submission")
+	low := hCreated(ctx, hPost(c, hWithField("priority", -5), "t1", "k-3"), "a priority -5 submission")
 	ctx.Assert(greedy.Priority == 8 && greedy.Band == 0, "priority 999999 was answered as %+v: clamp it to 8 first, which is band 0", greedy)
 	ctx.Assert(low.Priority == 0 && low.Band == 2, "priority -5 was answered as %+v: clamp it to 0 first, which is band 2", low)
-	order := queued(ctx)
+	order := hQueued(ctx)
 	ctx.Assert(len(order) >= 2 && order[0] == first.RunID && order[1] == greedy.RunID, "training:queue is ordered %v: the priority-8 run submitted first must stay ahead of the clamped 999999, not behind it", order)
 }
 
 func CheckRecipeVersion(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, withField("recipe_version", "llama-ft-v33"), "t1", "k-1")
+	c := hAPI(ctx)
+	r := hPost(c, hWithField("recipe_version", "llama-ft-v33"), "t1", "k-1")
 	ctx.Equal(r.Status, 400, "an unknown recipe_version must be rejected; the status")
-	ctx.Equal(len(queued(ctx)), 0, "an unknown recipe must not be queued; the runs in training:queue")
+	ctx.Equal(len(hQueued(ctx)), 0, "an unknown recipe must not be queued; the runs in training:queue")
 	ctx.Equal(len(ctx.Redis.Keys("run:run-*")), 0, "an unknown recipe must not leave a run row; the rows")
+	fixed := hPost(c, hGood, "t1", "k-1")
+	ctx.Equal(fixed.Status, 201, "the same Idempotency-Key resent with a known recipe after the 400 (%s) must create the run: the rejected request must not bind the key; the status", fixed.Text())
+	ctx.Equal(len(hQueued(ctx)), 1, "the corrected submission; the runs in training:queue")
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := created(ctx, post(c, good, "t1", "k-1"), "the first submission")
-	retry := post(c, good, "t1", "k-1")
+	c := hAPI(ctx)
+	first := hCreated(ctx, hPost(c, hGood, "t1", "k-1"), "the first submission")
+	retry := hPost(c, hWithField("priority", 1), "t1", "k-1")
 	ctx.Equal(retry.Status, 200, "a retry with the same Idempotency-Key must answer the run it created; the status")
-	var replay answer
+	var replay hAnswer
 	retry.Decode(&replay)
 	ctx.Equal(replay.RunID, first.RunID, "the retry's run id")
-	ctx.Equal(len(queued(ctx)), 1, "one submission retried once; the runs in training:queue")
-	other := created(ctx, post(c, good, "t2", "k-1"), "another tenant's submission with the same key")
+	ctx.Assert(replay.Priority == first.Priority && replay.Band == first.Band, "a retry sent with priority 1 answered %+v: answer the stored run the key created, priority %d in band %d", replay, first.Priority, first.Band)
+	ctx.Equal(len(hQueued(ctx)), 1, "one submission retried once; the runs in training:queue")
+	ctx.Equal(len(ctx.Redis.Keys("run:run-*")), 1, "one submission retried once must leave one run row (look the key up before writing anything); the rows")
+	other := hCreated(ctx, hPost(c, hGood, "t2", "k-1"), "another tenant's submission with the same key")
 	ctx.Assert(other.RunID != first.RunID, "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant")
-	none := post(c, good, "t1", "")
+	none := hPost(c, hGood, "t1", "")
 	ctx.Equal(none.Status, 400, "a submission without Idempotency-Key; the status")
 }
 
 func CheckUniqueRunId(ctx *harness.Ctx) {
-	c := api(ctx)
-	a := created(ctx, post(c, good, "t1", "k-1"), "the first submission")
-	b := created(ctx, post(c, withField("recipe_version", "vit-pretrain-v1"), "t1", "k-2"), "the second submission")
+	c := hAPI(ctx)
+	a := hCreated(ctx, hPost(c, hGood, "t1", "k-1"), "the first submission")
+	b := hCreated(ctx, hPost(c, hWithField("recipe_version", "vit-pretrain-v1"), "t1", "k-2"), "the second submission")
 	ctx.Assert(a.RunID != b.RunID, "two submissions in the same millisecond both got %s: take the id from runs.NewRunID", a.RunID)
 	run := runs.Get(context.Background(), a.RunID)
 	ctx.Assert(run != nil && run.RecipeVersion == "llama-ft-v3", "the first run's row now reads %+v: the second submission overwrote it", run)
-	ctx.Equal(len(queued(ctx)), 2, "two submissions; the runs in training:queue")
+	ctx.Equal(len(hQueued(ctx)), 2, "two submissions; the runs in training:queue")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -988,17 +1005,17 @@ func CheckUniqueRunId(ctx *harness.Ctx) {
 
 namespace {
 
-nlohmann::json good() {
+nlohmann::json hGood() {
   return nlohmann::json{{"dataset_version", "ds-2026-10"}, {"recipe_version", "llama-ft-v3"}, {"priority", 5}};
 }
 
-nlohmann::json withField(const std::string& name, const nlohmann::json& value) {
-  nlohmann::json out = good();
+nlohmann::json hWithField(const std::string& name, const nlohmann::json& value) {
+  nlohmann::json out = hGood();
   out[name] = value;
   return out;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1006,27 +1023,27 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& body, const std::string& tenant, const std::string& key) {
   const std::string text = body.dump();
   if (tenant.empty()) return c.Post("/v1/training/runs", text, "Content-Type", "application/json", "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/training/runs", text, "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/training/runs", text, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json created(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+nlohmann::json hCreated(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text());
   return nlohmann::json::parse(r.Text(), nullptr, false);
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
-long long number(const nlohmann::json& j, const std::string& name) {
+long long hNumber(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_number() ? j[name].get<long long>() : -1;
 }
 
-std::vector<std::string> queued(harness::Ctx& ctx) {
+std::vector<std::string> hQueued(harness::Ctx& ctx) {
   std::vector<std::string> out;
   for (const auto& z : ctx.Redis.ZRangeWithScores("training:queue", 0, -1)) out.push_back(z.Member);
   return out;
@@ -1035,56 +1052,63 @@ std::vector<std::string> queued(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto a = created(ctx, post(c, good(), "t1", "k-1"), "a valid submission");
-  ctx.Assert(field(a, "state") == "queued" && !field(a, "run_id").empty(), "the answer must carry the run id and state queued, got %s", a.dump());
-  const auto run = runs::get(field(a, "run_id"));
-  ctx.Assert(run && run->tenant == "t1" && run->recipe_version == "llama-ft-v3", "the run store has no row for %s with tenant t1 and recipe llama-ft-v3", field(a, "run_id"));
-  ctx.Assert(ctx.Redis.ZScore("training:queue", field(a, "run_id")).has_value(), "%s is not in training:queue", field(a, "run_id"));
+  auto c = hAPI(ctx);
+  const auto a = hCreated(ctx, hPost(c, hGood(), "t1", "k-1"), "a valid submission");
+  ctx.Assert(hField(a, "state") == "queued" && !hField(a, "run_id").empty(), "the answer must carry the run id and state queued, got %s", a.dump());
+  const auto run = runs::get(hField(a, "run_id"));
+  ctx.Assert(run && run->tenant == "t1" && run->recipe_version == "llama-ft-v3", "the run store has no row for %s with tenant t1 and recipe llama-ft-v3", hField(a, "run_id"));
+  ctx.Assert(ctx.Redis.ZScore("training:queue", hField(a, "run_id")).has_value(), "%s is not in training:queue", hField(a, "run_id"));
 }
 
 void CheckPriorityBand(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = created(ctx, post(c, withField("priority", 8), "t1", "k-1"), "a priority-8 submission");
+  auto c = hAPI(ctx);
+  const auto first = hCreated(ctx, hPost(c, hWithField("priority", 8), "t1", "k-1"), "a priority-8 submission");
   ctx.Clock.Advance(1);
-  const auto greedy = created(ctx, post(c, withField("priority", 999999), "t1", "k-2"), "a priority-999999 submission");
-  const auto low = created(ctx, post(c, withField("priority", -5), "t1", "k-3"), "a priority -5 submission");
-  ctx.Assert(number(greedy, "priority") == 8 && number(greedy, "band") == 0, "priority 999999 was answered as %s: clamp it to 8 first, which is band 0", greedy.dump());
-  ctx.Assert(number(low, "priority") == 0 && number(low, "band") == 2, "priority -5 was answered as %s: clamp it to 0 first, which is band 2", low.dump());
-  const auto order = queued(ctx);
-  ctx.Assert(order.size() >= 2 && order[0] == field(first, "run_id") && order[1] == field(greedy, "run_id"),
+  const auto greedy = hCreated(ctx, hPost(c, hWithField("priority", 999999), "t1", "k-2"), "a priority-999999 submission");
+  const auto low = hCreated(ctx, hPost(c, hWithField("priority", -5), "t1", "k-3"), "a priority -5 submission");
+  ctx.Assert(hNumber(greedy, "priority") == 8 && hNumber(greedy, "band") == 0, "priority 999999 was answered as %s: clamp it to 8 first, which is band 0", greedy.dump());
+  ctx.Assert(hNumber(low, "priority") == 0 && hNumber(low, "band") == 2, "priority -5 was answered as %s: clamp it to 0 first, which is band 2", low.dump());
+  const auto order = hQueued(ctx);
+  ctx.Assert(order.size() >= 2 && order[0] == hField(first, "run_id") && order[1] == hField(greedy, "run_id"),
              "training:queue is ordered %q: the priority-8 run submitted first must stay ahead of the clamped 999999, not behind it", order);
 }
 
 void CheckRecipeVersion(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, withField("recipe_version", "llama-ft-v33"), "t1", "k-1");
+  auto c = hAPI(ctx);
+  const auto r = hPost(c, hWithField("recipe_version", "llama-ft-v33"), "t1", "k-1");
   ctx.Equal(r.Status, 400, "an unknown recipe_version must be rejected; the status");
-  ctx.Equal(queued(ctx).size(), 0, "an unknown recipe must not be queued; the runs in training:queue");
+  ctx.Equal(hQueued(ctx).size(), 0, "an unknown recipe must not be queued; the runs in training:queue");
   ctx.Equal(ctx.Redis.Keys("run:run-*").size(), 0, "an unknown recipe must not leave a run row; the rows");
+  const auto fixed = hPost(c, hGood(), "t1", "k-1");
+  ctx.Equal(fixed.Status, 201, "the same Idempotency-Key resent with a known recipe after the 400 (%s) must create the run: the rejected request must not bind the key; the status", fixed.Text());
+  ctx.Equal(hQueued(ctx).size(), 1, "the corrected submission; the runs in training:queue");
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = created(ctx, post(c, good(), "t1", "k-1"), "the first submission");
-  const auto retry = post(c, good(), "t1", "k-1");
+  auto c = hAPI(ctx);
+  const auto first = hCreated(ctx, hPost(c, hGood(), "t1", "k-1"), "the first submission");
+  const auto retry = hPost(c, hWithField("priority", 1), "t1", "k-1");
   ctx.Equal(retry.Status, 200, "a retry with the same Idempotency-Key must answer the run it created; the status");
-  ctx.Equal(field(nlohmann::json::parse(retry.Text(), nullptr, false), "run_id"), field(first, "run_id"), "the retry's run id");
-  ctx.Equal(queued(ctx).size(), 1, "one submission retried once; the runs in training:queue");
-  const auto other = created(ctx, post(c, good(), "t2", "k-1"), "another tenant's submission with the same key");
-  ctx.Assert(field(other, "run_id") != field(first, "run_id"), "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant");
-  const auto none = post(c, good(), "t1", "");
+  const auto replay = nlohmann::json::parse(retry.Text(), nullptr, false);
+  ctx.Equal(hField(replay, "run_id"), hField(first, "run_id"), "the retry's run id");
+  ctx.Assert(hNumber(replay, "priority") == hNumber(first, "priority") && hNumber(replay, "band") == hNumber(first, "band"),
+             "a retry sent with priority 1 answered %s: answer the stored run the key created, priority %d in band %d", replay.dump(), hNumber(first, "priority"), hNumber(first, "band"));
+  ctx.Equal(hQueued(ctx).size(), 1, "one submission retried once; the runs in training:queue");
+  ctx.Equal(ctx.Redis.Keys("run:run-*").size(), 1, "one submission retried once must leave one run row (look the key up before writing anything); the rows");
+  const auto other = hCreated(ctx, hPost(c, hGood(), "t2", "k-1"), "another tenant's submission with the same key");
+  ctx.Assert(hField(other, "run_id") != hField(first, "run_id"), "another tenant's key k-1 replayed the first tenant's run: bind the key per tenant");
+  const auto none = hPost(c, hGood(), "t1", "");
   ctx.Equal(none.Status, 400, "a submission without Idempotency-Key; the status");
 }
 
 void CheckUniqueRunId(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto a = created(ctx, post(c, good(), "t1", "k-1"), "the first submission");
-  const auto b = created(ctx, post(c, withField("recipe_version", "vit-pretrain-v1"), "t1", "k-2"), "the second submission");
-  ctx.Assert(field(a, "run_id") != field(b, "run_id"), "two submissions in the same millisecond both got %s: take the id from runs::newRunId()", field(a, "run_id"));
-  const auto run = runs::get(field(a, "run_id"));
+  auto c = hAPI(ctx);
+  const auto a = hCreated(ctx, hPost(c, hGood(), "t1", "k-1"), "the first submission");
+  const auto b = hCreated(ctx, hPost(c, hWithField("recipe_version", "vit-pretrain-v1"), "t1", "k-2"), "the second submission");
+  ctx.Assert(hField(a, "run_id") != hField(b, "run_id"), "two submissions in the same millisecond both got %s: take the id from runs::newRunId()", hField(a, "run_id"));
+  const auto run = runs::get(hField(a, "run_id"));
   ctx.Assert(run && run->recipe_version == "llama-ft-v3", "the first run's row now reads recipe %q: the second submission overwrote it", run ? run->recipe_version : "");
-  ctx.Equal(queued(ctx).size(), 2, "two submissions; the runs in training:queue");
+  ctx.Equal(hQueued(ctx).size(), 2, "two submissions; the runs in training:queue");
 }
 `,
   },

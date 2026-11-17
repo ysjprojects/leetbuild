@@ -21,7 +21,7 @@ whole fleet.
 
 - The route requires \`Authorization: Bearer <token>\`; the token is resolved in Redis
   (\`token:{token}\`, field \`scope\`). No token is **401**, a scope other than \`operator\` is
-  **403**. Nothing the client sends decides the scope.
+  **403**, both before the node is looked up. Nothing the client sends decides the scope.
 - Read \`node:{id}\` from Redis on every request: \`capacity\` and \`allocated\` as the ledger holds
   them now, \`free = max(capacity - allocated, 0)\`, \`placeable = free > 0\`, \`alive\` from
   \`heartbeat:{id}\`. An unknown node is **404**.
@@ -59,7 +59,7 @@ whole fleet.
       id: 'node-route',
       title: 'GET /v1/nodes/{id} answers capacity, allocated and free',
       detail:
-        'The route is registered on `GET /v1/nodes/{id}` and answers `node_id`, `gpu_type`, `capacity`, `allocated`, `free`, `placeable` and `alive`; an unknown node is 404. The starter does this already.',
+        'The route is registered on `GET /v1/nodes/{id}` and answers `node_id`, `gpu_type`, `capacity`, `allocated`, `free`, `placeable` and `alive` (`false` once `heartbeat:{id}` lapsed, the node still readable); an unknown node is 404. The starter does this already.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/nodes\/\{/, /["']free["']/, /status_code=404/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/nodes\/:/, /\bfree\b/, /code\(\s*404\s*\)/]},
@@ -123,7 +123,7 @@ whole fleet.
       id: 'reconcile',
       title: 'reconcile_node sums the open placements only',
       detail:
-        'The sum runs over the ids in `node:{id}:placements`, which release removes, and is written to `allocated`. The starter scans every `placement:*` record with the node id, released ones included.',
+        'The sum runs over the ids in `node:{id}:placements`, which release removes, whatever their `status` (a `running` placement is open too), and is written to `allocated`; a placement record whose id is not in the set does not count. The starter scans every `placement:*` record with the node id, released ones included.',
       match: {
         python: {
           all: [/def reconcile_node/, /smembers\(\s*f["']node:\{node_id\}:placements["']\s*\)/],
@@ -151,7 +151,7 @@ whole fleet.
       id: 'operator-scope',
       title: 'The scope comes from the bearer token, not from a header',
       detail:
-        'The bearer token is looked up in `token:{token}` and its `scope` must be `operator`: 401 without a token, 403 for any other scope. The starter trusts an `X-Scope` header the client writes itself.',
+        'The bearer token is looked up in `token:{token}` and its `scope` must be `operator`: 401 without a token, 403 for any other scope or an unknown token, whatever headers come with it, and before the node is looked up, so a refused caller cannot tell a missing node from an existing one. The starter trusts an `X-Scope` header the client writes itself.',
       match: {
         python: {
           all: [/authorization/i, /f["']token:\{token\}["']/, /["']operator["']/, /status_code=403/, /status_code=401/],
@@ -822,6 +822,9 @@ async def check_node_route(ctx):
         assert body.get(field) == value, f"the answer was {body}: expected {field} = {value!r}"
     r = await _get(ctx, m, "gpu-9")
     assert r.status_code == 404, f"an unknown node answered {r.status_code}, expected 404"
+    ctx.redis.delete("heartbeat:gpu-1")  # the agent stopped reporting in
+    r = await _get(ctx, m)
+    assert r.status_code == 200 and r.json().get("alive") is False, f"with heartbeat:gpu-1 lapsed the read answered {r.status_code} {r.text}: alive comes from the heartbeat, the node stays readable"
 
 
 async def check_atomic_capacity(ctx):
@@ -854,12 +857,15 @@ async def check_reconcile(ctx):
     _book(ctx, "p-1", 4)
     _book(ctx, "p-2", 2)
     _release(ctx, "p-1")
+    _book(ctx, "p-3", 1)
+    ctx.redis.hset("placement:p-3", "status", "running")  # the start path (step 3) marked it running
+    ctx.redis.hset("placement:p-4", mapping={"node_id": "gpu-1", "count": 3, "status": "allocated"})  # a record whose booking never landed in the open set
     ctx.redis.hset("node:gpu-1", "allocated", 0)  # the node rebooted and its counter was lost
     total = m.reconcile_node("gpu-1")
-    assert total == 2, f"reconcile_node summed {total} GPUs for gpu-1, expected 2: p-1 was released, only p-2 (2 GPUs) is open"
-    assert ctx.redis.hget("node:gpu-1", "allocated") == "2", f"reconcile_node must write allocated, node:gpu-1 holds {ctx.redis.hget('node:gpu-1', 'allocated')}"
+    assert total == 3, f"reconcile_node summed {total} GPUs for gpu-1, expected 3: the open set holds p-2 (2 GPUs) and p-3 (1 GPU, running); p-1 was released and p-4 is not in node:gpu-1:placements"
+    assert ctx.redis.hget("node:gpu-1", "allocated") == "3", f"reconcile_node must write allocated, node:gpu-1 holds {ctx.redis.hget('node:gpu-1', 'allocated')}"
     body = (await _get(ctx, m)).json()
-    assert body.get("allocated") == 2 and body.get("free") == 6, f"after the reconcile the read answered {body}"
+    assert body.get("allocated") == 3 and body.get("free") == 5, f"after the reconcile the read answered {body}"
 
 
 async def check_operator_scope(ctx):
@@ -870,6 +876,12 @@ async def check_operator_scope(ctx):
     assert r.status_code == 401, f"no token at all answered {r.status_code}, expected 401"
     r = await _get(ctx, m, headers={"Authorization": "Bearer nobody"})
     assert r.status_code == 403, f"an unknown token answered {r.status_code}, expected 403"
+    r = await _get(ctx, m, headers={"Authorization": "Bearer nobody", "X-Scope": "operator"})
+    assert r.status_code == 403, f"an unknown token with an X-Scope: operator header answered {r.status_code}, expected 403: nothing the client sends decides the scope"
+    r = await _get(ctx, m, "gpu-9", headers=TENANT)
+    assert r.status_code == 403, f"a tenant's token on an unknown node answered {r.status_code}, expected 403: the scope is checked before the node is looked up, so a tenant cannot tell which nodes exist"
+    r = await _get(ctx, m, "gpu-9", headers={})
+    assert r.status_code == 401, f"no token on an unknown node answered {r.status_code}, expected 401"
     r = await _get(ctx, m, headers={"Authorization": "Bearer op-1"})
     assert r.status_code == 200, f"an operator token without any X-Scope header answered {r.status_code}, expected 200"
 `,
@@ -911,6 +923,10 @@ export async function check_node_route(ctx) {
   for (const [field, value] of Object.entries(expected)) assert.strictEqual(body[field], value, \`the answer was \${r.text}: \${field}\`);
   r = await get('gpu-9');
   assert.equal(r.status, 404, 'an unknown node');
+  ctx.redis.del('heartbeat:gpu-1'); // the agent stopped reporting in
+  r = await get();
+  const lapsed: Record<string, unknown> = r.status === 200 ? r.json() : {};
+  assert(r.status === 200 && lapsed.alive === false, \`with heartbeat:gpu-1 lapsed the read answered \${r.status} \${r.text}: alive comes from the heartbeat, the node stays readable\`);
 }
 
 export async function check_atomic_capacity(ctx) {
@@ -946,13 +962,16 @@ export async function check_reconcile(ctx) {
   book(ctx, 'p-1', 4);
   book(ctx, 'p-2', 2);
   releasePlacement(ctx, 'p-1');
+  book(ctx, 'p-3', 1);
+  ctx.redis.hset('placement:p-3', 'status', 'running'); // the start path (step 3) marked it running
+  ctx.redis.hset('placement:p-4', 'node_id', 'gpu-1', 'count', 3, 'status', 'allocated'); // a record whose booking never landed in the open set
   ctx.redis.hset('node:gpu-1', 'allocated', 0); // the node rebooted and its counter was lost
   const total = await m.reconcileNode('gpu-1');
-  assert.equal(total, 2, 'GPUs reconcileNode summed for gpu-1: p-1 was released, only p-2 (2 GPUs) is open');
-  assert.equal(ctx.redis.hget('node:gpu-1', 'allocated'), '2', 'reconcileNode must write allocated; node:gpu-1 holds');
+  assert.equal(total, 3, 'GPUs reconcileNode summed for gpu-1: the open set holds p-2 (2 GPUs) and p-3 (1 GPU, running); p-1 was released and p-4 is not in node:gpu-1:placements');
+  assert.equal(ctx.redis.hget('node:gpu-1', 'allocated'), '3', 'reconcileNode must write allocated; node:gpu-1 holds');
   const r = await get();
   const body = r.json() as Record<string, unknown>;
-  assert(body.allocated === 2 && body.free === 6, \`after the reconcile the read answered \${r.text}\`);
+  assert(body.allocated === 3 && body.free === 5, \`after the reconcile the read answered \${r.text}\`);
 }
 
 export async function check_operator_scope(ctx) {
@@ -963,6 +982,12 @@ export async function check_operator_scope(ctx) {
   assert.equal(r.status, 401, 'no token at all');
   r = await get('gpu-1', {Authorization: 'Bearer nobody'});
   assert.equal(r.status, 403, 'an unknown token');
+  r = await get('gpu-1', {Authorization: 'Bearer nobody', 'X-Scope': 'operator'});
+  assert.equal(r.status, 403, 'an unknown token with an X-Scope: operator header (nothing the client sends decides the scope)');
+  r = await get('gpu-9', TENANT);
+  assert.equal(r.status, 403, "a tenant's token on an unknown node (the scope is checked before the node is looked up, so a tenant cannot tell which nodes exist)");
+  r = await get('gpu-9', {});
+  assert.equal(r.status, 401, 'no token on an unknown node');
   r = await get('gpu-1', {Authorization: 'Bearer op-1'});
   assert.equal(r.status, 200, 'an operator token without any X-Scope header');
 }
@@ -1029,6 +1054,10 @@ func CheckNodeRoute(ctx *harness.Ctx) {
 	}
 	r = readGet(c, "gpu-9", readOperator)
 	ctx.Equal(r.Status, 404, "an unknown node")
+	ctx.Redis.Del("heartbeat:gpu-1") // the agent stopped reporting in
+	r = readGet(c, "gpu-1", readOperator)
+	ctx.Equal(r.Status, 200, "with heartbeat:gpu-1 lapsed the node stays readable (%s)", r.Text())
+	ctx.Equal(readBody(ctx, r)["alive"], false, "with heartbeat:gpu-1 lapsed alive (it comes from the heartbeat) in %s", r.Text())
 }
 
 func CheckAtomicCapacity(ctx *harness.Ctx) {
@@ -1064,15 +1093,18 @@ func CheckReconcile(ctx *harness.Ctx) {
 	readBook(ctx, "p-1", 4)
 	readBook(ctx, "p-2", 2)
 	readRelease(ctx, "p-1")
-	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 0) // the node rebooted and its counter was lost
+	readBook(ctx, "p-3", 1)
+	ctx.Redis.Do("HSET", "placement:p-3", "status", "running")                               // the start path (step 3) marked it running
+	ctx.Redis.Do("HSET", "placement:p-4", "node_id", "gpu-1", "count", 3, "status", "allocated") // a record whose booking never landed in the open set
+	ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 0)                                         // the node rebooted and its counter was lost
 	total, err := reconcileNode(context.Background(), "gpu-1")
 	ctx.NoError(err, "reconcileNode")
-	ctx.Equal(total, 2, "GPUs reconcileNode summed for gpu-1: p-1 was released, only p-2 (2 GPUs) is open")
+	ctx.Equal(total, 3, "GPUs reconcileNode summed for gpu-1: the open set holds p-2 (2 GPUs) and p-3 (1 GPU, running); p-1 was released and p-4 is not in node:gpu-1:placements")
 	allocated, _ := ctx.Redis.HGet("node:gpu-1", "allocated")
-	ctx.Equal(allocated, "2", "reconcileNode must write allocated; node:gpu-1 holds")
+	ctx.Equal(allocated, "3", "reconcileNode must write allocated; node:gpu-1 holds")
 	r := readGet(c, "gpu-1", readOperator)
 	body := readBody(ctx, r)
-	ctx.Assert(body["allocated"] == float64(2) && body["free"] == float64(6), "after the reconcile the read answered %s", r.Text())
+	ctx.Assert(body["allocated"] == float64(3) && body["free"] == float64(5), "after the reconcile the read answered %s", r.Text())
 }
 
 func CheckOperatorScope(ctx *harness.Ctx) {
@@ -1083,6 +1115,12 @@ func CheckOperatorScope(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 401, "no token at all")
 	r = readGet(c, "gpu-1", []string{"Authorization", "Bearer nobody"})
 	ctx.Equal(r.Status, 403, "an unknown token")
+	r = readGet(c, "gpu-1", []string{"Authorization", "Bearer nobody", "X-Scope", "operator"})
+	ctx.Equal(r.Status, 403, "an unknown token with an X-Scope: operator header (nothing the client sends decides the scope)")
+	r = readGet(c, "gpu-9", readTenant)
+	ctx.Equal(r.Status, 403, "a tenant's token on an unknown node (the scope is checked before the node is looked up, so a tenant cannot tell which nodes exist)")
+	r = readGet(c, "gpu-9", nil)
+	ctx.Equal(r.Status, 401, "no token on an unknown node")
 	r = readGet(c, "gpu-1", []string{"Authorization", "Bearer op-1"})
 	ctx.Equal(r.Status, 200, "an operator token without any X-Scope header")
 }
@@ -1155,6 +1193,10 @@ void CheckNodeRoute(harness::Ctx& ctx) {
   ctx.Equal(body.value("alive", false), true, "the answer was %s: alive", r.Text());
   r = readAsOperator(c, "gpu-9");
   ctx.Equal(r.Status, 404, "an unknown node");
+  ctx.Redis.Del("heartbeat:gpu-1");  // the agent stopped reporting in
+  r = readAsOperator(c);
+  ctx.Equal(r.Status, 200, "with heartbeat:gpu-1 lapsed the node stays readable (%s)", r.Text());
+  ctx.Equal(readBody(ctx, r).value("alive", true), false, "with heartbeat:gpu-1 lapsed alive (it comes from the heartbeat) in %s", r.Text());
 }
 
 void CheckAtomicCapacity(harness::Ctx& ctx) {
@@ -1191,13 +1233,18 @@ void CheckReconcile(harness::Ctx& ctx) {
   readBook(ctx, "p-1", 4);
   readBook(ctx, "p-2", 2);
   readRelease(ctx, "p-1");
-  ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 0);  // the node rebooted and its counter was lost
+  readBook(ctx, "p-3", 1);
+  ctx.Redis.Do("HSET", "placement:p-3", "status", "running");                                // the start path (step 3) marked it running
+  ctx.Redis.Do("HSET", "placement:p-4", "node_id", "gpu-1", "count", 3, "status", "allocated");  // a record whose booking never landed in the open set
+  ctx.Redis.Do("HSET", "node:gpu-1", "allocated", 0);                                          // the node rebooted and its counter was lost
   const int total = reconcile_node("gpu-1");
-  ctx.Equal(total, 2, "GPUs reconcile_node summed for gpu-1: p-1 was released, only p-2 (2 GPUs) is open");
-  ctx.Equal(ctx.Redis.HGet("node:gpu-1", "allocated"), "2", "reconcile_node must write allocated; node:gpu-1 holds");
+  ctx.Equal(total, 3,
+            "GPUs reconcile_node summed for gpu-1: the open set holds p-2 (2 GPUs) and p-3 (1 GPU, running); p-1 was released and p-4 is not in "
+            "node:gpu-1:placements");
+  ctx.Equal(ctx.Redis.HGet("node:gpu-1", "allocated"), "3", "reconcile_node must write allocated; node:gpu-1 holds");
   auto r = readAsOperator(c);
   const auto body = readBody(ctx, r);
-  ctx.Assert(body.value("allocated", -1) == 2 && body.value("free", -1) == 6, "after the reconcile the read answered %s", r.Text());
+  ctx.Assert(body.value("allocated", -1) == 3 && body.value("free", -1) == 5, "after the reconcile the read answered %s", r.Text());
 }
 
 void CheckOperatorScope(harness::Ctx& ctx) {
@@ -1208,6 +1255,12 @@ void CheckOperatorScope(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 401, "no token at all");
   r = c.Get("/v1/nodes/gpu-1", "Authorization", "Bearer nobody");
   ctx.Equal(r.Status, 403, "an unknown token");
+  r = c.Get("/v1/nodes/gpu-1", "Authorization", "Bearer nobody", "X-Scope", "operator");
+  ctx.Equal(r.Status, 403, "an unknown token with an X-Scope: operator header (nothing the client sends decides the scope)");
+  r = c.Get("/v1/nodes/gpu-9", "Authorization", "Bearer t-1", "X-Scope", "operator");
+  ctx.Equal(r.Status, 403, "a tenant's token on an unknown node (the scope is checked before the node is looked up, so a tenant cannot tell which nodes exist)");
+  r = c.Get("/v1/nodes/gpu-9");
+  ctx.Equal(r.Status, 401, "no token on an unknown node");
   r = c.Get("/v1/nodes/gpu-1", "Authorization", "Bearer op-1");
   ctx.Equal(r.Status, 200, "an operator token without any X-Scope header");
 }

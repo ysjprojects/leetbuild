@@ -25,9 +25,9 @@ re-registration under a reused version label replaces the definition agents are 
 - The schema has \`type: object\`, a \`type\` on every property and every \`required\` name declared.
   An invalid one is **422** with \`{"errors": [{pointer, message}]}\`, one JSON pointer per failure
   (\`/type\`, \`/properties/amount/type\`, \`/required/1\`).
-- The version is minted from the content: sha256 of the canonical JSON of \`name\`, \`owner\`,
-  \`schema\` and \`side_effect\`, first 16 hex characters; the caller's \`version\` is ignored. Store
-  with \`store.insert\`, which refuses an existing version: **409**.`,
+- The version is minted from the content: sha256 of the canonical JSON (keys sorted at every level,
+  no whitespace) of \`name\`, \`owner\`, \`schema\` and \`side_effect\`, first 16 hex characters; the
+  caller's \`version\` is ignored. Store with \`store.insert\`, which refuses an existing version: **409**.`,
   sequence: {
     participants: ['Reviewer', 'toolsd', 'tool store'],
     messages: [
@@ -57,7 +57,7 @@ re-registration under a reused version label replaces the definition agents are 
       id: 'role',
       title: 'Only the platform reviewer role may register',
       detail:
-        '`X-Roles` is split on commas and must contain `platform-reviewer` as one role; anything else is **403** before any write. The starter stops at authentication, so every service account can mint tools.',
+        '`X-Roles` is split on commas and must contain `platform-reviewer` exactly (case included) as one role; anything else is **403** before any write. The starter stops at authentication, so every service account can mint tools.',
       match: {
         python: {all: [/["']platform-reviewer["']/, /x-roles/i, /\b403\b/]},
         typescript: {all: [/['"]platform-reviewer['"]/, /x-roles/i, /\b403\b/]},
@@ -70,7 +70,7 @@ re-registration under a reused version label replaces the definition agents are 
       id: 'side-effect',
       title: 'Requires a declared side-effect class',
       detail:
-        '`side_effect` is checked against the closed set `read` / `write` / `irreversible` (and `name` against its pattern); anything else is **400**. The starter stores whatever string arrives.',
+        '`side_effect` is checked against the closed set `read` / `write` / `irreversible`, and `name` against its pattern, both ends of the length included; anything else is **400**. The starter stores whatever string arrives.',
       match: {
         python: {all: [/["']irreversible["']/, /\b400\b/]},
         typescript: {all: [/['"]irreversible['"]/, /\b400\b/]},
@@ -83,7 +83,7 @@ re-registration under a reused version label replaces the definition agents are 
       id: 'schema',
       title: 'Validates the schema and names the failing pointer',
       detail:
-        'The schema is validated before the write and an invalid one is **422** with the JSON pointer of each failure. The starter stores any object as a schema, so the breakage lands in the agent that cannot build arguments.',
+        'The schema is validated before the write (a missing top-level `type` included) and an invalid one is **422** with `errors`, one JSON pointer per failure, every failure listed. The starter stores any object as a schema, so the breakage lands in the agent that cannot build arguments.',
       match: {
         python: {all: [/\b422\b/, /pointer/, /["']required["']/]},
         typescript: {all: [/\b422\b/, /pointer/, /['"]required['"]|\.required\b/]},
@@ -96,7 +96,7 @@ re-registration under a reused version label replaces the definition agents are 
       id: 'version',
       title: 'Mints an immutable version and refuses to overwrite it',
       detail:
-        "The version is a sha256 digest of the definition, not the caller's label, and it is stored with `insert`, which refuses an existing version (**409**). The starter stores under the caller's label with `put`, so a re-registration replaces what agents are calling.",
+        "The version is the first 16 hex characters of the sha256 of the canonical definition, checked digit for digit, not the caller's label, and it is stored with `insert`, which refuses an existing version (**409**), even when another registration of the same definition lands at the same moment. The starter stores under the caller's label with `put`, so a re-registration replaces what agents are calling.",
       match: {
         python: {
           all: [/hashlib\.sha256\(/, /store\.insert\(/, /\b409\b/],
@@ -795,6 +795,9 @@ SCHEMA = {
     "properties": {"amount": {"type": "integer"}, "currency": {"type": "string"}},
     "required": ["amount"],
 }
+# sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect, first 16 hex.
+MINTED = "8bcec681e207c4df"
+MINTED_BILLING = "7f3ed45ed789ea40"  # the same definition with owner "billing"
 
 
 def _tool(**overrides):
@@ -833,7 +836,7 @@ async def check_route(ctx):
 
 async def check_role(ctx):
     async with _api(ctx) as c:
-        for roles in (None, "tool-author", "platform-reviewers"):
+        for roles in (None, "tool-author", "platform-reviewers", "Platform-Reviewer"):
             headers = {"X-Tenant-Id": "acme"} if roles is None else {"X-Tenant-Id": "acme", "X-Roles": roles}
             r = await c.post("/v1/tools", json=_tool(), headers=headers)
             assert r.status_code == 403, f"a registration with X-Roles {roles!r} answered {r.status_code}, expected 403: an authenticated caller is not an entitled one"
@@ -847,9 +850,12 @@ async def check_side_effect(ctx):
         for value in ("maybe", "READ", ""):
             r = await c.post("/v1/tools", json=_tool(side_effect=value), headers=REVIEWER)
             assert r.status_code == 400, f"side_effect {value!r} answered {r.status_code}, expected 400: the class must be read, write or irreversible"
-        r = await c.post("/v1/tools", json=_tool(name="Payments Refund"), headers=REVIEWER)
-        assert r.status_code == 400, f"the name 'Payments Refund' answered {r.status_code}, expected 400"
+        for name in ("Payments Refund", "p", "9payments", "payments.Refund", "p" + "a" * 64):
+            r = await c.post("/v1/tools", json=_tool(name=name), headers=REVIEWER)
+            assert r.status_code == 400, f"the name {name!r} answered {r.status_code}, expected 400: it must match ^[a-z][a-z0-9_.-]{{1,63}}$"
         assert _stored(ctx) == [], f"refused registrations wrote {_stored(ctx)}"
+        r = await c.post("/v1/tools", json=_tool(name="p" + "a" * 63), headers=REVIEWER)
+        assert r.status_code == 201, f"a 64-character name answered {r.status_code}, expected 201: the pattern allows up to 64: {r.text}"
         for i, value in enumerate(("read", "write", "irreversible")):
             r = await c.post("/v1/tools", json=_tool(name=f"payments.tool{i}", side_effect=value), headers=REVIEWER)
             assert r.status_code == 201, f"side_effect {value!r} answered {r.status_code}: {r.text}"
@@ -860,12 +866,22 @@ async def check_schema(ctx):
         ({"type": "array"}, "/type"),
         ({"type": "object", "properties": {"amount": {}}}, "/properties/amount/type"),
         ({"type": "object", "properties": {"amount": {"type": "integer"}}, "required": ["amount", "currency"]}, "/required/1"),
+        ({"properties": {"amount": {"type": "integer"}}}, "/type"),
     )
     async with _api(ctx) as c:
         for schema, pointer in cases:
             r = await c.post("/v1/tools", json=_tool(schema=schema), headers=REVIEWER)
             assert r.status_code == 422, f"the schema {schema} answered {r.status_code}, expected 422: an agent cannot build arguments from it"
             assert pointer in r.text, f"the 422 for {schema} must name the failing pointer {pointer}, got {r.text}"
+        broken = {"type": "object", "properties": {"amount": {"type": "integer"}, "note": {}}, "required": ["amount", "currency"]}
+        r = await c.post("/v1/tools", json=_tool(schema=broken), headers=REVIEWER)
+        assert r.status_code == 422, f"the schema {broken} answered {r.status_code}, expected 422"
+        try:
+            pointers = [e.get("pointer") for e in r.json()["errors"]]
+        except Exception:
+            raise AssertionError(f"the 422 must carry errors, a list of {{pointer, message}}, got {r.text}")
+        for pointer in ("/properties/note/type", "/required/1"):
+            assert pointer in pointers, f"the schema {broken} fails twice and the 422 names {pointers}: one pointer per failure, {pointer} is missing"
         assert _stored(ctx) == [], f"invalid schemas were stored: {_stored(ctx)}"
         r = await c.post("/v1/tools", json=_tool(), headers=REVIEWER)
     assert r.status_code == 201, f"a valid schema answered {r.status_code}: {r.text}"
@@ -878,17 +894,35 @@ async def check_version(ctx):
         version = first.json().get("version", "")
         assert version != "v1", "the version is the caller's label v1: a label can be reused for another definition. Mint it from the content"
         assert re.fullmatch(r"[0-9a-f]{16}", version), f"the version {version!r} must be 16 hex characters of a sha256 digest"
+        assert version == MINTED, f"the version is {version!r}, expected {MINTED!r}: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect"
         again = await c.post("/v1/tools", json=_tool(version="v2"), headers=REVIEWER)
         assert again.status_code == 409, f"re-registering the same definition answered {again.status_code}, expected 409"
         changed_schema = {**SCHEMA, "properties": {**SCHEMA["properties"], "reason": {"type": "string"}}}
         changed = await c.post("/v1/tools", json=_tool(version="v1", schema=changed_schema), headers=REVIEWER)
         assert changed.status_code == 201, f"a changed definition answered {changed.status_code}: {changed.text}"
         assert changed.json().get("version") != version, "a changed definition got the version of the first one"
-    row = store.get("payments.refund", version)
-    assert row is not None and row["schema"] == SCHEMA, f"the first version now holds {row}: a stored version must stay immutable"
+        row = store.get("payments.refund", version)
+        assert row is not None and row["schema"] == SCHEMA, f"the first version now holds {row}: a stored version must stay immutable"
+        # Another reviewer registers the same definition between this request's first look at the version and its write.
+        key = f"tool:payments.refund:{MINTED_BILLING}"
+        rival = {**_tool(owner="billing"), "endpoint": "https://billing.internal/refund-rival"}
+        raced = []
+        probe = ctx.redis_after(key, lambda: raced.append(store.insert("payments.refund", MINTED_BILLING, rival)) if not ctx.redis.exists(key) else None)
+        r = await c.post("/v1/tools", json=_tool(owner="billing"), headers=REVIEWER)
+    if probe.error is not None:
+        raise probe.error
+    if raced:
+        assert r.status_code == 409, f"another registration of the same definition landed between this request's check and its write, and it answered {r.status_code}: only a write that refuses an existing version is safe, 409"
+        row = store.get("payments.refund", MINTED_BILLING)
+        assert row is not None and row["endpoint"] == rival["endpoint"], f"the version registered by the other reviewer was replaced: {row}"
+    else:
+        assert r.status_code == 201, f"a new definition answered {r.status_code}: {r.text}"
 `,
     typescript: `const REVIEWER = {'X-Tenant-Id': 'acme', 'X-Roles': 'platform-reviewer'};
 const SCHEMA = {type: 'object', properties: {amount: {type: 'integer'}, currency: {type: 'string'}}, required: ['amount']};
+// sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect, first 16 hex.
+const MINTED = '8bcec681e207c4df';
+const MINTED_BILLING = '7f3ed45ed789ea40'; // the same definition with owner "billing"
 
 const tool = (overrides: Record<string, unknown> = {}) => ({
   name: 'payments.refund',
@@ -921,7 +955,7 @@ export async function check_route(ctx) {
 
 export async function check_role(ctx) {
   const {c} = api(ctx);
-  for (const roles of [null, 'tool-author', 'platform-reviewers']) {
+  for (const roles of [null, 'tool-author', 'platform-reviewers', 'Platform-Reviewer']) {
     const headers = roles === null ? {'X-Tenant-Id': 'acme'} : {'X-Tenant-Id': 'acme', 'X-Roles': roles};
     const r = await c.post('/v1/tools', {json: tool(), headers});
     assert.equal(r.status, 403, \`a registration with X-Roles \${JSON.stringify(roles)} answered \${r.status}, expected 403: an authenticated caller is not an entitled one\`);
@@ -937,9 +971,13 @@ export async function check_side_effect(ctx) {
     const r = await c.post('/v1/tools', {json: tool({side_effect: value}), headers: REVIEWER});
     assert.equal(r.status, 400, \`side_effect \${JSON.stringify(value)} answered \${r.status}, expected 400: the class must be read, write or irreversible\`);
   }
-  const bad = await c.post('/v1/tools', {json: tool({name: 'Payments Refund'}), headers: REVIEWER});
-  assert.equal(bad.status, 400, \`the name 'Payments Refund' answered \${bad.status}, expected 400\`);
+  for (const name of ['Payments Refund', 'p', '9payments', 'payments.Refund', 'p' + 'a'.repeat(64)]) {
+    const bad = await c.post('/v1/tools', {json: tool({name}), headers: REVIEWER});
+    assert.equal(bad.status, 400, \`the name \${JSON.stringify(name)} answered \${bad.status}, expected 400: it must match ^[a-z][a-z0-9_.-]{1,63}$\`);
+  }
   assert.deepStrictEqual(stored(ctx), [], \`refused registrations wrote \${JSON.stringify(stored(ctx))}\`);
+  const longest = await c.post('/v1/tools', {json: tool({name: 'p' + 'a'.repeat(63)}), headers: REVIEWER});
+  assert.equal(longest.status, 201, \`a 64-character name answered \${longest.status}, expected 201: the pattern allows up to 64: \${longest.text}\`);
   for (const [i, value] of ['read', 'write', 'irreversible'].entries()) {
     const r = await c.post('/v1/tools', {json: tool({name: \`payments.tool\${i}\`, side_effect: value}), headers: REVIEWER});
     assert.equal(r.status, 201, \`side_effect \${value} answered \${r.status}: \${r.text}\`);
@@ -952,11 +990,24 @@ export async function check_schema(ctx) {
     [{type: 'array'}, '/type'],
     [{type: 'object', properties: {amount: {}}}, '/properties/amount/type'],
     [{type: 'object', properties: {amount: {type: 'integer'}}, required: ['amount', 'currency']}, '/required/1'],
+    [{properties: {amount: {type: 'integer'}}}, '/type'],
   ];
   for (const [schema, pointer] of cases) {
     const r = await c.post('/v1/tools', {json: tool({schema}), headers: REVIEWER});
     assert.equal(r.status, 422, \`the schema \${JSON.stringify(schema)} answered \${r.status}, expected 422: an agent cannot build arguments from it\`);
     assert(r.text.includes(pointer), \`the 422 for \${JSON.stringify(schema)} must name the failing pointer \${pointer}, got \${r.text}\`);
+  }
+  const broken = {type: 'object', properties: {amount: {type: 'integer'}, note: {}}, required: ['amount', 'currency']};
+  const twice = await c.post('/v1/tools', {json: tool({schema: broken}), headers: REVIEWER});
+  assert.equal(twice.status, 422, \`the schema \${JSON.stringify(broken)} answered \${twice.status}, expected 422\`);
+  let pointers: unknown[] = [];
+  try {
+    pointers = twice.json().errors.map(e => e.pointer);
+  } catch {
+    assert.fail(\`the 422 must carry errors, a list of {pointer, message}, got \${twice.text}\`);
+  }
+  for (const pointer of ['/properties/note/type', '/required/1']) {
+    assert(pointers.includes(pointer), \`the schema \${JSON.stringify(broken)} fails twice and the 422 names \${JSON.stringify(pointers)}: one pointer per failure, \${pointer} is missing\`);
   }
   assert.deepStrictEqual(stored(ctx), [], \`invalid schemas were stored: \${JSON.stringify(stored(ctx))}\`);
   const r = await c.post('/v1/tools', {json: tool(), headers: REVIEWER});
@@ -970,6 +1021,7 @@ export async function check_version(ctx) {
   const version = first.json().version ?? '';
   assert.notEqual(version, 'v1', "the version is the caller's label v1: a label can be reused for another definition. Mint it from the content");
   assert(/^[0-9a-f]{16}$/.test(version), \`the version \${JSON.stringify(version)} must be 16 hex characters of a sha256 digest\`);
+  assert.equal(version, MINTED, \`the version is \${JSON.stringify(version)}, expected \${MINTED}: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect\`);
   const again = await c.post('/v1/tools', {json: tool({version: 'v2'}), headers: REVIEWER});
   assert.equal(again.status, 409, \`re-registering the same definition answered \${again.status}, expected 409\`);
   const changedSchema = {...SCHEMA, properties: {...SCHEMA.properties, reason: {type: 'string'}}};
@@ -978,6 +1030,24 @@ export async function check_version(ctx) {
   assert.notEqual(changed.json().version, version, 'a changed definition got the version of the first one');
   const row = await store.get('payments.refund', version);
   assert(row !== null && JSON.stringify(row.schema) === JSON.stringify(SCHEMA), \`the first version now holds \${JSON.stringify(row)}: a stored version must stay immutable\`);
+  // Another reviewer registers the same definition between this request's first look at the version and its write.
+  const key = \`tool:payments.refund:\${MINTED_BILLING}\`;
+  const rival = 'https://billing.internal/refund-rival';
+  let raced = false;
+  const probe = ctx.redisAfter(key, () => {
+    if (ctx.redis.exists(key) === 0) {
+      ctx.redis.hset(key, 'name', 'payments.refund', 'version', MINTED_BILLING, 'side_effect', 'irreversible', 'owner', 'billing', 'schema', JSON.stringify(SCHEMA), 'endpoint', rival, 'credential_ref', 'vault://payments/refund');
+      raced = true;
+    }
+  });
+  const r = await c.post('/v1/tools', {json: tool({owner: 'billing'}), headers: REVIEWER});
+  if (probe.error) throw probe.error;
+  if (raced) {
+    assert.equal(r.status, 409, \`another registration of the same definition landed between this request's check and its write, and it answered \${r.status}: only a write that refuses an existing version is safe, 409\`);
+    assert.equal(ctx.redis.hget(key, 'endpoint'), rival, 'the version registered by the other reviewer was replaced');
+  } else {
+    assert.equal(r.status, 201, \`a new definition answered \${r.status}: \${r.text}\`);
+  }
 }
 `,
     go: `package main
@@ -996,6 +1066,12 @@ import (
 )
 
 var reviewer = []string{"X-Tenant-Id", "acme", "X-Roles", "platform-reviewer"}
+
+// sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect, first 16 hex.
+const (
+	minted        = "8bcec681e207c4df"
+	mintedBilling = "7f3ed45ed789ea40" // the same definition with owner "billing"
+)
 
 func schemaDoc() map[string]any {
 	return map[string]any{
@@ -1056,7 +1132,7 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckRole(ctx *harness.Ctx) {
 	c := api(ctx)
-	for _, roles := range []string{"", "tool-author", "platform-reviewers"} {
+	for _, roles := range []string{"", "tool-author", "platform-reviewers", "Platform-Reviewer"} {
 		headers := []string{"X-Tenant-Id", "acme"}
 		if roles != "" {
 			headers = append(headers, "X-Roles", roles)
@@ -1075,9 +1151,13 @@ func CheckSideEffect(ctx *harness.Ctx) {
 		r := c.Post("/v1/tools", tool(map[string]any{"side_effect": value}), reviewer...)
 		ctx.Equal(r.Status, 400, "side_effect %q must be refused: the class must be read, write or irreversible", value)
 	}
-	r := c.Post("/v1/tools", tool(map[string]any{"name": "Payments Refund"}), reviewer...)
-	ctx.Equal(r.Status, 400, "the name 'Payments Refund'")
+	for _, name := range []string{"Payments Refund", "p", "9payments", "payments.Refund", "p" + strings.Repeat("a", 64)} {
+		r := c.Post("/v1/tools", tool(map[string]any{"name": name}), reviewer...)
+		ctx.Equal(r.Status, 400, "the name %q must be refused: it must match ^[a-z][a-z0-9_.-]{1,63}$", name)
+	}
 	ctx.Assert(len(ctx.Redis.Keys("tool:*")) == 0, "refused registrations wrote %q", ctx.Redis.Keys("tool:*"))
+	longest := c.Post("/v1/tools", tool(map[string]any{"name": "p" + strings.Repeat("a", 63)}), reviewer...)
+	ctx.Equal(longest.Status, 201, "a 64-character name, which the pattern allows (%s)", longest.Text())
 	for i, value := range []string{"read", "write", "irreversible"} {
 		r := c.Post("/v1/tools", tool(map[string]any{"name": fmt.Sprintf("payments.tool%d", i), "side_effect": value}), reviewer...)
 		ctx.Equal(r.Status, 201, "side_effect %q (%s)", value, r.Text())
@@ -1093,11 +1173,32 @@ func CheckSchema(ctx *harness.Ctx) {
 		{map[string]any{"type": "array"}, "/type"},
 		{map[string]any{"type": "object", "properties": map[string]any{"amount": map[string]any{}}}, "/properties/amount/type"},
 		{map[string]any{"type": "object", "properties": map[string]any{"amount": map[string]any{"type": "integer"}}, "required": []any{"amount", "currency"}}, "/required/1"},
+		{map[string]any{"properties": map[string]any{"amount": map[string]any{"type": "integer"}}}, "/type"},
 	}
 	for _, tc := range cases {
 		r := c.Post("/v1/tools", tool(map[string]any{"schema": tc.schema}), reviewer...)
 		ctx.Equal(r.Status, 422, "the schema %v must be refused: an agent cannot build arguments from it", tc.schema)
 		ctx.Assert(strings.Contains(r.Text(), tc.pointer), "the 422 for %v must name the failing pointer %s, got %s", tc.schema, tc.pointer, r.Text())
+	}
+	broken := map[string]any{"type": "object", "properties": map[string]any{"amount": map[string]any{"type": "integer"}, "note": map[string]any{}}, "required": []any{"amount", "currency"}}
+	twice := c.Post("/v1/tools", tool(map[string]any{"schema": broken}), reviewer...)
+	ctx.Equal(twice.Status, 422, "the schema %v must be refused", broken)
+	var report struct {
+		Errors []struct {
+			Pointer string \`json:"pointer"\`
+		} \`json:"errors"\`
+	}
+	twice.Decode(&report)
+	pointers := []string{}
+	for _, e := range report.Errors {
+		pointers = append(pointers, e.Pointer)
+	}
+	for _, pointer := range []string{"/properties/note/type", "/required/1"} {
+		found := false
+		for _, p := range pointers {
+			found = found || p == pointer
+		}
+		ctx.Assert(found, "the schema %v fails twice and the 422 names %q: one pointer per failure, %s is missing", broken, pointers, pointer)
 	}
 	ctx.Assert(len(ctx.Redis.Keys("tool:*")) == 0, "invalid schemas were stored: %q", ctx.Redis.Keys("tool:*"))
 	r := c.Post("/v1/tools", tool(nil), reviewer...)
@@ -1111,6 +1212,7 @@ func CheckVersion(ctx *harness.Ctx) {
 	version := versionIn(first)
 	ctx.Assert(version != "v1", "the version is the caller's label v1: a label can be reused for another definition. Mint it from the content")
 	ctx.Assert(regexp.MustCompile(\`^[0-9a-f]{16}$\`).MatchString(version), "the version %q must be 16 hex characters of a sha256 digest", version)
+	ctx.Assert(version == minted, "the version is %q, expected %q: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect", version, minted)
 	again := c.Post("/v1/tools", tool(map[string]any{"version": "v2"}), reviewer...)
 	ctx.Equal(again.Status, 409, "re-registering the same definition")
 	changedSchema := schemaDoc()
@@ -1121,12 +1223,35 @@ func CheckVersion(ctx *harness.Ctx) {
 	row, err := store.Get(context.Background(), "payments.refund", version)
 	ctx.NoError(err, "store.Get failed")
 	ctx.Assert(row != nil && sameJSON(row["schema"], schemaDoc()), "the first version now holds %v: a stored version must stay immutable", row)
+	// Another reviewer registers the same definition between this request's first look at the version and its write.
+	key := "tool:payments.refund:" + mintedBilling
+	const rival = "https://billing.internal/refund-rival"
+	schemaJSON, _ := json.Marshal(schemaDoc())
+	raced := false
+	probe := ctx.Redis.After(key, func() any {
+		if ctx.Redis.Exists(key) == 0 {
+			ctx.Redis.Do("HSET", key, "name", "payments.refund", "version", mintedBilling, "side_effect", "irreversible", "owner", "billing", "schema", string(schemaJSON), "endpoint", rival, "credential_ref", "vault://payments/refund")
+			raced = true
+		}
+		return nil
+	})
+	r := c.Post("/v1/tools", tool(map[string]any{"owner": "billing"}), reviewer...)
+	ctx.NoError(probe.Err, "the competing registration failed")
+	if raced {
+		ctx.Equal(r.Status, 409, "another registration of the same definition landed between this request's check and its write: only a write that refuses an existing version is safe")
+		endpoint, _ := ctx.Redis.HGet(key, "endpoint")
+		ctx.Equal(endpoint, rival, "the version registered by the other reviewer was replaced; its endpoint")
+	} else {
+		ctx.Equal(r.Status, 201, "a new definition (%s)", r.Text())
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <regex>
 #include <string>
 #include <vector>
@@ -1137,6 +1262,9 @@ const nlohmann::json kSchema = {
     {"type", "object"},
     {"properties", {{"amount", {{"type", "integer"}}}, {"currency", {{"type", "string"}}}}},
     {"required", {"amount"}}};
+// sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect, first 16 hex.
+const std::string kMinted = "8bcec681e207c4df";
+const std::string kMintedBilling = "7f3ed45ed789ea40";  // the same definition with owner "billing"
 
 nlohmann::json tool(const nlohmann::json& overrides = nlohmann::json::object()) {
   nlohmann::json body = {{"name", "payments.refund"},
@@ -1185,7 +1313,7 @@ void CheckRole(harness::Ctx& ctx) {
   auto c = api(ctx);
   auto r = c.Post("/v1/tools", tool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 403, "a registration without X-Roles must be refused (an authenticated caller is not an entitled one)");
-  for (const std::string roles : {"tool-author", "platform-reviewers"}) {
+  for (const std::string roles : {"tool-author", "platform-reviewers", "Platform-Reviewer"}) {
     r = c.Post("/v1/tools", tool().dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme", "X-Roles", roles);
     ctx.Equal(r.Status, 403, "a registration with X-Roles %q must be refused (an authenticated caller is not an entitled one)", roles);
   }
@@ -1200,8 +1328,12 @@ void CheckSideEffect(harness::Ctx& ctx) {
     const auto r = post(c, tool({{"side_effect", value}}));
     ctx.Equal(r.Status, 400, "side_effect %q must be refused: the class must be read, write or irreversible", value);
   }
-  ctx.Equal(post(c, tool({{"name", "Payments Refund"}})).Status, 400, "the name 'Payments Refund'");
+  for (const std::string name : {std::string("Payments Refund"), std::string("p"), std::string("9payments"), std::string("payments.Refund"), "p" + std::string(64, 'a')}) {
+    ctx.Equal(post(c, tool({{"name", name}})).Status, 400, "the name %q must be refused: it must match ^[a-z][a-z0-9_.-]{1,63}$", name);
+  }
   ctx.Equal(ctx.Redis.Keys("tool:*"), std::vector<std::string>{}, "refused registrations must write nothing; the tool keys");
+  const auto longest = post(c, tool({{"name", "p" + std::string(63, 'a')}}));
+  ctx.Equal(longest.Status, 201, "a 64-character name, which the pattern allows (%s)", longest.Text());
   int i = 0;
   for (const std::string value : {"read", "write", "irreversible"}) {
     const auto r = post(c, tool({{"name", "payments.tool" + std::to_string(i++)}, {"side_effect", value}}));
@@ -1215,11 +1347,27 @@ void CheckSchema(harness::Ctx& ctx) {
       {{{"type", "array"}}, "/type"},
       {{{"type", "object"}, {"properties", {{"amount", nlohmann::json::object()}}}}, "/properties/amount/type"},
       {{{"type", "object"}, {"properties", {{"amount", {{"type", "integer"}}}}}, {"required", {"amount", "currency"}}}, "/required/1"},
+      {{{"properties", {{"amount", {{"type", "integer"}}}}}}, "/type"},
   };
   for (const auto& [schema, pointer] : cases) {
     const auto r = post(c, tool({{"schema", schema}}));
     ctx.Equal(r.Status, 422, "the schema %s must be refused: an agent cannot build arguments from it", schema.dump());
     ctx.Assert(r.Text().find(pointer) != std::string::npos, "the 422 for %s must name the failing pointer %s, got %s", schema.dump(), pointer, r.Text());
+  }
+  const nlohmann::json broken = {{"type", "object"},
+                                 {"properties", {{"amount", {{"type", "integer"}}}, {"note", nlohmann::json::object()}}},
+                                 {"required", {"amount", "currency"}}};
+  const auto twice = post(c, tool({{"schema", broken}}));
+  ctx.Equal(twice.Status, 422, "the schema %s must be refused", broken.dump());
+  const auto report = nlohmann::json::parse(twice.Text(), nullptr, false);
+  std::vector<std::string> pointers;
+  if (report.is_object() && report.contains("errors") && report["errors"].is_array()) {
+    for (const auto& e : report["errors"]) {
+      if (e.is_object() && e.contains("pointer") && e["pointer"].is_string()) pointers.push_back(e["pointer"].get<std::string>());
+    }
+  }
+  for (const std::string pointer : {"/properties/note/type", "/required/1"}) {
+    ctx.Assert(std::find(pointers.begin(), pointers.end(), pointer) != pointers.end(), "the schema %s fails twice and the 422 (%s) must carry errors, a list of {pointer, message}, one pointer per failure: %s is missing", broken.dump(), twice.Text(), pointer);
   }
   ctx.Equal(ctx.Redis.Keys("tool:*"), std::vector<std::string>{}, "invalid schemas must not be stored; the tool keys");
   const auto r = post(c, tool());
@@ -1233,6 +1381,7 @@ void CheckVersion(harness::Ctx& ctx) {
   const std::string version = versionIn(first);
   ctx.Assert(version != "v1", "the version is the caller's label v1: a label can be reused for another definition. Mint it from the content");
   ctx.Assert(std::regex_match(version, std::regex("^[0-9a-f]{16}$")), "the version %q must be 16 hex characters of a sha256 digest", version);
+  ctx.Assert(version == kMinted, "the version is %q, expected %q: the first 16 hex characters of the sha256 of the canonical JSON (sorted keys, no whitespace) of name, owner, schema and side_effect", version, kMinted);
   ctx.Equal(post(c, tool({{"version", "v2"}})).Status, 409, "re-registering the same definition");
   nlohmann::json changed_schema = kSchema;
   changed_schema["properties"]["reason"] = {{"type", "string"}};
@@ -1241,6 +1390,23 @@ void CheckVersion(harness::Ctx& ctx) {
   ctx.Assert(versionIn(changed) != version, "a changed definition got the version of the first one");
   const auto row = store::get("payments.refund", version);
   ctx.Assert(row && (*row)["schema"] == kSchema, "the first version now holds %s: a stored version must stay immutable", row ? row->dump() : "nothing");
+  // Another reviewer registers the same definition between this request's first look at the version and its write.
+  const std::string key = "tool:payments.refund:" + kMintedBilling;
+  const std::string rival = "https://billing.internal/refund-rival";
+  std::atomic<bool> raced{false};
+  ctx.Redis.After(key, [&] {
+    if (ctx.Redis.Exists(key) == 0) {
+      ctx.Redis.Do("HSET", key, "name", "payments.refund", "version", kMintedBilling, "side_effect", "irreversible", "owner", "billing", "schema", kSchema.dump(), "endpoint", rival, "credential_ref", "vault://payments/refund");
+      raced = true;
+    }
+  });
+  const auto r = post(c, tool({{"owner", "billing"}}));
+  if (raced) {
+    ctx.Equal(r.Status, 409, "another registration of the same definition landed between this request's check and its write: only a write that refuses an existing version is safe");
+    ctx.Assert(ctx.Redis.HGet(key, "endpoint") == std::optional<std::string>(rival), "the version registered by the other reviewer was replaced: %s", ctx.Redis.HGet(key, "endpoint").value_or("nothing"));
+  } else {
+    ctx.Equal(r.Status, 201, "a new definition (%s)", r.Text());
+  }
 }
 `,
   },

@@ -40,7 +40,7 @@ the record, or does not answer, drops the label from every downstream count.
       id: 'task-key',
       title: 'Keys label.submitted by the task id',
       detail:
-        'Labels of tasks t-1, t-2, t-1 carry those keys and the two t-1 events share a partition, so the agreement consumer sees one task in order. The starter keys by annotator, which spreads one task over every partition.',
+        'Labels of tasks t-1, t-2, t-1 carry those keys and the two t-1 events share a partition, so the agreement consumer sees one task in order; each acknowledged call answers true and writes no outbox row. The starter keys by annotator, which spreads one task over every partition.',
       match: {
         python: {all: [/producer\.produce\([^\n]*key\s*=\s*label\[["']task_id["']\]/]},
         typescript: {all: [/key:\s*label\.task_id/]},
@@ -53,7 +53,7 @@ the record, or does not answer, drops the label from every downstream count.
       id: 'save-first',
       title: 'Saves the label before producing its event',
       detail:
-        'When the label is written to `labels:{task_id}` the topic is still empty: the event follows the save. The starter produces first, so a failed save leaves an event for a label nobody can read.',
+        'When the label is written to `labels:{task_id}` the topic is still empty: the event follows the save. A save that fails (the check makes `labels:{task_id}` the wrong type) leaves no event and no outbox row. The starter produces first, so a failed save leaves an event for a label nobody can read.',
       match: {
         python: {order: [/store\.save_label\(/, /producer\.produce\(/]},
         typescript: {order: [/await saveLabel\(/, /producer\.send\(/]},
@@ -79,7 +79,7 @@ the record, or does not answer, drops the label from every downstream count.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the task id and the label, and the call answers false. The starter fires and forgets.',
+        'A failed delivery, or no report within 2 s (the check allows 2.5 s), leaves an outbox row with the topic, the task id and the label as payload, and the call answers false. The starter fires and forgets.',
       match: {
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
@@ -464,9 +464,8 @@ def _outbox(ctx):
 
 def check_task_key(ctx):
     m = ctx.load("events")
-    m.record_label(_label(1, "t-1", "ana"))
-    m.record_label(_label(2, "t-2", "bo"))
-    m.record_label(_label(3, "t-1", "cy"))
+    oks = [m.record_label(_label(1, "t-1", "ana")), m.record_label(_label(2, "t-2", "bo")), m.record_label(_label(3, "t-1", "cy"))]
+    assert oks == [True, True, True] and _outbox(ctx) == [], f"three acknowledged events answered {oks} and left the outbox {_outbox(ctx)}: an acknowledged event answers True and writes no outbox row"
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 3, f"three record_label calls produced {len(records)} records on label.submitted (topics: {sorted(ctx.kafka.topics)})"
     keys = [r.key for r in records]
@@ -482,6 +481,15 @@ def check_save_first(ctx):
     assert probe.fired, "record_label never saved the label (no write to labels:t-1)"
     assert probe.result == 0, f"when the label was saved the topic already held {probe.result} record(s): an event for a label nobody can read yet is a phantom. Save first, then produce"
     assert len(ctx.kafka.records(TOPIC)) == 1, "the event must still be produced after the save"
+    # A save that fails must not leave an event, or an outbox row, for a label nobody can read.
+    ctx.redis.set("labels:t-9", "not a list")
+    try:
+        m.record_label(_label(9, "t-9"))
+    except Exception:
+        pass  # the save failure reaching the caller is fine
+    keys = [r.key for r in ctx.kafka.records(TOPIC)]
+    assert b"t-9" not in keys, f"the save of l-9 failed (labels:t-9 holds a string) and its event went out anyway, keys {keys}: an event for a label nobody can read is a phantom"
+    assert [row for row in _outbox(ctx) if row.get("key") == "t-9"] == [], f"the save of l-9 failed and the outbox holds {_outbox(ctx)}: the relay would publish a label nobody can read"
 
 
 def check_acks_idempotent(ctx):
@@ -500,14 +508,14 @@ def check_outbox_on_failure(ctx):
     ok = m.record_label(_label(1))
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the label is missing from every agreement count"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "t-1" and rows[0].get("payload", {}).get("label_id") == "l-1", f"the outbox row is {rows[0]}, expected the topic, the key t-1 and the label"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "t-1" and rows[0].get("payload") == _label(1), f"the outbox row is {rows[0]}, expected the topic, the key t-1 and the label as payload"
     assert ok is False, f"record_label returned {ok!r} after a failed delivery, expected False"
     assert ctx.redis.llen("labels:t-1") == 1, "the label must stay saved when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.record_label(_label(2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"record_label waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"record_label waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S = 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("label_id") == "l-2", f"no report within the window and the outbox holds {rows}"
     assert ok is False, f"record_label returned {ok!r} without a delivery report, expected False"
@@ -534,9 +542,8 @@ const settle = (): Promise<void> => {
 
 export async function check_task_key(ctx) {
   const m = ctx.load('events');
-  await m.recordLabel(label(1, 't-1', 'ana'));
-  await m.recordLabel(label(2, 't-2', 'bo'));
-  await m.recordLabel(label(3, 't-1', 'cy'));
+  const oks = [await m.recordLabel(label(1, 't-1', 'ana')), await m.recordLabel(label(2, 't-2', 'bo')), await m.recordLabel(label(3, 't-1', 'cy'))];
+  assert(JSON.stringify(oks) === '[true,true,true]' && outboxRows(ctx).length === 0, \`three acknowledged events resolved \${JSON.stringify(oks)} and left the outbox \${JSON.stringify(outboxRows(ctx))}: an acknowledged event resolves true and writes no outbox row\`);
   await settle();
   const records = ctx.kafka.records(TOPIC);
   assert.equal(records.length, 3, \`three recordLabel calls produced \${records.length} records on label.submitted\`);
@@ -554,6 +561,17 @@ export async function check_save_first(ctx) {
   assert(probe.fired, 'recordLabel never saved the label (no write to labels:t-1)');
   assert.equal(probe.result, 0, \`when the label was saved the topic already held \${probe.result} record(s): an event for a label nobody can read yet is a phantom. Save first, then produce\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must still be produced after the save');
+  // A save that fails must not leave an event, or an outbox row, for a label nobody can read.
+  ctx.redis.set('labels:t-9', 'not a list');
+  try {
+    await m.recordLabel(label(9, 't-9'));
+  } catch {
+    // the save failure reaching the caller is fine
+  }
+  await settle();
+  const keys = ctx.kafka.keys(TOPIC);
+  assert(!keys.includes('t-9'), \`the save of l-9 failed (labels:t-9 holds a string) and its event went out anyway, keys \${JSON.stringify(keys)}: an event for a label nobody can read is a phantom\`);
+  assert(!outboxRows(ctx).some(row => row.key === 't-9'), \`the save of l-9 failed and the outbox holds \${JSON.stringify(outboxRows(ctx))}: the relay would publish a label nobody can read\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -575,14 +593,15 @@ export async function check_outbox_on_failure(ctx) {
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the label is missing from every agreement count\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 't-1' && rows[0].payload?.label_id === 'l-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key t-1 and the label\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 't-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic and the key t-1\`);
+  assert.deepEqual(rows[0].payload, label(1), \`the outbox row is \${JSON.stringify(rows[0])}, expected the label as payload\`);
   assert.equal(ok, false, \`recordLabel resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   assert.equal(ctx.redis.llen('labels:t-1'), 1, 'the label must stay saved when only the produce failed');
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.recordLabel(label(2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`recordLabel waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`recordLabel waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.label_id === 'l-2', \`no report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`recordLabel resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -627,9 +646,8 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckTaskKey(ctx *harness.Ctx) {
-	eventsRecord(ctx, eventsLabel(1, "t-1", "ana"))
-	eventsRecord(ctx, eventsLabel(2, "t-2", "bo"))
-	eventsRecord(ctx, eventsLabel(3, "t-1", "cy"))
+	oks := []bool{eventsRecord(ctx, eventsLabel(1, "t-1", "ana")), eventsRecord(ctx, eventsLabel(2, "t-2", "bo")), eventsRecord(ctx, eventsLabel(3, "t-1", "cy"))}
+	ctx.Assert(oks[0] && oks[1] && oks[2] && len(eventsOutbox(ctx)) == 0, "three acknowledged events answered %v and left the outbox %v: an acknowledged event answers true and writes no outbox row", oks, eventsOutbox(ctx))
 	ctx.Settle()
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 3, "three recordLabel calls must produce three records on label.submitted; the records")
@@ -647,6 +665,16 @@ func CheckSaveFirst(ctx *harness.Ctx) {
 	ctx.Assert(probe.Fired, "recordLabel never saved the label (no write to labels:t-1)")
 	ctx.Equal(probe.Result, 0, "when the label was saved the topic already held records: an event for a label nobody can read yet is a phantom. Save first, then produce; the records at save time")
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "the event must still be produced after the save; the records")
+	// A save that fails must not leave an event, or an outbox row, for a label nobody can read.
+	ctx.Redis.Set("labels:t-9", "not a list")
+	recordLabel(context.Background(), eventsLabel(9, "t-9", "ana")) // the save failure reaching the caller is fine
+	ctx.Settle()
+	for _, key := range ctx.Kafka.Keys(topic) {
+		ctx.Assert(key != "t-9", "the save of l-9 failed (labels:t-9 holds a string) and its event went out anyway, keys %v: an event for a label nobody can read is a phantom", ctx.Kafka.Keys(topic))
+	}
+	for _, row := range eventsOutbox(ctx) {
+		ctx.Assert(row.Key != "t-9", "the save of l-9 failed and the outbox holds %v: the relay would publish a label nobody can read", eventsOutbox(ctx))
+	}
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -666,14 +694,18 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the label is missing from every agreement count; the rows")
-	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "t-1" && rows[0].Payload["label_id"] == "l-1", "the outbox row is %v, expected the topic, the key t-1 and the label", rows[0])
+	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "t-1", "the outbox row is %v, expected the topic and the key t-1", rows[0])
+	var want map[string]any
+	raw, _ := json.Marshal(eventsLabel(1, "t-1", "ana"))
+	json.Unmarshal(raw, &want)
+	ctx.Equal(rows[0].Payload, want, "the outbox row's payload must be the label")
 	ctx.Equal(ok, false, "recordLabel's result after a failed delivery")
 	ctx.Equal(ctx.Redis.LLen("labels:t-1"), int64(1), "the label must stay saved when only the produce failed")
 	ctx.Kafka.Stall(topic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsRecord(ctx, eventsLabel(2, "t-1", "ana"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "recordLabel waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "recordLabel waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["label_id"] == "l-2", "no report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "recordLabel's result without a delivery report")
@@ -709,9 +741,8 @@ std::string eventsField(const nlohmann::json& j, const std::string& field) {
 }  // namespace
 
 void CheckTaskKey(harness::Ctx& ctx) {
-  recordLabel(eventsLabel(1, "t-1", "ana"));
-  recordLabel(eventsLabel(2, "t-2", "bo"));
-  recordLabel(eventsLabel(3, "t-1", "cy"));
+  const bool oks[] = {recordLabel(eventsLabel(1, "t-1", "ana")), recordLabel(eventsLabel(2, "t-2", "bo")), recordLabel(eventsLabel(3, "t-1", "cy"))};
+  ctx.Assert(oks[0] && oks[1] && oks[2] && eventsOutbox(ctx).empty(), "three acknowledged events answered %v, %v, %v and left %d outbox rows: an acknowledged event answers true and writes no outbox row", oks[0], oks[1], oks[2], eventsOutbox(ctx).size());
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 3, "three recordLabel calls must produce three records on label.submitted; the records");
@@ -732,6 +763,20 @@ void CheckSaveFirst(harness::Ctx& ctx) {
   ctx.Assert(fired, "recordLabel never saved the label (no write to labels:t-1)");
   ctx.Equal(atSave, 0, "when the label was saved the topic already held records: an event for a label nobody can read yet is a phantom. Save first, then produce; the records at save time");
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the event must still be produced after the save; the records");
+  // A save that fails must not leave an event, or an outbox row, for a label nobody can read.
+  ctx.Redis.Set("labels:t-9", "not a list");
+  try {
+    recordLabel(eventsLabel(9, "t-9"));
+  } catch (const std::exception&) {
+    // the save failure reaching the caller is fine
+  }
+  ctx.Settle();
+  for (const auto& key : ctx.Kafka.Keys(kTopic)) {
+    ctx.Assert(key != "t-9", "the save of l-9 failed (labels:t-9 holds a string) and its event went out anyway: an event for a label nobody can read is a phantom");
+  }
+  for (const auto& row : eventsOutbox(ctx)) {
+    ctx.Assert(eventsField(row, "key") != "t-9", "the save of l-9 failed and the outbox holds %s: the relay would publish a label nobody can read", row.dump());
+  }
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -751,15 +796,15 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the label is missing from every agreement count; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kTopic && eventsField(rows[0], "key") == "t-1" && rows[0].contains("payload") && eventsField(rows[0]["payload"], "label_id") == "l-1",
-             "the outbox row is %s, expected the topic, the key t-1 and the label", rows[0].dump());
+  ctx.Assert(eventsField(rows[0], "topic") == kTopic && eventsField(rows[0], "key") == "t-1", "the outbox row is %s, expected the topic and the key t-1", rows[0].dump());
+  ctx.Equal(rows[0].value("payload", nlohmann::json()), store::toJson(eventsLabel(1)), "the outbox row's payload must be the label");
   ctx.Equal(ok, false, "recordLabel's result after a failed delivery");
   ctx.Equal(ctx.Redis.LLen("labels:t-1"), 1LL, "the label must stay saved when only the produce failed");
   ctx.Kafka.Stall(kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = recordLabel(eventsLabel(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "recordLabel waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "recordLabel waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "label_id") == "l-2", "no report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "recordLabel's result without a delivery report");

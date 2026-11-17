@@ -69,7 +69,7 @@ service Validator { rpc Validate(ValidateRequest) returns (ValidationReport); }
       id: 'timeout-no-promote',
       title: 'No verdict marks the version pending and leaves the pointer',
       detail:
-        'A failed call records `pending` and raises `ValidationPending`; the previous version stays latest. The starter swallows the error and promotes, so unchecked bytes reach training.',
+        'A failed call, whatever its status (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `INTERNAL`, `INVALID_ARGUMENT`), records `pending` and raises `ValidationPending`; the previous version stays latest. The starter swallows the error and promotes, so unchecked bytes reach training.',
       match: {
         python: {all: [/raise ValidationPending/, /["']pending["']/], none: [/except grpc\.RpcError:\s*\n\s*pass\b/]},
         typescript: {all: [/throw new ValidationPending/, /'pending'/]},
@@ -82,7 +82,7 @@ service Validator { rpc Validate(ValidateRequest) returns (ValidationReport); }
       id: 'rejected-held',
       title: 'A failed report is rejected, not promoted',
       detail:
-        'A report with `passed: false` records `rejected` with the report and returns without promoting. The starter records `validated` for any report that came back.',
+        'A report with `passed: false` records `rejected` with the report and returns without promoting; a full pass keeps its report too. The starter records `validated` for any report that came back.',
       match: {
         python: {all: [/["']rejected["']/]},
         typescript: {all: [/'rejected'/]},
@@ -95,7 +95,7 @@ service Validator { rpc Validate(ValidateRequest) returns (ValidationReport); }
       id: 'coverage',
       title: 'A pass counts only when it covers every row',
       detail:
-        "The request sets `max_rows` to 0 (every row), and a report whose `rows_scanned` is below the record's `row_count` is `pending`. The starter asks for a 1000-row sample, so a bad row at 1200 is never seen.",
+        "The request sets `max_rows` to 0 (every row), and a report whose `rows_scanned` is below the record's `row_count` is `pending`, even when the report's own `rows_total` claims the scan was complete. The starter asks for a 1000-row sample, so a bad row at 1200 is never seen.",
       match: {
         python: {all: [/max_rows\s*=\s*0\b/, /rows_scanned\s*</], none: [/SAMPLE_ROWS/]},
         typescript: {all: [/max_rows:\s*0\b/, /rows_scanned\)?\s*</], none: [/SAMPLE_ROWS/]},
@@ -636,6 +636,7 @@ class Validator(dataset_registry_pb2_grpc.ValidatorServicer):
 
     def __init__(self):
         self.cap = 0
+        self.short_view = False  # with a cap: reports the rows it scanned as the whole file
 
     def Validate(self, request, context):
         content = store.read_object(request.content_sha256)
@@ -646,7 +647,8 @@ class Validator(dataset_registry_pb2_grpc.ValidatorServicer):
         if self.cap:
             limit = min(limit, self.cap)
         failures = [f"row {i + 1}: label missing" for i, row in enumerate(rows[:limit]) if "BAD" in row]
-        return dataset_registry_pb2.ValidationReport(passed=not failures, rows_scanned=limit, rows_total=len(rows), failures=failures)
+        total = limit if self.short_view else len(rows)
+        return dataset_registry_pb2.ValidationReport(passed=not failures, rows_scanned=limit, rows_total=total, failures=failures)
 
 
 def _register(version, n, bad_at=0):
@@ -704,6 +706,10 @@ def check_timeout_no_promote(ctx):
     ctx.grpc.fail("Validate", grpc.StatusCode.UNAVAILABLE, "validator restarting")
     _pending(m, "2026-02", "with the validator UNAVAILABLE")
     _held("2026-02", "pending", "with the validator UNAVAILABLE")
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.INVALID_ARGUMENT):
+        ctx.grpc.fail("Validate", code, "validator error")
+        _pending(m, "2026-02", f"with the validator failing {code.name}")
+        _held("2026-02", "pending", f"with the validator failing {code.name}")
     ctx.grpc.set_latency("Validate", 120.0)
     _pending(m, "2026-03", "with the validator past its deadline")
     _held("2026-03", "pending", "with the validator past its deadline")
@@ -720,6 +726,8 @@ def check_rejected_held(ctx):
     _held("2026-02", "rejected", "after a failed report")
     report = store.version(DS, "2026-02")["report"]
     assert report is not None and report.get("passed") is False and report.get("failures"), f"the rejected version must keep the validator's report, it holds {report}"
+    report = store.version(DS, "2026-01")["report"]
+    assert report is not None and report.get("passed") is True and report.get("rows_scanned") == 10, f"the validated 2026-01 must keep the validator's report as well, it holds {report}"
 
 
 def check_coverage(ctx):
@@ -736,6 +744,11 @@ def check_coverage(ctx):
     validator.cap = 500
     _pending(m, "2026-03", "with a validator that scanned 500 of 1500 rows")
     _held("2026-03", "pending", "after a scan of 500 of 1500 rows")
+    validator.short_view = True
+    validator.cap = 1000
+    _register("2026-04", 1500)
+    _pending(m, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)")
+    _held("2026-04", "pending", "after a scan of 1000 of 1500 measured rows")
 `,
     typescript: `const DS = 'imdb-reviews';
 
@@ -746,11 +759,11 @@ async function register(store, version: string, n: number, badAt = 0): Promise<v
   await store.putVersion({tenant: 't1', dataset: DS, version, content_sha256: sha, license: 'mit', owner: 'team-lm', size_bytes: content.length, row_count: n, status: 'registered', report: null});
 }
 
-/** The validator scans the object's rows (every row when max_rows is 0); a row marked BAD fails. A cap truncates every scan. */
+/** The validator scans the object's rows (every row when max_rows is 0); a row marked BAD fails. A cap truncates every scan; with shortView it reports the rows it scanned as the whole file. */
 async function client(ctx) {
   const store = ctx.load('/support/registry/store.ts');
   const pointer = ctx.load('/support/registry/pointer.ts');
-  const peer = {cap: 0};
+  const peer = {cap: 0, shortView: false};
   const pkg = ctx.proto('dataset_registry.proto');
   ctx.grpc.serve(pkg.datasetregistry.Validator.service, {
     async Validate(call, callback) {
@@ -761,7 +774,7 @@ async function client(ctx) {
       let limit = max <= 0 ? rows.length : Math.min(max, rows.length);
       if (peer.cap) limit = Math.min(limit, peer.cap);
       const failures = rows.slice(0, limit).flatMap((row, i) => (row.includes('BAD') ? [\`row \${i + 1}: label missing\`] : []));
-      callback(null, {passed: failures.length === 0, rows_scanned: limit, rows_total: rows.length, failures});
+      callback(null, {passed: failures.length === 0, rows_scanned: limit, rows_total: peer.shortView ? limit : rows.length, failures});
     },
   });
   const m = ctx.load('client');
@@ -812,6 +825,11 @@ export async function check_timeout_no_promote(ctx) {
   ctx.grpc.fail('Validate', ctx.grpc.status.UNAVAILABLE, 'validator restarting', 1);
   await pending(env.m, '2026-02', 'with the validator UNAVAILABLE');
   await held(env, '2026-02', 'pending', 'with the validator UNAVAILABLE');
+  for (const code of ['INTERNAL', 'INVALID_ARGUMENT']) {
+    ctx.grpc.fail('Validate', ctx.grpc.status[code], 'validator error', 1);
+    await pending(env.m, '2026-02', \`with the validator failing \${code}\`);
+    await held(env, '2026-02', 'pending', \`with the validator failing \${code}\`);
+  }
   ctx.grpc.setLatency('Validate', 120);
   await pending(env.m, '2026-03', 'with the validator past its deadline');
   await held(env, '2026-03', 'pending', 'with the validator past its deadline');
@@ -828,6 +846,8 @@ export async function check_rejected_held(ctx) {
   await held(env, '2026-02', 'rejected', 'after a failed report');
   const {report} = await env.store.version(DS, '2026-02');
   assert(report !== null && report.passed === false && report.failures.length > 0, \`the rejected version must keep the validator's report, it holds \${JSON.stringify(report)}\`);
+  const validated = (await env.store.version(DS, '2026-01')).report;
+  assert(validated !== null && validated.passed === true && validated.rows_scanned === 10, \`the validated 2026-01 must keep the validator's report as well, it holds \${JSON.stringify(validated)}\`);
 }
 
 export async function check_coverage(ctx) {
@@ -847,6 +867,11 @@ export async function check_coverage(ctx) {
   env.peer.cap = 500;
   await pending(env.m, '2026-03', 'with a validator that scanned 500 of 1500 rows');
   await held(env, '2026-03', 'pending', 'after a scan of 500 of 1500 rows');
+  env.peer.shortView = true;
+  env.peer.cap = 1000;
+  await register(env.store, '2026-04', 1500);
+  await pending(env.m, '2026-04', 'with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)');
+  await held(env, '2026-04', 'pending', 'after a scan of 1000 of 1500 measured rows');
 }
 `,
     go: `package main
@@ -873,10 +898,11 @@ const clientDS = "imdb-reviews"
 var clientBg = context.Background()
 
 // validatorPeer scans the object's rows (every row when max_rows is 0); a row marked BAD fails. A
-// cap truncates every scan.
+// cap truncates every scan; with shortView it reports the rows it scanned as the whole file.
 type validatorPeer struct {
 	pb.UnimplementedValidatorServer
-	cap int64
+	cap       int64
+	shortView bool
 }
 
 func (v *validatorPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*pb.ValidationReport, error) {
@@ -903,7 +929,11 @@ func (v *validatorPeer) Validate(_ context.Context, req *pb.ValidateRequest) (*p
 			failures = append(failures, fmt.Sprintf("row %d: label missing", i+1))
 		}
 	}
-	return &pb.ValidationReport{Passed: len(failures) == 0, RowsScanned: limit, RowsTotal: int64(len(rows)), Failures: failures}, nil
+	total := int64(len(rows))
+	if v.shortView {
+		total = limit
+	}
+	return &pb.ValidationReport{Passed: len(failures) == 0, RowsScanned: limit, RowsTotal: total, Failures: failures}, nil
 }
 
 func clientRegister(ctx *harness.Ctx, version string, n, badAt int) {
@@ -974,6 +1004,11 @@ func CheckTimeoutNoPromote(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("Validate", codes.Unavailable, "validator restarting", 1, "")
 	clientPending(ctx, "2026-02", "with the validator UNAVAILABLE")
 	clientHeld(ctx, "2026-02", "pending", "with the validator UNAVAILABLE")
+	for _, code := range []codes.Code{codes.Internal, codes.InvalidArgument} {
+		ctx.GRPC.Fail("Validate", code, "validator error", 1, "")
+		clientPending(ctx, "2026-02", "with the validator failing "+code.String())
+		clientHeld(ctx, "2026-02", "pending", "with the validator failing "+code.String())
+	}
 	ctx.GRPC.SetLatency("Validate", 120, "")
 	clientPending(ctx, "2026-03", "with the validator past its deadline")
 	clientHeld(ctx, "2026-03", "pending", "with the validator past its deadline")
@@ -993,6 +1028,8 @@ func CheckRejectedHeld(ctx *harness.Ctx) {
 	clientHeld(ctx, "2026-02", "rejected", "after a failed report")
 	report := store.Version(clientBg, clientDS, "2026-02").Report
 	ctx.Assert(report != nil && !report.Passed && len(report.Failures) > 0, "the rejected version must keep the validator's report, it holds %+v", report)
+	validated := store.Version(clientBg, clientDS, "2026-01").Report
+	ctx.Assert(validated != nil && validated.Passed && validated.RowsScanned == 10, "the validated 2026-01 must keep the validator's report as well, it holds %+v", validated)
 }
 
 func CheckCoverage(ctx *harness.Ctx) {
@@ -1010,20 +1047,29 @@ func CheckCoverage(ctx *harness.Ctx) {
 	peer.cap = 500
 	clientPending(ctx, "2026-03", "with a validator that scanned 500 of 1500 rows")
 	clientHeld(ctx, "2026-03", "pending", "after a scan of 500 of 1500 rows")
+	peer.shortView = true
+	peer.cap = 1000
+	clientRegister(ctx, "2026-04", 1500, 0)
+	clientPending(ctx, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)")
+	clientHeld(ctx, "2026-04", "pending", "after a scan of 1000 of 1500 measured rows")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
 const std::string kDS = "imdb-reviews";
 
-// Scans the object's rows (every row when max_rows is 0); a row marked BAD fails. A cap truncates every scan.
+// Scans the object's rows (every row when max_rows is 0); a row marked BAD fails. A cap truncates
+// every scan; with short_view it reports the rows it scanned as the whole file.
 class ValidatorPeer final : public datasetregistry::Validator::Service {
  public:
   long long cap = 0;
+  bool short_view = false;
   grpc::Status Validate(grpc::ServerContext*, const datasetregistry::ValidateRequest* req, datasetregistry::ValidationReport* out) override {
     const auto content = store::readObject(req->content_sha256());
     if (!content) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no object " + req->content_sha256());
@@ -1046,7 +1092,7 @@ class ValidatorPeer final : public datasetregistry::Validator::Service {
     }
     out->set_passed(out->failures_size() == 0);
     out->set_rows_scanned(limit);
-    out->set_rows_total(static_cast<long long>(rows.size()));
+    out->set_rows_total(short_view ? limit : static_cast<long long>(rows.size()));
     return grpc::Status::OK;
   }
 };
@@ -1120,6 +1166,11 @@ void CheckTimeoutNoPromote(harness::Ctx& ctx) {
   ctx.GRPC.Fail("Validate", grpc::StatusCode::UNAVAILABLE, "validator restarting", 1);
   pending(ctx, "2026-02", "with the validator UNAVAILABLE");
   held(ctx, "2026-02", "pending", "with the validator UNAVAILABLE");
+  for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}}) {
+    ctx.GRPC.Fail("Validate", code, "validator error", 1);
+    pending(ctx, "2026-02", "with the validator failing " + name);
+    held(ctx, "2026-02", "pending", "with the validator failing " + name);
+  }
   ctx.GRPC.SetLatency("Validate", 120.0);
   pending(ctx, "2026-03", "with the validator past its deadline");
   held(ctx, "2026-03", "pending", "with the validator past its deadline");
@@ -1136,6 +1187,9 @@ void CheckRejectedHeld(harness::Ctx& ctx) {
   const auto report = store::version(kDS, "2026-02")->report;
   ctx.Assert(report && !report->value("passed", true) && !report->value("failures", nlohmann::json::array()).empty(),
              "the rejected version must keep the validator's report, it holds %s", report ? report->dump() : "nothing");
+  const auto validated = store::version(kDS, "2026-01")->report;
+  ctx.Assert(validated && validated->value("passed", false) && validated->value("rows_scanned", 0LL) == 10,
+             "the validated 2026-01 must keep the validator's report as well, it holds %s", validated ? validated->dump() : "nothing");
 }
 
 void CheckCoverage(harness::Ctx& ctx) {
@@ -1155,6 +1209,11 @@ void CheckCoverage(harness::Ctx& ctx) {
   peer.cap = 500;
   pending(ctx, "2026-03", "with a validator that scanned 500 of 1500 rows");
   held(ctx, "2026-03", "pending", "after a scan of 500 of 1500 rows");
+  peer.short_view = true;
+  peer.cap = 1000;
+  registerVersion("2026-04", 1500);
+  pending(ctx, "2026-04", "with a validator that scanned 1000 of the 1500 rows the registry measured (its report says rows_total 1000)");
+  held(ctx, "2026-04", "pending", "after a scan of 1000 of 1500 measured rows");
 }
 `,
   },

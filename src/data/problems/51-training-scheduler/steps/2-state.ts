@@ -61,7 +61,7 @@ comes back behind everything.
       id: 'single-claim',
       title: 'Lets exactly one of two racing schedulers claim a run',
       detail:
-        'A second scheduler claims right after this one first touches `training:queue`: one of them gets the run and the lease names it. The starter reads the head and removes it in two commands, so both claim it.',
+        'A second scheduler claims right after this one first touches `training:queue`: one of them gets the run, the lease names it and expires in `LEASE_TTL_MS`, and its deadline in `training:leases` is `now_ms + LEASE_TTL_MS`. The starter reads the head and removes it in two commands, so both claim it.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/\.zrem\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]ZREM['"]/], none: [/redis\.zrem\(/]},
@@ -74,7 +74,7 @@ comes back behind everything.
       id: 'confirm-guarded',
       title: 'Confirms a start only for the worker that holds the lease',
       detail:
-        'A worker whose lease ran out, and whose run was claimed again by another worker, gets false from `confirm_start` and the run stays with the new worker. The starter drops the lease and marks the run running whoever asks.',
+        'A worker whose lease ran out, and whose run was claimed again by another worker, gets false from `confirm_start` and the run stays with the new worker; so does a worker whose run is reaped and claimed again right after its confirm first touches the lease. The starter drops the lease and marks the run running whoever asks.',
       match: {
         python: {all: [/redis\.call\(\s*['"]GET['"]/, /(~=|==)\s*ARGV\[1\]/], none: [/\.delete\(\s*lease_key\(/]},
         typescript: {all: [/redis\.call\(\s*['"]GET['"]/, /(~=|==)\s*ARGV\[1\]/], none: [/redis\.del\(\s*leaseKey\(/]},
@@ -87,7 +87,7 @@ comes back behind everything.
       id: 'reap-keeps-position',
       title: 'Returns an expired start to the position it had',
       detail:
-        'A band-0 run whose lease ran out is re-added at its original score and claimed before a band-0 run submitted after it; a lease that has not run out is left alone. The starter re-adds it with score `now_ms`.',
+        'A band-0 run whose lease ran out is re-added at its original score and claimed before a band-0 run submitted after it; a lease 1 ms short of its deadline is left alone. The starter re-adds it with score `now_ms`.',
       match: {
         python: {all: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]position['"]/], none: [/zadd\([^\n]*now_ms/]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"][^\n]*['"]position['"]/], none: [/zadd\([^\n]*nowMs/]},
@@ -821,6 +821,10 @@ def check_single_claim(ctx):
     holder = ctx.redis.get("training:lease:run-a")
     assert holder == winners[0], f"training:lease:run-a names {holder!r}, but {winners[0]} won the claim"
     assert runs.get("run-a")["worker"] == winners[0], f"the run row names worker {runs.get('run-a')['worker']!r}, but {winners[0]} won the claim"
+    ttl = ctx.redis.pttl("training:lease:run-a")
+    assert 0 < ttl <= 15000, f"the claim left training:lease:run-a with PTTL {ttl}: set the lease with PX LEASE_TTL_MS in the claim script"
+    deadline = ctx.redis.zscore("training:leases", "run-a")
+    assert deadline == now + 15000, f"training:leases holds the deadline {deadline} for run-a, expected now_ms + LEASE_TTL_MS = {now + 15000}"
 
 
 def check_confirm_guarded(ctx):
@@ -838,6 +842,21 @@ def check_confirm_guarded(ctx):
     assert m.confirm_start("run-a", "w-2") is True, "the worker that holds the lease must be able to confirm"
     assert runs.get("run-a")["state"] == "running", f"a confirmed run reads state {runs.get('run-a')['state']!r}, expected running"
     assert ctx.redis.zscore("training:leases", "run-a") is None, "a confirmed run left its deadline in training:leases: the reaper would requeue a running run"
+    # The lease runs out and w-4 claims run-b right after w-3's confirm first touches the lease.
+    t1 = t0 + 16000
+    _enqueue(m, "run-b", 1, t1)
+    assert m.claim_next("w-3", t1) == "run-b", "run-b, the only queued run, must be claimed"
+    rival = ctx.redis_after("training:lease:run-b", lambda: (m.reap_expired(t1 + 20000), m.claim_next("w-4", t1 + 20000))[1])
+    confirmed = m.confirm_start("run-b", "w-3")
+    assert rival.fired, "confirm_start never touched training:lease:run-b"
+    if rival.error is not None:
+        raise rival.error
+    run = runs.get("run-b")
+    if rival.result == "run-b":
+        holder = ctx.redis.get("training:lease:run-b")
+        assert confirmed is False and holder == "w-4" and run["state"] == "starting" and run["worker"] == "w-4", f"w-4 claimed run-b between w-3's lease check and its writes, yet w-3's confirm returned {confirmed!r} and left lease {holder!r}, state {run['state']!r}, worker {run['worker']!r}: check the lease and confirm in one script"
+    else:
+        assert confirmed is True and run["state"] == "running", f"w-3 held the lease of run-b, yet its confirm returned {confirmed!r} with state {run['state']!r}"
 
 
 def check_reap_keeps_position(ctx):
@@ -847,7 +866,7 @@ def check_reap_keeps_position(ctx):
     assert m.claim_next("w-1", t0) == "run-a", "the only queued run must be claimed"
     _enqueue(m, "run-b", 0, t0 + 5000)
     _enqueue(m, "run-c", 1, t0 + 100)
-    assert m.reap_expired(t0 + 1000) == 0, "reap_expired returned a run whose lease has not run out"
+    assert m.reap_expired(t0 + 14999) == 0, "reap_expired returned a run whose lease has not run out"
     ctx.clock.advance(16)  # w-1 died during startup
     assert m.reap_expired(t0 + 16000) == 1, "the lease of run-a ran out: reap_expired must return it"
     score = ctx.redis.zscore("training:queue", "run-a")
@@ -892,6 +911,10 @@ export async function check_single_claim(ctx) {
   const holder = ctx.redis.get('training:lease:run-a');
   assert.equal(holder, winners[0], \`training:lease:run-a names \${JSON.stringify(holder)}, but \${winners[0]} won the claim\`);
   assert.equal((await runs.get('run-a')).worker, winners[0], \`the run row must name \${winners[0]}, which won the claim\`);
+  const ttl = ctx.redis.pttl('training:lease:run-a');
+  assert(ttl > 0 && ttl <= 15000, \`the claim left training:lease:run-a with PTTL \${ttl}: set the lease with PX LEASE_TTL_MS in the claim script\`);
+  const deadline = Number(ctx.redis.zscore('training:leases', 'run-a'));
+  assert.equal(deadline, now + 15000, \`training:leases holds the deadline \${deadline} for run-a, expected nowMs + LEASE_TTL_MS = \${now + 15000}\`);
 }
 
 export async function check_confirm_guarded(ctx) {
@@ -909,6 +932,24 @@ export async function check_confirm_guarded(ctx) {
   assert.equal(await m.confirmStart('run-a', 'w-2'), true, 'the worker that holds the lease must be able to confirm');
   assert.equal((await runs.get('run-a')).state, 'running', 'a confirmed run must read state running');
   assert.equal(ctx.redis.zscore('training:leases', 'run-a'), null, 'a confirmed run left its deadline in training:leases: the reaper would requeue a running run');
+  // The lease runs out and w-4 claims run-b right after w-3's confirm first touches the lease.
+  const t1 = t0 + 16000;
+  await enqueue(m, runs, 'run-b', 1, t1);
+  assert.equal(await m.claimNext('w-3', t1), 'run-b', 'run-b, the only queued run, must be claimed');
+  const rival = ctx.redisAfter('training:lease:run-b', () => [m.reapExpired(t1 + 20000), m.claimNext('w-4', t1 + 20000)]);
+  const confirmed = await m.confirmStart('run-b', 'w-3');
+  assert(rival.fired, 'confirmStart never touched training:lease:run-b');
+  if (rival.error !== undefined) throw rival.error;
+  const [rivalReap, rivalClaim] = rival.result;
+  await rivalReap;
+  const theirs = await rivalClaim;
+  const raced = await runs.get('run-b');
+  if (theirs === 'run-b') {
+    const holder = ctx.redis.get('training:lease:run-b');
+    assert(confirmed === false && holder === 'w-4' && raced.state === 'starting' && raced.worker === 'w-4', \`w-4 claimed run-b between w-3's lease check and its writes, yet w-3's confirm returned \${confirmed} and left lease \${JSON.stringify(holder)}, state \${raced.state}, worker \${raced.worker}: check the lease and confirm in one script\`);
+  } else {
+    assert(confirmed === true && raced.state === 'running', \`w-3 held the lease of run-b, yet its confirm returned \${confirmed} with state \${raced.state}\`);
+  }
 }
 
 export async function check_reap_keeps_position(ctx) {
@@ -918,7 +959,7 @@ export async function check_reap_keeps_position(ctx) {
   assert.equal(await m.claimNext('w-1', t0), 'run-a', 'the only queued run must be claimed');
   await enqueue(m, runs, 'run-b', 0, t0 + 5000);
   await enqueue(m, runs, 'run-c', 1, t0 + 100);
-  assert.equal(await m.reapExpired(t0 + 1000), 0, 'reapExpired returned a run whose lease has not run out');
+  assert.equal(await m.reapExpired(t0 + 14999), 0, 'reapExpired returned a run whose lease has not run out');
   ctx.clock.advance(16); // w-1 died during startup
   assert.equal(await m.reapExpired(t0 + 16000), 1, 'the lease of run-a ran out: reapExpired must return it');
   const score = Number(ctx.redis.zscore('training:queue', 'run-a'));
@@ -1001,6 +1042,10 @@ func CheckSingleClaim(ctx *harness.Ctx) {
 	holder, _ := ctx.Redis.Get("training:lease:run-a")
 	ctx.Equal(holder, winners[0], "training:lease:run-a must name the winner of the claim")
 	ctx.Equal(runs.Get(stateBg, "run-a").Worker, winners[0], "the run row's worker must be the winner of the claim")
+	ttl := ctx.Redis.PTTL("training:lease:run-a")
+	ctx.Assert(ttl > 0 && ttl <= 15000, "the claim left training:lease:run-a with PTTL %d: set the lease with PX LEASE_TTL_MS in the claim script", ttl)
+	deadline, _ := ctx.Redis.ZScore("training:leases", "run-a")
+	ctx.Assert(int64(deadline) == now+15000, "training:leases holds the deadline %.0f for run-a, expected nowMs + LEASE_TTL_MS = %d", deadline, now+15000)
 }
 
 func CheckConfirmGuarded(ctx *harness.Ctx) {
@@ -1018,6 +1063,25 @@ func CheckConfirmGuarded(ctx *harness.Ctx) {
 	ctx.Equal(runs.Get(stateBg, "run-a").State, "running", "a confirmed run's state")
 	_, left := ctx.Redis.ZScore("training:leases", "run-a")
 	ctx.Assert(!left, "a confirmed run left its deadline in training:leases: the reaper would requeue a running run")
+	// The lease runs out and w-4 claims run-b right after w-3's confirm first touches the lease.
+	t1 := t0 + 16000
+	stateEnqueue(ctx, "run-b", 1, t1)
+	ctx.Equal(stateClaim(ctx, "w-3", t1), "run-b", "run-b, the only queued run, must be claimed")
+	theirs := ""
+	rival := ctx.Redis.After("training:lease:run-b", func() any {
+		reapExpired(stateBg, t1+20000)
+		theirs, _ = claimNext(stateBg, "w-4", t1+20000)
+		return theirs
+	})
+	confirmed := stateConfirm(ctx, "run-b", "w-3")
+	ctx.Assert(rival.Fired, "confirmStart never touched training:lease:run-b")
+	raced := runs.Get(stateBg, "run-b")
+	if theirs == "run-b" {
+		holder, _ := ctx.Redis.Get("training:lease:run-b")
+		ctx.Assert(!confirmed && holder == "w-4" && raced.State == "starting" && raced.Worker == "w-4", "w-4 claimed run-b between w-3's lease check and its writes, yet w-3's confirm returned %t and left lease %q, state %q, worker %q: check the lease and confirm in one script", confirmed, holder, raced.State, raced.Worker)
+	} else {
+		ctx.Assert(confirmed && raced.State == "running", "w-3 held the lease of run-b, yet its confirm returned %t with state %q", confirmed, raced.State)
+	}
 }
 
 func CheckReapKeepsPosition(ctx *harness.Ctx) {
@@ -1026,7 +1090,7 @@ func CheckReapKeepsPosition(ctx *harness.Ctx) {
 	ctx.Equal(stateClaim(ctx, "w-1", t0), "run-a", "the only queued run must be claimed")
 	stateEnqueue(ctx, "run-b", 0, t0+5000)
 	stateEnqueue(ctx, "run-c", 1, t0+100)
-	ctx.Equal(stateReap(ctx, t0+1000), 0, "reapExpired must leave a lease that has not run out; the runs reaped")
+	ctx.Equal(stateReap(ctx, t0+14999), 0, "reapExpired must leave a lease that has not run out; the runs reaped")
 	ctx.Clock.Advance(16) // w-1 died during startup
 	ctx.Equal(stateReap(ctx, t0+16000), 1, "the lease of run-a ran out: reapExpired must return it")
 	score, _ := ctx.Redis.ZScore("training:queue", "run-a")
@@ -1060,7 +1124,7 @@ void stateEnqueue(const std::string& run_id, int band, long long at) {
   enqueue(run_id, band, at);
 }
 
-std::string claimed(long long now_ms, const std::string& worker) { return claimNext(worker, now_ms).value_or(""); }
+std::string hClaimed(long long now_ms, const std::string& worker) { return claimNext(worker, now_ms).value_or(""); }
 
 }  // namespace
 
@@ -1071,7 +1135,7 @@ void CheckQueueOrder(harness::Ctx& ctx) {
   stateEnqueue("run-c", 1, t0 + 500);
   stateEnqueue("run-0", 2, t0);
   std::vector<std::string> order;
-  for (int i = 0; i < 4; i++) order.push_back(claimed(t0 + 5000, "w-" + std::to_string(i)));
+  for (int i = 0; i < 4; i++) order.push_back(hClaimed(t0 + 5000, "w-" + std::to_string(i)));
   ctx.Equal(order, {"run-b", "run-c", "run-a", "run-0"},
             "the queue must serve run-b (band 0), then band 1 in submission order (run-c before run-a), then run-0 (band 2); the order");
   ctx.Assert(!claimNext("w-9", t0 + 5000).has_value(), "claimNext on an empty queue must return nothing");
@@ -1085,9 +1149,9 @@ void CheckSingleClaim(harness::Ctx& ctx) {
   std::string theirs;
   ctx.Redis.After("training:queue", [&] {
     fired = true;
-    theirs = claimed(now, "w-2");
+    theirs = hClaimed(now, "w-2");
   });
-  const std::string mine = claimed(now, "w-1");
+  const std::string mine = hClaimed(now, "w-1");
   ctx.Assert(fired, "claimNext never touched training:queue");
   std::vector<std::string> winners;
   if (mine == "run-a") winners.push_back("w-1");
@@ -1097,15 +1161,19 @@ void CheckSingleClaim(harness::Ctx& ctx) {
              winners.size(), winners);
   ctx.Equal(ctx.Redis.Get("training:lease:run-a").value_or(""), winners[0], "training:lease:run-a must name the winner of the claim");
   ctx.Equal(runs::get("run-a")->worker, winners[0], "the run row's worker must be the winner of the claim");
+  const long long ttl = ctx.Redis.PTTL("training:lease:run-a");
+  ctx.Assert(ttl > 0 && ttl <= 15000, "the claim left training:lease:run-a with PTTL %d: set the lease with PX LEASE_TTL_MS in the claim script", ttl);
+  const double deadline = ctx.Redis.ZScore("training:leases", "run-a").value_or(-1);
+  ctx.Assert(static_cast<long long>(deadline) == now + 15000, "training:leases holds the deadline %.0f for run-a, expected nowMs + LEASE_TTL_MS = %d", deadline, now + 15000);
 }
 
 void CheckConfirmGuarded(harness::Ctx& ctx) {
   const long long t0 = ctx.Clock.Now();
   stateEnqueue("run-a", 1, t0);
-  ctx.Equal(claimed(t0, "w-1"), "run-a", "the only queued run must be claimed");
+  ctx.Equal(hClaimed(t0, "w-1"), "run-a", "the only queued run must be claimed");
   ctx.Clock.Advance(16);  // w-1 died during startup
   ctx.Equal(reapExpired(t0 + 16000), 1, "the lease of run-a ran out: reapExpired must return it");
-  ctx.Equal(claimed(t0 + 16000, "w-2"), "run-a", "run-a must be claimable again once its lease ran out");
+  ctx.Equal(hClaimed(t0 + 16000, "w-2"), "run-a", "run-a must be claimable again once its lease ran out");
   const bool late = confirmStart("run-a", "w-1");
   ctx.Assert(!late, "w-1, whose lease ran out and whose run went to w-2, confirmed run-a: two workers would train it. Confirm only for the worker the lease names");
   const auto run = runs::get("run-a");
@@ -1113,21 +1181,43 @@ void CheckConfirmGuarded(harness::Ctx& ctx) {
   ctx.Equal(confirmStart("run-a", "w-2"), true, "the worker that holds the lease must be able to confirm");
   ctx.Equal(runs::get("run-a")->state, "running", "a confirmed run's state");
   ctx.Assert(!ctx.Redis.ZScore("training:leases", "run-a").has_value(), "a confirmed run left its deadline in training:leases: the reaper would requeue a running run");
+  // The lease runs out and w-4 claims run-b right after w-3's confirm first touches the lease.
+  const long long t1 = t0 + 16000;
+  stateEnqueue("run-b", 1, t1);
+  ctx.Equal(hClaimed(t1, "w-3"), "run-b", "run-b, the only queued run, must be claimed");
+  bool fired = false;
+  std::string theirs;
+  ctx.Redis.After("training:lease:run-b", [&] {
+    fired = true;
+    reapExpired(t1 + 20000);
+    theirs = hClaimed(t1 + 20000, "w-4");
+  });
+  const bool confirmed = confirmStart("run-b", "w-3");
+  ctx.Assert(fired, "confirmStart never touched training:lease:run-b");
+  const auto raced = runs::get("run-b");
+  if (theirs == "run-b") {
+    const std::string holder = ctx.Redis.Get("training:lease:run-b").value_or("");
+    ctx.Assert(!confirmed && holder == "w-4" && raced->state == "starting" && raced->worker == "w-4",
+               "w-4 claimed run-b between w-3's lease check and its writes, yet w-3's confirm returned %t and left lease %q, state %q, worker %q: check the lease and confirm in one script",
+               confirmed, holder, raced->state, raced->worker);
+  } else {
+    ctx.Assert(confirmed && raced->state == "running", "w-3 held the lease of run-b, yet its confirm returned %t with state %q", confirmed, raced->state);
+  }
 }
 
 void CheckReapKeepsPosition(harness::Ctx& ctx) {
   const long long t0 = ctx.Clock.Now();
   stateEnqueue("run-a", 0, t0);
-  ctx.Equal(claimed(t0, "w-1"), "run-a", "the only queued run must be claimed");
+  ctx.Equal(hClaimed(t0, "w-1"), "run-a", "the only queued run must be claimed");
   stateEnqueue("run-b", 0, t0 + 5000);
   stateEnqueue("run-c", 1, t0 + 100);
-  ctx.Equal(reapExpired(t0 + 1000), 0, "reapExpired must leave a lease that has not run out; the runs reaped");
+  ctx.Equal(reapExpired(t0 + 14999), 0, "reapExpired must leave a lease that has not run out; the runs reaped");
   ctx.Clock.Advance(16);  // w-1 died during startup
   ctx.Equal(reapExpired(t0 + 16000), 1, "the lease of run-a ran out: reapExpired must return it");
   const double score = ctx.Redis.ZScore("training:queue", "run-a").value_or(-1);
   ctx.Assert(static_cast<long long>(score) == t0, "run-a came back with score %.0f, expected its original position %d (band 0, submitted at %d)", score, t0, t0);
   std::vector<std::string> order;
-  for (int i = 0; i < 3; i++) order.push_back(claimed(t0 + 16000, "w-2"));
+  for (int i = 0; i < 3; i++) order.push_back(hClaimed(t0 + 16000, "w-2"));
   ctx.Equal(order, {"run-a", "run-b", "run-c"}, "after the reap run-a, submitted before run-b, must keep its place; the order");
 }
 `,

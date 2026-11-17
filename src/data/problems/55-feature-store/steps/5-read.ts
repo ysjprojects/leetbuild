@@ -83,7 +83,7 @@ hours reads as fresh because the backfill just touched its stats.
       id: 'pinned-baseline',
       title: 'Compares against the pinned baseline version',
       detail:
-        'The baseline is `baseline_of`/`baselineOf(name)`, the version an operator pinned, and no pin means no baseline. The starter compares against `version - 1`, so a bad version becomes the next baseline.',
+        'The baseline is `baseline_of`/`baselineOf(name)`, the version an operator pinned, summarized like the version itself (`null_rate`, `mean` over its values), and no pin means no baseline. The starter compares against `version - 1`, so a bad version becomes the next baseline.',
       match: {
         python: {all: [/stats\.baseline_of\(/], none: [/version\s*-\s*1/]},
         typescript: {all: [/stats\.baselineOf\(/], none: [/version\s*-\s*1/]},
@@ -96,7 +96,7 @@ hours reads as fresh because the backfill just touched its stats.
       id: 'drift-threshold',
       title: 'Flags drift beyond three baseline sigmas',
       detail:
-        '`drift` is true when the mean is more than `DRIFT_SIGMAS` (3) baseline standard deviations from the baseline mean, in either direction. The starter flags any rise and no fall.',
+        '`drift` is true when the mean is more than `DRIFT_SIGMAS` (3) baseline standard deviations from the baseline mean, in either direction; exactly three is not drift. The starter flags any rise and no fall.',
       match: {
         python: {all: [/DRIFT_SIGMAS\s*=\s*3\b/, /abs\(/, /DRIFT_SIGMAS\s*\*/]},
         typescript: {all: [/DRIFT_SIGMAS\s*=\s*3\b/, /Math\.abs\(/, /DRIFT_SIGMAS\s*\*/]},
@@ -109,7 +109,7 @@ hours reads as fresh because the backfill just touched its stats.
       id: 'freshness',
       title: "Measures freshness from the newest value's event time",
       detail:
-        "`freshness_s` is now minus `newest_ts` and `stale` compares it with the definition's `freshness_slo`. The starter measures from `updated_at`, the last time stats were written, which says the job ran, not that the data is recent.",
+        "`freshness_s` is now minus `newest_ts` and `stale` is true when it exceeds the definition's `freshness_slo` (a value exactly at the SLO is not stale). The starter measures from `updated_at`, the last time stats were written, which says the job ran, not that the data is recent.",
       match: {
         python: {all: [/newest_ts/], none: [/updated_at/]},
         typescript: {all: [/newest_ts/], none: [/updated_at/]},
@@ -684,7 +684,7 @@ async def check_null_rate(ctx):
 async def check_pinned_baseline(ctx):
     c, now = _read(ctx)
     async with c:
-        _observe(1, [8.0, 12.0, 8.0, 12.0], now - 60)
+        _observe(1, [8.0, 12.0, 8.0, 12.0, None, None, None, None], now - 60)  # half the baseline's rows are null
         _observe(2, [30.0, 30.0, 30.0, 30.0], now - 60)  # a bad deployment
         _observe(3, [11.0, 9.0, 11.0, 9.0], now - 60)
         body = await _stats(c, 3)
@@ -693,7 +693,7 @@ async def check_pinned_baseline(ctx):
         body = await _stats(c, 3)
     assert body.get("baseline_version") == 1, f"version 1 is pinned as the baseline and the response compares against {body.get('baseline_version')!r}"
     baseline = body.get("baseline") or {}
-    assert _near(baseline.get("mean"), 10.0), f"the baseline is {baseline}, expected the stats of version 1 (mean 10)"
+    assert _near(baseline.get("mean"), 10.0) and _near(baseline.get("null_rate"), 0.5), f"the baseline is {baseline}, expected the stats of version 1 summarized like the version's own: mean 10 over its values, null_rate 0.5"
     assert body.get("drift") is False, f"version 3 (mean 10) against the pinned version 1 (mean 10) reports drift {body.get('drift')!r}"
 
 
@@ -704,10 +704,13 @@ async def check_drift_threshold(ctx):
         _observe(1, [8.0, 12.0, 8.0, 12.0], now - 60)  # mean 10, std 2
         _observe(2, [11.0, 13.0, 11.0, 13.0], now - 60)  # mean 12: one sigma up
         _observe(3, [2.0, 4.0, 2.0, 4.0], now - 60)  # mean 3: three and a half sigmas down
+        _observe(4, [15.0, 17.0, 15.0, 17.0], now - 60)  # mean 16: exactly three sigmas up
         up = await _stats(c, 2)
         down = await _stats(c, 3)
+        edge = await _stats(c, 4)
     assert up.get("drift") is False, f"a mean one baseline sigma above the baseline reports drift {up.get('drift')!r}: drift is more than DRIFT_SIGMAS (3) sigmas away"
     assert down.get("drift") is True, f"a mean 3.5 baseline sigmas below the baseline reports drift {down.get('drift')!r}: a fall is drift too"
+    assert edge.get("drift") is False, f"a mean exactly 3 baseline sigmas above the baseline (16 against 10, sigma 2) reports drift {edge.get('drift')!r}: drift is more than DRIFT_SIGMAS sigmas, measured in the baseline's sigma"
 
 
 async def check_freshness(ctx):
@@ -715,11 +718,14 @@ async def check_freshness(ctx):
     async with c:
         _observe(1, [8.0, 12.0], now - 7200)  # the newest value is two hours old, observed just now
         _observe(2, [8.0, 12.0], now - 60)
+        _observe(3, [8.0, 12.0], now - 3600)  # exactly at the 3600 s SLO
         old = await _stats(c, 1)
         fresh = await _stats(c, 2)
+        edge = await _stats(c, 3)
     assert old.get("freshness_s") is not None and abs(old["freshness_s"] - 7200) <= 2, f"the newest value of v1 is 7200 s old and freshness_s is {old.get('freshness_s')!r}: measure from newest_ts, not from when the stats were written"
     assert old.get("stale") is True, f"a value 7200 s old under a 3600 s SLO reports stale {old.get('stale')!r}"
     assert fresh.get("stale") is False and abs(fresh.get("freshness_s", 0) - 60) <= 2, f"v2's newest value is 60 s old and the response is {fresh}"
+    assert edge.get("freshness_s") == 3600 and edge.get("stale") is False, f"v3's newest value is exactly 3600 s old, at its 3600 s SLO, and the response is {edge}: stale means older than the SLO"
 `,
     typescript: `async function read(ctx) {
   const registry = ctx.load('/support/features/registry.ts');
@@ -763,7 +769,7 @@ export async function check_null_rate(ctx) {
 
 export async function check_pinned_baseline(ctx) {
   const {c, stats, observe, now} = await read(ctx);
-  await observe(1, [8, 12, 8, 12], now - 60);
+  await observe(1, [8, 12, 8, 12, null, null, null, null], now - 60); // half the baseline's rows are null
   await observe(2, [30, 30, 30, 30], now - 60); // a bad deployment
   await observe(3, [11, 9, 11, 9], now - 60);
   let body = await statsOf(c, 3);
@@ -771,7 +777,7 @@ export async function check_pinned_baseline(ctx) {
   await stats.pinBaseline('amount_7d', 1);
   body = await statsOf(c, 3);
   assert.equal(body.baseline_version, 1, \`version 1 is pinned as the baseline and the response compares against \${body.baseline_version}\`);
-  assert(near(body.baseline?.mean, 10), \`the baseline is \${JSON.stringify(body.baseline)}, expected the stats of version 1 (mean 10)\`);
+  assert(near(body.baseline?.mean, 10) && near(body.baseline?.null_rate, 0.5), \`the baseline is \${JSON.stringify(body.baseline)}, expected the stats of version 1 summarized like the version's own: mean 10 over its values, null_rate 0.5\`);
   assert.equal(body.drift, false, \`version 3 (mean 10) against the pinned version 1 (mean 10) reports drift \${body.drift}\`);
 }
 
@@ -781,21 +787,27 @@ export async function check_drift_threshold(ctx) {
   await observe(1, [8, 12, 8, 12], now - 60); // mean 10, std 2
   await observe(2, [11, 13, 11, 13], now - 60); // mean 12: one sigma up
   await observe(3, [2, 4, 2, 4], now - 60); // mean 3: three and a half sigmas down
+  await observe(4, [15, 17, 15, 17], now - 60); // mean 16: exactly three sigmas up
   const up = await statsOf(c, 2);
   const down = await statsOf(c, 3);
+  const edge = await statsOf(c, 4);
   assert.equal(up.drift, false, \`a mean one baseline sigma above the baseline reports drift \${up.drift}: drift is more than DRIFT_SIGMAS (3) sigmas away\`);
   assert.equal(down.drift, true, \`a mean 3.5 baseline sigmas below the baseline reports drift \${down.drift}: a fall is drift too\`);
+  assert.equal(edge.drift, false, \`a mean exactly 3 baseline sigmas above the baseline (16 against 10, sigma 2) reports drift \${edge.drift}: drift is more than DRIFT_SIGMAS sigmas, measured in the baseline's sigma\`);
 }
 
 export async function check_freshness(ctx) {
   const {c, observe, now} = await read(ctx);
   await observe(1, [8, 12], now - 7200); // the newest value is two hours old, observed just now
   await observe(2, [8, 12], now - 60);
+  await observe(3, [8, 12], now - 3600); // exactly at the 3600 s SLO
   const old = await statsOf(c, 1);
   const fresh = await statsOf(c, 2);
+  const edge = await statsOf(c, 3);
   assert(typeof old.freshness_s === 'number' && Math.abs(old.freshness_s - 7200) <= 2, \`the newest value of v1 is 7200 s old and freshness_s is \${old.freshness_s}: measure from newest_ts, not from when the stats were written\`);
   assert.equal(old.stale, true, \`a value 7200 s old under a 3600 s SLO reports stale \${old.stale}\`);
   assert(fresh.stale === false && Math.abs(fresh.freshness_s - 60) <= 2, \`v2's newest value is 60 s old and the response is \${JSON.stringify(fresh)}\`);
+  assert(edge.freshness_s === 3600 && edge.stale === false, \`v3's newest value is exactly 3600 s old, at its 3600 s SLO, and the response is \${JSON.stringify(edge)}: stale means older than the SLO\`);
 }
 `,
     go: `package main
@@ -814,12 +826,12 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func read(ctx *harness.Ctx) (*harness.HTTP, int64) {
+func hRead(ctx *harness.Ctx) (*harness.HTTP, int64) {
 	now := time.Now().Unix()
 	for version := 1; version <= 3; version++ {
-		_, err := registry.CreateDefinition(readBg, registry.Definition{Name: "amount_7d", Version: version, Dtype: "float64", ComputationRef: "window_avg_7d", FreshnessSLO: 3600, CreatedAt: now})
+		_, err := registry.CreateDefinition(hReadBg, registry.Definition{Name: "amount_7d", Version: version, Dtype: "float64", ComputationRef: "window_avg_7d", FreshnessSLO: 3600, CreatedAt: now})
 		ctx.NoError(err, "CreateDefinition")
 	}
 	mux := http.NewServeMux()
@@ -827,19 +839,19 @@ func read(ctx *harness.Ctx) (*harness.HTTP, int64) {
 	return ctx.HTTP(mux), now
 }
 
-// observe feeds values to the sums of a version; NaN stands for a null.
-func observe(ctx *harness.Ctx, version int, values []float64, eventTs int64) {
+// hObserve feeds values to the sums of a version; NaN stands for a null.
+func hObserve(ctx *harness.Ctx, version int, values []float64, eventTs int64) {
 	for _, v := range values {
 		value := v
 		var p *float64
 		if !math.IsNaN(value) {
 			p = &value
 		}
-		ctx.NoError(stats.Observe(readBg, "amount_7d", version, p, eventTs), "stats.Observe")
+		ctx.NoError(stats.Observe(hReadBg, "amount_7d", version, p, eventTs), "stats.Observe")
 	}
 }
 
-func statsOf(ctx *harness.Ctx, c *harness.HTTP, version int) map[string]any {
+func hStatsOf(ctx *harness.Ctx, c *harness.HTTP, version int) map[string]any {
 	r := c.Get(fmt.Sprintf("/v1/features/amount_7d/versions/%d/stats", version))
 	ctx.Equal(r.Status, 200, "GET /v1/features/amount_7d/versions/%d/stats (%s)", version, r.Text())
 	var body map[string]any
@@ -847,66 +859,72 @@ func statsOf(ctx *harness.Ctx, c *harness.HTTP, version int) map[string]any {
 	return body
 }
 
-func near(v any, want float64) bool {
+func hNear(v any, want float64) bool {
 	f, ok := v.(float64)
 	return ok && math.Abs(f-want) < 1e-6
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, now := read(ctx)
-	observe(ctx, 1, []float64{8, 12}, now-60)
-	body := statsOf(ctx, c, 1)
-	ctx.Assert(body["feature"] == "amount_7d" && near(body["version"], 1) && near(body["count"], 2), "the stats of amount_7d v1 are %v, expected feature, version and count 2", body)
+	c, now := hRead(ctx)
+	hObserve(ctx, 1, []float64{8, 12}, now-60)
+	body := hStatsOf(ctx, c, 1)
+	ctx.Assert(body["feature"] == "amount_7d" && hNear(body["version"], 1) && hNear(body["count"], 2), "the stats of amount_7d v1 are %v, expected feature, version and count 2", body)
 	r := c.Get("/v1/features/amount_7d/versions/9/stats")
 	ctx.Equal(r.Status, 404, "a version without stats")
 }
 
 func CheckNullRate(ctx *harness.Ctx) {
-	c, now := read(ctx)
+	c, now := hRead(ctx)
 	null := math.NaN()
-	observe(ctx, 1, []float64{8, 12, 8, 12, null, null, null, null, null, null}, now-60)
-	body := statsOf(ctx, c, 1)
-	ctx.Assert(near(body["null_rate"], 0.6), "six of ten rows are null and null_rate is %v, expected 0.6", body["null_rate"])
-	ctx.Assert(near(body["mean"], 10) && near(body["std"], 2), "the values are 8, 12, 8, 12 and the response says mean %v std %v: nulls must not be averaged in as zeros", body["mean"], body["std"])
-	ctx.Assert(near(body["count"], 10), "count is %v, expected every row (10)", body["count"])
+	hObserve(ctx, 1, []float64{8, 12, 8, 12, null, null, null, null, null, null}, now-60)
+	body := hStatsOf(ctx, c, 1)
+	ctx.Assert(hNear(body["null_rate"], 0.6), "six of ten rows are null and null_rate is %v, expected 0.6", body["null_rate"])
+	ctx.Assert(hNear(body["mean"], 10) && hNear(body["std"], 2), "the values are 8, 12, 8, 12 and the response says mean %v std %v: nulls must not be averaged in as zeros", body["mean"], body["std"])
+	ctx.Assert(hNear(body["count"], 10), "count is %v, expected every row (10)", body["count"])
 }
 
 func CheckPinnedBaseline(ctx *harness.Ctx) {
-	c, now := read(ctx)
-	observe(ctx, 1, []float64{8, 12, 8, 12}, now-60)
-	observe(ctx, 2, []float64{30, 30, 30, 30}, now-60) // a bad deployment
-	observe(ctx, 3, []float64{11, 9, 11, 9}, now-60)
-	body := statsOf(ctx, c, 3)
+	c, now := hRead(ctx)
+	null := math.NaN()
+	hObserve(ctx, 1, []float64{8, 12, 8, 12, null, null, null, null}, now-60) // half the baseline's rows are null
+	hObserve(ctx, 2, []float64{30, 30, 30, 30}, now-60)                         // a bad deployment
+	hObserve(ctx, 3, []float64{11, 9, 11, 9}, now-60)
+	body := hStatsOf(ctx, c, 3)
 	ctx.Assert(body["baseline_version"] == nil && body["baseline"] == nil && body["drift"] == false, "with no baseline pinned the response is %v, expected baseline_version and baseline null and no drift", body)
-	ctx.NoError(stats.PinBaseline(readBg, "amount_7d", 1), "PinBaseline")
-	body = statsOf(ctx, c, 3)
-	ctx.Assert(near(body["baseline_version"], 1), "version 1 is pinned as the baseline and the response compares against %v", body["baseline_version"])
+	ctx.NoError(stats.PinBaseline(hReadBg, "amount_7d", 1), "PinBaseline")
+	body = hStatsOf(ctx, c, 3)
+	ctx.Assert(hNear(body["baseline_version"], 1), "version 1 is pinned as the baseline and the response compares against %v", body["baseline_version"])
 	baseline, _ := body["baseline"].(map[string]any)
-	ctx.Assert(near(baseline["mean"], 10), "the baseline is %v, expected the stats of version 1 (mean 10)", body["baseline"])
+	ctx.Assert(hNear(baseline["mean"], 10) && hNear(baseline["null_rate"], 0.5), "the baseline is %v, expected the stats of version 1 summarized like the version's own: mean 10 over its values, null_rate 0.5", body["baseline"])
 	ctx.Equal(body["drift"], false, "version 3 (mean 10) against the pinned version 1 (mean 10); drift")
 }
 
 func CheckDriftThreshold(ctx *harness.Ctx) {
-	c, now := read(ctx)
-	ctx.NoError(stats.PinBaseline(readBg, "amount_7d", 1), "PinBaseline")
-	observe(ctx, 1, []float64{8, 12, 8, 12}, now-60)   // mean 10, std 2
-	observe(ctx, 2, []float64{11, 13, 11, 13}, now-60) // mean 12: one sigma up
-	observe(ctx, 3, []float64{2, 4, 2, 4}, now-60)     // mean 3: three and a half sigmas down
-	ctx.Equal(statsOf(ctx, c, 2)["drift"], false, "a mean one baseline sigma above the baseline is not drift (more than driftSigmas = 3 sigmas is); drift")
-	ctx.Equal(statsOf(ctx, c, 3)["drift"], true, "a mean 3.5 baseline sigmas below the baseline is drift, a fall too; drift")
+	c, now := hRead(ctx)
+	ctx.NoError(stats.PinBaseline(hReadBg, "amount_7d", 1), "PinBaseline")
+	hObserve(ctx, 1, []float64{8, 12, 8, 12}, now-60)     // mean 10, std 2
+	hObserve(ctx, 2, []float64{11, 13, 11, 13}, now-60)   // mean 12: one sigma up
+	hObserve(ctx, 3, []float64{2, 4, 2, 4}, now-60)       // mean 3: three and a half sigmas down
+	hObserve(ctx, 4, []float64{15, 17, 15, 17}, now-60)   // mean 16: exactly three sigmas up
+	ctx.Equal(hStatsOf(ctx, c, 2)["drift"], false, "a mean one baseline sigma above the baseline is not drift (more than driftSigmas = 3 sigmas is); drift")
+	ctx.Equal(hStatsOf(ctx, c, 3)["drift"], true, "a mean 3.5 baseline sigmas below the baseline is drift, a fall too; drift")
+	ctx.Equal(hStatsOf(ctx, c, 4)["drift"], false, "a mean exactly 3 baseline sigmas above the baseline (16 against 10, sigma 2) is not drift: drift is more than driftSigmas sigmas, measured in the baseline's sigma; drift")
 }
 
 func CheckFreshness(ctx *harness.Ctx) {
-	c, now := read(ctx)
-	observe(ctx, 1, []float64{8, 12}, now-7200) // the newest value is two hours old, observed just now
-	observe(ctx, 2, []float64{8, 12}, now-60)
-	old := statsOf(ctx, c, 1)
-	fresh := statsOf(ctx, c, 2)
+	c, now := hRead(ctx)
+	hObserve(ctx, 1, []float64{8, 12}, now-7200) // the newest value is two hours old, observed just now
+	hObserve(ctx, 2, []float64{8, 12}, now-60)
+	hObserve(ctx, 3, []float64{8, 12}, now-3600) // exactly at the 3600 s SLO
+	old := hStatsOf(ctx, c, 1)
+	fresh := hStatsOf(ctx, c, 2)
+	edge := hStatsOf(ctx, c, 3)
 	f, _ := old["freshness_s"].(float64)
 	ctx.Assert(math.Abs(f-7200) <= 2, "the newest value of v1 is 7200 s old and freshness_s is %v: measure from newest_ts, not from when the stats were written", old["freshness_s"])
 	ctx.Equal(old["stale"], true, "a value 7200 s old under a 3600 s SLO; stale")
 	g, _ := fresh["freshness_s"].(float64)
 	ctx.Assert(fresh["stale"] == false && math.Abs(g-60) <= 2, "v2's newest value is 60 s old and the response is %v", fresh)
+	ctx.Assert(hNear(edge["freshness_s"], 3600) && edge["stale"] == false, "v3's newest value is exactly 3600 s old, at its 3600 s SLO, and the response is %v: stale means older than the SLO", edge)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -926,7 +944,7 @@ using json = nlohmann::json;
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -934,17 +952,17 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-long long setup() {
+long long hSetup() {
   const long long now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   for (long version = 1; version <= 3; version++) registry::createDefinition(registry::Definition{"amount_7d", version, "float64", "window_avg_7d", 3600, now});
   return now;
 }
 
-void observe(long version, const std::vector<std::optional<double>>& values, long long event_ts) {
+void hObserve(long version, const std::vector<std::optional<double>>& values, long long event_ts) {
   for (const auto& value : values) stats::observe("amount_7d", version, value, event_ts);
 }
 
-json statsOf(harness::Ctx& ctx, harness::HTTP& c, long version) {
+json hStatsOf(harness::Ctx& ctx, harness::HTTP& c, long version) {
   const auto r = c.Get("/v1/features/amount_7d/versions/" + std::to_string(version) + "/stats");
   ctx.Equal(r.Status, 200, "GET /v1/features/amount_7d/versions/%d/stats (%s)", version, r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
@@ -952,72 +970,79 @@ json statsOf(harness::Ctx& ctx, harness::HTTP& c, long version) {
   return body;
 }
 
-double number(const json& j, const std::string& field) {
+double hNumber(const json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_number() ? j[field].get<double>() : NAN;
 }
 
-bool near(double a, double b) { return std::fabs(a - b) < 1e-6; }
+bool hNear(double a, double b) { return std::fabs(a - b) < 1e-6; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const long long now = setup();
-  auto c = api(ctx);
-  observe(1, {8.0, 12.0}, now - 60);
-  const json body = statsOf(ctx, c, 1);
-  ctx.Assert(body.value("feature", "") == "amount_7d" && near(number(body, "version"), 1) && near(number(body, "count"), 2), "the stats of amount_7d v1 are %s, expected feature, version and count 2", body.dump());
+  const long long now = hSetup();
+  auto c = hAPI(ctx);
+  hObserve(1, {8.0, 12.0}, now - 60);
+  const json body = hStatsOf(ctx, c, 1);
+  ctx.Assert(body.value("feature", "") == "amount_7d" && hNear(hNumber(body, "version"), 1) && hNear(hNumber(body, "count"), 2), "the stats of amount_7d v1 are %s, expected feature, version and count 2", body.dump());
   const auto r = c.Get("/v1/features/amount_7d/versions/9/stats");
   ctx.Equal(r.Status, 404, "a version without stats");
 }
 
 void CheckNullRate(harness::Ctx& ctx) {
-  const long long now = setup();
-  auto c = api(ctx);
-  observe(1, {8.0, 12.0, 8.0, 12.0, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt}, now - 60);
-  const json body = statsOf(ctx, c, 1);
-  ctx.Assert(near(number(body, "null_rate"), 0.6), "six of ten rows are null and null_rate is %s, expected 0.6", body.contains("null_rate") ? body["null_rate"].dump() : "missing");
-  ctx.Assert(near(number(body, "mean"), 10) && near(number(body, "std"), 2), "the values are 8, 12, 8, 12 and the response says mean %v std %v: nulls must not be averaged in as zeros", number(body, "mean"), number(body, "std"));
-  ctx.Assert(near(number(body, "count"), 10), "count is %v, expected every row (10)", number(body, "count"));
+  const long long now = hSetup();
+  auto c = hAPI(ctx);
+  hObserve(1, {8.0, 12.0, 8.0, 12.0, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt}, now - 60);
+  const json body = hStatsOf(ctx, c, 1);
+  ctx.Assert(hNear(hNumber(body, "null_rate"), 0.6), "six of ten rows are null and null_rate is %s, expected 0.6", body.contains("null_rate") ? body["null_rate"].dump() : "missing");
+  ctx.Assert(hNear(hNumber(body, "mean"), 10) && hNear(hNumber(body, "std"), 2), "the values are 8, 12, 8, 12 and the response says mean %v std %v: nulls must not be averaged in as zeros", hNumber(body, "mean"), hNumber(body, "std"));
+  ctx.Assert(hNear(hNumber(body, "count"), 10), "count is %v, expected every row (10)", hNumber(body, "count"));
 }
 
 void CheckPinnedBaseline(harness::Ctx& ctx) {
-  const long long now = setup();
-  auto c = api(ctx);
-  observe(1, {8.0, 12.0, 8.0, 12.0}, now - 60);
-  observe(2, {30.0, 30.0, 30.0, 30.0}, now - 60);  // a bad deployment
-  observe(3, {11.0, 9.0, 11.0, 9.0}, now - 60);
-  json body = statsOf(ctx, c, 3);
+  const long long now = hSetup();
+  auto c = hAPI(ctx);
+  hObserve(1, {8.0, 12.0, 8.0, 12.0, std::nullopt, std::nullopt, std::nullopt, std::nullopt}, now - 60);  // half the baseline's rows are null
+  hObserve(2, {30.0, 30.0, 30.0, 30.0}, now - 60);  // a bad deployment
+  hObserve(3, {11.0, 9.0, 11.0, 9.0}, now - 60);
+  json body = hStatsOf(ctx, c, 3);
   ctx.Assert(body["baseline_version"].is_null() && body["baseline"].is_null() && body["drift"] == false, "with no baseline pinned the response is %s, expected baseline_version and baseline null and no drift", body.dump());
   stats::pinBaseline("amount_7d", 1);
-  body = statsOf(ctx, c, 3);
-  ctx.Assert(near(number(body, "baseline_version"), 1), "version 1 is pinned as the baseline and the response compares against %s", body["baseline_version"].dump());
-  ctx.Assert(near(number(body["baseline"], "mean"), 10), "the baseline is %s, expected the stats of version 1 (mean 10)", body["baseline"].dump());
+  body = hStatsOf(ctx, c, 3);
+  ctx.Assert(hNear(hNumber(body, "baseline_version"), 1), "version 1 is pinned as the baseline and the response compares against %s", body["baseline_version"].dump());
+  ctx.Assert(hNear(hNumber(body["baseline"], "mean"), 10) && hNear(hNumber(body["baseline"], "null_rate"), 0.5),
+             "the baseline is %s, expected the stats of version 1 summarized like the version's own: mean 10 over its values, null_rate 0.5", body["baseline"].dump());
   ctx.Assert(body["drift"] == false, "version 3 (mean 10) against the pinned version 1 (mean 10) reports drift %s", body["drift"].dump());
 }
 
 void CheckDriftThreshold(harness::Ctx& ctx) {
-  const long long now = setup();
-  auto c = api(ctx);
+  const long long now = hSetup();
+  auto c = hAPI(ctx);
   stats::pinBaseline("amount_7d", 1);
-  observe(1, {8.0, 12.0, 8.0, 12.0}, now - 60);    // mean 10, std 2
-  observe(2, {11.0, 13.0, 11.0, 13.0}, now - 60);  // mean 12: one sigma up
-  observe(3, {2.0, 4.0, 2.0, 4.0}, now - 60);      // mean 3: three and a half sigmas down
-  const json up = statsOf(ctx, c, 2);
-  const json down = statsOf(ctx, c, 3);
+  hObserve(1, {8.0, 12.0, 8.0, 12.0}, now - 60);    // mean 10, std 2
+  hObserve(2, {11.0, 13.0, 11.0, 13.0}, now - 60);  // mean 12: one sigma up
+  hObserve(3, {2.0, 4.0, 2.0, 4.0}, now - 60);      // mean 3: three and a half sigmas down
+  hObserve(4, {15.0, 17.0, 15.0, 17.0}, now - 60);  // mean 16: exactly three sigmas up
+  const json up = hStatsOf(ctx, c, 2);
+  const json down = hStatsOf(ctx, c, 3);
+  const json edge = hStatsOf(ctx, c, 4);
   ctx.Assert(up["drift"] == false, "a mean one baseline sigma above the baseline reports drift %s: drift is more than kDriftSigmas (3) sigmas away", up["drift"].dump());
   ctx.Assert(down["drift"] == true, "a mean 3.5 baseline sigmas below the baseline reports drift %s: a fall is drift too", down["drift"].dump());
+  ctx.Assert(edge["drift"] == false, "a mean exactly 3 baseline sigmas above the baseline (16 against 10, sigma 2) reports drift %s: drift is more than kDriftSigmas sigmas, measured in the baseline's sigma", edge["drift"].dump());
 }
 
 void CheckFreshness(harness::Ctx& ctx) {
-  const long long now = setup();
-  auto c = api(ctx);
-  observe(1, {8.0, 12.0}, now - 7200);  // the newest value is two hours old, observed just now
-  observe(2, {8.0, 12.0}, now - 60);
-  const json old = statsOf(ctx, c, 1);
-  const json fresh = statsOf(ctx, c, 2);
-  ctx.Assert(std::fabs(number(old, "freshness_s") - 7200) <= 2, "the newest value of v1 is 7200 s old and freshness_s is %v: measure from newest_ts, not from when the stats were written", number(old, "freshness_s"));
+  const long long now = hSetup();
+  auto c = hAPI(ctx);
+  hObserve(1, {8.0, 12.0}, now - 7200);  // the newest value is two hours old, observed just now
+  hObserve(2, {8.0, 12.0}, now - 60);
+  hObserve(3, {8.0, 12.0}, now - 3600);  // exactly at the 3600 s SLO
+  const json old = hStatsOf(ctx, c, 1);
+  const json fresh = hStatsOf(ctx, c, 2);
+  const json edge = hStatsOf(ctx, c, 3);
+  ctx.Assert(std::fabs(hNumber(old, "freshness_s") - 7200) <= 2, "the newest value of v1 is 7200 s old and freshness_s is %v: measure from newest_ts, not from when the stats were written", hNumber(old, "freshness_s"));
   ctx.Assert(old["stale"] == true, "a value 7200 s old under a 3600 s SLO reports stale %s", old["stale"].dump());
-  ctx.Assert(fresh["stale"] == false && std::fabs(number(fresh, "freshness_s") - 60) <= 2, "v2's newest value is 60 s old and the response is %s", fresh.dump());
+  ctx.Assert(fresh["stale"] == false && std::fabs(hNumber(fresh, "freshness_s") - 60) <= 2, "v2's newest value is 60 s old and the response is %s", fresh.dump());
+  ctx.Assert(hNear(hNumber(edge, "freshness_s"), 3600) && edge["stale"] == false, "v3's newest value is exactly 3600 s old, at its 3600 s SLO, and the response is %s: stale means older than the SLO", edge.dump());
 }
 `,
   },
