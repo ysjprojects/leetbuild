@@ -22,11 +22,11 @@ three flaws.
   \`catalog.scope_kind(scope)\` one of its \`scope_kinds\`, otherwise **422**.
 - **No escalation.** The assigner must hold \`roles:assign\` and every permission in
   \`catalog.permissions_of(role)\` at the target scope (\`grants.effective(assigner, scope)\`, which
-  applies \`catalog.covers\`). The first one missing is **403** with
+  applies \`catalog.covers\`), checked in that order. The first one missing is **403** with
   \`{"error": "insufficient_permissions", "missing_permission": "code:write"}\`.
-- **Idempotency.** \`Idempotency-Key\` is required (**400**). Look \`(assigner, key)\` up with
-  \`grants.assignment\` before writing and answer the recorded grant on a replay; record a new one
-  with \`grants.record_assignment\`.`,
+- **Idempotency.** \`Idempotency-Key\` is required (**400**) and scoped to its assigner. Look
+  \`(assigner, key)\` up with \`grants.assignment\` before writing and answer the recorded grant on a
+  replay; record a new one with \`grants.record_assignment\`.`,
   sequence: {
     participants: ['Client', 'Permission Service', 'Role catalog', 'Grant store'],
     messages: [
@@ -94,7 +94,7 @@ three flaws.
       id: 'no-escalation',
       title: 'Refuses a grant that exceeds the assigner, naming the permission',
       detail:
-        'The assigner must hold `roles:assign` and every permission of the role at the target scope (`effective`, scope containment included); the first gap is **403** naming `missing_permission`. The starter only asks whether the assigner is an admin somewhere.',
+        'The assigner must hold `roles:assign` and every permission of the role at the target scope (`effective`, scope containment included), checked in that order; the first gap is **403** `insufficient_permissions` naming `missing_permission`. The starter only asks whether the assigner is an admin somewhere.',
       match: {
         python: {all: [/grants\.effective\(/, /catalog\.permissions_of\(/, /roles:assign/, /missing_permission/]},
         typescript: {all: [/\beffective\(/, /permissionsOf\(/, /roles:assign/, /missing_permission/]},
@@ -107,7 +107,7 @@ three flaws.
       id: 'idempotent',
       title: 'Answers a retried assignment with the recorded grant',
       detail:
-        '`Idempotency-Key` is required (400) and `(assigner, key)` is looked up (`assignment`) before the grant is written; a replay answers the recorded grant and a new assignment is recorded (`record_assignment`/`recordAssignment`).',
+        '`Idempotency-Key` is required (400) and `(assigner, key)` is looked up (`assignment`) before the grant is written; a replay answers the recorded grant, the same key from another assigner is a new assignment, and a new assignment is recorded (`record_assignment`/`recordAssignment`).',
       match: {
         python: {
           all: [/idempotency-key/i, /grants\.assignment\(/, /grants\.record_assignment\(/, /\b400\b/],
@@ -597,6 +597,7 @@ async def check_catalog(ctx):
     async with _api(ctx) as c:
         for role, scope, what in (
             ("superuser", "org", "a role the catalog does not define"),
+            ("constructor", "org", 'a role named "constructor", which the catalog does not define'),
             ("viewer", "*", 'viewer at scope "*"'),
             ("viewer", "org", "viewer at org (the catalog allows viewer at team and project scopes)"),
             ("team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"),
@@ -612,13 +613,15 @@ async def check_no_escalation(ctx):
     async with _api(ctx) as c:
         r = await _assign(c, "ada", "org_admin", "org")
         assert r.status_code == 403, f"ada (team_admin at team:eng) granting org_admin at org answered {r.status_code}, expected 403: an assigner hands out only what it holds"
-        assert r.json().get("missing_permission"), f"the 403 must name the missing permission (missing_permission), got {r.text}"
+        assert r.json().get("missing_permission") and r.json().get("error") == "insufficient_permissions", f"the 403 must be {{\\"error\\": \\"insufficient_permissions\\"}} naming the missing permission (missing_permission), got {r.text}"
         r = await _assign(c, "ada", "team_admin", "team:ops")
         assert r.status_code == 403, f"ada granting team_admin at team:ops answered {r.status_code}, expected 403: team:eng does not cover team:ops"
         r = await _assign(c, "ada", "developer", "project:eng/api")
         assert r.status_code == 403 and r.json().get("missing_permission") == "code:write", f"ada granting developer (code:write, team:read) at project:eng/api answered {r.status_code} {r.text}, expected 403 naming code:write, which ada does not hold"
         r = await _assign(c, "bob", "viewer", "team:eng")
         assert r.status_code == 403 and r.json().get("missing_permission") == "roles:assign", f"bob (viewer at team:eng) granting viewer answered {r.status_code} {r.text}, expected 403 naming roles:assign"
+        r = await _assign(c, "bob", "developer", "team:eng")
+        assert r.status_code == 403 and r.json().get("missing_permission") == "roles:assign", f"bob (viewer at team:eng) granting developer answered {r.status_code} {r.text}, expected 403 naming roles:assign: bob lacks roles:assign and code:write, and roles:assign is checked first"
         r = await _assign(c, "ada", "viewer", "project:eng/api")
         assert r.status_code == 201, f"ada granting viewer at project:eng/api answered {r.status_code} {r.text}, expected 201: team:eng covers its projects"
     assert _held() == [("viewer", "project:eng/api")], f"cyd holds {_held()}: a refused assignment was written"
@@ -634,8 +637,11 @@ async def check_idempotent(ctx):
         assert first.status_code == 201 and replay.status_code in (200, 201), f"the assignment answered {first.status_code}, its replay {replay.status_code}"
         assert replay.json().get("grant_id") == first.json().get("grant_id"), f"a replay of Idempotency-Key k-1 answered grant {replay.json().get('grant_id')}, the first attempt {first.json().get('grant_id')}: a retry must answer the recorded grant"
         assert len(_held()) == 1, f"a retried assignment wrote {len(_held())} grants for cyd, expected 1"
+        mine = await _assign(c, "ada", "viewer", "project:eng/api", "k-1")
+        assert mine.status_code == 201 and mine.json().get("grant_id") not in (None, "", first.json().get("grant_id")), f"ada's assignment with Idempotency-Key k-1 (olu's key, another assigner) answered {mine.status_code} {mine.text}: a key is scoped to its assigner, so this is a new assignment"
+        assert len(_held()) == 2, f"after ada's own k-1 assignment cyd holds {_held()}, expected 2 grants"
         other = await _assign(c, "olu", "viewer", "team:ops", "k-2")
-    assert other.status_code == 201 and len(_held()) == 2, f"an assignment with a new key answered {other.status_code}; cyd holds {_held()}"
+    assert other.status_code == 201 and len(_held()) == 3, f"an assignment with a new key answered {other.status_code}; cyd holds {_held()}"
 `,
     typescript: `function api(ctx) {
   const grants = ctx.load('/support/permz/grants.ts');
@@ -670,6 +676,7 @@ export async function check_catalog(ctx) {
   await seed();
   const invalid = [
     ['superuser', 'org', 'a role the catalog does not define'],
+    ['constructor', 'org', 'a role named "constructor", which the catalog does not define'],
     ['viewer', '*', 'viewer at scope "*"'],
     ['viewer', 'org', 'viewer at org (the catalog allows viewer at team and project scopes)'],
     ['team_admin', 'project:eng/api', 'team_admin at a project (the catalog allows it at team scopes)'],
@@ -688,13 +695,15 @@ export async function check_no_escalation(ctx) {
   await seed();
   let r = await assign(c, 'ada', 'org_admin', 'org');
   assert.equal(r.status, 403, \`ada (team_admin at team:eng) granting org_admin at org answered \${r.status}, expected 403: an assigner hands out only what it holds\`);
-  assert(r.json().missing_permission, \`the 403 must name the missing permission (missing_permission), got \${r.text}\`);
+  assert(r.json().missing_permission && r.json().error === 'insufficient_permissions', \`the 403 must be {"error": "insufficient_permissions"} naming the missing permission (missing_permission), got \${r.text}\`);
   r = await assign(c, 'ada', 'team_admin', 'team:ops');
   assert.equal(r.status, 403, \`ada granting team_admin at team:ops answered \${r.status}, expected 403: team:eng does not cover team:ops\`);
   r = await assign(c, 'ada', 'developer', 'project:eng/api');
   assert(r.status === 403 && r.json().missing_permission === 'code:write', \`ada granting developer (code:write, team:read) at project:eng/api answered \${r.status} \${r.text}, expected 403 naming code:write, which ada does not hold\`);
   r = await assign(c, 'bob', 'viewer', 'team:eng');
   assert(r.status === 403 && r.json().missing_permission === 'roles:assign', \`bob (viewer at team:eng) granting viewer answered \${r.status} \${r.text}, expected 403 naming roles:assign\`);
+  r = await assign(c, 'bob', 'developer', 'team:eng');
+  assert(r.status === 403 && r.json().missing_permission === 'roles:assign', \`bob (viewer at team:eng) granting developer answered \${r.status} \${r.text}, expected 403 naming roles:assign: bob lacks roles:assign and code:write, and roles:assign is checked first\`);
   r = await assign(c, 'ada', 'viewer', 'project:eng/api');
   assert.equal(r.status, 201, \`ada granting viewer at project:eng/api answered \${r.status} \${r.text}, expected 201: team:eng covers its projects\`);
   assert.deepStrictEqual(await held(), ['viewer@project:eng/api'], 'a refused assignment was written');
@@ -711,8 +720,11 @@ export async function check_idempotent(ctx) {
   assert(first.status === 201 && (replay.status === 200 || replay.status === 201), \`the assignment answered \${first.status}, its replay \${replay.status}\`);
   assert.equal(replay.json().grant_id, first.json().grant_id, \`a replay of Idempotency-Key k-1 answered \${replay.text}, the first attempt \${first.text}: a retry must answer the recorded grant\`);
   assert.equal((await held()).length, 1, \`a retried assignment wrote \${(await held()).length} grants for cyd, expected 1\`);
+  const mine = await assign(c, 'ada', 'viewer', 'project:eng/api', 'k-1');
+  assert(mine.status === 201 && mine.json().grant_id && mine.json().grant_id !== first.json().grant_id, \`ada's assignment with Idempotency-Key k-1 (olu's key, another assigner) answered \${mine.status} \${mine.text}: a key is scoped to its assigner, so this is a new assignment\`);
+  assert.equal((await held()).length, 2, \`after ada's own k-1 assignment cyd holds \${JSON.stringify(await held())}, expected 2 grants\`);
   const other = await assign(c, 'olu', 'viewer', 'team:ops', 'k-2');
-  assert(other.status === 201 && (await held()).length === 2, \`an assignment with a new key answered \${other.status}; cyd holds \${JSON.stringify(await held())}\`);
+  assert(other.status === 201 && (await held()).length === 3, \`an assignment with a new key answered \${other.status}; cyd holds \${JSON.stringify(await held())}\`);
 }
 `,
     go: `package main
@@ -731,10 +743,11 @@ type assignReply struct {
 	Subject           string \`json:"subject"\`
 	Role              string \`json:"role"\`
 	Scope             string \`json:"scope"\`
+	Error             string \`json:"error"\`
 	MissingPermission string \`json:"missing_permission"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	bg := context.Background()
 	grants.Add(bg, "olu", "org_admin", "org", "root")
 	grants.Add(bg, "ada", "team_admin", "team:eng", "olu")
@@ -763,7 +776,7 @@ func heldByCyd() []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	r, body := assignAs(c, "olu", "viewer", "team:eng", "")
 	ctx.Equal(r.Status, 201, "olu (org_admin at org) assigning viewer at team:eng (%s)", r.Text())
 	ctx.Assert(body.Subject == "cyd" && body.Role == "viewer" && body.Scope == "team:eng" && body.GrantID != "", "the 201 must carry the grant (grant_id, subject, role, scope), got %s", r.Text())
@@ -771,9 +784,10 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckCatalog(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	for _, tc := range [][3]string{
 		{"superuser", "org", "a role the catalog does not define"},
+		{"constructor", "org", "a role named \\"constructor\\", which the catalog does not define"},
 		{"viewer", "*", "viewer at scope \\"*\\""},
 		{"viewer", "org", "viewer at org (the catalog allows viewer at team and project scopes)"},
 		{"team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"},
@@ -787,23 +801,25 @@ func CheckCatalog(ctx *harness.Ctx) {
 }
 
 func CheckNoEscalation(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	r, body := assignAs(c, "ada", "org_admin", "org", "")
 	ctx.Equal(r.Status, 403, "ada (team_admin at team:eng) granting org_admin at org must be refused: an assigner hands out only what it holds; the status")
-	ctx.Assert(body.MissingPermission != "", "the 403 must name the missing permission (missing_permission), got %s", r.Text())
+	ctx.Assert(body.MissingPermission != "" && body.Error == "insufficient_permissions", "the 403 must be {\\"error\\": \\"insufficient_permissions\\"} naming the missing permission (missing_permission), got %s", r.Text())
 	r, _ = assignAs(c, "ada", "team_admin", "team:ops", "")
 	ctx.Equal(r.Status, 403, "ada granting team_admin at team:ops must be refused (team:eng does not cover team:ops); the status")
 	r, body = assignAs(c, "ada", "developer", "project:eng/api", "")
 	ctx.Assert(r.Status == 403 && body.MissingPermission == "code:write", "ada granting developer (code:write, team:read) at project:eng/api answered %d %s, expected 403 naming code:write, which ada does not hold", r.Status, r.Text())
 	r, body = assignAs(c, "bob", "viewer", "team:eng", "")
 	ctx.Assert(r.Status == 403 && body.MissingPermission == "roles:assign", "bob (viewer at team:eng) granting viewer answered %d %s, expected 403 naming roles:assign", r.Status, r.Text())
+	r, body = assignAs(c, "bob", "developer", "team:eng", "")
+	ctx.Assert(r.Status == 403 && body.MissingPermission == "roles:assign", "bob (viewer at team:eng) granting developer answered %d %s, expected 403 naming roles:assign: bob lacks roles:assign and code:write, and roles:assign is checked first", r.Status, r.Text())
 	r, _ = assignAs(c, "ada", "viewer", "project:eng/api", "")
 	ctx.Equal(r.Status, 201, "ada granting viewer at project:eng/api must succeed, team:eng covers its projects (%s); the status", r.Text())
 	ctx.Equal(heldByCyd(), []string{"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants")
 }
 
 func CheckIdempotent(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	none := c.Post("/v1/roles/assignments", map[string]string{"subject": "cyd", "role": "viewer", "scope": "team:eng"}, "X-Assigner-Id", "olu")
 	ctx.Equal(none.Status, 400, "an assignment without Idempotency-Key")
 	ctx.Equal(heldByCyd(), []string{}, "an assignment without Idempotency-Key must write nothing; cyd's grants")
@@ -812,8 +828,11 @@ func CheckIdempotent(ctx *harness.Ctx) {
 	ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the assignment answered %d, its replay %d", first.Status, replay.Status)
 	ctx.Equal(b.GrantID, a.GrantID, "a replay of Idempotency-Key k-1 must answer the recorded grant; its grant_id")
 	ctx.Equal(len(heldByCyd()), 1, "a retried assignment must write one grant; cyd's grants")
+	mine, m := assignAs(c, "ada", "viewer", "project:eng/api", "k-1")
+	ctx.Assert(mine.Status == 201 && m.GrantID != "" && m.GrantID != a.GrantID, "ada's assignment with Idempotency-Key k-1 (olu's key, another assigner) answered %d %s: a key is scoped to its assigner, so this is a new assignment", mine.Status, mine.Text())
+	ctx.Equal(len(heldByCyd()), 2, "after ada's own k-1 assignment, cyd's grants")
 	other, _ := assignAs(c, "olu", "viewer", "team:ops", "k-2")
-	ctx.Assert(other.Status == 201 && len(heldByCyd()) == 2, "an assignment with a new key answered %d; cyd holds %v", other.Status, heldByCyd())
+	ctx.Assert(other.Status == 201 && len(heldByCyd()) == 3, "an assignment with a new key answered %d; cyd holds %v", other.Status, heldByCyd())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -827,7 +846,7 @@ func CheckIdempotent(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   grants::add("olu", "org_admin", "org", "root");
   grants::add("ada", "team_admin", "team:eng", "olu");
   grants::add("bob", "viewer", "team:eng", "ada");
@@ -845,7 +864,7 @@ harness::Response assignAs(harness::HTTP& c, const std::string& assigner, const 
   return c.Post("/v1/roles/assignments", body, "Content-Type", "application/json", "X-Assigner-Id", assigner, "Idempotency-Key", key);
 }
 
-std::string field(const harness::Response& r, const std::string& name) {
+std::string hField(const harness::Response& r, const std::string& name) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains(name) && body[name].is_string() ? body[name].get<std::string>() : "";
 }
@@ -859,18 +878,19 @@ std::vector<std::string> heldByCyd() {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hAPI(ctx);
   const auto r = assignAs(c, "olu", "viewer", "team:eng");
   ctx.Equal(r.Status, 201, "olu (org_admin at org) assigning viewer at team:eng (%s)", r.Text());
-  ctx.Assert(field(r, "subject") == "cyd" && field(r, "role") == "viewer" && field(r, "scope") == "team:eng" && !field(r, "grant_id").empty(),
+  ctx.Assert(hField(r, "subject") == "cyd" && hField(r, "role") == "viewer" && hField(r, "scope") == "team:eng" && !hField(r, "grant_id").empty(),
              "the 201 must carry the grant (grant_id, subject, role, scope), got %s", r.Text());
   ctx.Equal(heldByCyd(), {"viewer@team:eng"}, "after the assignment, cyd's grants");
 }
 
 void CheckCatalog(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hAPI(ctx);
   const std::vector<std::vector<std::string>> invalid = {
       {"superuser", "org", "a role the catalog does not define"},
+      {"constructor", "org", "a role named \\"constructor\\", which the catalog does not define"},
       {"viewer", "*", "viewer at scope \\"*\\""},
       {"viewer", "org", "viewer at org (the catalog allows viewer at team and project scopes)"},
       {"team_admin", "project:eng/api", "team_admin at a project (the catalog allows it at team scopes)"},
@@ -885,34 +905,42 @@ void CheckCatalog(harness::Ctx& ctx) {
 }
 
 void CheckNoEscalation(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hAPI(ctx);
   auto r = assignAs(c, "ada", "org_admin", "org");
   ctx.Equal(r.Status, 403, "ada (team_admin at team:eng) granting org_admin at org must be refused: an assigner hands out only what it holds; the status");
-  ctx.Assert(!field(r, "missing_permission").empty(), "the 403 must name the missing permission (missing_permission), got %s", r.Text());
+  ctx.Assert(!hField(r, "missing_permission").empty() && hField(r, "error") == "insufficient_permissions",
+             "the 403 must be {\\"error\\": \\"insufficient_permissions\\"} naming the missing permission (missing_permission), got %s", r.Text());
   r = assignAs(c, "ada", "team_admin", "team:ops");
   ctx.Equal(r.Status, 403, "ada granting team_admin at team:ops must be refused (team:eng does not cover team:ops); the status");
   r = assignAs(c, "ada", "developer", "project:eng/api");
-  ctx.Assert(r.Status == 403 && field(r, "missing_permission") == "code:write",
+  ctx.Assert(r.Status == 403 && hField(r, "missing_permission") == "code:write",
              "ada granting developer (code:write, team:read) at project:eng/api answered %d %s, expected 403 naming code:write, which ada does not hold", r.Status, r.Text());
   r = assignAs(c, "bob", "viewer", "team:eng");
-  ctx.Assert(r.Status == 403 && field(r, "missing_permission") == "roles:assign", "bob (viewer at team:eng) granting viewer answered %d %s, expected 403 naming roles:assign", r.Status, r.Text());
+  ctx.Assert(r.Status == 403 && hField(r, "missing_permission") == "roles:assign", "bob (viewer at team:eng) granting viewer answered %d %s, expected 403 naming roles:assign", r.Status, r.Text());
+  r = assignAs(c, "bob", "developer", "team:eng");
+  ctx.Assert(r.Status == 403 && hField(r, "missing_permission") == "roles:assign",
+             "bob (viewer at team:eng) granting developer answered %d %s, expected 403 naming roles:assign: bob lacks roles:assign and code:write, and roles:assign is checked first", r.Status, r.Text());
   r = assignAs(c, "ada", "viewer", "project:eng/api");
   ctx.Equal(r.Status, 201, "ada granting viewer at project:eng/api must succeed, team:eng covers its projects (%s); the status", r.Text());
   ctx.Equal(heldByCyd(), {"viewer@project:eng/api"}, "a refused assignment was written; cyd's grants");
 }
 
 void CheckIdempotent(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hAPI(ctx);
   const auto none = c.Post("/v1/roles/assignments", R"({"subject": "cyd", "role": "viewer", "scope": "team:eng"})", "Content-Type", "application/json", "X-Assigner-Id", "olu");
   ctx.Equal(none.Status, 400, "an assignment without Idempotency-Key");
   ctx.Equal(heldByCyd(), std::vector<std::string>{}, "an assignment without Idempotency-Key must write nothing; cyd's grants");
   const auto first = assignAs(c, "olu", "viewer", "team:eng", "k-1");
   const auto replay = assignAs(c, "olu", "viewer", "team:eng", "k-1");
   ctx.Assert(first.Status == 201 && (replay.Status == 200 || replay.Status == 201), "the assignment answered %d, its replay %d", first.Status, replay.Status);
-  ctx.Equal(field(replay, "grant_id"), field(first, "grant_id"), "a replay of Idempotency-Key k-1 must answer the recorded grant; its grant_id");
+  ctx.Equal(hField(replay, "grant_id"), hField(first, "grant_id"), "a replay of Idempotency-Key k-1 must answer the recorded grant; its grant_id");
   ctx.Equal(heldByCyd().size(), 1, "a retried assignment must write one grant; cyd's grants");
+  const auto mine = assignAs(c, "ada", "viewer", "project:eng/api", "k-1");
+  ctx.Assert(mine.Status == 201 && !hField(mine, "grant_id").empty() && hField(mine, "grant_id") != hField(first, "grant_id"),
+             "ada's assignment with Idempotency-Key k-1 (olu's key, another assigner) answered %d %s: a key is scoped to its assigner, so this is a new assignment", mine.Status, mine.Text());
+  ctx.Equal(heldByCyd().size(), 2, "after ada's own k-1 assignment, cyd's grants");
   const auto other = assignAs(c, "olu", "viewer", "team:ops", "k-2");
-  ctx.Assert(other.Status == 201 && heldByCyd().size() == 2, "an assignment with a new key answered %d; cyd holds %d grants", other.Status, heldByCyd().size());
+  ctx.Assert(other.Status == 201 && heldByCyd().size() == 3, "an assignment with a new key answered %d; cyd holds %d grants", other.Status, heldByCyd().size());
 }
 `,
   },

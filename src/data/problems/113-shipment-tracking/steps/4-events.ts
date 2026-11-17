@@ -67,7 +67,7 @@ broker that times the record out loses it.
       id: 'no-address',
       title: 'Carries the scan city, never the recipient',
       detail:
-        "The payload names the scan's city (`scan_city`) and nothing finer; no name, street or postcode reaches the payload or a log line. The topic is retained and replicated long after the parcel arrives.",
+        "The payload is exactly `{shipment_id, status, scan_city, carrier_ref, occurred_at}`, the scan's city and nothing finer; no name, street or postcode reaches the payload or any output line, at any log level. The topic is retained and replicated long after the parcel arrives.",
       match: {
         python: {all: [/["']scan_city["']/], none: [/["']recipient["']|["']street["']|["']scan["']\s*:\s*scan\b/]},
         typescript: {all: [/scan_city/], none: [/scan\.recipient|\.\.\.scan\b|scan:\s*scan\b/]},
@@ -93,7 +93,7 @@ broker that times the record out loses it.
       id: 'delivery-outbox',
       title: 'Parks an event whose delivery failed',
       detail:
-        'The event is parked when the broker reports the delivery failed (`on_delivery`, a rejected `send`, a `WriteMessages` error, `dr_cb`, a producer `Callback`); `except KafkaException` around `produce` only sees local enqueue errors.',
+        'The event is parked, as the topic would have carried it, when the broker reports the delivery failed (`on_delivery`, a rejected `send`, a `WriteMessages` error, `dr_cb`, a producer `Callback`); `except KafkaException` around `produce` only sees local enqueue errors.',
       match: {
         python: {all: [/on_delivery\s*=/, /store\.park_event\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/await\s+producer\.send\(/, /store\.parkEvent\(/], none: [/\.catch\(/]},
@@ -538,7 +538,9 @@ std::optional<json> recordScan(const std::string& shipment_id, const std::string
     },
   },
   harness: {
-    python: `import json
+    python: `import contextlib
+import io
+import json
 import logging
 
 from shipments import store
@@ -546,6 +548,7 @@ from shipments import store
 TOPIC = "shipment.event"
 RECIPIENT = {"name": "Ada Lovelace", "street": "12 Elm Street", "postcode": "LS1 4AP"}
 PRIVATE = ("Ada Lovelace", "12 Elm Street", "LS1 4AP")
+FIELDS = ["carrier_ref", "occurred_at", "scan_city", "shipment_id", "status"]
 
 
 def _scan(status, at, city="Leeds"):
@@ -585,11 +588,15 @@ def check_no_address(ctx):
     lines = _Lines()
     root = logging.getLogger()
     root.addHandler(lines)
-    root.setLevel(logging.INFO)
+    level = root.level
+    root.setLevel(logging.DEBUG)
+    printed = io.StringIO()
     try:
-        event = m.record_scan("shp_1", "ups", _scan("out_for_delivery", 200))
+        with contextlib.redirect_stdout(printed), contextlib.redirect_stderr(printed):
+            event = m.record_scan("shp_1", "ups", _scan("out_for_delivery", 200))
     finally:
         root.removeHandler(lines)
+        root.setLevel(level)
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one applied scan left {len(records)} records on {TOPIC}"
     text = records[0].value.decode()
@@ -597,9 +604,10 @@ def check_no_address(ctx):
     assert not leaked, f"the event carries the recipient's {leaked}: {text}. The timeline needs the city, nothing finer"
     payload = json.loads(text)
     assert payload.get("scan_city") == "Leeds" and payload.get("carrier_ref") == "1Z999AA1" and payload.get("occurred_at") == 200, f"the event must carry scan_city Leeds, carrier_ref and occurred_at 200, got {payload}"
+    assert sorted(payload) == FIELDS and payload.get("shipment_id") == "shp_1" and payload.get("status") == "out_for_delivery", f"the event must be exactly {{shipment_id, status, scan_city, carrier_ref, occurred_at}} for shp_1's out_for_delivery scan, got {payload}"
     assert event == payload, f"record_scan must answer the event it produced: answered {event}, produced {payload}"
-    logged = [line for line in lines.lines if any(p in line for p in PRIVATE)]
-    assert not logged, f"a log line carries the recipient: {logged}"
+    logged = [line for line in lines.lines + printed.getvalue().splitlines() if any(p in line for p in PRIVATE)]
+    assert not logged, f"a log line (at any level) or printed line carries the recipient: {logged}"
 
 
 def check_publish_after_commit(ctx):
@@ -622,6 +630,8 @@ def check_delivery_outbox(ctx):
     parked = [json.loads(raw) for raw in ctx.redis.lrange("outbox:shipment.event", 0, -1)]
     assert len(parked) == 1, f"the broker timed the event out and the outbox holds {len(parked)} events: park it from the delivery report (on_delivery), an exception around produce never sees it"
     assert parked[0].get("shipment_id") == "shp_1" and parked[0].get("status") == "out_for_delivery", f"the parked event is {parked[0]}, expected shp_1's out_for_delivery event {event}"
+    expected = {"shipment_id": "shp_1", "status": "out_for_delivery", "scan_city": "Leeds", "carrier_ref": "1Z999AA1", "occurred_at": 200}
+    assert parked[0] == expected, f"the outbox must hold the event the topic would have carried, {expected}, got {parked[0]}"
     m.record_scan("shp_1", "ups", _scan("delivered", 300))
     assert len(ctx.redis.lrange("outbox:shipment.event", 0, -1)) == 1, "a delivered event must not be parked"
     assert [json.loads(r.value).get("status") for r in ctx.kafka.records(TOPIC)][-1] == "delivered", "the next event must reach the topic"
@@ -629,6 +639,7 @@ def check_delivery_outbox(ctx):
     typescript: `const TOPIC = 'shipment.event';
 const RECIPIENT = {name: 'Ada Lovelace', street: '12 Elm Street', postcode: 'LS1 4AP'};
 const PRIVATE = ['Ada Lovelace', '12 Elm Street', 'LS1 4AP'];
+const FIELDS = ['carrier_ref', 'occurred_at', 'scan_city', 'shipment_id', 'status'];
 
 const scan = (status: string, at: number, city = 'Leeds') => ({status, scan_at: at, city, carrier_ref: '1Z999AA1', recipient: RECIPIENT});
 
@@ -658,8 +669,8 @@ export async function check_shipment_key(ctx) {
 export async function check_no_address(ctx) {
   const m = await events(ctx, 'shp_1');
   const lines: string[] = [];
-  const real = {log: console.log, info: console.info, warn: console.warn, error: console.error};
-  console.log = console.info = console.warn = console.error = (...args: unknown[]) => void lines.push(args.map(String).join(' '));
+  const real = {log: console.log, info: console.info, warn: console.warn, error: console.error, debug: console.debug, trace: console.trace};
+  console.log = console.info = console.warn = console.error = console.debug = console.trace = (...args: unknown[]) => void lines.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
   let event;
   try {
     event = await m.recordScan('shp_1', 'ups', scan('out_for_delivery', 200));
@@ -673,6 +684,8 @@ export async function check_no_address(ctx) {
   assert.equal(leaked.length, 0, \`the event carries the recipient's \${JSON.stringify(leaked)}: \${text}. The timeline needs the city, nothing finer\`);
   const payload = JSON.parse(text);
   assert(payload.scan_city === 'Leeds' && payload.carrier_ref === '1Z999AA1' && payload.occurred_at === 200, \`the event must carry scan_city Leeds, carrier_ref and occurred_at 200, got \${text}\`);
+  assert.deepStrictEqual(Object.keys(payload).sort(), FIELDS, \`the event must be exactly {shipment_id, status, scan_city, carrier_ref, occurred_at}, got \${text}\`);
+  assert(payload.shipment_id === 'shp_1' && payload.status === 'out_for_delivery', \`the event must name shp_1 and out_for_delivery, got \${text}\`);
   assert.deepStrictEqual(event, payload, \`recordScan must answer the event it produced: answered \${JSON.stringify(event)}, produced \${text}\`);
   const logged = lines.filter(line => PRIVATE.some(p => line.includes(p)));
   assert.equal(logged.length, 0, \`a log line carries the recipient: \${JSON.stringify(logged)}\`);
@@ -698,6 +711,8 @@ export async function check_delivery_outbox(ctx) {
   const parked = ctx.redis.lrange('outbox:shipment.event', 0, -1).map(raw => JSON.parse(raw));
   assert.equal(parked.length, 1, \`the broker timed the event out and the outbox holds \${parked.length} events: park it when the send rejects, a .catch that logs drops it\`);
   assert(parked[0].shipment_id === 'shp_1' && parked[0].status === 'out_for_delivery', \`the parked event is \${JSON.stringify(parked[0])}, expected shp_1's out_for_delivery event \${JSON.stringify(event)}\`);
+  const expected = {shipment_id: 'shp_1', status: 'out_for_delivery', scan_city: 'Leeds', carrier_ref: '1Z999AA1', occurred_at: 200};
+  assert.deepStrictEqual(parked[0], expected, \`the outbox must hold the event the topic would have carried, \${JSON.stringify(expected)}, got \${JSON.stringify(parked[0])}\`);
   await m.recordScan('shp_1', 'ups', scan('delivered', 300));
   assert.equal(ctx.redis.lrange('outbox:shipment.event', 0, -1).length, 1, 'a delivered event must not be parked');
   const last = ctx.kafka.records(TOPIC).at(-1);
@@ -712,6 +727,7 @@ import (
 	"encoding/json"
 	"log"
 	"os"
+	"sort"
 	"strings"
 
 	"shipments/store"
@@ -719,52 +735,62 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "shipment.event"
+const hTopic = "shipment.event"
 
 var (
-	eventsBg = context.Background()
-	private  = []string{"Ada Lovelace", "12 Elm Street", "LS1 4AP"}
+	hEventsBg = context.Background()
+	hPrivate  = []string{"Ada Lovelace", "12 Elm Street", "LS1 4AP"}
+	hFields   = []string{"carrier_ref", "occurred_at", "scan_city", "shipment_id", "status"}
 )
 
-func scanOf(status string, at int64, city string) ScanReport {
+func hScanOf(status string, at int64, city string) ScanReport {
 	return ScanReport{Status: status, ScanAt: at, City: city, CarrierRef: "1Z999AA1", Recipient: Recipient{Name: "Ada Lovelace", Street: "12 Elm Street", Postcode: "LS1 4AP"}}
 }
 
-func ships(ids ...string) {
+func hShips(ids ...string) {
 	for _, id := range ids {
-		store.Save(eventsBg, store.Shipment{ShipmentID: id, TenantID: "t-acme", OrderID: "ord_" + id, Carrier: "ups", ServiceLevel: "ground", Status: "label"})
+		store.Save(hEventsBg, store.Shipment{ShipmentID: id, TenantID: "t-acme", OrderID: "ord_" + id, Carrier: "ups", ServiceLevel: "ground", Status: "label"})
 	}
 }
 
-func record(ctx *harness.Ctx, shipmentID string, s ScanReport) map[string]any {
-	event, err := recordScan(eventsBg, shipmentID, "ups", s)
+func hRecord(ctx *harness.Ctx, shipmentID string, s ScanReport) map[string]any {
+	event, err := recordScan(hEventsBg, shipmentID, "ups", s)
 	ctx.NoError(err, "recordScan(%s, %s) failed", shipmentID, s.Status)
 	return event
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func statuses(ctx *harness.Ctx) []string {
+func hKeysOf(p map[string]any) []string {
+	keys := []string{}
+	for k := range p {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func hStatuses(ctx *harness.Ctx) []string {
 	out := []string{}
-	for _, r := range ctx.Kafka.Records(topic) {
-		s, _ := payloadOf(ctx, r.Value)["status"].(string)
+	for _, r := range ctx.Kafka.Records(hTopic) {
+		s, _ := hPayloadOf(ctx, r.Value)["status"].(string)
 		out = append(out, s)
 	}
 	return out
 }
 
 func CheckShipmentKey(ctx *harness.Ctx) {
-	ships("shp_1", "shp_2")
-	record(ctx, "shp_1", scanOf("in_transit", 100, "Memphis"))
-	record(ctx, "shp_2", scanOf("in_transit", 110, "Memphis"))
-	record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"))
-	record(ctx, "shp_1", scanOf("delivered", 300, "Leeds"))
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 4, "four applied scans; the records on %s", topic)
+	hShips("shp_1", "shp_2")
+	hRecord(ctx, "shp_1", hScanOf("in_transit", 100, "Memphis"))
+	hRecord(ctx, "shp_2", hScanOf("in_transit", 110, "Memphis"))
+	hRecord(ctx, "shp_1", hScanOf("out_for_delivery", 200, "Leeds"))
+	hRecord(ctx, "shp_1", hScanOf("delivered", 300, "Leeds"))
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 4, "four applied scans; the records on %s", hTopic)
 	partitions := map[int]bool{}
 	ones := 0
 	for _, r := range records {
@@ -773,51 +799,55 @@ func CheckShipmentKey(ctx *harness.Ctx) {
 			partitions[r.Partition] = true
 		}
 	}
-	ctx.Equal(ones, 3, "key each event by its shipment id; the records keyed shp_1 (keys %q)", ctx.Kafka.Keys(topic))
+	ctx.Equal(ones, 3, "key each event by its shipment id; the records keyed shp_1 (keys %q)", ctx.Kafka.Keys(hTopic))
 	ctx.Equal(len(partitions), 1, "one shipment's timeline must stay on one partition, in order; the partitions of shp_1's events")
 }
 
 func CheckNoAddress(ctx *harness.Ctx) {
-	ships("shp_1")
+	hShips("shp_1")
 	var lines bytes.Buffer
 	log.SetOutput(&lines)
-	event := record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"))
+	event := hRecord(ctx, "shp_1", hScanOf("out_for_delivery", 200, "Leeds"))
 	log.SetOutput(os.Stderr)
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 1, "one applied scan; the records on %s", topic)
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 1, "one applied scan; the records on %s", hTopic)
 	text := string(records[0].Value)
-	for _, p := range private {
+	for _, p := range hPrivate {
 		ctx.Assert(!strings.Contains(text, p), "the event carries the recipient's %q: %s. The timeline needs the city, nothing finer", p, text)
 		ctx.Assert(!strings.Contains(lines.String(), p), "a log line carries the recipient's %q: %s", p, lines.String())
 	}
-	payload := payloadOf(ctx, records[0].Value)
+	payload := hPayloadOf(ctx, records[0].Value)
 	ctx.Assert(payload["scan_city"] == "Leeds" && payload["carrier_ref"] == "1Z999AA1" && payload["occurred_at"] == float64(200), "the event must carry scan_city Leeds, carrier_ref and occurred_at 200, got %s", text)
+	ctx.Equal(hKeysOf(payload), hFields, "the event must be exactly {shipment_id, status, scan_city, carrier_ref, occurred_at} (%s); its fields", text)
+	ctx.Assert(payload["shipment_id"] == "shp_1" && payload["status"] == "out_for_delivery", "the event must name shp_1 and out_for_delivery, got %s", text)
 	ctx.Equal(event["scan_city"], "Leeds", "recordScan must answer the event it produced; its scan_city")
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
-	ships("shp_1")
-	atCommit := ctx.Redis.After("shipment:shp_1", func() any { return len(ctx.Kafka.Records(topic)) })
-	record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"))
+	hShips("shp_1")
+	atCommit := ctx.Redis.After("shipment:shp_1", func() any { return len(ctx.Kafka.Records(hTopic)) })
+	hRecord(ctx, "shp_1", hScanOf("out_for_delivery", 200, "Leeds"))
 	ctx.Assert(atCommit.Fired, "recordScan never touched shipment:shp_1: the scan must go through timeline.ApplyScan")
 	ctx.Equal(atCommit.Result, 0, "when the state store saw the scan the topic already held records: apply first, produce after; records at the commit")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one applied scan; the records")
-	dropped := record(ctx, "shp_1", scanOf("in_transit", 260, "Leeds"))
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "one applied scan; the records")
+	dropped := hRecord(ctx, "shp_1", hScanOf("in_transit", 260, "Leeds"))
 	ctx.Assert(dropped == nil, "a scan the state dropped (in_transit after out_for_delivery) must answer nil, got %v", dropped)
-	ctx.Equal(statuses(ctx), []string{"out_for_delivery"}, "a scan the state dropped must not reach the timeline; the statuses on the topic")
+	ctx.Equal(hStatuses(ctx), []string{"out_for_delivery"}, "a scan the state dropped must not reach the timeline; the statuses on the topic")
 }
 
 func CheckDeliveryOutbox(ctx *harness.Ctx) {
-	ships("shp_1")
-	ctx.Kafka.FailNext(topic, 1)
-	record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"))
+	hShips("shp_1")
+	ctx.Kafka.FailNext(hTopic, 1)
+	hRecord(ctx, "shp_1", hScanOf("out_for_delivery", 200, "Leeds"))
 	parked := ctx.Redis.LRange("outbox:shipment.event", 0, -1)
 	ctx.Equal(len(parked), 1, "the broker timed the event out: park it when WriteMessages returns an error; the outbox")
-	p := payloadOf(ctx, []byte(parked[0]))
+	p := hPayloadOf(ctx, []byte(parked[0]))
 	ctx.Assert(p["shipment_id"] == "shp_1" && p["status"] == "out_for_delivery", "the parked event is %s, expected shp_1's out_for_delivery event", parked[0])
-	record(ctx, "shp_1", scanOf("delivered", 300, "Leeds"))
+	ctx.Assert(p["scan_city"] == "Leeds" && p["carrier_ref"] == "1Z999AA1" && p["occurred_at"] == float64(200), "the outbox must hold the event the topic would have carried, got %s", parked[0])
+	ctx.Equal(hKeysOf(p), hFields, "the outbox must hold the event the topic would have carried (%s); its fields", parked[0])
+	hRecord(ctx, "shp_1", hScanOf("delivered", 300, "Leeds"))
 	ctx.Equal(len(ctx.Redis.LRange("outbox:shipment.event", 0, -1)), 1, "a delivered event must not be parked; the outbox")
-	s := statuses(ctx)
+	s := hStatuses(ctx)
 	ctx.Assert(len(s) > 0 && s[len(s)-1] == "delivered", "the next event must reach the topic, the statuses are %q", s)
 }
 `,
@@ -837,19 +867,20 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "shipment.event";
-const std::vector<std::string> kPrivate = {"Ada Lovelace", "12 Elm Street", "LS1 4AP"};
+const std::string kHTopic = "shipment.event";
+const std::vector<std::string> kHPrivate = {"Ada Lovelace", "12 Elm Street", "LS1 4AP"};
+const std::vector<std::string> kHFields = {"carrier_ref", "occurred_at", "scan_city", "shipment_id", "status"};
 
-json scanOf(const std::string& status, long at, const std::string& city) {
+json h_scan_of(const std::string& status, long at, const std::string& city) {
   return json{{"status", status}, {"scan_at", at}, {"city", city}, {"carrier_ref", "1Z999AA1"},
               {"recipient", {{"name", "Ada Lovelace"}, {"street", "12 Elm Street"}, {"postcode", "LS1 4AP"}}}};
 }
 
-void ships(const std::vector<std::string>& ids) {
+void h_ships(const std::vector<std::string>& ids) {
   for (const auto& id : ids) store::save(store::Shipment{id, "t-acme", "ord_" + id, "ups", "ground", "label", "", 0});
 }
 
-std::optional<json> record(harness::Ctx& ctx, const std::string& shipment_id, const json& scan) {
+std::optional<json> h_record(harness::Ctx& ctx, const std::string& shipment_id, const json& scan) {
   try {
     return recordScan(shipment_id, "ups", scan);
   } catch (const std::exception& e) {
@@ -858,75 +889,88 @@ std::optional<json> record(harness::Ctx& ctx, const std::string& shipment_id, co
   return std::nullopt;
 }
 
-std::vector<std::string> statuses(harness::Ctx& ctx) {
+std::vector<std::string> h_statuses(harness::Ctx& ctx) {
   std::vector<std::string> out;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) out.push_back(json::parse(r.Value.value_or("{}")).value("status", ""));
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) out.push_back(json::parse(r.Value.value_or("{}")).value("status", ""));
+  return out;
+}
+
+// The field names of a JSON object, sorted (nlohmann's object keeps them sorted).
+std::vector<std::string> h_fields_of(const json& j) {
+  std::vector<std::string> out;
+  if (j.is_object()) {
+    for (const auto& item : j.items()) out.push_back(item.key());
+  }
   return out;
 }
 
 }  // namespace
 
 void CheckShipmentKey(harness::Ctx& ctx) {
-  ships({"shp_1", "shp_2"});
-  record(ctx, "shp_1", scanOf("in_transit", 100, "Memphis"));
-  record(ctx, "shp_2", scanOf("in_transit", 110, "Memphis"));
-  record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"));
-  record(ctx, "shp_1", scanOf("delivered", 300, "Leeds"));
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"shp_1", "shp_2", "shp_1", "shp_1"}, "key each event by its shipment id; the record keys");
+  h_ships({"shp_1", "shp_2"});
+  h_record(ctx, "shp_1", h_scan_of("in_transit", 100, "Memphis"));
+  h_record(ctx, "shp_2", h_scan_of("in_transit", 110, "Memphis"));
+  h_record(ctx, "shp_1", h_scan_of("out_for_delivery", 200, "Leeds"));
+  h_record(ctx, "shp_1", h_scan_of("delivered", 300, "Leeds"));
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"shp_1", "shp_2", "shp_1", "shp_1"}, "key each event by its shipment id; the record keys");
   std::set<int> partitions;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) {
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) {
     if (r.Key.value_or("") == "shp_1") partitions.insert(r.Partition);
   }
   ctx.Equal(partitions.size(), 1, "one shipment's timeline must stay on one partition, in order; the partitions of shp_1's events");
 }
 
 void CheckNoAddress(harness::Ctx& ctx) {
-  ships({"shp_1"});
+  h_ships({"shp_1"});
   std::ostringstream lines;
   auto* err = std::cerr.rdbuf(lines.rdbuf());
   auto* clog = std::clog.rdbuf(lines.rdbuf());
   auto* out = std::cout.rdbuf(lines.rdbuf());
-  const auto event = record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"));
+  const auto event = h_record(ctx, "shp_1", h_scan_of("out_for_delivery", 200, "Leeds"));
   std::cerr.rdbuf(err);
   std::clog.rdbuf(clog);
   std::cout.rdbuf(out);
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 1, "one applied scan; the records on %s", kTopic);
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 1, "one applied scan; the records on %s", kHTopic);
   const std::string text = records[0].Value.value_or("");
-  for (const auto& p : kPrivate) {
+  for (const auto& p : kHPrivate) {
     ctx.Assert(text.find(p) == std::string::npos, "the event carries the recipient's %q: %s. The timeline needs the city, nothing finer", p, text);
     ctx.Assert(lines.str().find(p) == std::string::npos, "a log line carries the recipient's %q: %s", p, lines.str());
   }
   const json payload = json::parse(text);
   ctx.Assert(payload.value("scan_city", "") == "Leeds" && payload.value("carrier_ref", "") == "1Z999AA1" && payload.value("occurred_at", 0L) == 200,
              "the event must carry scan_city Leeds, carrier_ref and occurred_at 200, got %s", text);
+  ctx.Equal(h_fields_of(payload), kHFields, "the event must be exactly {shipment_id, status, scan_city, carrier_ref, occurred_at} (%s); its fields", text);
+  ctx.Assert(payload.value("shipment_id", "") == "shp_1" && payload.value("status", "") == "out_for_delivery", "the event must name shp_1 and out_for_delivery, got %s", text);
   ctx.Assert(event && *event == payload, "recordScan must answer the event it produced (%s)", text);
 }
 
 void CheckPublishAfterCommit(harness::Ctx& ctx) {
-  ships({"shp_1"});
+  h_ships({"shp_1"});
   int at_commit = -1;
-  ctx.Redis.After("shipment:shp_1", [&] { at_commit = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"));
+  ctx.Redis.After("shipment:shp_1", [&] { at_commit = static_cast<int>(ctx.Kafka.Records(kHTopic).size()); });
+  h_record(ctx, "shp_1", h_scan_of("out_for_delivery", 200, "Leeds"));
   ctx.Assert(at_commit >= 0, "recordScan never touched shipment:shp_1: the scan must go through timeline::applyScan");
   ctx.Equal(at_commit, 0, "when the state store saw the scan the topic already held records: apply first, produce after; records at the commit");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one applied scan; the records");
-  const auto dropped = record(ctx, "shp_1", scanOf("in_transit", 260, "Leeds"));
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "one applied scan; the records");
+  const auto dropped = h_record(ctx, "shp_1", h_scan_of("in_transit", 260, "Leeds"));
   ctx.Assert(!dropped, "a scan the state dropped (in_transit after out_for_delivery) must answer nothing, got %s", dropped ? dropped->dump() : "");
-  ctx.Equal(statuses(ctx), {"out_for_delivery"}, "a scan the state dropped must not reach the timeline; the statuses on the topic");
+  ctx.Equal(h_statuses(ctx), {"out_for_delivery"}, "a scan the state dropped must not reach the timeline; the statuses on the topic");
 }
 
 void CheckDeliveryOutbox(harness::Ctx& ctx) {
-  ships({"shp_1"});
-  ctx.Kafka.FailNext(kTopic, 1);
-  record(ctx, "shp_1", scanOf("out_for_delivery", 200, "Leeds"));
+  h_ships({"shp_1"});
+  ctx.Kafka.FailNext(kHTopic, 1);
+  h_record(ctx, "shp_1", h_scan_of("out_for_delivery", 200, "Leeds"));
   const auto parked = ctx.Redis.LRange("outbox:shipment.event", 0, -1);
   ctx.Equal(parked.size(), 1, "the broker timed the event out: park it from the delivery report (dr_cb), produce's return code never sees it; the outbox");
   const json p = json::parse(parked[0]);
   ctx.Assert(p.value("shipment_id", "") == "shp_1" && p.value("status", "") == "out_for_delivery", "the parked event is %s, expected shp_1's out_for_delivery event", parked[0]);
-  record(ctx, "shp_1", scanOf("delivered", 300, "Leeds"));
+  const json expected = {{"shipment_id", "shp_1"}, {"status", "out_for_delivery"}, {"scan_city", "Leeds"}, {"carrier_ref", "1Z999AA1"}, {"occurred_at", 200}};
+  ctx.Assert(p == expected, "the outbox must hold the event the topic would have carried, %s, got %s", expected.dump(), parked[0]);
+  h_record(ctx, "shp_1", h_scan_of("delivered", 300, "Leeds"));
   ctx.Equal(ctx.Redis.LRange("outbox:shipment.event", 0, -1).size(), 1, "a delivered event must not be parked; the outbox");
-  const auto s = statuses(ctx);
+  const auto s = h_statuses(ctx);
   ctx.Assert(!s.empty() && s.back() == "delivered", "the next event must reach the topic, the statuses are %q", s);
 }
 `,

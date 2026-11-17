@@ -21,7 +21,8 @@ for one return; the photo of a customer's kitchen sits in a retained topic every
 timeline shows a state the store does not hold yet; a lost acknowledgement writes an event twice
 and a failover loses one; a refused record vanishes.
 
-- The record key is the **return id**; the payload carries no \`photo_ref\`.
+- The record key is the **return id**; the payload is \`return_id\`, \`order_line_id\`, \`state\`,
+  \`grade\` and \`refund_cents\`, nothing else (no \`photo_ref\`), in the event and in its outbox row.
 - The state is written **before** the event is produced.
 - The producer is idempotent with \`acks=all\` (kafkajs \`idempotent\` with \`acks: -1\`; Go uses
   confluent-kafka-go, which has an idempotent producer).
@@ -76,7 +77,7 @@ and a failover loses one; a refused record vanishes.
       id: 'no-photo',
       title: 'Leaves the photo reference out of the event',
       detail:
-        'The payload carries `return_id`, `order_line_id`, `state`, `grade` and `refund_cents`, and no `photo_ref`: the topic is retained and every consumer reads it, while the evidence belongs in the returns store.',
+        'The payload carries exactly `return_id`, `order_line_id`, `state`, `grade` and `refund_cents`, and no `photo_ref`, in the event and in its outbox row: the topic is retained and every consumer reads it, while the evidence belongs in the returns store.',
       match: {
         python: {all: [/["']refund_cents["']/], none: [/photo_ref/]},
         typescript: {all: [/refund_cents/], none: [/photo_ref/]},
@@ -607,6 +608,7 @@ bool recordTransition(const store::Return& ret, const std::string& state) {
 from returns import ledger, store
 
 TOPIC = "returns.event"
+FIELDS = {"return_id", "order_line_id", "state", "grade", "refund_cents"}
 
 
 def _open(ctx, return_id):
@@ -643,6 +645,7 @@ def check_no_photo(ctx):
     value = json.loads(text)
     want = {"return_id": "ret-1", "order_line_id": "L1", "state": "refund_pending", "grade": "damaged", "refund_cents": 2000}
     assert all(value.get(k) == v for k, v in want.items()), f"the payload is {value}, expected {want}"
+    assert set(value) == FIELDS, f"the payload carries the fields {sorted(value)}, expected exactly {sorted(FIELDS)}: the timeline gets what it needs to place the event, and the rest of the return stays in the store"
 
 
 def check_publish_after_commit(ctx):
@@ -668,24 +671,29 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.record_transition(_open(ctx, "ret-0"), "refund_pending")
+    assert ok is True and not _outbox(ctx), f"an acknowledged event returned {ok!r} and left the outbox rows {_outbox(ctx)}, expected True and no row"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.record_transition(_open(ctx, "ret-1"), "refund_pending")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the transition never reaches the timeline"
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == "ret-1" and row.get("payload", {}).get("return_id") == "ret-1", f"the outbox row is {row}, expected the topic, the key ret-1 and the payload"
+    payload = row.get("payload", {})
+    assert set(payload) == FIELDS and payload.get("state") == "refund_pending", f"the outbox row carries the payload {payload}, expected the event's own payload (exactly {sorted(FIELDS)}, state refund_pending): the relay publishes it to the same topic"
     assert ok is False, f"record_transition returned {ok!r} after a failed delivery, expected False"
     assert ctx.redis.hget("return:ret-1", "state") == "refund_pending", "the state must stay written when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.record_transition(_open(ctx, "ret-2"), "refund_pending")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"record_transition waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"record_transition waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S (2 s), then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("return_id") == "ret-2", f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"record_transition returned {ok!r} without an acknowledgement, expected False"
 `,
     typescript: `const TOPIC = 'returns.event';
+const FIELDS = ['grade', 'order_line_id', 'refund_cents', 'return_id', 'state'];
 
 function world(ctx) {
   const m = ctx.load('events');
@@ -734,6 +742,8 @@ export async function check_no_photo(ctx) {
   const value = JSON.parse(values[0]);
   const want = {return_id: 'ret-1', order_line_id: 'L1', state: 'refund_pending', grade: 'damaged', refund_cents: 2000};
   assert(Object.entries(want).every(([k, v]) => value[k] === v), \`the payload is \${values[0]}, expected \${JSON.stringify(want)}\`);
+  const keys = Object.keys(value).sort();
+  assert.deepEqual(keys, FIELDS, \`the payload carries the fields \${JSON.stringify(keys)}, expected exactly \${JSON.stringify(FIELDS)}: the timeline gets what it needs to place the event, and the rest of the return stays in the store\`);
 }
 
 export async function check_publish_after_commit(ctx) {
@@ -762,13 +772,19 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const {m, open} = world(ctx);
+  const zero = await open('ret-0');
+  let ok = await m.recordTransition(zero, 'refund_pending');
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`an acknowledged event resolved \${JSON.stringify(ok)} and left the outbox rows \${JSON.stringify(outboxRows(ctx))}, expected true and no row\`);
   const first = await open('ret-1');
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.recordTransition(first, 'refund_pending');
+  ok = await m.recordTransition(first, 'refund_pending');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the transition never reaches the timeline\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'ret-1' && rows[0].payload?.return_id === 'ret-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key ret-1 and the payload\`);
+  const payload = rows[0].payload ?? {};
+  assert(JSON.stringify(Object.keys(payload).sort()) === JSON.stringify(FIELDS) && payload.state === 'refund_pending', \`the outbox row carries the payload \${JSON.stringify(payload)}, expected the event's own payload (exactly \${JSON.stringify(FIELDS)}, state refund_pending): the relay publishes it to the same topic\`);
   assert.equal(ok, false, \`recordTransition resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   assert.equal(ctx.redis.hget('return:ret-1', 'state'), 'refund_pending', 'the state must stay written when only the produce failed');
   const second = await open('ret-2');
@@ -776,7 +792,7 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.recordTransition(second, 'refund_pending');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`recordTransition waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`recordTransition waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS (2 s), then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.return_id === 'ret-2', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`recordTransition resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -797,6 +813,18 @@ import (
 )
 
 const eventsTopic = "returns.event"
+
+var eventsFields = []string{"grade", "order_line_id", "refund_cents", "return_id", "state"}
+
+// eventsKeys is a payload's field names, sorted.
+func eventsKeys(payload map[string]any) []string {
+	keys := []string{}
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 var eventsBg = context.Background()
 
@@ -860,6 +888,7 @@ func CheckNoPhoto(ctx *harness.Ctx) {
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the payload must be JSON")
 	ctx.Assert(value["return_id"] == "ret-1" && value["order_line_id"] == "L1" && value["state"] == "refund_pending" && value["grade"] == "damaged" && value["refund_cents"] == float64(2000),
 		"the payload is %s, expected return_id ret-1, order_line_id L1, state refund_pending, grade damaged, refund_cents 2000", values[0])
+	ctx.Equal(eventsKeys(value), eventsFields, "the payload must carry exactly these fields: the timeline gets what it needs to place the event, and the rest of the return stays in the store; the fields")
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
@@ -886,13 +915,17 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := eventsRecord(ctx, eventsOpen(ctx, "ret-0"), "refund_pending")
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "an acknowledged event returned %v and left the outbox rows %v, expected true and no row", ok, eventsOutbox(ctx))
 	first := eventsOpen(ctx, "ret-1")
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsRecord(ctx, first, "refund_pending")
+	ok = eventsRecord(ctx, first, "refund_pending")
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition never reaches the timeline; the rows")
 	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "ret-1" && rows[0].Payload["return_id"] == "ret-1", "the outbox row is %v, expected the topic, the key ret-1 and the payload", rows[0])
+	ctx.Assert(strings.Join(eventsKeys(rows[0].Payload), ",") == strings.Join(eventsFields, ",") && rows[0].Payload["state"] == "refund_pending", "the outbox row carries the payload %v, expected the event's own payload (exactly %v, state refund_pending): the relay publishes it to the same topic", rows[0].Payload, eventsFields)
 	ctx.Equal(ok, false, "recordTransition's result after a failed delivery")
 	state, _ := ctx.Redis.HGet("return:ret-1", "state")
 	ctx.Equal(state, "refund_pending", "the state must stay written when only the produce failed; the state")
@@ -901,7 +934,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsRecord(ctx, second, "refund_pending")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "recordTransition waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "recordTransition waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["return_id"] == "ret-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "recordTransition's result without an acknowledgement")
@@ -921,15 +954,16 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 namespace {
 
 const std::string kEventsTopic = "returns.event";
+const std::vector<std::string> hEventFields = {"grade", "order_line_id", "refund_cents", "return_id", "state"};
 
-store::Return open(harness::Ctx& ctx, const std::string& return_id) {
+store::Return hOpen(harness::Ctx& ctx, const std::string& return_id) {
   ctx.Redis.Set("line:L1:returnable", "9");
   ledger::registerReturn("L1", return_id, 1, {{"tenant", "t-1"}, {"reason_code", "damaged"}, {"photo_ref", "photos/" + return_id + "-kitchen.jpg"}});
   store::updateReturn(return_id, {{"grade", "damaged"}, {"refund_cents", "2000"}});
   return *store::returnOf(return_id);
 }
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -939,15 +973,24 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+// A payload's field names, sorted (nlohmann::json objects iterate in key order).
+std::vector<std::string> hKeys(const nlohmann::json& j) {
+  std::vector<std::string> keys;
+  if (j.is_object()) {
+    for (const auto& item : j.items()) keys.push_back(item.key());
+  }
+  return keys;
 }
 
 }  // namespace
 
 void CheckReturnKey(harness::Ctx& ctx) {
-  const store::Return first = open(ctx, "ret-1");
-  const store::Return second = open(ctx, "ret-2");
+  const store::Return first = hOpen(ctx, "ret-1");
+  const store::Return second = hOpen(ctx, "ret-2");
   recordTransition(first, "awaiting_inspection");
   recordTransition(second, "awaiting_inspection");
   recordTransition(first, "refund_pending");
@@ -965,19 +1008,20 @@ void CheckReturnKey(harness::Ctx& ctx) {
 }
 
 void CheckNoPhoto(harness::Ctx& ctx) {
-  recordTransition(open(ctx, "ret-1"), "refund_pending");
+  recordTransition(hOpen(ctx, "ret-1"), "refund_pending");
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 1, "one transition must produce one record; the records");
   ctx.Assert(values[0].find("kitchen.jpg") == std::string::npos, "the event carries the customer's photo reference: %s. returns.event is retained and read by every consumer; the evidence stays in the returns store", values[0]);
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(field(value, "return_id") == "ret-1" && field(value, "order_line_id") == "L1" && field(value, "state") == "refund_pending" && field(value, "grade") == "damaged" &&
+  ctx.Assert(hField(value, "return_id") == "ret-1" && hField(value, "order_line_id") == "L1" && hField(value, "state") == "refund_pending" && hField(value, "grade") == "damaged" &&
                  value.value("refund_cents", 0LL) == 2000,
              "the payload is %s, expected return_id ret-1, order_line_id L1, state refund_pending, grade damaged, refund_cents 2000", values[0]);
+  ctx.Equal(hKeys(value), hEventFields, "the payload must carry exactly these fields: the timeline gets what it needs to place the event, and the rest of the return stays in the store; the fields");
 }
 
 void CheckPublishAfterCommit(harness::Ctx& ctx) {
-  const store::Return ret = open(ctx, "ret-1");
+  const store::Return ret = hOpen(ctx, "ret-1");
   size_t atWrite = 999;
   bool fired = false;
   ctx.Redis.After("return:ret-1", [&] {
@@ -994,34 +1038,40 @@ void CheckPublishAfterCommit(harness::Ctx& ctx) {
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  recordTransition(open(ctx, "ret-1"), "refund_pending");
+  recordTransition(hOpen(ctx, "ret-1"), "refund_pending");
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  recordTransition(open(ctx, "ret-2"), "refund_pending");
+  recordTransition(hOpen(ctx, "ret-2"), "refund_pending");
   ctx.Settle();
   ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose an event (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  const store::Return first = open(ctx, "ret-1");
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = recordTransition(first, "refund_pending");
+  bool ok = recordTransition(hOpen(ctx, "ret-0"), "refund_pending");
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  ctx.Assert(ok && hOutboxRows(ctx).empty(), "an acknowledged event returned %t and left %d outbox rows, expected true and no row", ok, hOutboxRows(ctx).size());
+  const store::Return first = hOpen(ctx, "ret-1");
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ok = recordTransition(first, "refund_pending");
+  ctx.Settle();
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition never reaches the timeline; the rows");
-  ctx.Assert(field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == "ret-1" && rows[0].contains("payload") && field(rows[0]["payload"], "return_id") == "ret-1",
+  ctx.Assert(hField(rows[0], "topic") == kEventsTopic && hField(rows[0], "key") == "ret-1" && rows[0].contains("payload") && hField(rows[0]["payload"], "return_id") == "ret-1",
              "the outbox row is %s, expected the topic, the key ret-1 and the payload", rows[0].dump());
+  const nlohmann::json payload = rows[0].contains("payload") ? rows[0]["payload"] : nlohmann::json::object();
+  ctx.Assert(hKeys(payload) == hEventFields && hField(payload, "state") == "refund_pending",
+             "the outbox row carries the payload %s, expected the event's own payload (exactly grade, order_line_id, refund_cents, return_id, state; state refund_pending): the relay publishes it to the same topic", payload.dump());
   ctx.Equal(ok, false, "recordTransition's result after a failed delivery");
   ctx.Equal(ctx.Redis.HGet("return:ret-1", "state").value_or(""), "refund_pending", "the state must stay written when only the produce failed; the state");
-  const store::Return second = open(ctx, "ret-2");
+  const store::Return second = hOpen(ctx, "ret-2");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = recordTransition(second, "refund_pending");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "recordTransition waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && field(rows[1]["payload"], "return_id") == "ret-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(waited <= 2.5, "recordTransition waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hField(rows[1]["payload"], "return_id") == "ret-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "recordTransition's result without an acknowledgement");
 }
 `,

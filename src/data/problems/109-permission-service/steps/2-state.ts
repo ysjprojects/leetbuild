@@ -50,7 +50,7 @@ was deriving when a revocation committed caches what it derived, for the rest of
       id: 'every-scope',
       title: 'A grant change reaches every cached scope',
       detail:
-        'A change bumps the shared `perm:grant_version` counter (`INCR`), which outdates every entry at once; deleting the one `perm:{subject}:{scope}` key of the changed grant leaves the entries of the scopes it covers (a team grant at its projects) serving the old set.',
+        'A change bumps the shared `perm:grant_version` counter (`INCR`), which outdates every entry at once; deleting the one `perm:{subject}:{scope}` key of the changed grant leaves the entries of the scopes it covers (a team grant at its projects) serving the old set. An entry carries the 300 s TTL.',
       match: {
         python: {
           all: [/VERSION_KEY\s*=\s*["']perm:grant_version["']/, /\.incr\(\s*VERSION_KEY\s*\)/],
@@ -78,7 +78,7 @@ was deriving when a revocation committed caches what it derived, for the rest of
       id: 'after-commit',
       title: 'Invalidates after the grant store committed the change',
       detail:
-        'The grant is written (`add`/`revoke`) before the cache is invalidated; the starter deletes first, so a read landing in between derives the set the change was about to remove and caches it.',
+        'The grant is written (`add`/`revoke`) before the cache is invalidated, for a grant and for a revocation; the starter deletes first, so a read landing in between derives the set the change was about to remove and caches it.',
       match: {
         python: {order: [/grants\.add\(/, /\.incr\(\s*VERSION_KEY/, /grants\.revoke\(/, /\.incr\(\s*VERSION_KEY/]},
         typescript: {order: [/\badd\(/, /\.incr\(\s*VERSION_KEY/, /\brevoke\(/, /\.incr\(\s*VERSION_KEY/]},
@@ -541,7 +541,7 @@ def check_every_scope(ctx):
     assert "team:write" in m.effective_permissions("ada", "team:eng"), "a team_admin at team:eng must hold team:write there"
     assert "team:write" in m.effective_permissions("ada", "project:eng/api"), "team:eng covers project:eng/api: ada must hold team:write there"
     ttl = ctx.redis.ttl("perm:ada:team:eng")
-    assert 0 < ttl <= 300, f"perm:ada:team:eng has a TTL of {ttl} s, expected at most 300"
+    assert 290 < ttl <= 300, f"perm:ada:team:eng has a TTL of {ttl} s, expected 300"
     m.revoke_grant(grant["grant_id"])
     for scope in ("team:eng", "project:eng/api"):
         seen = m.effective_permissions("ada", scope)
@@ -569,6 +569,13 @@ def check_after_commit(ctx):
     assert seen[0] is False, "revoke_grant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate"
     after = m.effective_permissions("ada", "team:eng")
     assert "team:write" not in after, f"after the revocation ada still holds {after}"
+    held = []
+    ctx.redis_after("perm:grant_version", lambda: held.append(ctx.redis.scard("grants:ada")))
+    m.grant_role("ada", "developer", "team:eng", "olu")
+    assert held, "grant_role never touched perm:grant_version: nothing invalidates the cached sets"
+    assert held[0] == 1, "grant_role moved perm:grant_version before the grant store held the new grant: a read landing there derives the set without it and stamps it with the new version, so the grant stays invisible for the TTL. Write the grant first, then invalidate"
+    now = m.effective_permissions("ada", "team:eng")
+    assert "code:write" in now, f"after developer was granted at team:eng ada holds {now}"
 
 
 def check_stamp_before_derive(ctx):
@@ -597,7 +604,7 @@ export async function check_every_scope(ctx) {
   assert((await m.effectivePermissions('ada', 'team:eng')).includes('team:write'), 'a team_admin at team:eng must hold team:write there');
   assert((await m.effectivePermissions('ada', 'project:eng/api')).includes('team:write'), 'team:eng covers project:eng/api: ada must hold team:write there');
   const ttl = ctx.redis.ttl('perm:ada:team:eng');
-  assert(ttl > 0 && ttl <= 300, \`perm:ada:team:eng has a TTL of \${ttl} s, expected at most 300\`);
+  assert(ttl > 290 && ttl <= 300, \`perm:ada:team:eng has a TTL of \${ttl} s, expected 300\`);
   await m.revokeGrant(grant.grant_id);
   for (const scope of ['team:eng', 'project:eng/api']) {
     const seen = await m.effectivePermissions('ada', scope);
@@ -624,6 +631,13 @@ export async function check_after_commit(ctx) {
   assert.equal(seen[0], false, 'revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate');
   const after = await m.effectivePermissions('ada', 'team:eng');
   assert(!after.includes('team:write'), \`after the revocation ada still holds \${JSON.stringify(after)}\`);
+  const held: number[] = [];
+  ctx.redisAfter('perm:grant_version', () => held.push(ctx.redis.scard('grants:ada')));
+  await m.grantRole('ada', 'developer', 'team:eng', 'olu');
+  assert(held.length > 0, 'grantRole never touched perm:grant_version: nothing invalidates the cached sets');
+  assert.equal(held[0], 1, 'grantRole moved perm:grant_version before the grant store held the new grant: a read landing there derives the set without it and stamps it with the new version, so the grant stays invisible for the TTL. Write the grant first, then invalidate');
+  const now = await m.effectivePermissions('ada', 'team:eng');
+  assert(now.includes('code:write'), \`after developer was granted at team:eng ada holds \${JSON.stringify(now)}\`);
 }
 
 export async function check_stamp_before_derive(ctx) {
@@ -662,7 +676,7 @@ func CheckEveryScope(ctx *harness.Ctx) {
 	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there")
 	ctx.Assert(slices.Contains(effectivePermissions(stateBg, "ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there")
 	ttl := ctx.Redis.TTL("perm:ada:team:eng")
-	ctx.Assert(ttl > 0 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected at most 300", ttl)
+	ctx.Assert(ttl > 290 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected 300", ttl)
 	revokeGrant(stateBg, g.GrantID)
 	for _, scope := range []string{"team:eng", "project:eng/api"} {
 		seen := effectivePermissions(stateBg, "ada", scope)
@@ -691,6 +705,16 @@ func CheckAfterCommit(ctx *harness.Ctx) {
 	ctx.Assert(!seen[0], "revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate")
 	after := effectivePermissions(stateBg, "ada", "team:eng")
 	ctx.Assert(!slices.Contains(after, "team:write"), "after the revocation ada still holds %v", after)
+	var held []int64
+	ctx.Redis.After("perm:grant_version", func() any {
+		held = append(held, ctx.Redis.SCard("grants:ada"))
+		return nil
+	})
+	grantRole(stateBg, "ada", "developer", "team:eng", "olu")
+	ctx.Assert(len(held) > 0, "grantRole never touched perm:grant_version: nothing invalidates the cached sets")
+	ctx.Assert(held[0] == 1, "grantRole moved perm:grant_version before the grant store held the new grant: a read landing there derives the set without it and stamps it with the new version, so the grant stays invisible for the TTL. Write the grant first, then invalidate")
+	now := effectivePermissions(stateBg, "ada", "team:eng")
+	ctx.Assert(slices.Contains(now, "code:write"), "after developer was granted at team:eng ada holds %v", now)
 }
 
 func CheckStampBeforeDerive(ctx *harness.Ctx) {
@@ -735,7 +759,7 @@ void CheckEveryScope(harness::Ctx& ctx) {
   ctx.Assert(holds(effectivePermissions("ada", "team:eng"), "team:write"), "a team_admin at team:eng must hold team:write there");
   ctx.Assert(holds(effectivePermissions("ada", "project:eng/api"), "team:write"), "team:eng covers project:eng/api: ada must hold team:write there");
   const long long ttl = ctx.Redis.TTL("perm:ada:team:eng");
-  ctx.Assert(ttl > 0 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected at most 300", ttl);
+  ctx.Assert(ttl > 290 && ttl <= 300, "perm:ada:team:eng has a TTL of %d s, expected 300", ttl);
   revokeGrant(g.grant_id);
   for (const std::string scope : {"team:eng", "project:eng/api"}) {
     const auto seen = effectivePermissions("ada", scope);
@@ -761,6 +785,13 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   ctx.Assert(!seen[0], "revokeGrant invalidated the cache while g-1 was still in the grant store: a read landing there derives the set the revocation removes and caches it. Write the grant first, then invalidate");
   const auto after = effectivePermissions("ada", "team:eng");
   ctx.Assert(!holds(after, "team:write"), "after the revocation ada still holds %v", after);
+  std::vector<long long> held;
+  ctx.Redis.After("perm:grant_version", [&ctx, &held] { held.push_back(ctx.Redis.SCard("grants:ada")); });
+  grantRole("ada", "developer", "team:eng", "olu");
+  ctx.Assert(!held.empty(), "grantRole never touched perm:grant_version: nothing invalidates the cached sets");
+  ctx.Assert(held[0] == 1, "grantRole moved perm:grant_version before the grant store held the new grant: a read landing there derives the set without it and stamps it with the new version, so the grant stays invisible for the TTL. Write the grant first, then invalidate");
+  const auto now = effectivePermissions("ada", "team:eng");
+  ctx.Assert(holds(now, "code:write"), "after developer was granted at team:eng ada holds %v", now);
 }
 
 void CheckStampBeforeDerive(harness::Ctx& ctx) {

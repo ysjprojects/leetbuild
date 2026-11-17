@@ -79,7 +79,7 @@ operations view.
       id: 'delivered-scan',
       title: 'Derives status and delivered from the scans',
       detail:
-        'The customer sees the status of the latest applied scan (`label` before any) and `delivered` only after a delivered scan; the stored `status` field is what an override or a stale writer set.',
+        'The customer sees the status of the latest applied scan (`label` before any), whatever its `scan_at`, and `delivered` only after a delivered scan; the stored `status` field is what an override or a stale writer set.',
       match: {
         python: {
           all: [/store\.scans\(/],
@@ -104,7 +104,7 @@ operations view.
       id: 'ops-view',
       title: 'Opens the operations view only for the operations token',
       detail:
-        '`operations_view` (poll health, carrier error, dropped edges, reconciliation) is served only when `X-Ops-Token` equals `OPS_TOKEN`; a header that is merely present proves nothing.',
+        '`operations_view` (poll health, carrier error, dropped edges, reconciliation) is served only when `X-Ops-Token` equals `OPS_TOKEN` exactly, and `reconciliation` is true only while the stored status disagrees with the scans; a header that is merely present, or a prefix of the token, proves nothing.',
       match: {
         python: {all: [/OPS_TOKEN/, /def operations_view\(/]},
         typescript: {all: [/OPS_TOKEN/, /function operationsView\(/]},
@@ -117,7 +117,7 @@ operations view.
       id: 'no-error-leak',
       title: "Keeps the carrier's errors out of the customer view",
       detail:
-        "`customer_view` carries the status, `delivered` and the timeline; the carrier's error text and poll health live only in `operations_view`.",
+        "`customer_view` carries the status, `delivered` and the timeline, with nothing beyond the shipment's own fields; the carrier's error text and poll health live only in `operations_view`.",
       match: {
         python: {
           all: [/def customer_view\(/],
@@ -593,6 +593,9 @@ from shipments.timeline import apply_scan
 
 OPS = "ops-7f3a9c"
 ERROR = "UPS: 503 upstream timeout"
+OPS_KEYS = ("carrier_error", "poll_health", "rejects", "reconciliation")
+FORGED = ("x", "ops-", "ops-7f3a9", "OPS-7F3A9C", "ops-7f3a9c0")
+CUSTOMER_FIELDS = {"shipment_id", "status", "delivered", "timeline", "tenant_id", "order_id", "carrier", "service_level", "replacement_of", "created_at"}
 
 
 def _world(ctx):
@@ -640,15 +643,21 @@ async def check_delivered_scan(ctx):
         store.save({"shipment_id": "shp_2", "tenant_id": "t-acme", "order_id": "ord_2", "carrier": "ups", "service_level": "ground", "status": "label", "replacement_of": "", "created_at": 0})
         fresh = (await _get(c, shipment_id="shp_2")).json()
         assert fresh.get("status") == "label" and fresh.get("delivered") is False, f"a shipment with no scans must read label, not delivered, got {fresh}"
+        # A carrier device whose clock lags: the delivery is the latest applied scan, though stamped earlier.
+        apply_scan("shp_2", "in_transit", 400, "Memphis")
         apply_scan("shp_2", "delivered", 300, "Leeds")
         done = (await _get(c, shipment_id="shp_2")).json()
-    assert done.get("status") == "delivered" and done.get("delivered") is True, f"after a delivered scan the customer must read delivered, got {done}"
+    assert done.get("status") == "delivered" and done.get("delivered") is True, f"after a delivered scan (applied after an in_transit scan stamped later) the customer must read delivered, got {done}: the latest applied scan, not the latest stamp"
 
 
 async def check_ops_view(ctx):
     async with _world(ctx) as c:
-        forged = (await _get(c, token="x")).json()
-        assert "poll_health" not in forged and "rejects" not in forged, f"X-Ops-Token: x opened the operations view: {forged}. Compare the token with OPS_TOKEN"
+        for token in FORGED:
+            forged = (await _get(c, token=token)).json()
+            opened = [k for k in OPS_KEYS if k in forged]
+            assert not opened, f"X-Ops-Token: {token} opened the operations view ({opened}): {forged}. The token must equal OPS_TOKEN"
+        agreed = (await _get(c, token=OPS)).json()
+        assert agreed.get("reconciliation") is False, f"the stored status and the scans both say out_for_delivery: reconciliation must be false, got {agreed.get('reconciliation')!r}"
         store.set_status("shp_1", "delivered", 260)
         r = await _get(c, token=OPS)
     assert r.status_code == 200, f"the operations read answered {r.status_code}: {r.text}"
@@ -664,11 +673,14 @@ async def check_no_error_leak(ctx):
         r = await _get(c)
     assert r.status_code == 200, f"the customer read answered {r.status_code}"
     assert "503" not in r.text and ERROR not in r.text, f"the customer view carries the carrier's error: {r.text}"
-    leaked = [k for k in ("carrier_error", "poll_health", "rejects", "reconciliation") if k in r.json()]
-    assert not leaked, f"the customer view carries {leaked}: those belong to operations_view"
+    leaked = [k for k in r.json() if k not in CUSTOMER_FIELDS]
+    assert not leaked, f"the customer view carries {leaked}: the customer view is the shipment, its status, delivered and the timeline; poll health and the rest belong to operations_view"
 `,
     typescript: `const OPS = 'ops-7f3a9c';
 const ERROR = 'UPS: 503 upstream timeout';
+const OPS_KEYS = ['carrier_error', 'poll_health', 'rejects', 'reconciliation'];
+const FORGED = ['x', 'ops-', 'ops-7f3a9', 'OPS-7F3A9C', 'ops-7f3a9c0'];
+const CUSTOMER_FIELDS = ['shipment_id', 'status', 'delivered', 'timeline', 'tenant_id', 'order_id', 'carrier', 'service_level', 'replacement_of', 'created_at'];
 
 async function world(ctx) {
   const store = ctx.load('/support/shipments/store.ts');
@@ -717,15 +729,22 @@ export async function check_delivered_scan(ctx) {
   await store.save({shipment_id: 'shp_2', tenant_id: 't-acme', order_id: 'ord_2', carrier: 'ups', service_level: 'ground', status: 'label', replacement_of: '', created_at: 0});
   const fresh = (await get(c, 't-acme', null, 'shp_2')).json();
   assert(fresh.status === 'label' && fresh.delivered === false, \`a shipment with no scans must read label, not delivered, got \${JSON.stringify(fresh)}\`);
+  // A carrier device whose clock lags: the delivery is the latest applied scan, though stamped earlier.
+  await applyScan('shp_2', 'in_transit', 400, 'Memphis');
   await applyScan('shp_2', 'delivered', 300, 'Leeds');
   const done = (await get(c, 't-acme', null, 'shp_2')).json();
-  assert(done.status === 'delivered' && done.delivered === true, \`after a delivered scan the customer must read delivered, got \${JSON.stringify(done)}\`);
+  assert(done.status === 'delivered' && done.delivered === true, \`after a delivered scan (applied after an in_transit scan stamped later) the customer must read delivered, got \${JSON.stringify(done)}: the latest applied scan, not the latest stamp\`);
 }
 
 export async function check_ops_view(ctx) {
   const {c, store} = await world(ctx);
-  const forged = (await get(c, 't-acme', 'x')).json();
-  assert(!('poll_health' in forged) && !('rejects' in forged), \`X-Ops-Token: x opened the operations view: \${JSON.stringify(forged)}. Compare the token with OPS_TOKEN\`);
+  for (const token of FORGED) {
+    const forged = (await get(c, 't-acme', token)).json();
+    const opened = OPS_KEYS.filter(k => k in forged);
+    assert.equal(opened.length, 0, \`X-Ops-Token: \${token} opened the operations view (\${JSON.stringify(opened)}): \${JSON.stringify(forged)}. The token must equal OPS_TOKEN\`);
+  }
+  const agreed = (await get(c, 't-acme', OPS)).json();
+  assert.equal(agreed.reconciliation, false, \`the stored status and the scans both say out_for_delivery: reconciliation must be false, got \${agreed.reconciliation}\`);
   await store.setStatus('shp_1', 'delivered', 260);
   const r = await get(c, 't-acme', OPS);
   assert.equal(r.status, 200, \`the operations read answered \${r.status}: \${r.text}\`);
@@ -740,8 +759,8 @@ export async function check_no_error_leak(ctx) {
   const r = await get(c);
   assert.equal(r.status, 200, \`the customer read answered \${r.status}\`);
   assert(!r.text.includes('503'), \`the customer view carries the carrier's error: \${r.text}\`);
-  const leaked = ['carrier_error', 'poll_health', 'rejects', 'reconciliation'].filter(k => k in r.json());
-  assert.equal(leaked.length, 0, \`the customer view carries \${JSON.stringify(leaked)}: those belong to operationsView\`);
+  const leaked = Object.keys(r.json()).filter(k => !CUSTOMER_FIELDS.includes(k));
+  assert.equal(leaked.length, 0, \`the customer view carries \${JSON.stringify(leaked)}: the customer view is the shipment, its status, delivered and the timeline; poll health and the rest belong to operationsView\`);
 }
 `,
     go: `package main
@@ -758,28 +777,33 @@ import (
 )
 
 const (
-	ops     = "ops-7f3a9c"
-	carrErr = "UPS: 503 upstream timeout"
+	hOps     = "ops-7f3a9c"
+	hCarrErr = "UPS: 503 upstream timeout"
 )
 
-var readBg = context.Background()
+var (
+	hReadBg         = context.Background()
+	hOpsKeys        = []string{"carrier_error", "poll_health", "rejects", "reconciliation"}
+	hForged         = []string{"x", "ops-", "ops-7f3a9", "OPS-7F3A9C", "ops-7f3a9c0"}
+	hCustomerFields = map[string]bool{"shipment_id": true, "status": true, "delivered": true, "timeline": true, "tenant_id": true, "order_id": true, "carrier": true, "service_level": true, "replacement_of": true, "created_at": true}
+)
 
-func save(id string) {
-	store.Save(readBg, store.Shipment{ShipmentID: id, TenantID: "t-acme", OrderID: "ord_" + id, Carrier: "ups", ServiceLevel: "ground", Status: "label"})
+func hSave(id string) {
+	store.Save(hReadBg, store.Shipment{ShipmentID: id, TenantID: "t-acme", OrderID: "ord_" + id, Carrier: "ups", ServiceLevel: "ground", Status: "label"})
 }
 
-func world(ctx *harness.Ctx) *harness.HTTP {
-	save("shp_1")
-	timeline.ApplyScan(readBg, "shp_1", "in_transit", 100, "Memphis")
-	timeline.ApplyScan(readBg, "shp_1", "out_for_delivery", 200, "Leeds")
-	timeline.ApplyScan(readBg, "shp_1", "in_transit", 150, "Memphis") // dropped: recorded as a rejected edge
-	store.MarkPollFailed(readBg, "shp_1", 250, carrErr)
+func hWorld(ctx *harness.Ctx) *harness.HTTP {
+	hSave("shp_1")
+	timeline.ApplyScan(hReadBg, "shp_1", "in_transit", 100, "Memphis")
+	timeline.ApplyScan(hReadBg, "shp_1", "out_for_delivery", 200, "Leeds")
+	timeline.ApplyScan(hReadBg, "shp_1", "in_transit", 150, "Memphis") // dropped: recorded as a rejected edge
+	store.MarkPollFailed(hReadBg, "shp_1", 250, hCarrErr)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func get(c *harness.HTTP, tenant, token, shipmentID string) *harness.Response {
+func hGet(c *harness.HTTP, tenant, token, shipmentID string) *harness.Response {
 	headers := []string{}
 	if tenant != "" {
 		headers = append(headers, "X-Tenant-Id", tenant)
@@ -790,32 +814,34 @@ func get(c *harness.HTTP, tenant, token, shipmentID string) *harness.Response {
 	return c.Get("/v1/shipments/"+shipmentID, headers...)
 }
 
-func view(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hView(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the read must answer a JSON object, got %s", r.Text())
 	return body
 }
 
 func CheckReadRoute(ctx *harness.Ctx) {
-	c := world(ctx)
-	r := get(c, "t-acme", "", "shp_1")
+	c := hWorld(ctx)
+	r := hGet(c, "t-acme", "", "shp_1")
 	ctx.Equal(r.Status, 200, "GET /v1/shipments/shp_1 (%s); the status", r.Text())
-	body := view(ctx, r)
+	body := hView(ctx, r)
 	ctx.Equal(body["shipment_id"], "shp_1", "the read's shipment_id")
 	var cities []string
 	items, _ := body["timeline"].([]any)
 	for _, item := range items {
 		s, _ := item.(map[string]any)
-		cities = append(cities, s["status"].(string)+"@"+s["city"].(string))
+		status, _ := s["status"].(string)
+		city, _ := s["city"].(string)
+		cities = append(cities, status+"@"+city)
 	}
 	ctx.Equal(cities, []string{"in_transit@Memphis", "out_for_delivery@Leeds"}, "the timeline must list the applied scans with their cities, oldest first")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := world(ctx)
-	foreign := get(c, "t-globex", "", "shp_1")
-	missing := get(c, "t-acme", "", "shp_404")
-	anonymous := get(c, "", "", "shp_1")
+	c := hWorld(ctx)
+	foreign := hGet(c, "t-globex", "", "shp_1")
+	missing := hGet(c, "t-acme", "", "shp_404")
+	anonymous := hGet(c, "", "", "shp_1")
 	ctx.Equal(foreign.Status, 404, "t-globex reading t-acme's shp_1 must be refused as 404 (%s); the status", foreign.Text())
 	ctx.Equal(missing.Status, 404, "an unknown shipment; the status")
 	ctx.Equal(foreign.Text(), missing.Text(), "a foreign and a missing shipment must answer the same, so ids cannot be probed; the body")
@@ -823,43 +849,48 @@ func CheckTenantScope(ctx *harness.Ctx) {
 }
 
 func CheckDeliveredScan(ctx *harness.Ctx) {
-	c := world(ctx)
-	store.SetStatus(readBg, "shp_1", "delivered", 260) // an override no scan backs
-	body := view(ctx, get(c, "t-acme", "", "shp_1"))
+	c := hWorld(ctx)
+	store.SetStatus(hReadBg, "shp_1", "delivered", 260) // an override no scan backs
+	body := hView(ctx, hGet(c, "t-acme", "", "shp_1"))
 	ctx.Assert(body["status"] == "out_for_delivery" && body["delivered"] == false, "the last applied scan is out_for_delivery but the customer reads status %v, delivered %v: derive both from the scans", body["status"], body["delivered"])
-	save("shp_2")
-	fresh := view(ctx, get(c, "t-acme", "", "shp_2"))
+	hSave("shp_2")
+	fresh := hView(ctx, hGet(c, "t-acme", "", "shp_2"))
 	ctx.Assert(fresh["status"] == "label" && fresh["delivered"] == false, "a shipment with no scans must read label, not delivered, got %v", fresh)
-	timeline.ApplyScan(readBg, "shp_2", "delivered", 300, "Leeds")
-	done := view(ctx, get(c, "t-acme", "", "shp_2"))
-	ctx.Assert(done["status"] == "delivered" && done["delivered"] == true, "after a delivered scan the customer must read delivered, got %v", done)
+	// A carrier device whose clock lags: the delivery is the latest applied scan, though stamped earlier.
+	timeline.ApplyScan(hReadBg, "shp_2", "in_transit", 400, "Memphis")
+	timeline.ApplyScan(hReadBg, "shp_2", "delivered", 300, "Leeds")
+	done := hView(ctx, hGet(c, "t-acme", "", "shp_2"))
+	ctx.Assert(done["status"] == "delivered" && done["delivered"] == true, "after a delivered scan (applied after an in_transit scan stamped later) the customer must read delivered, got %v: the latest applied scan, not the latest stamp", done)
 }
 
 func CheckOpsView(ctx *harness.Ctx) {
-	c := world(ctx)
-	forged := view(ctx, get(c, "t-acme", "x", "shp_1"))
-	_, health := forged["poll_health"]
-	_, rejects := forged["rejects"]
-	ctx.Assert(!health && !rejects, "X-Ops-Token: x opened the operations view: %v. Compare the token with opsToken", forged)
-	store.SetStatus(readBg, "shp_1", "delivered", 260)
-	r := get(c, "t-acme", ops, "shp_1")
+	c := hWorld(ctx)
+	for _, token := range hForged {
+		forged := hView(ctx, hGet(c, "t-acme", token, "shp_1"))
+		for _, k := range hOpsKeys {
+			_, opened := forged[k]
+			ctx.Assert(!opened, "X-Ops-Token: %s opened the operations view (%s): %v. The token must equal opsToken", token, k, forged)
+		}
+	}
+	agreed := hView(ctx, hGet(c, "t-acme", hOps, "shp_1"))
+	ctx.Equal(agreed["reconciliation"], false, "the stored status and the scans both say out_for_delivery; reconciliation")
+	store.SetStatus(hReadBg, "shp_1", "delivered", 260)
+	r := hGet(c, "t-acme", hOps, "shp_1")
 	ctx.Equal(r.Status, 200, "the operations read (%s); the status", r.Text())
-	o := view(ctx, r)
+	o := hView(ctx, r)
 	h, _ := o["poll_health"].(map[string]any)
-	ctx.Assert(h != nil && h["failures"] == float64(1) && o["carrier_error"] == carrErr, "the operations view must carry poll_health (1 failure) and carrier_error %q, got %s", carrErr, r.Text())
+	ctx.Assert(h != nil && h["failures"] == float64(1) && o["carrier_error"] == hCarrErr, "the operations view must carry poll_health (1 failure) and carrier_error %q, got %s", hCarrErr, r.Text())
 	ctx.Equal(o["rejects"], []any{"out_for_delivery->in_transit"}, "the operations view must list the dropped edges; rejects")
 	ctx.Equal(o["reconciliation"], true, "the stored status says delivered and the scans say out_for_delivery; reconciliation")
 }
 
 func CheckNoErrorLeak(ctx *harness.Ctx) {
-	c := world(ctx)
-	r := get(c, "t-acme", "", "shp_1")
+	c := hWorld(ctx)
+	r := hGet(c, "t-acme", "", "shp_1")
 	ctx.Equal(r.Status, 200, "the customer read; the status")
 	ctx.Assert(!strings.Contains(r.Text(), "503"), "the customer view carries the carrier's error: %s", r.Text())
-	body := view(ctx, r)
-	for _, k := range []string{"carrier_error", "poll_health", "rejects", "reconciliation"} {
-		_, present := body[k]
-		ctx.Assert(!present, "the customer view carries %s: it belongs to operationsView (%s)", k, r.Text())
+	for k := range hView(ctx, r) {
+		ctx.Assert(hCustomerFields[k], "the customer view carries %s: the customer view is the shipment, its status, delivered and the timeline; poll health and the rest belong to operationsView (%s)", k, r.Text())
 	}
 }
 `,
@@ -867,6 +898,7 @@ func CheckNoErrorLeak(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <set>
 #include <string>
 #include <vector>
 
@@ -877,17 +909,20 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kOps = "ops-7f3a9c";
-const std::string kError = "UPS: 503 upstream timeout";
+const std::string kHOps = "ops-7f3a9c";
+const std::string kHError = "UPS: 503 upstream timeout";
+const std::vector<std::string> kHOpsKeys = {"carrier_error", "poll_health", "rejects", "reconciliation"};
+const std::vector<std::string> kHForged = {"x", "ops-", "ops-7f3a9", "OPS-7F3A9C", "ops-7f3a9c0"};
+const std::set<std::string> kHCustomerFields = {"shipment_id", "status", "delivered", "timeline", "tenant_id", "order_id", "carrier", "service_level", "replacement_of", "created_at"};
 
-void save(const std::string& id) { store::save(store::Shipment{id, "t-acme", "ord_" + id, "ups", "ground", "label", "", 0}); }
+void h_save(const std::string& id) { store::save(store::Shipment{id, "t-acme", "ord_" + id, "ups", "ground", "label", "", 0}); }
 
-harness::HTTP world(harness::Ctx& ctx) {
-  save("shp_1");
+harness::HTTP h_world(harness::Ctx& ctx) {
+  h_save("shp_1");
   timeline::applyScan("shp_1", "in_transit", 100, "Memphis");
   timeline::applyScan("shp_1", "out_for_delivery", 200, "Leeds");
   timeline::applyScan("shp_1", "in_transit", 150, "Memphis");  // dropped: recorded as a rejected edge
-  store::markPollFailed("shp_1", 250, kError);
+  store::markPollFailed("shp_1", 250, kHError);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -895,7 +930,7 @@ harness::HTTP world(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response get(harness::HTTP& c, const std::string& tenant, const std::string& token, const std::string& shipment_id) {
+harness::Response h_get(harness::HTTP& c, const std::string& tenant, const std::string& token, const std::string& shipment_id) {
   std::vector<std::string> headers;
   if (!tenant.empty()) {
     headers.push_back("X-Tenant-Id");
@@ -908,7 +943,7 @@ harness::Response get(harness::HTTP& c, const std::string& tenant, const std::st
   return c.Send("GET", "/v1/shipments/" + shipment_id, "", headers);
 }
 
-json view(harness::Ctx& ctx, const harness::Response& r) {
+json h_view(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the read must answer a JSON object, got %s", r.Text());
   return body;
@@ -917,10 +952,10 @@ json view(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckReadRoute(harness::Ctx& ctx) {
-  auto c = world(ctx);
-  const auto r = get(c, "t-acme", "", "shp_1");
+  auto c = h_world(ctx);
+  const auto r = h_get(c, "t-acme", "", "shp_1");
   ctx.Equal(r.Status, 200, "GET /v1/shipments/shp_1 (%s); the status", r.Text());
-  const json body = view(ctx, r);
+  const json body = h_view(ctx, r);
   ctx.Equal(body.value("shipment_id", ""), "shp_1", "the read's shipment_id");
   std::vector<std::string> cities;
   for (const auto& s : body.value("timeline", json::array())) cities.push_back(s.value("status", "") + "@" + s.value("city", ""));
@@ -928,10 +963,10 @@ void CheckReadRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = world(ctx);
-  const auto foreign = get(c, "t-globex", "", "shp_1");
-  const auto missing = get(c, "t-acme", "", "shp_404");
-  const auto anonymous = get(c, "", "", "shp_1");
+  auto c = h_world(ctx);
+  const auto foreign = h_get(c, "t-globex", "", "shp_1");
+  const auto missing = h_get(c, "t-acme", "", "shp_404");
+  const auto anonymous = h_get(c, "", "", "shp_1");
   ctx.Equal(foreign.Status, 404, "t-globex reading t-acme's shp_1 must be refused as 404 (%s); the status", foreign.Text());
   ctx.Equal(missing.Status, 404, "an unknown shipment; the status");
   ctx.Equal(foreign.Text(), missing.Text(), "a foreign and a missing shipment must answer the same, so ids cannot be probed; the body");
@@ -939,41 +974,51 @@ void CheckTenantScope(harness::Ctx& ctx) {
 }
 
 void CheckDeliveredScan(harness::Ctx& ctx) {
-  auto c = world(ctx);
+  auto c = h_world(ctx);
   store::setStatus("shp_1", "delivered", 260);  // an override no scan backs
-  const json body = view(ctx, get(c, "t-acme", "", "shp_1"));
+  const json body = h_view(ctx, h_get(c, "t-acme", "", "shp_1"));
   ctx.Assert(body.value("status", "") == "out_for_delivery" && body.value("delivered", true) == false,
              "the last applied scan is out_for_delivery but the customer reads %s: derive status and delivered from the scans", body.dump());
-  save("shp_2");
-  const json fresh = view(ctx, get(c, "t-acme", "", "shp_2"));
+  h_save("shp_2");
+  const json fresh = h_view(ctx, h_get(c, "t-acme", "", "shp_2"));
   ctx.Assert(fresh.value("status", "") == "label" && fresh.value("delivered", true) == false, "a shipment with no scans must read label, not delivered, got %s", fresh.dump());
+  // A carrier device whose clock lags: the delivery is the latest applied scan, though stamped earlier.
+  timeline::applyScan("shp_2", "in_transit", 400, "Memphis");
   timeline::applyScan("shp_2", "delivered", 300, "Leeds");
-  const json done = view(ctx, get(c, "t-acme", "", "shp_2"));
-  ctx.Assert(done.value("status", "") == "delivered" && done.value("delivered", false) == true, "after a delivered scan the customer must read delivered, got %s", done.dump());
+  const json done = h_view(ctx, h_get(c, "t-acme", "", "shp_2"));
+  ctx.Assert(done.value("status", "") == "delivered" && done.value("delivered", false) == true,
+             "after a delivered scan (applied after an in_transit scan stamped later) the customer must read delivered, got %s: the latest applied scan, not the latest stamp", done.dump());
 }
 
 void CheckOpsView(harness::Ctx& ctx) {
-  auto c = world(ctx);
-  const json forged = view(ctx, get(c, "t-acme", "x", "shp_1"));
-  ctx.Assert(!forged.contains("poll_health") && !forged.contains("rejects"), "X-Ops-Token: x opened the operations view: %s. Compare the token with kOpsToken", forged.dump());
+  auto c = h_world(ctx);
+  for (const auto& token : kHForged) {
+    const json forged = h_view(ctx, h_get(c, "t-acme", token, "shp_1"));
+    for (const auto& k : kHOpsKeys) {
+      ctx.Assert(!forged.contains(k), "X-Ops-Token: %s opened the operations view (%s): %s. The token must equal kOpsToken", token, k, forged.dump());
+    }
+  }
+  const json agreed = h_view(ctx, h_get(c, "t-acme", kHOps, "shp_1"));
+  ctx.Assert(agreed.contains("reconciliation") && agreed["reconciliation"] == false, "the stored status and the scans both say out_for_delivery: reconciliation must be false, got %s", agreed.dump());
   store::setStatus("shp_1", "delivered", 260);
-  const auto r = get(c, "t-acme", kOps, "shp_1");
+  const auto r = h_get(c, "t-acme", kHOps, "shp_1");
   ctx.Equal(r.Status, 200, "the operations read (%s); the status", r.Text());
-  const json ops = view(ctx, r);
-  ctx.Assert(ops.contains("poll_health") && ops["poll_health"].value("failures", 0L) == 1 && ops.value("carrier_error", "") == kError,
-             "the operations view must carry poll_health (1 failure) and carrier_error %q, got %s", kError, r.Text());
+  const json ops = h_view(ctx, r);
+  ctx.Assert(ops.contains("poll_health") && ops["poll_health"].value("failures", 0L) == 1 && ops.value("carrier_error", "") == kHError,
+             "the operations view must carry poll_health (1 failure) and carrier_error %q, got %s", kHError, r.Text());
   ctx.Equal(ops.value("rejects", std::vector<std::string>{}), {"out_for_delivery->in_transit"}, "the operations view must list the dropped edges; rejects");
   ctx.Equal(ops.value("reconciliation", false), true, "the stored status says delivered and the scans say out_for_delivery; reconciliation");
 }
 
 void CheckNoErrorLeak(harness::Ctx& ctx) {
-  auto c = world(ctx);
-  const auto r = get(c, "t-acme", "", "shp_1");
+  auto c = h_world(ctx);
+  const auto r = h_get(c, "t-acme", "", "shp_1");
   ctx.Equal(r.Status, 200, "the customer read; the status");
   ctx.Assert(r.Text().find("503") == std::string::npos, "the customer view carries the carrier's error: %s", r.Text());
-  const json body = view(ctx, r);
-  for (const std::string k : {"carrier_error", "poll_health", "rejects", "reconciliation"}) {
-    ctx.Assert(!body.contains(k), "the customer view carries %s: it belongs to operationsView (%s)", k, r.Text());
+  const json body = h_view(ctx, r);
+  for (const auto& item : body.items()) {
+    ctx.Assert(kHCustomerFields.count(item.key()) > 0,
+               "the customer view carries %s: the customer view is the shipment, its status, delivered and the timeline; poll health and the rest belong to operationsView (%s)", item.key(), r.Text());
   }
 }
 `,

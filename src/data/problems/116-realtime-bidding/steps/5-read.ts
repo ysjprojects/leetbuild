@@ -73,7 +73,7 @@ and sees 0 spent on a day it spent most of its cap.
       id: 'timeout-share',
       title: 'Timeout rate and degraded share are reported',
       detail:
-        'The response carries `timeout_rate` (timeouts over auctions) and `degraded_share` (degraded over bids), 0 with nothing to divide. The starter omits both, so a bidder whose answers never arrive looks healthy.',
+        'The response carries `timeout_rate` (timeouts over auctions) and `degraded_share` (degraded over bids), each 0 when its own denominator is 0: a bidder that timed out on every auction and bid nothing reads 1 and 0. The starter omits both, so a bidder whose answers never arrive looks healthy.',
       match: {
         python: {all: [/["']timeout_rate["']/, /["']degraded_share["']/]},
         typescript: {all: [/timeout_rate/, /degraded_share/]},
@@ -86,7 +86,7 @@ and sees 0 spent on a day it spent most of its cap.
       id: 'foreign-403',
       title: 'A bidder reads only its own stats',
       detail:
-        'No `X-Bidder-Id` is **401**; a caller other than the bidder in the path is **403** and sees none of its numbers. The starter serves whatever id the URL names.',
+        'No `X-Bidder-Id` is **401**; a caller other than the bidder in the path is **403** and sees none of its numbers, whether or not that bidder has any. The starter serves whatever id the URL names.',
       match: {
         python: {all: [/\b401\b/, /\b403\b/]},
         typescript: {all: [/\b401\b/, /\b403\b/]},
@@ -582,7 +582,10 @@ async def check_timeout_share(ctx):
         assert _near(body.get("timeout_rate"), 0.5), f"4 timeouts in 8 auctions read timeout_rate {body.get('timeout_rate')!r}, expected 0.5"
         assert _near(body.get("degraded_share"), 0.5), f"2 degraded bids of 4 read degraded_share {body.get('degraded_share')!r}, expected 0.5"
         empty = _body(await _stats(c, "b-2", "b-2"), "a bidder with nothing seen today")
+        ctx.redis.hset(f"stats:b-3:{spend.today()}", mapping={"auctions": 5, "timeouts": 5})
+        silent = _body(await _stats(c, "b-3", "b-3"), "a bidder that timed out on every auction")
     assert _near(empty.get("timeout_rate"), 0) and _near(empty.get("degraded_share"), 0), f"a bidder with nothing seen today reads {empty}, expected timeout_rate and degraded_share 0"
+    assert _near(silent.get("timeout_rate"), 1) and _near(silent.get("degraded_share"), 0), f"5 timeouts in 5 auctions and no bids read {silent}, expected timeout_rate 1 and degraded_share 0 (it divides by bids, and there are none)"
 
 
 async def check_foreign_403(ctx):
@@ -590,8 +593,10 @@ async def check_foreign_403(ctx):
         r = await _stats(c, "b-1", None)
         assert r.status_code == 401, f"a stats read without X-Bidder-Id answered {r.status_code}, expected 401"
         r = await _stats(c, "b-1", "b-2")
+        missing = await _stats(c, "b-9", "b-2")
     assert r.status_code == 403, f"bidder b-2 reading b-1's stats answered {r.status_code}: {r.text}, expected 403"
     assert "auctions" not in r.text, f"the 403 for b-2 carries b-1's numbers: {r.text}"
+    assert missing.status_code == 403, f"bidder b-2 reading b-9's stats, which do not exist, answered {missing.status_code}: {missing.text}, expected 403: whether another bidder has numbers is not the caller's to learn"
 
 
 async def check_spend_window(ctx):
@@ -638,12 +643,15 @@ export async function check_win_rate_denominator(ctx) {
 }
 
 export async function check_timeout_share(ctx) {
-  const {c} = read(ctx);
+  const {c, day} = read(ctx);
   const b = body(await stats(c), 'b-1 reading its own stats');
   assert(near(b.timeout_rate, 0.5), \`4 timeouts in 8 auctions read timeout_rate \${JSON.stringify(b.timeout_rate)}, expected 0.5\`);
   assert(near(b.degraded_share, 0.5), \`2 degraded bids of 4 read degraded_share \${JSON.stringify(b.degraded_share)}, expected 0.5\`);
   const empty = body(await stats(c, 'b-2', 'b-2'), 'a bidder with nothing seen today');
   assert(near(empty.timeout_rate, 0) && near(empty.degraded_share, 0), \`a bidder with nothing seen today reads \${JSON.stringify(empty)}, expected timeout_rate and degraded_share 0\`);
+  ctx.redis.hset(\`stats:b-3:\${day}\`, {auctions: 5, timeouts: 5});
+  const silent = body(await stats(c, 'b-3', 'b-3'), 'a bidder that timed out on every auction');
+  assert(near(silent.timeout_rate, 1) && near(silent.degraded_share, 0), \`5 timeouts in 5 auctions and no bids read \${JSON.stringify(silent)}, expected timeout_rate 1 and degraded_share 0 (it divides by bids, and there are none)\`);
 }
 
 export async function check_foreign_403(ctx) {
@@ -653,6 +661,8 @@ export async function check_foreign_403(ctx) {
   r = await stats(c, 'b-1', 'b-2');
   assert.equal(r.status, 403, \`bidder b-2 reading b-1's stats answered \${r.status}: \${r.text}, expected 403\`);
   assert(!r.text.includes('auctions'), \`the 403 for b-2 carries b-1's numbers: \${r.text}\`);
+  r = await stats(c, 'b-9', 'b-2');
+  assert.equal(r.status, 403, \`bidder b-2 reading b-9's stats, which do not exist, answered \${r.status}: \${r.text}, expected 403: whether another bidder has numbers is not the caller's to learn\`);
 }
 
 export async function check_spend_window(ctx) {
@@ -675,7 +685,7 @@ import (
 	"leetbuild/harness"
 )
 
-func readSetup(ctx *harness.Ctx) *harness.HTTP {
+func statsCheckSetup(ctx *harness.Ctx) *harness.HTTP {
 	day := spend.Today()
 	ctx.Redis.Do("HSET", "stats:b-1:"+day, "auctions", 8, "bids", 4, "wins", 1, "losses", 3, "timeouts", 4, "degraded", 2)
 	ctx.Redis.Set("spend:b-1:"+day, 310)
@@ -685,64 +695,69 @@ func readSetup(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func readStats(c *harness.HTTP, bidder, caller string) *harness.Response {
+func statsCheckGet(c *harness.HTTP, bidder, caller string) *harness.Response {
 	if caller == "" {
 		return c.Get("/v1/bidders/" + bidder + "/stats")
 	}
 	return c.Get("/v1/bidders/"+bidder+"/stats", "X-Bidder-Id", caller)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response, why string) map[string]any {
+func statsCheckBody(ctx *harness.Ctx, r *harness.Response, why string) map[string]any {
 	ctx.Equal(r.Status, 200, "%s: GET /v1/bidders/…/stats (%s)", why, strings.TrimSpace(r.Text()))
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "%s: the answer is not a JSON object: %s", why, r.Text())
 	return body
 }
 
-func readNear(got any, want float64) bool {
+func statsCheckNear(got any, want float64) bool {
 	f, ok := got.(float64)
 	return ok && math.Abs(f-want) < 1e-6
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readSetup(ctx)
-	body := readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats")
+	c := statsCheckSetup(ctx)
+	body := statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats")
 	ctx.Assert(body["bidder"] == "b-1" && body["day"] == spend.Today(), "the answer is %v, expected bidder b-1 and today's day %s", body, spend.Today())
-	ctx.Assert(readNear(body["auctions"], 8) && readNear(body["bids"], 4) && readNear(body["wins"], 1), "the answer is %v, expected today's 8 auctions, 4 bids and 1 win", body)
+	ctx.Assert(statsCheckNear(body["auctions"], 8) && statsCheckNear(body["bids"], 4) && statsCheckNear(body["wins"], 1), "the answer is %v, expected today's 8 auctions, 4 bids and 1 win", body)
 }
 
 func CheckWinRateDenominator(ctx *harness.Ctx) {
-	c := readSetup(ctx)
-	body := readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats")
-	ctx.Assert(readNear(body["win_rate"], 0.125), "1 win in 8 auctions (3 lost, 4 timed out) reads win_rate %v, expected 0.125: the denominator is every auction seen", body["win_rate"])
-	empty := readBody(ctx, readStats(c, "b-2", "b-2"), "a bidder with nothing seen today")
-	ctx.Assert(readNear(empty["win_rate"], 0), "a bidder with no auctions today reads win_rate %v, expected 0", empty["win_rate"])
+	c := statsCheckSetup(ctx)
+	body := statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats")
+	ctx.Assert(statsCheckNear(body["win_rate"], 0.125), "1 win in 8 auctions (3 lost, 4 timed out) reads win_rate %v, expected 0.125: the denominator is every auction seen", body["win_rate"])
+	empty := statsCheckBody(ctx, statsCheckGet(c, "b-2", "b-2"), "a bidder with nothing seen today")
+	ctx.Assert(statsCheckNear(empty["win_rate"], 0), "a bidder with no auctions today reads win_rate %v, expected 0", empty["win_rate"])
 }
 
 func CheckTimeoutShare(ctx *harness.Ctx) {
-	c := readSetup(ctx)
-	body := readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats")
-	ctx.Assert(readNear(body["timeout_rate"], 0.5), "4 timeouts in 8 auctions read timeout_rate %v, expected 0.5", body["timeout_rate"])
-	ctx.Assert(readNear(body["degraded_share"], 0.5), "2 degraded bids of 4 read degraded_share %v, expected 0.5", body["degraded_share"])
-	empty := readBody(ctx, readStats(c, "b-2", "b-2"), "a bidder with nothing seen today")
-	ctx.Assert(readNear(empty["timeout_rate"], 0) && readNear(empty["degraded_share"], 0), "a bidder with nothing seen today reads %v, expected timeout_rate and degraded_share 0", empty)
+	c := statsCheckSetup(ctx)
+	body := statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats")
+	ctx.Assert(statsCheckNear(body["timeout_rate"], 0.5), "4 timeouts in 8 auctions read timeout_rate %v, expected 0.5", body["timeout_rate"])
+	ctx.Assert(statsCheckNear(body["degraded_share"], 0.5), "2 degraded bids of 4 read degraded_share %v, expected 0.5", body["degraded_share"])
+	empty := statsCheckBody(ctx, statsCheckGet(c, "b-2", "b-2"), "a bidder with nothing seen today")
+	ctx.Assert(statsCheckNear(empty["timeout_rate"], 0) && statsCheckNear(empty["degraded_share"], 0), "a bidder with nothing seen today reads %v, expected timeout_rate and degraded_share 0", empty)
+	ctx.Redis.Do("HSET", "stats:b-3:"+spend.Today(), "auctions", 5, "timeouts", 5)
+	silent := statsCheckBody(ctx, statsCheckGet(c, "b-3", "b-3"), "a bidder that timed out on every auction")
+	ctx.Assert(statsCheckNear(silent["timeout_rate"], 1) && statsCheckNear(silent["degraded_share"], 0), "5 timeouts in 5 auctions and no bids read %v, expected timeout_rate 1 and degraded_share 0 (it divides by bids, and there are none)", silent)
 }
 
 func CheckForeign403(ctx *harness.Ctx) {
-	c := readSetup(ctx)
-	r := readStats(c, "b-1", "")
+	c := statsCheckSetup(ctx)
+	r := statsCheckGet(c, "b-1", "")
 	ctx.Equal(r.Status, 401, "a stats read without X-Bidder-Id")
-	r = readStats(c, "b-1", "b-2")
+	r = statsCheckGet(c, "b-1", "b-2")
 	ctx.Equal(r.Status, 403, "bidder b-2 reading b-1's stats (%s)", strings.TrimSpace(r.Text()))
 	ctx.Assert(!strings.Contains(r.Text(), "auctions"), "the 403 for b-2 carries b-1's numbers: %s", r.Text())
+	r = statsCheckGet(c, "b-9", "b-2")
+	ctx.Equal(r.Status, 403, "bidder b-2 reading b-9's stats, which do not exist (whether another bidder has numbers is not the caller's to learn; %s)", strings.TrimSpace(r.Text()))
 }
 
 func CheckSpendWindow(ctx *harness.Ctx) {
 	ctx.Redis.Set("spend:b-1:20200101", 900) // an old day's counter: not today's spend
-	c := readSetup(ctx)
-	body := readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats")
-	ctx.Assert(readNear(body["spend_cents"], 310), "with 310 claimed today (spend:b-1:%s) the answer reads spend_cents %v", spend.Today(), body["spend_cents"])
-	ctx.Assert(readNear(body["cap_cents"], 1000), "with cap:b-1 at 1000 the answer reads cap_cents %v", body["cap_cents"])
+	c := statsCheckSetup(ctx)
+	body := statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats")
+	ctx.Assert(statsCheckNear(body["spend_cents"], 310), "with 310 claimed today (spend:b-1:%s) the answer reads spend_cents %v", spend.Today(), body["spend_cents"])
+	ctx.Assert(statsCheckNear(body["cap_cents"], 1000), "with cap:b-1 at 1000 the answer reads cap_cents %v", body["cap_cents"])
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -758,7 +773,7 @@ using json = nlohmann::json;
 
 namespace {
 
-harness::HTTP readSetup(harness::Ctx& ctx) {
+harness::HTTP statsCheckSetup(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -770,65 +785,70 @@ harness::HTTP readSetup(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readStats(harness::HTTP& c, const std::string& bidder, const std::string& caller) {
+harness::Response statsCheckGet(harness::HTTP& c, const std::string& bidder, const std::string& caller) {
   if (caller.empty()) return c.Get("/v1/bidders/" + bidder + "/stats");
   return c.Get("/v1/bidders/" + bidder + "/stats", "X-Bidder-Id", caller);
 }
 
-json readBody(harness::Ctx& ctx, const harness::Response& r, const std::string& why) {
+json statsCheckBody(harness::Ctx& ctx, const harness::Response& r, const std::string& why) {
   ctx.Equal(r.Status, 200, "%s: GET /v1/bidders/…/stats (%s)", why, r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "%s: the answer is not a JSON object: %s", why, r.Text());
   return body;
 }
 
-bool near(const json& body, const std::string& field, double want) {
+bool statsCheckNear(const json& body, const std::string& field, double want) {
   return body.contains(field) && body[field].is_number() && std::fabs(body[field].get<double>() - want) < 1e-6;
 }
 
-std::string fieldText(const json& body, const std::string& field) { return body.contains(field) ? body[field].dump() : "missing"; }
+std::string statsCheckField(const json& body, const std::string& field) { return body.contains(field) ? body[field].dump() : "missing"; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
-  const json body = readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats");
+  auto c = statsCheckSetup(ctx);
+  const json body = statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats");
   ctx.Assert(body.value("bidder", "") == "b-1" && body.value("day", "") == rtb::spend::today(), "the answer is %s, expected bidder b-1 and today's day %s", body.dump(), rtb::spend::today());
-  ctx.Assert(near(body, "auctions", 8) && near(body, "bids", 4) && near(body, "wins", 1), "the answer is %s, expected today's 8 auctions, 4 bids and 1 win", body.dump());
+  ctx.Assert(statsCheckNear(body, "auctions", 8) && statsCheckNear(body, "bids", 4) && statsCheckNear(body, "wins", 1), "the answer is %s, expected today's 8 auctions, 4 bids and 1 win", body.dump());
 }
 
 void CheckWinRateDenominator(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
-  const json body = readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats");
-  ctx.Assert(near(body, "win_rate", 0.125), "1 win in 8 auctions (3 lost, 4 timed out) reads win_rate %s, expected 0.125: the denominator is every auction seen", fieldText(body, "win_rate"));
-  const json empty = readBody(ctx, readStats(c, "b-2", "b-2"), "a bidder with nothing seen today");
-  ctx.Assert(near(empty, "win_rate", 0), "a bidder with no auctions today reads win_rate %s, expected 0", fieldText(empty, "win_rate"));
+  auto c = statsCheckSetup(ctx);
+  const json body = statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats");
+  ctx.Assert(statsCheckNear(body, "win_rate", 0.125), "1 win in 8 auctions (3 lost, 4 timed out) reads win_rate %s, expected 0.125: the denominator is every auction seen", statsCheckField(body, "win_rate"));
+  const json empty = statsCheckBody(ctx, statsCheckGet(c, "b-2", "b-2"), "a bidder with nothing seen today");
+  ctx.Assert(statsCheckNear(empty, "win_rate", 0), "a bidder with no auctions today reads win_rate %s, expected 0", statsCheckField(empty, "win_rate"));
 }
 
 void CheckTimeoutShare(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
-  const json body = readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats");
-  ctx.Assert(near(body, "timeout_rate", 0.5), "4 timeouts in 8 auctions read timeout_rate %s, expected 0.5", fieldText(body, "timeout_rate"));
-  ctx.Assert(near(body, "degraded_share", 0.5), "2 degraded bids of 4 read degraded_share %s, expected 0.5", fieldText(body, "degraded_share"));
-  const json empty = readBody(ctx, readStats(c, "b-2", "b-2"), "a bidder with nothing seen today");
-  ctx.Assert(near(empty, "timeout_rate", 0) && near(empty, "degraded_share", 0), "a bidder with nothing seen today reads %s, expected timeout_rate and degraded_share 0", empty.dump());
+  auto c = statsCheckSetup(ctx);
+  const json body = statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats");
+  ctx.Assert(statsCheckNear(body, "timeout_rate", 0.5), "4 timeouts in 8 auctions read timeout_rate %s, expected 0.5", statsCheckField(body, "timeout_rate"));
+  ctx.Assert(statsCheckNear(body, "degraded_share", 0.5), "2 degraded bids of 4 read degraded_share %s, expected 0.5", statsCheckField(body, "degraded_share"));
+  const json empty = statsCheckBody(ctx, statsCheckGet(c, "b-2", "b-2"), "a bidder with nothing seen today");
+  ctx.Assert(statsCheckNear(empty, "timeout_rate", 0) && statsCheckNear(empty, "degraded_share", 0), "a bidder with nothing seen today reads %s, expected timeout_rate and degraded_share 0", empty.dump());
+  ctx.Redis.Do("HSET", "stats:b-3:" + rtb::spend::today(), "auctions", 5, "timeouts", 5);
+  const json silent = statsCheckBody(ctx, statsCheckGet(c, "b-3", "b-3"), "a bidder that timed out on every auction");
+  ctx.Assert(statsCheckNear(silent, "timeout_rate", 1) && statsCheckNear(silent, "degraded_share", 0), "5 timeouts in 5 auctions and no bids read %s, expected timeout_rate 1 and degraded_share 0 (it divides by bids, and there are none)", silent.dump());
 }
 
 void CheckForeign403(harness::Ctx& ctx) {
-  auto c = readSetup(ctx);
-  auto r = readStats(c, "b-1", "");
+  auto c = statsCheckSetup(ctx);
+  auto r = statsCheckGet(c, "b-1", "");
   ctx.Equal(r.Status, 401, "a stats read without X-Bidder-Id");
-  r = readStats(c, "b-1", "b-2");
+  r = statsCheckGet(c, "b-1", "b-2");
   ctx.Equal(r.Status, 403, "bidder b-2 reading b-1's stats (%s)", r.Text());
   ctx.Assert(r.Text().find("auctions") == std::string::npos, "the 403 for b-2 carries b-1's numbers: %s", r.Text());
+  r = statsCheckGet(c, "b-9", "b-2");
+  ctx.Equal(r.Status, 403, "bidder b-2 reading b-9's stats, which do not exist (whether another bidder has numbers is not the caller's to learn; %s)", r.Text());
 }
 
 void CheckSpendWindow(harness::Ctx& ctx) {
   ctx.Redis.Set("spend:b-1:20200101", 900);  // an old day's counter: not today's spend
-  auto c = readSetup(ctx);
-  const json body = readBody(ctx, readStats(c, "b-1", "b-1"), "b-1 reading its own stats");
-  ctx.Assert(near(body, "spend_cents", 310), "with 310 claimed today (spend:b-1:%s) the answer reads spend_cents %s", rtb::spend::today(), fieldText(body, "spend_cents"));
-  ctx.Assert(near(body, "cap_cents", 1000), "with cap:b-1 at 1000 the answer reads cap_cents %s", fieldText(body, "cap_cents"));
+  auto c = statsCheckSetup(ctx);
+  const json body = statsCheckBody(ctx, statsCheckGet(c, "b-1", "b-1"), "b-1 reading its own stats");
+  ctx.Assert(statsCheckNear(body, "spend_cents", 310), "with 310 claimed today (spend:b-1:%s) the answer reads spend_cents %s", rtb::spend::today(), statsCheckField(body, "spend_cents"));
+  ctx.Assert(statsCheckNear(body, "cap_cents", 1000), "with cap:b-1 at 1000 the answer reads cap_cents %s", statsCheckField(body, "cap_cents"));
 }
 `,
   },

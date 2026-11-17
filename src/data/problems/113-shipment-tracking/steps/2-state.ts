@@ -62,7 +62,7 @@ for operations.
       id: 'terminal-immutable',
       title: 'Keeps delivered, returned and cancelled closed',
       detail:
-        'The script drops any scan on a terminal status (`terminals[current]`) before the rank comparison: rank alone lets `returned` follow `delivered`.',
+        'The script drops any scan on a terminal status (`terminals[current]`) before the rank comparison and records its edge like any dropped scan: rank alone lets `returned` follow `delivered`.',
       match: {
         python: {all: [/terminals\[\s*current\s*\]/]},
         typescript: {all: [/terminals\[\s*current\s*\]/]},
@@ -75,7 +75,7 @@ for operations.
       id: 'atomic',
       title: 'Reads, compares and writes in one Lua script',
       detail:
-        'The status is read (`HGET`) and written inside one script run with `EVAL` (`register_script`, `defineCommand`, `NewScript`); a client-side read followed by `HSET` lets two concurrent scans both see the old status.',
+        'The status is read (`HGET`) and written, with its timeline entry, inside one script run with `EVAL` (`register_script`, `defineCommand`, `NewScript`); a client-side read followed by `HSET` lets two concurrent scans both see the old status.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/],
@@ -501,6 +501,11 @@ def check_monotonic(ctx):
     _ship(ctx)
     assert _apply(m, "in_transit", 100, "Memphis")["applied"] is True, "the first in_transit scan must apply to a fresh label"
     assert _apply(m, "out_for_delivery", 200)["applied"] is True, "out_for_delivery after in_transit must apply"
+    # A second out_for_delivery scan: later, but no further along.
+    result = _apply(m, "out_for_delivery", 230)
+    assert result.get("applied") is False and _status(ctx) == "out_for_delivery", f"a second out_for_delivery scan at t=230 answered {result}: a scan of the same rank is not forward and is dropped"
+    timeline = [s["status"] for s in store.scans(SHIP)]
+    assert timeline == ["in_transit", "out_for_delivery"], f"the timeline holds {timeline} after a same-rank scan: only a scan that ranks above the current status applies"
     # The van returns to the depot: a later scan, a lower rank.
     result = _apply(m, "in_transit", 260)
     assert _status(ctx) == "out_for_delivery", f"an in_transit depot scan at t=260 after out_for_delivery at t=200 moved the shipment to {_status(ctx)}: only a scan that ranks above the current status applies, whatever its time"
@@ -521,6 +526,8 @@ def check_terminal_immutable(ctx):
     _ship(ctx, "shp_2", "cancelled")
     result = _apply(m, "in_transit", 400, shipment_id="shp_2")
     assert _status(ctx, "shp_2") == "cancelled" and result.get("applied") is False, f"a scan on a cancelled shipment moved it to {_status(ctx, 'shp_2')} ({result}): cancelled is terminal"
+    rejects = [ctx.redis.lrange(f"shipment:{s}:rejects", 0, -1) for s in (SHIP, "shp_2")]
+    assert rejects == [["delivered->returned"], ["cancelled->in_transit"]], f"the rejects hold {rejects}: a scan dropped on a terminal status records its edge too"
 
 
 def check_atomic(ctx):
@@ -535,6 +542,13 @@ def check_atomic(ctx):
         raise rival.error
     assert _status(ctx) == "delivered", f"two scans raced and the shipment reads {_status(ctx)}: the out_for_delivery scan read in_transit before the delivery landed, then wrote over it. Read, compare and write in one Lua script"
     assert "delivered" in [s["status"] for s in store.scans(SHIP)], f"the delivery scan is missing from the timeline: {store.scans(SHIP)}"
+    # The status and its timeline entry are one write: once the status moved, the scan is there.
+    _ship(ctx, "shp_3")
+    seen = ctx.redis_after("shipment:shp_3", lambda: (_status(ctx, "shp_3"), [s["status"] for s in store.scans("shp_3")]))
+    _apply(m, "in_transit", 100, "Memphis", shipment_id="shp_3")
+    assert seen.fired, "the scan never touched shipment:shp_3"
+    assert seen.result is not None and (seen.result[0] == "label" or seen.result == ("in_transit", ["in_transit"])), f"right after a command on shipment:shp_3 the status and timeline read {seen.result}: the status and its scan entry are written in the same script"
+    assert _status(ctx, "shp_3") == "in_transit", f"the in_transit scan left shp_3 {_status(ctx, 'shp_3')}"
 
 
 def check_rejected_recorded(ctx):
@@ -568,6 +582,11 @@ export async function check_monotonic(ctx) {
   await ship(store);
   assert.equal((await m.applyScan(SHIP, 'in_transit', 100, 'Memphis')).applied, true, 'the first in_transit scan must apply to a fresh label');
   assert.equal((await m.applyScan(SHIP, 'out_for_delivery', 200, 'Leeds')).applied, true, 'out_for_delivery after in_transit must apply');
+  // A second out_for_delivery scan: later, but no further along.
+  const same = await m.applyScan(SHIP, 'out_for_delivery', 230, 'Leeds');
+  assert(same.applied === false && statusOf(ctx) === 'out_for_delivery', \`a second out_for_delivery scan at t=230 answered \${JSON.stringify(same)}: a scan of the same rank is not forward and is dropped\`);
+  const timeline = (await store.scans(SHIP)).map(s => s.status);
+  assert.deepStrictEqual(timeline, ['in_transit', 'out_for_delivery'], \`the timeline holds \${JSON.stringify(timeline)} after a same-rank scan: only a scan that ranks above the current status applies\`);
   // The van returns to the depot: a later scan, a lower rank.
   let result = await m.applyScan(SHIP, 'in_transit', 260, 'Leeds');
   assert.equal(statusOf(ctx), 'out_for_delivery', \`an in_transit depot scan at t=260 after out_for_delivery at t=200 moved the shipment to \${statusOf(ctx)}: only a scan that ranks above the current status applies, whatever its time\`);
@@ -588,6 +607,8 @@ export async function check_terminal_immutable(ctx) {
   await ship(store, 'shp_2', 'cancelled');
   result = await m.applyScan('shp_2', 'in_transit', 400, 'Leeds');
   assert(statusOf(ctx, 'shp_2') === 'cancelled' && result.applied === false, \`a scan on a cancelled shipment moved it to \${statusOf(ctx, 'shp_2')} (\${JSON.stringify(result)}): cancelled is terminal\`);
+  const rejects = [SHIP, 'shp_2'].map(s => ctx.redis.lrange(\`shipment:\${s}:rejects\`, 0, -1));
+  assert.deepStrictEqual(rejects, [['delivered->returned'], ['cancelled->in_transit']], \`the rejects hold \${JSON.stringify(rejects)}: a scan dropped on a terminal status records its edge too\`);
 }
 
 export async function check_atomic(ctx) {
@@ -603,6 +624,14 @@ export async function check_atomic(ctx) {
   assert.equal(statusOf(ctx), 'delivered', \`two scans raced and the shipment reads \${statusOf(ctx)}: the out_for_delivery scan read in_transit before the delivery landed, then wrote over it. Read, compare and write in one Lua script\`);
   const timeline = (await store.scans(SHIP)).map(s => s.status);
   assert(timeline.includes('delivered'), \`the delivery scan is missing from the timeline: \${JSON.stringify(timeline)}\`);
+  // The status and its timeline entry are one write: once the status moved, the scan is there.
+  await ship(store, 'shp_3');
+  const seen = ctx.redisAfter('shipment:shp_3', () => [statusOf(ctx, 'shp_3'), ctx.redis.lrange('shipment:shp_3:scans', 0, -1).map(e => e.split('|')[1])]);
+  await m.applyScan('shp_3', 'in_transit', 100, 'Memphis');
+  assert(seen.fired, 'the scan never touched shipment:shp_3');
+  const [moved, entries] = seen.result ?? [];
+  assert(moved === 'label' || (moved === 'in_transit' && JSON.stringify(entries) === '["in_transit"]'), \`right after a command on shipment:shp_3 the status read \${moved} and the timeline \${JSON.stringify(entries)}: the status and its scan entry are written in the same script\`);
+  assert.equal(statusOf(ctx, 'shp_3'), 'in_transit', 'the in_transit scan must move shp_3');
 }
 
 export async function check_rejected_recorded(ctx) {
@@ -630,85 +659,106 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func ship(shipmentID, status string) {
-	store.Save(stateBg, store.Shipment{ShipmentID: shipmentID, TenantID: "t-acme", OrderID: "ord_1", Carrier: "ups", ServiceLevel: "ground", Status: status})
+func hShip(shipmentID, status string) {
+	store.Save(hStateBg, store.Shipment{ShipmentID: shipmentID, TenantID: "t-acme", OrderID: "ord_1", Carrier: "ups", ServiceLevel: "ground", Status: status})
 }
 
-func statusOf(ctx *harness.Ctx, shipmentID string) string {
+func hStatusOf(ctx *harness.Ctx, shipmentID string) string {
 	s, _ := ctx.Redis.HGet("shipment:"+shipmentID, "status")
 	return s
 }
 
-func mustApply(ctx *harness.Ctx, shipmentID, status string, at int64, city string) Result {
-	result, err := applyScan(stateBg, shipmentID, status, at, city)
+func hMustApply(ctx *harness.Ctx, shipmentID, status string, at int64, city string) Result {
+	result, err := applyScan(hStateBg, shipmentID, status, at, city)
 	ctx.NoError(err, "applyScan(%s, %s, %d) failed", shipmentID, status, at)
 	return result
 }
 
-func timeline(shipmentID string) []string {
+func hTimeline(shipmentID string) []string {
 	out := []string{}
-	for _, s := range store.Scans(stateBg, shipmentID) {
+	for _, s := range store.Scans(hStateBg, shipmentID) {
 		out = append(out, s.Status)
 	}
 	return out
 }
 
 func CheckMonotonic(ctx *harness.Ctx) {
-	ship("shp_1", "label")
-	ctx.Equal(mustApply(ctx, "shp_1", "in_transit", 100, "Memphis").Applied, true, "the first in_transit scan must apply to a fresh label; applied")
-	ctx.Equal(mustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds").Applied, true, "out_for_delivery after in_transit must apply; applied")
+	hShip("shp_1", "label")
+	ctx.Equal(hMustApply(ctx, "shp_1", "in_transit", 100, "Memphis").Applied, true, "the first in_transit scan must apply to a fresh label; applied")
+	ctx.Equal(hMustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds").Applied, true, "out_for_delivery after in_transit must apply; applied")
+	// A second out_for_delivery scan: later, but no further along.
+	same := hMustApply(ctx, "shp_1", "out_for_delivery", 230, "Leeds")
+	ctx.Assert(!same.Applied && hStatusOf(ctx, "shp_1") == "out_for_delivery", "a second out_for_delivery scan at t=230 answered %+v: a scan of the same rank is not forward and is dropped", same)
+	ctx.Equal(hTimeline("shp_1"), []string{"in_transit", "out_for_delivery"}, "only a scan that ranks above the current status applies; the timeline after a same-rank scan")
 	// The van returns to the depot: a later scan, a lower rank.
-	result := mustApply(ctx, "shp_1", "in_transit", 260, "Leeds")
-	ctx.Equal(statusOf(ctx, "shp_1"), "out_for_delivery", "an in_transit depot scan at t=260 after out_for_delivery at t=200 must be dropped (only a scan that ranks above the current status applies, whatever its time); the status")
+	result := hMustApply(ctx, "shp_1", "in_transit", 260, "Leeds")
+	ctx.Equal(hStatusOf(ctx, "shp_1"), "out_for_delivery", "an in_transit depot scan at t=260 after out_for_delivery at t=200 must be dropped (only a scan that ranks above the current status applies, whatever its time); the status")
 	ctx.Assert(!result.Applied && result.Status == "out_for_delivery", "the dropped scan must answer applied false with status out_for_delivery, got %+v", result)
 	// A carrier device whose clock lags: a forward scan stamped earlier still moves the parcel on.
-	result = mustApply(ctx, "shp_1", "delivered", 190, "Leeds")
-	ctx.Assert(result.Applied && statusOf(ctx, "shp_1") == "delivered", "a delivered scan stamped t=190 after out_for_delivery at t=200 left the shipment %s (%+v): rank orders the journey, not the scan clock", statusOf(ctx, "shp_1"), result)
+	result = hMustApply(ctx, "shp_1", "delivered", 190, "Leeds")
+	ctx.Assert(result.Applied && hStatusOf(ctx, "shp_1") == "delivered", "a delivered scan stamped t=190 after out_for_delivery at t=200 left the shipment %s (%+v): rank orders the journey, not the scan clock", hStatusOf(ctx, "shp_1"), result)
 }
 
 func CheckTerminalImmutable(ctx *harness.Ctx) {
-	ship("shp_1", "label")
-	mustApply(ctx, "shp_1", "out_for_delivery", 100, "Leeds")
-	ctx.Equal(mustApply(ctx, "shp_1", "delivered", 200, "Leeds").Applied, true, "delivered after out_for_delivery must apply; applied")
-	result := mustApply(ctx, "shp_1", "returned", 300, "Leeds")
-	ctx.Equal(statusOf(ctx, "shp_1"), "delivered", "a returned scan after delivered must be dropped (delivered is terminal); the status")
+	hShip("shp_1", "label")
+	hMustApply(ctx, "shp_1", "out_for_delivery", 100, "Leeds")
+	ctx.Equal(hMustApply(ctx, "shp_1", "delivered", 200, "Leeds").Applied, true, "delivered after out_for_delivery must apply; applied")
+	result := hMustApply(ctx, "shp_1", "returned", 300, "Leeds")
+	ctx.Equal(hStatusOf(ctx, "shp_1"), "delivered", "a returned scan after delivered must be dropped (delivered is terminal); the status")
 	ctx.Equal(result.Applied, false, "a scan on a delivered shipment; applied")
-	ship("shp_2", "cancelled")
-	result, err := applyScan(stateBg, "shp_2", "in_transit", 400, "Leeds")
-	ctx.Assert(statusOf(ctx, "shp_2") == "cancelled" && !result.Applied, "a scan on a cancelled shipment moved it to %s (%+v, %v): cancelled is terminal", statusOf(ctx, "shp_2"), result, err)
+	hShip("shp_2", "cancelled")
+	result, err := applyScan(hStateBg, "shp_2", "in_transit", 400, "Leeds")
+	ctx.Assert(hStatusOf(ctx, "shp_2") == "cancelled" && !result.Applied, "a scan on a cancelled shipment moved it to %s (%+v, %v): cancelled is terminal", hStatusOf(ctx, "shp_2"), result, err)
+	rejects := [][]string{ctx.Redis.LRange("shipment:shp_1:rejects", 0, -1), ctx.Redis.LRange("shipment:shp_2:rejects", 0, -1)}
+	ctx.Equal(rejects, [][]string{{"delivered->returned"}, {"cancelled->in_transit"}}, "a scan dropped on a terminal status records its edge too; the rejects of shp_1 and shp_2")
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	ship("shp_1", "label")
-	mustApply(ctx, "shp_1", "in_transit", 100, "Memphis")
+	hShip("shp_1", "label")
+	hMustApply(ctx, "shp_1", "in_transit", 100, "Memphis")
 	// A second carrier's delivery scan lands between this scan's read and its write.
 	rival := ctx.Redis.After("shipment:shp_1", func() any {
-		_, err := applyScan(stateBg, "shp_1", "delivered", 300, "Leeds")
+		_, err := applyScan(hStateBg, "shp_1", "delivered", 300, "Leeds")
 		return err
 	})
-	mustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds")
+	hMustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds")
 	ctx.Assert(rival.Fired, "the scan never touched shipment:shp_1")
 	ctx.Assert(rival.Result == nil, "the rival delivery scan failed: %v", rival.Result)
-	ctx.Equal(statusOf(ctx, "shp_1"), "delivered", "two scans raced: the out_for_delivery scan read in_transit before the delivery landed, then wrote over it. Read, compare and write in one Lua script; the status")
+	ctx.Equal(hStatusOf(ctx, "shp_1"), "delivered", "two scans raced: the out_for_delivery scan read in_transit before the delivery landed, then wrote over it. Read, compare and write in one Lua script; the status")
 	found := false
-	for _, s := range timeline("shp_1") {
+	for _, s := range hTimeline("shp_1") {
 		found = found || s == "delivered"
 	}
-	ctx.Assert(found, "the delivery scan is missing from the timeline: %q", timeline("shp_1"))
+	ctx.Assert(found, "the delivery scan is missing from the timeline: %q", hTimeline("shp_1"))
+	// The status and its timeline entry are one write: once the status moved, the scan is there.
+	hShip("shp_3", "label")
+	seen := ctx.Redis.After("shipment:shp_3", func() any {
+		status := ""
+		if s := store.GetShipment(hStateBg, "shp_3"); s != nil {
+			status = s.Status
+		}
+		return append([]string{status}, hTimeline("shp_3")...)
+	})
+	hMustApply(ctx, "shp_3", "in_transit", 100, "Memphis")
+	ctx.Assert(seen.Fired, "the scan never touched shipment:shp_3")
+	snapshot, _ := seen.Result.([]string)
+	ctx.Assert(len(snapshot) > 0 && (snapshot[0] == "label" || (len(snapshot) == 2 && snapshot[0] == "in_transit" && snapshot[1] == "in_transit")),
+		"right after a command on shipment:shp_3 the status and timeline read %q: the status and its scan entry are written in the same script", snapshot)
+	ctx.Equal(hStatusOf(ctx, "shp_3"), "in_transit", "the in_transit scan on shp_3; the status")
 }
 
 func CheckRejectedRecorded(ctx *harness.Ctx) {
-	ship("shp_1", "label")
-	mustApply(ctx, "shp_1", "in_transit", 100, "Memphis")
-	mustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds")
-	result := mustApply(ctx, "shp_1", "in_transit", 150, "Memphis")
+	hShip("shp_1", "label")
+	hMustApply(ctx, "shp_1", "in_transit", 100, "Memphis")
+	hMustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds")
+	result := hMustApply(ctx, "shp_1", "in_transit", 150, "Memphis")
 	ctx.Assert(!result.Applied && result.Attempted == "out_for_delivery->in_transit", "a late in_transit scan must be dropped with attempted out_for_delivery->in_transit, got %+v", result)
 	rejects := ctx.Redis.LRange("shipment:shp_1:rejects", 0, -1)
 	ctx.Equal(rejects, []string{"out_for_delivery->in_transit"}, "a dropped scan must leave its edge for operations; shipment:shp_1:rejects")
-	ctx.Equal(timeline("shp_1"), []string{"in_transit", "out_for_delivery"}, "a dropped scan is not part of the timeline; the scans")
-	mustApply(ctx, "shp_1", "delivered", 300, "Leeds")
+	ctx.Equal(hTimeline("shp_1"), []string{"in_transit", "out_for_delivery"}, "a dropped scan is not part of the timeline; the scans")
+	hMustApply(ctx, "shp_1", "delivered", 300, "Leeds")
 	ctx.Equal(ctx.Redis.LRange("shipment:shp_1:rejects", 0, -1), rejects, "an applied scan must not be recorded as dropped; the rejects")
 }
 `,
@@ -724,15 +774,15 @@ func CheckRejectedRecorded(ctx *harness.Ctx) {
 
 namespace {
 
-void ship(const std::string& shipment_id, const std::string& status) {
+void h_ship(const std::string& shipment_id, const std::string& status) {
   store::save(store::Shipment{shipment_id, "t-acme", "ord_1", "ups", "ground", status, "", 0});
 }
 
-std::string statusOf(harness::Ctx& ctx, const std::string& shipment_id) {
+std::string h_status_of(harness::Ctx& ctx, const std::string& shipment_id) {
   return ctx.Redis.HGet("shipment:" + shipment_id, "status").value_or("");
 }
 
-ScanResult mustApply(harness::Ctx& ctx, const std::string& shipment_id, const std::string& status, long at, const std::string& city) {
+ScanResult h_must_apply(harness::Ctx& ctx, const std::string& shipment_id, const std::string& status, long at, const std::string& city) {
   try {
     return applyScan(shipment_id, status, at, city);
   } catch (const std::exception& e) {
@@ -741,7 +791,7 @@ ScanResult mustApply(harness::Ctx& ctx, const std::string& shipment_id, const st
   return {};
 }
 
-std::vector<std::string> timeline(const std::string& shipment_id) {
+std::vector<std::string> h_timeline(const std::string& shipment_id) {
   std::vector<std::string> out;
   for (const auto& s : store::scans(shipment_id)) out.push_back(s.status);
   return out;
@@ -750,37 +800,43 @@ std::vector<std::string> timeline(const std::string& shipment_id) {
 }  // namespace
 
 void CheckMonotonic(harness::Ctx& ctx) {
-  ship("shp_1", "label");
-  ctx.Equal(mustApply(ctx, "shp_1", "in_transit", 100, "Memphis").applied, true, "the first in_transit scan must apply to a fresh label; applied");
-  ctx.Equal(mustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds").applied, true, "out_for_delivery after in_transit must apply; applied");
+  h_ship("shp_1", "label");
+  ctx.Equal(h_must_apply(ctx, "shp_1", "in_transit", 100, "Memphis").applied, true, "the first in_transit scan must apply to a fresh label; applied");
+  ctx.Equal(h_must_apply(ctx, "shp_1", "out_for_delivery", 200, "Leeds").applied, true, "out_for_delivery after in_transit must apply; applied");
+  // A second out_for_delivery scan: later, but no further along.
+  const auto same = h_must_apply(ctx, "shp_1", "out_for_delivery", 230, "Leeds");
+  ctx.Assert(!same.applied && h_status_of(ctx, "shp_1") == "out_for_delivery", "a second out_for_delivery scan at t=230 answered applied %t status %q: a scan of the same rank is not forward and is dropped", same.applied, same.status);
+  ctx.Equal(h_timeline("shp_1"), {"in_transit", "out_for_delivery"}, "only a scan that ranks above the current status applies; the timeline after a same-rank scan");
   // The van returns to the depot: a later scan, a lower rank.
-  auto result = mustApply(ctx, "shp_1", "in_transit", 260, "Leeds");
-  ctx.Equal(statusOf(ctx, "shp_1"), "out_for_delivery", "an in_transit depot scan at t=260 after out_for_delivery at t=200 must be dropped (only a scan that ranks above the current status applies, whatever its time); the status");
+  auto result = h_must_apply(ctx, "shp_1", "in_transit", 260, "Leeds");
+  ctx.Equal(h_status_of(ctx, "shp_1"), "out_for_delivery", "an in_transit depot scan at t=260 after out_for_delivery at t=200 must be dropped (only a scan that ranks above the current status applies, whatever its time); the status");
   ctx.Assert(!result.applied && result.status == "out_for_delivery", "the dropped scan must answer applied false with status out_for_delivery, got applied %t status %q", result.applied, result.status);
   // A carrier device whose clock lags: a forward scan stamped earlier still moves the parcel on.
-  result = mustApply(ctx, "shp_1", "delivered", 190, "Leeds");
-  ctx.Assert(result.applied && statusOf(ctx, "shp_1") == "delivered", "a delivered scan stamped t=190 after out_for_delivery at t=200 left the shipment %s: rank orders the journey, not the scan clock", statusOf(ctx, "shp_1"));
+  result = h_must_apply(ctx, "shp_1", "delivered", 190, "Leeds");
+  ctx.Assert(result.applied && h_status_of(ctx, "shp_1") == "delivered", "a delivered scan stamped t=190 after out_for_delivery at t=200 left the shipment %s: rank orders the journey, not the scan clock", h_status_of(ctx, "shp_1"));
 }
 
 void CheckTerminalImmutable(harness::Ctx& ctx) {
-  ship("shp_1", "label");
-  mustApply(ctx, "shp_1", "out_for_delivery", 100, "Leeds");
-  ctx.Equal(mustApply(ctx, "shp_1", "delivered", 200, "Leeds").applied, true, "delivered after out_for_delivery must apply; applied");
-  const auto result = mustApply(ctx, "shp_1", "returned", 300, "Leeds");
-  ctx.Equal(statusOf(ctx, "shp_1"), "delivered", "a returned scan after delivered must be dropped (delivered is terminal); the status");
+  h_ship("shp_1", "label");
+  h_must_apply(ctx, "shp_1", "out_for_delivery", 100, "Leeds");
+  ctx.Equal(h_must_apply(ctx, "shp_1", "delivered", 200, "Leeds").applied, true, "delivered after out_for_delivery must apply; applied");
+  const auto result = h_must_apply(ctx, "shp_1", "returned", 300, "Leeds");
+  ctx.Equal(h_status_of(ctx, "shp_1"), "delivered", "a returned scan after delivered must be dropped (delivered is terminal); the status");
   ctx.Equal(result.applied, false, "a scan on a delivered shipment; applied");
-  ship("shp_2", "cancelled");
+  h_ship("shp_2", "cancelled");
   bool applied = false;
   try {
     applied = applyScan("shp_2", "in_transit", 400, "Leeds").applied;
   } catch (const std::exception&) {
   }
-  ctx.Assert(statusOf(ctx, "shp_2") == "cancelled" && !applied, "a scan on a cancelled shipment moved it to %s: cancelled is terminal", statusOf(ctx, "shp_2"));
+  ctx.Assert(h_status_of(ctx, "shp_2") == "cancelled" && !applied, "a scan on a cancelled shipment moved it to %s: cancelled is terminal", h_status_of(ctx, "shp_2"));
+  ctx.Equal(ctx.Redis.LRange("shipment:shp_1:rejects", 0, -1), {"delivered->returned"}, "a scan dropped on a terminal status records its edge too; shipment:shp_1:rejects");
+  ctx.Equal(ctx.Redis.LRange("shipment:shp_2:rejects", 0, -1), {"cancelled->in_transit"}, "a scan dropped on a terminal status records its edge too; shipment:shp_2:rejects");
 }
 
 void CheckAtomic(harness::Ctx& ctx) {
-  ship("shp_1", "label");
-  mustApply(ctx, "shp_1", "in_transit", 100, "Memphis");
+  h_ship("shp_1", "label");
+  h_must_apply(ctx, "shp_1", "in_transit", 100, "Memphis");
   // A second carrier's delivery scan lands between this scan's read and its write.
   auto fired = std::make_shared<bool>(false);
   auto failed = std::make_shared<std::optional<std::string>>();
@@ -792,24 +848,39 @@ void CheckAtomic(harness::Ctx& ctx) {
       *failed = e.what();
     }
   });
-  mustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds");
+  h_must_apply(ctx, "shp_1", "out_for_delivery", 200, "Leeds");
   ctx.Assert(*fired, "the scan never touched shipment:shp_1");
   ctx.Assert(!failed->has_value(), "the rival delivery scan failed: %s", failed->value_or(""));
-  ctx.Equal(statusOf(ctx, "shp_1"), "delivered", "two scans raced: the out_for_delivery scan read in_transit before the delivery landed, then wrote over it. Read, compare and write in one Lua script; the status");
-  const auto scans = timeline("shp_1");
+  ctx.Equal(h_status_of(ctx, "shp_1"), "delivered", "two scans raced: the out_for_delivery scan read in_transit before the delivery landed, then wrote over it. Read, compare and write in one Lua script; the status");
+  const auto scans = h_timeline("shp_1");
   ctx.Assert(std::count(scans.begin(), scans.end(), "delivered") > 0, "the delivery scan is missing from the timeline: %q", scans);
+  // The status and its timeline entry are one write: once the status moved, the scan is there.
+  h_ship("shp_3", "label");
+  auto snapshot = std::make_shared<std::optional<std::vector<std::string>>>();
+  ctx.Redis.After("shipment:shp_3", [snapshot] {
+    const auto s = store::getShipment("shp_3");
+    std::vector<std::string> seen = {s ? s->status : ""};
+    for (const auto& status : h_timeline("shp_3")) seen.push_back(status);
+    *snapshot = seen;
+  });
+  h_must_apply(ctx, "shp_3", "in_transit", 100, "Memphis");
+  ctx.Assert(snapshot->has_value(), "the scan never touched shipment:shp_3");
+  const auto& seen = snapshot->value();
+  ctx.Assert(!seen.empty() && (seen[0] == "label" || seen == std::vector<std::string>{"in_transit", "in_transit"}),
+             "right after a command on shipment:shp_3 the status and timeline read %q: the status and its scan entry are written in the same script", seen);
+  ctx.Equal(h_status_of(ctx, "shp_3"), "in_transit", "the in_transit scan on shp_3; the status");
 }
 
 void CheckRejectedRecorded(harness::Ctx& ctx) {
-  ship("shp_1", "label");
-  mustApply(ctx, "shp_1", "in_transit", 100, "Memphis");
-  mustApply(ctx, "shp_1", "out_for_delivery", 200, "Leeds");
-  const auto result = mustApply(ctx, "shp_1", "in_transit", 150, "Memphis");
+  h_ship("shp_1", "label");
+  h_must_apply(ctx, "shp_1", "in_transit", 100, "Memphis");
+  h_must_apply(ctx, "shp_1", "out_for_delivery", 200, "Leeds");
+  const auto result = h_must_apply(ctx, "shp_1", "in_transit", 150, "Memphis");
   ctx.Assert(!result.applied && result.attempted == "out_for_delivery->in_transit", "a late in_transit scan must be dropped with attempted out_for_delivery->in_transit, got applied %t attempted %q", result.applied, result.attempted);
   const auto rejects = ctx.Redis.LRange("shipment:shp_1:rejects", 0, -1);
   ctx.Equal(rejects, {"out_for_delivery->in_transit"}, "a dropped scan must leave its edge for operations; shipment:shp_1:rejects");
-  ctx.Equal(timeline("shp_1"), {"in_transit", "out_for_delivery"}, "a dropped scan is not part of the timeline; the scans");
-  mustApply(ctx, "shp_1", "delivered", 300, "Leeds");
+  ctx.Equal(h_timeline("shp_1"), {"in_transit", "out_for_delivery"}, "a dropped scan is not part of the timeline; the scans");
+  h_must_apply(ctx, "shp_1", "delivered", 300, "Leeds");
   ctx.Equal(ctx.Redis.LRange("shipment:shp_1:rejects", 0, -1), rejects, "an applied scan must not be recorded as dropped; the rejects");
 }
 `,

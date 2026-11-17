@@ -55,7 +55,7 @@ delivery report cannot tell which campaign version a serve used.
       id: 'request-guard',
       title: 'Rejects a malformed request with 400',
       detail:
-        'An empty or 65-character `placement`, a missing or empty `user_hash`, and a `format` outside `ALLOWED_FORMATS` are each **400** before any campaign is read. The starter answers them with an ad.',
+        'An empty or 65-character `placement`, a missing or empty `user_hash`, and a missing `format` or one outside `ALLOWED_FORMATS` are each **400** before any campaign is read; a 64-character `placement` is served. The starter answers them with an ad.',
       match: {
         python: {all: [/[<>]=?\s*MAX_PLACEMENT_CHARS/, /\bin ALLOWED_FORMATS/, /status_code\s*=\s*400/]},
         typescript: {all: [/[<>]=?\s*MAX_PLACEMENT_CHARS/, /ALLOWED_FORMATS\.includes\(/, /code\(\s*400\s*\)/]},
@@ -68,7 +68,7 @@ delivery report cannot tell which campaign version a serve used.
       id: 'eligibility',
       title: 'Leaves paused and spent campaigns out of the auction',
       detail:
-        'A campaign whose `state` is not `active`, or whose `store.spent(id) + bid_micros` exceeds `paced_budget_micros`, does not compete; when none is left the answer is `{"ad": null, "reason": "no_eligible_campaign"}`. The starter ranks every campaign of the placement.',
+        'A campaign whose `state` is not `active`, or whose `store.spent(id) + bid_micros` exceeds `paced_budget_micros`, does not compete; a bid that uses up exactly the budget left still does. When none is left the answer is `{"ad": null, "reason": "no_eligible_campaign"}`. The starter ranks every campaign of the placement.',
       match: {
         python: {all: [/\[["']state["']\]\s*[!=]=\s*["']active["']/, /store\.spent\(/, /paced_budget_micros/]},
         typescript: {all: [/\.state\s*[!=]==\s*['"]active['"]/, /\bspent\(/, /paced_budget_micros/]},
@@ -94,7 +94,7 @@ delivery report cannot tell which campaign version a serve used.
       id: 'served-version',
       title: 'Names the campaign version it served',
       detail:
-        'The response carries `campaign_version`, the `version` of the campaign row the decision read, so a delivery report can replay which creative, cap and budget applied. The starter omits it.',
+        'The response carries `campaign_version`, the `version` of the winning campaign’s row, so a delivery report can replay which creative, cap and budget applied. The starter omits it.',
       match: {
         python: {all: [/["']campaign_version["']\s*:/]},
         typescript: {all: [/campaign_version:/]},
@@ -586,6 +586,7 @@ async def check_request_guard(ctx):
         ({"placement": "home-top", "format": "banner"}, "a request without user_hash"),
         ({**REQUEST, "user_hash": ""}, "an empty user_hash"),
         ({**REQUEST, "format": "popup"}, "format popup"),
+        ({"placement": "home-top", "user_hash": "u-1"}, "a request without format"),
     ]
     async with ctx.client(m.app) as c:
         for body, what in bad:
@@ -601,10 +602,15 @@ async def check_eligibility(ctx):
     ctx.redis.set("pace:c-2", 9_500)
     _campaign("c-3", 700, state="exhausted")
     _campaign("c-4", 400)
+    _campaign("c-5", 600, paced_budget_micros=10_000)
+    ctx.redis.set("pace:c-5", 9_400)
     m = ctx.load("api")
     async with ctx.client(m.app) as c:
         won = _served(await c.post("/v1/ads/serve", json=REQUEST))
-        assert won == "c-4", f"the serve went to {won}: c-1 is paused, c-3 exhausted and c-2 has 500 micros of budget left for an 800-micro bid. Only c-4 may compete"
+        assert won == "c-5", f"the serve went to {won}: c-1 is paused, c-3 exhausted, c-2 has 500 micros of budget left for an 800-micro bid, and c-5's 600-micro bid fits its remaining 600 exactly (spent + bid <= budget). c-5 must win"
+        ctx.redis.set("pace:c-5", 9_401)
+        won = _served(await c.post("/v1/ads/serve", json=REQUEST))
+        assert won == "c-4", f"with c-5 one micro short of its 600-micro bid the serve went to {won}, expected c-4"
         ctx.redis.set("pace:c-4", 1_000_000)
         r = await c.post("/v1/ads/serve", json=REQUEST)
     assert r.status_code == 200 and r.json() == {"ad": None, "reason": "no_eligible_campaign"}, f"with every campaign paused or spent the serve answered {r.status_code} {r.text}, expected no_eligible_campaign"
@@ -624,12 +630,15 @@ async def check_frequency_cap(ctx):
 
 
 async def check_served_version(ctx):
+    _campaign("c-0", 300, version=11)
     _campaign("c-1", 900, version=7)
+    _campaign("c-3", 500, version=9)
     m = ctx.load("api")
     async with ctx.client(m.app) as c:
         r = await c.post("/v1/ads/serve", json=REQUEST)
     assert r.status_code == 200, f"POST /v1/ads/serve answered {r.status_code}: {r.text}"
-    assert r.json().get("campaign_version") == 7, f"the serve of c-1 (version 7) answered {r.text}: campaign_version must name the row the decision read"
+    assert _served(r) == "c-1", f"c-1 (900) outbids c-3 (500) and c-0 (300); the serve answered {r.text}"
+    assert r.json().get("campaign_version") == 7, f"the serve of c-1 (version 7, next to c-0 at version 11 and c-3 at version 9) answered {r.text}: campaign_version must name the row of the campaign that won"
 `,
     typescript: `const REQUEST = {placement: 'home-top', user_hash: 'u-1', format: 'banner'};
 
@@ -676,6 +685,7 @@ export async function check_request_guard(ctx) {
     [{placement: 'home-top', format: 'banner'}, 'a request without user_hash'],
     [{...REQUEST, user_hash: ''}, 'an empty user_hash'],
     [{...REQUEST, format: 'popup'}, 'format popup'],
+    [{placement: 'home-top', user_hash: 'u-1'}, 'a request without format'],
   ];
   for (const [body, what] of bad) {
     const r = await c.post('/v1/ads/serve', {json: body});
@@ -691,10 +701,15 @@ export async function check_eligibility(ctx) {
     campaign('c-2', 800, {paced_budget_micros: 10000}),
     campaign('c-3', 700, {state: 'exhausted'}),
     campaign('c-4', 400),
+    campaign('c-5', 600, {paced_budget_micros: 10000}),
   ]);
   ctx.redis.set('pace:c-2', '9500');
-  const won = served(await c.post('/v1/ads/serve', {json: REQUEST}));
-  assert.equal(won, 'c-4', \`the serve went to \${won}: c-1 is paused, c-3 exhausted and c-2 has 500 micros of budget left for an 800-micro bid. Only c-4 may compete\`);
+  ctx.redis.set('pace:c-5', '9400');
+  let won = served(await c.post('/v1/ads/serve', {json: REQUEST}));
+  assert.equal(won, 'c-5', \`the serve went to \${won}: c-1 is paused, c-3 exhausted, c-2 has 500 micros of budget left for an 800-micro bid, and c-5's 600-micro bid fits its remaining 600 exactly (spent + bid <= budget). c-5 must win\`);
+  ctx.redis.set('pace:c-5', '9401');
+  won = served(await c.post('/v1/ads/serve', {json: REQUEST}));
+  assert.equal(won, 'c-4', \`with c-5 one micro short of its 600-micro bid the serve went to \${won}, expected c-4\`);
   ctx.redis.set('pace:c-4', '1000000');
   const r = await c.post('/v1/ads/serve', {json: REQUEST});
   assert(r.status === 200 && r.text.includes('no_eligible_campaign') && r.json().ad === null, \`with every campaign paused or spent the serve answered \${r.status} \${r.text}, expected no_eligible_campaign\`);
@@ -711,10 +726,10 @@ export async function check_frequency_cap(ctx) {
 }
 
 export async function check_served_version(ctx) {
-  const c = await api(ctx, [campaign('c-1', 900, {version: 7})]);
+  const c = await api(ctx, [campaign('c-0', 300, {version: 11}), campaign('c-1', 900, {version: 7}), campaign('c-3', 500, {version: 9})]);
   const r = await c.post('/v1/ads/serve', {json: REQUEST});
-  assert.equal(r.status, 200, \`POST /v1/ads/serve answered \${r.status}: \${r.text}\`);
-  assert.equal(r.json().campaign_version, 7, \`the serve of c-1 (version 7) answered \${r.text}: campaign_version must name the row the decision read\`);
+  assert.equal(served(r), 'c-1', \`c-1 (900) outbids c-3 (500) and c-0 (300); the serve answered \${r.text}\`);
+  assert.equal(r.json().campaign_version, 7, \`the serve of c-1 (version 7, next to c-0 at version 11 and c-3 at version 9) answered \${r.text}: campaign_version must name the row of the campaign that won\`);
 }
 `,
     go: `package main
@@ -786,6 +801,7 @@ func CheckRequestGuard(ctx *harness.Ctx) {
 		{map[string]any{"placement": "home-top", "format": "banner"}, "a request without user_hash"},
 		{apiWith(map[string]any{"user_hash": ""}), "an empty user_hash"},
 		{apiWith(map[string]any{"format": "popup"}), "format popup"},
+		{map[string]any{"placement": "home-top", "user_hash": "u-1"}, "a request without format"},
 	}
 	for _, b := range bad {
 		r := c.Post("/v1/ads/serve", b.body)
@@ -802,10 +818,16 @@ func CheckEligibility(ctx *harness.Ctx) {
 	spent.PacedBudgetMicros = 10000
 	exhausted := apiCampaign("c-3", 700)
 	exhausted.State = "exhausted"
-	c := apiClient(ctx, paused, spent, exhausted, apiCampaign("c-4", 400))
+	exact := apiCampaign("c-5", 600)
+	exact.PacedBudgetMicros = 10000
+	c := apiClient(ctx, paused, spent, exhausted, apiCampaign("c-4", 400), exact)
 	ctx.Redis.Set("pace:c-2", "9500")
+	ctx.Redis.Set("pace:c-5", "9400")
 	won := apiServed(ctx, c.Post("/v1/ads/serve", apiRequest))
-	ctx.Equal(won, "c-4", "c-1 is paused, c-3 exhausted and c-2 has 500 micros of budget left for an 800-micro bid: only c-4 may compete; the serve went to")
+	ctx.Equal(won, "c-5", "c-1 is paused, c-3 exhausted, c-2 has 500 micros of budget left for an 800-micro bid, and c-5's 600-micro bid fits its remaining 600 exactly (spent + bid <= budget): c-5 must win; the serve went to")
+	ctx.Redis.Set("pace:c-5", "9401")
+	won = apiServed(ctx, c.Post("/v1/ads/serve", apiRequest))
+	ctx.Equal(won, "c-4", "with c-5 one micro short of its 600-micro bid only c-4 may compete; the serve went to")
 	ctx.Redis.Set("pace:c-4", "1000000")
 	r := c.Post("/v1/ads/serve", apiRequest)
 	body, _ := r.JSON().(map[string]any)
@@ -825,13 +847,17 @@ func CheckFrequencyCap(ctx *harness.Ctx) {
 }
 
 func CheckServedVersion(ctx *harness.Ctx) {
+	cheap := apiCampaign("c-0", 300)
+	cheap.Version = 11
 	versioned := apiCampaign("c-1", 900)
 	versioned.Version = 7
-	c := apiClient(ctx, versioned)
+	middle := apiCampaign("c-3", 500)
+	middle.Version = 9
+	c := apiClient(ctx, cheap, versioned, middle)
 	r := c.Post("/v1/ads/serve", apiRequest)
-	ctx.Equal(r.Status, 200, "POST /v1/ads/serve (%s)", r.Text())
+	ctx.Equal(apiServed(ctx, r), "c-1", "c-1 (900) outbids c-3 (500) and c-0 (300); the serve went to")
 	body, _ := r.JSON().(map[string]any)
-	ctx.Equal(body["campaign_version"], 7, "the serve of c-1 (version 7) answered %s: campaign_version must name the row the decision read; campaign_version", r.Text())
+	ctx.Equal(body["campaign_version"], 7, "the serve of c-1 (version 7, next to c-0 at version 11 and c-3 at version 9) answered %s: campaign_version must name the row of the campaign that won; campaign_version", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -914,6 +940,7 @@ void CheckRequestGuard(harness::Ctx& ctx) {
       {nlohmann::json{{"placement", "home-top"}, {"format", "banner"}}, "a request without user_hash"},
       {apiWith({{"user_hash", ""}}), "an empty user_hash"},
       {apiWith({{"format", "popup"}}), "format popup"},
+      {nlohmann::json{{"placement", "home-top"}, {"user_hash", "u-1"}}, "a request without format"},
   };
   for (const auto& [body, what] : bad) {
     const auto r = apiPost(c, body);
@@ -930,10 +957,17 @@ void CheckEligibility(harness::Ctx& ctx) {
   spent.paced_budget_micros = 10000;
   auto exhausted = apiCampaign("c-3", 700);
   exhausted.state = "exhausted";
-  auto c = apiClient(ctx, {paused, spent, exhausted, apiCampaign("c-4", 400)});
+  auto exact = apiCampaign("c-5", 600);
+  exact.paced_budget_micros = 10000;
+  auto c = apiClient(ctx, {paused, spent, exhausted, apiCampaign("c-4", 400), exact});
   ctx.Redis.Set("pace:c-2", "9500");
-  const std::string won = apiServed(ctx, apiPost(c, kApiRequest));
-  ctx.Equal(won, std::string("c-4"), "c-1 is paused, c-3 exhausted and c-2 has 500 micros of budget left for an 800-micro bid: only c-4 may compete; the serve went to");
+  ctx.Redis.Set("pace:c-5", "9400");
+  std::string won = apiServed(ctx, apiPost(c, kApiRequest));
+  ctx.Equal(won, std::string("c-5"),
+            "c-1 is paused, c-3 exhausted, c-2 has 500 micros of budget left for an 800-micro bid, and c-5's 600-micro bid fits its remaining 600 exactly (spent + bid <= budget): c-5 must win; the serve went to");
+  ctx.Redis.Set("pace:c-5", "9401");
+  won = apiServed(ctx, apiPost(c, kApiRequest));
+  ctx.Equal(won, std::string("c-4"), "with c-5 one micro short of its 600-micro bid only c-4 may compete; the serve went to");
   ctx.Redis.Set("pace:c-4", "1000000");
   const auto r = apiPost(c, kApiRequest);
   const auto body = apiBody(r);
@@ -954,14 +988,18 @@ void CheckFrequencyCap(harness::Ctx& ctx) {
 }
 
 void CheckServedVersion(harness::Ctx& ctx) {
+  auto cheap = apiCampaign("c-0", 300);
+  cheap.version = 11;
   auto versioned = apiCampaign("c-1", 900);
   versioned.version = 7;
-  auto c = apiClient(ctx, {versioned});
+  auto middle = apiCampaign("c-3", 500);
+  middle.version = 9;
+  auto c = apiClient(ctx, {cheap, versioned, middle});
   const auto r = apiPost(c, kApiRequest);
-  ctx.Equal(r.Status, 200, "POST /v1/ads/serve (%s)", r.Text());
+  ctx.Equal(apiServed(ctx, r), std::string("c-1"), "c-1 (900) outbids c-3 (500) and c-0 (300); the serve went to");
   const auto body = apiBody(r);
   ctx.Assert(body.is_object() && body.contains("campaign_version") && body["campaign_version"] == 7,
-             "the serve of c-1 (version 7) answered %s: campaign_version must name the row the decision read", r.Text());
+             "the serve of c-1 (version 7, next to c-0 at version 11 and c-3 at version 9) answered %s: campaign_version must name the row of the campaign that won", r.Text());
 }
 `,
   },

@@ -27,7 +27,7 @@ refund disappears from the page, so support cannot see why; the line shows an id
   is the stored state.
 - \`refund\` is there for every refund the return has, failed ones included.
 - \`order_line\` is the line itself (\`store.line_of\`): \`order_line_id\`, \`sku\`,
-  \`ordered_quantity\`, \`delivered_at\`.`,
+  \`ordered_quantity\` and \`delivered_at\`, nothing else.`,
   sequence: {
     participants: ['Customer', 'Returns API', 'returns store'],
     messages: [
@@ -56,7 +56,7 @@ refund disappears from the page, so support cannot see why; the line shows an id
       id: 'tenant-scope',
       title: 'Scopes the read to the caller’s tenant',
       detail:
-        'The tenant comes from `X-Tenant-Id` (401 without it) and a return of another tenant answers 404, like a return that does not exist, so ids cannot be probed. The starter answers any caller.',
+        'The tenant comes from `X-Tenant-Id` (401 without it) and a return of another tenant answers 404 with the same body as a return that does not exist, so ids cannot be probed. The starter answers any caller.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/, /\[["']tenant["']\]\s*!=\s*tenant/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/, /\.tenant\s*!==\s*tenant/]},
@@ -95,7 +95,7 @@ refund disappears from the page, so support cannot see why; the line shows an id
       id: 'order-line',
       title: 'Shows the order line itself',
       detail:
-        '`order_line` is loaded with `line_of`/`lineOf` and carries `order_line_id`, `sku`, `ordered_quantity` and `delivered_at`; the starter echoes the id and the return’s own quantity.',
+        '`order_line` is loaded with `line_of`/`lineOf` and carries exactly `order_line_id`, `sku`, `ordered_quantity` and `delivered_at`; the starter echoes the id and the return’s own quantity.',
       match: {
         python: {all: [/store\.line_of\(/, /["']sku["']/, /["']ordered_quantity["']/, /["']delivered_at["']/]},
         typescript: {all: [/lineOf\(/, /sku:/, /ordered_quantity:/, /delivered_at:/]},
@@ -529,6 +529,8 @@ async def check_tenant_scope(ctx):
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
     assert other.status_code == 404, f"tenant t-2 reading t-1's return answered {other.status_code}: {other.text[:120]}. Another tenant's return is 404, like one that does not exist"
     assert unknown.status_code == 404, f"an unknown return answered {unknown.status_code}, expected 404"
+    foreign, missing = other.text.replace("ret-1", "<id>"), unknown.text.replace("ret-404", "<id>")
+    assert foreign == missing, f"another tenant's return answered {other.text[:120]!r} and a missing one {unknown.text[:120]!r}: the two must read the same, or ids can be probed"
 
 
 async def check_refund_state(ctx):
@@ -536,8 +538,10 @@ async def check_refund_state(ctx):
     _return("ret-2", "refund_pending", "sellable", refund="confirmed")
     _return("ret-3", "refund_pending", "damaged", refund="failed")
     _return("ret-4", "awaiting_inspection")
-    want = {"ret-1": "refund_pending", "ret-2": "refunded", "ret-3": "refund_failed", "ret-4": "awaiting_inspection"}
-    processor = {"ret-1": "initiated", "ret-2": "confirmed", "ret-3": "failed", "ret-4": "no refund"}
+    # The store already says refunded, but the processor has only started the refund.
+    _return("ret-5", "refunded", "sellable", refund="initiated")
+    want = {"ret-1": "refund_pending", "ret-2": "refunded", "ret-3": "refund_failed", "ret-4": "awaiting_inspection", "ret-5": "refund_pending"}
+    processor = {"ret-1": "initiated", "ret-2": "confirmed", "ret-3": "failed", "ret-4": "no refund", "ret-5": "initiated (the store says refunded)"}
     async with _api(ctx) as c:
         for return_id, state in want.items():
             r = await _get(c, return_id)
@@ -563,6 +567,7 @@ async def check_order_line(ctx):
         body = (await _get(c, "ret-1")).json()
     line = body.get("order_line") or {}
     assert all(line.get(k) == v for k, v in LINE.items()), f"the read's order_line is {line}, expected the line itself: {LINE}"
+    assert set(line) == set(LINE), f"the read's order_line carries {sorted(line)}, expected exactly {sorted(LINE)}: the line's tenant and price stay in the store"
 `,
     typescript: `const TENANT = 't-1';
 const LINE = {order_line_id: 'L1', sku: 'KETTLE-2L', ordered_quantity: 3, delivered_at: '2026-10-20'};
@@ -610,6 +615,9 @@ export async function check_tenant_scope(ctx) {
   assert.equal(other.status, 404, \`tenant t-2 reading t-1's return answered \${other.status}: \${other.text.slice(0, 120)}. Another tenant's return is 404, like one that does not exist\`);
   const unknown = await get('ret-404');
   assert.equal(unknown.status, 404, \`an unknown return answered \${unknown.status}, expected 404\`);
+  const foreign = other.text.replaceAll('ret-1', '<id>');
+  const missing = unknown.text.replaceAll('ret-404', '<id>');
+  assert.equal(foreign, missing, \`another tenant's return answered \${JSON.stringify(other.text.slice(0, 120))} and a missing one \${JSON.stringify(unknown.text.slice(0, 120))}: the two must read the same, or ids can be probed\`);
 }
 
 export async function check_refund_state(ctx) {
@@ -618,11 +626,14 @@ export async function check_refund_state(ctx) {
   await open('ret-2', 'refund_pending', 'sellable', 'confirmed');
   await open('ret-3', 'refund_pending', 'damaged', 'failed');
   await open('ret-4', 'awaiting_inspection');
+  // The store already says refunded, but the processor has only started the refund.
+  await open('ret-5', 'refunded', 'sellable', 'initiated');
   const want: [string, string, string][] = [
     ['ret-1', 'refund_pending', 'initiated'],
     ['ret-2', 'refunded', 'confirmed'],
     ['ret-3', 'refund_failed', 'failed'],
     ['ret-4', 'awaiting_inspection', 'no refund'],
+    ['ret-5', 'refund_pending', 'initiated (the store says refunded)'],
   ];
   for (const [returnId, state, processor] of want) {
     const r = await get(returnId);
@@ -648,6 +659,8 @@ export async function check_order_line(ctx) {
   await open('ret-1');
   const line = (await get('ret-1')).json().order_line ?? {};
   assert(Object.entries(LINE).every(([k, v]) => line[k] === v), \`the read's order_line is \${JSON.stringify(line)}, expected the line itself: \${JSON.stringify(LINE)}\`);
+  const keys = Object.keys(line).sort();
+  assert.deepEqual(keys, Object.keys(LINE).sort(), \`the read's order_line carries \${JSON.stringify(keys)}, expected exactly \${JSON.stringify(Object.keys(LINE).sort())}: the line's tenant and price stay in the store\`);
 }
 `,
     go: `package main
@@ -656,6 +669,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"sort"
+	"strings"
 
 	"returns/store"
 
@@ -718,7 +733,10 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	ctx.Equal(readGet(c, "ret-1", "").Status, 401, "a read without X-Tenant-Id")
 	other := readGet(c, "ret-1", "t-2")
 	ctx.Equal(other.Status, 404, "tenant t-2 reading t-1's return must get 404, like a return that does not exist (%.120s)", other.Text())
-	ctx.Equal(readGet(c, "ret-404", readTenant).Status, 404, "an unknown return")
+	unknown := readGet(c, "ret-404", readTenant)
+	ctx.Equal(unknown.Status, 404, "an unknown return")
+	foreign, missing := strings.ReplaceAll(other.Text(), "ret-1", "<id>"), strings.ReplaceAll(unknown.Text(), "ret-404", "<id>")
+	ctx.Assert(foreign == missing, "another tenant's return answered %q and a missing one %q: the two must read the same, or ids can be probed", other.Text(), unknown.Text())
 }
 
 func CheckRefundState(ctx *harness.Ctx) {
@@ -727,7 +745,9 @@ func CheckRefundState(ctx *harness.Ctx) {
 	readOpen("ret-2", "refund_pending", "sellable", "confirmed")
 	readOpen("ret-3", "refund_pending", "damaged", "failed")
 	readOpen("ret-4", "awaiting_inspection", "", "")
-	for _, tc := range [][3]string{{"ret-1", "refund_pending", "initiated"}, {"ret-2", "refunded", "confirmed"}, {"ret-3", "refund_failed", "failed"}, {"ret-4", "awaiting_inspection", "no refund"}} {
+	// The store already says refunded, but the processor has only started the refund.
+	readOpen("ret-5", "refunded", "sellable", "initiated")
+	for _, tc := range [][3]string{{"ret-1", "refund_pending", "initiated"}, {"ret-2", "refunded", "confirmed"}, {"ret-3", "refund_failed", "failed"}, {"ret-4", "awaiting_inspection", "no refund"}, {"ret-5", "refund_pending", "initiated (the store says refunded)"}} {
 		r := readGet(c, tc[0], readTenant)
 		ctx.Equal(r.Status, 200, "GET /v1/returns/%s (%s)", tc[0], r.Text())
 		ctx.Equal(readBody(r)["state"], tc[1], "a return whose refund the processor reports as %s (refunded means the processor confirmed it); the state", tc[2])
@@ -749,6 +769,12 @@ func CheckOrderLine(ctx *harness.Ctx) {
 	line, _ := readBody(readGet(c, "ret-1", readTenant))["order_line"].(map[string]any)
 	ctx.Assert(line != nil && line["order_line_id"] == "L1" && line["sku"] == "KETTLE-2L" && line["ordered_quantity"] == float64(3) && line["delivered_at"] == "2026-10-20",
 		"the read's order_line is %v, expected the line itself: order_line_id L1, sku KETTLE-2L, ordered_quantity 3, delivered_at 2026-10-20", line)
+	keys := []string{}
+	for k := range line {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	ctx.Equal(keys, []string{"delivered_at", "order_line_id", "ordered_quantity", "sku"}, "the read's order_line must carry exactly the line's id, sku, ordered quantity and delivery date (its tenant and price stay in the store); the fields")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -757,15 +783,16 @@ func CheckOrderLine(ctx *harness.Ctx) {
 
 #include <array>
 #include <string>
+#include <vector>
 
 #include "returns/store.h"
 
 namespace {
 
-const std::string kTenant = "t-1";
+const std::string hTenant = "t-1";
 
-harness::HTTP api(harness::Ctx& ctx) {
-  store::putLine(store::OrderLine{"L1", kTenant, "KETTLE-2L", 3, 4000, "2026-10-20", "standard"});
+harness::HTTP hApi(harness::Ctx& ctx) {
+  store::putLine(store::OrderLine{"L1", hTenant, "KETTLE-2L", 3, 4000, "2026-10-20", "standard"});
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -774,8 +801,8 @@ harness::HTTP api(harness::Ctx& ctx) {
 }
 
 // A return of 1 unit of L1 in state; a non-empty refund (the processor's state) adds a refund of 4000 cents.
-void open(const std::string& return_id, const std::string& state = "registered", const std::string& grade = "", const std::string& refund = "") {
-  std::map<std::string, std::string> fields = {{"return_id", return_id}, {"tenant", kTenant}, {"order_line_id", "L1"}, {"quantity", "1"},
+void hOpen(const std::string& return_id, const std::string& state = "registered", const std::string& grade = "", const std::string& refund = "") {
+  std::map<std::string, std::string> fields = {{"return_id", return_id}, {"tenant", hTenant}, {"order_line_id", "L1"}, {"quantity", "1"},
                                                {"reason_code", "damaged"}, {"photo_ref", "photos/kettle.jpg"}, {"state", state},
                                                {"grade", grade}, {"refund_cents", "0"}, {"refund_id", ""}};
   if (!refund.empty()) {
@@ -786,77 +813,92 @@ void open(const std::string& return_id, const std::string& state = "registered",
   store::updateReturn(return_id, fields);
 }
 
-harness::Response get(harness::HTTP& c, const std::string& return_id, const std::string& tenant = kTenant) {
+harness::Response hGet(harness::HTTP& c, const std::string& return_id, const std::string& tenant = hTenant) {
   if (tenant.empty()) return c.Get("/v1/returns/" + return_id);
   return c.Get("/v1/returns/" + return_id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json body(const harness::Response& r) {
+nlohmann::json hBody(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
 
-std::string text(const nlohmann::json& j, const char* name) {
+std::string hText(const nlohmann::json& j, const char* name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+// text with every occurrence of from replaced by to.
+std::string hReplaceAll(std::string text, const std::string& from, const std::string& to) {
+  for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) text.replace(at, from.size(), to);
+  return text;
 }
 
 }  // namespace
 
 void CheckReadRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  open("ret-1");
-  const auto r = get(c, "ret-1");
+  auto c = hApi(ctx);
+  hOpen("ret-1");
+  const auto r = hGet(c, "ret-1");
   ctx.Equal(r.Status, 200, "GET /v1/returns/ret-1 by its owner (%s)", r.Text());
-  const auto b = body(r);
-  ctx.Assert(text(b, "return_id") == "ret-1" && text(b, "state") == "registered" && b.value("quantity", 0LL) == 1, "the read answered %s, expected ret-1, registered, quantity 1", r.Text());
+  const auto b = hBody(r);
+  ctx.Assert(hText(b, "return_id") == "ret-1" && hText(b, "state") == "registered" && b.value("quantity", 0LL) == 1, "the read answered %s, expected ret-1, registered, quantity 1", r.Text());
   ctx.Assert(b.contains("refund") && b["refund"].is_null(), "a return with no refund shows refund %s", b.value("refund", nlohmann::json()).dump());
-  ctx.Assert(b.contains("order_line") && text(b["order_line"], "order_line_id") == "L1", "the read's order_line is %s", b.value("order_line", nlohmann::json()).dump());
+  ctx.Assert(b.contains("order_line") && hText(b["order_line"], "order_line_id") == "L1", "the read's order_line is %s", b.value("order_line", nlohmann::json()).dump());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  open("ret-1");
-  ctx.Equal(get(c, "ret-1", "").Status, 401, "a read without X-Tenant-Id");
-  const auto other = get(c, "ret-1", "t-2");
+  auto c = hApi(ctx);
+  hOpen("ret-1");
+  ctx.Equal(hGet(c, "ret-1", "").Status, 401, "a read without X-Tenant-Id");
+  const auto other = hGet(c, "ret-1", "t-2");
   ctx.Equal(other.Status, 404, "tenant t-2 reading t-1's return must get 404, like a return that does not exist (%s)", other.Text().substr(0, 120));
-  ctx.Equal(get(c, "ret-404").Status, 404, "an unknown return");
+  const auto unknown = hGet(c, "ret-404");
+  ctx.Equal(unknown.Status, 404, "an unknown return");
+  ctx.Assert(hReplaceAll(other.Text(), "ret-1", "<id>") == hReplaceAll(unknown.Text(), "ret-404", "<id>"),
+             "another tenant's return answered %q and a missing one %q: the two must read the same, or ids can be probed", other.Text(), unknown.Text());
 }
 
 void CheckRefundState(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  open("ret-1", "refund_pending", "sellable", "initiated");
-  open("ret-2", "refund_pending", "sellable", "confirmed");
-  open("ret-3", "refund_pending", "damaged", "failed");
-  open("ret-4", "awaiting_inspection");
-  const std::array<std::array<std::string, 3>, 4> cases = {{{"ret-1", "refund_pending", "initiated"},
+  auto c = hApi(ctx);
+  hOpen("ret-1", "refund_pending", "sellable", "initiated");
+  hOpen("ret-2", "refund_pending", "sellable", "confirmed");
+  hOpen("ret-3", "refund_pending", "damaged", "failed");
+  hOpen("ret-4", "awaiting_inspection");
+  // The store already says refunded, but the processor has only started the refund.
+  hOpen("ret-5", "refunded", "sellable", "initiated");
+  const std::array<std::array<std::string, 3>, 5> cases = {{{"ret-1", "refund_pending", "initiated"},
                                                              {"ret-2", "refunded", "confirmed"},
                                                              {"ret-3", "refund_failed", "failed"},
-                                                             {"ret-4", "awaiting_inspection", "no refund"}}};
+                                                             {"ret-4", "awaiting_inspection", "no refund"},
+                                                             {"ret-5", "refund_pending", "initiated (the store says refunded)"}}};
   for (const auto& [return_id, state, processor] : cases) {
-    const auto r = get(c, return_id);
+    const auto r = hGet(c, return_id);
     ctx.Equal(r.Status, 200, "GET /v1/returns/%s (%s)", return_id, r.Text());
-    ctx.Equal(text(body(r), "state"), state, "a return whose refund the processor reports as %s (refunded means the processor confirmed it); the state", processor);
+    ctx.Equal(hText(hBody(r), "state"), state, "a return whose refund the processor reports as %s (refunded means the processor confirmed it); the state", processor);
   }
 }
 
 void CheckFailedRefundVisible(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  open("ret-1", "refund_pending", "damaged", "failed");
-  open("ret-2");
-  const auto failed = body(get(c, "ret-1"));
+  auto c = hApi(ctx);
+  hOpen("ret-1", "refund_pending", "damaged", "failed");
+  hOpen("ret-2");
+  const auto failed = hBody(hGet(c, "ret-1"));
   const nlohmann::json want = {{"refund_id", "rf-ret-1"}, {"state", "failed"}, {"amount_cents", 4000}};
   ctx.Assert(failed.contains("refund") && failed["refund"] == want, "a return whose refund failed shows refund %s, expected %s: support needs to see it failed", failed.value("refund", nlohmann::json()).dump(), want.dump());
-  const auto none = body(get(c, "ret-2"));
+  const auto none = hBody(hGet(c, "ret-2"));
   ctx.Assert(none.contains("refund") && none["refund"].is_null(), "a return with no refund shows refund %s, expected null", none.value("refund", nlohmann::json()).dump());
 }
 
 void CheckOrderLine(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  open("ret-1");
-  const auto b = body(get(c, "ret-1"));
-  const auto line = b.contains("order_line") ? b["order_line"] : nlohmann::json();
-  ctx.Assert(text(line, "order_line_id") == "L1" && text(line, "sku") == "KETTLE-2L" && line.value("ordered_quantity", 0LL) == 3 && text(line, "delivered_at") == "2026-10-20",
+  auto c = hApi(ctx);
+  hOpen("ret-1");
+  const auto b = hBody(hGet(c, "ret-1"));
+  const auto line = b.contains("order_line") && b["order_line"].is_object() ? b["order_line"] : nlohmann::json::object();
+  ctx.Assert(hText(line, "order_line_id") == "L1" && hText(line, "sku") == "KETTLE-2L" && line.value("ordered_quantity", 0LL) == 3 && hText(line, "delivered_at") == "2026-10-20",
              "the read's order_line is %s, expected the line itself: order_line_id L1, sku KETTLE-2L, ordered_quantity 3, delivered_at 2026-10-20", line.dump());
+  std::vector<std::string> keys;
+  for (const auto& item : line.items()) keys.push_back(item.key());
+  ctx.Equal(keys, std::vector<std::string>{"delivered_at", "order_line_id", "ordered_quantity", "sku"}, "the read's order_line must carry exactly the line's id, sku, ordered quantity and delivery date (its tenant and price stay in the store); the fields");
 }
 `,
   },

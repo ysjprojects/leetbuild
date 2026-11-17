@@ -43,7 +43,7 @@ forever.
       id: 'no-burn',
       title: 'A refused serve moves no counter',
       detail:
-        'Inside the script the user counter is read and compared with `freq_cap` before any `INCR`, and both counters move only on the allowed path. The starter increments the user first, so a capped or unfunded request burns an impression it never showed.',
+        'Inside the script the user counter is read and compared with `freq_cap` before any `INCR`, and both counters move only on the allowed path; a refusal answers `seen` and `spent_micros` as they stand. The starter increments the user first, so a capped or unfunded request burns an impression it never showed.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/],
@@ -74,9 +74,9 @@ forever.
     },
     {
       id: 'one-decision',
-      title: 'Two racing serves cannot both spend the last of a budget',
+      title: 'Two racing serves cannot both take the last of a budget or a cap',
       detail:
-        'The pacing counter is read and incremented by `INCRBY` inside the same script (`KEYS[2]`), so a second serve landing between the read and the write sees the new total. The starter reads `pace:{id}` and increments it in two round trips.',
+        'The pacing counter is read and incremented by `INCRBY` inside the same script (`KEYS[2]`), and so is the user counter (`KEYS[1]`): a second serve landing right after the first command that touches either key sees the new total. The starter reads `pace:{id}` and increments it in two round trips.',
       match: {
         python: {
           all: [/redis\.call\(\s*['"]GET['"],\s*KEYS\[2\]\s*\)/, /redis\.call\(\s*['"]INCRBY['"],\s*KEYS\[2\]/],
@@ -104,7 +104,7 @@ forever.
       id: 'window-ttl',
       title: 'The cap key expires at the frequency window',
       detail:
-        'The script runs `EXPIRE KEYS[1] freq_window_s` when `INCR` returns 1, so the window starts at the first impression, is not pushed back by later ones, and the user can be served again once it ends. The starter never sets a TTL.',
+        'The script runs `EXPIRE KEYS[1] freq_window_s` when `INCR` returns 1, so the key has its TTL the moment it exists, the window starts at the first impression, is not pushed back by later ones, and the user can be served again once it ends. The starter never sets a TTL.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"],\s*KEYS\[1\]/, /==\s*1\s+then/]},
@@ -512,6 +512,7 @@ def check_no_burn(ctx):
     assert refused["allowed"] is False, f"a third serve for u-1 with freq_cap 2 answered {refused}, expected a refusal"
     assert ctx.redis.get("freq:c-1:u-1") == "2", f"the refused serve moved freq:c-1:u-1 to {ctx.redis.get('freq:c-1:u-1')}: a serve that was never shown burned one of the user's impressions. Compare before INCR"
     assert ctx.redis.get("pace:c-1") == "2000", f"pace:c-1 is {ctx.redis.get('pace:c-1')} after a refused serve, expected the 2000 the two allowed serves reserved"
+    assert refused["seen"] == 2 and refused["spent_micros"] == 2000, f"the refusal answered {refused}, expected seen 2 and spent_micros 2000: the counters after the decision, which moved neither"
     ctx.redis.set("pace:c-1", 3000)
     broke = m.reserve(c, "u-2", 1000)
     assert broke["allowed"] is False, f"a serve with the budget spent answered {broke}, expected a refusal"
@@ -532,12 +533,28 @@ def check_one_decision(ctx):
     allowed = [got for got in (mine, rival.result) if got["allowed"]]
     assert len(allowed) == 1, f"two serves raced for the last 1000 micros of a 2000-micro budget and {len(allowed)} were allowed (pace:c-1 is now {ctx.redis.get('pace:c-1')}): the read and the increment must be one atomic decision"
     assert ctx.redis.get("pace:c-1") == "2000", f"pace:c-1 is {ctx.redis.get('pace:c-1')} after the race, expected the 2000-micro budget, not more"
+    # The same race on the user's counter: u-3 has one impression left under freq_cap 2.
+    capped = _campaign(campaign_id="c-2", freq_cap=2, paced_budget_micros=1_000_000)
+    ctx.redis.set("freq:c-2:u-3", 1)
+    rival = ctx.redis_after("freq:c-2:u-3", lambda: m.reserve(capped, "u-3", 1000))
+    mine = m.reserve(capped, "u-3", 1000)
+    assert rival.fired, "reserve never touched freq:c-2:u-3"
+    if rival.error is not None:
+        raise rival.error
+    allowed = [got for got in (mine, rival.result) if got["allowed"]]
+    assert len(allowed) == 1, f"two serves for u-3 raced for the last impression under freq_cap 2 and {len(allowed)} were allowed (freq:c-2:u-3 is now {ctx.redis.get('freq:c-2:u-3')}): the cap must be read inside the same script that increments it"
+    assert ctx.redis.get("freq:c-2:u-3") == "2", f"freq:c-2:u-3 is {ctx.redis.get('freq:c-2:u-3')} after the race, expected the cap of 2"
 
 
 def check_window_ttl(ctx):
     m = ctx.load("state")
     c = _campaign(freq_cap=5, paced_budget_micros=1_000_000)
+    # Read the TTL right after the command that first touches the key (-2: it does not exist yet, a plain read).
+    # A crash between the INCR and a separate EXPIRE would leave a cap that never rolls off.
+    at_create = ctx.redis_after("freq:c-1:u-1", lambda: ctx.redis.ttl("freq:c-1:u-1"))
     m.reserve(c, "u-1", 1000)
+    assert at_create.fired, "reserve never touched freq:c-1:u-1"
+    assert at_create.result == -2 or 3590 <= at_create.result <= 3600, f"right after the command that created freq:c-1:u-1 its TTL was {at_create.result}, expected the 3600 s frequency window set by the same script that creates the key: a separate EXPIRE leaves a window where the cap never rolls off"
     ttl = ctx.redis.ttl("freq:c-1:u-1")
     assert 3590 <= ttl <= 3600, f"freq:c-1:u-1 has TTL {ttl} after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off"
     ctx.clock.advance(600)
@@ -577,6 +594,7 @@ export async function check_no_burn(ctx) {
   assert.equal(refused.allowed, false, \`a third serve for u-1 with freq_cap 2 answered \${JSON.stringify(refused)}, expected a refusal\`);
   assert.equal(ctx.redis.get('freq:c-1:u-1'), '2', \`the refused serve moved freq:c-1:u-1 to \${ctx.redis.get('freq:c-1:u-1')}: a serve that was never shown burned one of the user's impressions. Compare before INCR\`);
   assert.equal(ctx.redis.get('pace:c-1'), '2000', \`pace:c-1 is \${ctx.redis.get('pace:c-1')} after a refused serve, expected the 2000 the two allowed serves reserved\`);
+  assert(refused.seen === 2 && refused.spent_micros === 2000, \`the refusal answered \${JSON.stringify(refused)}, expected seen 2 and spent_micros 2000: the counters after the decision, which moved neither\`);
   ctx.redis.set('pace:c-1', '3000');
   const broke = await m.reserve(c, 'u-2', 1000);
   assert.equal(broke.allowed, false, \`a serve with the budget spent answered \${JSON.stringify(broke)}, expected a refusal\`);
@@ -598,12 +616,29 @@ export async function check_one_decision(ctx) {
   const allowed = [mine, theirs].filter(got => got.allowed).length;
   assert.equal(allowed, 1, \`two serves raced for the last 1000 micros of a 2000-micro budget and \${allowed} were allowed (pace:c-1 is now \${ctx.redis.get('pace:c-1')}): the read and the increment must be one atomic decision\`);
   assert.equal(ctx.redis.get('pace:c-1'), '2000', \`pace:c-1 is \${ctx.redis.get('pace:c-1')} after the race, expected the 2000-micro budget, not more\`);
+  // The same race on the user's counter: u-3 has one impression left under freq_cap 2.
+  const capped = campaign({campaign_id: 'c-2', freq_cap: 2, paced_budget_micros: 1000000});
+  ctx.redis.set('freq:c-2:u-3', '1');
+  const rivalUser = ctx.redisAfter('freq:c-2:u-3', () => m.reserve(capped, 'u-3', 1000));
+  const mineUser = await m.reserve(capped, 'u-3', 1000);
+  assert(rivalUser.fired, 'reserve never touched freq:c-2:u-3');
+  if (rivalUser.error !== undefined) throw rivalUser.error;
+  const theirsUser = await rivalUser.result;
+  const allowedUser = [mineUser, theirsUser].filter(got => got.allowed).length;
+  assert.equal(allowedUser, 1, \`two serves for u-3 raced for the last impression under freq_cap 2 and \${allowedUser} were allowed (freq:c-2:u-3 is now \${ctx.redis.get('freq:c-2:u-3')}): the cap must be read inside the same script that increments it\`);
+  assert.equal(ctx.redis.get('freq:c-2:u-3'), '2', \`freq:c-2:u-3 is \${ctx.redis.get('freq:c-2:u-3')} after the race, expected the cap of 2\`);
 }
 
 export async function check_window_ttl(ctx) {
   const m = ctx.load('state');
   const c = campaign({freq_cap: 5, paced_budget_micros: 1000000});
+  // Read the TTL right after the command that first touches the key (-2: it does not exist yet, a plain read).
+  // A crash between the INCR and a separate EXPIRE would leave a cap that never rolls off.
+  const atCreate = ctx.redisAfter('freq:c-1:u-1', () => ctx.redis.ttl('freq:c-1:u-1'));
   await m.reserve(c, 'u-1', 1000);
+  assert(atCreate.fired, 'reserve never touched freq:c-1:u-1');
+  const created = await atCreate.result;
+  assert(created === -2 || (3590 <= created && created <= 3600), \`right after the command that created freq:c-1:u-1 its TTL was \${created}, expected the 3600 s frequency window set by the same script that creates the key: a separate EXPIRE leaves a window where the cap never rolls off\`);
   let ttl = ctx.redis.ttl('freq:c-1:u-1');
   assert(3590 <= ttl && ttl <= 3600, \`freq:c-1:u-1 has TTL \${ttl} after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off\`);
   ctx.clock.advance(600);
@@ -656,6 +691,7 @@ func CheckNoBurn(ctx *harness.Ctx) {
 	ctx.Equal(refused.Allowed, false, "a third serve for u-1 with freq_cap 2 must be refused; allowed")
 	ctx.Equal(stateGet(ctx, "freq:c-1:u-1"), "2", "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal")
 	ctx.Equal(stateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after a refused serve")
+	ctx.Assert(refused.Seen == 2 && refused.SpentMicros == 2000, "the refusal answered %+v, expected seen 2 and spent_micros 2000: the counters after the decision, which moved neither", refused)
 	ctx.Redis.Set("pace:c-1", "3000")
 	broke := stateReserve(ctx, c, "u-2")
 	ctx.Equal(broke.Allowed, false, "a serve with the budget spent must be refused; allowed")
@@ -687,13 +723,41 @@ func CheckOneDecision(ctx *harness.Ctx) {
 	}
 	ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", stateGet(ctx, "pace:c-1"))
 	ctx.Equal(stateGet(ctx, "pace:c-1"), "2000", "pace:c-1 after the race must not pass the 2000-micro budget")
+	// The same race on the user's counter: u-3 has one impression left under freq_cap 2.
+	capped := stateCampaign()
+	capped.CampaignID = "c-2"
+	capped.PacedBudgetMicros = 1000000
+	ctx.Redis.Set("freq:c-2:u-3", "1")
+	rivalUser := ctx.Redis.After("freq:c-2:u-3", func() any {
+		got, err := reserve(stateBg, capped, "u-3", 1000)
+		ctx.NoError(err, "the rival reserve failed")
+		return got
+	})
+	mineUser := stateReserve(ctx, capped, "u-3")
+	ctx.Assert(rivalUser.Fired, "reserve never touched freq:c-2:u-3")
+	ctx.Assert(rivalUser.Err == nil, "the rival reserve failed: %v", rivalUser.Err)
+	theirsUser, _ := rivalUser.Result.(Reservation)
+	allowedUser := 0
+	for _, got := range []Reservation{mineUser, theirsUser} {
+		if got.Allowed {
+			allowedUser++
+		}
+	}
+	ctx.Equal(allowedUser, 1, "two serves for u-3 raced for the last impression under freq_cap 2 (freq:c-2:u-3 is now %s): the cap must be read inside the same script that increments it; serves allowed", stateGet(ctx, "freq:c-2:u-3"))
+	ctx.Equal(stateGet(ctx, "freq:c-2:u-3"), "2", "freq:c-2:u-3 after the race must not pass the cap of 2")
 }
 
 func CheckWindowTtl(ctx *harness.Ctx) {
 	c := stateCampaign()
 	c.FreqCap = 5
 	c.PacedBudgetMicros = 1000000
+	// Read the TTL right after the command that first touches the key (-2: it does not exist yet, a plain read).
+	// A crash between the INCR and a separate EXPIRE would leave a cap that never rolls off.
+	atCreate := ctx.Redis.After("freq:c-1:u-1", func() any { return ctx.Redis.TTL("freq:c-1:u-1") })
 	stateReserve(ctx, c, "u-1")
+	ctx.Assert(atCreate.Fired, "reserve never touched freq:c-1:u-1")
+	created, _ := atCreate.Result.(int64)
+	ctx.Assert(created == -2 || (3590 <= created && created <= 3600), "right after the command that created freq:c-1:u-1 its TTL was %d, expected the 3600 s frequency window set by the same script that creates the key: a separate EXPIRE leaves a window where the cap never rolls off", created)
 	ttl := ctx.Redis.TTL("freq:c-1:u-1")
 	ctx.Assert(3590 <= ttl && ttl <= 3600, "freq:c-1:u-1 has TTL %d after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off", ttl)
 	ctx.Clock.Advance(600)
@@ -759,6 +823,7 @@ void CheckNoBurn(harness::Ctx& ctx) {
   ctx.Equal(refused.allowed, false, "a third serve for u-1 with freq_cap 2 must be refused; allowed");
   ctx.Equal(stateGet(ctx, "freq:c-1:u-1"), std::string("2"), "a serve that was never shown must not burn one of the user's impressions (compare before INCR); freq:c-1:u-1 after the refusal");
   ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after a refused serve");
+  ctx.Assert(refused.seen == 2 && refused.spent_micros == 2000, "the refusal answered %s, expected seen 2 and spent_micros 2000: the counters after the decision, which moved neither", stateShow(refused));
   ctx.Redis.Set("pace:c-1", "3000");
   const Reservation broke = reserve(c, "u-2", 1000);
   ctx.Equal(broke.allowed, false, "a serve with the budget spent must be refused; allowed");
@@ -788,13 +853,45 @@ void CheckOneDecision(harness::Ctx& ctx) {
   const int allowed = (mine.allowed ? 1 : 0) + (rival->got.allowed ? 1 : 0);
   ctx.Equal(allowed, 1, "two serves raced for the last 1000 micros of a 2000-micro budget (pace:c-1 is now %s): the read and the increment must be one atomic decision; serves allowed", stateGet(ctx, "pace:c-1"));
   ctx.Equal(stateGet(ctx, "pace:c-1"), std::string("2000"), "pace:c-1 after the race must not pass the 2000-micro budget");
+  // The same race on the user's counter: u-3 has one impression left under freq_cap 2.
+  store::Campaign capped = stateCampaign();
+  capped.campaign_id = "c-2";
+  capped.paced_budget_micros = 1000000;
+  ctx.Redis.Set("freq:c-2:u-3", "1");
+  auto rivalUser = std::make_shared<StateRival>();
+  ctx.Redis.After("freq:c-2:u-3", [rivalUser, capped] {
+    rivalUser->fired = true;
+    try {
+      rivalUser->got = reserve(capped, "u-3", 1000);
+    } catch (const std::exception& e) {
+      rivalUser->err = e.what();
+    }
+  });
+  const Reservation mineUser = reserve(capped, "u-3", 1000);
+  ctx.Assert(rivalUser->fired, "reserve never touched freq:c-2:u-3");
+  ctx.Assert(!rivalUser->err, "the rival reserve failed: %s", rivalUser->err.value_or(""));
+  const int allowedUser = (mineUser.allowed ? 1 : 0) + (rivalUser->got.allowed ? 1 : 0);
+  ctx.Equal(allowedUser, 1, "two serves for u-3 raced for the last impression under freq_cap 2 (freq:c-2:u-3 is now %s): the cap must be read inside the same script that increments it; serves allowed", stateGet(ctx, "freq:c-2:u-3"));
+  ctx.Equal(stateGet(ctx, "freq:c-2:u-3"), std::string("2"), "freq:c-2:u-3 after the race must not pass the cap of 2");
 }
 
 void CheckWindowTtl(harness::Ctx& ctx) {
   store::Campaign c = stateCampaign();
   c.freq_cap = 5;
   c.paced_budget_micros = 1000000;
+  // Read the TTL right after the command that first touches the key (-2: it does not exist yet, a plain read).
+  // A crash between the INCR and a separate EXPIRE would leave a cap that never rolls off.
+  bool createdFired = false;
+  long long created = 0;
+  ctx.Redis.After("freq:c-1:u-1", [&] {
+    createdFired = true;
+    created = ctx.Redis.TTL("freq:c-1:u-1");
+  });
   reserve(c, "u-1", 1000);
+  ctx.Assert(createdFired, "reserve never touched freq:c-1:u-1");
+  ctx.Assert(created == -2 || (3590 <= created && created <= 3600),
+             "right after the command that created freq:c-1:u-1 its TTL was %d, expected the 3600 s frequency window set by the same script that creates the key: a separate EXPIRE leaves a window where the cap never rolls off",
+             created);
   long long ttl = ctx.Redis.TTL("freq:c-1:u-1");
   ctx.Assert(3590 <= ttl && ttl <= 3600, "freq:c-1:u-1 has TTL %d after the first impression, expected the campaign's 3600 s frequency window: without it the cap never rolls off", ttl);
   ctx.Clock.Advance(600);

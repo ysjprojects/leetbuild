@@ -27,7 +27,7 @@ the series.
   \`status\` \`finalized\` and the number, so nothing runs between the read and the writes.
   \`claim_number\` answers \`None\` for a non-draft.
 - \`finalize_invoice\` runs \`validate_totals\` **before** \`claim_number\`: a rejection raises
-  \`InvoiceRejected\` with no number claimed.`,
+  \`InvoiceRejected\` with no number claimed, not even one given back afterwards.`,
   sequence: {
     participants: ['Finalize path', 'Redis'],
     messages: [
@@ -84,7 +84,7 @@ the series.
       id: 'status-in-claim',
       title: 'Checks the draft status inside the claim',
       detail:
-        "The script reads `status` itself (`redis.call('HGET', KEYS[1], 'status')`) and answers 0 for a non-draft; a status read in the client is a separate command, and a finalize of the same invoice landing after it spends a second number.",
+        "The script reads `status` itself (`redis.call('HGET', KEYS[1], 'status')`) and answers 0 unless it is `draft`, an invoice that does not exist included; a status read in the client is a separate command, and a finalize of the same invoice landing after it spends a second number.",
       match: {
         python: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"][^)\n]*status/], none: [/\.hget\(/i]},
@@ -97,7 +97,7 @@ the series.
       id: 'no-burn',
       title: 'Validates before it claims a number',
       detail:
-        '`finalize_invoice`/`finalizeInvoice` runs `validate_totals`/`validateTotals` before the claim and raises `InvoiceRejected` with no number taken; claiming first and reopening on a rejection leaves a hole in the series.',
+        '`finalize_invoice`/`finalizeInvoice` runs `validate_totals`/`validateTotals` before the claim and raises `InvoiceRejected` with no number taken; claiming first and reopening on a rejection leaves a hole in the series, and giving the number back is no fix when another finalize lands in between.',
       match: {
         python: {order: [/def finalize_invoice\(/, /validate_totals\(/, /claim_number\(/], none: [/store\.reopen\(/]},
         typescript: {order: [/function finalizeInvoice\(/, /validateTotals\(/, /claimNumber\(/], none: [/\breopen\(/]},
@@ -681,13 +681,27 @@ def check_status_in_claim(ctx):
     assert len(claimed) == 1, f"two finalizes of one invoice answered {mine} and {rival.result}: exactly one may claim a number, the other must get None. Read the status inside the claim script"
     assert _counter(ctx) == "1", f"one invoice was finalized and the counter is at {_counter(ctx)}: a number was spent on nothing"
     assert store.get(a)["number"] == claimed[0], f"the invoice holds number {store.get(a)['number']}, the claim answered {claimed[0]}"
+    ghost = m.claim_number("t-1", "inv-404")
+    assert ghost is None, f"a claim for an invoice that does not exist answered {ghost}, expected None: the script answers 0 unless the status is draft"
+    assert ctx.redis.exists(store.invoice_key("inv-404")) == 0 and _counter(ctx) == "1", f"a claim for an invoice that does not exist moved the counter to {_counter(ctx)} or wrote invoice:inv-404: the script answers 0 unless the status is draft"
 
 
 def check_no_burn(ctx):
     m = ctx.load("state")
     empty = _draft(lines=[])
     stale = _draft()
+    valid = _draft()
     ctx.redis.hset(store.invoice_key(stale), "subtotal_cents", 1)
+    rival = {}
+
+    def race():
+        # Another worker finalizes a valid invoice right after this code first touches the counter.
+        if "n" not in rival:
+            rival["n"] = None
+            rival["n"] = m.claim_number("t-1", valid)
+        return rival["n"]
+
+    probes = [ctx.redis_after(key, race) for key in ("invoice:seq:t-1", "invoice:seq")]
     for invoice_id, what in ((empty, "with no line items"), (stale, "whose subtotal does not match its lines")):
         try:
             m.finalize_invoice("t-1", invoice_id)
@@ -697,10 +711,13 @@ def check_no_burn(ctx):
             raise AssertionError(f"finalizing an invoice {what} must raise InvoiceRejected")
         stored = store.get(invoice_id)
         assert stored["status"] == "draft" and stored["number"] is None, f"an invoice {what} must stay a draft without a number, the store holds {stored['status']} number {stored['number']}"
-    assert _counter(ctx) in (None, "0"), f"two rejected finalizes left the counter at {_counter(ctx)}: their numbers are holes in the series. Validate before claim_number"
     good = _draft()
     n = m.finalize_invoice("t-1", good)
-    assert n == 1, f"the first invoice that validates got number {n}, expected 1"
+    for p in probes:
+        if p.error is not None:
+            raise p.error
+    issued = sorted(x for x in (rival.get("n"), n) if x is not None)
+    assert n is not None and issued == list(range(1, len(issued) + 1)) and _counter(ctx) == str(len(issued)), f"the valid invoices finalized around two rejected ones got numbers {issued} and the counter is at {_counter(ctx)}: a rejected finalize must take no number, not even one it gives back, since another finalize can land in between. Validate before claim_number"
 `,
     typescript: `const LINES = [{description: 'Consulting', quantity: 2, unit_price_cents: 25000}];
 
@@ -754,22 +771,32 @@ export async function check_status_in_claim(ctx) {
   assert.equal(claimed.length, 1, \`two finalizes of one invoice answered \${mine} and \${theirs}: exactly one may claim a number, the other must get null. Read the status inside the claim script\`);
   assert.equal(counter(ctx), '1', \`one invoice was finalized and the counter is at \${counter(ctx)}: a number was spent on nothing\`);
   assert.equal((await store.get(a)).number, claimed[0], 'the invoice must hold the number the claim answered');
+  const ghost = await m.claimNumber('t-1', 'inv-404');
+  assert.equal(ghost, null, \`a claim for an invoice that does not exist answered \${ghost}, expected null: the script answers 0 unless the status is draft\`);
+  assert(ctx.redis.exists(store.invoiceKey('inv-404')) === 0 && counter(ctx) === '1', \`a claim for an invoice that does not exist moved the counter to \${counter(ctx)} or wrote invoice:inv-404: the script answers 0 unless the status is draft\`);
 }
 
 export async function check_no_burn(ctx) {
   const {m, store} = state(ctx);
   const empty = await draft(store, 't-1', []);
   const stale = await draft(store);
+  const valid = await draft(store);
   ctx.redis.hset(store.invoiceKey(stale), 'subtotal_cents', '1');
+  let rival: Promise<number | null> | null = null;
+  // Another worker finalizes a valid invoice right after this code first touches the counter.
+  const race = () => (rival ??= m.claimNumber('t-1', valid));
+  const probes = ['invoice:seq:t-1', 'invoice:seq'].map(key => ctx.redisAfter(key, race));
   for (const [invoiceId, what] of [[empty, 'with no line items'], [stale, 'whose subtotal does not match its lines']]) {
     await assert.rejects(m.finalizeInvoice('t-1', invoiceId), m.InvoiceRejected, \`finalizing an invoice \${what} must throw InvoiceRejected\`);
     const stored = await store.get(invoiceId);
     assert(stored.status === 'draft' && stored.number === null, \`an invoice \${what} must stay a draft without a number, the store holds \${stored.status} number \${stored.number}\`);
   }
-  assert([null, '0'].includes(counter(ctx)), \`two rejected finalizes left the counter at \${counter(ctx)}: their numbers are holes in the series. Validate before claimNumber\`);
   const good = await draft(store);
   const n = await m.finalizeInvoice('t-1', good);
-  assert.equal(n, 1, \`the first invoice that validates got number \${n}, expected 1\`);
+  for (const p of probes) if (p.error !== undefined) throw p.error;
+  const theirs = await rival;
+  const issued = [theirs, n].filter(x => x !== null && x !== undefined).sort((x, y) => x - y);
+  assert(n !== null && issued.every((x, i) => x === i + 1) && counter(ctx) === String(issued.length), \`the valid invoices finalized around two rejected ones got numbers \${JSON.stringify(issued)} and the counter is at \${counter(ctx)}: a rejected finalize must take no number, not even one it gives back, since another finalize can land in between. Validate before claimNumber\`);
 }
 `,
     go: `package main
@@ -777,6 +804,8 @@ export async function check_no_burn(ctx) {
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sort"
 
 	"invoice/store"
 
@@ -784,22 +813,22 @@ import (
 )
 
 var (
-	stateBg    = context.Background()
-	stateLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}}
+	hBg    = context.Background()
+	hLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}}
 )
 
-func draftOf(tenant string, lines []store.Line) string {
-	return store.Create(stateBg, tenant, "usd", lines, "", "", "").ID
+func hDraft(tenant string, lines []store.Line) string {
+	return store.Create(hBg, tenant, "usd", lines, "", "", "").ID
 }
 
-func mustClaim(ctx *harness.Ctx, tenant, invoiceID string) int64 {
-	n, err := claimNumber(stateBg, tenant, invoiceID)
+func hMustClaim(ctx *harness.Ctx, tenant, invoiceID string) int64 {
+	n, err := claimNumber(hBg, tenant, invoiceID)
 	ctx.NoError(err, "claimNumber(%s, %s) failed", tenant, invoiceID)
 	return n
 }
 
-// counter is what the claims spent, whichever key the code counts on.
-func counter(ctx *harness.Ctx) string {
+// hCounter is what the claims spent, whichever key the code counts on.
+func hCounter(ctx *harness.Ctx) string {
 	if v, ok := ctx.Redis.Get("invoice:seq:t-1"); ok {
 		return v
 	}
@@ -808,8 +837,8 @@ func counter(ctx *harness.Ctx) string {
 }
 
 func CheckSequenceKey(ctx *harness.Ctx) {
-	a, b, other := draftOf("t-1", stateLines), draftOf("t-1", stateLines), draftOf("t-2", stateLines)
-	got := []int64{mustClaim(ctx, "t-1", a), mustClaim(ctx, "t-1", b), mustClaim(ctx, "t-2", other)}
+	a, b, other := hDraft("t-1", hLines), hDraft("t-1", hLines), hDraft("t-2", hLines)
+	got := []int64{hMustClaim(ctx, "t-1", a), hMustClaim(ctx, "t-1", b), hMustClaim(ctx, "t-2", other)}
 	ctx.Equal(got, []int64{1, 2, 1}, "t-1's two invoices and t-2's first must get numbers 1, 2 and 1 (each tenant's series is its own); the numbers")
 	s1, _ := ctx.Redis.Get("invoice:seq:t-1")
 	s2, _ := ctx.Redis.Get("invoice:seq:t-2")
@@ -817,13 +846,13 @@ func CheckSequenceKey(ctx *harness.Ctx) {
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	a, b := draftOf("t-1", stateLines), draftOf("t-1", stateLines)
+	a, b := hDraft("t-1", hLines), hDraft("t-1", hLines)
 	var theirs int64 = -1
 	// Another worker finalizes invoice b between this claim's commands.
 	race := func() any {
 		if theirs == -1 {
 			theirs = 0
-			n, err := claimNumber(stateBg, "t-1", b)
+			n, err := claimNumber(hBg, "t-1", b)
 			ctx.NoError(err, "the rival claim failed")
 			theirs = n
 		}
@@ -831,46 +860,74 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	}
 	p1 := ctx.Redis.After("invoice:seq:t-1", race)
 	p2 := ctx.Redis.After("invoice:seq", race)
-	mine := mustClaim(ctx, "t-1", a)
+	mine := hMustClaim(ctx, "t-1", a)
 	ctx.Assert(p1.Fired || p2.Fired, "claimNumber never touched the tenant's counter")
-	sa, sb := store.Get(stateBg, a).Number, store.Get(stateBg, b).Number
+	sa, sb := store.Get(hBg, a).Number, store.Get(hBg, b).Number
 	ctx.Assert(mine+theirs == 3 && mine != theirs && sa+sb == 3 && sa != sb, "two finalizes racing got numbers %d and %d (stored %d and %d): both read the same last number. Take it with INCR inside the claim script", mine, theirs, sa, sb)
 }
 
 func CheckStatusInClaim(ctx *harness.Ctx) {
-	a := draftOf("t-1", stateLines)
+	a := hDraft("t-1", hLines)
 	// A second finalize of the same invoice lands right after this claim first touches the invoice.
 	rival := ctx.Redis.After(store.InvoiceKey(a), func() any {
-		n, err := claimNumber(stateBg, "t-1", a)
+		n, err := claimNumber(hBg, "t-1", a)
 		ctx.NoError(err, "the rival claim failed")
 		return n
 	})
-	mine := mustClaim(ctx, "t-1", a)
+	mine := hMustClaim(ctx, "t-1", a)
 	ctx.Assert(rival.Fired, "claimNumber never touched the invoice")
 	theirs, _ := rival.Result.(int64)
 	ctx.Assert((mine == 0) != (theirs == 0), "two finalizes of one invoice answered %d and %d: exactly one may claim a number, the other must get 0. Read the status inside the claim script", mine, theirs)
-	ctx.Equal(counter(ctx), "1", "one invoice was finalized: a number was spent on nothing; the counter")
-	ctx.Equal(store.Get(stateBg, a).Number, mine+theirs, "the invoice must hold the number the claim answered; its number")
+	ctx.Equal(hCounter(ctx), "1", "one invoice was finalized: a number was spent on nothing; the counter")
+	ctx.Equal(store.Get(hBg, a).Number, mine+theirs, "the invoice must hold the number the claim answered; its number")
+	ghost := hMustClaim(ctx, "t-1", "inv-404")
+	ctx.Equal(ghost, int64(0), "a claim for an invoice that does not exist must answer 0 (the script answers 0 unless the status is draft); it answered")
+	ctx.Assert(ctx.Redis.Exists(store.InvoiceKey("inv-404")) == 0 && hCounter(ctx) == "1", "a claim for an invoice that does not exist moved the counter to %s or wrote invoice:inv-404: the script answers 0 unless the status is draft", hCounter(ctx))
 }
 
 func CheckNoBurn(ctx *harness.Ctx) {
-	empty := draftOf("t-1", nil)
-	stale := draftOf("t-1", stateLines)
+	empty := hDraft("t-1", nil)
+	stale := hDraft("t-1", hLines)
+	valid := hDraft("t-1", hLines)
 	ctx.Redis.Do("HSET", store.InvoiceKey(stale), "subtotal_cents", "1")
+	var theirs int64 = -1
+	// Another worker finalizes a valid invoice right after this code first touches the counter.
+	race := func() any {
+		if theirs == -1 {
+			theirs = 0
+			n, err := claimNumber(hBg, "t-1", valid)
+			ctx.NoError(err, "the rival claim failed")
+			theirs = n
+		}
+		return theirs
+	}
+	ctx.Redis.After("invoice:seq:t-1", race)
+	ctx.Redis.After("invoice:seq", race)
 	for _, c := range []struct{ id, what string }{{empty, "with no line items"}, {stale, "whose subtotal does not match its lines"}} {
-		n, err := finalizeInvoice(stateBg, "t-1", c.id)
+		n, err := finalizeInvoice(hBg, "t-1", c.id)
 		ctx.Assert(errors.Is(err, ErrInvoiceRejected), "finalizing an invoice %s must return an error wrapping ErrInvoiceRejected, got %d, %v", c.what, n, err)
-		stored := store.Get(stateBg, c.id)
+		stored := store.Get(hBg, c.id)
 		ctx.Assert(stored.Status == "draft" && stored.Number == 0, "an invoice %s must stay a draft without a number, the store holds %s number %d", c.what, stored.Status, stored.Number)
 	}
-	ctx.Assert(counter(ctx) == "" || counter(ctx) == "0", "two rejected finalizes left the counter at %s: their numbers are holes in the series. Validate before claimNumber", counter(ctx))
-	n, err := finalizeInvoice(stateBg, "t-1", draftOf("t-1", stateLines))
+	n, err := finalizeInvoice(hBg, "t-1", hDraft("t-1", hLines))
 	ctx.NoError(err, "finalizing a valid invoice failed")
-	ctx.Equal(n, int64(1), "the first invoice that validates; its number")
+	issued := []int64{}
+	for _, x := range []int64{theirs, n} {
+		if x > 0 {
+			issued = append(issued, x)
+		}
+	}
+	sort.Slice(issued, func(i, j int) bool { return issued[i] < issued[j] })
+	gapless := n > 0 && hCounter(ctx) == fmt.Sprint(len(issued))
+	for i, x := range issued {
+		gapless = gapless && x == int64(i+1)
+	}
+	ctx.Assert(gapless, "the valid invoices finalized around two rejected ones got numbers %v and the counter is at %s: a rejected finalize must take no number, not even one it gives back, since another finalize can land in between. Validate before claimNumber", issued, hCounter(ctx))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <algorithm>
 #include <memory>
 #include <optional>
 #include <string>
@@ -880,17 +937,17 @@ func CheckNoBurn(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<store::Line> kLines = {{"Consulting", 2, 25000}};
+const std::vector<store::Line> hLines = {{"Consulting", 2, 25000}};
 
-std::string draftOf(const std::string& tenant, const std::vector<store::Line>& lines) { return store::create(tenant, "usd", lines).id; }
+std::string hDraft(const std::string& tenant, const std::vector<store::Line>& lines) { return store::create(tenant, "usd", lines).id; }
 
 // What the claims spent, whichever key the code counts on.
-std::string counter(harness::Ctx& ctx) {
+std::string hCounter(harness::Ctx& ctx) {
   if (const auto v = ctx.Redis.Get("invoice:seq:t-1")) return *v;
   return ctx.Redis.Get("invoice:seq").value_or("");
 }
 
-struct Rival {
+struct HRival {
   bool fired = false;
   long number = -1;
   std::optional<std::string> err;
@@ -899,7 +956,7 @@ struct Rival {
 }  // namespace
 
 void CheckSequenceKey(harness::Ctx& ctx) {
-  const std::string a = draftOf("t-1", kLines), b = draftOf("t-1", kLines), other = draftOf("t-2", kLines);
+  const std::string a = hDraft("t-1", hLines), b = hDraft("t-1", hLines), other = hDraft("t-2", hLines);
   const std::vector<long> got = {claimNumber("t-1", a), claimNumber("t-1", b), claimNumber("t-2", other)};
   ctx.Equal(got, {1L, 2L, 1L}, "t-1's two invoices and t-2's first must get numbers 1, 2 and 1 (each tenant's series is its own); the numbers");
   const std::vector<std::string> seqs = {ctx.Redis.Get("invoice:seq:t-1").value_or(""), ctx.Redis.Get("invoice:seq:t-2").value_or("")};
@@ -907,8 +964,8 @@ void CheckSequenceKey(harness::Ctx& ctx) {
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  const std::string a = draftOf("t-1", kLines), b = draftOf("t-1", kLines);
-  auto rival = std::make_shared<Rival>();
+  const std::string a = hDraft("t-1", hLines), b = hDraft("t-1", hLines);
+  auto rival = std::make_shared<HRival>();
   // Another worker finalizes invoice b between this claim's commands.
   const auto race = [rival, b] {
     if (rival->fired) return;
@@ -931,8 +988,8 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
 }
 
 void CheckStatusInClaim(harness::Ctx& ctx) {
-  const std::string a = draftOf("t-1", kLines);
-  auto rival = std::make_shared<Rival>();
+  const std::string a = hDraft("t-1", hLines);
+  auto rival = std::make_shared<HRival>();
   // A second finalize of the same invoice lands right after this claim first touches the invoice.
   ctx.Redis.After(store::invoiceKey(a), [rival, a] {
     rival->fired = true;
@@ -948,14 +1005,32 @@ void CheckStatusInClaim(harness::Ctx& ctx) {
   ctx.Assert((mine == 0) != (rival->number == 0),
              "two finalizes of one invoice answered %d and %d: exactly one may claim a number, the other must get 0. Read the status inside the claim script", mine,
              rival->number);
-  ctx.Equal(counter(ctx), "1", "one invoice was finalized: a number was spent on nothing; the counter");
+  ctx.Equal(hCounter(ctx), "1", "one invoice was finalized: a number was spent on nothing; the counter");
   ctx.Equal(store::get(a)->number, mine + rival->number, "the invoice must hold the number the claim answered; its number");
+  const long ghost = claimNumber("t-1", "inv-404");
+  ctx.Equal(ghost, 0L, "a claim for an invoice that does not exist must answer 0 (the script answers 0 unless the status is draft); it answered");
+  ctx.Assert(ctx.Redis.Exists(store::invoiceKey("inv-404")) == 0 && hCounter(ctx) == "1",
+             "a claim for an invoice that does not exist moved the counter to %s or wrote invoice:inv-404: the script answers 0 unless the status is draft", hCounter(ctx));
 }
 
 void CheckNoBurn(harness::Ctx& ctx) {
-  const std::string empty = draftOf("t-1", {});
-  const std::string stale = draftOf("t-1", kLines);
+  const std::string empty = hDraft("t-1", {});
+  const std::string stale = hDraft("t-1", hLines);
+  const std::string valid = hDraft("t-1", hLines);
   ctx.Redis.Do("HSET", store::invoiceKey(stale), "subtotal_cents", "1");
+  auto rival = std::make_shared<HRival>();
+  // Another worker finalizes a valid invoice right after this code first touches the counter.
+  const auto race = [rival, valid] {
+    if (rival->fired) return;
+    rival->fired = true;
+    try {
+      rival->number = claimNumber("t-1", valid);
+    } catch (const std::exception& e) {
+      rival->err = e.what();
+    }
+  };
+  ctx.Redis.After("invoice:seq:t-1", race);
+  ctx.Redis.After("invoice:seq", race);
   for (const auto& [id, what] : std::vector<std::pair<std::string, std::string>>{{empty, "with no line items"}, {stale, "whose subtotal does not match its lines"}}) {
     bool rejected = false;
     long n = 0;
@@ -969,9 +1044,19 @@ void CheckNoBurn(harness::Ctx& ctx) {
     ctx.Assert(stored->status == "draft" && stored->number == 0, "an invoice %s must stay a draft without a number, the store holds %s number %d", what,
                stored->status, stored->number);
   }
-  ctx.Assert(counter(ctx).empty() || counter(ctx) == "0", "two rejected finalizes left the counter at %s: their numbers are holes in the series. Validate before claimNumber",
-             counter(ctx));
-  ctx.Equal(finalizeInvoice("t-1", draftOf("t-1", kLines)), 1, "the first invoice that validates; its number");
+  const long n = finalizeInvoice("t-1", hDraft("t-1", hLines));
+  ctx.Assert(!rival->err, "the rival claim failed: %s", rival->err.value_or(""));
+  std::vector<long> issued;
+  for (const long x : {rival->number, n}) {
+    if (x > 0) issued.push_back(x);
+  }
+  std::sort(issued.begin(), issued.end());
+  bool gapless = n > 0 && hCounter(ctx) == std::to_string(issued.size());
+  for (size_t i = 0; i < issued.size(); i++) gapless = gapless && issued[i] == static_cast<long>(i + 1);
+  ctx.Assert(gapless,
+             "the valid invoices finalized around two rejected ones got numbers %s and the counter is at %s: a rejected finalize must take no number, not even one it "
+             "gives back, since another finalize can land in between. Validate before claimNumber",
+             issued, hCounter(ctx));
 }
 `,
   },

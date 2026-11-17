@@ -55,7 +55,7 @@ service DemandModel { rpc Estimate(EstimateRequest) returns (PriceEstimate); }  
       id: 'deadline',
       title: 'Every Estimate call carries a 0.7-second deadline',
       detail:
-        'The demand call is made with `DEADLINE_S` (0.7 s) as its deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`). The starter sends it with none, so a model that hangs holds the pricing worker with it.',
+        'The demand call is made with `DEADLINE_S` (0.7 s) as its deadline (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`): a model answering in 0.75 s is an outage, one answering in 0.65 s reprices the sku. The starter sends it with none, so a model that hangs holds the pricing worker with it.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.7\b/, /Estimate\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*700\b/, /Estimate\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -559,6 +559,12 @@ def check_deadline(ctx):
     ctx.grpc.set_latency("Estimate", 5.0)
     row = m.price_from_demand("SKU-1", "demand refresh")
     assert row["price_cents"] == 1100, f"a model slower than the deadline changed the price to {row['price_cents']}"
+    ctx.grpc.set_latency("Estimate", 0.75)
+    row = m.price_from_demand("SKU-1", "demand refresh")
+    assert row["price_cents"] == 1100 and row["stale"] is True, f"a model answering in 0.75 s, past the 0.7 s deadline, must leave the price kept and stale; got {row}"
+    ctx.grpc.set_latency("Estimate", 0.65)
+    row = m.price_from_demand("SKU-1", "demand refresh")
+    assert row["price_cents"] == 1210 and row["source"] == "demand-model", f"a model answering in 0.65 s, inside the 0.7 s deadline, must reprice the sku to its estimate 1210; got {row}"
 
 
 def check_terminal_rejection(ctx):
@@ -645,6 +651,12 @@ export async function check_deadline(ctx) {
   ctx.grpc.setLatency('Estimate', 5.0);
   row = await m.priceFromDemand('SKU-1', 'demand refresh');
   assert.equal(row.price_cents, 1100, \`a model slower than the deadline changed the price to \${row.price_cents}\`);
+  ctx.grpc.setLatency('Estimate', 0.75);
+  row = await m.priceFromDemand('SKU-1', 'demand refresh');
+  assert(row.price_cents === 1100 && row.stale === true, \`a model answering in 0.75 s, past the 700 ms deadline, must leave the price kept and stale; got \${JSON.stringify(row)}\`);
+  ctx.grpc.setLatency('Estimate', 0.65);
+  row = await m.priceFromDemand('SKU-1', 'demand refresh');
+  assert(row.price_cents === 1210 && row.source === 'demand-model', \`a model answering in 0.65 s, inside the 700 ms deadline, must reprice the sku to its estimate 1210; got \${JSON.stringify(row)}\`);
 }
 
 export async function check_terminal_rejection(ctx) {
@@ -714,16 +726,16 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-// demandPeer proposes current * pct / 100 (110 unless set per sku); it refuses the skus in refused.
-type demandPeer struct {
+// hDemandPeer proposes current * pct / 100 (110 unless set per sku); it refuses the skus in refused.
+type hDemandPeer struct {
 	pb.UnimplementedDemandModelServer
 	pct     map[string]int64
 	refused map[string]bool
 }
 
-func (d *demandPeer) Estimate(_ context.Context, req *pb.EstimateRequest) (*pb.PriceEstimate, error) {
+func (d *hDemandPeer) Estimate(_ context.Context, req *pb.EstimateRequest) (*pb.PriceEstimate, error) {
 	if d.refused[req.GetSku()] {
 		return nil, status.Errorf(codes.FailedPrecondition, "%s is price-matched: the model may not move it", req.GetSku())
 	}
@@ -734,23 +746,23 @@ func (d *demandPeer) Estimate(_ context.Context, req *pb.EstimateRequest) (*pb.P
 	return &pb.PriceEstimate{PriceCents: req.GetCurrentPriceCents() * pct / 100, ModelVersion: "elasticity-v7"}, nil
 }
 
-func demandClient(ctx *harness.Ctx) *demandPeer {
-	peer := &demandPeer{pct: map[string]int64{}, refused: map[string]bool{}}
+func hDemandClient(ctx *harness.Ctx) *hDemandPeer {
+	peer := &hDemandPeer{pct: map[string]int64{}, refused: map[string]bool{}}
 	pb.RegisterDemandModelServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func reprice(ctx *harness.Ctx, sku string) *store.Row {
-	row, err := priceFromDemand(clientBg, sku, "demand refresh")
+func hReprice(ctx *harness.Ctx, sku string) *store.Row {
+	row, err := priceFromDemand(hClientBg, sku, "demand refresh")
 	ctx.NoError(err, "priceFromDemand(%s)", sku)
 	ctx.Assert(row != nil, "priceFromDemand(%s) returned no row", sku)
 	return row
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	demandClient(ctx)
-	store.Seed(clientBg, "SKU-1", 1000)
-	row := reprice(ctx, "SKU-1")
+	hDemandClient(ctx)
+	store.Seed(hClientBg, "SKU-1", 1000)
+	row := hReprice(ctx, "SKU-1")
 	ctx.Assert(row.PriceCents == 1100 && row.Source == "demand-model", "with the model healthy the sku must be repriced to its estimate 1100, got %+v", row)
 	calls := ctx.GRPC.CallsTo("Estimate", "")
 	ctx.Assert(len(calls) > 0, "no Estimate call was made")
@@ -759,54 +771,60 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(call.Timeout.Seconds() >= 0.5 && call.Timeout.Seconds() <= 0.9, "an Estimate call carries a %v deadline, expected 700 ms", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Estimate", 5.0, "")
-	row = reprice(ctx, "SKU-1")
+	row = hReprice(ctx, "SKU-1")
 	ctx.Equal(row.PriceCents, 1100, "a model slower than the deadline must not change the price; the price")
+	ctx.GRPC.SetLatency("Estimate", 0.75, "")
+	row = hReprice(ctx, "SKU-1")
+	ctx.Assert(row.PriceCents == 1100 && row.Stale, "a model answering in 0.75 s, past the 700 ms deadline, must leave the price kept and stale; got %+v", row)
+	ctx.GRPC.SetLatency("Estimate", 0.65, "")
+	row = hReprice(ctx, "SKU-1")
+	ctx.Assert(row.PriceCents == 1210 && row.Source == "demand-model", "a model answering in 0.65 s, inside the 700 ms deadline, must reprice the sku to its estimate 1210; got %+v", row)
 }
 
 func CheckTerminalRejection(ctx *harness.Ctx) {
-	peer := demandClient(ctx)
-	store.Seed(clientBg, "SKU-7", 2000)
+	peer := hDemandClient(ctx)
+	store.Seed(hClientBg, "SKU-7", 2000)
 	peer.refused["SKU-7"] = true
-	row, err := priceFromDemand(clientBg, "SKU-7", "demand refresh")
+	row, err := priceFromDemand(hClientBg, "SKU-7", "demand refresh")
 	calls := len(ctx.GRPC.CallsTo("Estimate", ""))
 	ctx.Equal(calls, 1, "a sku the model refused must be sent to it once (FAILED_PRECONDITION is an answer, not an outage); the calls")
 	ctx.Assert(err != nil, "priceFromDemand returned %+v for a sku the model refused, expected an error wrapping ErrPriceRejected", row)
 	ctx.ErrorIs(err, ErrPriceRejected, "a refused sku returned %v", err)
-	stored := store.GetSKU(clientBg, "SKU-7")
+	stored := store.GetSKU(hClientBg, "SKU-7")
 	ctx.Assert(stored.PriceCents == 2000 && stored.Source == "seed" && !stored.Stale, "a refusal must leave the price as it was, the store holds %+v", stored)
 }
 
 func CheckLastApprovedFallback(ctx *harness.Ctx) {
-	demandClient(ctx)
-	store.Seed(clientBg, "SKU-1", 1000)
-	reprice(ctx, "SKU-1")
+	hDemandClient(ctx)
+	store.Seed(hClientBg, "SKU-1", 1000)
+	hReprice(ctx, "SKU-1")
 	ctx.Clock.Advance(60)
-	approved := store.Publish(clientBg, "SKU-1", 1050, "operator correction", "operator")
+	approved := store.Publish(hClientBg, "SKU-1", 1050, "operator correction", "operator")
 	ctx.Clock.Advance(60)
 	ctx.GRPC.Fail("Estimate", codes.Unavailable, "model redeploying", 5, "")
-	row := reprice(ctx, "SKU-1")
+	row := hReprice(ctx, "SKU-1")
 	ctx.Equal(row.PriceCents, 1050, "with the model down an old model estimate must not go out again over the price the operator approved since; the price")
 	ctx.Assert(row.Stale && row.Source == "last-approved", "the kept price must say what it is (source last-approved, stale true), got %+v", row)
 	ctx.Equal(row.UpdatedAt, approved.UpdatedAt, "the kept price must keep its own updated_at (%d s later otherwise); updated_at", row.UpdatedAt-approved.UpdatedAt)
-	ctx.Equal(*store.GetSKU(clientBg, "SKU-1"), *row, "the store must hold the row the call returned")
+	ctx.Equal(*store.GetSKU(hClientBg, "SKU-1"), *row, "the store must hold the row the call returned")
 	ctx.GRPC.ClearFailures()
 	ctx.GRPC.SetLatency("Estimate", 5.0, "")
-	late := reprice(ctx, "SKU-1")
+	late := hReprice(ctx, "SKU-1")
 	ctx.Assert(late.PriceCents == 1050 && late.Stale, "a model slower than the deadline must leave the approved price, marked stale; got %+v", late)
 }
 
 func CheckGuardedEstimate(ctx *harness.Ctx) {
-	peer := demandClient(ctx)
-	store.Seed(clientBg, "SKU-1", 1000)
+	peer := hDemandClient(ctx)
+	store.Seed(hClientBg, "SKU-1", 1000)
 	peer.pct["SKU-1"] = 150
-	row := reprice(ctx, "SKU-1")
-	stored := store.GetSKU(clientBg, "SKU-1")
+	row := hReprice(ctx, "SKU-1")
+	stored := store.GetSKU(hClientBg, "SKU-1")
 	ctx.Assert(stored.PriceCents == 1000 && stored.Source == "seed", "the model proposed 1500 for a sku at 1000 and the store now holds %d: an estimate moves the price only through guard.Reserve", stored.PriceCents)
 	ctx.Equal(row.PriceCents, 1000, "a refused estimate must return the unchanged row; the price")
 	peer.pct["SKU-1"] = 110
-	row = reprice(ctx, "SKU-1")
+	row = hReprice(ctx, "SKU-1")
 	ctx.Assert(row.PriceCents == 1100 && row.Source == "demand-model", "a 10 %% estimate inside the window must be published, got %+v", row)
-	spent := guard.WindowState(clientBg, "SKU-1").MovedBP
+	spent := guard.WindowState(hClientBg, "SKU-1").MovedBP
 	ctx.Equal(spent, int64(1000), "the published 10 %% move must spend 1000 bp of the window through guard.Reserve; spent")
 }
 `,
@@ -819,7 +837,7 @@ func CheckGuardedEstimate(ctx *harness.Ctx) {
 namespace {
 
 // Proposes current * pct / 100 (110 unless set per sku); refuses the skus in refused.
-class DemandPeer final : public priced::DemandModel::Service {
+class HDemandPeer final : public priced::DemandModel::Service {
  public:
   std::map<std::string, long long> pct;
   std::set<std::string> refused;
@@ -834,15 +852,15 @@ class DemandPeer final : public priced::DemandModel::Service {
   }
 };
 
-DemandPeer& demandClient(harness::Ctx& ctx) {
-  static DemandPeer* peer = nullptr;
+HDemandPeer& hDemandClient(harness::Ctx& ctx) {
+  static HDemandPeer* peer = nullptr;
   delete peer;
-  peer = new DemandPeer;
+  peer = new HDemandPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-store::Row reprice(harness::Ctx& ctx, const std::string& sku) {
+store::Row hReprice(harness::Ctx& ctx, const std::string& sku) {
   try {
     return priceFromDemand(sku, "demand refresh");
   } catch (const std::exception& e) {
@@ -850,7 +868,7 @@ store::Row reprice(harness::Ctx& ctx, const std::string& sku) {
   }
 }
 
-std::string text(const store::Row& r) {
+std::string hText(const store::Row& r) {
   return "{price_cents: " + std::to_string(r.price_cents) + ", source: " + r.source + ", stale: " + (r.stale ? "true" : "false") +
          ", updated_at: " + std::to_string(r.updated_at) + "}";
 }
@@ -858,10 +876,10 @@ std::string text(const store::Row& r) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  demandClient(ctx);
+  hDemandClient(ctx);
   store::seed("SKU-1", 1000);
-  store::Row row = reprice(ctx, "SKU-1");
-  ctx.Assert(row.price_cents == 1100 && row.source == "demand-model", "with the model healthy the sku must be repriced to its estimate 1100, got %s", text(row));
+  store::Row row = hReprice(ctx, "SKU-1");
+  ctx.Assert(row.price_cents == 1100 && row.source == "demand-model", "with the model healthy the sku must be repriced to its estimate 1100, got %s", hText(row));
   const auto calls = ctx.GRPC.CallsTo("Estimate");
   ctx.Assert(!calls.empty(), "no Estimate call was made");
   for (const auto& call : calls) {
@@ -870,12 +888,18 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(seconds >= 0.5 && seconds <= 0.9, "an Estimate call carries a %v s deadline, expected 700 ms", seconds);
   }
   ctx.GRPC.SetLatency("Estimate", 5.0);
-  row = reprice(ctx, "SKU-1");
+  row = hReprice(ctx, "SKU-1");
   ctx.Equal(row.price_cents, 1100, "a model slower than the deadline must not change the price; the price");
+  ctx.GRPC.SetLatency("Estimate", 0.75);
+  row = hReprice(ctx, "SKU-1");
+  ctx.Assert(row.price_cents == 1100 && row.stale, "a model answering in 0.75 s, past the 700 ms deadline, must leave the price kept and stale; got %s", hText(row));
+  ctx.GRPC.SetLatency("Estimate", 0.65);
+  row = hReprice(ctx, "SKU-1");
+  ctx.Assert(row.price_cents == 1210 && row.source == "demand-model", "a model answering in 0.65 s, inside the 700 ms deadline, must reprice the sku to its estimate 1210; got %s", hText(row));
 }
 
 void CheckTerminalRejection(harness::Ctx& ctx) {
-  DemandPeer& peer = demandClient(ctx);
+  HDemandPeer& peer = hDemandClient(ctx);
   store::seed("SKU-7", 2000);
   peer.refused.insert("SKU-7");
   bool rejected = false;
@@ -889,39 +913,39 @@ void CheckTerminalRejection(harness::Ctx& ctx) {
   ctx.Equal(ctx.GRPC.CallsTo("Estimate").size(), 1, "a sku the model refused must be sent to it once (FAILED_PRECONDITION is an answer, not an outage); the calls");
   ctx.Assert(rejected, "priceFromDemand returned a row for a sku the model refused, expected PriceRejected");
   const store::Row stored = *store::getSku("SKU-7");
-  ctx.Assert(stored.price_cents == 2000 && stored.source == "seed" && !stored.stale, "a refusal must leave the price as it was, the store holds %s", text(stored));
+  ctx.Assert(stored.price_cents == 2000 && stored.source == "seed" && !stored.stale, "a refusal must leave the price as it was, the store holds %s", hText(stored));
 }
 
 void CheckLastApprovedFallback(harness::Ctx& ctx) {
-  demandClient(ctx);
+  hDemandClient(ctx);
   store::seed("SKU-1", 1000);
-  reprice(ctx, "SKU-1");
+  hReprice(ctx, "SKU-1");
   ctx.Clock.Advance(60);
   const store::Row approved = store::publish("SKU-1", 1050, "operator correction", "operator");
   ctx.Clock.Advance(60);
   ctx.GRPC.Fail("Estimate", grpc::StatusCode::UNAVAILABLE, "model redeploying", 5);
-  const store::Row row = reprice(ctx, "SKU-1");
+  const store::Row row = hReprice(ctx, "SKU-1");
   ctx.Equal(row.price_cents, 1050, "with the model down an old model estimate must not go out again over the price the operator approved since; the price");
-  ctx.Assert(row.stale && row.source == "last-approved", "the kept price must say what it is (source last-approved, stale true), got %s", text(row));
+  ctx.Assert(row.stale && row.source == "last-approved", "the kept price must say what it is (source last-approved, stale true), got %s", hText(row));
   ctx.Equal(row.updated_at, approved.updated_at, "the kept price must keep its own updated_at (%d s later otherwise); updated_at", row.updated_at - approved.updated_at);
-  ctx.Equal(text(*store::getSku("SKU-1")), text(row), "the store must hold the row the call returned");
+  ctx.Equal(hText(*store::getSku("SKU-1")), hText(row), "the store must hold the row the call returned");
   ctx.GRPC.ClearFailures();
   ctx.GRPC.SetLatency("Estimate", 5.0);
-  const store::Row late = reprice(ctx, "SKU-1");
-  ctx.Assert(late.price_cents == 1050 && late.stale, "a model slower than the deadline must leave the approved price, marked stale; got %s", text(late));
+  const store::Row late = hReprice(ctx, "SKU-1");
+  ctx.Assert(late.price_cents == 1050 && late.stale, "a model slower than the deadline must leave the approved price, marked stale; got %s", hText(late));
 }
 
 void CheckGuardedEstimate(harness::Ctx& ctx) {
-  DemandPeer& peer = demandClient(ctx);
+  HDemandPeer& peer = hDemandClient(ctx);
   store::seed("SKU-1", 1000);
   peer.pct["SKU-1"] = 150;
-  store::Row row = reprice(ctx, "SKU-1");
+  store::Row row = hReprice(ctx, "SKU-1");
   const store::Row stored = *store::getSku("SKU-1");
   ctx.Assert(stored.price_cents == 1000 && stored.source == "seed", "the model proposed 1500 for a sku at 1000 and the store now holds %d: an estimate moves the price only through guard::reserve", stored.price_cents);
   ctx.Equal(row.price_cents, 1000, "a refused estimate must return the unchanged row; the price");
   peer.pct["SKU-1"] = 110;
-  row = reprice(ctx, "SKU-1");
-  ctx.Assert(row.price_cents == 1100 && row.source == "demand-model", "a 10 %% estimate inside the window must be published, got %s", text(row));
+  row = hReprice(ctx, "SKU-1");
+  ctx.Assert(row.price_cents == 1100 && row.source == "demand-model", "a 10 %% estimate inside the window must be published, got %s", hText(row));
   ctx.Equal(guard::windowState("SKU-1").moved_bp, 1000, "the published 10 %% move must spend 1000 bp of the window through guard::reserve; spent");
 }
 `,

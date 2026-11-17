@@ -23,12 +23,12 @@ keeps its cached allow for a minute.
 service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decision{allowed, reason}
 \`\`\`
 
-- Every call carries a **400 ms** deadline (\`DEADLINE_S\`).
+- Every attempt carries its own **400 ms** deadline (\`DEADLINE_S\`).
 - At most **two** attempts (\`MAX_ATTEMPTS\`), 100 ms apart, and only after \`UNAVAILABLE\` or
   \`DEADLINE_EXCEEDED\`. Any other status is the engine's answer: deny, no retry.
 - When both attempts fail, raise \`PolicyUnavailable\` (the route answers 503): never an old allow.
-- A cached allow is a hash stamped with \`perm:grant_version\` and counts only while the stamp equals
-  the current version.`,
+- A cached allow is a hash with a **60 s** TTL, stamped with the \`perm:grant_version\` read before
+  the call, and counts only while the stamp equals the current version.`,
   sequence: {
     participants: ['Permission Service', 'Redis', 'Policy engine'],
     messages: [
@@ -66,7 +66,7 @@ service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decisio
       id: 'deadline',
       title: 'Calls the policy engine under a 400 ms deadline',
       detail:
-        'Every `Check` carries a 400 ms deadline, so a stalled engine costs two short attempts and a `PolicyUnavailable`; the starter calls with no deadline and waits as long as the engine does.',
+        'Every `Check` attempt carries its own 400 ms deadline, and the two attempts are 100 ms apart, so a stalled engine costs two short attempts and a `PolicyUnavailable`; the starter calls with no deadline and waits as long as the engine does.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0?\.4\b/, /Check\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*400\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -81,7 +81,7 @@ service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decisio
       id: 'retry-transient',
       title: 'Retries only a transport failure, and only once',
       detail:
-        'Two attempts at most, the second only after `UNAVAILABLE` or `DEADLINE_EXCEEDED`; any other status (an unknown permission is `INVALID_ARGUMENT`) is a denial after one call. The starter retries every error three times.',
+        'Two attempts at most, the second only after `UNAVAILABLE` or `DEADLINE_EXCEEDED`; any other status (an unknown permission is `INVALID_ARGUMENT`; `PERMISSION_DENIED`, `NOT_FOUND`, `FAILED_PRECONDITION` and `INTERNAL` too) is a denial after one call. The starter retries every error three times.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/, /StatusCode\.DEADLINE_EXCEEDED/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/, /status\.DEADLINE_EXCEEDED/]},
@@ -107,7 +107,7 @@ service PolicyEngine { rpc Check(CheckRequest) returns (Decision); }  // Decisio
       id: 'cached-allow-version',
       title: 'Serves a cached allow only at the grant version it was given at',
       detail:
-        'The cached allow is stamped with `perm:grant_version` and served only while the stamp equals the current version; any grant change asks the engine again. The starter trusts the TTL.',
+        'The cached allow (60 s TTL) is stamped with the `perm:grant_version` read before the call and served only while the stamp equals the current version; any grant change, one that commits while the engine answers included, asks the engine again. The starter trusts the TTL.',
       match: {
         python: {
           all: [/VERSION_KEY\s*=\s*["']perm:grant_version["']/, /\.get\(\s*VERSION_KEY/],
@@ -676,11 +676,15 @@ class Engine(pb_grpc.PolicyEngineServicer):
 
     def __init__(self):
         self.allowed = {("ada", "team:read", "team:eng"), ("ada", "team:write", "team:eng")}
+        self.after_decision = None  # runs once, after the engine decided and before it answers
 
     def Check(self, request, context):
         if ":" not in request.permission:
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"unknown permission {request.permission!r}")
         allowed = (request.subject, request.permission, request.scope) in self.allowed
+        hook, self.after_decision = self.after_decision, None
+        if hook is not None:
+            hook()
         return pb.Decision(allowed=allowed, reason="granted" if allowed else "no grant")
 
 
@@ -706,9 +710,14 @@ def check_deadline(ctx):
         assert 0.35 <= call.timeout <= 0.45, f"a Check call carries a {call.timeout} s deadline, expected 400 ms"
     ctx.grpc.set_latency("Check", 5.0)
     before = ctx.clock.time()
+    calls_before = len(ctx.grpc.calls_to("Check"))
     _unavailable(m, ctx, "team:write", "with the engine taking 5 s per call")
     waited = ctx.clock.time() - before
-    assert waited <= 1.5, f"authorize waited {waited:.1f} s for a stalled engine, expected two 400 ms attempts"
+    stalled = ctx.grpc.calls_to("Check")[calls_before:]
+    assert len(stalled) == 2, f"a stalled engine was asked {len(stalled)} times, expected 2: DEADLINE_EXCEEDED is a transport failure, retried once"
+    for call in stalled:
+        assert call.timeout is not None and 0.35 <= call.timeout <= 0.45, f"an attempt against the stalled engine carried a {call.timeout} s deadline, expected 400 ms: every attempt gets its own full deadline"
+    assert 0.85 <= waited <= 1.0, f"authorize waited {waited:.2f} s for a stalled engine, expected two 400 ms attempts 100 ms apart"
 
 
 def check_retry_transient(ctx):
@@ -721,6 +730,15 @@ def check_retry_transient(ctx):
     calls = len(ctx.grpc.calls_to("Check")) - before
     assert verdict is False, f"an unknown permission (INVALID_ARGUMENT) answered {verdict!r}, expected a denial"
     assert calls == 1, f"an unknown permission was asked {calls} times: INVALID_ARGUMENT is the engine's answer, not a transport failure"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.NOT_FOUND, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.INTERNAL):
+        ctx.grpc.fail("Check", code, "the engine refused", times=1)
+        before = len(ctx.grpc.calls_to("Check"))
+        try:
+            verdict = m.authorize("ada", "team:write", "team:eng")
+        except m.PolicyUnavailable:
+            verdict = "PolicyUnavailable"
+        calls = len(ctx.grpc.calls_to("Check")) - before
+        assert verdict is False and calls == 1, f"the engine answering {code.name} gave {verdict!r} after {calls} calls, expected a denial after 1: only UNAVAILABLE and DEADLINE_EXCEEDED are transport failures"
     ctx.grpc.fail("Check", grpc.StatusCode.UNAVAILABLE, "engine down", times=10)
     before = len(ctx.grpc.calls_to("Check"))
     try:
@@ -750,20 +768,39 @@ def check_cached_allow_version(ctx):
     verdict = m.authorize("ada", "team:write", "team:eng")
     assert verdict is False, f"after ada's grant was revoked (perm:grant_version moved) authorize still answered {verdict!r} from the cached allow: an allow counts only at the grant version it was given at"
     assert len(ctx.grpc.calls_to("Check")) == 2, "after the grant version moved the engine must be asked again"
+
+    def revoke_read():  # ada's team:read is revoked while the engine's allow is on its way back
+        engine.allowed.discard(("ada", "team:read", "team:eng"))
+        ctx.redis.incr("perm:grant_version")
+
+    engine.after_decision = revoke_read
+    m.authorize("ada", "team:read", "team:eng")
+    verdict = m.authorize("ada", "team:read", "team:eng")
+    assert verdict is False, f"a revocation committed while the engine's allow was in flight, and the next check answered {verdict!r}: the allow must carry the version read before the call, so it is already stale"
+    assert len(ctx.grpc.calls_to("Check")) == 4, f"after a revocation committed during the call the engine must be asked again; {len(ctx.grpc.calls_to('Check'))} calls in all, expected 4"
+    stamped = [key for key in ctx.redis.keys("*") if key != "perm:grant_version"]
+    assert stamped, "the allow is cached nowhere in Redis"
+    for key in stamped:
+        ttl = ctx.redis.ttl(key)
+        assert 50 < ttl <= 60, f"the cached allow {key} has a TTL of {ttl} s, expected 60"
 `,
     typescript: `/** Allows what is in allowed; a permission without a "kind:" prefix is unknown (INVALID_ARGUMENT). */
 function client(ctx) {
   const pkg = ctx.proto('permission_service.proto');
   const allowed = new Set(['ada|team:read|team:eng', 'ada|team:write|team:eng']);
+  const hooks: {afterDecision: (() => void) | null} = {afterDecision: null}; // runs once, after the engine decided and before it answers
   ctx.grpc.serve(pkg.policyd.PolicyEngine.service, {
     Check(call, callback) {
       const {subject, permission, scope} = call.request;
       if (!permission.includes(':')) return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: \`unknown permission "\${permission}"\`});
       const ok = allowed.has(\`\${subject}|\${permission}|\${scope}\`);
+      const hook = hooks.afterDecision;
+      hooks.afterDecision = null;
+      if (hook !== null) hook();
       callback(null, {allowed: ok, reason: ok ? 'granted' : 'no grant'});
     },
   });
-  return {m: ctx.load('client'), allowed};
+  return {m: ctx.load('client'), allowed, hooks};
 }
 
 async function unavailable(m, permission: string, why: string): Promise<void> {
@@ -786,9 +823,15 @@ export async function check_deadline(ctx) {
   }
   ctx.grpc.setLatency('Check', 5.0);
   const before = ctx.clock.now();
+  const callsBefore = ctx.grpc.callsTo('Check').length;
   await unavailable(m, 'team:write', 'with the engine taking 5 s per call');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 1.5, \`authorize waited \${waited.toFixed(1)} s for a stalled engine, expected two 400 ms attempts\`);
+  const stalled = ctx.grpc.callsTo('Check').slice(callsBefore);
+  assert.equal(stalled.length, 2, \`a stalled engine was asked \${stalled.length} times, expected 2: DEADLINE_EXCEEDED is a transport failure, retried once\`);
+  for (const call of stalled) {
+    assert(call.timeout !== null && call.timeout >= 0.35 && call.timeout <= 0.45, \`an attempt against the stalled engine carried a \${call.timeout} s deadline, expected 400 ms: every attempt gets its own full deadline\`);
+  }
+  assert(waited >= 0.85 && waited <= 1.0, \`authorize waited \${waited.toFixed(2)} s for a stalled engine, expected two 400 ms attempts 100 ms apart\`);
 }
 
 export async function check_retry_transient(ctx) {
@@ -801,6 +844,19 @@ export async function check_retry_transient(ctx) {
   let calls = ctx.grpc.callsTo('Check').length - before;
   assert.equal(verdict, false, \`an unknown permission (INVALID_ARGUMENT) answered \${verdict}, expected a denial\`);
   assert.equal(calls, 1, \`an unknown permission was asked \${calls} times: INVALID_ARGUMENT is the engine's answer, not a transport failure\`);
+  for (const code of ['PERMISSION_DENIED', 'NOT_FOUND', 'FAILED_PRECONDITION', 'INTERNAL']) {
+    ctx.grpc.fail('Check', ctx.grpc.status[code], 'the engine refused', 1);
+    before = ctx.grpc.callsTo('Check').length;
+    let answer;
+    try {
+      answer = await m.authorize('ada', 'team:write', 'team:eng');
+    } catch (e) {
+      if (!(e instanceof m.PolicyUnavailable)) throw e;
+      answer = 'PolicyUnavailable';
+    }
+    calls = ctx.grpc.callsTo('Check').length - before;
+    assert(answer === false && calls === 1, \`the engine answering \${code} gave \${answer} after \${calls} calls, expected a denial after 1: only UNAVAILABLE and DEADLINE_EXCEEDED are transport failures\`);
+  }
   ctx.grpc.fail('Check', ctx.grpc.status.UNAVAILABLE, 'engine down', 10);
   before = ctx.grpc.callsTo('Check').length;
   try {
@@ -822,7 +878,7 @@ export async function check_fail_closed(ctx) {
 }
 
 export async function check_cached_allow_version(ctx) {
-  const {m, allowed} = client(ctx);
+  const {m, allowed, hooks} = client(ctx);
   assert.equal(await m.authorize('ada', 'team:write', 'team:eng'), true, 'with a healthy engine ada must be allowed team:write at team:eng');
   assert.equal(await m.authorize('ada', 'team:write', 'team:eng'), true, 'the same check again must be allowed');
   assert.equal(ctx.grpc.callsTo('Check').length, 1, 'the same check at the same grant version must be served from the cached allow');
@@ -831,6 +887,21 @@ export async function check_cached_allow_version(ctx) {
   const verdict = await m.authorize('ada', 'team:write', 'team:eng');
   assert.equal(verdict, false, \`after ada's grant was revoked (perm:grant_version moved) authorize still answered \${verdict} from the cached allow: an allow counts only at the grant version it was given at\`);
   assert.equal(ctx.grpc.callsTo('Check').length, 2, 'after the grant version moved the engine must be asked again');
+  hooks.afterDecision = () => {
+    // ada's team:read is revoked while the engine's allow is on its way back
+    allowed.delete('ada|team:read|team:eng');
+    ctx.redis.incr('perm:grant_version');
+  };
+  await m.authorize('ada', 'team:read', 'team:eng');
+  const again = await m.authorize('ada', 'team:read', 'team:eng');
+  assert.equal(again, false, \`a revocation committed while the engine's allow was in flight, and the next check answered \${again}: the allow must carry the version read before the call, so it is already stale\`);
+  assert.equal(ctx.grpc.callsTo('Check').length, 4, \`after a revocation committed during the call the engine must be asked again; \${ctx.grpc.callsTo('Check').length} calls in all, expected 4\`);
+  const stamped = ctx.redis.keys('*').filter(key => key !== 'perm:grant_version');
+  assert(stamped.length > 0, 'the allow is cached nowhere in Redis');
+  for (const key of stamped) {
+    const ttl = ctx.redis.ttl(key);
+    assert(ttl > 50 && ttl <= 60, \`the cached allow \${key} has a TTL of \${ttl} s, expected 60\`);
+  }
 }
 `,
     go: `package main
@@ -854,7 +925,8 @@ var clientBg = context.Background()
 // enginePeer allows what is in allowed; a permission without a "kind:" prefix is unknown (InvalidArgument).
 type enginePeer struct {
 	pb.UnimplementedPolicyEngineServer
-	allowed map[string]bool
+	allowed       map[string]bool
+	afterDecision func() // runs once, after the engine decided and before it answers
 }
 
 func (e *enginePeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.Decision, error) {
@@ -862,6 +934,10 @@ func (e *enginePeer) Check(_ context.Context, req *pb.CheckRequest) (*pb.Decisio
 		return nil, status.Errorf(codes.InvalidArgument, "unknown permission %q", req.GetPermission())
 	}
 	ok := e.allowed[req.GetSubject()+"|"+req.GetPermission()+"|"+req.GetScope()]
+	if hook := e.afterDecision; hook != nil {
+		e.afterDecision = nil
+		hook()
+	}
 	reason := "no grant"
 	if ok {
 		reason = "granted"
@@ -895,9 +971,15 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Check", 5.0, "")
 	before := ctx.Clock.Now()
+	callsBefore := len(ctx.GRPC.CallsTo("Check", ""))
 	mustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 1.5, "authorize waited %.1f s for a stalled engine, expected two 400 ms attempts", waited)
+	stalled := ctx.GRPC.CallsTo("Check", "")[callsBefore:]
+	ctx.Equal(len(stalled), 2, "a stalled engine must be asked twice, DEADLINE_EXCEEDED is a transport failure retried once; the calls")
+	for _, call := range stalled {
+		ctx.Assert(call.HasDeadline() && 350*time.Millisecond <= call.Timeout && call.Timeout <= 450*time.Millisecond, "an attempt against the stalled engine carried a %v deadline, expected 400 ms: every attempt gets its own full deadline", call.Timeout)
+	}
+	ctx.Assert(waited >= 0.85 && waited <= 1.0, "authorize waited %.2f s for a stalled engine, expected two 400 ms attempts 100 ms apart", waited)
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
@@ -909,6 +991,13 @@ func CheckRetryTransient(ctx *harness.Ctx) {
 	ok, err := authorize(clientBg, "ada", "deploy", "team:eng")
 	ctx.Assert(!ok && err == nil, "an unknown permission (InvalidArgument) answered %v, %v, expected a denial", ok, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", ""))-before, 1, "an unknown permission is the engine's answer, not a transport failure; the calls it took")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.NotFound, codes.FailedPrecondition, codes.Internal} {
+		ctx.GRPC.Fail("Check", code, "the engine refused", 1, "")
+		before = len(ctx.GRPC.CallsTo("Check", ""))
+		ok, err = authorize(clientBg, "ada", "team:write", "team:eng")
+		calls := len(ctx.GRPC.CallsTo("Check", "")) - before
+		ctx.Assert(!ok && err == nil && calls == 1, "the engine answering %v gave %v, %v after %d calls, expected a denial after 1: only Unavailable and DeadlineExceeded are transport failures", code, ok, err, calls)
+	}
 	ctx.GRPC.Fail("Check", codes.Unavailable, "engine down", 10, "")
 	before = len(ctx.GRPC.CallsTo("Check", ""))
 	authorize(clientBg, "ada", "team:write", "team:eng")
@@ -934,10 +1023,30 @@ func CheckCachedAllowVersion(ctx *harness.Ctx) {
 	ok, err := authorize(clientBg, "ada", "team:write", "team:eng")
 	ctx.Assert(!ok && err == nil, "after ada's grant was revoked (perm:grant_version moved) authorize answered %v, %v from the cached allow: an allow counts only at the grant version it was given at", ok, err)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 2, "after the grant version moved the engine must be asked again; the calls")
+	e.afterDecision = func() { // ada's team:read is revoked while the engine's allow is on its way back
+		delete(e.allowed, "ada|team:read|team:eng")
+		ctx.Redis.Do("INCR", "perm:grant_version")
+	}
+	authorize(clientBg, "ada", "team:read", "team:eng")
+	ok, err = authorize(clientBg, "ada", "team:read", "team:eng")
+	ctx.Assert(!ok && err == nil, "a revocation committed while the engine's allow was in flight, and the next check answered %v, %v: the allow must carry the version read before the call, so it is already stale", ok, err)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Check", "")), 4, "after a revocation committed during the call the engine must be asked again; the calls in all")
+	stamped := []string{}
+	for _, key := range ctx.Redis.Keys("*") {
+		if key != "perm:grant_version" {
+			stamped = append(stamped, key)
+		}
+	}
+	ctx.Assert(len(stamped) > 0, "the allow is cached nowhere in Redis")
+	for _, key := range stamped {
+		ttl := ctx.Redis.TTL(key)
+		ctx.Assert(ttl > 50 && ttl <= 60, "the cached allow %s has a TTL of %d s, expected 60", key, ttl)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <functional>
 #include <set>
 #include <string>
 
@@ -949,11 +1058,17 @@ namespace {
 class EnginePeer final : public policyd::PolicyEngine::Service {
  public:
   std::set<std::string> allowed = {"ada|team:read|team:eng", "ada|team:write|team:eng"};
+  std::function<void()> after_decision;  // runs once, after the engine decided and before it answers
   grpc::Status Check(grpc::ServerContext*, const policyd::CheckRequest* req, policyd::Decision* out) override {
     if (req->permission().find(':') == std::string::npos) {
       return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "unknown permission " + req->permission());
     }
     const bool ok = allowed.count(req->subject() + "|" + req->permission() + "|" + req->scope()) > 0;
+    if (after_decision) {
+      const std::function<void()> hook = std::move(after_decision);
+      after_decision = nullptr;
+      hook();
+    }
     out->set_allowed(ok);
     out->set_reason(ok ? "granted" : "no grant");
     return grpc::Status::OK;
@@ -999,9 +1114,16 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Check", 5.0);
   const int64_t before = ctx.Clock.Now();
+  const size_t calls_before = ctx.GRPC.CallsTo("Check").size();
   mustBeUnavailable(ctx, "team:write", "with the engine taking 5 s per call");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 1.5, "authorize waited %.1f s for a stalled engine, expected two 400 ms attempts", waited);
+  const auto calls = ctx.GRPC.CallsTo("Check");
+  ctx.Equal(calls.size() - calls_before, 2, "a stalled engine must be asked twice, DEADLINE_EXCEEDED is a transport failure retried once; the calls");
+  for (size_t i = calls_before; i < calls.size(); ++i) {
+    ctx.Assert(calls[i].HasDeadline() && 0.35 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 0.45,
+               "an attempt against the stalled engine carried a %v s deadline, expected 400 ms: every attempt gets its own full deadline", calls[i].TimeoutSeconds());
+  }
+  ctx.Assert(waited >= 0.85 && waited <= 1.0, "authorize waited %.2f s for a stalled engine, expected two 400 ms attempts 100 ms apart", waited);
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
@@ -1018,6 +1140,24 @@ void CheckRetryTransient(harness::Ctx& ctx) {
   }
   ctx.Equal(ok, false, "an unknown permission (INVALID_ARGUMENT) must be denied; allowed");
   ctx.Equal(ctx.GRPC.CallsTo("Check").size() - before, 1, "an unknown permission is the engine's answer, not a transport failure; the calls it took");
+  for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{
+           {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+           {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+           {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+           {grpc::StatusCode::INTERNAL, "INTERNAL"}}) {
+    ctx.GRPC.Fail("Check", code, "the engine refused", 1);
+    before = ctx.GRPC.CallsTo("Check").size();
+    std::string answer;
+    try {
+      answer = authorize("ada", "team:write", "team:eng") ? "true" : "false";
+    } catch (const PolicyUnavailable&) {
+      answer = "PolicyUnavailable";
+    } catch (const std::exception& e) {
+      answer = std::string("an exception: ") + e.what();
+    }
+    const size_t calls = ctx.GRPC.CallsTo("Check").size() - before;
+    ctx.Assert(answer == "false" && calls == 1, "the engine answering %s gave %s after %d calls, expected a denial after 1: only UNAVAILABLE and DEADLINE_EXCEEDED are transport failures", name, answer, calls);
+  }
   ctx.GRPC.Fail("Check", grpc::StatusCode::UNAVAILABLE, "engine down", 10);
   before = ctx.GRPC.CallsTo("Check").size();
   try {
@@ -1051,6 +1191,27 @@ void CheckCachedAllowVersion(harness::Ctx& ctx) {
   }
   ctx.Equal(ok, false, "after ada's grant was revoked (perm:grant_version moved) authorize must not answer from the cached allow, which counts only at the grant version it was given at; allowed");
   ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 2, "after the grant version moved the engine must be asked again; the calls");
+  engine_peer.after_decision = [&ctx, &engine_peer] {  // ada's team:read is revoked while the engine's allow is on its way back
+    engine_peer.allowed.erase("ada|team:read|team:eng");
+    ctx.Redis.Do("INCR", "perm:grant_version");
+  };
+  try {
+    authorize("ada", "team:read", "team:eng");
+    ok = authorize("ada", "team:read", "team:eng");
+  } catch (const std::exception& e) {
+    ctx.Fatalf("a check after a revocation committed during the engine's call threw %s: %s", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Equal(ok, false, "a revocation committed while the engine's allow was in flight, so the next check must not answer from it: the allow carries the version read before the call; allowed");
+  ctx.Equal(ctx.GRPC.CallsTo("Check").size(), 4, "after a revocation committed during the call the engine must be asked again; the calls in all");
+  std::vector<std::string> stamped;
+  for (const std::string& key : ctx.Redis.Keys("*")) {
+    if (key != "perm:grant_version") stamped.push_back(key);
+  }
+  ctx.Assert(!stamped.empty(), "the allow is cached nowhere in Redis");
+  for (const std::string& key : stamped) {
+    const long long ttl = ctx.Redis.TTL(key);
+    ctx.Assert(ttl > 50 && ttl <= 60, "the cached allow %s has a TTL of %d s, expected 60", key, ttl);
+  }
 }
 `,
   },

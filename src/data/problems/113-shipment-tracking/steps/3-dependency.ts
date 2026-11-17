@@ -59,7 +59,7 @@ carrier that cannot answer; a stale carrier answer rolls the status backward.
       id: 'deadline',
       title: 'Every poll carries a 4-second deadline',
       detail:
-        'The `PollStatus` call is made with a 4-second deadline; without one a carrier that stops answering holds the poll, and the worker running it, open.',
+        'The `PollStatus` call is made with a 4-second deadline; without one a carrier that stops answering holds the poll, and the worker running it, open. A poll that runs out of deadline is a failed poll: recorded, and retried after the backoff.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*4\b/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*4_?000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -72,7 +72,7 @@ carrier that cannot answer; a stale carrier answer rolls the status backward.
       id: 'failure-recorded',
       title: 'Records a failed poll instead of calling it fresh',
       detail:
-        'A failed poll records `mark_poll_failed` with the carrier error and never calls `mark_poll_ok`, so the shipment goes stale after `STALE_AFTER_S` and operations see the error.',
+        'Every failed poll, whatever its gRPC code, records one `mark_poll_failed` with the carrier error and never calls `mark_poll_ok`, so the shipment goes stale after `STALE_AFTER_S` and operations see the error.',
       match: {
         python: {all: [/store\.mark_poll_failed\(/], order: [/except\s+grpc\.RpcError/, /store\.mark_poll_failed\(/]},
         typescript: {all: [/store\.markPollFailed\(/], order: [/catch\s*\(/, /store\.markPollFailed\(/]},
@@ -623,10 +623,13 @@ def check_deadline(ctx):
         assert call.timeout is not None, "PollStatus carries no deadline: a carrier that stops answering holds the poll open"
         assert 3.5 <= call.timeout <= 4.5, f"PollStatus carries a {call.timeout} s deadline, expected DEADLINE_S = 4"
     ctx.grpc.set_latency("PollStatus", 30.0)
-    started = time.time()
+    started = int(time.time())
     result = m.poll_shipment(SHIP, 0)
     assert result.get("polled") is False, f"a carrier slower than the deadline must fail the poll, got {result}"
     assert time.time() - started <= 5, f"a poll of a carrier that takes 30 s held on for {time.time() - started:.0f} s"
+    health = store.poll_health(SHIP, int(time.time()))
+    assert health["failures"] == 1 and health["last_error"] != "", f"a poll that ran out of deadline is a failed poll and must be recorded like any other, poll health is {health}"
+    assert _due(ctx) is not None and started + 30 <= _due(ctx) <= started + 35, f"after a poll that ran out of deadline at attempt 0 the next poll is due {None if _due(ctx) is None else _due(ctx) - started} s out, expected 30 s (the backoff)"
 
 
 def check_failure_recorded(ctx):
@@ -637,9 +640,15 @@ def check_failure_recorded(ctx):
     assert result.get("polled") is False, f"a poll the carrier refused must answer polled False, got {result}"
     health = store.poll_health(SHIP, int(time.time()))
     assert health["last_ok_at"] == 0, f"a failed poll recorded a good one at {health['last_ok_at']}: the feed must go stale, not look fresh"
-    assert health["failures"] >= 1 and health["last_error"] == DOWN, f"a failed poll must record the failure and the carrier's error ({DOWN!r}), poll health is {health}"
+    assert health["failures"] == 1 and health["last_error"] == DOWN, f"a failed poll must record one failure and the carrier's error ({DOWN!r}), poll health is {health}"
     assert health["stale"] is True, f"1000 s after the label with no good poll the shipment must be stale (STALE_AFTER_S = 900), poll health is {health}"
     assert store.get_shipment(SHIP)["status"] == "label", f"a failed poll wrote status {store.get_shipment(SHIP)['status']}"
+    for failures, (code, message) in enumerate(((grpc.StatusCode.INTERNAL, "UPS adapter crashed"), (grpc.StatusCode.PERMISSION_DENIED, "carrier account suspended")), start=2):
+        ctx.grpc.failures.clear()
+        ctx.grpc.fail("PollStatus", code, message, times=1)
+        result = m.poll_shipment(SHIP, failures - 1)
+        health = store.poll_health(SHIP, int(time.time()))
+        assert result.get("polled") is False and health["failures"] == failures and health["last_error"] == message, f"a poll the carrier failed with {code.name} ({message!r}) answered {result} and left poll health {health}: every failed poll is recorded, whatever its code"
     ctx.grpc.failures.clear()
     assert m.poll_shipment(SHIP, 1).get("polled") is True, "once the carrier answers again the poll must succeed"
     health = store.poll_health(SHIP, int(time.time()))
@@ -703,7 +712,7 @@ function due(ctx): number | null {
 }
 
 export async function check_deadline(ctx) {
-  const {m} = await client(ctx);
+  const {m, store} = await client(ctx);
   assert.equal((await m.pollShipment(SHIP, 0)).polled, true, 'with the carrier answering, the poll must succeed');
   const calls = ctx.grpc.callsTo('PollStatus');
   assert(calls.length > 0, 'no PollStatus call was made');
@@ -712,10 +721,14 @@ export async function check_deadline(ctx) {
     assert(3.5 <= call.timeout && call.timeout <= 4.5, \`PollStatus carries a \${call.timeout} s deadline, expected DEADLINE_MS = 4000\`);
   }
   ctx.grpc.setLatency('PollStatus', 30.0);
-  const started = Date.now();
+  const started = nowS();
   const result = await m.pollShipment(SHIP, 0);
   assert.equal(result.polled, false, \`a carrier slower than the deadline must fail the poll, got \${JSON.stringify(result)}\`);
-  assert(Date.now() - started <= 5000, \`a poll of a carrier that takes 30 s held on for \${(Date.now() - started) / 1000} s\`);
+  assert(nowS() - started <= 5, \`a poll of a carrier that takes 30 s held on for \${nowS() - started} s\`);
+  const health = await store.pollHealth(SHIP, nowS());
+  assert(health.failures === 1 && health.last_error !== '', \`a poll that ran out of deadline is a failed poll and must be recorded like any other, poll health is \${JSON.stringify(health)}\`);
+  const next = due(ctx);
+  assert(next !== null && started + 30 <= next && next <= started + 35, \`after a poll that ran out of deadline at attempt 0 the next poll is due \${next === null ? null : next - started} s out, expected 30 s (the backoff)\`);
 }
 
 export async function check_failure_recorded(ctx) {
@@ -726,9 +739,17 @@ export async function check_failure_recorded(ctx) {
   assert.equal(result.polled, false, \`a poll the carrier refused must answer polled false, got \${JSON.stringify(result)}\`);
   let health = await store.pollHealth(SHIP, nowS());
   assert.equal(health.last_ok_at, 0, \`a failed poll recorded a good one at \${health.last_ok_at}: the feed must go stale, not look fresh\`);
-  assert(health.failures >= 1 && health.last_error === DOWN, \`a failed poll must record the failure and the carrier's error (\${DOWN}), poll health is \${JSON.stringify(health)}\`);
+  assert(health.failures === 1 && health.last_error === DOWN, \`a failed poll must record one failure and the carrier's error (\${DOWN}), poll health is \${JSON.stringify(health)}\`);
   assert.equal(health.stale, true, \`1000 s after the label with no good poll the shipment must be stale (STALE_AFTER_S = 900), poll health is \${JSON.stringify(health)}\`);
   assert.equal((await store.getShipment(SHIP)).status, 'label', 'a failed poll must write no status');
+  const others: [string, string][] = [['INTERNAL', 'UPS adapter crashed'], ['PERMISSION_DENIED', 'carrier account suspended']];
+  for (const [i, [code, message]] of others.entries()) {
+    ctx.grpc.clearFailures();
+    ctx.grpc.fail('PollStatus', ctx.grpc.status[code], message, 1);
+    const failed = await m.pollShipment(SHIP, i + 1);
+    health = await store.pollHealth(SHIP, nowS());
+    assert(failed.polled === false && health.failures === i + 2 && health.last_error === message, \`a poll the carrier failed with \${code} (\${message}) answered \${JSON.stringify(failed)} and left poll health \${JSON.stringify(health)}: every failed poll is recorded, whatever its code\`);
+  }
   ctx.grpc.clearFailures();
   assert.equal((await m.pollShipment(SHIP, 1)).polled, true, 'once the carrier answers again the poll must succeed');
   health = await store.pollHealth(SHIP, nowS());
@@ -783,43 +804,43 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-const down = "carrier gateway unreachable"
+const hDown = "carrier gateway unreachable"
 
-// carrierPeer answers the scan it holds for every shipment.
-type carrierPeer struct {
+// hCarrierPeer answers the scan it holds for every shipment.
+type hCarrierPeer struct {
 	pb.UnimplementedCarrierGatewayServer
 	status string
 	at     int64
 	city   string
 }
 
-func (c *carrierPeer) PollStatus(_ context.Context, _ *pb.PollRequest) (*pb.CarrierScan, error) {
+func (c *hCarrierPeer) PollStatus(_ context.Context, _ *pb.PollRequest) (*pb.CarrierScan, error) {
 	return &pb.CarrierScan{Status: c.status, ScanAt: c.at, City: c.city, CarrierRef: "1Z999"}, nil
 }
 
-func client(ctx *harness.Ctx, status string) *carrierPeer {
-	peer := &carrierPeer{status: "in_transit", at: 100, city: "Memphis"}
+func hClient(ctx *harness.Ctx, status string) *hCarrierPeer {
+	peer := &hCarrierPeer{status: "in_transit", at: 100, city: "Memphis"}
 	pb.RegisterCarrierGatewayServer(ctx.GRPC.Server(""), peer)
-	store.Save(clientBg, store.Shipment{ShipmentID: "shp_1", TenantID: "t-acme", OrderID: "ord_1", Carrier: "ups", ServiceLevel: "ground", Status: status, CreatedAt: time.Now().Unix()})
+	store.Save(hClientBg, store.Shipment{ShipmentID: "shp_1", TenantID: "t-acme", OrderID: "ord_1", Carrier: "ups", ServiceLevel: "ground", Status: status, CreatedAt: time.Now().Unix()})
 	return peer
 }
 
-func mustPoll(ctx *harness.Ctx, attempt int) PollResult {
-	result, err := pollShipment(clientBg, "shp_1", attempt)
+func hMustPoll(ctx *harness.Ctx, attempt int) PollResult {
+	result, err := pollShipment(hClientBg, "shp_1", attempt)
 	ctx.NoError(err, "pollShipment(shp_1, %d) failed", attempt)
 	return result
 }
 
-func due(ctx *harness.Ctx) int64 {
+func hDue(ctx *harness.Ctx) int64 {
 	score, _ := ctx.Redis.ZScore("poll:due", "shp_1")
 	return int64(score)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx, "label")
-	ctx.Equal(mustPoll(ctx, 0).Polled, true, "with the carrier answering, the poll must succeed; polled")
+	hClient(ctx, "label")
+	ctx.Equal(hMustPoll(ctx, 0).Polled, true, "with the carrier answering, the poll must succeed; polled")
 	calls := ctx.GRPC.CallsTo("PollStatus", "")
 	ctx.Assert(len(calls) > 0, "no PollStatus call was made")
 	for _, call := range calls {
@@ -828,57 +849,72 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("PollStatus", 30.0, "")
 	started := time.Now()
-	result := mustPoll(ctx, 0)
+	result := hMustPoll(ctx, 0)
 	ctx.Equal(result.Polled, false, "a carrier slower than the deadline must fail the poll; polled")
 	ctx.Assert(time.Since(started) <= 5*time.Second, "a poll of a carrier that takes 30 s held on for %v", time.Since(started))
+	health := store.PollHealth(hClientBg, "shp_1", time.Now().Unix())
+	ctx.Assert(health.Failures == 1 && health.LastError != "", "a poll that ran out of deadline is a failed poll and must be recorded like any other, poll health is %+v", health)
+	wait := hDue(ctx) - started.Unix()
+	ctx.Assert(30 <= wait && wait <= 35, "after a poll that ran out of deadline at attempt 0 the next poll is due %d s out, expected 30 s (the backoff)", wait)
 }
 
 func CheckFailureRecorded(ctx *harness.Ctx) {
-	client(ctx, "label")
+	hClient(ctx, "label")
 	ctx.Clock.Advance(1000)
-	ctx.GRPC.Fail("PollStatus", codes.Unavailable, down, 10, "")
-	ctx.Equal(mustPoll(ctx, 0).Polled, false, "a poll the carrier refused; polled")
-	health := store.PollHealth(clientBg, "shp_1", time.Now().Unix())
+	ctx.GRPC.Fail("PollStatus", codes.Unavailable, hDown, 10, "")
+	ctx.Equal(hMustPoll(ctx, 0).Polled, false, "a poll the carrier refused; polled")
+	health := store.PollHealth(hClientBg, "shp_1", time.Now().Unix())
 	ctx.Equal(health.LastOKAt, 0, "a failed poll must not record a good one (the feed must go stale, not look fresh); last_ok_at")
-	ctx.Assert(health.Failures >= 1 && health.LastError == down, "a failed poll must record the failure and the carrier's error (%q), poll health is %+v", down, health)
+	ctx.Assert(health.Failures == 1 && health.LastError == hDown, "a failed poll must record one failure and the carrier's error (%q), poll health is %+v", hDown, health)
 	ctx.Equal(health.Stale, true, "1000 s after the label with no good poll the shipment must be stale (StaleAfterS = 900); stale")
-	ctx.Equal(store.GetShipment(clientBg, "shp_1").Status, "label", "a failed poll must write no status; the status")
+	ctx.Equal(store.GetShipment(hClientBg, "shp_1").Status, "label", "a failed poll must write no status; the status")
+	for i, c := range []struct {
+		code    codes.Code
+		message string
+	}{{codes.Internal, "UPS adapter crashed"}, {codes.PermissionDenied, "carrier account suspended"}} {
+		ctx.GRPC.ClearFailures()
+		ctx.GRPC.Fail("PollStatus", c.code, c.message, 1, "")
+		failed := hMustPoll(ctx, i+1)
+		health = store.PollHealth(hClientBg, "shp_1", time.Now().Unix())
+		ctx.Assert(!failed.Polled && health.Failures == int64(i+2) && health.LastError == c.message,
+			"a poll the carrier failed with %v (%q) answered %+v and left poll health %+v: every failed poll is recorded, whatever its code", c.code, c.message, failed, health)
+	}
 	ctx.GRPC.ClearFailures()
-	ctx.Equal(mustPoll(ctx, 1).Polled, true, "once the carrier answers again the poll must succeed; polled")
-	health = store.PollHealth(clientBg, "shp_1", time.Now().Unix())
+	ctx.Equal(hMustPoll(ctx, 1).Polled, true, "once the carrier answers again the poll must succeed; polled")
+	health = store.PollHealth(hClientBg, "shp_1", time.Now().Unix())
 	ctx.Assert(health.Failures == 0 && !health.Stale, "a good poll must reset the failures and the staleness, poll health is %+v", health)
 }
 
 func CheckScheduler(ctx *harness.Ctx) {
-	client(ctx, "label")
-	ctx.GRPC.Fail("PollStatus", codes.Unavailable, down, 1, "")
+	hClient(ctx, "label")
+	ctx.GRPC.Fail("PollStatus", codes.Unavailable, hDown, 1, "")
 	now := time.Now().Unix()
-	mustPoll(ctx, 0)
+	hMustPoll(ctx, 0)
 	ctx.Equal(len(ctx.GRPC.CallsTo("PollStatus", "")), 1, "a failure is retried by the scheduler, not inside the poll; PollStatus calls in one poll")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a worker must not wait on a carrier that is down; the poll's sleeps")
-	ctx.Equal(due(ctx), now+30, "after a failed attempt 0 the next poll must be due at now + 30 s")
+	ctx.Equal(hDue(ctx), now+30, "after a failed attempt 0 the next poll must be due at now + 30 s")
 	for _, c := range []struct{ attempt, wait int64 }{{3, 240}, {10, 1800}} {
-		ctx.GRPC.Fail("PollStatus", codes.Unavailable, down, 1, "")
+		ctx.GRPC.Fail("PollStatus", codes.Unavailable, hDown, 1, "")
 		now = time.Now().Unix()
-		mustPoll(ctx, int(c.attempt))
-		ctx.Equal(due(ctx)-now, c.wait, "after a failed attempt %d, seconds until the next poll (30 s doubling, at most 1800 s)", c.attempt)
+		hMustPoll(ctx, int(c.attempt))
+		ctx.Equal(hDue(ctx)-now, c.wait, "after a failed attempt %d, seconds until the next poll (30 s doubling, at most 1800 s)", c.attempt)
 	}
 	now = time.Now().Unix()
-	mustPoll(ctx, 0)
-	ctx.Equal(due(ctx)-now, 3600, "after a good poll, seconds until the routine poll (pollIntervalS)")
+	hMustPoll(ctx, 0)
+	ctx.Equal(hDue(ctx)-now, 3600, "after a good poll, seconds until the routine poll (pollIntervalS)")
 }
 
 func CheckApplyThroughState(ctx *harness.Ctx) {
-	peer := client(ctx, "out_for_delivery")
+	peer := hClient(ctx, "out_for_delivery")
 	peer.status, peer.at, peer.city = "in_transit", 500, "Leeds"
-	result := mustPoll(ctx, 0)
-	ctx.Equal(store.GetShipment(clientBg, "shp_1").Status, "out_for_delivery", "the carrier answered an in_transit scan for a shipment out for delivery: the answer goes through timeline.ApplyScan, which drops it; the status")
+	result := hMustPoll(ctx, 0)
+	ctx.Equal(store.GetShipment(hClientBg, "shp_1").Status, "out_for_delivery", "the carrier answered an in_transit scan for a shipment out for delivery: the answer goes through timeline.ApplyScan, which drops it; the status")
 	ctx.Equal(result.Status, "out_for_delivery", "the poll must answer the status the shipment holds; the answered status")
-	ctx.Equal(store.Rejects(clientBg, "shp_1"), []string{"out_for_delivery->in_transit"}, "the dropped answer must be recorded; the rejects")
+	ctx.Equal(store.Rejects(hClientBg, "shp_1"), []string{"out_for_delivery->in_transit"}, "the dropped answer must be recorded; the rejects")
 	peer.status, peer.at = "delivered", 600
-	mustPoll(ctx, 0)
-	ctx.Equal(store.GetShipment(clientBg, "shp_1").Status, "delivered", "a delivered answer must apply; the status")
-	scans := store.Scans(clientBg, "shp_1")
+	hMustPoll(ctx, 0)
+	ctx.Equal(store.GetShipment(hClientBg, "shp_1").Status, "delivered", "a delivered answer must apply; the status")
+	scans := store.Scans(hClientBg, "shp_1")
 	ctx.Assert(len(scans) == 1 && scans[0].Status == "delivered", "the applied scan must join the timeline, scans are %+v", scans)
 }
 `,
@@ -892,10 +928,10 @@ func CheckApplyThroughState(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kDown = "carrier gateway unreachable";
+const std::string kHDown = "carrier gateway unreachable";
 
 // Answers the scan it holds for every shipment.
-class CarrierPeer final : public shiptrack::CarrierGateway::Service {
+class HCarrierPeer final : public shiptrack::CarrierGateway::Service {
  public:
   std::string status = "in_transit";
   long at = 100;
@@ -909,16 +945,20 @@ class CarrierPeer final : public shiptrack::CarrierGateway::Service {
   }
 };
 
-CarrierPeer& client(harness::Ctx& ctx, const std::string& status) {
-  static CarrierPeer* peer = nullptr;
+long h_now_s() {
+  return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+HCarrierPeer& h_client(harness::Ctx& ctx, const std::string& status) {
+  static HCarrierPeer* peer = nullptr;
   delete peer;
-  peer = new CarrierPeer;
+  peer = new HCarrierPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
-  store::save(store::Shipment{"shp_1", "t-acme", "ord_1", "ups", "ground", status, "", now_seconds()});
+  store::save(store::Shipment{"shp_1", "t-acme", "ord_1", "ups", "ground", status, "", h_now_s()});
   return *peer;
 }
 
-PollResult mustPoll(harness::Ctx& ctx, int attempt) {
+PollResult h_must_poll(harness::Ctx& ctx, int attempt) {
   try {
     return pollShipment("shp_1", attempt);
   } catch (const std::exception& e) {
@@ -927,13 +967,13 @@ PollResult mustPoll(harness::Ctx& ctx, int attempt) {
   return {};
 }
 
-long due(harness::Ctx& ctx) { return static_cast<long>(ctx.Redis.ZScore("poll:due", "shp_1").value_or(0)); }
+long h_due(harness::Ctx& ctx) { return static_cast<long>(ctx.Redis.ZScore("poll:due", "shp_1").value_or(0)); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx, "label");
-  ctx.Equal(mustPoll(ctx, 0).polled, true, "with the carrier answering, the poll must succeed; polled");
+  h_client(ctx, "label");
+  ctx.Equal(h_must_poll(ctx, 0).polled, true, "with the carrier answering, the poll must succeed; polled");
   const auto calls = ctx.GRPC.CallsTo("PollStatus");
   ctx.Assert(!calls.empty(), "no PollStatus call was made");
   for (const auto& call : calls) {
@@ -941,59 +981,74 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(3.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 4.5, "PollStatus carries a %v s deadline, expected kDeadline = 4 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("PollStatus", 30.0);
-  const long started = now_seconds();
-  const PollResult result = mustPoll(ctx, 0);
+  const long started = h_now_s();
+  const PollResult result = h_must_poll(ctx, 0);
   ctx.Equal(result.polled, false, "a carrier slower than the deadline must fail the poll; polled");
-  ctx.Assert(now_seconds() - started <= 5, "a poll of a carrier that takes 30 s held on for %d s", now_seconds() - started);
+  ctx.Assert(h_now_s() - started <= 5, "a poll of a carrier that takes 30 s held on for %d s", h_now_s() - started);
+  const auto health = store::pollHealth("shp_1", h_now_s());
+  ctx.Assert(health.failures == 1 && !health.last_error.empty(), "a poll that ran out of deadline is a failed poll and must be recorded like any other, got failures %d last_error %q", health.failures, health.last_error);
+  const long wait = h_due(ctx) - started;
+  ctx.Assert(30 <= wait && wait <= 35, "after a poll that ran out of deadline at attempt 0 the next poll is due %d s out, expected 30 s (the backoff)", wait);
 }
 
 void CheckFailureRecorded(harness::Ctx& ctx) {
-  client(ctx, "label");
+  h_client(ctx, "label");
   ctx.Clock.Advance(1000);
-  ctx.GRPC.Fail("PollStatus", grpc::StatusCode::UNAVAILABLE, kDown, 10);
-  ctx.Equal(mustPoll(ctx, 0).polled, false, "a poll the carrier refused; polled");
-  auto health = store::pollHealth("shp_1", now_seconds());
+  ctx.GRPC.Fail("PollStatus", grpc::StatusCode::UNAVAILABLE, kHDown, 10);
+  ctx.Equal(h_must_poll(ctx, 0).polled, false, "a poll the carrier refused; polled");
+  auto health = store::pollHealth("shp_1", h_now_s());
   ctx.Equal(health.last_ok_at, 0, "a failed poll must not record a good one (the feed must go stale, not look fresh); last_ok_at");
-  ctx.Assert(health.failures >= 1 && health.last_error == kDown, "a failed poll must record the failure and the carrier's error (%q), got failures %d last_error %q", kDown, health.failures, health.last_error);
+  ctx.Assert(health.failures == 1 && health.last_error == kHDown, "a failed poll must record one failure and the carrier's error (%q), got failures %d last_error %q", kHDown, health.failures, health.last_error);
   ctx.Equal(health.stale, true, "1000 s after the label with no good poll the shipment must be stale (kStaleAfterS = 900); stale");
   ctx.Equal(store::getShipment("shp_1")->status, "label", "a failed poll must write no status; the status");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> others = {{grpc::StatusCode::INTERNAL, "UPS adapter crashed"},
+                                                                        {grpc::StatusCode::PERMISSION_DENIED, "carrier account suspended"}};
+  for (size_t i = 0; i < others.size(); ++i) {
+    ctx.GRPC.ClearFailures();
+    ctx.GRPC.Fail("PollStatus", others[i].first, others[i].second, 1);
+    const PollResult failed = h_must_poll(ctx, static_cast<int>(i) + 1);
+    health = store::pollHealth("shp_1", h_now_s());
+    ctx.Assert(!failed.polled && health.failures == static_cast<long>(i) + 2 && health.last_error == others[i].second,
+               "a poll the carrier failed with code %d (%q) answered polled %t and left failures %d last_error %q: every failed poll is recorded, whatever its code",
+               static_cast<int>(others[i].first), others[i].second, failed.polled, health.failures, health.last_error);
+  }
   ctx.GRPC.ClearFailures();
-  ctx.Equal(mustPoll(ctx, 1).polled, true, "once the carrier answers again the poll must succeed; polled");
-  health = store::pollHealth("shp_1", now_seconds());
+  ctx.Equal(h_must_poll(ctx, 1).polled, true, "once the carrier answers again the poll must succeed; polled");
+  health = store::pollHealth("shp_1", h_now_s());
   ctx.Assert(health.failures == 0 && !health.stale, "a good poll must reset the failures and the staleness, got failures %d stale %t", health.failures, health.stale);
 }
 
 void CheckScheduler(harness::Ctx& ctx) {
-  client(ctx, "label");
-  ctx.GRPC.Fail("PollStatus", grpc::StatusCode::UNAVAILABLE, kDown, 1);
-  long now = now_seconds();
-  mustPoll(ctx, 0);
+  h_client(ctx, "label");
+  ctx.GRPC.Fail("PollStatus", grpc::StatusCode::UNAVAILABLE, kHDown, 1);
+  long now = h_now_s();
+  h_must_poll(ctx, 0);
   ctx.Equal(ctx.GRPC.CallsTo("PollStatus").size(), 1, "a failure is retried by the scheduler, not inside the poll; PollStatus calls in one poll");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a worker must not wait on a carrier that is down; the poll's sleeps");
-  ctx.Equal(due(ctx), now + 30, "after a failed attempt 0 the next poll must be due at now + 30 s");
+  ctx.Equal(h_due(ctx), now + 30, "after a failed attempt 0 the next poll must be due at now + 30 s");
   for (const auto& [attempt, wait] : std::vector<std::pair<int, long>>{{3, 240}, {10, 1800}}) {
-    ctx.GRPC.Fail("PollStatus", grpc::StatusCode::UNAVAILABLE, kDown, 1);
-    now = now_seconds();
-    mustPoll(ctx, attempt);
-    ctx.Equal(due(ctx) - now, wait, "after a failed attempt %d, seconds until the next poll (30 s doubling, at most 1800 s)", attempt);
+    ctx.GRPC.Fail("PollStatus", grpc::StatusCode::UNAVAILABLE, kHDown, 1);
+    now = h_now_s();
+    h_must_poll(ctx, attempt);
+    ctx.Equal(h_due(ctx) - now, wait, "after a failed attempt %d, seconds until the next poll (30 s doubling, at most 1800 s)", attempt);
   }
-  now = now_seconds();
-  mustPoll(ctx, 0);
-  ctx.Equal(due(ctx) - now, 3600, "after a good poll, seconds until the routine poll (kPollIntervalS)");
+  now = h_now_s();
+  h_must_poll(ctx, 0);
+  ctx.Equal(h_due(ctx) - now, 3600, "after a good poll, seconds until the routine poll (kPollIntervalS)");
 }
 
 void CheckApplyThroughState(harness::Ctx& ctx) {
-  CarrierPeer& peer = client(ctx, "out_for_delivery");
+  HCarrierPeer& peer = h_client(ctx, "out_for_delivery");
   peer.status = "in_transit";
   peer.at = 500;
   peer.city = "Leeds";
-  const PollResult result = mustPoll(ctx, 0);
+  const PollResult result = h_must_poll(ctx, 0);
   ctx.Equal(store::getShipment("shp_1")->status, "out_for_delivery", "the carrier answered an in_transit scan for a shipment out for delivery: the answer goes through timeline::applyScan, which drops it; the status");
   ctx.Equal(result.status, "out_for_delivery", "the poll must answer the status the shipment holds; the answered status");
   ctx.Equal(store::rejects("shp_1"), {"out_for_delivery->in_transit"}, "the dropped answer must be recorded; the rejects");
   peer.status = "delivered";
   peer.at = 600;
-  mustPoll(ctx, 0);
+  h_must_poll(ctx, 0);
   ctx.Equal(store::getShipment("shp_1")->status, "delivered", "a delivered answer must apply; the status");
   const auto scans = store::scans("shp_1");
   ctx.Assert(scans.size() == 1 && scans[0].status == "delivered", "the applied scan must join the timeline, got %d scan(s)", scans.size());

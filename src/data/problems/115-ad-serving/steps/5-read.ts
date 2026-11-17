@@ -64,7 +64,7 @@ ads that were served but did not render, and every campaign looks behind on its 
       id: 'advertiser-scope',
       title: 'Answers only the advertiser who owns the campaign',
       detail:
-        'A request without `X-Advertiser-Id` is **401**, and one from an advertiser other than the campaign’s `advertiser_id` is **403**, so no account reads another’s delivery. The starter answers anyone.',
+        'A request without `X-Advertiser-Id` is **401**, even one naming the advertiser in the query string, and one from an advertiser other than the campaign’s `advertiser_id` is **403**, so no account reads another’s delivery. The starter answers anyone.',
       match: {
         python: {
           all: [/x-advertiser-id/i, /\[["']advertiser_id["']\]/, /status_code\s*=\s*401/, /status_code\s*=\s*403/],
@@ -79,7 +79,7 @@ ads that were served but did not render, and every campaign looks behind on its 
       id: 'render-counts',
       title: 'Reports what rendered, not what was served',
       detail:
-        '`impressions` and `spend_micros` come from `render:{id}` through `store.rendered`, and `counted_at` is `render`. The starter divides the pacing counter, which also holds serves that never rendered, by the bid.',
+        '`impressions` and `spend_micros` both come from `render:{id}` through `store.rendered` (renders can clear below the bid, so spend is not impressions times `bid_micros`), and `counted_at` is `render`. The starter divides the pacing counter, which also holds serves that never rendered, by the bid.',
       match: {
         python: {all: [/store\.rendered\(/, /["']counted_at["']\s*:\s*["']render["']/], none: [/store\.spent\(/]},
         typescript: {all: [/\brendered\(/, /counted_at:\s*['"]render['"]/], none: [/\bspent\(/]},
@@ -92,7 +92,7 @@ ads that were served but did not render, and every campaign looks behind on its 
       id: 'under-delivery',
       title: 'Projects under-delivery from the pace so far',
       detail:
-        'The shortfall is the goal minus the impressions projected over the whole flight at the rate since `start_ts`, so a campaign on pace shows 0 at mid-flight and one behind shows its real gap. The starter subtracts the impressions so far, which flags every campaign that has just started.',
+        'The shortfall is the goal minus the impressions projected over the whole flight at the rate since `start_ts`, so a campaign on pace shows 0 at mid-flight, one ahead of pace shows 0 rather than a negative number, one behind shows its real gap, and one that starts this very second divides by 1 s, not by zero. The starter subtracts the impressions so far, which flags every campaign that has just started.',
       match: {
         python: {all: [/time\.time\(\)|datetime\.now\(/, /start_ts/, /end_ts/]},
         typescript: {all: [/Date\.now\(\)/, /start_ts/, /end_ts/]},
@@ -482,7 +482,7 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/campaigns/([\\w-]+)/
 OWNER = {"X-Advertiser-Id": "adv-1"}
 
 
-def _read(ctx, **fields):
+def _put(ctx, **fields):
     """Campaign c-1 of adv-1, half-way through a one-day flight with a goal of 1000 impressions."""
     now = int(ctx.clock.time())
     campaign = {
@@ -492,6 +492,10 @@ def _read(ctx, **fields):
     }
     campaign.update(fields)
     store.put_campaign(campaign)
+
+
+def _read(ctx):
+    _put(ctx)
     return ctx.client(ctx.load("read").app)
 
 
@@ -509,6 +513,8 @@ async def check_advertiser_scope(ctx):
     async with _read(ctx) as c:
         anonymous = await c.get("/v1/campaigns/c-1/delivery")
         assert anonymous.status_code == 401, f"a request without X-Advertiser-Id answered {anonymous.status_code} {anonymous.text}, expected 401"
+        queried = await c.get("/v1/campaigns/c-1/delivery?advertiser_id=adv-1")
+        assert queried.status_code == 401, f"a request naming adv-1 in the query string but without X-Advertiser-Id answered {queried.status_code} {queried.text}, expected 401: the caller's identity comes from the header alone"
         rival = await c.get("/v1/campaigns/c-1/delivery", headers={"X-Advertiser-Id": "adv-2"})
         assert rival.status_code == 403, f"adv-2 asked for adv-1's campaign and got {rival.status_code} {rival.text}: one account must not read another's delivery. Expected 403"
         owner = await c.get("/v1/campaigns/c-1/delivery", headers=OWNER)
@@ -518,14 +524,14 @@ async def check_advertiser_scope(ctx):
 async def check_render_counts(ctx):
     client = _read(ctx)
     ctx.redis.set("pace:c-1", 9000)  # six serves reserved at 1500 micros
-    ctx.redis.hset("render:c-1", mapping={"impressions": 4, "spend_micros": 6000})  # four of them rendered
+    ctx.redis.hset("render:c-1", mapping={"impressions": 4, "spend_micros": 5800})  # four of them rendered, one cleared at 1300
     async with client as c:
         r = await c.get("/v1/campaigns/c-1/delivery", headers=OWNER)
     assert r.status_code == 200, f"the owner got {r.status_code} {r.text}"
     body = r.json()
     got = {k: body.get(k) for k in ("counted_at", "impressions", "spend_micros")}
-    want = {"counted_at": "render", "impressions": 4, "spend_micros": 6000}
-    assert got == want, f"six ads were served and four rendered; the report says {got}, expected {want}: the advertiser pays for what rendered"
+    want = {"counted_at": "render", "impressions": 4, "spend_micros": 5800}
+    assert got == want, f"six ads were served and four rendered for 5800 micros; the report says {got}, expected {want}: the advertiser pays for what rendered, at the prices the render counter holds"
 
 
 async def check_under_delivery(ctx):
@@ -534,17 +540,24 @@ async def check_under_delivery(ctx):
         ctx.redis.hset("render:c-1", mapping={"impressions": 500, "spend_micros": 750_000})
         on_pace = (await c.get("/v1/campaigns/c-1/delivery", headers=OWNER)).json().get("under_delivery_impressions")
         assert on_pace == 0, f"half-way through the flight with 500 of 1000 impressions the campaign is on pace, the report says {on_pace} short"
+        ctx.redis.hset("render:c-1", mapping={"impressions": 600, "spend_micros": 900_000})
+        ahead = (await c.get("/v1/campaigns/c-1/delivery", headers=OWNER)).json().get("under_delivery_impressions")
+        assert ahead == 0, f"half-way through with 600 of 1000 the campaign projects 1200, the report says {ahead} short, expected 0: the shortfall is floored at 0"
         ctx.redis.hset("render:c-1", mapping={"impressions": 400, "spend_micros": 600_000})
         behind = (await c.get("/v1/campaigns/c-1/delivery", headers=OWNER)).json().get("under_delivery_impressions")
         assert behind == 200, f"half-way through with 400 of 1000 the campaign projects 800, the report says {behind} short, expected 200"
         ctx.clock.advance(86400)  # the flight is over
         ended = (await c.get("/v1/campaigns/c-1/delivery", headers=OWNER)).json().get("under_delivery_impressions")
-    assert ended == 600, f"after the flight ended with 400 of 1000 the report says {ended} short, expected 600: the projection stops at end_ts"
+        assert ended == 600, f"after the flight ended with 400 of 1000 the report says {ended} short, expected 600: the projection stops at end_ts"
+        now = int(ctx.clock.time())
+        _put(ctx, campaign_id="c-2", start_ts=now, end_ts=now + 86400)  # starts this second, nothing rendered yet
+        r = await c.get("/v1/campaigns/c-2/delivery", headers=OWNER)
+    assert r.status_code == 200 and r.json().get("under_delivery_impressions") == 1000, f"a campaign starting this very second answered {r.status_code} {r.text}, expected 1000 short: elapsed is at least 1 s, never a division by zero"
 `,
     typescript: `const OWNER = {'X-Advertiser-Id': 'adv-1'};
 
 /** Campaign c-1 of adv-1, half-way through a one-day flight with a goal of 1000 impressions. */
-async function read(ctx) {
+async function put(ctx, fields = {}) {
   const store = ctx.load('/support/ads/store.ts');
   const now = Math.floor(ctx.clock.now() / 1000);
   await store.putCampaign({
@@ -561,7 +574,12 @@ async function read(ctx) {
     goal_impressions: 1000,
     start_ts: now - 43200,
     end_ts: now + 43200,
+    ...fields,
   });
+}
+
+async function read(ctx) {
+  await put(ctx);
   return ctx.client(ctx.load('read').app);
 }
 
@@ -581,6 +599,8 @@ export async function check_advertiser_scope(ctx) {
   const c = await read(ctx);
   const anonymous = await c.get('/v1/campaigns/c-1/delivery');
   assert.equal(anonymous.status, 401, \`a request without X-Advertiser-Id answered \${anonymous.status} \${anonymous.text}, expected 401\`);
+  const queried = await c.get('/v1/campaigns/c-1/delivery?advertiser_id=adv-1');
+  assert.equal(queried.status, 401, \`a request naming adv-1 in the query string but without X-Advertiser-Id answered \${queried.status} \${queried.text}, expected 401: the caller's identity comes from the header alone\`);
   const rival = await c.get('/v1/campaigns/c-1/delivery', {headers: {'X-Advertiser-Id': 'adv-2'}});
   assert.equal(rival.status, 403, \`adv-2 asked for adv-1's campaign and got \${rival.status} \${rival.text}: one account must not read another's delivery. Expected 403\`);
   const owner = await c.get('/v1/campaigns/c-1/delivery', {headers: OWNER});
@@ -590,12 +610,12 @@ export async function check_advertiser_scope(ctx) {
 export async function check_render_counts(ctx) {
   const c = await read(ctx);
   ctx.redis.set('pace:c-1', '9000'); // six serves reserved at 1500 micros
-  ctx.redis.hset('render:c-1', 'impressions', '4', 'spend_micros', '6000'); // four of them rendered
+  ctx.redis.hset('render:c-1', 'impressions', '4', 'spend_micros', '5800'); // four of them rendered, one cleared at 1300
   const r = await c.get('/v1/campaigns/c-1/delivery', {headers: OWNER});
   assert.equal(r.status, 200, \`the owner got \${r.status} \${r.text}\`);
   const {counted_at, impressions, spend_micros} = r.json();
   const got = {counted_at, impressions, spend_micros};
-  assert.deepStrictEqual(got, {counted_at: 'render', impressions: 4, spend_micros: 6000}, \`six ads were served and four rendered; the report says \${JSON.stringify(got)}: the advertiser pays for what rendered\`);
+  assert.deepStrictEqual(got, {counted_at: 'render', impressions: 4, spend_micros: 5800}, \`six ads were served and four rendered for 5800 micros; the report says \${JSON.stringify(got)}: the advertiser pays for what rendered, at the prices the render counter holds\`);
 }
 
 export async function check_under_delivery(ctx) {
@@ -603,12 +623,19 @@ export async function check_under_delivery(ctx) {
   ctx.redis.hset('render:c-1', 'impressions', '500', 'spend_micros', '750000');
   const onPace = await shortfall(c);
   assert.equal(onPace, 0, \`half-way through the flight with 500 of 1000 impressions the campaign is on pace, the report says \${onPace} short\`);
+  ctx.redis.hset('render:c-1', 'impressions', '600', 'spend_micros', '900000');
+  const ahead = await shortfall(c);
+  assert.equal(ahead, 0, \`half-way through with 600 of 1000 the campaign projects 1200, the report says \${ahead} short, expected 0: the shortfall is floored at 0\`);
   ctx.redis.hset('render:c-1', 'impressions', '400', 'spend_micros', '600000');
   const behind = await shortfall(c);
   assert.equal(behind, 200, \`half-way through with 400 of 1000 the campaign projects 800, the report says \${behind} short, expected 200\`);
   ctx.clock.advance(86400); // the flight is over
   const ended = await shortfall(c);
   assert.equal(ended, 600, \`after the flight ended with 400 of 1000 the report says \${ended} short, expected 600: the projection stops at end_ts\`);
+  const now = Math.floor(ctx.clock.now() / 1000);
+  await put(ctx, {campaign_id: 'c-2', start_ts: now, end_ts: now + 86400}); // starts this second, nothing rendered yet
+  const r = await c.get('/v1/campaigns/c-2/delivery', {headers: OWNER});
+  assert(r.status === 200 && r.json().under_delivery_impressions === 1000, \`a campaign starting this very second answered \${r.status} \${r.text}, expected 1000 short: elapsed is at least 1 s, never a division by zero\`);
 }
 `,
     go: `package main
@@ -622,31 +649,37 @@ import (
 	"leetbuild/harness"
 )
 
+// readFlight is adv-1's campaign with a goal of 1000 impressions over the flight [start, end].
+func readFlight(id string, start, end int64) store.Campaign {
+	return store.Campaign{
+		CampaignID: id, AdvertiserID: "adv-1", Version: 3, State: "active", Placement: "home-top", CreativeID: "cr-" + id,
+		BidMicros: 1500, FreqCap: 3, FreqWindowS: 3600, PacedBudgetMicros: 10000000, GoalImpressions: 1000,
+		StartTs: start, EndTs: end,
+	}
+}
+
+// readClient serves campaign c-1, half-way through a one-day flight.
 func readClient(ctx *harness.Ctx) *harness.HTTP {
 	now := ctx.Clock.Now() / 1000
-	store.PutCampaign(context.Background(), store.Campaign{
-		CampaignID: "c-1", AdvertiserID: "adv-1", Version: 3, State: "active", Placement: "home-top", CreativeID: "cr-c-1",
-		BidMicros: 1500, FreqCap: 3, FreqWindowS: 3600, PacedBudgetMicros: 10000000, GoalImpressions: 1000,
-		StartTs: now - 43200, EndTs: now + 43200,
-	})
+	store.PutCampaign(context.Background(), readFlight("c-1", now-43200, now+43200))
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func readReport(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	ctx.Equal(r.Status, 200, "the owner's delivery read (%s)", r.Text())
 	body, _ := r.JSON().(map[string]any)
 	return body
 }
 
 func readShortfall(ctx *harness.Ctx, c *harness.HTTP) any {
-	return readBody(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))["under_delivery_impressions"]
+	return readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))["under_delivery_impressions"]
 }
 
 func CheckRoute(ctx *harness.Ctx) {
 	c := readClient(ctx)
-	body := readBody(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
+	body := readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
 	ctx.Assert(body["campaign_id"] == "c-1" && body["campaign_version"] == float64(3), "the report must name c-1 and its version 3, got %v", body)
 	r := c.Get("/v1/campaigns/c-404/delivery", "X-Advertiser-Id", "adv-1")
 	ctx.Equal(r.Status, 404, "an unknown campaign (%s)", r.Text())
@@ -656,6 +689,8 @@ func CheckAdvertiserScope(ctx *harness.Ctx) {
 	c := readClient(ctx)
 	anonymous := c.Get("/v1/campaigns/c-1/delivery")
 	ctx.Equal(anonymous.Status, 401, "a request without X-Advertiser-Id answered %s; the status", anonymous.Text())
+	queried := c.Get("/v1/campaigns/c-1/delivery?advertiser_id=adv-1")
+	ctx.Equal(queried.Status, 401, "a request naming adv-1 in the query string but without X-Advertiser-Id answered %s: the caller's identity comes from the header alone; the status", queried.Text())
 	rival := c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-2")
 	ctx.Equal(rival.Status, 403, "adv-2 asked for adv-1's campaign and got %s: one account must not read another's delivery; the status", rival.Text())
 	owner := c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1")
@@ -665,20 +700,27 @@ func CheckAdvertiserScope(ctx *harness.Ctx) {
 func CheckRenderCounts(ctx *harness.Ctx) {
 	c := readClient(ctx)
 	ctx.Redis.Set("pace:c-1", "9000")                                         // six serves reserved at 1500 micros
-	ctx.Redis.Do("HSET", "render:c-1", "impressions", "4", "spend_micros", "6000") // four of them rendered
-	body := readBody(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
+	ctx.Redis.Do("HSET", "render:c-1", "impressions", "4", "spend_micros", "5800") // four of them rendered, one cleared at 1300
+	body := readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"))
 	got := map[string]any{"counted_at": body["counted_at"], "impressions": body["impressions"], "spend_micros": body["spend_micros"]}
-	ctx.Equal(got, map[string]any{"counted_at": "render", "impressions": 4, "spend_micros": 6000}, "six ads were served and four rendered: the advertiser pays for what rendered; the report")
+	ctx.Equal(got, map[string]any{"counted_at": "render", "impressions": 4, "spend_micros": 5800}, "six ads were served and four rendered for 5800 micros: the advertiser pays for what rendered, at the prices the render counter holds; the report")
 }
 
 func CheckUnderDelivery(ctx *harness.Ctx) {
 	c := readClient(ctx)
 	ctx.Redis.Do("HSET", "render:c-1", "impressions", "500", "spend_micros", "750000")
 	ctx.Equal(readShortfall(ctx, c), 0, "half-way through the flight with 500 of 1000 impressions the campaign is on pace; under_delivery_impressions")
+	ctx.Redis.Do("HSET", "render:c-1", "impressions", "600", "spend_micros", "900000")
+	ctx.Equal(readShortfall(ctx, c), 0, "half-way through with 600 of 1000 the campaign projects 1200 and the shortfall is floored at 0; under_delivery_impressions")
 	ctx.Redis.Do("HSET", "render:c-1", "impressions", "400", "spend_micros", "600000")
 	ctx.Equal(readShortfall(ctx, c), 200, "half-way through with 400 of 1000 the campaign projects 800; under_delivery_impressions")
 	ctx.Clock.Advance(86400) // the flight is over
 	ctx.Equal(readShortfall(ctx, c), 600, "after the flight ended with 400 of 1000 the projection stops at end_ts; under_delivery_impressions")
+	now := ctx.Clock.Now() / 1000
+	store.PutCampaign(context.Background(), readFlight("c-2", now, now+86400)) // starts this second, nothing rendered yet
+	r := c.Get("/v1/campaigns/c-2/delivery", "X-Advertiser-Id", "adv-1")
+	body, _ := r.JSON().(map[string]any)
+	ctx.Assert(r.Status == 200 && body["under_delivery_impressions"] == float64(1000), "a campaign starting this very second answered %d %s, expected 1000 short: elapsed is at least 1 s, never a division by zero", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -691,23 +733,29 @@ func CheckUnderDelivery(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readClient(harness::Ctx& ctx) {
-  const long long now = ctx.Clock.Now() / 1000;
+// adv-1's campaign with a goal of 1000 impressions over the flight [start, end].
+store::Campaign readFlight(const std::string& id, long long start, long long end) {
   store::Campaign c;
-  c.campaign_id = "c-1";
+  c.campaign_id = id;
   c.advertiser_id = "adv-1";
   c.version = 3;
   c.state = "active";
   c.placement = "home-top";
-  c.creative_id = "cr-c-1";
+  c.creative_id = "cr-" + id;
   c.bid_micros = 1500;
   c.freq_cap = 3;
   c.freq_window_s = 3600;
   c.paced_budget_micros = 10000000;
   c.goal_impressions = 1000;
-  c.start_ts = now - 43200;
-  c.end_ts = now + 43200;
-  store::putCampaign(c);
+  c.start_ts = start;
+  c.end_ts = end;
+  return c;
+}
+
+// Serves campaign c-1, half-way through a one-day flight.
+harness::HTTP readClient(harness::Ctx& ctx) {
+  const long long now = ctx.Clock.Now() / 1000;
+  store::putCampaign(readFlight("c-1", now - 43200, now + 43200));
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -715,23 +763,24 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json readReport(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 200, "the owner's delivery read (%s)", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the delivery read must answer a JSON object, got %s", r.Text());
   return body;
 }
 
-long long readShortfall(harness::Ctx& ctx, harness::HTTP& c) {
-  const auto body = readBody(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
-  return body.value("under_delivery_impressions", -1LL);
+long long readShortfall(harness::Ctx& ctx, harness::HTTP& c, const std::string& id = "c-1") {
+  const auto body = readReport(ctx, c.Get("/v1/campaigns/" + id + "/delivery", "X-Advertiser-Id", "adv-1"));
+  const auto shortfall = body.find("under_delivery_impressions");
+  return shortfall != body.end() && shortfall->is_number_integer() ? shortfall->get<long long>() : -1;
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = readClient(ctx);
-  const auto body = readBody(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
+  const auto body = readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
   ctx.Assert(body.value("campaign_id", std::string()) == "c-1" && body.value("campaign_version", 0LL) == 3, "the report must name c-1 and its version 3, got %s", body.dump());
   const auto r = c.Get("/v1/campaigns/c-404/delivery", "X-Advertiser-Id", "adv-1");
   ctx.Equal(r.Status, 404, "an unknown campaign (%s)", r.Text());
@@ -741,6 +790,8 @@ void CheckAdvertiserScope(harness::Ctx& ctx) {
   auto c = readClient(ctx);
   const auto anonymous = c.Get("/v1/campaigns/c-1/delivery");
   ctx.Equal(anonymous.Status, 401, "a request without X-Advertiser-Id answered %s; the status", anonymous.Text());
+  const auto queried = c.Get("/v1/campaigns/c-1/delivery?advertiser_id=adv-1");
+  ctx.Equal(queried.Status, 401, "a request naming adv-1 in the query string but without X-Advertiser-Id answered %s: the caller's identity comes from the header alone; the status", queried.Text());
   const auto rival = c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-2");
   ctx.Equal(rival.Status, 403, "adv-2 asked for adv-1's campaign and got %s: one account must not read another's delivery; the status", rival.Text());
   const auto owner = c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1");
@@ -750,10 +801,10 @@ void CheckAdvertiserScope(harness::Ctx& ctx) {
 void CheckRenderCounts(harness::Ctx& ctx) {
   auto c = readClient(ctx);
   ctx.Redis.Set("pace:c-1", "9000");                                             // six serves reserved at 1500 micros
-  ctx.Redis.Do("HSET", "render:c-1", "impressions", "4", "spend_micros", "6000");  // four of them rendered
-  const auto body = readBody(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
-  ctx.Assert(body.value("counted_at", std::string()) == "render" && body.value("impressions", -1LL) == 4 && body.value("spend_micros", -1LL) == 6000,
-             "six ads were served and four rendered; the report says %s, expected counted_at render, impressions 4, spend_micros 6000: the advertiser pays for what rendered",
+  ctx.Redis.Do("HSET", "render:c-1", "impressions", "4", "spend_micros", "5800");  // four of them rendered, one cleared at 1300
+  const auto body = readReport(ctx, c.Get("/v1/campaigns/c-1/delivery", "X-Advertiser-Id", "adv-1"));
+  ctx.Assert(body.value("counted_at", std::string()) == "render" && body.value("impressions", -1LL) == 4 && body.value("spend_micros", -1LL) == 5800,
+             "six ads were served and four rendered for 5800 micros; the report says %s, expected counted_at render, impressions 4, spend_micros 5800: the advertiser pays for what rendered, at the prices the render counter holds",
              body.dump());
 }
 
@@ -761,10 +812,15 @@ void CheckUnderDelivery(harness::Ctx& ctx) {
   auto c = readClient(ctx);
   ctx.Redis.Do("HSET", "render:c-1", "impressions", "500", "spend_micros", "750000");
   ctx.Equal(readShortfall(ctx, c), 0, "half-way through the flight with 500 of 1000 impressions the campaign is on pace; under_delivery_impressions");
+  ctx.Redis.Do("HSET", "render:c-1", "impressions", "600", "spend_micros", "900000");
+  ctx.Equal(readShortfall(ctx, c), 0, "half-way through with 600 of 1000 the campaign projects 1200 and the shortfall is floored at 0; under_delivery_impressions");
   ctx.Redis.Do("HSET", "render:c-1", "impressions", "400", "spend_micros", "600000");
   ctx.Equal(readShortfall(ctx, c), 200, "half-way through with 400 of 1000 the campaign projects 800; under_delivery_impressions");
   ctx.Clock.Advance(86400);  // the flight is over
   ctx.Equal(readShortfall(ctx, c), 600, "after the flight ended with 400 of 1000 the projection stops at end_ts; under_delivery_impressions");
+  const long long now = ctx.Clock.Now() / 1000;
+  store::putCampaign(readFlight("c-2", now, now + 86400));  // starts this second, nothing rendered yet
+  ctx.Equal(readShortfall(ctx, c, "c-2"), 1000, "a campaign starting this very second: elapsed is at least 1 s, never a division by zero; under_delivery_impressions");
 }
 `,
   },

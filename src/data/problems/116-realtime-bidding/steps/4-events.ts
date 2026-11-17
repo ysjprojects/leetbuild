@@ -41,7 +41,7 @@ acknowledgement, and is not told about an event the broker refused.
       id: 'auction-key',
       title: 'Keys bid.event by the auction id',
       detail:
-        "Three results for a-1, a-2, a-3 carry those keys, so every event about one auction shares a partition and a replay rebuilds it in order. The starter keys by bidder, which puts all of one bidder's traffic on one partition.",
+        "Three results for a-1, a-2, a-3 carry those keys, so every event about one auction shares a partition and a replay rebuilds it in order; each value is the auction's `bid_event` (type, auction id, bidder, a null `loss_reason` on a win). The starter keys by bidder, which puts all of one bidder's traffic on one partition.",
       match: {
         python: {all: [/\.produce\([^\n]*key\s*=\s*auction_id/]},
         typescript: {all: [/key:\s*auctionId/]},
@@ -54,7 +54,7 @@ acknowledgement, and is not told about an event the broker refused.
       id: 'loss-event',
       title: 'Publishes losses with their reason',
       detail:
-        'A lost auction produces one event with `type: "loss"` and the exchange\'s `loss_reason`. The starter publishes wins only, so the win rate downstream has no denominator.',
+        'A lost auction produces one event with `type: "loss"`, its bidder and the exchange\'s `loss_reason`. The starter publishes wins only, so the win rate downstream has no denominator.',
       match: {
         python: {none: [/if\s+won\s*:\s*\n\s*producer\.produce\(/]},
         typescript: {none: [/if\s*\(\s*won\s*\)\s*\{[^}]*producer\.send\(/]},
@@ -93,7 +93,7 @@ acknowledgement, and is not told about an event the broker refused.
       id: 'outbox',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves the event in `outbox:bid.event` with a reason, and the call returns false. The starter fires and forgets.',
+        'A delivered event returns true and leaves no outbox row. A failed delivery, or no report within 2 s, leaves the event in `outbox:bid.event` with a reason, and the call returns false. The starter fires and forgets.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -566,9 +566,15 @@ def _outbox(ctx):
 def check_auction_key(ctx):
     m = _events(ctx, "a-1", "a-2", "a-3")
     for auction_id in ("a-1", "a-2", "a-3"):
-        m.report_result("b-1", auction_id, True)
-    keys = sorted(r.key for r in ctx.kafka.records(TOPIC))
+        ok = m.report_result("b-1", auction_id, True)
+        assert ok is True, f"report_result returned {ok!r} for a delivered win of {auction_id}, expected True"
+    records = ctx.kafka.records(TOPIC)
+    keys = sorted(r.key for r in records)
     assert keys == [b"a-1", b"a-2", b"a-3"], f"three results produced records keyed {keys}, expected the auction ids a-1, a-2, a-3"
+    for r in records:
+        value = json.loads(r.value)
+        assert (value.get("type"), value.get("auction_id"), value.get("bidder"), value.get("loss_reason")) == ("win", r.key.decode(), "b-1", None), f"the win event keyed {r.key.decode()} is {value}, expected bid_event's type win, its auction_id, bidder b-1 and loss_reason null"
+    assert not _outbox(ctx), f"three delivered wins left outbox rows {_outbox(ctx)}: the outbox is only for events the broker did not take"
 
 
 def check_loss_event(ctx):
@@ -577,7 +583,7 @@ def check_loss_event(ctx):
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"a lost auction produced {len(records)} records on bid.event: without its losses the win rate downstream has no denominator"
     value = json.loads(records[0].value)
-    assert value.get("type") == "loss" and value.get("auction_id") == "a-1" and value.get("loss_reason") == "outbid", f"the loss event is {value}, expected type loss for a-1 with loss_reason outbid"
+    assert (value.get("type"), value.get("auction_id"), value.get("bidder"), value.get("loss_reason")) == ("loss", "a-1", "b-1", "outbid"), f"the loss event is {value}, expected type loss for a-1 by b-1 with loss_reason outbid"
     assert spend.spent("b-1", spend.today()) == 0, "the lost auction's claim must be given back"
 
 
@@ -601,7 +607,9 @@ def check_acks_idempotent(ctx):
 
 
 def check_outbox(ctx):
-    m = _events(ctx, "a-1", "a-2")
+    m = _events(ctx, "a-1", "a-2", "a-3")
+    ok = m.report_result("b-1", "a-3", True)
+    assert ok is True and not _outbox(ctx), f"a delivered win returned {ok!r} and left outbox rows {_outbox(ctx)}, expected True and no row"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.report_result("b-1", "a-1", True)
     rows = _outbox(ctx)
@@ -613,7 +621,7 @@ def check_outbox(ctx):
     before = ctx.clock.time()
     ok = m.report_result("b-1", "a-2", True)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"report_result waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"report_result waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S (2 s), then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and (rows[1].get("event") or {}).get("auction_id") == "a-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"report_result returned {ok!r} without a delivery report, expected False"
@@ -638,10 +646,19 @@ const settle = (): Promise<void> => {
 
 export async function check_auction_key(ctx) {
   const {m} = await events(ctx, 'a-1', 'a-2', 'a-3');
-  for (const auctionId of ['a-1', 'a-2', 'a-3']) await m.reportResult('b-1', auctionId, true);
+  for (const auctionId of ['a-1', 'a-2', 'a-3']) {
+    const ok = await m.reportResult('b-1', auctionId, true);
+    assert.equal(ok, true, \`reportResult resolved \${JSON.stringify(ok)} for a delivered win of \${auctionId}, expected true\`);
+  }
   await settle();
   const keys = [...ctx.kafka.keys(TOPIC)].sort();
   assert.deepEqual(keys, ['a-1', 'a-2', 'a-3'], \`three results produced records keyed \${JSON.stringify(keys)}, expected the auction ids a-1, a-2, a-3\`);
+  const values = ctx.kafka.values(TOPIC);
+  ctx.kafka.keys(TOPIC).forEach((key, i) => {
+    const value = JSON.parse(values[i]);
+    assert(value.type === 'win' && value.auction_id === key && value.bidder === 'b-1' && value.loss_reason == null, \`the win event keyed \${key} is \${values[i]}, expected bidEvent's type win, its auction_id, bidder b-1 and loss_reason null\`);
+  });
+  assert.equal(outboxRows(ctx).length, 0, \`three delivered wins left outbox rows \${JSON.stringify(outboxRows(ctx))}: the outbox is only for events the broker did not take\`);
 }
 
 export async function check_loss_event(ctx) {
@@ -651,7 +668,7 @@ export async function check_loss_event(ctx) {
   const values = ctx.kafka.values(TOPIC);
   assert.equal(values.length, 1, \`a lost auction produced \${values.length} records on bid.event: without its losses the win rate downstream has no denominator\`);
   const value = JSON.parse(values[0]);
-  assert(value.type === 'loss' && value.auction_id === 'a-1' && value.loss_reason === 'outbid', \`the loss event is \${values[0]}, expected type loss for a-1 with loss_reason outbid\`);
+  assert(value.type === 'loss' && value.auction_id === 'a-1' && value.bidder === 'b-1' && value.loss_reason === 'outbid', \`the loss event is \${values[0]}, expected type loss for a-1 by b-1 with loss_reason outbid\`);
   assert.equal(await spend.spent('b-1', spend.today()), 0, "the lost auction's claim must be given back");
 }
 
@@ -678,9 +695,12 @@ export async function check_acks_idempotent(ctx) {
 }
 
 export async function check_outbox(ctx) {
-  const {m} = await events(ctx, 'a-1', 'a-2');
+  const {m} = await events(ctx, 'a-1', 'a-2', 'a-3');
+  let ok = await m.reportResult('b-1', 'a-3', true);
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`a delivered win resolved \${JSON.stringify(ok)} and left outbox rows \${JSON.stringify(outboxRows(ctx))}, expected true and no row\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.reportResult('b-1', 'a-1', true);
+  ok = await m.reportResult('b-1', 'a-1', true);
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and outbox:bid.event holds \${rows.length} rows: without a row the win never reaches the stats\`);
@@ -690,7 +710,7 @@ export async function check_outbox(ctx) {
   const before = ctx.clock.now();
   ok = await m.reportResult('b-1', 'a-2', true);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`reportResult waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`reportResult waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS (2 s), then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].event?.auction_id === 'a-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`reportResult resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -744,12 +764,21 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 func CheckAuctionKey(ctx *harness.Ctx) {
 	eventsSetup(ctx, "a-1", "a-2", "a-3")
 	for _, auctionID := range []string{"a-1", "a-2", "a-3"} {
-		eventsReport(ctx, auctionID, true, "")
+		ok := eventsReport(ctx, auctionID, true, "")
+		ctx.Assert(ok, "reportResult returned false for a delivered win of %s, expected true", auctionID)
 	}
 	ctx.Settle()
 	keys := ctx.Kafka.Keys(eventsTopic)
-	sort.Strings(keys)
-	ctx.Equal(keys, []string{"a-1", "a-2", "a-3"}, "three results must produce records keyed by the auction ids; the keys")
+	sorted := append([]string(nil), keys...)
+	sort.Strings(sorted)
+	ctx.Equal(sorted, []string{"a-1", "a-2", "a-3"}, "three results must produce records keyed by the auction ids; the keys")
+	values := ctx.Kafka.Values(eventsTopic)
+	for i, key := range keys {
+		var value map[string]any
+		ctx.NoError(json.Unmarshal([]byte(values[i]), &value), "the event must be JSON")
+		ctx.Assert(value["type"] == "win" && value["auction_id"] == key && value["bidder"] == "b-1" && value["loss_reason"] == nil, "the win event keyed %s is %s, expected bidEvent's type win, its auction_id, bidder b-1 and loss_reason null", key, values[i])
+	}
+	ctx.Equal(len(eventsOutbox(ctx)), 0, "three delivered wins must leave no outbox row (the outbox is only for events the broker did not take); the rows")
 }
 
 func CheckLossEvent(ctx *harness.Ctx) {
@@ -760,7 +789,7 @@ func CheckLossEvent(ctx *harness.Ctx) {
 	ctx.Equal(len(values), 1, "a lost auction must produce one record on bid.event (without its losses the win rate downstream has no denominator); the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the event must be JSON")
-	ctx.Assert(value["type"] == "loss" && value["auction_id"] == "a-1" && value["loss_reason"] == "outbid", "the loss event is %s, expected type loss for a-1 with loss_reason outbid", values[0])
+	ctx.Assert(value["type"] == "loss" && value["auction_id"] == "a-1" && value["bidder"] == "b-1" && value["loss_reason"] == "outbid", "the loss event is %s, expected type loss for a-1 by b-1 with loss_reason outbid", values[0])
 	ctx.Equal(spend.Spent(eventsBg, "b-1", spend.Today()), 0, "the lost auction's claim must be given back; the counter")
 }
 
@@ -787,9 +816,12 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	eventsSetup(ctx, "a-1", "a-2")
+	eventsSetup(ctx, "a-1", "a-2", "a-3")
+	ok := eventsReport(ctx, "a-3", true, "")
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered win returned %v and left outbox rows %+v, expected true and no row", ok, eventsOutbox(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsReport(ctx, "a-1", true, "")
+	ok = eventsReport(ctx, "a-1", true, "")
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the win never reaches the stats; the rows")
@@ -799,7 +831,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsReport(ctx, "a-2", true, "")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "reportResult waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "reportResult waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Event["auction_id"] == "a-2", "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "reportResult's result without a delivery report")
@@ -842,11 +874,23 @@ std::string eventsField(const nlohmann::json& j, const std::string& field) {
 
 void CheckAuctionKey(harness::Ctx& ctx) {
   eventsSetup(ctx, {"a-1", "a-2", "a-3"});
-  for (const char* auction_id : {"a-1", "a-2", "a-3"}) reportResult("b-1", auction_id, true, "");
+  for (const char* auction_id : {"a-1", "a-2", "a-3"}) {
+    const bool ok = reportResult("b-1", auction_id, true, "");
+    ctx.Assert(ok, "reportResult returned false for a delivered win of %s, expected true", auction_id);
+  }
   ctx.Settle();
-  auto keys = ctx.Kafka.Keys(kEventsTopic);
-  std::sort(keys.begin(), keys.end());
-  ctx.Equal(keys, {"a-1", "a-2", "a-3"}, "three results must produce records keyed by the auction ids; the keys");
+  const auto keys = ctx.Kafka.Keys(kEventsTopic);
+  auto sorted = keys;
+  std::sort(sorted.begin(), sorted.end());
+  ctx.Equal(sorted, {"a-1", "a-2", "a-3"}, "three results must produce records keyed by the auction ids; the keys");
+  const auto values = ctx.Kafka.Values(kEventsTopic);
+  for (size_t i = 0; i < keys.size() && i < values.size(); ++i) {
+    const auto value = nlohmann::json::parse(values[i], nullptr, false);
+    ctx.Assert(eventsField(value, "type") == "win" && eventsField(value, "auction_id") == keys[i] && eventsField(value, "bidder") == "b-1" &&
+                   (!value.contains("loss_reason") || value["loss_reason"].is_null()),
+               "the win event keyed %s is %s, expected bidEvent's type win, its auction_id, bidder b-1 and loss_reason null", keys[i], values[i]);
+  }
+  ctx.Equal(eventsOutbox(ctx).size(), 0, "three delivered wins must leave no outbox row (the outbox is only for events the broker did not take); the rows");
 }
 
 void CheckLossEvent(harness::Ctx& ctx) {
@@ -856,8 +900,8 @@ void CheckLossEvent(harness::Ctx& ctx) {
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 1, "a lost auction must produce one record on bid.event (without its losses the win rate downstream has no denominator); the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(eventsField(value, "type") == "loss" && eventsField(value, "auction_id") == "a-1" && eventsField(value, "loss_reason") == "outbid",
-             "the loss event is %s, expected type loss for a-1 with loss_reason outbid", values[0]);
+  ctx.Assert(eventsField(value, "type") == "loss" && eventsField(value, "auction_id") == "a-1" && eventsField(value, "bidder") == "b-1" && eventsField(value, "loss_reason") == "outbid",
+             "the loss event is %s, expected type loss for a-1 by b-1 with loss_reason outbid", values[0]);
   ctx.Equal(rtb::spend::spent("b-1", rtb::spend::today()), 0, "the lost auction's claim must be given back; the counter");
 }
 
@@ -889,9 +933,12 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  eventsSetup(ctx, {"a-1", "a-2"});
+  eventsSetup(ctx, {"a-1", "a-2", "a-3"});
+  bool ok = reportResult("b-1", "a-3", true, "");
+  ctx.Settle();
+  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a delivered win returned %t and left %d outbox rows, expected true and no row", ok, eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = reportResult("b-1", "a-1", true, "");
+  ok = reportResult("b-1", "a-1", true, "");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the win never reaches the stats; the rows");
@@ -903,7 +950,7 @@ void CheckOutbox(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = reportResult("b-1", "a-2", true, "");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "reportResult waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "reportResult waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("event") && eventsField(rows[1]["event"], "auction_id") == "a-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "reportResult's result without a delivery report");

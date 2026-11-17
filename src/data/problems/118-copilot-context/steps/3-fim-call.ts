@@ -21,11 +21,11 @@ editor moved on; retrying every status multiplies a bad request; the raw first c
 empty or cut off.
 
 - Send \`prefix\`, \`suffix\` and \`snippets\` as **separate fields** (fill-in-the-middle).
-- Every attempt carries a **300 ms** deadline (\`DEADLINE_MS\`).
+- Every attempt carries its own full **300 ms** deadline (\`DEADLINE_MS\`), the retry included.
 - At most **2 attempts** (\`MAX_ATTEMPTS\`), the second only after \`UNAVAILABLE\`; any other failure
   returns \`[]\` (no ghost text this keystroke).
 - Ask for **3 candidates** (\`N_CANDIDATES\`); \`filter_candidates\` drops empty or whitespace-only
-  text, \`truncated\` candidates and duplicates after trimming, in the model's order.`,
+  text, \`truncated\` candidates and duplicates after trimming both ends, in the model's order.`,
   sequence: {
     participants: ['completiond', 'Model service'],
     messages: [
@@ -73,7 +73,7 @@ empty or cut off.
       id: 'deadline',
       title: 'Every attempt carries a 300 ms deadline',
       detail:
-        'Each `Complete` call is made with a 300 ms deadline, so a slow model ends in `DEADLINE_EXCEEDED` and no ghost text instead of holding the request after the editor moved on. The starter calls with no deadline.',
+        'Each `Complete` call is made with its own 300 ms deadline, the retry after a late `UNAVAILABLE` included, so a slow model ends in `DEADLINE_EXCEEDED` and no ghost text instead of holding the request after the editor moved on. The starter calls with no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*0\.3/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*300/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -86,7 +86,7 @@ empty or cut off.
       id: 'retry-once',
       title: 'At most two attempts, only after UNAVAILABLE',
       detail:
-        'A call is retried once, and only when it ended `UNAVAILABLE`; a deadline or any other status returns `[]` at once. The starter retries every error up to five times.',
+        'A call is retried once, and only when it ended `UNAVAILABLE`; a deadline or any other status (`INVALID_ARGUMENT`, `RESOURCE_EXHAUSTED`, `INTERNAL`, `UNKNOWN`, `PERMISSION_DENIED` are checked) returns `[]` at once. The starter retries every error up to five times.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2/, /StatusCode\.UNAVAILABLE/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2/, /status\.UNAVAILABLE/], none: [/attempt\s*<\s*5/]},
@@ -99,7 +99,7 @@ empty or cut off.
       id: 'filter',
       title: 'Generates 3 candidates and shows the ones worth showing',
       detail:
-        "The request asks for `N_CANDIDATES = 3`; `filter_candidates` drops empty, `truncated` and duplicate candidates and keeps the model's order. The starter asks for one and shows it unchecked.",
+        "The request asks for `N_CANDIDATES = 3`; `filter_candidates` drops empty or whitespace-only, `truncated` and duplicate candidates (compared after trimming both ends; a dropped truncated one does not hide a later complete copy) and keeps the model's order. The starter asks for one and shows it unchecked.",
       match: {
         python: {all: [/N_CANDIDATES\s*=\s*3/, /def filter_candidates\(/, /\.truncated/], none: [/candidates\[0\]/]},
         typescript: {
@@ -542,19 +542,25 @@ HEALTHY = [("cursor.fetchone()", False), ("cursor.fetchall()[0]", False), ("next
 
 
 class ModelPeer(pb_grpc.ModelServicer):
-    """The stand-in model service: records every request, answers the candidates it was given."""
+    """The stand-in model service: records every request, answers the candidates it was given, and can fail one call late (UNAVAILABLE after a stall)."""
 
-    def __init__(self, candidates):
+    def __init__(self, ctx, candidates):
+        self.ctx = ctx
         self.candidates = candidates
         self.requests = []
+        self.stall = None
 
     def Complete(self, request, context):
         self.requests.append(request)
+        if self.stall is not None:
+            stall, self.stall = self.stall, None
+            self.ctx.clock.advance(stall)  # the model restarts under the call
+            context.abort(grpc.StatusCode.UNAVAILABLE, "model restarting")
         return pb.CompleteReply(candidates=[pb.Candidate(text=text, truncated=cut) for text, cut in self.candidates])
 
 
 def _world(ctx, candidates=HEALTHY):
-    peer = ModelPeer(candidates)
+    peer = ModelPeer(ctx, candidates)
     ctx.grpc.serve(pb_grpc.add_ModelServicer_to_server, peer, TARGET)
     return ctx.load("fim_call"), peer
 
@@ -579,13 +585,18 @@ def check_deadline(ctx):
     call = _calls(ctx)[0]
     assert call.timeout is not None, "the Complete call carries no deadline: a slow model holds the request after the editor moved on"
     assert 0.25 <= call.timeout <= 0.35, f"the deadline must be 300 ms, got {call.timeout} s"
+    peer.stall = 0.2  # the first attempt fails UNAVAILABLE after 200 ms, the retry answers at once
+    shown = m.complete(PREFIX, SUFFIX, SNIPPETS, "python")
+    calls = _calls(ctx)
+    assert len(calls) == 3 and shown, f"an UNAVAILABLE after 200 ms earns one retry that succeeds: saw {len(calls) - 1} calls and {shown}"
+    assert calls[2].timeout is not None and 0.25 <= calls[2].timeout <= 0.35, f"the retry must carry its own 300 ms deadline, got {calls[2].timeout} s: a deadline shared by both attempts leaves the retry what the first one did not use"
     ctx.grpc.set_latency("Complete", 2.0, TARGET)
     started = ctx.clock.offset
     shown = m.complete(PREFIX, SUFFIX, SNIPPETS, "python")
     waited = ctx.clock.offset - started
     assert shown == [], f"a model that answers after the deadline must give no ghost text, got {shown}"
     assert waited <= 0.4, f"complete waited {waited:.2f} s on a model that takes 2 s: the deadline must cut it at 300 ms"
-    assert len(_calls(ctx)) == 2 and _calls(ctx)[1].code == grpc.StatusCode.DEADLINE_EXCEEDED, f"the slow call must end DEADLINE_EXCEEDED and not be retried: {len(_calls(ctx)) - 1} calls"
+    assert len(_calls(ctx)) == 4 and _calls(ctx)[3].code == grpc.StatusCode.DEADLINE_EXCEEDED, f"the slow call must end DEADLINE_EXCEEDED and not be retried: {len(_calls(ctx)) - 3} calls"
 
 
 def check_retry_once(ctx):
@@ -601,14 +612,30 @@ def check_retry_once(ctx):
     shown = m.complete(PREFIX, SUFFIX, SNIPPETS, "python")
     assert len(_calls(ctx)) == 5, f"INVALID_ARGUMENT is not transient: one call, no retry; saw {len(_calls(ctx)) - 4}"
     assert shown == [], f"a rejected request gives no ghost text, got {shown}"
+    for code in (grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INTERNAL, grpc.StatusCode.UNKNOWN, grpc.StatusCode.PERMISSION_DENIED):
+        before = len(_calls(ctx))
+        ctx.grpc.fail("Complete", code, "refused", times=1, target=TARGET)
+        shown = m.complete(PREFIX, SUFFIX, SNIPPETS, "python")
+        assert len(_calls(ctx)) - before == 1, f"{code.name} is not UNAVAILABLE: one call, no retry; saw {len(_calls(ctx)) - before}"
+        assert shown == [], f"a call that ended {code.name} gives no ghost text, got {shown}"
 
 
 def check_filter(ctx):
-    candidates = [("", False), ("   ", False), ("cursor.fetchone()", False), ("cursor.fetchone()  ", False), ("cursor.fetch", True), ("next(cursor)", False)]
+    candidates = [
+        ("", False),
+        ("   ", False),
+        ("\\n\\t", False),
+        ("cursor.fetchone()", False),
+        ("cursor.fetchone()  ", False),
+        ("cursor.close()", True),
+        ("next(cursor)", False),
+        ("\\tnext(cursor)", False),
+        ("cursor.close()", False),
+    ]
     m, peer = _world(ctx, candidates)
     shown = m.complete(PREFIX, SUFFIX, SNIPPETS, "python")
     assert peer.requests[0].n == 3, f"the request asked for {peer.requests[0].n} candidates, expected N_CANDIDATES = 3"
-    assert shown == ["cursor.fetchone()", "next(cursor)"], f"empty, truncated and duplicate candidates must be dropped in the model's order, got {shown}"
+    assert shown == ["cursor.fetchone()", "next(cursor)", "cursor.close()"], f"empty or whitespace-only, truncated and duplicate (after trimming both ends) candidates must be dropped in the model's order; a truncated candidate does not hide a later complete one. Got {shown}"
 `,
     typescript: `const TARGET = 'model:9000';
 const PREFIX = 'def load_user(conn, user_id):\\n    row = ';
@@ -616,21 +643,28 @@ const SUFFIX = '\\n    return User.from_row(row)\\n';
 const SNIPPETS = ['class User:\\n    user_id: int\\n'];
 const HEALTHY = [{text: 'cursor.fetchone()', truncated: false}, {text: 'cursor.fetchall()[0]', truncated: false}, {text: 'next(cursor)', truncated: false}];
 
-/** The stand-in model service at model:9000 (records every request, answers the candidates it was given) and the learner's module. */
+/** The stand-in model service at model:9000 (records every request, answers the candidates it was given, can fail one call late: UNAVAILABLE after a stall) and the learner's module. */
 function world(ctx, candidates = HEALTHY) {
   const {copilotctx} = ctx.proto('copilot_context.proto');
   const requests = [];
+  const late: {stall: number | null} = {stall: null};
   ctx.grpc.serve(
     copilotctx.Model.service,
     {
       Complete(call, callback) {
         requests.push(call.request);
+        if (late.stall !== null) {
+          ctx.clock.advance(late.stall); // the model restarts under the call
+          late.stall = null;
+          callback({code: ctx.grpc.status.UNAVAILABLE, details: 'model restarting'});
+          return;
+        }
         callback(null, {candidates});
       },
     },
     TARGET,
   );
-  return {m: ctx.load('fim_call'), requests};
+  return {m: ctx.load('fim_call'), requests, late};
 }
 
 const calls = ctx => ctx.grpc.callsTo('Complete');
@@ -646,18 +680,23 @@ export async function check_fim_order(ctx) {
 }
 
 export async function check_deadline(ctx) {
-  const {m} = world(ctx);
+  const {m, late} = world(ctx);
   await m.complete(PREFIX, SUFFIX, SNIPPETS, 'python');
   const call = calls(ctx)[0];
   assert(call.timeout !== null, 'the Complete call carries no deadline: a slow model holds the request after the editor moved on');
   assert(call.timeout >= 0.25 && call.timeout <= 0.35, \`the deadline must be 300 ms, got \${call.timeout} s\`);
+  late.stall = 0.2; // the first attempt fails UNAVAILABLE after 200 ms, the retry answers at once
+  let shown = await m.complete(PREFIX, SUFFIX, SNIPPETS, 'python');
+  assert(calls(ctx).length === 3 && shown.length > 0, \`an UNAVAILABLE after 200 ms earns one retry that succeeds: saw \${calls(ctx).length - 1} calls and \${JSON.stringify(shown)}\`);
+  const retry = calls(ctx)[2];
+  assert(retry.timeout !== null && retry.timeout >= 0.25 && retry.timeout <= 0.35, \`the retry must carry its own 300 ms deadline, got \${retry.timeout} s: a deadline shared by both attempts leaves the retry what the first one did not use\`);
   ctx.grpc.setLatency('Complete', 2.0, TARGET);
   const started = ctx.clock.now();
-  const shown = await m.complete(PREFIX, SUFFIX, SNIPPETS, 'python');
+  shown = await m.complete(PREFIX, SUFFIX, SNIPPETS, 'python');
   const waited = (ctx.clock.now() - started) / 1000;
   assert.deepEqual(shown, [], \`a model that answers after the deadline must give no ghost text, got \${JSON.stringify(shown)}\`);
   assert(waited <= 0.4, \`complete waited \${waited.toFixed(2)} s on a model that takes 2 s: the deadline must cut it at 300 ms\`);
-  assert(calls(ctx).length === 2 && calls(ctx)[1].code === ctx.grpc.status.DEADLINE_EXCEEDED, \`the slow call must end DEADLINE_EXCEEDED and not be retried: \${calls(ctx).length - 1} calls\`);
+  assert(calls(ctx).length === 4 && calls(ctx)[3].code === ctx.grpc.status.DEADLINE_EXCEEDED, \`the slow call must end DEADLINE_EXCEEDED and not be retried: \${calls(ctx).length - 3} calls\`);
 }
 
 export async function check_retry_once(ctx) {
@@ -673,21 +712,31 @@ export async function check_retry_once(ctx) {
   shown = await m.complete(PREFIX, SUFFIX, SNIPPETS, 'python');
   assert.equal(calls(ctx).length, 5, \`INVALID_ARGUMENT is not transient: one call, no retry; saw \${calls(ctx).length - 4}\`);
   assert.deepEqual(shown, [], \`a rejected request gives no ghost text, got \${JSON.stringify(shown)}\`);
+  for (const name of ['RESOURCE_EXHAUSTED', 'INTERNAL', 'UNKNOWN', 'PERMISSION_DENIED']) {
+    const before = calls(ctx).length;
+    ctx.grpc.fail('Complete', ctx.grpc.status[name], 'refused', 1, TARGET);
+    shown = await m.complete(PREFIX, SUFFIX, SNIPPETS, 'python');
+    assert.equal(calls(ctx).length - before, 1, \`\${name} is not UNAVAILABLE: one call, no retry; saw \${calls(ctx).length - before}\`);
+    assert.deepEqual(shown, [], \`a call that ended \${name} gives no ghost text, got \${JSON.stringify(shown)}\`);
+  }
 }
 
 export async function check_filter(ctx) {
   const candidates = [
     {text: '', truncated: false},
     {text: '   ', truncated: false},
+    {text: '\\n\\t', truncated: false},
     {text: 'cursor.fetchone()', truncated: false},
     {text: 'cursor.fetchone()  ', truncated: false},
-    {text: 'cursor.fetch', truncated: true},
+    {text: 'cursor.close()', truncated: true},
     {text: 'next(cursor)', truncated: false},
+    {text: '\\tnext(cursor)', truncated: false},
+    {text: 'cursor.close()', truncated: false},
   ];
   const {m, requests} = world(ctx, candidates);
   const shown = await m.complete(PREFIX, SUFFIX, SNIPPETS, 'python');
   assert.equal(requests[0].n, 3, \`the request asked for \${requests[0].n} candidates, expected N_CANDIDATES = 3\`);
-  assert.deepEqual(shown, ['cursor.fetchone()', 'next(cursor)'], \`empty, truncated and duplicate candidates must be dropped in the model's order, got \${JSON.stringify(shown)}\`);
+  assert.deepEqual(shown, ['cursor.fetchone()', 'next(cursor)', 'cursor.close()'], \`empty or whitespace-only, truncated and duplicate (after trimming both ends) candidates must be dropped in the model's order; a truncated candidate does not hide a later complete one. Got \${JSON.stringify(shown)}\`);
 }
 `,
     go: `package main
@@ -697,6 +746,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	hstatus "google.golang.org/grpc/status"
 
 	pb "copilot/gen/copilot_context"
 
@@ -711,15 +761,23 @@ const (
 
 var fimSnippets = []string{"class User:\\n    user_id: int\\n"}
 
-// fimModel is the stand-in model service: records every request, answers the candidates it was given.
+// fimModel is the stand-in model service: records every request, answers the candidates it was given,
+// and can fail one call late (UNAVAILABLE after a stall).
 type fimModel struct {
 	pb.UnimplementedModelServer
+	ctx        *harness.Ctx
 	candidates []*pb.Candidate
 	requests   []*pb.CompleteRequest
+	stall      float64
 }
 
 func (m *fimModel) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	m.requests = append(m.requests, req)
+	if m.stall > 0 {
+		m.ctx.Clock.Advance(m.stall) // the model restarts under the call
+		m.stall = 0
+		return nil, hstatus.Error(codes.Unavailable, "model restarting")
+	}
 	return &pb.CompleteReply{Candidates: m.candidates}, nil
 }
 
@@ -727,7 +785,7 @@ func fimWorld(ctx *harness.Ctx, candidates []*pb.Candidate) *fimModel {
 	if candidates == nil {
 		candidates = []*pb.Candidate{{Text: "cursor.fetchone()"}, {Text: "cursor.fetchall()[0]"}, {Text: "next(cursor)"}}
 	}
-	peer := &fimModel{candidates: candidates}
+	peer := &fimModel{ctx: ctx, candidates: candidates}
 	pb.RegisterModelServer(ctx.GRPC.Server(fimTarget), peer)
 	return peer
 }
@@ -749,19 +807,24 @@ func CheckFimOrder(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	fimWorld(ctx, nil)
+	peer := fimWorld(ctx, nil)
 	fimCall()
 	call := fimCalls(ctx)[0]
 	ctx.Assert(call.HasDeadline(), "the Complete call carries no deadline: a slow model holds the request after the editor moved on")
 	ctx.Assert(call.Timeout >= 250*time.Millisecond && call.Timeout <= 350*time.Millisecond, "the deadline must be 300 ms, got %v", call.Timeout)
+	peer.stall = 0.2 // the first attempt fails UNAVAILABLE after 200 ms, the retry answers at once
+	shown := fimCall()
+	calls := fimCalls(ctx)
+	ctx.Assert(len(calls) == 3 && len(shown) > 0, "an UNAVAILABLE after 200 ms earns one retry that succeeds: saw %d calls and %q", len(calls)-1, shown)
+	ctx.Assert(len(calls) == 3 && calls[2].HasDeadline() && calls[2].Timeout >= 250*time.Millisecond && calls[2].Timeout <= 350*time.Millisecond, "the retry must carry its own 300 ms deadline, got %v: a deadline shared by both attempts leaves the retry what the first one did not use", calls[len(calls)-1].Timeout)
 	ctx.GRPC.SetLatency("Complete", 2.0, fimTarget)
 	started := ctx.Clock.Now()
-	shown := fimCall()
+	shown = fimCall()
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Equal(len(shown), 0, "a model that answers after the deadline must give no ghost text; candidates shown")
 	ctx.Assert(waited <= 0.4, "complete waited %.2f s on a model that takes 2 s: the deadline must cut it at 300 ms", waited)
-	calls := fimCalls(ctx)
-	ctx.Assert(len(calls) == 2 && calls[1].Code == codes.DeadlineExceeded, "the slow call must end DEADLINE_EXCEEDED and not be retried: %d calls", len(calls)-1)
+	calls = fimCalls(ctx)
+	ctx.Assert(len(calls) == 4 && calls[3].Code == codes.DeadlineExceeded, "the slow call must end DEADLINE_EXCEEDED and not be retried: %d calls", len(calls)-3)
 }
 
 func CheckRetryOnce(ctx *harness.Ctx) {
@@ -777,15 +840,23 @@ func CheckRetryOnce(ctx *harness.Ctx) {
 	shown = fimCall()
 	ctx.Equal(len(fimCalls(ctx)), 5, "INVALID_ARGUMENT is not transient: one call, no retry; calls so far")
 	ctx.Equal(len(shown), 0, "a rejected request gives no ghost text; candidates shown")
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Internal, codes.Unknown, codes.PermissionDenied} {
+		before := len(fimCalls(ctx))
+		ctx.GRPC.Fail("Complete", code, "refused", 1, fimTarget)
+		shown = fimCall()
+		ctx.Equal(len(fimCalls(ctx))-before, 1, "%v is not UNAVAILABLE: one call, no retry; calls", code)
+		ctx.Equal(len(shown), 0, "a call that ended %v gives no ghost text; candidates shown", code)
+	}
 }
 
 func CheckFilter(ctx *harness.Ctx) {
 	peer := fimWorld(ctx, []*pb.Candidate{
-		{Text: ""}, {Text: "   "}, {Text: "cursor.fetchone()"}, {Text: "cursor.fetchone()  "}, {Text: "cursor.fetch", Truncated: true}, {Text: "next(cursor)"},
+		{Text: ""}, {Text: "   "}, {Text: "\\n\\t"}, {Text: "cursor.fetchone()"}, {Text: "cursor.fetchone()  "}, {Text: "cursor.close()", Truncated: true},
+		{Text: "next(cursor)"}, {Text: "\\tnext(cursor)"}, {Text: "cursor.close()"},
 	})
 	shown := fimCall()
 	ctx.Equal(peer.requests[0].GetN(), int32(3), "the request must ask for nCandidates = 3")
-	ctx.Equal(shown, []string{"cursor.fetchone()", "next(cursor)"}, "empty, truncated and duplicate candidates must be dropped in the model's order")
+	ctx.Equal(shown, []string{"cursor.fetchone()", "next(cursor)", "cursor.close()"}, "empty or whitespace-only, truncated and duplicate (after trimming both ends) candidates must be dropped in the model's order; a truncated candidate does not hide a later complete one")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -802,13 +873,20 @@ const std::string kFimPrefix = "def load_user(conn, user_id):\\n    row = ";
 const std::string kFimSuffix = "\\n    return User.from_row(row)\\n";
 const std::vector<std::string> kFimSnippets = {"class User:\\n    user_id: int\\n"};
 
-// The stand-in model service: records every request, answers the candidates it was given.
+// The stand-in model service: records every request, answers the candidates it was given, and can fail one call late (UNAVAILABLE after a stall).
 class FimModel final : public copilotctx::Model::Service {
  public:
+  harness::Ctx* ctx = nullptr;
+  double stall = 0;
   std::vector<std::pair<std::string, bool>> candidates;
   std::vector<copilotctx::CompleteRequest> requests;
   grpc::Status Complete(grpc::ServerContext*, const copilotctx::CompleteRequest* req, copilotctx::CompleteReply* reply) override {
     requests.push_back(*req);
+    if (stall > 0) {
+      ctx->Clock.Advance(stall);  // the model restarts under the call
+      stall = 0;
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "model restarting");
+    }
     for (const auto& [text, truncated] : candidates) {
       auto* c = reply->add_candidates();
       c->set_text(text);
@@ -823,6 +901,7 @@ FimModel& fimWorld(harness::Ctx& ctx, std::vector<std::pair<std::string, bool>> 
   static FimModel* peer = nullptr;
   delete peer;
   peer = new FimModel();
+  peer->ctx = &ctx;
   peer->candidates = std::move(candidates);
   ctx.GRPC.Server(kFimTarget)->RegisterService(peer);
   return *peer;
@@ -844,19 +923,25 @@ void CheckFimOrder(harness::Ctx& ctx) {
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  fimWorld(ctx);
+  auto& peer = fimWorld(ctx);
   fimCall();
   const auto first = ctx.GRPC.CallsTo("Complete")[0];
   ctx.Assert(first.HasDeadline(), "the Complete call carries no deadline: a slow model holds the request after the editor moved on");
   ctx.Assert(first.TimeoutSeconds() >= 0.25 && first.TimeoutSeconds() <= 0.35, "the deadline must be 300 ms, got %vs", first.TimeoutSeconds());
+  peer.stall = 0.2;  // the first attempt fails UNAVAILABLE after 200 ms, the retry answers at once
+  auto shown = fimCall();
+  auto calls = ctx.GRPC.CallsTo("Complete");
+  ctx.Assert(calls.size() == 3 && !shown.empty(), "an UNAVAILABLE after 200 ms earns one retry that succeeds: saw %d calls and %d candidates", calls.size() - 1, shown.size());
+  const double retry_timeout = calls.back().HasDeadline() ? calls.back().TimeoutSeconds() : -1;
+  ctx.Assert(calls.size() == 3 && retry_timeout >= 0.25 && retry_timeout <= 0.35, "the retry must carry its own 300 ms deadline, got %vs: a deadline shared by both attempts leaves the retry what the first one did not use", retry_timeout);
   ctx.GRPC.SetLatency("Complete", 2.0, kFimTarget);
   const int64_t started = ctx.Clock.Now();
-  const auto shown = fimCall();
+  shown = fimCall();
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Equal(shown.size(), 0, "a model that answers after the deadline must give no ghost text; candidates shown");
   ctx.Assert(waited <= 0.4, "complete waited %.2f s on a model that takes 2 s: the deadline must cut it at 300 ms", waited);
-  const auto calls = ctx.GRPC.CallsTo("Complete");
-  ctx.Assert(calls.size() == 2 && calls[1].Code == grpc::StatusCode::DEADLINE_EXCEEDED, "the slow call must end DEADLINE_EXCEEDED and not be retried: %d calls", calls.size() - 1);
+  calls = ctx.GRPC.CallsTo("Complete");
+  ctx.Assert(calls.size() == 4 && calls[3].Code == grpc::StatusCode::DEADLINE_EXCEEDED, "the slow call must end DEADLINE_EXCEEDED and not be retried: %d calls", calls.size() - 3);
 }
 
 void CheckRetryOnce(harness::Ctx& ctx) {
@@ -872,13 +957,22 @@ void CheckRetryOnce(harness::Ctx& ctx) {
   shown = fimCall();
   ctx.Equal(ctx.GRPC.CallsTo("Complete").size(), 5, "INVALID_ARGUMENT is not transient: one call, no retry; calls so far");
   ctx.Equal(shown.size(), 0, "a rejected request gives no ghost text; candidates shown");
+  for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{
+           {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::UNKNOWN, "UNKNOWN"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}}) {
+    const std::size_t before = ctx.GRPC.CallsTo("Complete").size();
+    ctx.GRPC.Fail("Complete", code, "refused", 1, kFimTarget);
+    shown = fimCall();
+    ctx.Equal(ctx.GRPC.CallsTo("Complete").size() - before, 1, "%s is not UNAVAILABLE: one call, no retry; calls", name);
+    ctx.Equal(shown.size(), 0, "a call that ended %s gives no ghost text; candidates shown", name);
+  }
 }
 
 void CheckFilter(harness::Ctx& ctx) {
-  auto& peer = fimWorld(ctx, {{"", false}, {"   ", false}, {"cursor.fetchone()", false}, {"cursor.fetchone()  ", false}, {"cursor.fetch", true}, {"next(cursor)", false}});
+  auto& peer = fimWorld(ctx, {{"", false}, {"   ", false}, {"\\n\\t", false}, {"cursor.fetchone()", false}, {"cursor.fetchone()  ", false}, {"cursor.close()", true},
+                              {"next(cursor)", false}, {"\\tnext(cursor)", false}, {"cursor.close()", false}});
   const auto shown = fimCall();
   ctx.Equal(peer.requests[0].n(), 3, "the request must ask for kNCandidates = 3");
-  ctx.Equal(shown, {"cursor.fetchone()", "next(cursor)"}, "empty, truncated and duplicate candidates must be dropped in the model's order");
+  ctx.Equal(shown, {"cursor.fetchone()", "next(cursor)", "cursor.close()"}, "empty or whitespace-only, truncated and duplicate (after trimming both ends) candidates must be dropped in the model's order; a truncated candidate does not hide a later complete one");
 }
 `,
   },

@@ -21,9 +21,11 @@ pending; and a projector that reads partitions in another order winds the versio
 
 - The record key is the **subject**; the value is \`{type, grant_id, subject, role, scope,
   grant_version}\`.
-- A row is marked sent only after its **delivery report** says the broker has it (2 s at most).
+- A row is marked sent only after its **delivery report** says the broker has it. Wait for the
+  report **2 s** at most: a row without one counts as a failure.
 - On the first failure the relay **stops**: that row and every row after it stay pending, in order.
-- \`apply_event\` only ever **raises** the counter (one Lua compare-and-set).`,
+- \`apply_event\` only ever **raises** the counter, comparing versions as numbers, in one Lua
+  compare-and-set.`,
   sequence: {
     participants: ['Permission Service', 'Outbox', 'permission.event', 'Projector', 'Redis'],
     messages: [
@@ -72,7 +74,7 @@ pending; and a projector that reads partitions in another order winds the versio
       id: 'sent-after-ack',
       title: 'Marks a row sent only after its delivery report',
       detail:
-        'Each row is produced with a delivery report (`on_delivery`, an awaited `send`, the `WriteMessages` error, `dr_cb`, the send future) and marked sent only once the broker has it; the starter marks every row before the flush, so a rejected record is gone.',
+        'Each row is produced with a delivery report (`on_delivery`, an awaited `send`, the `WriteMessages` error, `dr_cb`, the send future) and marked sent only once the broker has it, waiting 2 s at most: a broker that never answers leaves the row pending. The starter marks every row before the flush, so a rejected record is gone.',
       match: {
         python: {all: [/on_delivery\s*=/], order: [/producer\.produce\(/, /producer\.flush\(/, /grants\.mark_sent\(/]},
         typescript: {all: [/await producer\.send\(/], order: [/await producer\.send\(/, /markSent\(/]},
@@ -98,7 +100,7 @@ pending; and a projector that reads partitions in another order winds the versio
       id: 'monotonic-rebuild',
       title: 'The projector only ever raises the version counter',
       detail:
-        "Records of different subjects arrive from different partitions in any order, so `apply_event` raises `perm:grant_version` to the record's version in one Lua compare-and-set and leaves a higher counter alone; a plain `SET` winds it back, and cache entries stamped since look current again.",
+        "Records of different subjects arrive from different partitions in any order, so `apply_event` raises `perm:grant_version` to the record's version in one Lua compare-and-set, comparing numbers, and leaves a higher counter alone, even one another projector raised a moment ago; a plain `SET` winds it back, and cache entries stamped since look current again.",
       match: {
         python: {all: [/register_script\(|\.eval\(/, /tonumber\(ARGV\[1\]\)\s*>/], none: [/\.set\(\s*VERSION_KEY/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /tonumber\(ARGV\[1\]\)\s*>/], none: [/\.set\(\s*VERSION_KEY/]},
@@ -302,6 +304,7 @@ export async function applyEvent(raw: string): Promise<void> {
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
@@ -312,6 +315,7 @@ import (
 const (
 	topic      = "permission.event"
 	versionKey = "perm:grant_version"
+	ackTimeout = 2 * time.Second
 )
 
 var (
@@ -354,6 +358,7 @@ func applyEvent(ctx context.Context, raw []byte) error {
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/segmentio/kafka-go"
@@ -364,6 +369,7 @@ import (
 const (
 	topic      = "permission.event"
 	versionKey = "perm:grant_version"
+	ackTimeout = 2 * time.Second
 )
 
 var (
@@ -390,7 +396,10 @@ func relay(ctx context.Context) int {
 	sent := 0
 	for _, row := range grants.Pending(ctx) {
 		value, _ := json.Marshal(eventOf(row))
-		if err := writer.WriteMessages(ctx, kafka.Message{Key: []byte(row.Subject), Value: value}); err != nil {
+		sendCtx, cancel := context.WithTimeout(ctx, ackTimeout) // the broker's answer, or give up after the window
+		err := writer.WriteMessages(sendCtx, kafka.Message{Key: []byte(row.Subject), Value: value})
+		cancel()
+		if err != nil {
 			break // this row and every later one stay pending, in order, for the next pass
 		}
 		grants.MarkSent(ctx, row.ID) // the broker has it
@@ -678,6 +687,18 @@ def _event(version):
     return json.dumps({"type": "granted", "grant_id": f"g-{version}", "subject": "ada", "role": "viewer", "scope": "team:eng", "grant_version": version})
 
 
+def _stalled_relay(ctx, m):
+    """bob's row meets a broker that stops answering: relay gives up after the report window, the row pending."""
+    grants.commit_grant("bob", "viewer", "team:eng", "olu")
+    ctx.kafka.stall(TOPIC)
+    before = ctx.clock.time()
+    m.relay()
+    waited = ctx.clock.time() - before
+    assert waited <= 2.5, f"relay waited {waited:.1f} s for a broker that does not answer, expected the 2 s delivery-report window"
+    held = [row["subject"] for row in grants.pending()]
+    assert held == ["bob"], f"no delivery report came for bob's row and the outbox holds the rows of {held}: a row without a report stays pending"
+
+
 def check_subject_key(ctx):
     m = ctx.load("events")
     ada = grants.commit_grant("ada", "viewer", "team:eng", "olu")
@@ -706,6 +727,7 @@ def check_sent_after_ack(ctx):
     m.relay()
     assert len(ctx.kafka.records(TOPIC)) == 1, f"the next relay must publish the row the broker rejected, the topic holds {len(ctx.kafka.records(TOPIC))} records"
     assert grants.pending() == [], f"once delivered the row must be marked sent, the outbox still holds {grants.pending()}"
+    _stalled_relay(ctx, m)
 
 
 def check_stop_at_failure(ctx):
@@ -732,6 +754,13 @@ def check_monotonic_rebuild(ctx):
     m.apply_event(_event(7))
     got = ctx.redis.get("perm:grant_version")
     assert got == "9", f"a record with grant_version 7 moved the counter from 9 to {got!r}: the projector only ever raises it"
+    m.apply_event(_event(10))
+    got = ctx.redis.get("perm:grant_version")
+    assert got == "10", f"a record with grant_version 10 left the counter at {got!r} (it was 9): versions compare as numbers"
+    ctx.redis_after("perm:grant_version", lambda: ctx.redis.set("perm:grant_version", "20"))
+    m.apply_event(_event(11))
+    got = ctx.redis.get("perm:grant_version")
+    assert got == "20", f"another projector raised the counter to 20 while this one applied grant_version 11, and it ended at {got!r}: read and raise it in one atomic step"
 `,
     typescript: `const TOPIC = 'permission.event';
 
@@ -750,6 +779,18 @@ function events(ctx) {
 }
 
 const values = ctx => ctx.kafka.values(TOPIC).map(v => JSON.parse(v));
+
+/** bob's row meets a broker that stops answering: relay gives up after the report window, the row pending. */
+async function stalledRelay(ctx, m, grants): Promise<void> {
+  await grants.commitGrant('bob', 'viewer', 'team:eng', 'olu');
+  ctx.kafka.stall(TOPIC);
+  const before = ctx.clock.now();
+  await m.relay();
+  const waited = (ctx.clock.now() - before) / 1000;
+  assert(waited <= 2.5, \`relay waited \${waited.toFixed(1)} s for a broker that does not answer, expected the 2 s delivery-report window\`);
+  const held = (await grants.pending()).map(row => row.subject);
+  assert.deepStrictEqual(held, ['bob'], \`no delivery report came for bob's row and the outbox holds the rows of \${JSON.stringify(held)}: a row without a report stays pending\`);
+}
 
 export async function check_subject_key(ctx) {
   const {m, grants} = events(ctx);
@@ -781,6 +822,7 @@ export async function check_sent_after_ack(ctx) {
   await settle();
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the next relay must publish the row the broker rejected');
   assert.deepStrictEqual(await grants.pending(), [], 'once delivered the row must be marked sent');
+  await stalledRelay(ctx, m, grants);
 }
 
 export async function check_stop_at_failure(ctx) {
@@ -808,6 +850,13 @@ export async function check_monotonic_rebuild(ctx) {
   await m.applyEvent(event(7));
   got = ctx.redis.get('perm:grant_version');
   assert.equal(got, '9', \`a record with grant_version 7 moved the counter from 9 to \${JSON.stringify(got)}: the projector only ever raises it\`);
+  await m.applyEvent(event(10));
+  got = ctx.redis.get('perm:grant_version');
+  assert.equal(got, '10', \`a record with grant_version 10 left the counter at \${JSON.stringify(got)} (it was 9): versions compare as numbers\`);
+  ctx.redisAfter('perm:grant_version', () => ctx.redis.set('perm:grant_version', '20'));
+  await m.applyEvent(event(11));
+  got = ctx.redis.get('perm:grant_version');
+  assert.equal(got, '20', \`another projector raised the counter to 20 while this one applied grant_version 11, and it ended at \${JSON.stringify(got)}: read and raise it in one atomic step\`);
 }
 `,
     go: `package main
@@ -847,9 +896,24 @@ func typesOf(ctx *harness.Ctx, subject string) []string {
 	return out
 }
 
-func eventJSON(version int) []byte {
+func hEventJSON(version int) []byte {
 	raw, _ := json.Marshal(map[string]any{"type": "granted", "grant_id": fmt.Sprintf("g-%d", version), "subject": "ada", "role": "viewer", "scope": "team:eng", "grant_version": version})
 	return raw
+}
+
+// stalledRelay: bob's row meets a broker that stops answering; relay gives up after the report window, the row pending.
+func stalledRelay(ctx *harness.Ctx) {
+	mustCommit(ctx, "bob", "viewer")
+	ctx.Kafka.Stall(eventsTopic)
+	before := ctx.Clock.Now()
+	relay(eventsBg)
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	ctx.Assert(waited <= 2.5, "relay waited %.1f s for a broker that does not answer, expected the 2 s delivery-report window", waited)
+	held := []string{}
+	for _, row := range grants.Pending(eventsBg) {
+		held = append(held, row.Subject)
+	}
+	ctx.Equal(held, []string{"bob"}, "no delivery report came for bob's row: a row without a report stays pending; the subjects of the pending rows")
 }
 
 func mustCommit(ctx *harness.Ctx, subject, role string) *grants.OutboxRow {
@@ -898,6 +962,7 @@ func CheckSentAfterAck(ctx *harness.Ctx) {
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the next relay must publish the row the broker rejected; the records")
 	ctx.Equal(len(grants.Pending(eventsBg)), 0, "once delivered the row must be marked sent; the pending rows")
+	stalledRelay(ctx)
 }
 
 func CheckStopAtFailure(ctx *harness.Ctx) {
@@ -916,14 +981,24 @@ func CheckStopAtFailure(ctx *harness.Ctx) {
 func CheckMonotonicRebuild(ctx *harness.Ctx) {
 	// Records of different subjects come off different partitions in any order.
 	for _, v := range []int{5, 3, 6, 2} {
-		ctx.NoError(applyEvent(eventsBg, eventJSON(v)), "applyEvent(grant_version %d)", v)
+		ctx.NoError(applyEvent(eventsBg, hEventJSON(v)), "applyEvent(grant_version %d)", v)
 	}
 	got, _ := ctx.Redis.Get("perm:grant_version")
 	ctx.Equal(got, "6", "after records with grant_version 5, 3, 6, 2 the counter must be 6 (a counter wound back makes cache entries stamped since look current again)")
 	ctx.Redis.Set("perm:grant_version", "9")
-	ctx.NoError(applyEvent(eventsBg, eventJSON(7)), "applyEvent(grant_version 7)")
+	ctx.NoError(applyEvent(eventsBg, hEventJSON(7)), "applyEvent(grant_version 7)")
 	got, _ = ctx.Redis.Get("perm:grant_version")
 	ctx.Equal(got, "9", "a record with grant_version 7 must leave a counter of 9 alone: the projector only ever raises it")
+	ctx.NoError(applyEvent(eventsBg, hEventJSON(10)), "applyEvent(grant_version 10)")
+	got, _ = ctx.Redis.Get("perm:grant_version")
+	ctx.Equal(got, "10", "a record with grant_version 10 must raise a counter of 9: versions compare as numbers; the counter")
+	ctx.Redis.After("perm:grant_version", func() any {
+		ctx.Redis.Set("perm:grant_version", "20")
+		return nil
+	})
+	ctx.NoError(applyEvent(eventsBg, hEventJSON(11)), "applyEvent(grant_version 11)")
+	got, _ = ctx.Redis.Get("perm:grant_version")
+	ctx.Equal(got, "20", "another projector raised the counter to 20 while this one applied grant_version 11: read and raise it in one atomic step; the counter")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -959,8 +1034,21 @@ std::vector<std::string> typesOf(harness::Ctx& ctx, const std::string& subject) 
   return out;
 }
 
-std::string eventJson(int version) {
+std::string hEventJson(int version) {
   return nlohmann::json{{"type", "granted"}, {"grant_id", "g-" + std::to_string(version)}, {"subject", "ada"}, {"role", "viewer"}, {"scope", "team:eng"}, {"grant_version", version}}.dump();
+}
+
+// bob's row meets a broker that stops answering: relay gives up after the report window, the row pending.
+void stalledRelay(harness::Ctx& ctx) {
+  grants::commitGrant("bob", "viewer", "team:eng", "olu");
+  ctx.Kafka.Stall(kEventsTopic);
+  const int64_t before = ctx.Clock.Now();
+  relay();
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  ctx.Assert(waited <= 2.5, "relay waited %.1f s for a broker that does not answer, expected the 2 s delivery-report window", waited);
+  std::vector<std::string> held;
+  for (const grants::OutboxRow& row : grants::pending()) held.push_back(row.subject);
+  ctx.Equal(held, {"bob"}, "no delivery report came for bob's row: a row without a report stays pending; the subjects of the pending rows");
 }
 
 }  // namespace
@@ -1002,6 +1090,7 @@ void CheckSentAfterAck(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the next relay must publish the row the broker rejected; the records");
   ctx.Equal(grants::pending().size(), 0, "once delivered the row must be marked sent; the pending rows");
+  stalledRelay(ctx);
 }
 
 void CheckStopAtFailure(harness::Ctx& ctx) {
@@ -1019,11 +1108,16 @@ void CheckStopAtFailure(harness::Ctx& ctx) {
 
 void CheckMonotonicRebuild(harness::Ctx& ctx) {
   // Records of different subjects come off different partitions in any order.
-  for (const int v : {5, 3, 6, 2}) applyEvent(eventJson(v));
+  for (const int v : {5, 3, 6, 2}) applyEvent(hEventJson(v));
   ctx.Equal(ctx.Redis.Get("perm:grant_version"), std::optional<std::string>("6"), "after records with grant_version 5, 3, 6, 2 the counter must be 6 (a counter wound back makes cache entries stamped since look current again)");
   ctx.Redis.Set("perm:grant_version", "9");
-  applyEvent(eventJson(7));
+  applyEvent(hEventJson(7));
   ctx.Equal(ctx.Redis.Get("perm:grant_version"), std::optional<std::string>("9"), "a record with grant_version 7 must leave a counter of 9 alone: the projector only ever raises it");
+  applyEvent(hEventJson(10));
+  ctx.Equal(ctx.Redis.Get("perm:grant_version"), std::optional<std::string>("10"), "a record with grant_version 10 must raise a counter of 9: versions compare as numbers; the counter");
+  ctx.Redis.After("perm:grant_version", [&ctx] { ctx.Redis.Set("perm:grant_version", "20"); });
+  applyEvent(hEventJson(11));
+  ctx.Equal(ctx.Redis.Get("perm:grant_version"), std::optional<std::string>("20"), "another projector raised the counter to 20 while this one applied grant_version 11: read and raise it in one atomic step; the counter");
 }
 `,
   },

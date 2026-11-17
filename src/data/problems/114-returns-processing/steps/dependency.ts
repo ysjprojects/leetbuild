@@ -61,7 +61,7 @@ service Refunds   { rpc IssueRefund(RefundRequest) returns (RefundReply); }
       id: 'deadline',
       title: 'Every grade call carries a 3-second deadline',
       detail:
-        'Each `GradeItem` attempt is made with `GRADE_DEADLINE_S` (3 s), so a stalled warehouse costs at most three short waits; the starter allows 30 s per attempt.',
+        'Each `GradeItem` attempt is made with its own `GRADE_DEADLINE_S` (3 s), so a stalled warehouse costs three attempts of 3 s each and the return waits in `awaiting_inspection`; the starter allows 30 s per attempt.',
       match: {
         python: {all: [/GRADE_DEADLINE_S\s*=\s*3\b/, /GradeItem\([\s\S]{0,200}?timeout\s*=\s*GRADE_DEADLINE_S/]},
         typescript: {
@@ -102,7 +102,7 @@ service Refunds   { rpc IssueRefund(RefundRequest) returns (RefundReply); }
       id: 'terminal-not-retried',
       title: 'Only UNAVAILABLE and DEADLINE_EXCEEDED are asked again',
       detail:
-        'An attempt is repeated only for `UNAVAILABLE` or `DEADLINE_EXCEEDED`; `NOT_FOUND` and `INVALID_ARGUMENT` end the attempts, and so does any grade. The starter retries every error and asks again until the grade is `sellable`.',
+        'An attempt is repeated only for `UNAVAILABLE` or `DEADLINE_EXCEEDED`, up to `MAX_ATTEMPTS`; any other status (`NOT_FOUND`, `INVALID_ARGUMENT`, `PERMISSION_DENIED`, ...) ends the attempts, and so does any grade. The starter retries every error and asks again until the grade is `sellable`.',
       match: {
         python: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/==\s*["']sellable["']/, /\bcontinue\b/]},
         typescript: {all: [/UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/===?\s*["']sellable["']/, /\bcontinue;/]},
@@ -753,9 +753,14 @@ def check_deadline(ctx):
     _return("ret-2")
     ctx.grpc.set_latency("GradeItem", 60.0)
     before = ctx.clock.time()
-    m.settle_return("ret-2")
+    state = m.settle_return("ret-2")
     waited = ctx.clock.time() - before
     assert waited <= 10, f"settle_return waited {waited:.0f} s on a stalled warehouse: three attempts of 3 s each is the most it may spend"
+    stalled = _calls(ctx, "GradeItem", "ret-2")
+    assert len(stalled) == 3, f"a stalled warehouse was asked {len(stalled)} times, expected 3: an attempt that runs out its deadline is asked again, up to MAX_ATTEMPTS"
+    deadlines = [call.timeout for call in stalled]
+    assert all(t is not None and 2.5 <= t <= 3.5 for t in deadlines), f"the attempts on a stalled warehouse carried deadlines {deadlines}, expected 3 s each: every attempt gets its own GRADE_DEADLINE_S, not what is left of the first"
+    assert state == "awaiting_inspection", f"three attempts that all ran out left the return {state!r}, expected awaiting_inspection"
 
 
 def check_hold_on_outage(ctx):
@@ -772,6 +777,10 @@ def check_hold_on_outage(ctx):
     ctx.grpc.fail("GradeItem", grpc.StatusCode.UNAVAILABLE, times=1)
     assert m.settle_return("ret-2") == "refund_pending", "after one UNAVAILABLE the next attempt gets the grade: the return must move on to its refund"
     assert len(_calls(ctx, "GradeItem", "ret-2")) == 2, f"one UNAVAILABLE then a grade took {len(_calls(ctx, 'GradeItem', 'ret-2'))} GradeItem calls, expected 2"
+    _return("ret-3")
+    ctx.grpc.fail("GradeItem", grpc.StatusCode.UNAVAILABLE, times=2)
+    assert m.settle_return("ret-3") == "refund_pending", "after two UNAVAILABLE the third attempt gets the grade: the return must move on to its refund"
+    assert len(_calls(ctx, "GradeItem", "ret-3")) == 3, f"two UNAVAILABLE then a grade took {len(_calls(ctx, 'GradeItem', 'ret-3'))} GradeItem calls, expected 3 (MAX_ATTEMPTS)"
 
 
 def check_damaged_amount(ctx):
@@ -807,6 +816,16 @@ def check_terminal_not_retried(ctx):
     m.settle_return("ret-3")
     asked = len(_calls(ctx, "GradeItem", "ret-3"))
     assert asked == 1, f"INVALID_ARGUMENT was asked again {asked - 1} times: the same request gets the same refusal"
+    ctx.grpc.failures.clear()
+    for n, code in enumerate((grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.INTERNAL), start=4):
+        return_id = f"ret-{n}"
+        _return(return_id)
+        ctx.grpc.fail("GradeItem", code, times=1)
+        state = m.settle_return(return_id)
+        asked = len(_calls(ctx, "GradeItem", return_id))
+        assert asked == 1, f"{code.name} was asked again {asked - 1} times: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again"
+        paid = [c.request.amount_cents for c in _calls(ctx, "IssueRefund", return_id)]
+        assert state == "awaiting_inspection" and not paid, f"after {code.name} the return is {state!r} and the refund processor was asked for {paid}: no grade holds it in awaiting_inspection"
 `,
     typescript: `function world(ctx) {
   const pkg = ctx.proto('returns_processing.proto');
@@ -851,9 +870,14 @@ export async function check_deadline(ctx) {
   await open('ret-2');
   ctx.grpc.setLatency('GradeItem', 60.0);
   const before = ctx.clock.now();
-  await m.settleReturn('ret-2');
+  const state = await m.settleReturn('ret-2');
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited <= 10, \`settleReturn waited \${waited.toFixed(0)} s on a stalled warehouse: three attempts of 3 s each is the most it may spend\`);
+  const stalled = calls(ctx, 'GradeItem', 'ret-2');
+  assert.equal(stalled.length, 3, \`a stalled warehouse was asked \${stalled.length} times, expected 3: an attempt that runs out its deadline is asked again, up to MAX_ATTEMPTS\`);
+  const deadlines = stalled.map(call => call.timeout);
+  assert(deadlines.every(t => t !== null && 2.5 <= t && t <= 3.5), \`the attempts on a stalled warehouse carried deadlines \${JSON.stringify(deadlines)} s, expected 3 s each: every attempt gets its own GRADE_DEADLINE_MS, not what is left of the first\`);
+  assert.equal(state, 'awaiting_inspection', \`three attempts that all ran out left the return \${JSON.stringify(state)}, expected awaiting_inspection\`);
 }
 
 export async function check_hold_on_outage(ctx) {
@@ -870,6 +894,10 @@ export async function check_hold_on_outage(ctx) {
   ctx.grpc.fail('GradeItem', ctx.grpc.status.UNAVAILABLE, '', 1);
   assert.equal(await m.settleReturn('ret-2'), 'refund_pending', 'after one UNAVAILABLE the next attempt gets the grade: the return must move on to its refund');
   assert.equal(calls(ctx, 'GradeItem', 'ret-2').length, 2, 'one UNAVAILABLE then a grade must take 2 GradeItem calls');
+  await open('ret-3');
+  ctx.grpc.fail('GradeItem', ctx.grpc.status.UNAVAILABLE, '', 2);
+  assert.equal(await m.settleReturn('ret-3'), 'refund_pending', 'after two UNAVAILABLE the third attempt gets the grade: the return must move on to its refund');
+  assert.equal(calls(ctx, 'GradeItem', 'ret-3').length, 3, 'two UNAVAILABLE then a grade must take 3 GradeItem calls (MAX_ATTEMPTS)');
 }
 
 export async function check_damaged_amount(ctx) {
@@ -905,6 +933,18 @@ export async function check_terminal_not_retried(ctx) {
   await m.settleReturn('ret-3');
   asked = calls(ctx, 'GradeItem', 'ret-3').length;
   assert.equal(asked, 1, \`INVALID_ARGUMENT was asked again \${asked - 1} times: the same request gets the same refusal\`);
+  ctx.grpc.clearFailures();
+  const terminal = ['PERMISSION_DENIED', 'FAILED_PRECONDITION', 'INTERNAL'];
+  for (const [i, name] of terminal.entries()) {
+    const returnId = \`ret-\${i + 4}\`;
+    await open(returnId);
+    ctx.grpc.fail('GradeItem', ctx.grpc.status[name], '', 1);
+    const after = await m.settleReturn(returnId);
+    asked = calls(ctx, 'GradeItem', returnId).length;
+    assert.equal(asked, 1, \`\${name} was asked again \${asked - 1} times: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again\`);
+    const paid = calls(ctx, 'IssueRefund', returnId).map(c => Number(c.request.amount_cents));
+    assert(after === 'awaiting_inspection' && paid.length === 0, \`after \${name} the return is \${JSON.stringify(after)} and the refund processor was asked for \${JSON.stringify(paid)}: no grade holds it in awaiting_inspection\`);
+  }
 }
 `,
     go: `package main
@@ -969,17 +1009,27 @@ func clientSettle(ctx *harness.Ctx, returnID string) string {
 	return state
 }
 
-func gradeCalls(ctx *harness.Ctx, returnID string) int {
-	n := 0
-	for _, c := range ctx.GRPC.CallsTo("GradeItem", "") {
-		if c.Request.(*pb.GradeRequest).GetReturnId() == returnID {
-			n++
-		}
-	}
-	return n
+func clientGradeCalls(ctx *harness.Ctx, returnID string) int {
+	return len(clientGradeDeadlines(ctx, returnID))
 }
 
-func refundAmounts(ctx *harness.Ctx, returnID string) []int64 {
+// clientGradeDeadlines is the deadline, in seconds, each GradeItem call for returnID carried (-1 for none).
+func clientGradeDeadlines(ctx *harness.Ctx, returnID string) []float64 {
+	var out []float64
+	for _, c := range ctx.GRPC.CallsTo("GradeItem", "") {
+		if c.Request.(*pb.GradeRequest).GetReturnId() != returnID {
+			continue
+		}
+		if c.HasDeadline() {
+			out = append(out, c.Timeout.Seconds())
+		} else {
+			out = append(out, -1)
+		}
+	}
+	return out
+}
+
+func clientRefundAmounts(ctx *harness.Ctx, returnID string) []int64 {
 	var out []int64
 	for _, c := range ctx.GRPC.CallsTo("IssueRefund", "") {
 		if req := c.Request.(*pb.RefundRequest); req.GetReturnId() == returnID {
@@ -1000,9 +1050,15 @@ func CheckDeadline(ctx *harness.Ctx) {
 	clientOpen(ctx, "ret-2", 1)
 	ctx.GRPC.SetLatency("GradeItem", 60.0, "")
 	before := ctx.Clock.Now()
-	settleReturn(clientBg, "ret-2")
+	state, _ := settleReturn(clientBg, "ret-2")
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 10, "settleReturn waited %.0f s on a stalled warehouse: three attempts of 3 s each is the most it may spend", waited)
+	deadlines := clientGradeDeadlines(ctx, "ret-2")
+	ctx.Equal(len(deadlines), 3, "a stalled warehouse: an attempt that runs out its deadline is asked again, up to MAX_ATTEMPTS; the GradeItem calls")
+	for _, d := range deadlines {
+		ctx.Assert(d >= 2.5 && d <= 3.5, "the attempts on a stalled warehouse carried deadlines %v s, expected 3 s each: every attempt gets its own gradeDeadline, not what is left of the first", deadlines)
+	}
+	ctx.Equal(state, "awaiting_inspection", "three attempts that all ran out; the state")
 }
 
 func CheckHoldOnOutage(ctx *harness.Ctx) {
@@ -1010,7 +1066,7 @@ func CheckHoldOnOutage(ctx *harness.Ctx) {
 	clientOpen(ctx, "ret-1", 1)
 	ctx.GRPC.Fail("GradeItem", codes.Unavailable, "", 3, "")
 	state := clientSettle(ctx, "ret-1")
-	paid := refundAmounts(ctx, "ret-1")
+	paid := clientRefundAmounts(ctx, "ret-1")
 	ctx.Assert(len(paid) == 0, "with the warehouse unavailable on every attempt the refund processor was asked to pay %v: an item nobody graded was refunded", paid)
 	ctx.Equal(state, "awaiting_inspection", "with no grade, settleReturn's state")
 	record := store.ReturnOf(clientBg, "ret-1")
@@ -1018,7 +1074,11 @@ func CheckHoldOnOutage(ctx *harness.Ctx) {
 	clientOpen(ctx, "ret-2", 1)
 	ctx.GRPC.Fail("GradeItem", codes.Unavailable, "", 1, "")
 	ctx.Equal(clientSettle(ctx, "ret-2"), "refund_pending", "after one UNAVAILABLE the next attempt gets the grade: the return must move on to its refund; the state")
-	ctx.Equal(gradeCalls(ctx, "ret-2"), 2, "one UNAVAILABLE then a grade; the GradeItem calls")
+	ctx.Equal(clientGradeCalls(ctx, "ret-2"), 2, "one UNAVAILABLE then a grade; the GradeItem calls")
+	clientOpen(ctx, "ret-3", 1)
+	ctx.GRPC.Fail("GradeItem", codes.Unavailable, "", 2, "")
+	ctx.Equal(clientSettle(ctx, "ret-3"), "refund_pending", "after two UNAVAILABLE the third attempt gets the grade: the return must move on to its refund; the state")
+	ctx.Equal(clientGradeCalls(ctx, "ret-3"), 3, "two UNAVAILABLE then a grade (MAX_ATTEMPTS); the GradeItem calls")
 }
 
 func CheckDamagedAmount(ctx *harness.Ctx) {
@@ -1026,7 +1086,7 @@ func CheckDamagedAmount(ctx *harness.Ctx) {
 	clientOpen(ctx, "ret-1", 2)
 	w.grades["ret-1"] = "damaged"
 	ctx.Equal(clientSettle(ctx, "ret-1"), "refund_pending", "a graded return must move on to its refund; the state")
-	ctx.Equal(refundAmounts(ctx, "ret-1"), []int64{4000}, "a damaged return of 2 units at 4000 cents must ask for DAMAGED_REFUND_PERCENT (50) of the line value; the IssueRefund amounts")
+	ctx.Equal(clientRefundAmounts(ctx, "ret-1"), []int64{4000}, "a damaged return of 2 units at 4000 cents must ask for DAMAGED_REFUND_PERCENT (50) of the line value; the IssueRefund amounts")
 	record := store.ReturnOf(clientBg, "ret-1")
 	ctx.Assert(record.Grade == "damaged" && record.RefundCents == 4000 && record.RefundID == "rf-ret-1", "the return holds %+v, expected grade damaged, refund_cents 4000, refund_id rf-ret-1", *record)
 	clientOpen(ctx, "ret-2", 1)
@@ -1040,16 +1100,30 @@ func CheckTerminalNotRetried(ctx *harness.Ctx) {
 	clientOpen(ctx, "ret-1", 1)
 	w.missing["ret-1"] = true
 	state := clientSettle(ctx, "ret-1")
-	ctx.Equal(gradeCalls(ctx, "ret-1"), 1, "the warehouse answered NOT_FOUND (the item has not arrived): only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls")
+	ctx.Equal(clientGradeCalls(ctx, "ret-1"), 1, "the warehouse answered NOT_FOUND (the item has not arrived): only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls")
 	ctx.Equal(state, "awaiting_inspection", "an item that has not arrived; the state")
 	clientOpen(ctx, "ret-2", 1)
 	w.grades["ret-2"] = "damaged"
 	clientSettle(ctx, "ret-2")
-	ctx.Equal(gradeCalls(ctx, "ret-2"), 1, "the warehouse graded the item damaged, and a grade is an answer; the GradeItem calls")
+	ctx.Equal(clientGradeCalls(ctx, "ret-2"), 1, "the warehouse graded the item damaged, and a grade is an answer; the GradeItem calls")
 	clientOpen(ctx, "ret-3", 1)
 	ctx.GRPC.Fail("GradeItem", codes.InvalidArgument, "", 3, "")
 	clientSettle(ctx, "ret-3")
-	ctx.Equal(gradeCalls(ctx, "ret-3"), 1, "INVALID_ARGUMENT: the same request gets the same refusal; the GradeItem calls")
+	ctx.Equal(clientGradeCalls(ctx, "ret-3"), 1, "INVALID_ARGUMENT: the same request gets the same refusal; the GradeItem calls")
+	ctx.GRPC.ClearFailures()
+	terminal := []struct {
+		name string
+		code codes.Code
+	}{{"PERMISSION_DENIED", codes.PermissionDenied}, {"FAILED_PRECONDITION", codes.FailedPrecondition}, {"INTERNAL", codes.Internal}}
+	for i, t := range terminal {
+		returnID := "ret-" + string(rune('4'+i))
+		clientOpen(ctx, returnID, 1)
+		ctx.GRPC.Fail("GradeItem", t.code, "", 1, "")
+		after := clientSettle(ctx, returnID)
+		ctx.Equal(clientGradeCalls(ctx, returnID), 1, "%s: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls", t.name)
+		paid := clientRefundAmounts(ctx, returnID)
+		ctx.Assert(after == "awaiting_inspection" && len(paid) == 0, "after %s the return is %q and the refund processor was asked for %v: no grade holds it in awaiting_inspection", t.name, after, paid)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1065,7 +1139,7 @@ func CheckTerminalNotRetried(ctx *harness.Ctx) {
 namespace {
 
 // Grades every item sellable, except those in grades; those in missing have not arrived.
-class WarehousePeer final : public returnsd::Warehouse::Service {
+class HWarehousePeer final : public returnsd::Warehouse::Service {
  public:
   std::map<std::string, std::string> grades;
   std::set<std::string> missing;
@@ -1077,7 +1151,7 @@ class WarehousePeer final : public returnsd::Warehouse::Service {
   }
 };
 
-class RefundsPeer final : public returnsd::Refunds::Service {
+class HRefundsPeer final : public returnsd::Refunds::Service {
  public:
   grpc::Status IssueRefund(grpc::ServerContext*, const returnsd::RefundRequest* req, returnsd::RefundReply* out) override {
     out->set_refund_id("rf-" + req->return_id());
@@ -1086,26 +1160,26 @@ class RefundsPeer final : public returnsd::Refunds::Service {
   }
 };
 
-struct Peers {
-  WarehousePeer warehouse;
-  RefundsPeer refunds;
+struct HPeers {
+  HWarehousePeer warehouse;
+  HRefundsPeer refunds;
 };
 
-WarehousePeer& world(harness::Ctx& ctx) {
-  static Peers* peers = nullptr;
+HWarehousePeer& hWorld(harness::Ctx& ctx) {
+  static HPeers* peers = nullptr;
   delete peers;
-  peers = new Peers;
+  peers = new HPeers;
   ctx.GRPC.Server("warehouse:9000")->RegisterService(&peers->warehouse);
   ctx.GRPC.Server("refunds:9000")->RegisterService(&peers->refunds);
   store::putLine(store::OrderLine{"L1", "t-1", "KETTLE-2L", 9, 4000, store::today(), "standard"});
   return peers->warehouse;
 }
 
-void open(const std::string& return_id, long long quantity = 1) {
+void hOpen(const std::string& return_id, long long quantity = 1) {
   ledger::registerReturn("L1", return_id, quantity, {{"tenant", "t-1"}, {"reason_code", "damaged"}, {"photo_ref", "photos/kettle.jpg"}});
 }
 
-std::string settle(harness::Ctx& ctx, const std::string& return_id) {
+std::string hSettle(harness::Ctx& ctx, const std::string& return_id) {
   try {
     return settleReturn(return_id);
   } catch (const std::exception& e) {
@@ -1114,15 +1188,18 @@ std::string settle(harness::Ctx& ctx, const std::string& return_id) {
   return "";
 }
 
-int gradeCalls(harness::Ctx& ctx, const std::string& return_id) {
-  int n = 0;
+// The deadline, in seconds, each GradeItem call for return_id carried (-1 for none).
+std::vector<double> hGradeDeadlines(harness::Ctx& ctx, const std::string& return_id) {
+  std::vector<double> out;
   for (const auto& c : ctx.GRPC.CallsTo("GradeItem")) {
-    if (c.Request<returnsd::GradeRequest>().return_id() == return_id) n++;
+    if (c.Request<returnsd::GradeRequest>().return_id() == return_id) out.push_back(c.HasDeadline() ? c.TimeoutSeconds() : -1);
   }
-  return n;
+  return out;
 }
 
-std::vector<long long> refundAmounts(harness::Ctx& ctx, const std::string& return_id) {
+int hGradeCalls(harness::Ctx& ctx, const std::string& return_id) { return static_cast<int>(hGradeDeadlines(ctx, return_id).size()); }
+
+std::vector<long long> hRefundAmounts(harness::Ctx& ctx, const std::string& return_id) {
   std::vector<long long> out;
   for (const auto& c : ctx.GRPC.CallsTo("IssueRefund")) {
     const auto req = c.Request<returnsd::RefundRequest>();
@@ -1134,69 +1211,92 @@ std::vector<long long> refundAmounts(harness::Ctx& ctx, const std::string& retur
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  world(ctx);
-  open("ret-1");
-  ctx.Equal(settle(ctx, "ret-1"), "refund_pending", "with a healthy warehouse the return must move on to its refund; the state");
+  hWorld(ctx);
+  hOpen("ret-1");
+  ctx.Equal(hSettle(ctx, "ret-1"), "refund_pending", "with a healthy warehouse the return must move on to its refund; the state");
   for (const auto& call : ctx.GRPC.CallsTo("GradeItem")) {
     ctx.Assert(call.HasDeadline(), "a GradeItem call carries no deadline: a stalled warehouse holds the settlement open");
     ctx.Assert(2.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 3.5, "a GradeItem call carries a %v s deadline, expected kGradeDeadline = 3 s", call.TimeoutSeconds());
   }
-  open("ret-2");
+  hOpen("ret-2");
   ctx.GRPC.SetLatency("GradeItem", 60.0);
   const int64_t before = ctx.Clock.Now();
+  std::string state;
   try {
-    settleReturn("ret-2");
+    state = settleReturn("ret-2");
   } catch (const std::exception&) {
   }
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 10, "settleReturn waited %.0f s on a stalled warehouse: three attempts of 3 s each is the most it may spend", waited);
+  const auto deadlines = hGradeDeadlines(ctx, "ret-2");
+  ctx.Equal(deadlines.size(), 3, "a stalled warehouse: an attempt that runs out its deadline is asked again, up to MAX_ATTEMPTS; the GradeItem calls");
+  for (const double d : deadlines) {
+    ctx.Assert(2.5 <= d && d <= 3.5, "the attempts on a stalled warehouse carried deadlines %v s, expected 3 s each: every attempt gets its own kGradeDeadline, not what is left of the first", deadlines);
+  }
+  ctx.Equal(state, "awaiting_inspection", "three attempts that all ran out; the state");
 }
 
 void CheckHoldOnOutage(harness::Ctx& ctx) {
-  world(ctx);
-  open("ret-1");
+  hWorld(ctx);
+  hOpen("ret-1");
   ctx.GRPC.Fail("GradeItem", grpc::StatusCode::UNAVAILABLE, "", 3);
-  const std::string state = settle(ctx, "ret-1");
-  const auto paid = refundAmounts(ctx, "ret-1");
+  const std::string state = hSettle(ctx, "ret-1");
+  const auto paid = hRefundAmounts(ctx, "ret-1");
   ctx.Assert(paid.empty(), "with the warehouse unavailable on every attempt the refund processor was asked to pay %v: an item nobody graded was refunded", paid);
   ctx.Equal(state, "awaiting_inspection", "with no grade, settleReturn's state");
   const auto record = store::returnOf("ret-1");
   ctx.Assert(record->state == "awaiting_inspection" && record->refund_id.empty() && record->refund_cents == 0, "the return holds state %q, refund_id %q, refund_cents %d, expected awaiting_inspection and no refund", record->state, record->refund_id, record->refund_cents);
-  open("ret-2");
+  hOpen("ret-2");
   ctx.GRPC.Fail("GradeItem", grpc::StatusCode::UNAVAILABLE, "", 1);
-  ctx.Equal(settle(ctx, "ret-2"), "refund_pending", "after one UNAVAILABLE the next attempt gets the grade: the return must move on to its refund; the state");
-  ctx.Equal(gradeCalls(ctx, "ret-2"), 2, "one UNAVAILABLE then a grade; the GradeItem calls");
+  ctx.Equal(hSettle(ctx, "ret-2"), "refund_pending", "after one UNAVAILABLE the next attempt gets the grade: the return must move on to its refund; the state");
+  ctx.Equal(hGradeCalls(ctx, "ret-2"), 2, "one UNAVAILABLE then a grade; the GradeItem calls");
+  hOpen("ret-3");
+  ctx.GRPC.Fail("GradeItem", grpc::StatusCode::UNAVAILABLE, "", 2);
+  ctx.Equal(hSettle(ctx, "ret-3"), "refund_pending", "after two UNAVAILABLE the third attempt gets the grade: the return must move on to its refund; the state");
+  ctx.Equal(hGradeCalls(ctx, "ret-3"), 3, "two UNAVAILABLE then a grade (MAX_ATTEMPTS); the GradeItem calls");
 }
 
 void CheckDamagedAmount(harness::Ctx& ctx) {
-  WarehousePeer& warehouse = world(ctx);
-  open("ret-1", 2);
+  HWarehousePeer& warehouse = hWorld(ctx);
+  hOpen("ret-1", 2);
   warehouse.grades["ret-1"] = "damaged";
-  ctx.Equal(settle(ctx, "ret-1"), "refund_pending", "a graded return must move on to its refund; the state");
-  ctx.Equal(refundAmounts(ctx, "ret-1"), std::vector<long long>{4000}, "a damaged return of 2 units at 4000 cents must ask for DAMAGED_REFUND_PERCENT (50) of the line value; the IssueRefund amounts");
+  ctx.Equal(hSettle(ctx, "ret-1"), "refund_pending", "a graded return must move on to its refund; the state");
+  ctx.Equal(hRefundAmounts(ctx, "ret-1"), std::vector<long long>{4000}, "a damaged return of 2 units at 4000 cents must ask for DAMAGED_REFUND_PERCENT (50) of the line value; the IssueRefund amounts");
   auto record = store::returnOf("ret-1");
   ctx.Assert(record->grade == "damaged" && record->refund_cents == 4000 && record->refund_id == "rf-ret-1", "the return holds grade %q, refund_cents %d, refund_id %q, expected damaged, 4000, rf-ret-1", record->grade, record->refund_cents, record->refund_id);
-  open("ret-2");
-  settle(ctx, "ret-2");
+  hOpen("ret-2");
+  hSettle(ctx, "ret-2");
   record = store::returnOf("ret-2");
   ctx.Assert(record->grade == "sellable" && record->refund_cents == 4000, "a sellable return of 1 unit at 4000 cents holds grade %q and refund_cents %d, expected the full 4000", record->grade, record->refund_cents);
 }
 
 void CheckTerminalNotRetried(harness::Ctx& ctx) {
-  WarehousePeer& warehouse = world(ctx);
-  open("ret-1");
+  HWarehousePeer& warehouse = hWorld(ctx);
+  hOpen("ret-1");
   warehouse.missing.insert("ret-1");
-  const std::string state = settle(ctx, "ret-1");
-  ctx.Equal(gradeCalls(ctx, "ret-1"), 1, "the warehouse answered NOT_FOUND (the item has not arrived): only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls");
+  const std::string state = hSettle(ctx, "ret-1");
+  ctx.Equal(hGradeCalls(ctx, "ret-1"), 1, "the warehouse answered NOT_FOUND (the item has not arrived): only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls");
   ctx.Equal(state, "awaiting_inspection", "an item that has not arrived; the state");
-  open("ret-2");
+  hOpen("ret-2");
   warehouse.grades["ret-2"] = "damaged";
-  settle(ctx, "ret-2");
-  ctx.Equal(gradeCalls(ctx, "ret-2"), 1, "the warehouse graded the item damaged, and a grade is an answer; the GradeItem calls");
-  open("ret-3");
+  hSettle(ctx, "ret-2");
+  ctx.Equal(hGradeCalls(ctx, "ret-2"), 1, "the warehouse graded the item damaged, and a grade is an answer; the GradeItem calls");
+  hOpen("ret-3");
   ctx.GRPC.Fail("GradeItem", grpc::StatusCode::INVALID_ARGUMENT, "", 3);
-  settle(ctx, "ret-3");
-  ctx.Equal(gradeCalls(ctx, "ret-3"), 1, "INVALID_ARGUMENT: the same request gets the same refusal; the GradeItem calls");
+  hSettle(ctx, "ret-3");
+  ctx.Equal(hGradeCalls(ctx, "ret-3"), 1, "INVALID_ARGUMENT: the same request gets the same refusal; the GradeItem calls");
+  ctx.GRPC.ClearFailures();
+  const std::vector<std::pair<std::string, grpc::StatusCode>> terminal = {
+      {"PERMISSION_DENIED", grpc::StatusCode::PERMISSION_DENIED}, {"FAILED_PRECONDITION", grpc::StatusCode::FAILED_PRECONDITION}, {"INTERNAL", grpc::StatusCode::INTERNAL}};
+  for (size_t i = 0; i < terminal.size(); i++) {
+    const std::string return_id = "ret-" + std::to_string(i + 4);
+    hOpen(return_id);
+    ctx.GRPC.Fail("GradeItem", terminal[i].second, "", 1);
+    const std::string after = hSettle(ctx, return_id);
+    ctx.Equal(hGradeCalls(ctx, return_id), 1, "%s: only UNAVAILABLE and DEADLINE_EXCEEDED are asked again; the GradeItem calls", terminal[i].first);
+    const auto paid = hRefundAmounts(ctx, return_id);
+    ctx.Assert(after == "awaiting_inspection" && paid.empty(), "after %s the return is %q and the refund processor was asked for %v: no grade holds it in awaiting_inspection", terminal[i].first, after, paid);
+  }
 }
 `,
   },

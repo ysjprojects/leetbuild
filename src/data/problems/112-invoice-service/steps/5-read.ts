@@ -54,7 +54,7 @@ and any tenant reads another tenant's invoice by guessing its id.
       id: 'role-header',
       title: 'Takes the role from X-Role, not the query',
       detail:
-        "The role is the gateway's `X-Role` header, checked against `ROLES` (403 otherwise, a missing header included); a query parameter is whatever the caller typed, so `?role=issuer` must change nothing.",
+        "The role is the gateway's `X-Role` header, checked against `ROLES` (403 otherwise, a missing header included, never filled in from the query); a query parameter is whatever the caller typed, so `?role=issuer` must change nothing.",
       match: {
         python: {all: [/x-role/i, /\b403\b/], none: [/query_params/]},
         typescript: {all: [/x-role/i, /\b403\b/], none: [/request\.query/]},
@@ -93,7 +93,7 @@ and any tenant reads another tenant's invoice by guessing its id.
       id: 'tenant-scope',
       title: "Another tenant's invoice is 404",
       detail:
-        "The tenant from `X-Tenant-Id` is compared with the invoice's `tenant_id`; a mismatch answers **404** exactly like a missing invoice, so the id is not an existence oracle.",
+        "The tenant from `X-Tenant-Id` is compared with the invoice's `tenant_id`, for the issuer and the customer alike; a mismatch answers **404** exactly like a missing invoice, so the id is not an existence oracle.",
       match: {
         python: {all: [/x-tenant-id/i, /tenant_id["']\]\s*!=\s*tenant/]},
         typescript: {all: [/x-tenant-id/i, /tenant_id\s*!==\s*tenant/]},
@@ -555,6 +555,8 @@ async def check_role_header(ctx):
     async with _api(ctx) as c:
         r = await c.get(f"/v1/invoices/{a}", headers={"X-Tenant-Id": "t-1"})
         assert r.status_code == 403, f"a request without X-Role answered {r.status_code}, expected 403: the role comes from the gateway, not a default"
+        r = await c.get(f"/v1/invoices/{a}?role=issuer", headers={"X-Tenant-Id": "t-1"})
+        assert r.status_code == 403, f"a request without X-Role but with ?role=issuer answered {r.status_code}, expected 403: the query string is never the role, not even as a fallback"
         r = await c.get(f"/v1/invoices/{a}", headers=_as("auditor"))
         assert r.status_code == 403, f"X-Role auditor answered {r.status_code}, expected 403"
         plain = await c.get(f"/v1/invoices/{a}", headers=_as("customer"))
@@ -582,7 +584,11 @@ async def check_drafts_hidden(ctx):
         r = await c.get(f"/v1/invoices/{d}?role=customer", headers=_as("customer"))
         assert r.status_code == 404, f"a customer reading a draft got {r.status_code}, expected 404: a draft can still change"
         r = await c.get(f"/v1/invoices/{d}?role=issuer", headers=_as("issuer"))
-    assert r.status_code == 200 and r.json().get("status") == "draft", f"the issuer reading its draft got {r.status_code} {r.text}"
+        assert r.status_code == 200 and r.json().get("status") == "draft", f"the issuer reading its draft got {r.status_code} {r.text}"
+        voided = _issued()
+        ctx.redis.hset(store.invoice_key(voided), "status", "void")
+        r = await c.get(f"/v1/invoices/{voided}", headers=_as("customer"))
+    assert r.status_code == 404, f"a customer reading an invoice whose status is void got {r.status_code}, expected 404: only a finalized invoice is the customer's to read"
 
 
 async def check_tenant_scope(ctx):
@@ -592,6 +598,9 @@ async def check_tenant_scope(ctx):
         missing = await c.get("/v1/invoices/inv-404?role=issuer", headers=_as("issuer", "t-2"))
         assert foreign.status_code == 404, f"tenant t-2 reading t-1's invoice got {foreign.status_code}, expected 404"
         assert foreign.text == missing.text, f"another tenant's invoice answered {foreign.text}, a missing one {missing.text}: the difference tells a caller the id exists"
+        theirs = await c.get(f"/v1/invoices/{a}", headers=_as("customer", "t-2"))
+        nothing = await c.get("/v1/invoices/inv-404", headers=_as("customer", "t-2"))
+        assert theirs.status_code == 404 and theirs.text == nothing.text, f"a customer of tenant t-2 reading t-1's invoice got {theirs.status_code} {theirs.text}, a missing one {nothing.text}: the tenant scope holds for every role"
         r = await c.get(f"/v1/invoices/{a}?role=issuer", headers={"X-Role": "issuer"})
     assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
 `,
@@ -629,6 +638,8 @@ export async function check_role_header(ctx) {
   const a = await issued();
   let r = await c.get(\`/v1/invoices/\${a}\`, {headers: {'X-Tenant-Id': 't-1'}});
   assert.equal(r.status, 403, \`a request without X-Role answered \${r.status}, expected 403: the role comes from the gateway, not a default\`);
+  r = await c.get(\`/v1/invoices/\${a}?role=issuer\`, {headers: {'X-Tenant-Id': 't-1'}});
+  assert.equal(r.status, 403, \`a request without X-Role but with ?role=issuer answered \${r.status}, expected 403: the query string is never the role, not even as a fallback\`);
   r = await c.get(\`/v1/invoices/\${a}\`, {headers: as('auditor')});
   assert.equal(r.status, 403, \`X-Role auditor answered \${r.status}, expected 403\`);
   const plain = await c.get(\`/v1/invoices/\${a}\`, {headers: as('customer')});
@@ -651,12 +662,16 @@ export async function check_customer_view(ctx) {
 }
 
 export async function check_drafts_hidden(ctx) {
-  const {c, draft} = await setup(ctx);
+  const {c, draft, issued} = await setup(ctx);
   const d = await draft();
   let r = await c.get(\`/v1/invoices/\${d}?role=customer\`, {headers: as('customer')});
   assert.equal(r.status, 404, \`a customer reading a draft got \${r.status}, expected 404: a draft can still change\`);
   r = await c.get(\`/v1/invoices/\${d}?role=issuer\`, {headers: as('issuer')});
   assert(r.status === 200 && r.json().status === 'draft', \`the issuer reading its draft got \${r.status} \${r.text}\`);
+  const voided = await issued();
+  ctx.redis.hset(\`invoice:\${voided}\`, 'status', 'void');
+  r = await c.get(\`/v1/invoices/\${voided}\`, {headers: as('customer')});
+  assert.equal(r.status, 404, \`a customer reading an invoice whose status is void got \${r.status}, expected 404: only a finalized invoice is the customer's to read\`);
 }
 
 export async function check_tenant_scope(ctx) {
@@ -666,6 +681,9 @@ export async function check_tenant_scope(ctx) {
   const missing = await c.get('/v1/invoices/inv-404?role=issuer', {headers: as('issuer', 't-2')});
   assert.equal(foreign.status, 404, \`tenant t-2 reading t-1's invoice got \${foreign.status}, expected 404\`);
   assert.equal(foreign.text, missing.text, \`another tenant's invoice answered \${foreign.text}, a missing one \${missing.text}: the difference tells a caller the id exists\`);
+  const theirs = await c.get(\`/v1/invoices/\${a}\`, {headers: as('customer', 't-2')});
+  const nothing = await c.get('/v1/invoices/inv-404', {headers: as('customer', 't-2')});
+  assert(theirs.status === 404 && theirs.text === nothing.text, \`a customer of tenant t-2 reading t-1's invoice got \${theirs.status} \${theirs.text}, a missing one \${nothing.text}: the tenant scope holds for every role\`);
   const r = await c.get(\`/v1/invoices/\${a}?role=issuer\`, {headers: {'X-Role': 'issuer'}});
   assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
 }
@@ -685,44 +703,46 @@ import (
 )
 
 var (
-	readBg    = context.Background()
-	readLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}}
-	readNotes = "margin 40%, do not discount"
+	hBg    = context.Background()
+	hLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}}
+	hNotes = "margin 40%, do not discount"
 )
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func issued(tenant string) string {
-	id := store.Create(readBg, tenant, "eur", readLines, "cus-1", "DE", readNotes).ID
-	store.SetTax(readBg, id, 9500, "quote")
-	sequence.ClaimNumber(readBg, tenant, id)
+func hIssued(tenant string) string {
+	id := store.Create(hBg, tenant, "eur", hLines, "cus-1", "DE", hNotes).ID
+	store.SetTax(hBg, id, 9500, "quote")
+	sequence.ClaimNumber(hBg, tenant, id)
 	return id
 }
 
-func bodyOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the response is not a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	a := issued("t-1")
-	r := readAPI(ctx).Get("/v1/invoices/"+a, "X-Tenant-Id", "t-1", "X-Role", "issuer")
+	a := hIssued("t-1")
+	r := hAPI(ctx).Get("/v1/invoices/"+a, "X-Tenant-Id", "t-1", "X-Role", "issuer")
 	ctx.Equal(r.Status, 200, "the issuer reading its invoice (%s)", r.Text())
-	body := bodyOf(ctx, r)
+	body := hBody(ctx, r)
 	ctx.Assert(body["id"] == a && body["number"] == float64(1) && strings.Contains(r.Text(), "Consulting"), "the issuer's copy must carry the id, number 1 and the lines, got %s", r.Text())
-	ctx.Equal(body["internal_notes"], readNotes, "the issuer's copy must carry its internal notes")
+	ctx.Equal(body["internal_notes"], hNotes, "the issuer's copy must carry its internal notes")
 }
 
 func CheckRoleHeader(ctx *harness.Ctx) {
-	a := issued("t-1")
-	c := readAPI(ctx)
+	a := hIssued("t-1")
+	c := hAPI(ctx)
 	r := c.Get("/v1/invoices/"+a, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 403, "a request without X-Role (the role comes from the gateway, not a default)")
+	r = c.Get("/v1/invoices/"+a+"?role=issuer", "X-Tenant-Id", "t-1")
+	ctx.Equal(r.Status, 403, "a request without X-Role but with ?role=issuer (the query string is never the role, not even as a fallback)")
 	r = c.Get("/v1/invoices/"+a, "X-Tenant-Id", "t-1", "X-Role", "auditor")
 	ctx.Equal(r.Status, 403, "X-Role auditor")
 	plain := c.Get("/v1/invoices/"+a, "X-Tenant-Id", "t-1", "X-Role", "customer")
@@ -732,39 +752,46 @@ func CheckRoleHeader(ctx *harness.Ctx) {
 }
 
 func CheckCustomerView(ctx *harness.Ctx) {
-	a := issued("t-1")
-	c := readAPI(ctx)
+	a := hIssued("t-1")
+	c := hAPI(ctx)
 	r := c.Get("/v1/invoices/"+a+"?role=customer", "X-Tenant-Id", "t-1", "X-Role", "customer")
 	issuer := c.Get("/v1/invoices/"+a+"?role=issuer", "X-Tenant-Id", "t-1", "X-Role", "issuer")
 	ctx.Equal(r.Status, 200, "a customer reading a finalized invoice (%s)", r.Text())
-	body := bodyOf(ctx, r)
+	body := hBody(ctx, r)
 	fields := []string{}
 	for name := range body {
 		fields = append(fields, name)
 	}
 	sort.Strings(fields)
 	ctx.Equal(fields, []string{"currency", "id", "line_items", "number", "status", "subtotal_cents", "tax_cents"}, "the customer's copy must hold exactly the customer fields; its fields")
-	ctx.Assert(!strings.Contains(r.Text(), readNotes), "the customer's copy carries the issuer's internal notes")
+	ctx.Assert(!strings.Contains(r.Text(), hNotes), "the customer's copy carries the issuer's internal notes")
 	ctx.Assert(body["number"] == float64(1) && body["tax_cents"] == float64(9500) && strings.Contains(r.Text(), "Consulting"), "the customer's copy must carry the lines, number 1 and the tax, got %s", r.Text())
-	ctx.Assert(issuer.Status == 200 && strings.Contains(issuer.Text(), readNotes), "the issuer's copy must still carry its notes, got %d %s", issuer.Status, issuer.Text())
+	ctx.Assert(issuer.Status == 200 && strings.Contains(issuer.Text(), hNotes), "the issuer's copy must still carry its notes, got %d %s", issuer.Status, issuer.Text())
 }
 
 func CheckDraftsHidden(ctx *harness.Ctx) {
-	d := store.Create(readBg, "t-1", "eur", readLines, "cus-1", "DE", readNotes).ID
-	c := readAPI(ctx)
+	d := store.Create(hBg, "t-1", "eur", hLines, "cus-1", "DE", hNotes).ID
+	c := hAPI(ctx)
 	r := c.Get("/v1/invoices/"+d+"?role=customer", "X-Tenant-Id", "t-1", "X-Role", "customer")
 	ctx.Equal(r.Status, 404, "a customer reading a draft (a draft can still change)")
 	r = c.Get("/v1/invoices/"+d+"?role=issuer", "X-Tenant-Id", "t-1", "X-Role", "issuer")
-	ctx.Assert(r.Status == 200 && bodyOf(ctx, r)["status"] == "draft", "the issuer reading its draft got %d %s", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && hBody(ctx, r)["status"] == "draft", "the issuer reading its draft got %d %s", r.Status, r.Text())
+	voided := hIssued("t-1")
+	ctx.Redis.Do("HSET", store.InvoiceKey(voided), "status", "void")
+	r = c.Get("/v1/invoices/"+voided, "X-Tenant-Id", "t-1", "X-Role", "customer")
+	ctx.Equal(r.Status, 404, "a customer reading an invoice whose status is void (only a finalized invoice is the customer's to read)")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	a := issued("t-1")
-	c := readAPI(ctx)
+	a := hIssued("t-1")
+	c := hAPI(ctx)
 	foreign := c.Get("/v1/invoices/"+a+"?role=issuer", "X-Tenant-Id", "t-2", "X-Role", "issuer")
 	missing := c.Get("/v1/invoices/inv-404?role=issuer", "X-Tenant-Id", "t-2", "X-Role", "issuer")
 	ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's invoice")
 	ctx.Equal(foreign.Text(), missing.Text(), "another tenant's invoice must answer like a missing one, or the difference tells a caller the id exists; the body")
+	theirs := c.Get("/v1/invoices/"+a, "X-Tenant-Id", "t-2", "X-Role", "customer")
+	nothing := c.Get("/v1/invoices/inv-404", "X-Tenant-Id", "t-2", "X-Role", "customer")
+	ctx.Assert(theirs.Status == 404 && theirs.Text() == nothing.Text(), "a customer of tenant t-2 reading t-1's invoice got %d %s, a missing one %s: the tenant scope holds for every role", theirs.Status, theirs.Text(), nothing.Text())
 	r := c.Get("/v1/invoices/"+a+"?role=issuer", "X-Role", "issuer")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
 }
@@ -784,10 +811,10 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::vector<store::Line> kReadLines = {{"Consulting", 2, 25000}};
-const std::string kReadNotes = "margin 40%, do not discount";
+const std::vector<store::Line> hLines = {{"Consulting", 2, 25000}};
+const std::string hNotes = "margin 40%, do not discount";
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -795,14 +822,14 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string issued(const std::string& tenant) {
-  const std::string id = store::create(tenant, "eur", kReadLines, "cus-1", "DE", kReadNotes).id;
+std::string hIssued(const std::string& tenant) {
+  const std::string id = store::create(tenant, "eur", hLines, "cus-1", "DE", hNotes).id;
   store::setTax(id, 9500, "quote");
   sequence::claimNumber(tenant, id);
   return id;
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBody(harness::Ctx& ctx, const harness::Response& r) {
   try {
     return json::parse(r.Text());
   } catch (const std::exception&) {
@@ -813,21 +840,23 @@ json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::string a = issued("t-1");
-  auto c = readApi(ctx);
+  const std::string a = hIssued("t-1");
+  auto c = hApi(ctx);
   const auto r = c.Get("/v1/invoices/" + a, "X-Tenant-Id", "t-1", "X-Role", "issuer");
   ctx.Equal(r.Status, 200, "the issuer reading its invoice (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBody(ctx, r);
   ctx.Assert(body.value("id", "") == a && body.value("number", 0L) == 1 && r.Text().find("Consulting") != std::string::npos,
              "the issuer's copy must carry the id, number 1 and the lines, got %s", r.Text());
-  ctx.Equal(body.value("internal_notes", ""), kReadNotes, "the issuer's copy must carry its internal notes");
+  ctx.Equal(body.value("internal_notes", ""), hNotes, "the issuer's copy must carry its internal notes");
 }
 
 void CheckRoleHeader(harness::Ctx& ctx) {
-  const std::string a = issued("t-1");
-  auto c = readApi(ctx);
+  const std::string a = hIssued("t-1");
+  auto c = hApi(ctx);
   auto r = c.Get("/v1/invoices/" + a, "X-Tenant-Id", "t-1");
   ctx.Equal(r.Status, 403, "a request without X-Role (the role comes from the gateway, not a default)");
+  r = c.Get("/v1/invoices/" + a + "?role=issuer", "X-Tenant-Id", "t-1");
+  ctx.Equal(r.Status, 403, "a request without X-Role but with ?role=issuer (the query string is never the role, not even as a fallback)");
   r = c.Get("/v1/invoices/" + a, "X-Tenant-Id", "t-1", "X-Role", "auditor");
   ctx.Equal(r.Status, 403, "X-Role auditor");
   const auto plain = c.Get("/v1/invoices/" + a, "X-Tenant-Id", "t-1", "X-Role", "customer");
@@ -838,38 +867,47 @@ void CheckRoleHeader(harness::Ctx& ctx) {
 }
 
 void CheckCustomerView(harness::Ctx& ctx) {
-  const std::string a = issued("t-1");
-  auto c = readApi(ctx);
+  const std::string a = hIssued("t-1");
+  auto c = hApi(ctx);
   const auto r = c.Get("/v1/invoices/" + a + "?role=customer", "X-Tenant-Id", "t-1", "X-Role", "customer");
   const auto issuer = c.Get("/v1/invoices/" + a + "?role=issuer", "X-Tenant-Id", "t-1", "X-Role", "issuer");
   ctx.Equal(r.Status, 200, "a customer reading a finalized invoice (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
+  const json body = hBody(ctx, r);
   std::vector<std::string> fields;
   for (const auto& [name, value] : body.items()) fields.push_back(name);
   std::sort(fields.begin(), fields.end());
   ctx.Equal(fields, {"currency", "id", "line_items", "number", "status", "subtotal_cents", "tax_cents"}, "the customer's copy must hold exactly the customer fields; its fields");
-  ctx.Assert(r.Text().find(kReadNotes) == std::string::npos, "the customer's copy carries the issuer's internal notes");
+  ctx.Assert(r.Text().find(hNotes) == std::string::npos, "the customer's copy carries the issuer's internal notes");
   ctx.Assert(body.value("number", 0L) == 1 && body.value("tax_cents", 0L) == 9500 && r.Text().find("Consulting") != std::string::npos,
              "the customer's copy must carry the lines, number 1 and the tax, got %s", r.Text());
-  ctx.Assert(issuer.Status == 200 && issuer.Text().find(kReadNotes) != std::string::npos, "the issuer's copy must still carry its notes, got %d %s", issuer.Status, issuer.Text());
+  ctx.Assert(issuer.Status == 200 && issuer.Text().find(hNotes) != std::string::npos, "the issuer's copy must still carry its notes, got %d %s", issuer.Status, issuer.Text());
 }
 
 void CheckDraftsHidden(harness::Ctx& ctx) {
-  const std::string d = store::create("t-1", "eur", kReadLines, "cus-1", "DE", kReadNotes).id;
-  auto c = readApi(ctx);
+  const std::string d = store::create("t-1", "eur", hLines, "cus-1", "DE", hNotes).id;
+  auto c = hApi(ctx);
   auto r = c.Get("/v1/invoices/" + d + "?role=customer", "X-Tenant-Id", "t-1", "X-Role", "customer");
   ctx.Equal(r.Status, 404, "a customer reading a draft (a draft can still change)");
   r = c.Get("/v1/invoices/" + d + "?role=issuer", "X-Tenant-Id", "t-1", "X-Role", "issuer");
-  ctx.Assert(r.Status == 200 && bodyOf(ctx, r).value("status", "") == "draft", "the issuer reading its draft got %d %s", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && hBody(ctx, r).value("status", "") == "draft", "the issuer reading its draft got %d %s", r.Status, r.Text());
+  const std::string voided = hIssued("t-1");
+  ctx.Redis.Do("HSET", store::invoiceKey(voided), "status", "void");
+  r = c.Get("/v1/invoices/" + voided, "X-Tenant-Id", "t-1", "X-Role", "customer");
+  ctx.Equal(r.Status, 404, "a customer reading an invoice whose status is void (only a finalized invoice is the customer's to read)");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  const std::string a = issued("t-1");
-  auto c = readApi(ctx);
+  const std::string a = hIssued("t-1");
+  auto c = hApi(ctx);
   const auto foreign = c.Get("/v1/invoices/" + a + "?role=issuer", "X-Tenant-Id", "t-2", "X-Role", "issuer");
   const auto missing = c.Get("/v1/invoices/inv-404?role=issuer", "X-Tenant-Id", "t-2", "X-Role", "issuer");
   ctx.Equal(foreign.Status, 404, "tenant t-2 reading t-1's invoice");
   ctx.Equal(foreign.Text(), missing.Text(), "another tenant's invoice must answer like a missing one, or the difference tells a caller the id exists; the body");
+  const auto theirs = c.Get("/v1/invoices/" + a, "X-Tenant-Id", "t-2", "X-Role", "customer");
+  const auto nothing = c.Get("/v1/invoices/inv-404", "X-Tenant-Id", "t-2", "X-Role", "customer");
+  ctx.Assert(theirs.Status == 404 && theirs.Text() == nothing.Text(),
+             "a customer of tenant t-2 reading t-1's invoice got %d %s, a missing one %s: the tenant scope holds for every role", theirs.Status, theirs.Text(),
+             nothing.Text());
   const auto r = c.Get("/v1/invoices/" + a + "?role=issuer", "X-Role", "issuer");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
 }

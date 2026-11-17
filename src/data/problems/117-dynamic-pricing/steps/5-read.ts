@@ -63,7 +63,7 @@ of its window a sku has spent.
       id: 'published-only',
       title: 'Serves the published price, 404 for an unknown sku',
       detail:
-        "Every caller's `price_cents` is the published row's (`store.get_sku`), and an unknown sku answers **404**. The starter lets the experiment's candidate win for everyone and answers 200 with a null price for a sku that does not exist.",
+        "Every caller's `price_cents` is the published row's (`store.get_sku`), and an unknown sku answers **404**, even to an operator when an experiment holds a candidate for it. The starter lets the experiment's candidate win for everyone and answers 200 with a null price for a sku that does not exist.",
       match: {
         python: {all: [/\b404\b/], order: [/store\.get_sku\(/, /store\.candidate_of\(/]},
         typescript: {all: [/\b404\b/], order: [/getSku\(/, /candidateOf\(/]},
@@ -76,7 +76,7 @@ of its window a sku has spent.
       id: 'preview-scope',
       title: 'Operators see the candidate beside the price',
       detail:
-        'With `X-Operator-Scope: preview` the body carries `candidate` (`price_cents`, `model_version`) next to the published `price_cents`; any other scope, or none, gets no candidate. The starter has no scope and no candidate field.',
+        'With `X-Operator-Scope: preview` exactly, the body carries `candidate` (`price_cents`, `model_version`) next to the published `price_cents`; any other scope value, a query parameter, or no header gets no candidate. The starter has no scope and no candidate field.',
       match: {
         python: {all: [/x-operator-scope/i, /PREVIEW_SCOPE\s*=/, /["']candidate["']/]},
         typescript: {all: [/x-operator-scope/i, /PREVIEW_SCOPE\s*=/, /candidate\s*[:=]|\.candidate\b/]},
@@ -444,7 +444,10 @@ async def check_published_only(ctx):
         r = await c.get("/v1/prices/SKU-1", headers=PREVIEW)
         assert r.json().get("price_cents") == 1000, f"an operator's price_cents must be the published price too, got {r.text}"
         missing = await c.get("/v1/prices/SKU-404")
-    assert missing.status_code == 404, f"a sku that does not exist answered {missing.status_code} {missing.text}, expected 404"
+        assert missing.status_code == 404, f"a sku that does not exist answered {missing.status_code} {missing.text}, expected 404"
+        store.set_candidate("SKU-9", 900, "elasticity-v8")  # a candidate for a sku that was never published
+        orphan = await c.get("/v1/prices/SKU-9", headers=PREVIEW)
+    assert orphan.status_code == 404, f"an operator's read of SKU-9, which has a candidate but no published price, answered {orphan.status_code} {orphan.text}, expected 404"
 
 
 async def check_preview_scope(ctx):
@@ -454,9 +457,11 @@ async def check_preview_scope(ctx):
         body = r.json()
         assert body.get("candidate") == {"price_cents": 1150, "model_version": "elasticity-v8"}, f"an operator with X-Operator-Scope: preview got {body}, expected candidate {{price_cents: 1150, model_version: elasticity-v8}} beside the price"
         assert body.get("price_cents") == 1000, f"the candidate goes beside the published price, not over it: {body}"
-        other = await c.get("/v1/prices/SKU-1", headers={"X-Operator-Scope": "admin"})
-        plain = await c.get("/v1/prices/SKU-1")
-    assert "candidate" not in other.json() and "candidate" not in plain.json(), f"a caller without the preview scope saw the candidate: {other.text} / {plain.text}"
+        reads = [(f"X-Operator-Scope: {scope}", await c.get("/v1/prices/SKU-1", headers={"X-Operator-Scope": scope})) for scope in ("admin", "previewer", "no-preview")]
+        reads.append(("no scope", await c.get("/v1/prices/SKU-1")))
+        reads.append(("?scope=preview and no header", await c.get("/v1/prices/SKU-1?scope=preview")))
+    for who, r in reads:
+        assert r.status_code == 200 and "candidate" not in r.json(), f"a caller with {who} saw the candidate: {r.text}; only X-Operator-Scope: preview does"
 
 
 async def check_provenance(ctx):
@@ -510,6 +515,9 @@ export async function check_published_only(ctx) {
   assert.equal(r.json().price_cents, 1000, \`an operator's price_cents must be the published price too, got \${r.text}\`);
   const missing = await c.get('/v1/prices/SKU-404');
   assert.equal(missing.status, 404, \`a sku that does not exist answered \${missing.status} \${missing.text}, expected 404\`);
+  await store.setCandidate('SKU-9', 900, 'elasticity-v8'); // a candidate for a sku that was never published
+  const orphan = await c.get('/v1/prices/SKU-9', {headers: PREVIEW});
+  assert.equal(orphan.status, 404, \`an operator's read of SKU-9, which has a candidate but no published price, answered \${orphan.status} \${orphan.text}, expected 404\`);
 }
 
 export async function check_preview_scope(ctx) {
@@ -519,9 +527,13 @@ export async function check_preview_scope(ctx) {
   const body = r.json();
   assert.deepStrictEqual(body.candidate, {price_cents: 1150, model_version: 'elasticity-v8'}, \`an operator with X-Operator-Scope: preview got \${r.text}, expected candidate {price_cents: 1150, model_version: elasticity-v8} beside the price\`);
   assert.equal(body.price_cents, 1000, \`the candidate goes beside the published price, not over it: \${r.text}\`);
-  const other = await c.get('/v1/prices/SKU-1', {headers: {'X-Operator-Scope': 'admin'}});
-  const plain = await c.get('/v1/prices/SKU-1');
-  assert(!('candidate' in other.json()) && !('candidate' in plain.json()), \`a caller without the preview scope saw the candidate: \${other.text} / \${plain.text}\`);
+  const reads = [];
+  for (const scope of ['admin', 'previewer', 'no-preview']) reads.push([\`X-Operator-Scope: \${scope}\`, await c.get('/v1/prices/SKU-1', {headers: {'X-Operator-Scope': scope}})]);
+  reads.push(['no scope', await c.get('/v1/prices/SKU-1')]);
+  reads.push(['?scope=preview and no header', await c.get('/v1/prices/SKU-1?scope=preview')]);
+  for (const [who, read] of reads) {
+    assert(read.status === 200 && !('candidate' in read.json()), \`a caller with \${who} saw the candidate: \${read.text}; only X-Operator-Scope: preview does\`);
+  }
 }
 
 export async function check_provenance(ctx) {
@@ -559,9 +571,9 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type readReply struct {
+type hReadReply struct {
 	PriceCents int64          \`json:"price_cents"\`
 	Source     string         \`json:"source"\`
 	UpdatedAt  int64          \`json:"updated_at"\`
@@ -570,73 +582,81 @@ type readReply struct {
 	Candidate  map[string]any \`json:"candidate"\`
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func getPrice(c *harness.HTTP, sku string, header ...string) (*harness.Response, readReply) {
+func hGetPrice(c *harness.HTTP, sku string, header ...string) (*harness.Response, hReadReply) {
 	r := c.Get("/v1/prices/"+sku, header...)
-	var body readReply
+	var body hReadReply
 	r.Decode(&body)
 	return r, body
 }
 
-// experiment: SKU-1 published at 1000 while an experiment proposes 1150.
-func experiment() {
-	store.Seed(readBg, "SKU-1", 1000)
-	store.SetCandidate(readBg, "SKU-1", 1150, "elasticity-v8")
+// hExperiment: SKU-1 published at 1000 while an experiment proposes 1150.
+func hExperiment() {
+	store.Seed(hReadBg, "SKU-1", 1000)
+	store.SetCandidate(hReadBg, "SKU-1", 1150, "elasticity-v8")
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	store.Seed(readBg, "SKU-1", 1000)
-	r, body := getPrice(readAPI(ctx), "SKU-1")
+	store.Seed(hReadBg, "SKU-1", 1000)
+	r, body := hGetPrice(hReadAPI(ctx), "SKU-1")
 	ctx.Equal(r.Status, 200, "GET /v1/prices/SKU-1 (%s)", r.Text())
 	ctx.Equal(body.PriceCents, int64(1000), "the read's price_cents (%s)", r.Text())
 }
 
 func CheckPublishedOnly(ctx *harness.Ctx) {
-	experiment()
-	c := readAPI(ctx)
-	r, body := getPrice(c, "SKU-1")
+	hExperiment()
+	c := hReadAPI(ctx)
+	r, body := hGetPrice(c, "SKU-1")
 	ctx.Assert(r.Status == 200 && body.PriceCents == 1000, "the storefront read answered %s: 1150 is an experiment's candidate nobody approved, the published price is 1000", r.Text())
-	r, body = getPrice(c, "SKU-1", "X-Operator-Scope", "preview")
+	r, body = hGetPrice(c, "SKU-1", "X-Operator-Scope", "preview")
 	ctx.Equal(body.PriceCents, int64(1000), "an operator's price_cents must be the published price too (%s)", r.Text())
-	missing, _ := getPrice(c, "SKU-404")
+	missing, _ := hGetPrice(c, "SKU-404")
 	ctx.Equal(missing.Status, 404, "a sku that does not exist (%s)", missing.Text())
+	store.SetCandidate(hReadBg, "SKU-9", 900, "elasticity-v8") // a candidate for a sku that was never published
+	orphan, _ := hGetPrice(c, "SKU-9", "X-Operator-Scope", "preview")
+	ctx.Equal(orphan.Status, 404, "an operator's read of SKU-9, which has a candidate but no published price (%s)", orphan.Text())
 }
 
 func CheckPreviewScope(ctx *harness.Ctx) {
-	experiment()
-	c := readAPI(ctx)
-	r, body := getPrice(c, "SKU-1", "X-Operator-Scope", "preview")
+	hExperiment()
+	c := hReadAPI(ctx)
+	r, body := hGetPrice(c, "SKU-1", "X-Operator-Scope", "preview")
 	ctx.Assert(body.Candidate != nil && body.Candidate["price_cents"] == 1150.0 && body.Candidate["model_version"] == "elasticity-v8", "an operator with X-Operator-Scope: preview got %s, expected candidate {price_cents: 1150, model_version: elasticity-v8} beside the price", r.Text())
 	ctx.Equal(body.PriceCents, int64(1000), "the candidate goes beside the published price, not over it (%s)", r.Text())
-	other, otherBody := getPrice(c, "SKU-1", "X-Operator-Scope", "admin")
-	plain, plainBody := getPrice(c, "SKU-1")
-	ctx.Assert(otherBody.Candidate == nil && plainBody.Candidate == nil, "a caller without the preview scope saw the candidate: %s / %s", other.Text(), plain.Text())
+	for _, scope := range []string{"admin", "previewer", "no-preview"} {
+		other, otherBody := hGetPrice(c, "SKU-1", "X-Operator-Scope", scope)
+		ctx.Assert(other.Status == 200 && otherBody.Candidate == nil, "a caller with X-Operator-Scope: %s saw the candidate: %s; only X-Operator-Scope: preview does", scope, other.Text())
+	}
+	plain, plainBody := hGetPrice(c, "SKU-1")
+	ctx.Assert(plain.Status == 200 && plainBody.Candidate == nil, "a caller with no scope saw the candidate: %s; only X-Operator-Scope: preview does", plain.Text())
+	query, queryBody := hGetPrice(c, "SKU-1?scope=preview")
+	ctx.Assert(query.Status == 200 && queryBody.Candidate == nil, "a caller with ?scope=preview and no header saw the candidate: %s; only X-Operator-Scope: preview does", query.Text())
 }
 
 func CheckProvenance(ctx *harness.Ctx) {
-	store.Seed(readBg, "SKU-1", 1000)
+	store.Seed(hReadBg, "SKU-1", 1000)
 	ctx.Clock.Advance(30)
-	approved := store.Publish(readBg, "SKU-1", 1100, "weekend promo", "operator")
-	c := readAPI(ctx)
-	r, body := getPrice(c, "SKU-1")
+	approved := store.Publish(hReadBg, "SKU-1", 1100, "weekend promo", "operator")
+	c := hReadAPI(ctx)
+	r, body := hGetPrice(c, "SKU-1")
 	ctx.Assert(body.Source == "operator" && body.UpdatedAt == approved.UpdatedAt && body.Stale != nil && !*body.Stale, "the read answered %s, expected source operator, updated_at %d and stale false", r.Text(), approved.UpdatedAt)
 	ctx.Clock.Advance(600)
-	store.MarkStale(readBg, "SKU-1") // the demand model went down: the approved price is kept
-	r, body = getPrice(c, "SKU-1")
+	store.MarkStale(hReadBg, "SKU-1") // the demand model went down: the approved price is kept
+	r, body = hGetPrice(c, "SKU-1")
 	ctx.Assert(body.Stale != nil && *body.Stale && body.Source == "last-approved", "a price kept while the model is down answered %s: it must say stale true and source last-approved", r.Text())
 	ctx.Equal(body.UpdatedAt, approved.UpdatedAt, "the kept price must report when it was approved; updated_at")
 }
 
 func CheckGuardrailState(ctx *harness.Ctx) {
-	store.Seed(readBg, "SKU-1", 1000)
-	_, err := guard.Reserve(readBg, "SKU-1", 1000, 1150)
+	store.Seed(hReadBg, "SKU-1", 1000)
+	_, err := guard.Reserve(hReadBg, "SKU-1", 1000, 1150)
 	ctx.NoError(err, "guard.Reserve")
-	r, body := getPrice(readAPI(ctx), "SKU-1")
+	r, body := hGetPrice(hReadAPI(ctx), "SKU-1")
 	want := guard.State{Window: ctx.Clock.Now() / 1000 / 3600, MovedBP: 1500, LimitBP: 2000, HeadroomBP: 500}
 	ctx.Assert(body.Guardrail != nil && *body.Guardrail == want, "after a 15 %% change the read answered %s, expected guardrail %+v", r.Text(), want)
 }
@@ -652,7 +672,7 @@ func CheckGuardrailState(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -660,13 +680,13 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) {
+nlohmann::json hBodyOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
 // SKU-1 published at 1000 while an experiment proposes 1150.
-void experiment() {
+void hExperiment() {
   store::seed("SKU-1", 1000);
   store::setCandidate("SKU-1", 1150, "elasticity-v8");
 }
@@ -675,48 +695,56 @@ void experiment() {
 
 void CheckRoute(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto r = c.Get("/v1/prices/SKU-1");
   ctx.Equal(r.Status, 200, "GET /v1/prices/SKU-1 (%s)", r.Text());
-  ctx.Assert(bodyOf(r).value("price_cents", nlohmann::json()) == 1000, "the read answered %s, expected price_cents 1000", r.Text());
+  ctx.Assert(hBodyOf(r).value("price_cents", nlohmann::json()) == 1000, "the read answered %s, expected price_cents 1000", r.Text());
 }
 
 void CheckPublishedOnly(harness::Ctx& ctx) {
-  experiment();
-  auto c = readApi(ctx);
+  hExperiment();
+  auto c = hReadApi(ctx);
   auto r = c.Get("/v1/prices/SKU-1");
-  ctx.Assert(r.Status == 200 && bodyOf(r).value("price_cents", nlohmann::json()) == 1000, "the storefront read answered %s: 1150 is an experiment's candidate nobody approved, the published price is 1000", r.Text());
+  ctx.Assert(r.Status == 200 && hBodyOf(r).value("price_cents", nlohmann::json()) == 1000, "the storefront read answered %s: 1150 is an experiment's candidate nobody approved, the published price is 1000", r.Text());
   r = c.Get("/v1/prices/SKU-1", "X-Operator-Scope", "preview");
-  ctx.Assert(bodyOf(r).value("price_cents", nlohmann::json()) == 1000, "an operator's price_cents must be the published price too, got %s", r.Text());
+  ctx.Assert(hBodyOf(r).value("price_cents", nlohmann::json()) == 1000, "an operator's price_cents must be the published price too, got %s", r.Text());
   const auto missing = c.Get("/v1/prices/SKU-404");
   ctx.Equal(missing.Status, 404, "a sku that does not exist (%s)", missing.Text());
+  store::setCandidate("SKU-9", 900, "elasticity-v8");  // a candidate for a sku that was never published
+  const auto orphan = c.Get("/v1/prices/SKU-9", "X-Operator-Scope", "preview");
+  ctx.Equal(orphan.Status, 404, "an operator's read of SKU-9, which has a candidate but no published price (%s)", orphan.Text());
 }
 
 void CheckPreviewScope(harness::Ctx& ctx) {
-  experiment();
-  auto c = readApi(ctx);
+  hExperiment();
+  auto c = hReadApi(ctx);
   const auto r = c.Get("/v1/prices/SKU-1", "X-Operator-Scope", "preview");
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.value("candidate", nlohmann::json()) == nlohmann::json{{"price_cents", 1150}, {"model_version", "elasticity-v8"}}, "an operator with X-Operator-Scope: preview got %s, expected candidate {price_cents: 1150, model_version: elasticity-v8} beside the price", r.Text());
   ctx.Assert(body.value("price_cents", nlohmann::json()) == 1000, "the candidate goes beside the published price, not over it: %s", r.Text());
-  const auto other = c.Get("/v1/prices/SKU-1", "X-Operator-Scope", "admin");
+  for (const std::string scope : {"admin", "previewer", "no-preview"}) {
+    const auto other = c.Get("/v1/prices/SKU-1", "X-Operator-Scope", scope);
+    ctx.Assert(other.Status == 200 && !hBodyOf(other).contains("candidate"), "a caller with X-Operator-Scope: %s saw the candidate: %s; only X-Operator-Scope: preview does", scope, other.Text());
+  }
   const auto plain = c.Get("/v1/prices/SKU-1");
-  ctx.Assert(!bodyOf(other).contains("candidate") && !bodyOf(plain).contains("candidate"), "a caller without the preview scope saw the candidate: %s / %s", other.Text(), plain.Text());
+  ctx.Assert(plain.Status == 200 && !hBodyOf(plain).contains("candidate"), "a caller with no scope saw the candidate: %s; only X-Operator-Scope: preview does", plain.Text());
+  const auto query = c.Get("/v1/prices/SKU-1?scope=preview");
+  ctx.Assert(query.Status == 200 && !hBodyOf(query).contains("candidate"), "a caller with ?scope=preview and no header saw the candidate: %s; only X-Operator-Scope: preview does", query.Text());
 }
 
 void CheckProvenance(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
   ctx.Clock.Advance(30);
   const store::Row approved = store::publish("SKU-1", 1100, "weekend promo", "operator");
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   auto r = c.Get("/v1/prices/SKU-1");
-  auto body = bodyOf(r);
+  auto body = hBodyOf(r);
   ctx.Assert(body.value("source", nlohmann::json()) == "operator" && body.value("updated_at", nlohmann::json()) == approved.updated_at && body.value("stale", nlohmann::json()) == false,
              "the read answered %s, expected source operator, updated_at %d and stale false", r.Text(), approved.updated_at);
   ctx.Clock.Advance(600);
   store::markStale("SKU-1");  // the demand model went down: the approved price is kept
   r = c.Get("/v1/prices/SKU-1");
-  body = bodyOf(r);
+  body = hBodyOf(r);
   ctx.Assert(body.value("stale", nlohmann::json()) == true && body.value("source", nlohmann::json()) == "last-approved", "a price kept while the model is down answered %s: it must say stale true and source last-approved", r.Text());
   ctx.Assert(body.value("updated_at", nlohmann::json()) == approved.updated_at, "the kept price reports %s, expected updated_at %d, when it was approved", r.Text(), approved.updated_at);
 }
@@ -724,10 +752,10 @@ void CheckProvenance(harness::Ctx& ctx) {
 void CheckGuardrailState(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
   guard::reserve("SKU-1", 1000, 1150);
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const auto r = c.Get("/v1/prices/SKU-1");
   const nlohmann::json want{{"window", ctx.Clock.Now() / 1000 / 3600}, {"moved_bp", 1500}, {"limit_bp", 2000}, {"headroom_bp", 500}};
-  ctx.Assert(bodyOf(r).value("guardrail", nlohmann::json()) == want, "after a 15 %% change the read answered %s, expected guardrail %s", r.Text(), want.dump());
+  ctx.Assert(hBodyOf(r).value("guardrail", nlohmann::json()) == want, "after a 15 %% change the read answered %s, expected guardrail %s", r.Text(), want.dump());
 }
 `,
   },

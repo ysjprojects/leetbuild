@@ -67,7 +67,7 @@ stays listed for ten minutes.
       id: 'route',
       title: 'Registers GET /v1/users/{id}/permissions',
       detail:
-        'Register `GET /v1/users/{id}/permissions`; a subject reading its own permissions gets 200, a request without `X-Caller-Id` 401.',
+        'Register `GET /v1/users/{id}/permissions`; a subject reading its own permissions gets 200 (the scope defaults to `org`), a request without `X-Caller-Id` 401.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/users\/\{\w+\}\/permissions["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/users\/:\w+\/permissions['"]/]},
@@ -80,7 +80,7 @@ stays listed for ten minutes.
       id: 'foreign-403',
       title: "Refuses another subject's permissions without permissions:read_any",
       detail:
-        "A caller reading someone else must hold `permissions:read_any` at `org`, asked through the cache (`effective_permissions` of the caller); otherwise **403**. The starter answers any caller, so one user can enumerate everyone's access.",
+        "A caller reading someone else must hold `permissions:read_any` at `org`, asked through the cache (`effective_permissions` of the caller); otherwise **403**, a body already cached for that subject included. The starter answers any caller, so one user can enumerate everyone's access.",
       match: {
         python: {all: [/permissions:read_any/, /cache\.effective_permissions\(\s*caller/, /\b403\b/]},
         typescript: {all: [/permissions:read_any/, /effectivePermissions\(\s*caller/, /\b403\b/]},
@@ -93,7 +93,7 @@ stays listed for ten minutes.
       id: 'provenance',
       title: 'Every permission names the grants it comes from',
       detail:
-        'Each entry carries `granted_by`, the grants (`grant_id`, `role`, `scope`) that confer the permission; the starter merges every permission into one list, so nobody can say which grant to revoke.',
+        'Each entry carries `granted_by`, the grants (`grant_id`, `role`, `scope`) that confer the permission, oldest first (`g-2` before `g-10`); the starter merges every permission into one list, so nobody can say which grant to revoke.',
       match: {
         python: {all: [/granted_by/, /["']grant_id["']/]},
         typescript: {all: [/granted_by/, /grant_id/]},
@@ -119,7 +119,7 @@ stays listed for ten minutes.
       id: 'fresh-cache',
       title: 'Serves a cached body only at the current grant version',
       detail:
-        'The body is stamped with `grant_version`, read before deriving, and a cached body is served only while it equals `perm:grant_version`; the starter serves its copy for 600 s whatever changed.',
+        'The body is stamped with `grant_version`, read before deriving, and a cached body is served only while it equals `perm:grant_version`, so a body derived while a revocation committed is stale at once; the starter serves its copy for 600 s whatever changed.',
       match: {
         python: {all: [/\.get\(\s*VERSION_KEY/, /grant_version/]},
         typescript: {all: [/\.get\(\s*VERSION_KEY/, /grant_version/]},
@@ -712,7 +712,9 @@ async def check_route(ctx):
         assert r.status_code == 200, f"ada reading her own permissions answered {r.status_code}: {r.text}"
         assert r.json().get("subject") == "ada", f"the body must name the subject, got {r.text}"
         anonymous = await c.get("/v1/users/ada/permissions")
-    assert anonymous.status_code == 401, f"a read without X-Caller-Id answered {anonymous.status_code}, expected 401"
+        assert anonymous.status_code == 401, f"a read without X-Caller-Id answered {anonymous.status_code}, expected 401"
+        r = await c.get("/v1/users/olu/permissions", headers={"X-Caller-Id": "olu"})
+    assert r.status_code == 200 and r.json().get("scope") == "org" and "org:write" in _names(r.json()), f"olu reading his own permissions without ?scope= answered {r.status_code} {r.text}, expected the scope org (the default) with org:write"
 
 
 async def check_foreign_403(ctx):
@@ -721,20 +723,30 @@ async def check_foreign_403(ctx):
         assert r.status_code == 403, f"bob (viewer at team:ops) reading ada's permissions answered {r.status_code}, expected 403: only a caller with permissions:read_any may read another subject"
         r = await _read(c, "ada", "olu", "team:eng")
         assert r.status_code == 200, f"olu (org_admin, which confers permissions:read_any) reading ada answered {r.status_code}: {r.text}"
+        r = await _read(c, "ada", "bob", "team:eng")
+        assert r.status_code == 403, f"bob reading ada's permissions right after olu's read cached them answered {r.status_code}, expected 403: a cached body is still another subject's"
         r = await _read(c, "bob", "bob", "team:ops")
     assert r.status_code == 200, f"bob reading his own permissions answered {r.status_code}: {r.text}"
 
 
 async def check_provenance(ctx):
     async with _api(ctx) as c:
+        for _ in range(5):
+            cache.grant_role("cyd", "viewer", "team:ops", "olu")  # g-5 to g-9
+        cache.grant_role("ada", "team_admin", "team:eng", "olu")  # g-10
         r = await _read(c, "ada", "ada", "team:eng")
     assert r.status_code == 200, f"ada reading her own permissions answered {r.status_code}: {r.text}"
+    g2 = {"grant_id": "g-2", "role": "viewer", "scope": "team:eng"}
+    g3 = {"grant_id": "g-3", "role": "developer", "scope": "team:eng"}
+    g10 = {"grant_id": "g-10", "role": "team_admin", "scope": "team:eng"}
     want = [
-        {"permission": "code:write", "granted_by": [{"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]},
-        {"permission": "team:read", "granted_by": [{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"}, {"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]},
+        {"permission": "code:write", "granted_by": [g3]},
+        {"permission": "roles:assign", "granted_by": [g10]},
+        {"permission": "team:read", "granted_by": [g2, g3, g10]},
+        {"permission": "team:write", "granted_by": [g10]},
     ]
     got = r.json().get("permissions")
-    assert got == want, f"ada's permissions at team:eng are {got}, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first: {want}"
+    assert got == want, f"ada's permissions at team:eng are {got}, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first (g-2, g-3, g-10): {want}"
 
 
 async def check_covering_scopes(ctx):
@@ -753,14 +765,26 @@ async def check_covering_scopes(ctx):
 
 
 async def check_fresh_cache(ctx):
+    def revoke_g5():  # another replica revokes g-5 while the read is deriving: the grant store, then the version
+        ctx.redis.delete("grant:g-5")
+        ctx.redis.srem("grants:ada", "g-5")
+        ctx.redis.incr("perm:grant_version")
+
     async with _api(ctx) as c:
         r = await _read(c, "ada", "ada", "team:eng")
         assert "code:write" in _names(r.json()), f"ada (developer at team:eng) must hold code:write there, got {r.text}"
         cache.revoke_grant("g-3")  # writes the grant store, then bumps perm:grant_version
         r = await _read(c, "ada", "ada", "team:eng")
+        names = _names(r.json())
+        assert "code:write" not in names, f"after ada's developer grant was revoked her permissions still list {names}: a cached body counts only at the grant version it was derived at"
+        assert names == ["team:read"], f"after the revocation ada's permissions at team:eng are {names}, expected team:read"
+        cache.grant_role("ada", "team_admin", "team:eng", "olu")  # g-5
+        probe = ctx.redis_after("grant:g-5", revoke_g5)
+        first = await _read(c, "ada", "ada", "team:eng")
+        assert probe.fired, "the read never loaded ada's grant g-5 from the grant store"
+        r = await _read(c, "ada", "ada", "team:eng")
     names = _names(r.json())
-    assert "code:write" not in names, f"after ada's developer grant was revoked her permissions still list {names}: a cached body counts only at the grant version it was derived at"
-    assert names == ["team:read"], f"after the revocation ada's permissions at team:eng are {names}, expected team:read"
+    assert names == ["team:read"], f"g-5 was revoked while a read derived {_names(first.json())}, and the next read answers {names}: stamp the body with the grant_version read before deriving, so it is stale at once"
 `,
     typescript: `async function api(ctx) {
   const cache = ctx.load('/support/permz/cache.ts');
@@ -783,6 +807,8 @@ export async function check_route(ctx) {
   assert.equal(r.json().subject, 'ada', \`the body must name the subject, got \${r.text}\`);
   const anonymous = await c.get('/v1/users/ada/permissions');
   assert.equal(anonymous.status, 401, \`a read without X-Caller-Id answered \${anonymous.status}, expected 401\`);
+  const own = await c.get('/v1/users/olu/permissions', {headers: {'X-Caller-Id': 'olu'}});
+  assert(own.status === 200 && own.json().scope === 'org' && names(own).includes('org:write'), \`olu reading his own permissions without ?scope= answered \${own.status} \${own.text}, expected the scope org (the default) with org:write\`);
 }
 
 export async function check_foreign_403(ctx) {
@@ -791,20 +817,29 @@ export async function check_foreign_403(ctx) {
   assert.equal(r.status, 403, \`bob (viewer at team:ops) reading ada's permissions answered \${r.status}, expected 403: only a caller with permissions:read_any may read another subject\`);
   r = await read(c, 'ada', 'olu', 'team:eng');
   assert.equal(r.status, 200, \`olu (org_admin, which confers permissions:read_any) reading ada answered \${r.status}: \${r.text}\`);
+  r = await read(c, 'ada', 'bob', 'team:eng');
+  assert.equal(r.status, 403, \`bob reading ada's permissions right after olu's read cached them answered \${r.status}, expected 403: a cached body is still another subject's\`);
   r = await read(c, 'bob', 'bob', 'team:ops');
   assert.equal(r.status, 200, \`bob reading his own permissions answered \${r.status}: \${r.text}\`);
 }
 
 export async function check_provenance(ctx) {
-  const {c} = await api(ctx);
+  const {c, cache} = await api(ctx);
+  for (let i = 0; i < 5; i++) await cache.grantRole('cyd', 'viewer', 'team:ops', 'olu'); // g-5 to g-9
+  await cache.grantRole('ada', 'team_admin', 'team:eng', 'olu'); // g-10
   const r = await read(c, 'ada', 'ada', 'team:eng');
   assert.equal(r.status, 200, \`ada reading her own permissions answered \${r.status}: \${r.text}\`);
+  const g2 = {grant_id: 'g-2', role: 'viewer', scope: 'team:eng'};
+  const g3 = {grant_id: 'g-3', role: 'developer', scope: 'team:eng'};
+  const g10 = {grant_id: 'g-10', role: 'team_admin', scope: 'team:eng'};
   const want = [
-    {permission: 'code:write', granted_by: [{grant_id: 'g-3', role: 'developer', scope: 'team:eng'}]},
-    {permission: 'team:read', granted_by: [{grant_id: 'g-2', role: 'viewer', scope: 'team:eng'}, {grant_id: 'g-3', role: 'developer', scope: 'team:eng'}]},
+    {permission: 'code:write', granted_by: [g3]},
+    {permission: 'roles:assign', granted_by: [g10]},
+    {permission: 'team:read', granted_by: [g2, g3, g10]},
+    {permission: 'team:write', granted_by: [g10]},
   ];
   const got = r.json().permissions;
-  assert.deepStrictEqual(got, want, \`ada's permissions at team:eng are \${JSON.stringify(got)}, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first\`);
+  assert.deepStrictEqual(got, want, \`ada's permissions at team:eng are \${JSON.stringify(got)}, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first (g-2, g-3, g-10)\`);
 }
 
 export async function check_covering_scopes(ctx) {
@@ -828,6 +863,17 @@ export async function check_fresh_cache(ctx) {
   r = await read(c, 'ada', 'ada', 'team:eng');
   assert(!names(r).includes('code:write'), \`after ada's developer grant was revoked her permissions still list \${JSON.stringify(names(r))}: a cached body counts only at the grant version it was derived at\`);
   assert.deepStrictEqual(names(r), ['team:read'], \`after the revocation ada's permissions at team:eng are \${JSON.stringify(names(r))}, expected team:read\`);
+  await cache.grantRole('ada', 'team_admin', 'team:eng', 'olu'); // g-5
+  const probe = ctx.redisAfter('grant:g-5', () => {
+    // another replica revokes g-5 while the read is deriving: the grant store, then the version
+    ctx.redis.del('grant:g-5');
+    ctx.redis.srem('grants:ada', 'g-5');
+    ctx.redis.incr('perm:grant_version');
+  });
+  const first = await read(c, 'ada', 'ada', 'team:eng');
+  assert(probe.fired, "the read never loaded ada's grant g-5 from the grant store");
+  r = await read(c, 'ada', 'ada', 'team:eng');
+  assert.deepStrictEqual(names(r), ['team:read'], \`g-5 was revoked while a read derived \${JSON.stringify(names(first))}, and the next read answers \${JSON.stringify(names(r))}: stamp the body with the grant_version read before deriving, so it is stale at once\`);
 }
 `,
     go: `package main
@@ -859,14 +905,15 @@ func readAs(c *harness.HTTP, subject, caller, scope string) *harness.Response {
 	return c.Get("/v1/users/"+subject+"/permissions?scope="+url.QueryEscape(scope), "X-Caller-Id", caller)
 }
 
-type readBody struct {
+type hReadBody struct {
 	Subject     string            \`json:"subject"\`
+	Scope       string            \`json:"scope"\`
 	Permissions []json.RawMessage \`json:"permissions"\`
 }
 
 // permissionNames lists the permissions of a body whose entries are names or {permission, …} objects.
 func permissionNames(r *harness.Response) []string {
-	var body readBody
+	var body hReadBody
 	r.Decode(&body)
 	out := []string{}
 	for _, raw := range body.Permissions {
@@ -884,7 +931,7 @@ func permissionNames(r *harness.Response) []string {
 	return out
 }
 
-func has(names []string, p string) bool {
+func hHas(names []string, p string) bool {
 	for _, n := range names {
 		if n == p {
 			return true
@@ -897,10 +944,14 @@ func CheckRoute(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	r := readAs(c, "ada", "ada", "team:eng")
 	ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text())
-	var body readBody
+	var body hReadBody
 	r.Decode(&body)
 	ctx.Equal(body.Subject, "ada", "the body must name the subject (%s)", r.Text())
 	ctx.Equal(c.Get("/v1/users/ada/permissions").Status, 401, "a read without X-Caller-Id")
+	own := c.Get("/v1/users/olu/permissions", "X-Caller-Id", "olu")
+	var ownBody hReadBody
+	own.Decode(&ownBody)
+	ctx.Assert(own.Status == 200 && ownBody.Scope == "org" && hHas(permissionNames(own), "org:write"), "olu reading his own permissions without ?scope= answered %d %s, expected the scope org (the default) with org:write", own.Status, own.Text())
 }
 
 func CheckForeign403(ctx *harness.Ctx) {
@@ -908,26 +959,33 @@ func CheckForeign403(ctx *harness.Ctx) {
 	ctx.Equal(readAs(c, "ada", "bob", "team:eng").Status, 403, "bob (viewer at team:ops) reading ada's permissions must be refused: only a caller with permissions:read_any may read another subject; the status")
 	r := readAs(c, "ada", "olu", "team:eng")
 	ctx.Equal(r.Status, 200, "olu (org_admin, which confers permissions:read_any) reading ada (%s)", r.Text())
+	ctx.Equal(readAs(c, "ada", "bob", "team:eng").Status, 403, "bob reading ada's permissions right after olu's read cached them must be refused: a cached body is still another subject's; the status")
 	r = readAs(c, "bob", "bob", "team:ops")
 	ctx.Equal(r.Status, 200, "bob reading his own permissions (%s)", r.Text())
 }
 
 func CheckProvenance(ctx *harness.Ctx) {
 	c := readAPI(ctx)
+	for i := 0; i < 5; i++ {
+		cache.GrantRole(context.Background(), "cyd", "viewer", "team:ops", "olu") // g-5 to g-9
+	}
+	cache.GrantRole(context.Background(), "ada", "team_admin", "team:eng", "olu") // g-10
 	r := readAs(c, "ada", "ada", "team:eng")
 	ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text())
 	var body struct {
 		Permissions any \`json:"permissions"\`
 	}
 	r.Decode(&body)
+	g2 := map[string]any{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"}
+	g3 := map[string]any{"grant_id": "g-3", "role": "developer", "scope": "team:eng"}
+	g10 := map[string]any{"grant_id": "g-10", "role": "team_admin", "scope": "team:eng"}
 	want := []any{
-		map[string]any{"permission": "code:write", "granted_by": []any{map[string]any{"grant_id": "g-3", "role": "developer", "scope": "team:eng"}}},
-		map[string]any{"permission": "team:read", "granted_by": []any{
-			map[string]any{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"},
-			map[string]any{"grant_id": "g-3", "role": "developer", "scope": "team:eng"},
-		}},
+		map[string]any{"permission": "code:write", "granted_by": []any{g3}},
+		map[string]any{"permission": "roles:assign", "granted_by": []any{g10}},
+		map[string]any{"permission": "team:read", "granted_by": []any{g2, g3, g10}},
+		map[string]any{"permission": "team:write", "granted_by": []any{g10}},
 	}
-	ctx.Equal(body.Permissions, want, "ada's permissions at team:eng must each name the grants that confer them (granted_by: grant_id, role, scope), oldest first")
+	ctx.Equal(body.Permissions, want, "ada's permissions at team:eng must each name the grants that confer them (granted_by: grant_id, role, scope), oldest first (g-2, g-3, g-10)")
 }
 
 func CheckCoveringScopes(ctx *harness.Ctx) {
@@ -935,7 +993,7 @@ func CheckCoveringScopes(ctx *harness.Ctx) {
 	cache.GrantRole(context.Background(), "ada", "viewer", "project:eng/web", "olu") // g-5, narrower than team:eng
 	ctx.Equal(permissionNames(readAs(c, "ada", "ada", "project:eng/api")), []string{"code:write", "team:read"}, "ada's grants at team:eng cover the team's projects; her permissions at project:eng/api")
 	names := permissionNames(readAs(c, "olu", "olu", "team:ops"))
-	ctx.Assert(has(names, "team:write"), "olu's permissions at team:ops are %v: an org grant covers every team", names)
+	ctx.Assert(hHas(names, "team:write"), "olu's permissions at team:ops are %v: an org grant covers every team", names)
 	ctx.Equal(permissionNames(readAs(c, "ada", "ada", "team:ops")), []string{}, "team:eng does not cover team:ops; ada's permissions there")
 	r := readAs(c, "ada", "ada", "team:eng")
 	ctx.Assert(!strings.Contains(r.Text(), "g-5"), "ada's read at team:eng lists g-5, a grant at project:eng/web: a project grant does not reach its team (%s)", r.Text())
@@ -944,11 +1002,23 @@ func CheckCoveringScopes(ctx *harness.Ctx) {
 func CheckFreshCache(ctx *harness.Ctx) {
 	c := readAPI(ctx)
 	r := readAs(c, "ada", "ada", "team:eng")
-	ctx.Assert(has(permissionNames(r), "code:write"), "ada (developer at team:eng) must hold code:write there, got %s", r.Text())
+	ctx.Assert(hHas(permissionNames(r), "code:write"), "ada (developer at team:eng) must hold code:write there, got %s", r.Text())
 	cache.RevokeGrant(context.Background(), "g-3") // writes the grant store, then bumps perm:grant_version
 	names := permissionNames(readAs(c, "ada", "ada", "team:eng"))
-	ctx.Assert(!has(names, "code:write"), "after ada's developer grant was revoked her permissions still list %v: a cached body counts only at the grant version it was derived at", names)
+	ctx.Assert(!hHas(names, "code:write"), "after ada's developer grant was revoked her permissions still list %v: a cached body counts only at the grant version it was derived at", names)
 	ctx.Equal(names, []string{"team:read"}, "after the revocation, ada's permissions at team:eng")
+	cache.GrantRole(context.Background(), "ada", "team_admin", "team:eng", "olu") // g-5
+	probe := ctx.Redis.After("grant:g-5", func() any {
+		// another replica revokes g-5 while the read is deriving: the grant store, then the version
+		ctx.Redis.Del("grant:g-5")
+		ctx.Redis.Do("SREM", "grants:ada", "g-5")
+		ctx.Redis.Do("INCR", "perm:grant_version")
+		return nil
+	})
+	first := permissionNames(readAs(c, "ada", "ada", "team:eng"))
+	ctx.Assert(probe.Fired, "the read never loaded ada's grant g-5 from the grant store")
+	names = permissionNames(readAs(c, "ada", "ada", "team:eng"))
+	ctx.Equal(names, []string{"team:read"}, "g-5 was revoked while a read derived %v: stamp the body with the grant_version read before deriving, so it is stale at once; the next read's permissions", first)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -979,18 +1049,18 @@ harness::Response readAs(harness::HTTP& c, const std::string& subject, const std
   return c.Get("/v1/users/" + subject + "/permissions?scope=" + scope, "X-Caller-Id", caller);
 }
 
-nlohmann::json bodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hBodyOf(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
 // The permissions of a body whose entries are names or {permission, …} objects.
 std::vector<std::string> permissionNames(const harness::Response& r) {
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   std::vector<std::string> out;
   if (!body.is_object() || !body.contains("permissions") || !body["permissions"].is_array()) return out;
   for (const auto& e : body["permissions"]) out.push_back(e.is_string() ? e.get<std::string>() : e.value("permission", ""));
   return out;
 }
 
-bool has(const std::vector<std::string>& names, const std::string& p) { return std::find(names.begin(), names.end(), p) != names.end(); }
+bool hHas(const std::vector<std::string>& names, const std::string& p) { return std::find(names.begin(), names.end(), p) != names.end(); }
 
 }  // namespace
 
@@ -998,9 +1068,13 @@ void CheckRoute(harness::Ctx& ctx) {
   auto c = readApi(ctx);
   const auto r = readAs(c, "ada", "ada", "team:eng");
   ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text());
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   ctx.Assert(body.is_object() && body.value("subject", "") == "ada", "the body must name the subject, got %s", r.Text());
   ctx.Equal(c.Get("/v1/users/ada/permissions").Status, 401, "a read without X-Caller-Id");
+  const auto own = c.Get("/v1/users/olu/permissions", "X-Caller-Id", "olu");
+  const auto ownBody = hBodyOf(own);
+  ctx.Assert(own.Status == 200 && ownBody.is_object() && ownBody.value("scope", "") == "org" && hHas(permissionNames(own), "org:write"),
+             "olu reading his own permissions without ?scope= answered %d %s, expected the scope org (the default) with org:write", own.Status, own.Text());
 }
 
 void CheckForeign403(harness::Ctx& ctx) {
@@ -1008,21 +1082,26 @@ void CheckForeign403(harness::Ctx& ctx) {
   ctx.Equal(readAs(c, "ada", "bob", "team:eng").Status, 403, "bob (viewer at team:ops) reading ada's permissions must be refused: only a caller with permissions:read_any may read another subject; the status");
   auto r = readAs(c, "ada", "olu", "team:eng");
   ctx.Equal(r.Status, 200, "olu (org_admin, which confers permissions:read_any) reading ada (%s)", r.Text());
+  ctx.Equal(readAs(c, "ada", "bob", "team:eng").Status, 403, "bob reading ada's permissions right after olu's read cached them must be refused: a cached body is still another subject's; the status");
   r = readAs(c, "bob", "bob", "team:ops");
   ctx.Equal(r.Status, 200, "bob reading his own permissions (%s)", r.Text());
 }
 
 void CheckProvenance(harness::Ctx& ctx) {
   auto c = readApi(ctx);
+  for (int i = 0; i < 5; i++) cache::grantRole("cyd", "viewer", "team:ops", "olu");  // g-5 to g-9
+  cache::grantRole("ada", "team_admin", "team:eng", "olu");                           // g-10
   const auto r = readAs(c, "ada", "ada", "team:eng");
   ctx.Equal(r.Status, 200, "ada reading her own permissions (%s)", r.Text());
   const nlohmann::json want = nlohmann::json::parse(R"([
     {"permission": "code:write", "granted_by": [{"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]},
-    {"permission": "team:read", "granted_by": [{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"}, {"grant_id": "g-3", "role": "developer", "scope": "team:eng"}]}
+    {"permission": "roles:assign", "granted_by": [{"grant_id": "g-10", "role": "team_admin", "scope": "team:eng"}]},
+    {"permission": "team:read", "granted_by": [{"grant_id": "g-2", "role": "viewer", "scope": "team:eng"}, {"grant_id": "g-3", "role": "developer", "scope": "team:eng"}, {"grant_id": "g-10", "role": "team_admin", "scope": "team:eng"}]},
+    {"permission": "team:write", "granted_by": [{"grant_id": "g-10", "role": "team_admin", "scope": "team:eng"}]}
   ])");
-  const auto body = bodyOf(r);
+  const auto body = hBodyOf(r);
   const nlohmann::json got = body.is_object() && body.contains("permissions") ? body["permissions"] : nlohmann::json();
-  ctx.Assert(got == want, "ada's permissions at team:eng are %s, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first: %s", got.dump(), want.dump());
+  ctx.Assert(got == want, "ada's permissions at team:eng are %s, expected each permission with the grants that confer it (granted_by: grant_id, role, scope), oldest first (g-2, g-3, g-10): %s", got.dump(), want.dump());
 }
 
 void CheckCoveringScopes(harness::Ctx& ctx) {
@@ -1030,7 +1109,7 @@ void CheckCoveringScopes(harness::Ctx& ctx) {
   cache::grantRole("ada", "viewer", "project:eng/web", "olu");  // g-5, narrower than team:eng
   ctx.Equal(permissionNames(readAs(c, "ada", "ada", "project:eng/api")), {"code:write", "team:read"}, "ada's grants at team:eng cover the team's projects; her permissions at project:eng/api");
   const auto names = permissionNames(readAs(c, "olu", "olu", "team:ops"));
-  ctx.Assert(has(names, "team:write"), "olu's permissions at team:ops are %v: an org grant covers every team", names);
+  ctx.Assert(hHas(names, "team:write"), "olu's permissions at team:ops are %v: an org grant covers every team", names);
   ctx.Equal(permissionNames(readAs(c, "ada", "ada", "team:ops")), std::vector<std::string>{}, "team:eng does not cover team:ops; ada's permissions there");
   const auto r = readAs(c, "ada", "ada", "team:eng");
   ctx.Assert(r.Text().find("g-5") == std::string::npos, "ada's read at team:eng lists g-5, a grant at project:eng/web: a project grant does not reach its team (%s)", r.Text());
@@ -1039,11 +1118,24 @@ void CheckCoveringScopes(harness::Ctx& ctx) {
 void CheckFreshCache(harness::Ctx& ctx) {
   auto c = readApi(ctx);
   const auto r = readAs(c, "ada", "ada", "team:eng");
-  ctx.Assert(has(permissionNames(r), "code:write"), "ada (developer at team:eng) must hold code:write there, got %s", r.Text());
+  ctx.Assert(hHas(permissionNames(r), "code:write"), "ada (developer at team:eng) must hold code:write there, got %s", r.Text());
   cache::revokeGrant("g-3");  // writes the grant store, then bumps perm:grant_version
-  const auto names = permissionNames(readAs(c, "ada", "ada", "team:eng"));
-  ctx.Assert(!has(names, "code:write"), "after ada's developer grant was revoked her permissions still list %v: a cached body counts only at the grant version it was derived at", names);
+  auto names = permissionNames(readAs(c, "ada", "ada", "team:eng"));
+  ctx.Assert(!hHas(names, "code:write"), "after ada's developer grant was revoked her permissions still list %v: a cached body counts only at the grant version it was derived at", names);
   ctx.Equal(names, {"team:read"}, "after the revocation, ada's permissions at team:eng");
+  cache::grantRole("ada", "team_admin", "team:eng", "olu");  // g-5
+  bool fired = false;
+  ctx.Redis.After("grant:g-5", [&ctx, &fired] {
+    // another replica revokes g-5 while the read is deriving: the grant store, then the version
+    fired = true;
+    ctx.Redis.Do("DEL", "grant:g-5");
+    ctx.Redis.Do("SREM", "grants:ada", "g-5");
+    ctx.Redis.Do("INCR", "perm:grant_version");
+  });
+  const auto first = permissionNames(readAs(c, "ada", "ada", "team:eng"));
+  ctx.Assert(fired, "the read never loaded ada's grant g-5 from the grant store");
+  names = permissionNames(readAs(c, "ada", "ada", "team:eng"));
+  ctx.Equal(names, {"team:read"}, "g-5 was revoked while a read derived %v: stamp the body with the grant_version read before deriving, so it is stale at once; the next read's permissions", first);
 }
 `,
   },

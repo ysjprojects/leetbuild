@@ -72,7 +72,7 @@ and an event the broker refused is gone.
       id: 'digests-not-descriptions',
       title: 'Carries line digests, not line text or notes',
       detail:
-        "The payload carries `line_digests` (`line_digest`/`lineDigest` of each line) and neither the line items nor `internal_notes`: the topic is retained and replicated, so a description written there outlives the invoice's own access rules.",
+        "The payload carries `line_digests` (`line_digest`/`lineDigest` of each line) next to the event type, invoice and tenant ids, number, currency, subtotal and tax as the invoice holds them, and neither the line items nor `internal_notes`: the topic is retained and replicated, so a description written there outlives the invoice's own access rules.",
       match: {
         python: {all: [/line_digest\(/, /line_digests/], none: [/["']line_items["']\s*:/, /internal_notes/]},
         typescript: {all: [/lineDigest\(/, /line_digests/], none: [/line_items:\s*invoice/, /internal_notes/]},
@@ -718,6 +718,7 @@ def check_key_invoice(ctx):
 def check_digests_not_descriptions(ctx):
     m = ctx.load("events")
     a = _draft()
+    store.set_tax(a, 11780, "quote")
     _finalize(m, a)
     record = ctx.kafka.records(TOPIC)[0]
     text = record.value.decode()
@@ -727,7 +728,9 @@ def check_digests_not_descriptions(ctx):
     payload = _payload(record)
     want = [store.line_digest(line) for line in LINES]
     assert payload.get("line_digests") == want, f"line_digests must be store.line_digest of each line in order, got {payload.get('line_digests')}"
-    assert payload.get("invoice_id") == a and payload.get("subtotal_cents") == 62000 and payload.get("event_type") == "invoice.finalized", f"the event must carry event_type, invoice_id and subtotal_cents, got {payload}"
+    want = {"event_type": "invoice.finalized", "invoice_id": a, "tenant_id": "t-1", "number": 1, "currency": "eur", "subtotal_cents": 62000, "tax_cents": 11780}
+    got = {key: payload.get(key) for key in want}
+    assert got == want, f"the event must carry {want}, got {got}"
 
 
 def check_publish_after_claim(ctx):
@@ -803,6 +806,7 @@ export async function check_key_invoice(ctx) {
 export async function check_digests_not_descriptions(ctx) {
   const {m, store} = events(ctx);
   const a = await draft(store);
+  await store.setTax(a, 11780, 'quote');
   await finalize(m, a);
   const record = ctx.kafka.records(TOPIC)[0];
   const text = record.value.toString();
@@ -810,7 +814,9 @@ export async function check_digests_not_descriptions(ctx) {
   assert(!text.includes(NOTES), "the event carries the invoice's internal notes");
   const p = payload(record);
   assert.deepStrictEqual(p.line_digests, LINES.map(store.lineDigest), \`line_digests must be lineDigest of each line in order, got \${JSON.stringify(p.line_digests)}\`);
-  assert(p.invoice_id === a && p.subtotal_cents === 62000 && p.event_type === 'invoice.finalized', \`the event must carry event_type, invoice_id and subtotal_cents, got \${text}\`);
+  const want = {event_type: 'invoice.finalized', invoice_id: a, tenant_id: 't-1', number: 1, currency: 'eur', subtotal_cents: 62000, tax_cents: 11780};
+  const got = Object.fromEntries(Object.keys(want).map(key => [key, p[key]]));
+  assert.deepStrictEqual(got, want, \`the event must carry \${JSON.stringify(want)}, got \${JSON.stringify(got)}\`);
 }
 
 export async function check_publish_after_claim(ctx) {
@@ -852,46 +858,46 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "invoice.event"
+const hTopic = "invoice.event"
 
 var (
-	eventsBg    = context.Background()
-	eventsLines = []store.Line{
+	hBg    = context.Background()
+	hLines = []store.Line{
 		{Description: "Consulting: Acme merger due diligence", Quantity: 2, UnitPriceCents: 25000},
 		{Description: "Travel to Zurich", Quantity: 1, UnitPriceCents: 12000},
 	}
-	notes = "margin 40%, do not discount"
+	hNotes = "margin 40%, do not discount"
 )
 
-func eventDraft() string {
-	return store.Create(eventsBg, "t-1", "eur", eventsLines, "cus-1", "DE", notes).ID
+func hDraft() string {
+	return store.Create(hBg, "t-1", "eur", hLines, "cus-1", "DE", hNotes).ID
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func hPayload(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func mustFinalize(ctx *harness.Ctx, invoiceID string) map[string]any {
-	event, err := finalizeAndPublish(eventsBg, "t-1", invoiceID)
+func hMustFinalize(ctx *harness.Ctx, invoiceID string) map[string]any {
+	event, err := finalizeAndPublish(hBg, "t-1", invoiceID)
 	ctx.NoError(err, "finalizeAndPublish(t-1, %s) failed", invoiceID)
 	ctx.Assert(event != nil, "finalizing the draft %s must answer its event", invoiceID)
 	return event
 }
 
 func CheckKeyInvoice(ctx *harness.Ctx) {
-	a, b := eventDraft(), eventDraft()
-	mustFinalize(ctx, a)
-	mustFinalize(ctx, b)
-	_, err := publishEvent(eventsBg, "invoice.paid", store.Get(eventsBg, a))
+	a, b := hDraft(), hDraft()
+	hMustFinalize(ctx, a)
+	hMustFinalize(ctx, b)
+	_, err := publishEvent(hBg, "invoice.paid", store.Get(hBg, a))
 	ctx.NoError(err, "publishEvent(invoice.paid) failed")
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 3, "two finalizes and a payment, the records on %s", topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{a, b, a}, "records must be keyed by the invoice id")
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 3, "two finalizes and a payment, the records on %s", hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{a, b, a}, "records must be keyed by the invoice id")
 	partitions := map[int]bool{}
 	for _, r := range records {
-		if payloadOf(ctx, r.Value)["invoice_id"] == a {
+		if hPayload(ctx, r.Value)["invoice_id"] == a {
 			partitions[r.Partition] = true
 		}
 	}
@@ -899,48 +905,54 @@ func CheckKeyInvoice(ctx *harness.Ctx) {
 }
 
 func CheckDigestsNotDescriptions(ctx *harness.Ctx) {
-	a := eventDraft()
-	mustFinalize(ctx, a)
-	value := ctx.Kafka.Records(topic)[0].Value
+	a := hDraft()
+	store.SetTax(hBg, a, 11780, "quote")
+	hMustFinalize(ctx, a)
+	value := ctx.Kafka.Records(hTopic)[0].Value
 	text := string(value)
-	for _, line := range eventsLines {
+	for _, line := range hLines {
 		ctx.Assert(!strings.Contains(text, line.Description), "the event carries the line text %q: the topic is retained and replicated. Send line_digests", line.Description)
 	}
-	ctx.Assert(!strings.Contains(text, notes), "the event carries the invoice's internal notes")
-	p := payloadOf(ctx, value)
+	ctx.Assert(!strings.Contains(text, hNotes), "the event carries the invoice's internal notes")
+	p := hPayload(ctx, value)
 	want := []any{}
-	for _, line := range eventsLines {
+	for _, line := range hLines {
 		want = append(want, store.LineDigest(line))
 	}
 	ctx.Equal(p["line_digests"], want, "line_digests must be store.LineDigest of each line in order")
-	ctx.Assert(p["invoice_id"] == a && p["subtotal_cents"] == float64(62000) && p["event_type"] == "invoice.finalized", "the event must carry event_type, invoice_id and subtotal_cents, got %s", text)
+	fields := map[string]any{"event_type": "invoice.finalized", "invoice_id": a, "tenant_id": "t-1", "number": float64(1), "currency": "eur", "subtotal_cents": float64(62000), "tax_cents": float64(11780)}
+	got := map[string]any{}
+	for key := range fields {
+		got[key] = p[key]
+	}
+	ctx.Equal(got, fields, "the event's fields")
 }
 
 func CheckPublishAfterClaim(ctx *harness.Ctx) {
-	a := eventDraft()
+	a := hDraft()
 	// The moment the number is claimed, what is already on the topic.
-	atClaim := ctx.Redis.After("invoice:seq:t-1", func() any { return len(ctx.Kafka.Records(topic)) })
-	event := mustFinalize(ctx, a)
+	atClaim := ctx.Redis.After("invoice:seq:t-1", func() any { return len(ctx.Kafka.Records(hTopic)) })
+	event := hMustFinalize(ctx, a)
 	ctx.Assert(atClaim.Fired, "finalizeAndPublish never claimed a number")
 	ctx.Equal(atClaim.Result, 0, "when the number was claimed the topic already held records: the ledger heard of the finalize before it happened. Claim, then publish; the records at the claim")
-	ctx.Assert(event["number"] == int64(1) && payloadOf(ctx, ctx.Kafka.Records(topic)[0].Value)["number"] == float64(1), "the finalized event must carry number 1, got %v", event)
-	before := len(ctx.Kafka.Records(topic))
-	again, err := finalizeAndPublish(eventsBg, "t-1", a)
+	ctx.Assert(event["number"] == int64(1) && hPayload(ctx, ctx.Kafka.Records(hTopic)[0].Value)["number"] == float64(1), "the finalized event must carry number 1, got %v", event)
+	before := len(ctx.Kafka.Records(hTopic))
+	again, err := finalizeAndPublish(hBg, "t-1", a)
 	ctx.NoError(err, "a second finalize must not fail")
 	ctx.Assert(again == nil, "finalizing an invoice that is no longer a draft answered %v, expected nil", again)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), before, "a finalize that claimed nothing must not produce an event; the records")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), before, "a finalize that claimed nothing must not produce an event; the records")
 }
 
 func CheckDelivery(ctx *harness.Ctx) {
-	a := eventDraft()
-	ctx.Kafka.FailNext(topic, 1)
-	mustFinalize(ctx, a)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "the broker refused the record; the records on the topic")
-	outbox := store.Outbox(eventsBg)
+	a := hDraft()
+	ctx.Kafka.FailNext(hTopic, 1)
+	hMustFinalize(ctx, a)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 0, "the broker refused the record; the records on the topic")
+	outbox := store.Outbox(hBg)
 	ctx.Assert(len(outbox) == 1 && outbox[0]["invoice_id"] == a && outbox[0]["event_type"] == "invoice.finalized", "the refused invoice.finalized must wait in the outbox for the relay, the outbox holds %v", outbox)
-	_, err := publishEvent(eventsBg, "invoice.paid", store.Get(eventsBg, a))
+	_, err := publishEvent(hBg, "invoice.paid", store.Get(hBg, a))
 	ctx.NoError(err, "publishEvent(invoice.paid) failed")
-	ctx.Assert(len(ctx.Kafka.Records(topic)) == 1 && len(store.Outbox(eventsBg)) == 1, "a delivered event must not go to the outbox (outbox %v)", store.Outbox(eventsBg))
+	ctx.Assert(len(ctx.Kafka.Records(hTopic)) == 1 && len(store.Outbox(hBg)) == 1, "a delivered event must not go to the outbox (outbox %v)", store.Outbox(hBg))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -957,13 +969,13 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kTopic = "invoice.event";
-const std::vector<store::Line> kEventLines = {{"Consulting: Acme merger due diligence", 2, 25000}, {"Travel to Zurich", 1, 12000}};
-const std::string kNotes = "margin 40%, do not discount";
+const std::string hTopic = "invoice.event";
+const std::vector<store::Line> hLines = {{"Consulting: Acme merger due diligence", 2, 25000}, {"Travel to Zurich", 1, 12000}};
+const std::string hNotes = "margin 40%, do not discount";
 
-std::string eventDraft() { return store::create("t-1", "eur", kEventLines, "cus-1", "DE", kNotes).id; }
+std::string hDraft() { return store::create("t-1", "eur", hLines, "cus-1", "DE", hNotes).id; }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayload(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -971,7 +983,7 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   }
 }
 
-json mustFinalize(harness::Ctx& ctx, const std::string& invoice_id) {
+json hMustFinalize(harness::Ctx& ctx, const std::string& invoice_id) {
   std::optional<json> event;
   try {
     event = finalizeAndPublish("t-1", invoice_id);
@@ -985,63 +997,66 @@ json mustFinalize(harness::Ctx& ctx, const std::string& invoice_id) {
 }  // namespace
 
 void CheckKeyInvoice(harness::Ctx& ctx) {
-  const std::string a = eventDraft(), b = eventDraft();
-  mustFinalize(ctx, a);
-  mustFinalize(ctx, b);
+  const std::string a = hDraft(), b = hDraft();
+  hMustFinalize(ctx, a);
+  hMustFinalize(ctx, b);
   publishEvent("invoice.paid", *store::get(a));
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "two finalizes and a payment, the records on %s", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {a, b, a}, "records must be keyed by the invoice id");
+  const auto records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 3, "two finalizes and a payment, the records on %s", hTopic);
+  ctx.Equal(ctx.Kafka.Keys(hTopic), {a, b, a}, "records must be keyed by the invoice id");
   std::set<int> partitions;
   for (const auto& r : records) {
-    if (payloadOf(ctx, r).value("invoice_id", "") == a) partitions.insert(r.Partition);
+    if (hPayload(ctx, r).value("invoice_id", "") == a) partitions.insert(r.Partition);
   }
   ctx.Equal(partitions.size(), 1, "%s's finalized and paid must land on one partition, or the ledger can apply the payment first; the partitions", a);
 }
 
 void CheckDigestsNotDescriptions(harness::Ctx& ctx) {
-  const std::string a = eventDraft();
-  mustFinalize(ctx, a);
-  const auto record = ctx.Kafka.Records(kTopic)[0];
+  const std::string a = hDraft();
+  store::setTax(a, 11780, "quote");
+  hMustFinalize(ctx, a);
+  const auto record = ctx.Kafka.Records(hTopic)[0];
   const std::string text = record.Value.value_or("");
-  for (const auto& line : kEventLines) {
+  for (const auto& line : hLines) {
     ctx.Assert(text.find(line.description) == std::string::npos, "the event carries the line text %q: the topic is retained and replicated. Send line_digests", line.description);
   }
-  ctx.Assert(text.find(kNotes) == std::string::npos, "the event carries the invoice's internal notes");
-  const json p = payloadOf(ctx, record);
+  ctx.Assert(text.find(hNotes) == std::string::npos, "the event carries the invoice's internal notes");
+  const json p = hPayload(ctx, record);
   std::vector<std::string> want;
-  for (const auto& line : kEventLines) want.push_back(store::lineDigest(line));
+  for (const auto& line : hLines) want.push_back(store::lineDigest(line));
   ctx.Equal(p.value("line_digests", std::vector<std::string>{}), want, "line_digests must be store::lineDigest of each line in order");
-  ctx.Assert(p.value("invoice_id", "") == a && p.value("subtotal_cents", 0L) == 62000 && p.value("event_type", "") == "invoice.finalized",
-             "the event must carry event_type, invoice_id and subtotal_cents, got %s", text);
+  const json fields = {{"event_type", "invoice.finalized"}, {"invoice_id", a}, {"tenant_id", "t-1"}, {"number", 1}, {"currency", "eur"}, {"subtotal_cents", 62000}, {"tax_cents", 11780}};
+  json got = json::object();
+  for (const auto& [key, value] : fields.items()) got[key] = p.contains(key) ? p[key] : json();
+  ctx.Assert(got == fields, "the event must carry %s, got %s", fields.dump(), got.dump());
 }
 
 void CheckPublishAfterClaim(harness::Ctx& ctx) {
-  const std::string a = eventDraft();
+  const std::string a = hDraft();
   // The moment the number is claimed, what is already on the topic.
   int atClaim = -1;
-  ctx.Redis.After("invoice:seq:t-1", [&] { atClaim = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  const json event = mustFinalize(ctx, a);
+  ctx.Redis.After("invoice:seq:t-1", [&] { atClaim = static_cast<int>(ctx.Kafka.Records(hTopic).size()); });
+  const json event = hMustFinalize(ctx, a);
   ctx.Assert(atClaim >= 0, "finalizeAndPublish never claimed a number");
   ctx.Equal(atClaim, 0, "when the number was claimed the topic already held records: the ledger heard of the finalize before it happened. Claim, then publish; the records at the claim");
-  ctx.Assert(event.value("number", 0L) == 1 && payloadOf(ctx, ctx.Kafka.Records(kTopic)[0]).value("number", 0L) == 1, "the finalized event must carry number 1, got %s",
+  ctx.Assert(event.value("number", 0L) == 1 && hPayload(ctx, ctx.Kafka.Records(hTopic)[0]).value("number", 0L) == 1, "the finalized event must carry number 1, got %s",
              event.dump());
-  const size_t before = ctx.Kafka.Records(kTopic).size();
+  const size_t before = ctx.Kafka.Records(hTopic).size();
   const auto again = finalizeAndPublish("t-1", a);
   ctx.Assert(!again, "finalizing an invoice that is no longer a draft answered %s, expected nothing", again ? again->dump() : "");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), before, "a finalize that claimed nothing must not produce an event; the records");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), before, "a finalize that claimed nothing must not produce an event; the records");
 }
 
 void CheckDelivery(harness::Ctx& ctx) {
-  const std::string a = eventDraft();
-  ctx.Kafka.FailNext(kTopic, 1);
-  mustFinalize(ctx, a);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "the broker refused the record; the records on the topic");
+  const std::string a = hDraft();
+  ctx.Kafka.FailNext(hTopic, 1);
+  hMustFinalize(ctx, a);
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 0, "the broker refused the record; the records on the topic");
   const auto outbox = store::outbox();
   ctx.Assert(outbox.size() == 1 && outbox[0].value("invoice_id", "") == a && outbox[0].value("event_type", "") == "invoice.finalized",
              "the refused invoice.finalized must wait in the outbox for the relay, the outbox holds %d event(s)", outbox.size());
   publishEvent("invoice.paid", *store::get(a));
-  ctx.Assert(ctx.Kafka.Records(kTopic).size() == 1 && store::outbox().size() == 1, "a delivered event must not go to the outbox (outbox %d)", store::outbox().size());
+  ctx.Assert(ctx.Kafka.Records(hTopic).size() == 1 && store::outbox().size() == 1, "a delivered event must not go to the outbox (outbox %d)", store::outbox().size());
 }
 `,
   },

@@ -38,7 +38,7 @@ and a counter with no day spends today's cap on yesterday's bids.
       id: 'atomic-claim',
       title: 'The cap is checked and reserved in one script',
       detail:
-        'Two claims racing for the last headroom: exactly one passes. The check and the `INCRBY` run inside one Lua script; the starter reads in one round trip and writes in another, so a second bid lands between them.',
+        'Two claims racing for the last headroom: exactly one passes, and a claim that brings the counter exactly to the cap passes too. The check and the `INCRBY` run inside one Lua script; the starter reads in one round trip and writes in another, so a second bid lands between them.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
@@ -64,7 +64,7 @@ and a counter with no day spends today's cap on yesterday's bids.
       id: 'release-once',
       title: 'A claim is settled once',
       detail:
-        'The claim is recorded in `claim:{bidder}:{auction_id}` and the settle script deletes it as it reads it: a duplicate loss notice, a notice for an auction never claimed or a loss after a win gives back nothing.',
+        "The claim is recorded in `claim:{bidder}:{auction_id}` and the settle script deletes it as it reads it: a duplicate loss notice, even one racing the first, a notice for an auction never claimed or a loss after a win gives back nothing, and one bidder's loss never touches another bidder's claim of the same auction.",
       match: {
         python: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.call\(\s*['"]DEL['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]HSET['"]/, /redis\.call\(\s*['"]DEL['"]/]},
@@ -77,7 +77,7 @@ and a counter with no day spends today's cap on yesterday's bids.
       id: 'daily-window',
       title: 'The counter is per UTC day and expires',
       detail:
-        'The counter is `spend:{bidder}:{yyyymmdd}` with a TTL of at most two days set on its first write, so a new UTC day starts a fresh cap. The starter keeps one counter forever.',
+        'The counter is `spend:{bidder}:{yyyymmdd}`, and the claim script itself gives it a TTL of at most two days on its first write, so a new UTC day starts a fresh cap; a later claim does not push the expiry back, the claim hash expires too, and a loss settled the next day gives back to the day it was claimed on. The starter keeps one counter forever.',
       match: {
         python: {all: [/%Y%m%d/, /['"]EXPIRE(AT)?['"]/i]},
         typescript: {all: [/toISOString\(\)|getUTC/, /['"]EXPIRE(AT)?['"]/i]},
@@ -503,9 +503,9 @@ def _state(ctx, cap=CAP):
     return ctx.load("state")
 
 
-def _spent(ctx):
+def _spent(ctx, bidder="b-1"):
     """Every cent the bidder's counters hold, whatever the key."""
-    return sum(int(ctx.redis.get(k) or 0) for k in ctx.redis.keys("spend:b-1*"))
+    return sum(int(ctx.redis.get(k) or 0) for k in ctx.redis.keys(f"spend:{bidder}*"))
 
 
 def check_atomic_claim(ctx):
@@ -524,6 +524,8 @@ def check_atomic_claim(ctx):
     passed = [ours, rival["passed"]].count(True)
     assert passed == 1, f"two claims of 600 raced for a cap of 1000 and {passed} passed (the counters hold {_spent(ctx)}): the check and the INCRBY must run in one script"
     assert _spent(ctx) == 600, f"after one passing claim of 600 the counters hold {_spent(ctx)}"
+    assert m.claim("b-1", "a-3", 400) is True, "with 600 of a 1000 cap spent a claim of 400 reaches the cap exactly and must pass"
+    assert m.claim("b-1", "a-4", 1) is False and _spent(ctx) == 1000, f"with the cap reached a claim of 1 must be refused; the counters hold {_spent(ctx)}"
 
 
 def check_release_on_loss(ctx):
@@ -548,19 +550,39 @@ def check_release_once(ctx):
     assert m.settle("b-1", "a-9", False) == 0, "a loss notice for an auction never claimed must give back 0"
     assert m.settle("b-1", "a-2", True) == 0 and m.settle("b-1", "a-2", False) == 0, "a loss notice after the win of a-2 must give back 0"
     assert _spent(ctx) == 300, f"the counters hold {_spent(ctx)}, expected the 300 a-2 won"
+    m.claim("b-1", "a-3", 200)
+    given = []
+    # A second loss notice for a-3 is handled right after the first one first touches the claim.
+    ctx.redis_after("claim:b-1:a-3", lambda: given.append(m.settle("b-1", "a-3", False)))
+    given.append(m.settle("b-1", "a-3", False))
+    assert sum(given) == 200 and _spent(ctx) == 300, f"two racing loss notices for a claim of 200 gave back {given} and left the counters at {_spent(ctx)}: reading the claim, deleting it and the DECRBY must be one script"
+    ctx.redis.set("cap:b-2", 1000)
+    assert m.claim("b-1", "a-5", 100) and m.claim("b-2", "a-5", 500), "claims of 100 by b-1 and 500 by b-2 for the same auction must both pass"
+    assert m.settle("b-1", "a-5", False) == 100, "b-1's loss of a-5 must give back b-1's 100: the claim is per bidder and auction"
+    assert _spent(ctx, "b-2") == 500 and m.settle("b-2", "a-5", False) == 500, f"b-2's claim of a-5 must be untouched by b-1's loss and give back its 500 (b-2's counters hold {_spent(ctx, 'b-2')})"
 
 
 def check_daily_window(ctx):
     m = _state(ctx)
-    assert m.claim("b-1", "a-1", 900) is True, "a claim of 900 under a cap of 1000 must pass"
+    ctx.clock.advance(86400 - ctx.clock.time() % 86400 + 10)  # 00:00:10 UTC: the next hour stays on this day
     key = f"spend:b-1:{_day()}"
+    created = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
+    assert m.claim("b-1", "a-1", 900) is True, "a claim of 900 under a cap of 1000 must pass"
     assert ctx.redis.get(key) == "900", f"{key} holds {ctx.redis.get(key)!r} (keys {sorted(ctx.redis.keys('spend:*'))}): the counter must be per UTC day"
+    assert created.fired and 0 < created.result <= 2 * 86400, f"right after the claim first wrote {key} its TTL was {created.result}: the script itself sets the expiry, at most two days, on its first write"
+    ttl = ctx.redis.ttl("claim:b-1:a-1")
+    assert 0 < ttl <= 2 * 86400, f"claim:b-1:a-1 has TTL {ttl}: the claim hash expires with the counter"
+    ctx.clock.advance(3600)
+    assert m.claim("b-1", "a-2", 50) is True, "an hour later a claim of 50 must fit the 100 left"
     ttl = ctx.redis.ttl(key)
-    assert 0 < ttl <= 2 * 86400, f"{key} has TTL {ttl}: the day's counter must expire, at most two days after its first write"
-    assert m.claim("b-1", "a-2", 200) is False, "the same day a claim of 200 must not fit the 100 left"
+    assert 0 < ttl <= 2 * 86400 - 3600, f"an hour after its first write {key} has TTL {ttl}: the expiry is set on the first write, not pushed back by every claim"
+    assert m.claim("b-1", "a-3", 200) is False, "the same day a claim of 200 must not fit the 50 left"
     ctx.clock.advance(86400)
-    assert m.claim("b-1", "a-3", 200) is True, "a new UTC day must start with a fresh cap"
-    assert ctx.redis.get(f"spend:b-1:{_day()}") == "200", f"the new day's counter holds {ctx.redis.get(f'spend:b-1:{_day()}')!r}, expected 200"
+    assert m.claim("b-1", "a-4", 200) is True, "a new UTC day must start with a fresh cap"
+    today = f"spend:b-1:{_day()}"
+    assert ctx.redis.get(today) == "200", f"the new day's counter holds {ctx.redis.get(today)!r}, expected 200"
+    assert m.settle("b-1", "a-1", False) == 900, "yesterday's lost auction must give back its 900"
+    assert ctx.redis.get(today) == "200" and ctx.redis.get(key) == "50", f"a loss gives back to the counter its claim came from: yesterday's {key} holds {ctx.redis.get(key)!r} (expected 50), today's {ctx.redis.get(today)!r} (expected 200)"
 `,
     typescript: `const CAP = 1000;
 
@@ -572,7 +594,7 @@ function state(ctx, cap = CAP) {
 }
 
 /** Every cent the bidder's counters hold, whatever the key. */
-const spent = (ctx): number => (ctx.redis.keys('spend:b-1*') as string[]).reduce((sum, k) => sum + Number(ctx.redis.get(k) ?? 0), 0);
+const spent = (ctx, bidder = 'b-1'): number => (ctx.redis.keys(\`spend:\${bidder}*\`) as string[]).reduce((sum, k) => sum + Number(ctx.redis.get(k) ?? 0), 0);
 
 export async function check_atomic_claim(ctx) {
   const m = state(ctx);
@@ -589,6 +611,8 @@ export async function check_atomic_claim(ctx) {
   const passed = [ours, await rival].filter(p => p === true).length;
   assert.equal(passed, 1, \`two claims of 600 raced for a cap of 1000 and \${passed} passed (the counters hold \${spent(ctx)}): the check and the INCRBY must run in one script\`);
   assert.equal(spent(ctx), 600, \`after one passing claim of 600 the counters hold \${spent(ctx)}\`);
+  assert.equal(await m.claim('b-1', 'a-3', 400), true, 'with 600 of a 1000 cap spent a claim of 400 reaches the cap exactly and must pass');
+  assert((await m.claim('b-1', 'a-4', 1)) === false && spent(ctx) === 1000, \`with the cap reached a claim of 1 must be refused; the counters hold \${spent(ctx)}\`);
 }
 
 export async function check_release_on_loss(ctx) {
@@ -614,19 +638,42 @@ export async function check_release_once(ctx) {
   assert.equal(await m.settle('b-1', 'a-2', true), 0, 'a won auction keeps its charge');
   assert.equal(await m.settle('b-1', 'a-2', false), 0, 'a loss notice after the win of a-2 must give back 0');
   assert.equal(spent(ctx), 300, \`the counters hold \${spent(ctx)}, expected the 300 a-2 won\`);
+  await m.claim('b-1', 'a-3', 200);
+  let rival: Promise<number> | null = null;
+  // A second loss notice for a-3 is handled right after the first one first touches the claim.
+  ctx.redisAfter('claim:b-1:a-3', () => {
+    rival ??= m.settle('b-1', 'a-3', false);
+    return null;
+  });
+  const given = [await m.settle('b-1', 'a-3', false), await rival];
+  assert(given[0] + (given[1] ?? 0) === 200 && spent(ctx) === 300, \`two racing loss notices for a claim of 200 gave back \${JSON.stringify(given)} and left the counters at \${spent(ctx)}: reading the claim, deleting it and the DECRBY must be one script\`);
+  ctx.redis.set('cap:b-2', 1000);
+  assert((await m.claim('b-1', 'a-5', 100)) && (await m.claim('b-2', 'a-5', 500)), 'claims of 100 by b-1 and 500 by b-2 for the same auction must both pass');
+  assert.equal(await m.settle('b-1', 'a-5', false), 100, "b-1's loss of a-5 must give back b-1's 100: the claim is per bidder and auction");
+  assert(spent(ctx, 'b-2') === 500 && (await m.settle('b-2', 'a-5', false)) === 500, \`b-2's claim of a-5 must be untouched by b-1's loss and give back its 500 (b-2's counters hold \${spent(ctx, 'b-2')})\`);
 }
 
 export async function check_daily_window(ctx) {
   const m = state(ctx);
-  assert.equal(await m.claim('b-1', 'a-1', 900), true, 'a claim of 900 under a cap of 1000 must pass');
+  ctx.clock.advance(86400 - ((Date.now() / 1000) % 86400) + 10); // 00:00:10 UTC: the next hour stays on this day
   const key = \`spend:b-1:\${day()}\`;
+  const created = ctx.redisAfter(key, () => ctx.redis.ttl(key));
+  assert.equal(await m.claim('b-1', 'a-1', 900), true, 'a claim of 900 under a cap of 1000 must pass');
   assert.equal(ctx.redis.get(key), '900', \`\${key} holds \${JSON.stringify(ctx.redis.get(key))} (keys \${JSON.stringify(ctx.redis.keys('spend:*'))}): the counter must be per UTC day\`);
-  const ttl = ctx.redis.ttl(key);
-  assert(ttl > 0 && ttl <= 2 * 86400, \`\${key} has TTL \${ttl}: the day's counter must expire, at most two days after its first write\`);
-  assert.equal(await m.claim('b-1', 'a-2', 200), false, 'the same day a claim of 200 must not fit the 100 left');
+  assert(created.fired && created.result > 0 && created.result <= 2 * 86400, \`right after the claim first wrote \${key} its TTL was \${created.result}: the script itself sets the expiry, at most two days, on its first write\`);
+  let ttl = ctx.redis.ttl('claim:b-1:a-1');
+  assert(ttl > 0 && ttl <= 2 * 86400, \`claim:b-1:a-1 has TTL \${ttl}: the claim hash expires with the counter\`);
+  ctx.clock.advance(3600);
+  assert.equal(await m.claim('b-1', 'a-2', 50), true, 'an hour later a claim of 50 must fit the 100 left');
+  ttl = ctx.redis.ttl(key);
+  assert(ttl > 0 && ttl <= 2 * 86400 - 3600, \`an hour after its first write \${key} has TTL \${ttl}: the expiry is set on the first write, not pushed back by every claim\`);
+  assert.equal(await m.claim('b-1', 'a-3', 200), false, 'the same day a claim of 200 must not fit the 50 left');
   ctx.clock.advance(86400);
-  assert.equal(await m.claim('b-1', 'a-3', 200), true, 'a new UTC day must start with a fresh cap');
-  assert.equal(ctx.redis.get(\`spend:b-1:\${day()}\`), '200', 'the new day\\'s counter must hold 200');
+  assert.equal(await m.claim('b-1', 'a-4', 200), true, 'a new UTC day must start with a fresh cap');
+  const today = \`spend:b-1:\${day()}\`;
+  assert.equal(ctx.redis.get(today), '200', 'the new day\\'s counter must hold 200');
+  assert.equal(await m.settle('b-1', 'a-1', false), 900, "yesterday's lost auction must give back its 900");
+  assert(ctx.redis.get(today) === '200' && ctx.redis.get(key) === '50', \`a loss gives back to the counter its claim came from: yesterday's \${key} holds \${JSON.stringify(ctx.redis.get(key))} (expected 50), today's \${JSON.stringify(ctx.redis.get(today))} (expected 200)\`);
 }
 `,
     go: `package main
@@ -648,9 +695,9 @@ func stateDay(ctx *harness.Ctx) string { return ctx.Clock.Time().UTC().Format("2
 func stateSetup(ctx *harness.Ctx) { ctx.Redis.Set("cap:b-1", stateCap) }
 
 // stateSpent is every cent the bidder's counters hold, whatever the key.
-func stateSpent(ctx *harness.Ctx) int64 {
+func stateSpent(ctx *harness.Ctx, bidder string) int64 {
 	var sum int64
-	for _, k := range ctx.Redis.Keys("spend:b-1*") {
+	for _, k := range ctx.Redis.Keys("spend:" + bidder + "*") {
 		v, _ := ctx.Redis.Get(k)
 		n, _ := strconv.ParseInt(v, 10, 64)
 		sum += n
@@ -658,15 +705,15 @@ func stateSpent(ctx *harness.Ctx) int64 {
 	return sum
 }
 
-func mustClaim(ctx *harness.Ctx, auctionID string, cents int64) bool {
-	ok, err := claim(stateBg, "b-1", auctionID, cents)
-	ctx.NoError(err, "claim(b-1, %s, %d) failed", auctionID, cents)
+func stateClaim(ctx *harness.Ctx, bidder, auctionID string, cents int64) bool {
+	ok, err := claim(stateBg, bidder, auctionID, cents)
+	ctx.NoError(err, "claim(%s, %s, %d) failed", bidder, auctionID, cents)
 	return ok
 }
 
-func mustSettle(ctx *harness.Ctx, auctionID string, won bool) int64 {
-	n, err := settle(stateBg, "b-1", auctionID, won)
-	ctx.NoError(err, "settle(b-1, %s, %v) failed", auctionID, won)
+func stateSettle(ctx *harness.Ctx, bidder, auctionID string, won bool) int64 {
+	n, err := settle(stateBg, bidder, auctionID, won)
+	ctx.NoError(err, "settle(%s, %s, %v) failed", bidder, auctionID, won)
 	return n
 }
 
@@ -684,7 +731,7 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	// A second bid claims the same headroom right after this claim first touches the counter.
 	ctx.Redis.After("spend:b-1", race)
 	ctx.Redis.After("spend:b-1:"+stateDay(ctx), race)
-	ours := mustClaim(ctx, "a-1", 600)
+	ours := stateClaim(ctx, "b-1", "a-1", 600)
 	ctx.Assert(fired, "claim never touched the bidder's spend counter (spend:b-1:{yyyymmdd})")
 	ctx.NoError(rivalErr, "the racing claim failed")
 	passed := 0
@@ -693,47 +740,84 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 			passed++
 		}
 	}
-	ctx.Assert(passed == 1, "two claims of 600 raced for a cap of 1000 and %d passed (the counters hold %d): the check and the INCRBY must run in one script", passed, stateSpent(ctx))
-	ctx.Equal(stateSpent(ctx), 600, "after one passing claim of 600, the counters")
+	ctx.Assert(passed == 1, "two claims of 600 raced for a cap of 1000 and %d passed (the counters hold %d): the check and the INCRBY must run in one script", passed, stateSpent(ctx, "b-1"))
+	ctx.Equal(stateSpent(ctx, "b-1"), 600, "after one passing claim of 600, the counters")
+	ctx.Equal(stateClaim(ctx, "b-1", "a-3", 400), true, "with 600 of a 1000 cap spent a claim of 400 reaches the cap exactly and must pass; passed")
+	ctx.Assert(!stateClaim(ctx, "b-1", "a-4", 1) && stateSpent(ctx, "b-1") == 1000, "with the cap reached a claim of 1 must be refused; the counters hold %d", stateSpent(ctx, "b-1"))
 }
 
 func CheckReleaseOnLoss(ctx *harness.Ctx) {
 	stateSetup(ctx)
-	ctx.Equal(mustClaim(ctx, "a-1", 600), true, "a claim of 600 under a cap of 1000 must pass; passed")
-	ctx.Equal(mustSettle(ctx, "a-1", false), 600, "settle of a lost auction that claimed 600 must give it back (a lost auction spends nothing); given back")
-	ctx.Equal(stateSpent(ctx), 0, "after the loss, the counters")
-	ctx.Equal(mustClaim(ctx, "a-2", 900), true, "with the loss given back a claim of 900 must fit the cap of 1000; passed")
-	ctx.Equal(mustSettle(ctx, "a-2", true), 0, "a won auction keeps its charge; given back")
-	ctx.Equal(stateSpent(ctx), 900, "after a win of 900, the counters")
+	ctx.Equal(stateClaim(ctx, "b-1", "a-1", 600), true, "a claim of 600 under a cap of 1000 must pass; passed")
+	ctx.Equal(stateSettle(ctx, "b-1", "a-1", false), 600, "settle of a lost auction that claimed 600 must give it back (a lost auction spends nothing); given back")
+	ctx.Equal(stateSpent(ctx, "b-1"), 0, "after the loss, the counters")
+	ctx.Equal(stateClaim(ctx, "b-1", "a-2", 900), true, "with the loss given back a claim of 900 must fit the cap of 1000; passed")
+	ctx.Equal(stateSettle(ctx, "b-1", "a-2", true), 0, "a won auction keeps its charge; given back")
+	ctx.Equal(stateSpent(ctx, "b-1"), 900, "after a win of 900, the counters")
 }
 
 func CheckReleaseOnce(ctx *harness.Ctx) {
 	stateSetup(ctx)
-	mustClaim(ctx, "a-1", 600)
-	mustClaim(ctx, "a-2", 300)
-	first := mustSettle(ctx, "a-1", false)
-	second := mustSettle(ctx, "a-1", false) // the exchange delivered the loss notice twice
+	stateClaim(ctx, "b-1", "a-1", 600)
+	stateClaim(ctx, "b-1", "a-2", 300)
+	first := stateSettle(ctx, "b-1", "a-1", false)
+	second := stateSettle(ctx, "b-1", "a-1", false) // the exchange delivered the loss notice twice
 	ctx.Assert(first == 600 && second == 0, "two loss notices for one claim of 600 gave back %d then %d, expected 600 once", first, second)
-	ctx.Equal(stateSpent(ctx), 300, "after a duplicate loss notice the counters must hold the 300 still claimed; they hold")
-	ctx.Equal(mustSettle(ctx, "a-9", false), 0, "a loss notice for an auction never claimed; given back")
-	ctx.Equal(mustSettle(ctx, "a-2", true), 0, "a won auction keeps its charge; given back")
-	ctx.Equal(mustSettle(ctx, "a-2", false), 0, "a loss notice after the win of a-2; given back")
-	ctx.Equal(stateSpent(ctx), 300, "the counters must hold the 300 a-2 won; they hold")
+	ctx.Equal(stateSpent(ctx, "b-1"), 300, "after a duplicate loss notice the counters must hold the 300 still claimed; they hold")
+	ctx.Equal(stateSettle(ctx, "b-1", "a-9", false), 0, "a loss notice for an auction never claimed; given back")
+	ctx.Equal(stateSettle(ctx, "b-1", "a-2", true), 0, "a won auction keeps its charge; given back")
+	ctx.Equal(stateSettle(ctx, "b-1", "a-2", false), 0, "a loss notice after the win of a-2; given back")
+	ctx.Equal(stateSpent(ctx, "b-1"), 300, "the counters must hold the 300 a-2 won; they hold")
+	stateClaim(ctx, "b-1", "a-3", 200)
+	var rival int64
+	raced := false
+	// A second loss notice for a-3 is handled right after the first one first touches the claim.
+	ctx.Redis.After("claim:b-1:a-3", func() any {
+		if !raced {
+			raced = true
+			rival, _ = settle(stateBg, "b-1", "a-3", false)
+		}
+		return nil
+	})
+	ours := stateSettle(ctx, "b-1", "a-3", false)
+	ctx.Assert(ours+rival == 200 && stateSpent(ctx, "b-1") == 300, "two racing loss notices for a claim of 200 gave back %d and %d and left the counters at %d: reading the claim, deleting it and the DECRBY must be one script", ours, rival, stateSpent(ctx, "b-1"))
+	ctx.Redis.Set("cap:b-2", 1000)
+	ctx.Assert(stateClaim(ctx, "b-1", "a-5", 100) && stateClaim(ctx, "b-2", "a-5", 500), "claims of 100 by b-1 and 500 by b-2 for the same auction must both pass")
+	ctx.Equal(stateSettle(ctx, "b-1", "a-5", false), 100, "b-1's loss of a-5 must give back b-1's 100 (the claim is per bidder and auction); given back")
+	ctx.Equal(stateSpent(ctx, "b-2"), 500, "b-2's claim of a-5 must be untouched by b-1's loss; b-2's counters")
+	ctx.Equal(stateSettle(ctx, "b-2", "a-5", false), 500, "b-2's loss of a-5; given back")
 }
 
 func CheckDailyWindow(ctx *harness.Ctx) {
 	stateSetup(ctx)
-	ctx.Equal(mustClaim(ctx, "a-1", 900), true, "a claim of 900 under a cap of 1000 must pass; passed")
+	now := ctx.Clock.Time().UTC()
+	ctx.Clock.AdvanceBy(now.Truncate(24*time.Hour).Add(24*time.Hour + 10*time.Second).Sub(now)) // 00:00:10 UTC: the next hour stays on this day
 	key := "spend:b-1:" + stateDay(ctx)
+	var created int64
+	probe := ctx.Redis.After(key, func() any {
+		created = ctx.Redis.TTL(key)
+		return nil
+	})
+	ctx.Equal(stateClaim(ctx, "b-1", "a-1", 900), true, "a claim of 900 under a cap of 1000 must pass; passed")
 	got, _ := ctx.Redis.Get(key)
 	ctx.Equal(got, "900", "the counter must be per UTC day (keys %q); %s", ctx.Redis.Keys("spend:*"), key)
-	ttl := ctx.Redis.TTL(key)
-	ctx.Assert(ttl > 0 && ttl <= 2*86400, "%s has TTL %d: the day's counter must expire, at most two days after its first write", key, ttl)
-	ctx.Equal(mustClaim(ctx, "a-2", 200), false, "the same day a claim of 200 must not fit the 100 left; passed")
+	ctx.Assert(probe.Fired && created > 0 && created <= 2*86400, "right after the claim first wrote %s its TTL was %d: the script itself sets the expiry, at most two days, on its first write", key, created)
+	ttl := ctx.Redis.TTL("claim:b-1:a-1")
+	ctx.Assert(ttl > 0 && ttl <= 2*86400, "claim:b-1:a-1 has TTL %d: the claim hash expires with the counter", ttl)
+	ctx.Clock.AdvanceBy(time.Hour)
+	ctx.Equal(stateClaim(ctx, "b-1", "a-2", 50), true, "an hour later a claim of 50 must fit the 100 left; passed")
+	ttl = ctx.Redis.TTL(key)
+	ctx.Assert(ttl > 0 && ttl <= 2*86400-3600, "an hour after its first write %s has TTL %d: the expiry is set on the first write, not pushed back by every claim", key, ttl)
+	ctx.Equal(stateClaim(ctx, "b-1", "a-3", 200), false, "the same day a claim of 200 must not fit the 50 left; passed")
 	ctx.Clock.AdvanceBy(24 * time.Hour)
-	ctx.Equal(mustClaim(ctx, "a-3", 200), true, "a new UTC day must start with a fresh cap; passed")
-	got, _ = ctx.Redis.Get("spend:b-1:" + stateDay(ctx))
+	ctx.Equal(stateClaim(ctx, "b-1", "a-4", 200), true, "a new UTC day must start with a fresh cap; passed")
+	today := "spend:b-1:" + stateDay(ctx)
+	got, _ = ctx.Redis.Get(today)
 	ctx.Equal(got, "200", "the new day's counter")
+	ctx.Equal(stateSettle(ctx, "b-1", "a-1", false), 900, "yesterday's lost auction must give back its 900; given back")
+	got, _ = ctx.Redis.Get(today)
+	old, _ := ctx.Redis.Get(key)
+	ctx.Assert(got == "200" && old == "50", "a loss gives back to the counter its claim came from: yesterday's %s holds %q (expected 50), today's %q (expected 200)", key, old, got)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -745,7 +829,7 @@ func CheckDailyWindow(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long kCap = 1000;
+constexpr long kStateCap = 1000;
 
 std::string stateDay() {
   const std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
@@ -756,18 +840,19 @@ std::string stateDay() {
   return out;
 }
 
-void stateSetup(harness::Ctx& ctx) { ctx.Redis.Set("cap:b-1", kCap); }
+void stateSetup(harness::Ctx& ctx) { ctx.Redis.Set("cap:b-1", kStateCap); }
 
 // Every cent the bidder's counters hold, whatever the key.
-long stateSpent(harness::Ctx& ctx) {
+long stateSpent(harness::Ctx& ctx, const std::string& bidder = "b-1") {
   long sum = 0;
-  for (const auto& k : ctx.Redis.Keys("spend:b-1*")) sum += std::stol(ctx.Redis.Get(k).value_or("0"));
+  for (const auto& k : ctx.Redis.Keys("spend:" + bidder + "*")) sum += std::stol(ctx.Redis.Get(k).value_or("0"));
   return sum;
 }
 
-struct Rival {
+struct StateRival {
   bool fired = false;
   bool passed = false;
+  long given = 0;
   std::string error;
 };
 
@@ -775,7 +860,7 @@ struct Rival {
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
   stateSetup(ctx);
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<StateRival>();
   const auto race = [rival] {
     if (rival->fired) return;
     rival->fired = true;
@@ -794,6 +879,8 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   const int passed = (ours ? 1 : 0) + (rival->passed ? 1 : 0);
   ctx.Assert(passed == 1, "two claims of 600 raced for a cap of 1000 and %d passed (the counters hold %d): the check and the INCRBY must run in one script", passed, stateSpent(ctx));
   ctx.Equal(stateSpent(ctx), 600, "after one passing claim of 600, the counters");
+  ctx.Equal(claim("b-1", "a-3", 400), true, "with 600 of a 1000 cap spent a claim of 400 reaches the cap exactly and must pass; passed");
+  ctx.Assert(!claim("b-1", "a-4", 1) && stateSpent(ctx) == 1000, "with the cap reached a claim of 1 must be refused; the counters hold %d", stateSpent(ctx));
 }
 
 void CheckReleaseOnLoss(harness::Ctx& ctx) {
@@ -818,19 +905,55 @@ void CheckReleaseOnce(harness::Ctx& ctx) {
   ctx.Equal(settle("b-1", "a-2", true), 0, "a won auction keeps its charge; given back");
   ctx.Equal(settle("b-1", "a-2", false), 0, "a loss notice after the win of a-2; given back");
   ctx.Equal(stateSpent(ctx), 300, "the counters must hold the 300 a-2 won; they hold");
+  claim("b-1", "a-3", 200);
+  auto rival = std::make_shared<StateRival>();
+  // A second loss notice for a-3 is handled right after the first one first touches the claim.
+  ctx.Redis.After("claim:b-1:a-3", [rival] {
+    if (rival->fired) return;
+    rival->fired = true;
+    try {
+      rival->given = settle("b-1", "a-3", false);
+    } catch (const std::exception& e) {
+      rival->error = e.what();
+    }
+  });
+  const long ours = settle("b-1", "a-3", false);
+  ctx.Assert(ours + rival->given == 200 && stateSpent(ctx) == 300, "two racing loss notices for a claim of 200 gave back %d and %d and left the counters at %d: reading the claim, deleting it and the DECRBY must be one script", ours, rival->given, stateSpent(ctx));
+  ctx.Redis.Set("cap:b-2", 1000);
+  ctx.Assert(claim("b-1", "a-5", 100) && claim("b-2", "a-5", 500), "claims of 100 by b-1 and 500 by b-2 for the same auction must both pass");
+  ctx.Equal(settle("b-1", "a-5", false), 100, "b-1's loss of a-5 must give back b-1's 100 (the claim is per bidder and auction); given back");
+  ctx.Equal(stateSpent(ctx, "b-2"), 500, "b-2's claim of a-5 must be untouched by b-1's loss; b-2's counters");
+  ctx.Equal(settle("b-2", "a-5", false), 500, "b-2's loss of a-5; given back");
 }
 
 void CheckDailyWindow(harness::Ctx& ctx) {
   stateSetup(ctx);
-  ctx.Equal(claim("b-1", "a-1", 900), true, "a claim of 900 under a cap of 1000 must pass; passed");
+  const int64_t now_ms = ctx.Clock.Now();
+  ctx.Clock.Advance(static_cast<double>(86400000 - now_ms % 86400000) / 1000 + 10);  // 00:00:10 UTC: the next hour stays on this day
   const std::string key = "spend:b-1:" + stateDay();
+  bool fired = false;
+  long long created = 0;
+  ctx.Redis.After(key, [&] {
+    fired = true;
+    created = ctx.Redis.TTL(key);
+  });
+  ctx.Equal(claim("b-1", "a-1", 900), true, "a claim of 900 under a cap of 1000 must pass; passed");
   ctx.Equal(ctx.Redis.Get(key).value_or(""), "900", "the counter must be per UTC day (keys %q); %s", ctx.Redis.Keys("spend:*"), key);
-  const long long ttl = ctx.Redis.TTL(key);
-  ctx.Assert(ttl > 0 && ttl <= 2 * 86400, "%s has TTL %d: the day's counter must expire, at most two days after its first write", key, ttl);
-  ctx.Equal(claim("b-1", "a-2", 200), false, "the same day a claim of 200 must not fit the 100 left; passed");
+  ctx.Assert(fired && created > 0 && created <= 2 * 86400, "right after the claim first wrote %s its TTL was %d: the script itself sets the expiry, at most two days, on its first write", key, created);
+  long long ttl = ctx.Redis.TTL("claim:b-1:a-1");
+  ctx.Assert(ttl > 0 && ttl <= 2 * 86400, "claim:b-1:a-1 has TTL %d: the claim hash expires with the counter", ttl);
+  ctx.Clock.Advance(3600);
+  ctx.Equal(claim("b-1", "a-2", 50), true, "an hour later a claim of 50 must fit the 100 left; passed");
+  ttl = ctx.Redis.TTL(key);
+  ctx.Assert(ttl > 0 && ttl <= 2 * 86400 - 3600, "an hour after its first write %s has TTL %d: the expiry is set on the first write, not pushed back by every claim", key, ttl);
+  ctx.Equal(claim("b-1", "a-3", 200), false, "the same day a claim of 200 must not fit the 50 left; passed");
   ctx.Clock.Advance(86400);
-  ctx.Equal(claim("b-1", "a-3", 200), true, "a new UTC day must start with a fresh cap; passed");
-  ctx.Equal(ctx.Redis.Get("spend:b-1:" + stateDay()).value_or(""), "200", "the new day's counter");
+  ctx.Equal(claim("b-1", "a-4", 200), true, "a new UTC day must start with a fresh cap; passed");
+  const std::string today = "spend:b-1:" + stateDay();
+  ctx.Equal(ctx.Redis.Get(today).value_or(""), "200", "the new day's counter");
+  ctx.Equal(settle("b-1", "a-1", false), 900, "yesterday's lost auction must give back its 900; given back");
+  const std::string now_today = ctx.Redis.Get(today).value_or(""), old = ctx.Redis.Get(key).value_or("");
+  ctx.Assert(now_today == "200" && old == "50", "a loss gives back to the counter its claim came from: yesterday's %s holds %q (expected 50), today's %q (expected 200)", key, old, now_today);
 }
 `,
   },

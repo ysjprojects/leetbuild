@@ -81,7 +81,7 @@ change with a blank reason leaves the audit trail nothing to explain it with.
       id: 'bounds',
       title: 'Applies the floor and the ceiling',
       detail:
-        'A price below `FLOOR_CENTS` or above `CEILING_CENTS` answers **422** naming `floor_cents` and `ceiling_cents`, and nothing is published. The starter has no bound, so `0` publishes a free product.',
+        'A price below `FLOOR_CENTS` or above `CEILING_CENTS` answers **422** naming `floor_cents` and `ceiling_cents`, and nothing is published; a price exactly on the floor or the ceiling is accepted. The starter has no bound, so `0` publishes a free product.',
       match: {
         python: {all: [/FLOOR_CENTS\s*=/, /CEILING_CENTS\s*=/, /\b422\b/, /floor_cents/, /ceiling_cents/]},
         typescript: {all: [/FLOOR_CENTS\s*=/, /CEILING_CENTS\s*=/, /\b422\b/, /floor_cents/, /ceiling_cents/]},
@@ -94,7 +94,7 @@ change with a blank reason leaves the audit trail nothing to explain it with.
       id: 'move-limit',
       title: 'A move past the limit is 409 with the bound',
       detail:
-        'A change of more than `MAX_MOVE_BP` (20 %) from the current price answers **409** with `bound_cents`, the furthest price the limit allows in that direction; nothing is published. The starter publishes any jump it receives.',
+        'A change of more than `MAX_MOVE_BP` (20 %) from the current price answers **409** with `bound_cents`, the furthest price the limit allows in that direction, to the cent; nothing is published. A change of exactly the limit, up or down, is published. The starter publishes any jump it receives.',
       match: {
         python: {all: [/MAX_MOVE_BP\s*=/, /\b409\b/, /bound_cents/], order: [/MAX_MOVE_BP/, /store\.publish\(/]},
         typescript: {all: [/MAX_MOVE_BP\s*=/, /\b409\b/, /bound_cents/]},
@@ -107,7 +107,7 @@ change with a blank reason leaves the audit trail nothing to explain it with.
       id: 'reason-required',
       title: 'A blank reason is 400',
       detail:
-        'A change whose `reason` is empty or only spaces answers **400** and publishes nothing: every price in the audit trail carries why it moved. The starter publishes it.',
+        'A change whose `reason` is empty or only whitespace answers **400** and publishes nothing: every price in the audit trail carries why it moved. The starter publishes it.',
       match: {
         python: {all: [/reason\.strip\(\)|reason\.isspace\(\)/, /\b400\b/]},
         typescript: {all: [/reason\.trim\(\)|reason\s*===\s*''/, /\b400\b/]},
@@ -698,7 +698,14 @@ async def check_bounds(ctx):
             assert body.get("floor_cents") == 50 and body.get("ceiling_cents") == 500_000, f"the 422 must name floor_cents 50 and ceiling_cents 500000, got {body}"
         assert [store.get_sku(s)["price_cents"] for s in ("SKU-1", "SKU-2", "SKU-3")] == [1000, 480_000, 55], "a refused price was published anyway"
         r = await _post(c, price_cents=1100)
-    assert r.status_code == 200, f"a price inside the bounds answered {r.status_code}: {r.text}"
+        assert r.status_code == 200, f"a price inside the bounds answered {r.status_code}: {r.text}"
+        for sku, price, why in (("SKU-3", 49, "49, one cent under the floor"), ("SKU-2", 500_001, "500001, one cent over the ceiling")):
+            r = await _post(c, sku=sku, price_cents=price)
+            assert r.status_code == 422, f"{why} for {sku} answered {r.status_code}: {r.text}, expected 422"
+        for sku, price, why in (("SKU-3", 50, "exactly the floor (50)"), ("SKU-2", 500_000, "exactly the ceiling (500000)")):
+            r = await _post(c, sku=sku, price_cents=price)
+            assert r.status_code == 200, f"{why} for {sku} answered {r.status_code}: {r.text}, expected 200: the bounds are inclusive"
+    assert store.get_sku("SKU-3")["price_cents"] == 50 and store.get_sku("SKU-2")["price_cents"] == 500_000, "a price exactly on the floor or the ceiling was not published"
 
 
 async def check_move_limit(ctx):
@@ -711,14 +718,26 @@ async def check_move_limit(ctx):
         r = await _post(c, price_cents=1200)
         assert r.status_code == 200, f"a change of exactly MAX_MOVE_BP (1000 to 1200) answered {r.status_code}: {r.text}"
         r = await _post(c, price_cents=900)
-    assert r.status_code == 409, f"a 25 % cut from 1200 to 900 answered {r.status_code}: {r.text}, expected 409"
-    assert r.json().get("bound_cents") == 960, f"a cut is bounded below: expected bound_cents 960 (1200 - 20 %), got {r.json()}"
+        assert r.status_code == 409, f"a 25 % cut from 1200 to 900 answered {r.status_code}: {r.text}, expected 409"
+        assert r.json().get("bound_cents") == 960, f"a cut is bounded below: expected bound_cents 960 (1200 - 20 %), got {r.json()}"
+        store.seed("SKU-2", 1234)
+        store.seed("SKU-3", 1234)
+        r = await _post(c, sku="SKU-2", price_cents=987)
+        assert r.status_code == 409, f"a cut from 1234 to 987 (2001 bp) answered {r.status_code}: {r.text}, expected 409"
+        assert r.json().get("bound_cents") == 988, f"from 1234 the furthest cut is 988 (1234 - 1234 * 2000 // 10000), got {r.json()}"
+        r = await _post(c, sku="SKU-3", price_cents=1481)
+        assert r.status_code == 409, f"a rise from 1234 to 1481 (2001 bp) answered {r.status_code}: {r.text}, expected 409"
+        assert r.json().get("bound_cents") == 1480, f"from 1234 the furthest rise is 1480 (1234 + 1234 * 2000 // 10000), got {r.json()}"
+        r = await _post(c, sku="SKU-2", price_cents=988)
+        assert r.status_code == 200, f"a cut from 1234 to its bound 988 answered {r.status_code}: {r.text}, expected 200: moved_bp is measured from the current price"
+        r = await _post(c, sku="SKU-3", price_cents=1480)
+    assert r.status_code == 200, f"a rise from 1234 to its bound 1480 answered {r.status_code}: {r.text}, expected 200"
 
 
 async def check_reason_required(ctx):
     store.seed("SKU-1", 1000)
     async with _api(ctx) as c:
-        for reason in ("", "   "):
+        for reason in ("", "   ", "\\t\\n"):
             r = await _post(c, reason=reason)
             assert r.status_code == 400, f"a change with reason {reason!r} answered {r.status_code}: {r.text}, expected 400"
         assert store.get_sku("SKU-1")["price_cents"] == 1000, f"a change with no reason was published: {store.get_sku('SKU-1')}"
@@ -771,8 +790,17 @@ export async function check_bounds(ctx) {
   const prices = [];
   for (const sku of ['SKU-1', 'SKU-2', 'SKU-3']) prices.push((await store.getSku(sku)).price_cents);
   assert.deepStrictEqual(prices, [1000, 480_000, 55], 'a refused price was published anyway');
-  const r = await post(c, 'SKU-1', 1100);
+  let r = await post(c, 'SKU-1', 1100);
   assert.equal(r.status, 200, \`a price inside the bounds answered \${r.status}: \${r.text}\`);
+  for (const [sku, price, why] of [['SKU-3', 49, '49, one cent under the floor'], ['SKU-2', 500_001, '500001, one cent over the ceiling']] as const) {
+    r = await post(c, sku, price);
+    assert.equal(r.status, 422, \`\${why} for \${sku} answered \${r.status}: \${r.text}, expected 422\`);
+  }
+  for (const [sku, price, why] of [['SKU-3', 50, 'exactly the floor (50)'], ['SKU-2', 500_000, 'exactly the ceiling (500000)']] as const) {
+    r = await post(c, sku, price);
+    assert.equal(r.status, 200, \`\${why} for \${sku} answered \${r.status}: \${r.text}, expected 200: the bounds are inclusive\`);
+  }
+  assert((await store.getSku('SKU-3')).price_cents === 50 && (await store.getSku('SKU-2')).price_cents === 500_000, 'a price exactly on the floor or the ceiling was not published');
 }
 
 export async function check_move_limit(ctx) {
@@ -787,12 +815,24 @@ export async function check_move_limit(ctx) {
   r = await post(c, 'SKU-1', 900);
   assert.equal(r.status, 409, \`a 25 % cut from 1200 to 900 answered \${r.status}: \${r.text}, expected 409\`);
   assert.equal(r.json().bound_cents, 960, \`a cut is bounded below: expected bound_cents 960 (1200 - 20 %), got \${r.text}\`);
+  await store.seed('SKU-2', 1234);
+  await store.seed('SKU-3', 1234);
+  r = await post(c, 'SKU-2', 987);
+  assert.equal(r.status, 409, \`a cut from 1234 to 987 (2001 bp) answered \${r.status}: \${r.text}, expected 409\`);
+  assert.equal(r.json().bound_cents, 988, \`from 1234 the furthest cut is 988 (1234 - 1234 * 2000 // 10000), got \${r.text}\`);
+  r = await post(c, 'SKU-3', 1481);
+  assert.equal(r.status, 409, \`a rise from 1234 to 1481 (2001 bp) answered \${r.status}: \${r.text}, expected 409\`);
+  assert.equal(r.json().bound_cents, 1480, \`from 1234 the furthest rise is 1480 (1234 + 1234 * 2000 // 10000), got \${r.text}\`);
+  r = await post(c, 'SKU-2', 988);
+  assert.equal(r.status, 200, \`a cut from 1234 to its bound 988 answered \${r.status}: \${r.text}, expected 200: moved_bp is measured from the current price\`);
+  r = await post(c, 'SKU-3', 1480);
+  assert.equal(r.status, 200, \`a rise from 1234 to its bound 1480 answered \${r.status}: \${r.text}, expected 200\`);
 }
 
 export async function check_reason_required(ctx) {
   const {c, store} = api(ctx);
   await store.seed('SKU-1', 1000);
-  for (const reason of ['', '   ']) {
+  for (const reason of ['', '   ', '\\t\\n']) {
     const r = await post(c, 'SKU-1', 1100, reason);
     assert.equal(r.status, 400, \`a change with reason \${JSON.stringify(reason)} answered \${r.status}: \${r.text}, expected 400\`);
   }
@@ -813,9 +853,9 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hBg = context.Background()
 
-type priceReply struct {
+type hPriceReply struct {
 	PriceCents         int64 \`json:"price_cents"\`
 	PreviousPriceCents int64 \`json:"previous_price_cents"\`
 	MovedBP            int64 \`json:"moved_bp"\`
@@ -824,92 +864,114 @@ type priceReply struct {
 	CeilingCents       int64 \`json:"ceiling_cents"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func postPrice(c *harness.HTTP, sku string, priceCents int64, reason string) (*harness.Response, priceReply) {
+func hPostPrice(c *harness.HTTP, sku string, priceCents int64, reason string) (*harness.Response, hPriceReply) {
 	r := c.Post("/v1/prices", map[string]any{"sku": sku, "price_cents": priceCents, "reason": reason})
-	var body priceReply
+	var body hPriceReply
 	r.Decode(&body)
 	return r, body
 }
 
-func priceOf(sku string) int64 {
-	if row := store.GetSKU(apiBg, sku); row != nil {
+func hPriceOf(sku string) int64 {
+	if row := store.GetSKU(hBg, sku); row != nil {
 		return row.PriceCents
 	}
 	return 0
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	store.Seed(apiBg, "SKU-1", 1000)
-	r, body := postPrice(api(ctx), "SKU-1", 1100, "weekend promo")
+	store.Seed(hBg, "SKU-1", 1000)
+	r, body := hPostPrice(hAPI(ctx), "SKU-1", 1100, "weekend promo")
 	ctx.Equal(r.Status, 200, "POST /v1/prices (%s)", r.Text())
 	ctx.Assert(body.PriceCents == 1100 && body.PreviousPriceCents == 1000, "a change from 1000 to 1100 answered %s, expected price_cents 1100 and previous_price_cents 1000", r.Text())
 	ctx.Equal(body.MovedBP, 1000, "a 10 %% change; moved_bp")
-	row := store.GetSKU(apiBg, "SKU-1")
+	row := store.GetSKU(hBg, "SKU-1")
 	ctx.Assert(row.PriceCents == 1100 && row.Source == "operator", "the store holds %+v, expected 1100 published by the operator", row)
 }
 
 func CheckKnownSku(ctx *harness.Ctx) {
-	store.Seed(apiBg, "SKU-1", 1000)
-	c := api(ctx)
-	r, _ := postPrice(c, "SKU-404", 1100, "weekend promo")
+	store.Seed(hBg, "SKU-1", 1000)
+	c := hAPI(ctx)
+	r, _ := hPostPrice(c, "SKU-404", 1100, "weekend promo")
 	ctx.Equal(r.Status, 404, "a change for SKU-404, which does not exist (%s)", r.Text())
-	phantom := store.GetSKU(apiBg, "SKU-404")
+	phantom := store.GetSKU(hBg, "SKU-404")
 	ctx.Assert(phantom == nil, "the unknown sku now has a price row %+v: a typo became a price the storefront serves", phantom)
-	r, _ = postPrice(c, "SKU-1", 1100, "weekend promo")
+	r, _ = hPostPrice(c, "SKU-1", 1100, "weekend promo")
 	ctx.Equal(r.Status, 200, "a change for the known SKU-1 (%s)", r.Text())
 }
 
+type hPriceCase struct {
+	sku   string
+	price int64
+	why   string
+}
+
 func CheckBounds(ctx *harness.Ctx) {
-	store.Seed(apiBg, "SKU-1", 1000)
-	store.Seed(apiBg, "SKU-2", 480_000)
-	store.Seed(apiBg, "SKU-3", 55)
-	c := api(ctx)
-	cases := []struct {
-		sku   string
-		price int64
-		why   string
-	}{{"SKU-1", 0, "a price of 0"}, {"SKU-2", 520_000, "520000, above the ceiling"}, {"SKU-3", 45, "45, below the floor"}}
-	for _, tc := range cases {
-		r, body := postPrice(c, tc.sku, tc.price, "weekend promo")
+	store.Seed(hBg, "SKU-1", 1000)
+	store.Seed(hBg, "SKU-2", 480_000)
+	store.Seed(hBg, "SKU-3", 55)
+	c := hAPI(ctx)
+	for _, tc := range []hPriceCase{{"SKU-1", 0, "a price of 0"}, {"SKU-2", 520_000, "520000, above the ceiling"}, {"SKU-3", 45, "45, below the floor"}} {
+		r, body := hPostPrice(c, tc.sku, tc.price, "weekend promo")
 		ctx.Equal(r.Status, 422, "%s for %s (%s)", tc.why, tc.sku, r.Text())
 		ctx.Assert(body.FloorCents == 50 && body.CeilingCents == 500_000, "the 422 must name floor_cents 50 and ceiling_cents 500000, got %s", r.Text())
 	}
-	ctx.Equal([]int64{priceOf("SKU-1"), priceOf("SKU-2"), priceOf("SKU-3")}, []int64{1000, 480_000, 55}, "a refused price must not be published; the prices")
-	r, _ := postPrice(c, "SKU-1", 1100, "weekend promo")
+	ctx.Equal([]int64{hPriceOf("SKU-1"), hPriceOf("SKU-2"), hPriceOf("SKU-3")}, []int64{1000, 480_000, 55}, "a refused price must not be published; the prices")
+	r, _ := hPostPrice(c, "SKU-1", 1100, "weekend promo")
 	ctx.Equal(r.Status, 200, "a price inside the bounds (%s)", r.Text())
+	for _, tc := range []hPriceCase{{"SKU-3", 49, "49, one cent under the floor"}, {"SKU-2", 500_001, "500001, one cent over the ceiling"}} {
+		r, _ = hPostPrice(c, tc.sku, tc.price, "weekend promo")
+		ctx.Equal(r.Status, 422, "%s for %s (%s)", tc.why, tc.sku, r.Text())
+	}
+	for _, tc := range []hPriceCase{{"SKU-3", 50, "exactly the floor (50)"}, {"SKU-2", 500_000, "exactly the ceiling (500000)"}} {
+		r, _ = hPostPrice(c, tc.sku, tc.price, "weekend promo")
+		ctx.Equal(r.Status, 200, "%s for %s, the bounds are inclusive (%s)", tc.why, tc.sku, r.Text())
+	}
+	ctx.Equal([]int64{hPriceOf("SKU-3"), hPriceOf("SKU-2")}, []int64{50, 500_000}, "a price exactly on the floor or the ceiling must be published; the prices")
 }
 
 func CheckMoveLimit(ctx *harness.Ctx) {
-	store.Seed(apiBg, "SKU-1", 1000)
-	c := api(ctx)
-	r, body := postPrice(c, "SKU-1", 1300, "weekend promo")
+	store.Seed(hBg, "SKU-1", 1000)
+	c := hAPI(ctx)
+	r, body := hPostPrice(c, "SKU-1", 1300, "weekend promo")
 	ctx.Equal(r.Status, 409, "a 30 %% rise from 1000 to 1300 (%s)", r.Text())
 	ctx.Equal(body.BoundCents, 1200, "the 409 must carry bound_cents 1000 + 20 %%; bound_cents")
-	ctx.Equal(priceOf("SKU-1"), 1000, "the refused change must not be published; the price")
-	r, _ = postPrice(c, "SKU-1", 1200, "weekend promo")
+	ctx.Equal(hPriceOf("SKU-1"), 1000, "the refused change must not be published; the price")
+	r, _ = hPostPrice(c, "SKU-1", 1200, "weekend promo")
 	ctx.Equal(r.Status, 200, "a change of exactly MAX_MOVE_BP, 1000 to 1200 (%s)", r.Text())
-	r, body = postPrice(c, "SKU-1", 900, "weekend promo")
+	r, body = hPostPrice(c, "SKU-1", 900, "weekend promo")
 	ctx.Equal(r.Status, 409, "a 25 %% cut from 1200 to 900 (%s)", r.Text())
 	ctx.Equal(body.BoundCents, 960, "a cut is bounded below (1200 - 20 %%); bound_cents")
+	store.Seed(hBg, "SKU-2", 1234)
+	store.Seed(hBg, "SKU-3", 1234)
+	r, body = hPostPrice(c, "SKU-2", 987, "weekend promo")
+	ctx.Equal(r.Status, 409, "a cut from 1234 to 987, 2001 bp (%s)", r.Text())
+	ctx.Equal(body.BoundCents, 988, "from 1234 the furthest cut is 1234 - 1234 * 2000 / 10000; bound_cents")
+	r, body = hPostPrice(c, "SKU-3", 1481, "weekend promo")
+	ctx.Equal(r.Status, 409, "a rise from 1234 to 1481, 2001 bp (%s)", r.Text())
+	ctx.Equal(body.BoundCents, 1480, "from 1234 the furthest rise is 1234 + 1234 * 2000 / 10000; bound_cents")
+	r, _ = hPostPrice(c, "SKU-2", 988, "weekend promo")
+	ctx.Equal(r.Status, 200, "a cut from 1234 to its bound 988; moved_bp is measured from the current price (%s)", r.Text())
+	r, _ = hPostPrice(c, "SKU-3", 1480, "weekend promo")
+	ctx.Equal(r.Status, 200, "a rise from 1234 to its bound 1480 (%s)", r.Text())
 }
 
 func CheckReasonRequired(ctx *harness.Ctx) {
-	store.Seed(apiBg, "SKU-1", 1000)
-	c := api(ctx)
-	for _, reason := range []string{"", "   "} {
-		r, _ := postPrice(c, "SKU-1", 1100, reason)
+	store.Seed(hBg, "SKU-1", 1000)
+	c := hAPI(ctx)
+	for _, reason := range []string{"", "   ", "\\t\\n"} {
+		r, _ := hPostPrice(c, "SKU-1", 1100, reason)
 		ctx.Equal(r.Status, 400, "a change with reason %q (%s)", reason, r.Text())
 	}
-	ctx.Equal(priceOf("SKU-1"), 1000, "a change with no reason must not be published; the price")
-	r, _ := postPrice(c, "SKU-1", 1100, "competitor match")
+	ctx.Equal(hPriceOf("SKU-1"), 1000, "a change with no reason must not be published; the price")
+	r, _ := hPostPrice(c, "SKU-1", 1100, "competitor match")
 	ctx.Equal(r.Status, 200, "a change with a reason (%s)", r.Text())
-	ctx.Equal(store.GetSKU(apiBg, "SKU-1").Reason, "competitor match", "the row's reason")
+	ctx.Equal(store.GetSKU(hBg, "SKU-1").Reason, "competitor match", "the row's reason")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -921,7 +983,7 @@ func CheckReasonRequired(ctx *harness.Ctx) {
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -929,41 +991,47 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response postPrice(harness::HTTP& c, const std::string& sku, long long price_cents, const std::string& reason = "weekend promo") {
+harness::Response hPostPrice(harness::HTTP& c, const std::string& sku, long long price_cents, const std::string& reason = "weekend promo") {
   const nlohmann::json body{{"sku", sku}, {"price_cents", price_cents}, {"reason", reason}};
   return c.Post("/v1/prices", body.dump(), "Content-Type", "application/json");
 }
 
-long long field(const harness::Response& r, const std::string& name) {
+long long hField(const harness::Response& r, const std::string& name) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains(name) && body[name].is_number() ? body[name].get<long long>() : -1;
 }
 
-long long priceOf(const std::string& sku) {
+long long hPriceOf(const std::string& sku) {
   const auto row = store::getSku(sku);
   return row ? row->price_cents : 0;
 }
+
+struct HPriceCase {
+  std::string sku;
+  long long price;
+  std::string why;
+};
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  auto c = api(ctx);
-  const auto r = postPrice(c, "SKU-1", 1100);
+  auto c = hAPI(ctx);
+  const auto r = hPostPrice(c, "SKU-1", 1100);
   ctx.Equal(r.Status, 200, "POST /v1/prices (%s)", r.Text());
-  ctx.Assert(field(r, "price_cents") == 1100 && field(r, "previous_price_cents") == 1000, "a change from 1000 to 1100 answered %s, expected price_cents 1100 and previous_price_cents 1000", r.Text());
-  ctx.Equal(field(r, "moved_bp"), 1000, "a 10 %% change; moved_bp");
+  ctx.Assert(hField(r, "price_cents") == 1100 && hField(r, "previous_price_cents") == 1000, "a change from 1000 to 1100 answered %s, expected price_cents 1100 and previous_price_cents 1000", r.Text());
+  ctx.Equal(hField(r, "moved_bp"), 1000, "a 10 %% change; moved_bp");
   const auto row = store::getSku("SKU-1");
   ctx.Assert(row && row->price_cents == 1100 && row->source == "operator", "the store holds price %d from %q, expected 1100 published by the operator", row ? row->price_cents : 0, row ? row->source : "");
 }
 
 void CheckKnownSku(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  auto c = api(ctx);
-  auto r = postPrice(c, "SKU-404", 1100);
+  auto c = hAPI(ctx);
+  auto r = hPostPrice(c, "SKU-404", 1100);
   ctx.Equal(r.Status, 404, "a change for SKU-404, which does not exist (%s)", r.Text());
   ctx.Assert(!store::getSku("SKU-404"), "the unknown sku now has a price row: a typo became a price the storefront serves");
-  r = postPrice(c, "SKU-1", 1100);
+  r = hPostPrice(c, "SKU-1", 1100);
   ctx.Equal(r.Status, 200, "a change for the known SKU-1 (%s)", r.Text());
 }
 
@@ -971,45 +1039,61 @@ void CheckBounds(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
   store::seed("SKU-2", 480000);
   store::seed("SKU-3", 55);
-  auto c = api(ctx);
-  struct Case {
-    std::string sku;
-    long long price;
-    std::string why;
-  };
-  for (const Case& tc : std::vector<Case>{{"SKU-1", 0, "a price of 0"}, {"SKU-2", 520000, "520000, above the ceiling"}, {"SKU-3", 45, "45, below the floor"}}) {
-    const auto r = postPrice(c, tc.sku, tc.price);
+  auto c = hAPI(ctx);
+  for (const HPriceCase& tc : std::vector<HPriceCase>{{"SKU-1", 0, "a price of 0"}, {"SKU-2", 520000, "520000, above the ceiling"}, {"SKU-3", 45, "45, below the floor"}}) {
+    const auto r = hPostPrice(c, tc.sku, tc.price);
     ctx.Equal(r.Status, 422, "%s for %s (%s)", tc.why, tc.sku, r.Text());
-    ctx.Assert(field(r, "floor_cents") == 50 && field(r, "ceiling_cents") == 500000, "the 422 must name floor_cents 50 and ceiling_cents 500000, got %s", r.Text());
+    ctx.Assert(hField(r, "floor_cents") == 50 && hField(r, "ceiling_cents") == 500000, "the 422 must name floor_cents 50 and ceiling_cents 500000, got %s", r.Text());
   }
-  ctx.Equal(std::vector<long long>{priceOf("SKU-1"), priceOf("SKU-2"), priceOf("SKU-3")}, std::vector<long long>{1000, 480000, 55}, "a refused price must not be published; the prices");
-  const auto r = postPrice(c, "SKU-1", 1100);
+  ctx.Equal(std::vector<long long>{hPriceOf("SKU-1"), hPriceOf("SKU-2"), hPriceOf("SKU-3")}, std::vector<long long>{1000, 480000, 55}, "a refused price must not be published; the prices");
+  auto r = hPostPrice(c, "SKU-1", 1100);
   ctx.Equal(r.Status, 200, "a price inside the bounds (%s)", r.Text());
+  for (const HPriceCase& tc : std::vector<HPriceCase>{{"SKU-3", 49, "49, one cent under the floor"}, {"SKU-2", 500001, "500001, one cent over the ceiling"}}) {
+    r = hPostPrice(c, tc.sku, tc.price);
+    ctx.Equal(r.Status, 422, "%s for %s (%s)", tc.why, tc.sku, r.Text());
+  }
+  for (const HPriceCase& tc : std::vector<HPriceCase>{{"SKU-3", 50, "exactly the floor (50)"}, {"SKU-2", 500000, "exactly the ceiling (500000)"}}) {
+    r = hPostPrice(c, tc.sku, tc.price);
+    ctx.Equal(r.Status, 200, "%s for %s, the bounds are inclusive (%s)", tc.why, tc.sku, r.Text());
+  }
+  ctx.Equal(std::vector<long long>{hPriceOf("SKU-3"), hPriceOf("SKU-2")}, std::vector<long long>{50, 500000}, "a price exactly on the floor or the ceiling must be published; the prices");
 }
 
 void CheckMoveLimit(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  auto c = api(ctx);
-  auto r = postPrice(c, "SKU-1", 1300);
+  auto c = hAPI(ctx);
+  auto r = hPostPrice(c, "SKU-1", 1300);
   ctx.Equal(r.Status, 409, "a 30 %% rise from 1000 to 1300 (%s)", r.Text());
-  ctx.Equal(field(r, "bound_cents"), 1200, "the 409 must carry bound_cents 1000 + 20 %%; bound_cents");
-  ctx.Equal(priceOf("SKU-1"), 1000, "the refused change must not be published; the price");
-  r = postPrice(c, "SKU-1", 1200);
+  ctx.Equal(hField(r, "bound_cents"), 1200, "the 409 must carry bound_cents 1000 + 20 %%; bound_cents");
+  ctx.Equal(hPriceOf("SKU-1"), 1000, "the refused change must not be published; the price");
+  r = hPostPrice(c, "SKU-1", 1200);
   ctx.Equal(r.Status, 200, "a change of exactly MAX_MOVE_BP, 1000 to 1200 (%s)", r.Text());
-  r = postPrice(c, "SKU-1", 900);
+  r = hPostPrice(c, "SKU-1", 900);
   ctx.Equal(r.Status, 409, "a 25 %% cut from 1200 to 900 (%s)", r.Text());
-  ctx.Equal(field(r, "bound_cents"), 960, "a cut is bounded below (1200 - 20 %%); bound_cents");
+  ctx.Equal(hField(r, "bound_cents"), 960, "a cut is bounded below (1200 - 20 %%); bound_cents");
+  store::seed("SKU-2", 1234);
+  store::seed("SKU-3", 1234);
+  r = hPostPrice(c, "SKU-2", 987);
+  ctx.Equal(r.Status, 409, "a cut from 1234 to 987, 2001 bp (%s)", r.Text());
+  ctx.Equal(hField(r, "bound_cents"), 988, "from 1234 the furthest cut is 1234 - 1234 * 2000 / 10000; bound_cents");
+  r = hPostPrice(c, "SKU-3", 1481);
+  ctx.Equal(r.Status, 409, "a rise from 1234 to 1481, 2001 bp (%s)", r.Text());
+  ctx.Equal(hField(r, "bound_cents"), 1480, "from 1234 the furthest rise is 1234 + 1234 * 2000 / 10000; bound_cents");
+  r = hPostPrice(c, "SKU-2", 988);
+  ctx.Equal(r.Status, 200, "a cut from 1234 to its bound 988; moved_bp is measured from the current price (%s)", r.Text());
+  r = hPostPrice(c, "SKU-3", 1480);
+  ctx.Equal(r.Status, 200, "a rise from 1234 to its bound 1480 (%s)", r.Text());
 }
 
 void CheckReasonRequired(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  auto c = api(ctx);
-  for (const std::string reason : {"", "   "}) {
-    const auto r = postPrice(c, "SKU-1", 1100, reason);
+  auto c = hAPI(ctx);
+  for (const std::string reason : {"", "   ", "\\t\\n"}) {
+    const auto r = hPostPrice(c, "SKU-1", 1100, reason);
     ctx.Equal(r.Status, 400, "a change with reason %q (%s)", reason, r.Text());
   }
-  ctx.Equal(priceOf("SKU-1"), 1000, "a change with no reason must not be published; the price");
-  const auto r = postPrice(c, "SKU-1", 1100, "competitor match");
+  ctx.Equal(hPriceOf("SKU-1"), 1000, "a change with no reason must not be published; the price");
+  const auto r = hPostPrice(c, "SKU-1", 1100, "competitor match");
   ctx.Equal(r.Status, 200, "a change with a reason (%s)", r.Text());
   ctx.Equal(store::getSku("SKU-1")->reason, "competitor match", "the row's reason");
 }

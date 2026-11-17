@@ -25,7 +25,8 @@ document is asked five times and invoiced anyway.
 service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDITION: the jurisdiction refuses
 \`\`\`
 
-- Every \`Quote\` carries a \`TAX_DEADLINE_S\` = 2 s deadline.
+- Every \`Quote\` carries a \`TAX_DEADLINE_S\` = 2 s deadline of its own: a retry does not inherit
+  what is left of the first attempt's.
 - At most \`TAX_MAX_ATTEMPTS\` = 3 attempts; only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are
   retried, after a short backoff.
 - \`FAILED_PRECONDITION\` raises \`JurisdictionRejected\` naming the invoice's \`jurisdiction\`, after
@@ -64,7 +65,7 @@ service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDIT
       id: 'deadline',
       title: 'Every quote carries a 2-second deadline',
       detail:
-        'Each `Quote` is made with `TAX_DEADLINE_S` (2 s) as its deadline (a call `timeout`, `deadline`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`); without one, a stuck tax service holds the finalize open.',
+        'Each `Quote`, every retry included, is made with a full `TAX_DEADLINE_S` (2 s) as its deadline (a call `timeout`, `deadline`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`); without one, a stuck tax service holds the finalize open.',
       match: {
         python: {all: [/TAX_DEADLINE_S\s*=\s*2\b/, /\.Quote\([^)]*timeout\s*=\s*TAX_DEADLINE_S/]},
         typescript: {all: [/TAX_DEADLINE_MS\s*=\s*2000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*TAX_DEADLINE_MS/]},
@@ -77,7 +78,7 @@ service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDIT
       id: 'bounded-retry',
       title: 'At most three attempts, on the transient statuses only',
       detail:
-        'Attempts are bounded by `TAX_MAX_ATTEMPTS` = 3 and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; any other status ends the attempts at once.',
+        'Attempts are bounded by `TAX_MAX_ATTEMPTS` = 3 and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried, the latter whether the deadline ran out or the service answered it; any other status ends the attempts at once.',
       match: {
         python: {all: [/TAX_MAX_ATTEMPTS\s*=\s*3\b/, /range\(TAX_MAX_ATTEMPTS\)/]},
         typescript: {all: [/TAX_MAX_ATTEMPTS\s*=\s*3\b/, /<\s*TAX_MAX_ATTEMPTS/]},
@@ -118,7 +119,7 @@ service Tax { rpc Quote(QuoteRequest) returns (TaxQuote); }  // FAILED_PRECONDIT
       id: 'hold-marker',
       title: 'An unanswered quote holds the draft',
       detail:
-        'When no quote arrives, the invoice stays a draft: `hold` records the reason and the attempts and the outcome is `held`; the starter records zero tax with source `quote` and claims a number, issuing a document nobody reconciles.',
+        'When no quote arrives, the invoice stays a draft: `hold` records the reason (the last status, in lower case) and the attempts and the outcome is `held`; the starter records zero tax with source `quote` and claims a number, issuing a document nobody reconciles.',
       match: {
         python: {all: [/store\.hold\(/, /["']held["']/]},
         typescript: {all: [/\bhold\(/, /'held'/]},
@@ -866,6 +867,8 @@ def check_deadline(ctx):
     out = m.finalize_with_tax("t-1", b)
     assert out.get("status") == "held" and out.get("reason") == "deadline_exceeded", f"with the tax service slower than the deadline finalize_with_tax answered {out}, expected held with reason deadline_exceeded"
     assert store.get(b)["number"] is None, f"an invoice whose quote timed out got number {store.get(b)['number']}"
+    for i, call in enumerate(ctx.grpc.calls_to("Quote")[1:], start=1):
+        assert call.timeout is not None and 1.5 <= call.timeout <= 2.5, f"attempt {i} at a slow tax service carries a {call.timeout} s deadline: every attempt gets its own TAX_DEADLINE_S = 2, not what is left of the first one's"
 
 
 def check_bounded_retry(ctx):
@@ -875,10 +878,17 @@ def check_bounded_retry(ctx):
     calls = len(ctx.grpc.calls_to("Quote"))
     assert calls == 3, f"an unavailable tax service was called {calls} times for one finalize, expected TAX_MAX_ATTEMPTS = 3"
     ctx.grpc.failures.clear()
-    ctx.grpc.fail("Quote", grpc.StatusCode.INTERNAL, times=1)
+    ctx.grpc.fail("Quote", grpc.StatusCode.DEADLINE_EXCEEDED, times=10)
     m.finalize_with_tax("t-1", _draft())
     again = len(ctx.grpc.calls_to("Quote")) - calls
-    assert again == 1, f"an INTERNAL answer was retried ({again} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are transient"
+    assert again == 3, f"a tax service answering DEADLINE_EXCEEDED was called {again} times for one finalize, expected TAX_MAX_ATTEMPTS = 3: it is transient"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.RESOURCE_EXHAUSTED):
+        ctx.grpc.failures.clear()
+        before = len(ctx.grpc.calls_to("Quote"))
+        ctx.grpc.fail("Quote", code, times=1)
+        m.finalize_with_tax("t-1", _draft())
+        again = len(ctx.grpc.calls_to("Quote")) - before
+        assert again == 1, f"an answer of {code.name} was retried ({again} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are transient"
 
 
 def check_terminal_jurisdiction(ctx):
@@ -914,6 +924,15 @@ def check_hold_marker(ctx):
     out = m.finalize_with_tax("t-1", a)
     assert out.get("status") == "finalized" and out.get("number") == 1 and out.get("tax_cents") == 9500 and out.get("tax_source") == "quote", f"once the tax service answers the held draft must finalize as number 1 with the quoted 9500, got {out}"
     assert store.get(a)["tax_hold"] is None, "a finalized invoice still carries its tax hold"
+    ctx.grpc.failures.clear()
+    ctx.grpc.fail("Quote", grpc.StatusCode.DEADLINE_EXCEEDED, times=1)
+    ctx.grpc.fail("Quote", grpc.StatusCode.UNAVAILABLE, times=10)
+    before = len(ctx.grpc.calls_to("Quote"))
+    b = _draft()
+    out = m.finalize_with_tax("t-1", b)
+    calls = len(ctx.grpc.calls_to("Quote")) - before
+    hold = store.get(b)["tax_hold"]
+    assert out.get("status") == "held" and out.get("reason") == "unavailable" and out.get("attempts") == calls and hold == {"reason": "unavailable", "attempts": calls}, f"after a DEADLINE_EXCEEDED, then UNAVAILABLE answers, the outcome is {out} and the hold {hold}, expected held with reason unavailable after the {calls} attempts made: the reason is the last status, in lower case"
 `,
     typescript: `const LINES = [{description: 'Consulting', quantity: 2, unit_price_cents: 25000}];
 
@@ -954,6 +973,9 @@ export async function check_deadline(ctx) {
   out = await m.finalizeWithTax('t-1', b);
   assert(out.status === 'held' && out.reason === 'deadline_exceeded', \`with the tax service slower than the deadline finalizeWithTax answered \${JSON.stringify(out)}, expected held with reason deadline_exceeded\`);
   assert.equal((await store.get(b)).number, null, 'an invoice whose quote timed out got a number');
+  ctx.grpc.callsTo('Quote').slice(1).forEach((call, i) => {
+    assert(call.timeout !== null && 1.5 <= call.timeout && call.timeout <= 2.5, \`attempt \${i + 1} at a slow tax service carries a \${call.timeout} s deadline: every attempt gets its own TAX_DEADLINE_MS = 2000, not what is left of the first one's\`);
+  });
 }
 
 export async function check_bounded_retry(ctx) {
@@ -963,10 +985,18 @@ export async function check_bounded_retry(ctx) {
   const calls = ctx.grpc.callsTo('Quote').length;
   assert.equal(calls, 3, \`an unavailable tax service was called \${calls} times for one finalize, expected TAX_MAX_ATTEMPTS = 3\`);
   ctx.grpc.clearFailures();
-  ctx.grpc.fail('Quote', ctx.grpc.status.INTERNAL, '', 1);
+  ctx.grpc.fail('Quote', ctx.grpc.status.DEADLINE_EXCEEDED, '', 10);
   await m.finalizeWithTax('t-1', await draft(store));
-  const again = ctx.grpc.callsTo('Quote').length - calls;
-  assert.equal(again, 1, \`an INTERNAL answer was retried (\${again} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are transient\`);
+  const slow = ctx.grpc.callsTo('Quote').length - calls;
+  assert.equal(slow, 3, \`a tax service answering DEADLINE_EXCEEDED was called \${slow} times for one finalize, expected TAX_MAX_ATTEMPTS = 3: it is transient\`);
+  for (const code of ['INTERNAL', 'INVALID_ARGUMENT', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED']) {
+    ctx.grpc.clearFailures();
+    const before = ctx.grpc.callsTo('Quote').length;
+    ctx.grpc.fail('Quote', ctx.grpc.status[code], '', 1);
+    await m.finalizeWithTax('t-1', await draft(store));
+    const again = ctx.grpc.callsTo('Quote').length - before;
+    assert.equal(again, 1, \`an answer of \${code} was retried (\${again} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are transient\`);
+  }
 }
 
 export async function check_terminal_jurisdiction(ctx) {
@@ -1002,6 +1032,15 @@ export async function check_hold_marker(ctx) {
   out = await m.finalizeWithTax('t-1', a);
   assert(out.status === 'finalized' && out.number === 1 && out.tax_cents === 9500 && out.tax_source === 'quote', \`once the tax service answers the held draft must finalize as number 1 with the quoted 9500, got \${JSON.stringify(out)}\`);
   assert.equal((await store.get(a)).tax_hold, null, 'a finalized invoice still carries its tax hold');
+  ctx.grpc.clearFailures();
+  ctx.grpc.fail('Quote', ctx.grpc.status.DEADLINE_EXCEEDED, '', 1);
+  ctx.grpc.fail('Quote', ctx.grpc.status.UNAVAILABLE, '', 10);
+  const before = ctx.grpc.callsTo('Quote').length;
+  const b = await draft(store);
+  out = await m.finalizeWithTax('t-1', b);
+  const made = ctx.grpc.callsTo('Quote').length - before;
+  const hold = (await store.get(b)).tax_hold;
+  assert(out.status === 'held' && out.reason === 'unavailable' && out.attempts === made && JSON.stringify(hold) === JSON.stringify({reason: 'unavailable', attempts: made}), \`after a DEADLINE_EXCEEDED, then UNAVAILABLE answers, the outcome is \${JSON.stringify(out)} and the hold \${JSON.stringify(hold)}, expected held with reason unavailable after the \${made} attempts made: the reason is the last status, in lower case\`);
 }
 `,
     go: `package main
@@ -1021,16 +1060,16 @@ import (
 )
 
 var (
-	clientBg    = context.Background()
-	clientLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}}
+	hBg    = context.Background()
+	hLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}}
 )
 
-// taxPeer: 19% in DE, exempt in US-OR; jurisdiction XX refuses invoices from this seller.
-type taxPeer struct {
+// hTaxPeer: 19% in DE, exempt in US-OR; jurisdiction XX refuses invoices from this seller.
+type hTaxPeer struct {
 	pb.UnimplementedTaxServer
 }
 
-func (taxPeer) Quote(_ context.Context, req *pb.QuoteRequest) (*pb.TaxQuote, error) {
+func (hTaxPeer) Quote(_ context.Context, req *pb.QuoteRequest) (*pb.TaxQuote, error) {
 	switch req.GetJurisdiction() {
 	case "XX":
 		return nil, status.Error(codes.FailedPrecondition, "jurisdiction XX does not accept invoices from this seller")
@@ -1040,87 +1079,107 @@ func (taxPeer) Quote(_ context.Context, req *pb.QuoteRequest) (*pb.TaxQuote, err
 	return &pb.TaxQuote{TaxCents: req.GetSubtotalCents() * 19 / 100, TaxSource: "quote"}, nil
 }
 
-func client(ctx *harness.Ctx) {
-	pb.RegisterTaxServer(ctx.GRPC.Server(""), taxPeer{})
+func hServeTax(ctx *harness.Ctx) {
+	pb.RegisterTaxServer(ctx.GRPC.Server(""), hTaxPeer{})
 }
 
-func taxDraft(jurisdiction string) string {
-	return store.Create(clientBg, "t-1", "eur", clientLines, "cus-1", jurisdiction, "").ID
+func hDraft(jurisdiction string) string {
+	return store.Create(hBg, "t-1", "eur", hLines, "cus-1", jurisdiction, "").ID
 }
 
-func mustFinalize(ctx *harness.Ctx, invoiceID string) Outcome {
-	out, err := finalizeWithTax(clientBg, "t-1", invoiceID)
+func hMustFinalize(ctx *harness.Ctx, invoiceID string) Outcome {
+	out, err := finalizeWithTax(hBg, "t-1", invoiceID)
 	ctx.NoError(err, "finalizeWithTax(t-1, %s) failed", invoiceID)
 	return out
 }
 
-func unclaimed(ctx *harness.Ctx, invoiceID, why string) {
-	stored := store.Get(clientBg, invoiceID)
+func hUnclaimed(ctx *harness.Ctx, invoiceID, why string) {
+	stored := store.Get(hBg, invoiceID)
 	ctx.Assert(stored.Status == "draft" && stored.Number == 0, "%s: the invoice must stay a draft without a number, the store holds %s number %d", why, stored.Status, stored.Number)
 	seq, claimed := ctx.Redis.Get("invoice:seq:t-1")
 	ctx.Assert(!claimed, "%s: a number was claimed (%s)", why, seq)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	out := mustFinalize(ctx, taxDraft("DE"))
+	hServeTax(ctx)
+	out := hMustFinalize(ctx, hDraft("DE"))
 	ctx.Assert(out.Status == "finalized" && out.TaxCents == 9500 && out.Number == 1, "with the tax service healthy the invoice must finalize as number 1 with 9500 tax, got %+v", out)
 	for _, call := range ctx.GRPC.CallsTo("Quote", "") {
 		ctx.Assert(call.HasDeadline(), "a Quote call carries no deadline: a stuck tax service would hold the finalize open")
 		ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a Quote call carries a %v deadline, expected taxDeadline = 2 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Quote", 10.0, "")
-	b := taxDraft("DE")
-	out = mustFinalize(ctx, b)
+	b := hDraft("DE")
+	out = hMustFinalize(ctx, b)
 	ctx.Assert(out.Status == "held" && out.Reason == "deadline_exceeded", "with the tax service slower than the deadline finalizeWithTax answered %+v, expected held with reason deadline_exceeded", out)
-	ctx.Equal(store.Get(clientBg, b).Number, int64(0), "an invoice whose quote timed out must not get a number; its number")
+	ctx.Equal(store.Get(hBg, b).Number, int64(0), "an invoice whose quote timed out must not get a number; its number")
+	for i, call := range ctx.GRPC.CallsTo("Quote", "")[1:] {
+		ctx.Assert(call.HasDeadline() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "attempt %d at a slow tax service carries a %v deadline: every attempt gets its own taxDeadline = 2 s, not what is left of the first one's", i+1, call.Timeout)
+	}
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	client(ctx)
+	hServeTax(ctx)
 	ctx.GRPC.Fail("Quote", codes.Unavailable, "", 10, "")
-	finalizeWithTax(clientBg, "t-1", taxDraft("DE"))
+	finalizeWithTax(hBg, "t-1", hDraft("DE"))
 	calls := len(ctx.GRPC.CallsTo("Quote", ""))
 	ctx.Equal(calls, 3, "an unavailable tax service, the calls for one finalize (taxMaxAttempts = 3)")
 	ctx.GRPC.ClearFailures()
-	ctx.GRPC.Fail("Quote", codes.Internal, "", 1, "")
-	finalizeWithTax(clientBg, "t-1", taxDraft("DE"))
-	ctx.Equal(len(ctx.GRPC.CallsTo("Quote", ""))-calls, 1, "an INTERNAL answer must not be retried (only Unavailable and DeadlineExceeded are transient); the calls")
+	ctx.GRPC.Fail("Quote", codes.DeadlineExceeded, "", 10, "")
+	finalizeWithTax(hBg, "t-1", hDraft("DE"))
+	ctx.Equal(len(ctx.GRPC.CallsTo("Quote", ""))-calls, 3, "a tax service answering DeadlineExceeded (transient), the calls for one finalize (taxMaxAttempts = 3)")
+	for _, code := range []codes.Code{codes.Internal, codes.InvalidArgument, codes.PermissionDenied, codes.ResourceExhausted} {
+		ctx.GRPC.ClearFailures()
+		before := len(ctx.GRPC.CallsTo("Quote", ""))
+		ctx.GRPC.Fail("Quote", code, "", 1, "")
+		finalizeWithTax(hBg, "t-1", hDraft("DE"))
+		ctx.Equal(len(ctx.GRPC.CallsTo("Quote", ""))-before, 1, "an answer of %v must not be retried (only Unavailable and DeadlineExceeded are transient); the calls", code)
+	}
 }
 
 func CheckTerminalJurisdiction(ctx *harness.Ctx) {
-	client(ctx)
-	a := taxDraft("XX")
-	out, err := finalizeWithTax(clientBg, "t-1", a)
+	hServeTax(ctx)
+	a := hDraft("XX")
+	out, err := finalizeWithTax(hBg, "t-1", a)
 	var rejected *JurisdictionRejected
 	ctx.Assert(errors.As(err, &rejected), "finalizeWithTax answered %+v, %v for an invoice its jurisdiction refuses: return a *JurisdictionRejected", out, err)
 	ctx.Equal(rejected.Jurisdiction, "XX", "JurisdictionRejected must name the invoice's jurisdiction")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Quote", "")), 1, "a jurisdiction refusal is terminal, not retried; the calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a jurisdiction refusal must not be slept on and retried; the sleeps")
-	unclaimed(ctx, a, "after a jurisdiction refusal")
+	hUnclaimed(ctx, a, "after a jurisdiction refusal")
 }
 
 func CheckHoldMarker(ctx *harness.Ctx) {
-	client(ctx)
-	a := taxDraft("DE")
+	hServeTax(ctx)
+	a := hDraft("DE")
 	ctx.GRPC.Fail("Quote", codes.Unavailable, "", 10, "")
-	out := mustFinalize(ctx, a)
+	out := hMustFinalize(ctx, a)
 	calls := len(ctx.GRPC.CallsTo("Quote", ""))
 	ctx.Equal(out.Status, "held", "with the tax service unavailable finalizeWithTax answered %+v: an unknown tax is not zero tax. Hold the draft; the status", out)
 	ctx.Assert(out.Reason == "unavailable" && out.Attempts == calls, "the held outcome must carry reason unavailable and the %d attempts made, got %+v", calls, out)
-	unclaimed(ctx, a, "with no quote")
-	stored := store.Get(clientBg, a)
+	hUnclaimed(ctx, a, "with no quote")
+	stored := store.Get(hBg, a)
 	ctx.Equal(stored.TaxSource, "", "an invoice without a quote must record no tax; its tax source")
 	ctx.Assert(stored.HoldReason == "unavailable" && stored.HoldAttempts == calls, "the store's tax hold is %q after %d attempts, expected unavailable after %d", stored.HoldReason, stored.HoldAttempts, calls)
 	ctx.GRPC.ClearFailures()
-	out = mustFinalize(ctx, a)
+	out = hMustFinalize(ctx, a)
 	ctx.Assert(out.Status == "finalized" && out.Number == 1 && out.TaxCents == 9500 && out.TaxSource == "quote", "once the tax service answers the held draft must finalize as number 1 with the quoted 9500, got %+v", out)
-	ctx.Equal(store.Get(clientBg, a).HoldReason, "", "a finalized invoice still carries its tax hold; the hold")
+	ctx.Equal(store.Get(hBg, a).HoldReason, "", "a finalized invoice still carries its tax hold; the hold")
+	ctx.GRPC.ClearFailures()
+	ctx.GRPC.Fail("Quote", codes.DeadlineExceeded, "", 1, "")
+	ctx.GRPC.Fail("Quote", codes.Unavailable, "", 10, "")
+	before := len(ctx.GRPC.CallsTo("Quote", ""))
+	b := hDraft("DE")
+	out = hMustFinalize(ctx, b)
+	made := len(ctx.GRPC.CallsTo("Quote", "")) - before
+	held := store.Get(hBg, b)
+	ctx.Assert(out.Status == "held" && out.Reason == "unavailable" && out.Attempts == made && held.HoldReason == "unavailable" && held.HoldAttempts == made, "after a DeadlineExceeded, then Unavailable answers, the outcome is %+v and the hold %q after %d attempts, expected held with reason unavailable after the %d attempts made: the reason is the last status, in lower case", out, held.HoldReason, held.HoldAttempts, made)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "invoice/store.h"
@@ -1128,10 +1187,10 @@ func CheckHoldMarker(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<store::Line> kLines = {{"Consulting", 2, 25000}};
+const std::vector<store::Line> hLines = {{"Consulting", 2, 25000}};
 
 // 19% in DE, exempt in US-OR; jurisdiction XX refuses invoices from this seller.
-class TaxPeer final : public invoicetax::Tax::Service {
+class HTaxPeer final : public invoicetax::Tax::Service {
  public:
   grpc::Status Quote(grpc::ServerContext*, const invoicetax::QuoteRequest* req, invoicetax::TaxQuote* out) override {
     if (req->jurisdiction() == "XX") return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "jurisdiction XX does not accept invoices from this seller");
@@ -1146,16 +1205,16 @@ class TaxPeer final : public invoicetax::Tax::Service {
   }
 };
 
-void client(harness::Ctx& ctx) {
-  static TaxPeer* peer = nullptr;
+void hServeTax(harness::Ctx& ctx) {
+  static HTaxPeer* peer = nullptr;
   delete peer;
-  peer = new TaxPeer;
+  peer = new HTaxPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-std::string taxDraft(const std::string& jurisdiction) { return store::create("t-1", "eur", kLines, "cus-1", jurisdiction).id; }
+std::string hDraft(const std::string& jurisdiction) { return store::create("t-1", "eur", hLines, "cus-1", jurisdiction).id; }
 
-Outcome mustFinalize(harness::Ctx& ctx, const std::string& invoice_id) {
+Outcome hMustFinalize(harness::Ctx& ctx, const std::string& invoice_id) {
   try {
     return finalizeWithTax("t-1", invoice_id);
   } catch (const std::exception& e) {
@@ -1163,12 +1222,12 @@ Outcome mustFinalize(harness::Ctx& ctx, const std::string& invoice_id) {
   }
 }
 
-std::string show(const Outcome& out) {
+std::string hShow(const Outcome& out) {
   return harness::Sprintf("{status %s number %d tax_cents %d tax_source %s reason %s attempts %d}", out.status, out.number, out.tax_cents, out.tax_source,
                           out.reason, out.attempts);
 }
 
-void unclaimed(harness::Ctx& ctx, const std::string& invoice_id, const std::string& why) {
+void hUnclaimed(harness::Ctx& ctx, const std::string& invoice_id, const std::string& why) {
   const auto stored = store::get(invoice_id);
   ctx.Assert(stored->status == "draft" && stored->number == 0, "%s: the invoice must stay a draft without a number, the store holds %s number %d", why, stored->status,
              stored->number);
@@ -1179,39 +1238,56 @@ void unclaimed(harness::Ctx& ctx, const std::string& invoice_id, const std::stri
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  Outcome out = mustFinalize(ctx, taxDraft("DE"));
-  ctx.Assert(out.status == "finalized" && out.tax_cents == 9500 && out.number == 1, "with the tax service healthy the invoice must finalize as number 1 with 9500 tax, got %s", show(out));
+  hServeTax(ctx);
+  Outcome out = hMustFinalize(ctx, hDraft("DE"));
+  ctx.Assert(out.status == "finalized" && out.tax_cents == 9500 && out.number == 1, "with the tax service healthy the invoice must finalize as number 1 with 9500 tax, got %s", hShow(out));
   for (const auto& call : ctx.GRPC.CallsTo("Quote")) {
     ctx.Assert(call.HasDeadline(), "a Quote call carries no deadline: a stuck tax service would hold the finalize open");
     ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a Quote call carries a %v s deadline, expected kTaxDeadline = 2 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Quote", 10.0);
-  const std::string b = taxDraft("DE");
-  out = mustFinalize(ctx, b);
-  ctx.Assert(out.status == "held" && out.reason == "deadline_exceeded", "with the tax service slower than the deadline finalizeWithTax answered %s, expected held with reason deadline_exceeded", show(out));
+  const std::string b = hDraft("DE");
+  out = hMustFinalize(ctx, b);
+  ctx.Assert(out.status == "held" && out.reason == "deadline_exceeded", "with the tax service slower than the deadline finalizeWithTax answered %s, expected held with reason deadline_exceeded", hShow(out));
   ctx.Equal(store::get(b)->number, 0, "an invoice whose quote timed out must not get a number; its number");
+  const auto slow = ctx.GRPC.CallsTo("Quote");
+  for (size_t i = 1; i < slow.size(); i++) {
+    ctx.Assert(slow[i].HasDeadline() && 1.5 <= slow[i].TimeoutSeconds() && slow[i].TimeoutSeconds() <= 2.5,
+               "attempt %d at a slow tax service carries a %v s deadline: every attempt gets its own kTaxDeadline = 2 s, not what is left of the first one's", i,
+               slow[i].TimeoutSeconds());
+  }
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  client(ctx);
+  hServeTax(ctx);
   ctx.GRPC.Fail("Quote", grpc::StatusCode::UNAVAILABLE, "", 10);
-  finalizeWithTax("t-1", taxDraft("DE"));
+  finalizeWithTax("t-1", hDraft("DE"));
   const size_t calls = ctx.GRPC.CallsTo("Quote").size();
   ctx.Equal(calls, 3, "an unavailable tax service, the calls for one finalize (kTaxMaxAttempts = 3)");
   ctx.GRPC.ClearFailures();
-  ctx.GRPC.Fail("Quote", grpc::StatusCode::INTERNAL, "", 1);
-  finalizeWithTax("t-1", taxDraft("DE"));
-  ctx.Equal(ctx.GRPC.CallsTo("Quote").size() - calls, 1, "an INTERNAL answer must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are transient); the calls");
+  ctx.GRPC.Fail("Quote", grpc::StatusCode::DEADLINE_EXCEEDED, "", 10);
+  finalizeWithTax("t-1", hDraft("DE"));
+  ctx.Equal(ctx.GRPC.CallsTo("Quote").size() - calls, 3, "a tax service answering DEADLINE_EXCEEDED (transient), the calls for one finalize (kTaxMaxAttempts = 3)");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INTERNAL, "INTERNAL"},
+                                                                          {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+                                                                          {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+                                                                          {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}};
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.ClearFailures();
+    const size_t before = ctx.GRPC.CallsTo("Quote").size();
+    ctx.GRPC.Fail("Quote", code, "", 1);
+    finalizeWithTax("t-1", hDraft("DE"));
+    ctx.Equal(ctx.GRPC.CallsTo("Quote").size() - before, 1, "an answer of %s must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are transient); the calls", name);
+  }
 }
 
 void CheckTerminalJurisdiction(harness::Ctx& ctx) {
-  client(ctx);
-  const std::string a = taxDraft("XX");
+  hServeTax(ctx);
+  const std::string a = hDraft("XX");
   bool rejected = false;
   try {
     const Outcome out = finalizeWithTax("t-1", a);
-    ctx.Fatalf("finalizeWithTax answered %s for an invoice its jurisdiction refuses: throw JurisdictionRejected", show(out));
+    ctx.Fatalf("finalizeWithTax answered %s for an invoice its jurisdiction refuses: throw JurisdictionRejected", hShow(out));
   } catch (const JurisdictionRejected& e) {
     rejected = true;
     ctx.Equal(e.jurisdiction, "XX", "JurisdictionRejected must name the invoice's jurisdiction");
@@ -1223,27 +1299,39 @@ void CheckTerminalJurisdiction(harness::Ctx& ctx) {
   ctx.Assert(rejected, "a refusing jurisdiction must throw JurisdictionRejected");
   ctx.Equal(ctx.GRPC.CallsTo("Quote").size(), 1, "a jurisdiction refusal is terminal, not retried; the calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a jurisdiction refusal must not be slept on and retried; the sleeps");
-  unclaimed(ctx, a, "after a jurisdiction refusal");
+  hUnclaimed(ctx, a, "after a jurisdiction refusal");
 }
 
 void CheckHoldMarker(harness::Ctx& ctx) {
-  client(ctx);
-  const std::string a = taxDraft("DE");
+  hServeTax(ctx);
+  const std::string a = hDraft("DE");
   ctx.GRPC.Fail("Quote", grpc::StatusCode::UNAVAILABLE, "", 10);
-  Outcome out = mustFinalize(ctx, a);
+  Outcome out = hMustFinalize(ctx, a);
   const long calls = static_cast<long>(ctx.GRPC.CallsTo("Quote").size());
-  ctx.Assert(out.status == "held", "with the tax service unavailable finalizeWithTax answered %s: an unknown tax is not zero tax. Hold the draft", show(out));
-  ctx.Assert(out.reason == "unavailable" && out.attempts == calls, "the held outcome must carry reason unavailable and the %d attempts made, got %s", calls, show(out));
-  unclaimed(ctx, a, "with no quote");
+  ctx.Assert(out.status == "held", "with the tax service unavailable finalizeWithTax answered %s: an unknown tax is not zero tax. Hold the draft", hShow(out));
+  ctx.Assert(out.reason == "unavailable" && out.attempts == calls, "the held outcome must carry reason unavailable and the %d attempts made, got %s", calls, hShow(out));
+  hUnclaimed(ctx, a, "with no quote");
   const auto stored = store::get(a);
   ctx.Equal(stored->tax_source, "", "an invoice without a quote must record no tax; its tax source");
   ctx.Assert(stored->hold_reason == "unavailable" && stored->hold_attempts == calls, "the store's tax hold is %q after %d attempts, expected unavailable after %d",
              stored->hold_reason, stored->hold_attempts, calls);
   ctx.GRPC.ClearFailures();
-  out = mustFinalize(ctx, a);
+  out = hMustFinalize(ctx, a);
   ctx.Assert(out.status == "finalized" && out.number == 1 && out.tax_cents == 9500 && out.tax_source == "quote",
-             "once the tax service answers the held draft must finalize as number 1 with the quoted 9500, got %s", show(out));
+             "once the tax service answers the held draft must finalize as number 1 with the quoted 9500, got %s", hShow(out));
   ctx.Equal(store::get(a)->hold_reason, "", "a finalized invoice still carries its tax hold; the hold");
+  ctx.GRPC.ClearFailures();
+  ctx.GRPC.Fail("Quote", grpc::StatusCode::DEADLINE_EXCEEDED, "", 1);
+  ctx.GRPC.Fail("Quote", grpc::StatusCode::UNAVAILABLE, "", 10);
+  const long before = static_cast<long>(ctx.GRPC.CallsTo("Quote").size());
+  const std::string b = hDraft("DE");
+  out = hMustFinalize(ctx, b);
+  const long made = static_cast<long>(ctx.GRPC.CallsTo("Quote").size()) - before;
+  const auto held = store::get(b);
+  ctx.Assert(out.status == "held" && out.reason == "unavailable" && out.attempts == made && held->hold_reason == "unavailable" && held->hold_attempts == made,
+             "after a DEADLINE_EXCEEDED, then UNAVAILABLE answers, the outcome is %s and the hold %q after %d attempts, expected held with reason unavailable after the %d "
+             "attempts made: the reason is the last status, in lower case",
+             hShow(out), held->hold_reason, held->hold_attempts, made);
 }
 `,
   },

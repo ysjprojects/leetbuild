@@ -77,7 +77,7 @@ cancelled label lands on the voided id.
       id: 'single-active',
       title: 'Answers 409 naming the live shipment',
       detail:
-        'A second create for an order whose shipment is still `label`, `in_transit` or `out_for_delivery` (`active_for_order`) is **409** with `active_shipment_exists` and the live shipment id, and saves nothing.',
+        'A second create for an order whose shipment is still `label`, `in_transit` or `out_for_delivery` (`active_for_order`) is **409** with `active_shipment_exists` and the live shipment id, and saves nothing; once it is `delivered` or `returned`, a create is **201** and replaces nothing.',
       match: {
         python: {all: [/store\.active_for_order\(/, /\b409\b/, /active_shipment_exists/]},
         typescript: {all: [/store\.activeForOrder\(/, /\b409\b/, /active_shipment_exists/]},
@@ -90,7 +90,7 @@ cancelled label lands on the voided id.
       id: 'idempotency-key',
       title: 'Keys a create by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required (**400**); the recorded shipment is looked up (`get_by_key`) before the live-shipment rule and answered with **200** on a replay, and a new shipment is recorded (`put_by_key`).',
+        '`Idempotency-Key` is required (**400**); the recorded shipment is looked up (`get_by_key`) before the live-shipment rule and answered with **200** on every replay, also once that shipment is delivered, and a new shipment is recorded (`put_by_key`).',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.get_by_key\(/, /store\.put_by_key\(/],
@@ -118,7 +118,7 @@ cancelled label lands on the voided id.
       id: 'replacement',
       title: 'Replaces a cancelled shipment under a new id',
       detail:
-        'Every new shipment takes `new_shipment_id()`; after a `cancelled` shipment the new one names it in `replacement_of`. Copying the previous shipment id hands the replacement a voided label.',
+        'Every new shipment takes `new_shipment_id()`; after a `cancelled` shipment, and only then, the new one names it in `replacement_of`. Copying the previous shipment id hands the replacement a voided label.',
       match: {
         python: {all: [/["']cancelled["']/, /replacement_of/], none: [/["']shipment_id["']\s*:\s*previous\b/]},
         typescript: {all: [/['"]cancelled['"]/, /replacement_of/], none: [/shipment_id:\s*previous\b/]},
@@ -658,8 +658,10 @@ async def check_validate(ctx):
         assert r.status_code == 400, f"an empty order_id answered {r.status_code}, expected 400"
         saved = ctx.redis.keys("order:*")
         assert saved == [], f"refused creates still saved shipments: {sorted(saved)}"
-        r = await _create(c, "k-5", {**BODY, "carrier": "fedex", "service_level": "express"})
-    _created(r, "a valid fedex express create")
+        r = await _create(c, "k-7", {**BODY, "carrier": "fedex", "service_level": "express"})
+        _created(r, "a valid fedex express create")
+        r = await _create(c, "k-8", {**BODY, "order_id": "ord_9001", "carrier": "usps", "service_level": "freight"})
+    _created(r, "a valid usps freight create (every registry carrier, every service level)")
 
 
 async def check_single_active(ctx):
@@ -671,9 +673,21 @@ async def check_single_active(ctx):
     assert body.get("error") == "active_shipment_exists" and body.get("shipment_id") == first_id, f"the 409 must name the live shipment ({{error: active_shipment_exists, shipment_id: {first_id}}}), got {body}"
     ids = ctx.redis.lrange("order:t-acme:ord_8123", 0, -1)
     assert ids == [first_id], f"the order lists shipments {ids}: the refused create saved one"
+    for live in ("in_transit", "out_for_delivery"):
+        store.set_status(first_id, live, 100)
+        async with _api(ctx) as c:
+            again = await _create(c, f"k-{live}")
+        assert again.status_code == 409 and again.json().get("shipment_id") == first_id, f"a create while {first_id} is {live} (still live) answered {again.status_code} {again.text}, expected 409 naming it"
     store.set_status(first_id, "delivered", 100)
     async with _api(ctx) as c:
-        _created(await _create(c, "k-3"), "a create after the order's shipment was delivered (no longer live)")
+        third = await _create(c, "k-3")
+    third_id = _created(third, "a create after the order's shipment was delivered (no longer live)")
+    assert third.json().get("replacement_of") == "", f"a create after a delivered shipment replaces nothing (replacement_of is only for a cancelled one), got {third.json()}"
+    store.set_status(third_id, "returned", 200)
+    async with _api(ctx) as c:
+        fourth = await _create(c, "k-4")
+    _created(fourth, "a create after the order's shipment was returned (no longer live)")
+    assert fourth.json().get("replacement_of") == "", f"a create after a returned shipment replaces nothing, got {fourth.json()}"
 
 
 async def check_idempotency_key(ctx):
@@ -687,6 +701,11 @@ async def check_idempotency_key(ctx):
         assert missing.status_code == 400, f"a create without Idempotency-Key answered {missing.status_code}, expected 400"
         ids = ctx.redis.lrange("order:t-acme:ord_8123", 0, -1)
         assert ids == [first_id], f"one create and its replay left {ids} on the order, expected [{first_id!r}]"
+        store.set_status(first_id, "delivered", 100)
+        late = await _create(c, "k-1")
+        assert late.status_code == 200 and late.json() == first.json(), f"a replay of k-1 after {first_id} was delivered answered {late.status_code} {late.text}, expected 200 with the recorded shipment: the key is looked up before anything else"
+        ids = ctx.redis.lrange("order:t-acme:ord_8123", 0, -1)
+        assert ids == [first_id], f"a replay after delivery left {ids} on the order, expected [{first_id!r}]"
         other = await _create(c, "k-1", tenant="t-globex")
     other_id = _created(other, "another tenant's create with the same key")
     assert other_id != first_id, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant"
@@ -743,6 +762,10 @@ export async function check_validate(ctx) {
   const saved = ctx.redis.keys('order:*');
   assert.equal(saved.length, 0, \`refused creates still saved shipments: \${JSON.stringify(saved)}\`);
   created(await create(c, 'k-5', {...BODY, carrier: 'fedex', service_level: 'express'}), 'a valid fedex express create');
+  created(
+    await create(c, 'k-6', {...BODY, order_id: 'ord_9001', carrier: 'usps', service_level: 'freight'}),
+    'a valid usps freight create (every registry carrier, every service level)',
+  );
 }
 
 export async function check_single_active(ctx) {
@@ -754,12 +777,23 @@ export async function check_single_active(ctx) {
   assert(body.error === 'active_shipment_exists' && body.shipment_id === firstId, \`the 409 must name the live shipment (active_shipment_exists, \${firstId}), got \${second.text}\`);
   const ids = ctx.redis.lrange('order:t-acme:ord_8123', 0, -1);
   assert.deepStrictEqual(ids, [firstId], \`the order lists shipments \${JSON.stringify(ids)}: the refused create saved one\`);
+  for (const live of ['in_transit', 'out_for_delivery']) {
+    await store.setStatus(firstId, live, 100);
+    const again = await create(c, \`k-\${live}\`);
+    assert(again.status === 409 && again.json().shipment_id === firstId, \`a create while \${firstId} is \${live} (still live) answered \${again.status} \${again.text}, expected 409 naming it\`);
+  }
   await store.setStatus(firstId, 'delivered', 100);
-  created(await create(c, 'k-3'), "a create after the order's shipment was delivered (no longer live)");
+  const third = await create(c, 'k-3');
+  const thirdId = created(third, "a create after the order's shipment was delivered (no longer live)");
+  assert.equal(third.json().replacement_of, '', \`a create after a delivered shipment replaces nothing (replacement_of is only for a cancelled one), got \${third.text}\`);
+  await store.setStatus(thirdId, 'returned', 200);
+  const fourth = await create(c, 'k-4');
+  created(fourth, "a create after the order's shipment was returned (no longer live)");
+  assert.equal(fourth.json().replacement_of, '', \`a create after a returned shipment replaces nothing, got \${fourth.text}\`);
 }
 
 export async function check_idempotency_key(ctx) {
-  const {c} = api(ctx);
+  const {c, store} = api(ctx);
   const first = await create(c, 'k-1');
   const firstId = created(first, 'the first create');
   const replay = await create(c, 'k-1');
@@ -769,6 +803,11 @@ export async function check_idempotency_key(ctx) {
   assert.equal(missing.status, 400, \`a create without Idempotency-Key answered \${missing.status}, expected 400\`);
   const ids = ctx.redis.lrange('order:t-acme:ord_8123', 0, -1);
   assert.deepStrictEqual(ids, [firstId], \`one create and its replay left \${JSON.stringify(ids)} on the order, expected one shipment\`);
+  await store.setStatus(firstId, 'delivered', 100);
+  const late = await create(c, 'k-1');
+  assert.equal(late.status, 200, \`a replay of k-1 after \${firstId} was delivered answered \${late.status} \${late.text}, expected 200 with the recorded shipment: the key is looked up before anything else\`);
+  assert.deepStrictEqual(late.json(), first.json(), \`a replay of k-1 after delivery must answer the recorded shipment \${first.text}, got \${late.text}\`);
+  assert.deepStrictEqual(ctx.redis.lrange('order:t-acme:ord_8123', 0, -1), [firstId], 'a replay after delivery must save nothing; the order lists one shipment');
   const otherId = created(await create(c, 'k-1', BODY, 't-globex'), "another tenant's create with the same key");
   assert.notEqual(otherId, firstId, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant");
 }
@@ -796,26 +835,26 @@ import (
 )
 
 var (
-	apiBg = context.Background()
-	body  = map[string]string{"order_id": "ord_8123", "carrier": "ups", "service_level": "ground"}
+	hApiBg = context.Background()
+	hBody  = map[string]string{"order_id": "ord_8123", "carrier": "ups", "service_level": "ground"}
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func with(field, value string) map[string]string {
+func hWith(field, value string) map[string]string {
 	out := map[string]string{}
-	for k, v := range body {
+	for k, v := range hBody {
 		out[k] = v
 	}
 	out[field] = value
 	return out
 }
 
-func create(c *harness.HTTP, key string, b map[string]string, tenant string) *harness.Response {
+func hCreate(c *harness.HTTP, key string, b map[string]string, tenant string) *harness.Response {
 	headers := []string{"Idempotency-Key", key}
 	if tenant != "" {
 		headers = append(headers, "X-Tenant-Id", tenant)
@@ -823,7 +862,7 @@ func create(c *harness.HTTP, key string, b map[string]string, tenant string) *ha
 	return c.Post("/v1/shipments", b, headers...)
 }
 
-func created(ctx *harness.Ctx, r *harness.Response, what string) string {
+func hCreated(ctx *harness.Ctx, r *harness.Response, what string) string {
 	ctx.Equal(r.Status, 201, "%s (%s); the status", what, r.Text())
 	var s struct {
 		ShipmentID string \`json:"shipment_id"\`
@@ -832,38 +871,48 @@ func created(ctx *harness.Ctx, r *harness.Response, what string) string {
 	return s.ShipmentID
 }
 
+func hReplacementOf(r *harness.Response) string {
+	var got store.Shipment
+	r.Decode(&got)
+	return got.ReplacementOf
+}
+
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := create(c, "k-1", body, "t-acme")
-	shipmentID := created(ctx, r, "POST /v1/shipments")
+	c := hAPI(ctx)
+	r := hCreate(c, "k-1", hBody, "t-acme")
+	shipmentID := hCreated(ctx, r, "POST /v1/shipments")
 	var got store.Shipment
 	r.Decode(&got)
 	ctx.Assert(got.Status == "label" && got.OrderID == "ord_8123", "a new shipment must answer status label for ord_8123, got %s", r.Text())
-	saved := store.GetShipment(apiBg, shipmentID)
+	saved := store.GetShipment(hApiBg, shipmentID)
 	ctx.Assert(saved != nil && saved.TenantID == "t-acme" && saved.Carrier == "ups", "the store holds %+v for %s, expected t-acme's ups shipment", saved, shipmentID)
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/shipments", body, "Idempotency-Key", "k-1")
+	c := hAPI(ctx)
+	r := c.Post("/v1/shipments", hBody, "Idempotency-Key", "k-1")
 	ctx.Equal(r.Status, 401, "a create without X-Tenant-Id; the status")
-	r = create(c, "k-2", with("carrier", "upss"), "t-acme")
+	r = hCreate(c, "k-2", hWith("carrier", "upss"), "t-acme")
 	ctx.Equal(r.Status, 422, "a create for carrier 'upss' (no partner has it) must be refused; ask registry.Lookup; the status")
-	r = create(c, "k-3", with("service_level", "overnight"), "t-acme")
+	r = hCreate(c, "k-3", hWith("service_level", "overnight"), "t-acme")
 	ctx.Equal(r.Status, 400, "service_level 'overnight' (ground, express, freight); the status")
-	r = create(c, "k-4", with("order_id", ""), "t-acme")
+	r = hCreate(c, "k-4", hWith("order_id", ""), "t-acme")
 	ctx.Equal(r.Status, 400, "an empty order_id; the status")
 	saved := ctx.Redis.Keys("order:*")
 	ctx.Assert(len(saved) == 0, "refused creates still saved shipments: %q", saved)
-	fedex := with("carrier", "fedex")
+	fedex := hWith("carrier", "fedex")
 	fedex["service_level"] = "express"
-	created(ctx, create(c, "k-5", fedex, "t-acme"), "a valid fedex express create")
+	hCreated(ctx, hCreate(c, "k-5", fedex, "t-acme"), "a valid fedex express create")
+	usps := hWith("carrier", "usps")
+	usps["service_level"] = "freight"
+	usps["order_id"] = "ord_9001"
+	hCreated(ctx, hCreate(c, "k-6", usps, "t-acme"), "a valid usps freight create (every registry carrier, every service level)")
 }
 
 func CheckSingleActive(ctx *harness.Ctx) {
-	c := api(ctx)
-	firstID := created(ctx, create(c, "k-1", body, "t-acme"), "the first create")
-	second := create(c, "k-2", body, "t-acme")
+	c := hAPI(ctx)
+	firstID := hCreated(ctx, hCreate(c, "k-1", hBody, "t-acme"), "the first create")
+	second := hCreate(c, "k-2", hBody, "t-acme")
 	ctx.Equal(second.Status, 409, "a second shipment for ord_8123 while %s is live (%s); the status", firstID, second.Text())
 	var conflict struct {
 		Error      string \`json:"error"\`
@@ -872,35 +921,53 @@ func CheckSingleActive(ctx *harness.Ctx) {
 	second.Decode(&conflict)
 	ctx.Assert(conflict.Error == "active_shipment_exists" && conflict.ShipmentID == firstID, "the 409 must name the live shipment (active_shipment_exists, %s), got %s", firstID, second.Text())
 	ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), []string{firstID}, "the refused create must save nothing; the order's shipments")
-	store.SetStatus(apiBg, firstID, "delivered", 100)
-	created(ctx, create(c, "k-3", body, "t-acme"), "a create after the order's shipment was delivered (no longer live)")
+	for _, live := range []string{"in_transit", "out_for_delivery"} {
+		store.SetStatus(hApiBg, firstID, live, 100)
+		again := hCreate(c, "k-"+live, hBody, "t-acme")
+		var named struct {
+			ShipmentID string \`json:"shipment_id"\`
+		}
+		again.Decode(&named)
+		ctx.Assert(again.Status == 409 && named.ShipmentID == firstID, "a create while %s is %s (still live) answered %d %s, expected 409 naming it", firstID, live, again.Status, again.Text())
+	}
+	store.SetStatus(hApiBg, firstID, "delivered", 100)
+	third := hCreate(c, "k-3", hBody, "t-acme")
+	thirdID := hCreated(ctx, third, "a create after the order's shipment was delivered (no longer live)")
+	ctx.Equal(hReplacementOf(third), "", "a create after a delivered shipment replaces nothing (replacement_of is only for a cancelled one); replacement_of")
+	store.SetStatus(hApiBg, thirdID, "returned", 200)
+	fourth := hCreate(c, "k-4", hBody, "t-acme")
+	hCreated(ctx, fourth, "a create after the order's shipment was returned (no longer live)")
+	ctx.Equal(hReplacementOf(fourth), "", "a create after a returned shipment replaces nothing; replacement_of")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := create(c, "k-1", body, "t-acme")
-	firstID := created(ctx, first, "the first create")
-	replay := create(c, "k-1", body, "t-acme")
+	c := hAPI(ctx)
+	first := hCreate(c, "k-1", hBody, "t-acme")
+	firstID := hCreated(ctx, first, "the first create")
+	replay := hCreate(c, "k-1", hBody, "t-acme")
 	ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the recorded shipment (%s); the status", replay.Text())
 	ctx.Equal(replay.JSON(), first.JSON(), "the replay must answer the recorded shipment")
-	missing := c.Post("/v1/shipments", body, "X-Tenant-Id", "t-acme")
+	missing := c.Post("/v1/shipments", hBody, "X-Tenant-Id", "t-acme")
 	ctx.Equal(missing.Status, 400, "a create without Idempotency-Key; the status")
 	ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), []string{firstID}, "one create and its replay; the order's shipments")
-	otherID := created(ctx, create(c, "k-1", body, "t-globex"), "another tenant's create with the same key")
+	store.SetStatus(hApiBg, firstID, "delivered", 100)
+	late := hCreate(c, "k-1", hBody, "t-acme")
+	ctx.Equal(late.Status, 200, "a replay of k-1 after %s was delivered must answer the recorded shipment: the key is looked up before anything else (%s); the status", firstID, late.Text())
+	ctx.Equal(late.JSON(), first.JSON(), "a replay of k-1 after delivery must answer the recorded shipment")
+	ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), []string{firstID}, "a replay after delivery must save nothing; the order's shipments")
+	otherID := hCreated(ctx, hCreate(c, "k-1", hBody, "t-globex"), "another tenant's create with the same key")
 	ctx.Assert(otherID != firstID, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant")
 }
 
 func CheckReplacement(ctx *harness.Ctx) {
-	c := api(ctx)
-	firstID := created(ctx, create(c, "k-1", body, "t-acme"), "the first create")
-	store.SetStatus(apiBg, firstID, "cancelled", 100)
-	second := create(c, "k-2", body, "t-acme")
-	secondID := created(ctx, second, "a create after the order's shipment was cancelled")
+	c := hAPI(ctx)
+	firstID := hCreated(ctx, hCreate(c, "k-1", hBody, "t-acme"), "the first create")
+	store.SetStatus(hApiBg, firstID, "cancelled", 100)
+	second := hCreate(c, "k-2", hBody, "t-acme")
+	secondID := hCreated(ctx, second, "a create after the order's shipment was cancelled")
 	ctx.Assert(secondID != firstID, "the replacement reused the cancelled id %s: the carrier's scans for the voided label would land on it", firstID)
-	var got store.Shipment
-	second.Decode(&got)
-	ctx.Equal(got.ReplacementOf, firstID, "the replacement must name the cancelled shipment; replacement_of")
-	ctx.Equal(store.GetShipment(apiBg, firstID).Status, "cancelled", "the cancelled shipment's status")
+	ctx.Equal(hReplacementOf(second), firstID, "the replacement must name the cancelled shipment; replacement_of")
+	ctx.Equal(store.GetShipment(hApiBg, firstID).Status, "cancelled", "the cancelled shipment's status")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -918,7 +985,7 @@ namespace {
 
 const json kBody = {{"order_id", "ord_8123"}, {"carrier", "ups"}, {"service_level", "ground"}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP h_api(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -926,13 +993,13 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json with(const std::string& field, const std::string& value) {
+json h_with(const std::string& field, const std::string& value) {
   json out = kBody;
   out[field] = value;
   return out;
 }
 
-harness::Response create(harness::HTTP& c, const std::string& key, const json& body, const std::string& tenant) {
+harness::Response h_create(harness::HTTP& c, const std::string& key, const json& body, const std::string& tenant) {
   std::vector<std::string> headers = {"Content-Type", "application/json", "Idempotency-Key", key};
   if (!tenant.empty()) {
     headers.push_back("X-Tenant-Id");
@@ -941,17 +1008,22 @@ harness::Response create(harness::HTTP& c, const std::string& key, const json& b
   return c.Send("POST", "/v1/shipments", body.dump(), headers);
 }
 
-std::string created(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+std::string h_created(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   ctx.Equal(r.Status, 201, "%s (%s); the status", what, r.Text());
   return json::parse(r.Text()).value("shipment_id", "");
+}
+
+std::string h_replacement_of(const harness::Response& r) {
+  const json got = json::parse(r.Text(), nullptr, false);
+  return got.is_object() ? got.value("replacement_of", "") : "";
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = create(c, "k-1", kBody, "t-acme");
-  const std::string shipment_id = created(ctx, r, "POST /v1/shipments");
+  auto c = h_api(ctx);
+  const auto r = h_create(c, "k-1", kBody, "t-acme");
+  const std::string shipment_id = h_created(ctx, r, "POST /v1/shipments");
   const json got = json::parse(r.Text());
   ctx.Assert(got.value("status", "") == "label" && got.value("order_id", "") == "ord_8123", "a new shipment must answer status label for ord_8123, got %s", r.Text());
   const auto saved = store::getShipment(shipment_id);
@@ -960,57 +1032,79 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   auto r = c.Post("/v1/shipments", kBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-1");
   ctx.Equal(r.Status, 401, "a create without X-Tenant-Id; the status");
-  r = create(c, "k-2", with("carrier", "upss"), "t-acme");
+  r = h_create(c, "k-2", h_with("carrier", "upss"), "t-acme");
   ctx.Equal(r.Status, 422, "a create for carrier 'upss' (no partner has it) must be refused; ask registry::lookup; the status");
-  r = create(c, "k-3", with("service_level", "overnight"), "t-acme");
+  r = h_create(c, "k-3", h_with("service_level", "overnight"), "t-acme");
   ctx.Equal(r.Status, 400, "service_level 'overnight' (ground, express, freight); the status");
-  r = create(c, "k-4", with("order_id", ""), "t-acme");
+  r = h_create(c, "k-4", h_with("order_id", ""), "t-acme");
   ctx.Equal(r.Status, 400, "an empty order_id; the status");
   const auto saved = ctx.Redis.Keys("order:*");
   ctx.Assert(saved.empty(), "refused creates still saved shipments: %q", saved);
-  json fedex = with("carrier", "fedex");
+  json fedex = h_with("carrier", "fedex");
   fedex["service_level"] = "express";
-  created(ctx, create(c, "k-5", fedex, "t-acme"), "a valid fedex express create");
+  h_created(ctx, h_create(c, "k-5", fedex, "t-acme"), "a valid fedex express create");
+  json usps = h_with("carrier", "usps");
+  usps["service_level"] = "freight";
+  usps["order_id"] = "ord_9001";
+  h_created(ctx, h_create(c, "k-6", usps, "t-acme"), "a valid usps freight create (every registry carrier, every service level)");
 }
 
 void CheckSingleActive(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string first_id = created(ctx, create(c, "k-1", kBody, "t-acme"), "the first create");
-  const auto second = create(c, "k-2", kBody, "t-acme");
+  auto c = h_api(ctx);
+  const std::string first_id = h_created(ctx, h_create(c, "k-1", kBody, "t-acme"), "the first create");
+  const auto second = h_create(c, "k-2", kBody, "t-acme");
   ctx.Equal(second.Status, 409, "a second shipment for ord_8123 while %s is live (%s); the status", first_id, second.Text());
   const json conflict = json::parse(second.Text(), nullptr, false);
   ctx.Assert(conflict.is_object() && conflict.value("error", "") == "active_shipment_exists" && conflict.value("shipment_id", "") == first_id,
              "the 409 must name the live shipment (active_shipment_exists, %s), got %s", first_id, second.Text());
   ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "the refused create must save nothing; the order's shipments");
+  for (const std::string live : {"in_transit", "out_for_delivery"}) {
+    store::setStatus(first_id, live, 100);
+    const auto again = h_create(c, "k-" + live, kBody, "t-acme");
+    const json named = json::parse(again.Text(), nullptr, false);
+    ctx.Assert(again.Status == 409 && named.is_object() && named.value("shipment_id", "") == first_id,
+               "a create while %s is %s (still live) answered %d %s, expected 409 naming it", first_id, live, again.Status, again.Text());
+  }
   store::setStatus(first_id, "delivered", 100);
-  created(ctx, create(c, "k-3", kBody, "t-acme"), "a create after the order's shipment was delivered (no longer live)");
+  const auto third = h_create(c, "k-3", kBody, "t-acme");
+  const std::string third_id = h_created(ctx, third, "a create after the order's shipment was delivered (no longer live)");
+  ctx.Equal(h_replacement_of(third), "", "a create after a delivered shipment replaces nothing (replacement_of is only for a cancelled one); replacement_of");
+  store::setStatus(third_id, "returned", 200);
+  const auto fourth = h_create(c, "k-4", kBody, "t-acme");
+  h_created(ctx, fourth, "a create after the order's shipment was returned (no longer live)");
+  ctx.Equal(h_replacement_of(fourth), "", "a create after a returned shipment replaces nothing; replacement_of");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = create(c, "k-1", kBody, "t-acme");
-  const std::string first_id = created(ctx, first, "the first create");
-  const auto replay = create(c, "k-1", kBody, "t-acme");
+  auto c = h_api(ctx);
+  const auto first = h_create(c, "k-1", kBody, "t-acme");
+  const std::string first_id = h_created(ctx, first, "the first create");
+  const auto replay = h_create(c, "k-1", kBody, "t-acme");
   ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1 must answer the recorded shipment (%s); the status", replay.Text());
   ctx.Equal(json::parse(replay.Text()), json::parse(first.Text()), "the replay must answer the recorded shipment");
   const auto missing = c.Post("/v1/shipments", kBody.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t-acme");
   ctx.Equal(missing.Status, 400, "a create without Idempotency-Key; the status");
   ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "one create and its replay; the order's shipments");
-  const std::string other_id = created(ctx, create(c, "k-1", kBody, "t-globex"), "another tenant's create with the same key");
+  store::setStatus(first_id, "delivered", 100);
+  const auto late = h_create(c, "k-1", kBody, "t-acme");
+  ctx.Equal(late.Status, 200, "a replay of k-1 after %s was delivered must answer the recorded shipment: the key is looked up before anything else (%s); the status", first_id, late.Text());
+  ctx.Equal(json::parse(late.Text(), nullptr, false), json::parse(first.Text()), "a replay of k-1 after delivery must answer the recorded shipment");
+  ctx.Equal(ctx.Redis.LRange("order:t-acme:ord_8123", 0, -1), {first_id}, "a replay after delivery must save nothing; the order's shipments");
+  const std::string other_id = h_created(ctx, h_create(c, "k-1", kBody, "t-globex"), "another tenant's create with the same key");
   ctx.Assert(other_id != first_id, "another tenant's key k-1 answered t-acme's shipment: keys are scoped by tenant");
 }
 
 void CheckReplacement(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string first_id = created(ctx, create(c, "k-1", kBody, "t-acme"), "the first create");
+  auto c = h_api(ctx);
+  const std::string first_id = h_created(ctx, h_create(c, "k-1", kBody, "t-acme"), "the first create");
   store::setStatus(first_id, "cancelled", 100);
-  const auto second = create(c, "k-2", kBody, "t-acme");
-  const std::string second_id = created(ctx, second, "a create after the order's shipment was cancelled");
+  const auto second = h_create(c, "k-2", kBody, "t-acme");
+  const std::string second_id = h_created(ctx, second, "a create after the order's shipment was cancelled");
   ctx.Assert(second_id != first_id, "the replacement reused the cancelled id %s: the carrier's scans for the voided label would land on it", first_id);
-  ctx.Equal(json::parse(second.Text()).value("replacement_of", ""), first_id, "the replacement must name the cancelled shipment; replacement_of");
+  ctx.Equal(h_replacement_of(second), first_id, "the replacement must name the cancelled shipment; replacement_of");
   ctx.Equal(store::getShipment(first_id)->status, "cancelled", "the cancelled shipment's status");
 }
 `,

@@ -128,7 +128,7 @@ and a damage claim needs no photo.
       id: 'reason-photo',
       title: 'Checks the reason code and its evidence',
       detail:
-        '`reason_code` must be in `REASON_CODES`, and the `PHOTO_REQUIRED` reasons need a `photo_ref`; either failure is **400**. The starter stores whatever reason it is sent.',
+        '`reason_code` must be in `REASON_CODES`, and the `PHOTO_REQUIRED` reasons need a non-empty `photo_ref`; either failure is **400**. The starter stores whatever reason it is sent.',
       match: {
         python: {all: [/REASON_CODES/, /PHOTO_REQUIRED/, /\b400\b/]},
         typescript: {all: [/REASON_CODES/, /PHOTO_REQUIRED/, /\b400\b/]},
@@ -707,9 +707,14 @@ async def check_window(ctx):
     _line("L-ext", 45, "extended")
     _line("L-30", 30)
     _line("L-31", 31)
+    _line("L-60", 60, "extended")
+    _line("L-61", 61, "extended")
     async with _api(ctx) as c:
         r = await _post(c, "L-ext")
         assert r.status_code == 201, f"an extended line delivered 45 days ago (a 60-day window) answered {r.status_code}: {r.text}. The window is the line's policy_window"
+        r = await _post(c, "L-60")
+        assert r.status_code == 201, f"an extended line delivered 60 days ago is on the last day of its window; it answered {r.status_code}: {r.text}"
+        late_ext = await _post(c, "L-61")
         r = await _post(c, "L-30")
         assert r.status_code == 201, f"a standard line delivered 30 days ago is on the last day of its window; it answered {r.status_code}: {r.text}"
         r = await _post(c, "L-31")
@@ -718,6 +723,11 @@ async def check_window(ctx):
     body = _json(r)
     assert body.get("delivered_at") == delivered and body.get("window_ends") == store.add_days(delivered, 30), f"the 422 must carry delivered_at {delivered} and window_ends {store.add_days(delivered, 30)}, got {r.text}"
     assert _left(ctx, "L-31") == 2, "a return outside the window took units from the line"
+    assert late_ext.status_code == 422, f"an extended line delivered 61 days ago answered {late_ext.status_code}, expected 422: its 60-day window has closed"
+    delivered = store.line_of("L-61")["delivered_at"]
+    body = _json(late_ext)
+    assert body.get("delivered_at") == delivered and body.get("window_ends") == store.add_days(delivered, 60), f"the 422 for an extended line must carry delivered_at {delivered} and window_ends {store.add_days(delivered, 60)}, got {late_ext.text}"
+    assert _left(ctx, "L-61") == 2, "a return outside the extended window took units from the line"
 
 
 async def check_no_client_flag(ctx):
@@ -748,13 +758,19 @@ async def check_reason_photo(ctx):
     async with _api(ctx) as c:
         r = await _post(c, "L1", reason="it_was_late")
         assert r.status_code == 400, f"reason_code it_was_late answered {r.status_code}, expected 400: the reason codes are a fixed set"
-        r = await _post(c, "L1", reason="damaged")
-        assert r.status_code == 400, f"a damaged claim without a photo_ref answered {r.status_code}, expected 400"
+        for reason in ("damaged", "wrong_item", "not_as_described"):
+            r = await _post(c, "L1", reason=reason)
+            assert r.status_code == 400, f"a {reason} claim without a photo_ref answered {r.status_code}, expected 400"
+        r = await _post(c, "L1", reason="damaged", photo="")
+        assert r.status_code == 400, f"a damaged claim with an empty photo_ref answered {r.status_code}, expected 400: an empty reference is no evidence"
         assert _left(ctx, "L1") == 5, f"a refused claim took units: {_left(ctx, 'L1')} of 5 left"
         r = await _post(c, "L1", reason="damaged", photo="photos/kettle-dent.jpg")
         assert r.status_code == 201, f"a damaged claim with a photo answered {r.status_code}: {r.text}"
         stored = ctx.redis.hget(f"return:{r.json()['return_id']}", "photo_ref")
         assert stored == "photos/kettle-dent.jpg", f"the return records photo_ref {stored!r}"
+        for reason in ("wrong_item", "not_as_described"):
+            r = await _post(c, "L1", reason=reason, photo="photos/kettle-box.jpg")
+            assert r.status_code == 201, f"a {reason} claim with a photo answered {r.status_code}: {r.text}"
         r = await _post(c, "L1", reason="late_delivery")
     assert r.status_code == 201, f"late_delivery needs no photo; it answered {r.status_code}: {r.text}"
 `,
@@ -808,16 +824,26 @@ export async function check_window(ctx) {
   await line('L-ext', 45, 'extended');
   await line('L-30', 30);
   await line('L-31', 31);
+  await line('L-60', 60, 'extended');
+  await line('L-61', 61, 'extended');
   let r = await post(c, 'L-ext');
   assert.equal(r.status, 201, \`an extended line delivered 45 days ago (a 60-day window) answered \${r.status}: \${r.text}. The window is the line's policy_window\`);
+  r = await post(c, 'L-60');
+  assert.equal(r.status, 201, \`an extended line delivered 60 days ago is on the last day of its window; it answered \${r.status}: \${r.text}\`);
+  const lateExt = await post(c, 'L-61');
   r = await post(c, 'L-30');
   assert.equal(r.status, 201, \`a standard line delivered 30 days ago is on the last day of its window; it answered \${r.status}: \${r.text}\`);
   r = await post(c, 'L-31');
   assert.equal(r.status, 422, \`a standard line delivered 31 days ago answered \${r.status}, expected 422\`);
-  const delivered = (await store.lineOf('L-31')).delivered_at;
-  const body = json(r);
+  let delivered = (await store.lineOf('L-31')).delivered_at;
+  let body = json(r);
   assert(body.delivered_at === delivered && body.window_ends === store.addDays(delivered, 30), \`the 422 must carry delivered_at \${delivered} and window_ends \${store.addDays(delivered, 30)}, got \${r.text}\`);
   assert.equal(left(ctx, 'L-31'), 2, 'a return outside the window took units from the line');
+  assert.equal(lateExt.status, 422, \`an extended line delivered 61 days ago answered \${lateExt.status}, expected 422: its 60-day window has closed\`);
+  delivered = (await store.lineOf('L-61')).delivered_at;
+  body = json(lateExt);
+  assert(body.delivered_at === delivered && body.window_ends === store.addDays(delivered, 60), \`the 422 for an extended line must carry delivered_at \${delivered} and window_ends \${store.addDays(delivered, 60)}, got \${lateExt.text}\`);
+  assert.equal(left(ctx, 'L-61'), 2, 'a return outside the extended window took units from the line');
 }
 
 export async function check_no_client_flag(ctx) {
@@ -849,13 +875,21 @@ export async function check_reason_photo(ctx) {
   await line('L1', 3, 'standard', 5);
   let r = await post(c, 'L1', {reason: 'it_was_late'});
   assert.equal(r.status, 400, \`reason_code it_was_late answered \${r.status}, expected 400: the reason codes are a fixed set\`);
-  r = await post(c, 'L1', {reason: 'damaged'});
-  assert.equal(r.status, 400, \`a damaged claim without a photo_ref answered \${r.status}, expected 400\`);
+  for (const reason of ['damaged', 'wrong_item', 'not_as_described']) {
+    r = await post(c, 'L1', {reason});
+    assert.equal(r.status, 400, \`a \${reason} claim without a photo_ref answered \${r.status}, expected 400\`);
+  }
+  r = await post(c, 'L1', {reason: 'damaged', photo: ''});
+  assert.equal(r.status, 400, \`a damaged claim with an empty photo_ref answered \${r.status}, expected 400: an empty reference is no evidence\`);
   assert.equal(left(ctx, 'L1'), 5, 'a refused claim took units from the line');
   r = await post(c, 'L1', {reason: 'damaged', photo: 'photos/kettle-dent.jpg'});
   assert.equal(r.status, 201, \`a damaged claim with a photo answered \${r.status}: \${r.text}\`);
   const stored = ctx.redis.hget(\`return:\${r.json().return_id}\`, 'photo_ref');
   assert.equal(stored, 'photos/kettle-dent.jpg', \`the return records photo_ref \${JSON.stringify(stored)}\`);
+  for (const reason of ['wrong_item', 'not_as_described']) {
+    r = await post(c, 'L1', {reason, photo: 'photos/kettle-box.jpg'});
+    assert.equal(r.status, 201, \`a \${reason} claim with a photo answered \${r.status}: \${r.text}\`);
+  }
   r = await post(c, 'L1', {reason: 'late_delivery'});
   assert.equal(r.status, 201, \`late_delivery needs no photo; it answered \${r.status}: \${r.text}\`);
 }
@@ -884,7 +918,7 @@ func apiLine(lineID string, daysAgo int, window string, ordered int64) {
 	})
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func apiServer(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
@@ -915,7 +949,7 @@ func apiLeft(ctx *harness.Ctx, lineID string) int {
 
 func CheckRoute(ctx *harness.Ctx) {
 	apiLine("L1", 3, "standard", 2)
-	c := api(ctx)
+	c := apiServer(ctx)
 	r := apiPost(c, "L1", 1, "changed_mind", "", apiTenant, nil)
 	ctx.Equal(r.Status, 201, "POST /v1/returns for a line delivered 3 days ago (%s)", r.Text())
 	body := apiJSON(r)
@@ -934,9 +968,14 @@ func CheckWindow(ctx *harness.Ctx) {
 	apiLine("L-ext", 45, "extended", 2)
 	apiLine("L-30", 30, "standard", 2)
 	apiLine("L-31", 31, "standard", 2)
-	c := api(ctx)
+	apiLine("L-60", 60, "extended", 2)
+	apiLine("L-61", 61, "extended", 2)
+	c := apiServer(ctx)
 	r := apiPost(c, "L-ext", 1, "changed_mind", "", apiTenant, nil)
 	ctx.Equal(r.Status, 201, "an extended line delivered 45 days ago (a 60-day window) must be returnable: the window is the line's policy_window (%s)", r.Text())
+	r = apiPost(c, "L-60", 1, "changed_mind", "", apiTenant, nil)
+	ctx.Equal(r.Status, 201, "an extended line delivered 60 days ago is on the last day of its window (%s)", r.Text())
+	lateExt := apiPost(c, "L-61", 1, "changed_mind", "", apiTenant, nil)
 	r = apiPost(c, "L-30", 1, "changed_mind", "", apiTenant, nil)
 	ctx.Equal(r.Status, 201, "a standard line delivered 30 days ago is on the last day of its window (%s)", r.Text())
 	r = apiPost(c, "L-31", 1, "changed_mind", "", apiTenant, nil)
@@ -945,18 +984,23 @@ func CheckWindow(ctx *harness.Ctx) {
 	body := apiJSON(r)
 	ctx.Assert(body["delivered_at"] == delivered && body["window_ends"] == store.AddDays(delivered, 30), "the 422 must carry delivered_at %s and window_ends %s, got %s", delivered, store.AddDays(delivered, 30), r.Text())
 	ctx.Equal(apiLeft(ctx, "L-31"), 2, "a return outside the window must not take units; the line's returnable units")
+	ctx.Equal(lateExt.Status, 422, "an extended line delivered 61 days ago (its 60-day window has closed)")
+	delivered = store.LineOf(apiBg, "L-61").DeliveredAt
+	body = apiJSON(lateExt)
+	ctx.Assert(body["delivered_at"] == delivered && body["window_ends"] == store.AddDays(delivered, 60), "the 422 for an extended line must carry delivered_at %s and window_ends %s, got %s", delivered, store.AddDays(delivered, 60), lateExt.Text())
+	ctx.Equal(apiLeft(ctx, "L-61"), 2, "a return outside the extended window must not take units; the line's returnable units")
 }
 
 func CheckNoClientFlag(ctx *harness.Ctx) {
 	apiLine("L1", 40, "standard", 2)
-	r := apiPost(api(ctx), "L1", 1, "changed_mind", "", apiTenant, map[string]any{"eligible": true})
+	r := apiPost(apiServer(ctx), "L1", 1, "changed_mind", "", apiTenant, map[string]any{"eligible": true})
 	ctx.Equal(r.Status, 422, "a standard line delivered 40 days ago, asked with eligible: true in the body (the caller reopened a closed window; eligibility comes from the line, not the request)")
 	ctx.Assert(apiLeft(ctx, "L1") == 2 && len(ctx.Redis.Keys("return:ret-*")) == 0, "the refused return still took units (%d of 2 left) or left a record", apiLeft(ctx, "L1"))
 }
 
 func CheckQuantity(ctx *harness.Ctx) {
 	apiLine("L1", 3, "standard", 2)
-	c := api(ctx)
+	c := apiServer(ctx)
 	for _, bad := range []int{0, -2} {
 		r := apiPost(c, "L1", bad, "changed_mind", "", apiTenant, nil)
 		ctx.Equal(r.Status, 400, "quantity %d", bad)
@@ -972,17 +1016,25 @@ func CheckQuantity(ctx *harness.Ctx) {
 
 func CheckReasonPhoto(ctx *harness.Ctx) {
 	apiLine("L1", 3, "standard", 5)
-	c := api(ctx)
+	c := apiServer(ctx)
 	r := apiPost(c, "L1", 1, "it_was_late", "", apiTenant, nil)
 	ctx.Equal(r.Status, 400, "reason_code it_was_late (the reason codes are a fixed set)")
-	r = apiPost(c, "L1", 1, "damaged", "", apiTenant, nil)
-	ctx.Equal(r.Status, 400, "a damaged claim without a photo_ref")
+	for _, reason := range []string{"damaged", "wrong_item", "not_as_described"} {
+		r = apiPost(c, "L1", 1, reason, "", apiTenant, nil)
+		ctx.Equal(r.Status, 400, "a %s claim without a photo_ref", reason)
+	}
+	r = apiPost(c, "L1", 1, "damaged", "", apiTenant, map[string]any{"photo_ref": ""})
+	ctx.Equal(r.Status, 400, "a damaged claim with an empty photo_ref (an empty reference is no evidence)")
 	ctx.Equal(apiLeft(ctx, "L1"), 5, "a refused claim must not take units; the returnable units")
 	r = apiPost(c, "L1", 1, "damaged", "photos/kettle-dent.jpg", apiTenant, nil)
 	ctx.Equal(r.Status, 201, "a damaged claim with a photo (%s)", r.Text())
 	returnID, _ := apiJSON(r)["return_id"].(string)
 	stored, _ := ctx.Redis.HGet("return:"+returnID, "photo_ref")
 	ctx.Equal(stored, "photos/kettle-dent.jpg", "the return's photo_ref")
+	for _, reason := range []string{"wrong_item", "not_as_described"} {
+		r = apiPost(c, "L1", 1, reason, "photos/kettle-box.jpg", apiTenant, nil)
+		ctx.Equal(r.Status, 201, "a %s claim with a photo (%s)", reason, r.Text())
+	}
 	r = apiPost(c, "L1", 1, "late_delivery", "", apiTenant, nil)
 	ctx.Equal(r.Status, 201, "late_delivery needs no photo (%s)", r.Text())
 }
@@ -997,13 +1049,13 @@ func CheckReasonPhoto(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTenant = "t-1";
+const std::string hTenant = "t-1";
 
-void line(const std::string& line_id, long long days_ago, const std::string& window = "standard", long long ordered = 2) {
-  store::putLine(store::OrderLine{line_id, kTenant, "KETTLE-2L", ordered, 4000, store::addDays(store::today(), -days_ago), window});
+void hLine(const std::string& line_id, long long days_ago, const std::string& window = "standard", long long ordered = 2) {
+  store::putLine(store::OrderLine{line_id, hTenant, "KETTLE-2L", ordered, 4000, store::addDays(store::today(), -days_ago), window});
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1011,20 +1063,20 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const std::string& line_id, long long quantity = 1, const std::string& reason = "changed_mind",
-                       const std::string& photo = "", const std::string& tenant = kTenant, bool eligible = false) {
+harness::Response hPost(harness::HTTP& c, const std::string& line_id, long long quantity = 1, const std::string& reason = "changed_mind",
+                        const std::string& photo = "", const std::string& tenant = hTenant, const nlohmann::json& extra = nlohmann::json::object()) {
   nlohmann::json body = {{"order_line_id", line_id}, {"quantity", quantity}, {"reason_code", reason}};
   if (!photo.empty()) body["photo_ref"] = photo;
-  if (eligible) body["eligible"] = true;
+  for (const auto& [k, v] : extra.items()) body[k] = v;
   return c.Post("/v1/returns", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json body(const harness::Response& r) {
+nlohmann::json hBody(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
 
-long long left(harness::Ctx& ctx, const std::string& line_id) {
+long long hLeft(harness::Ctx& ctx, const std::string& line_id) {
   const auto v = ctx.Redis.Get("line:" + line_id + ":returnable");
   return v ? std::stoll(*v) : 0;
 }
@@ -1032,71 +1084,88 @@ long long left(harness::Ctx& ctx, const std::string& line_id) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  line("L1", 3);
-  auto c = api(ctx);
-  const auto r = post(c, "L1");
+  hLine("L1", 3);
+  auto c = hApi(ctx);
+  const auto r = hPost(c, "L1");
   ctx.Equal(r.Status, 201, "POST /v1/returns for a line delivered 3 days ago (%s)", r.Text());
-  const auto b = body(r);
+  const auto b = hBody(r);
   const std::string return_id = b.value("return_id", "");
   ctx.Assert(b.value("quantity", 0LL) == 1 && b.value("state", "") == "registered" && !return_id.empty(), "the 201 must carry return_id, quantity 1 and state registered, got %s", r.Text());
   auto record = ctx.Redis.HGetAll("return:" + return_id);
-  ctx.Assert(record["order_line_id"] == "L1" && record["tenant"] == kTenant && record["state"] == "registered", "return:%s holds order_line_id %q, tenant %q, state %q", return_id, record["order_line_id"], record["tenant"], record["state"]);
-  ctx.Equal(left(ctx, "L1"), 1, "the line's returnable units after a return of 1 of 2");
-  ctx.Equal(post(c, "L1", 1, "changed_mind", "", "t-2").Status, 404, "another tenant's order line");
-  ctx.Equal(post(c, "L-404").Status, 404, "an unknown order line");
+  ctx.Assert(record["order_line_id"] == "L1" && record["tenant"] == hTenant && record["state"] == "registered", "return:%s holds order_line_id %q, tenant %q, state %q", return_id, record["order_line_id"], record["tenant"], record["state"]);
+  ctx.Equal(hLeft(ctx, "L1"), 1, "the line's returnable units after a return of 1 of 2");
+  ctx.Equal(hPost(c, "L1", 1, "changed_mind", "", "t-2").Status, 404, "another tenant's order line");
+  ctx.Equal(hPost(c, "L-404").Status, 404, "an unknown order line");
 }
 
 void CheckWindow(harness::Ctx& ctx) {
-  line("L-ext", 45, "extended");
-  line("L-30", 30);
-  line("L-31", 31);
-  auto c = api(ctx);
-  auto r = post(c, "L-ext");
+  hLine("L-ext", 45, "extended");
+  hLine("L-30", 30);
+  hLine("L-31", 31);
+  hLine("L-60", 60, "extended");
+  hLine("L-61", 61, "extended");
+  auto c = hApi(ctx);
+  auto r = hPost(c, "L-ext");
   ctx.Equal(r.Status, 201, "an extended line delivered 45 days ago (a 60-day window) must be returnable: the window is the line's policy_window (%s)", r.Text());
-  r = post(c, "L-30");
+  r = hPost(c, "L-60");
+  ctx.Equal(r.Status, 201, "an extended line delivered 60 days ago is on the last day of its window (%s)", r.Text());
+  const auto late_ext = hPost(c, "L-61");
+  r = hPost(c, "L-30");
   ctx.Equal(r.Status, 201, "a standard line delivered 30 days ago is on the last day of its window (%s)", r.Text());
-  r = post(c, "L-31");
+  r = hPost(c, "L-31");
   ctx.Equal(r.Status, 422, "a standard line delivered 31 days ago");
-  const std::string delivered = store::lineOf("L-31")->delivered_at;
-  const auto b = body(r);
+  std::string delivered = store::lineOf("L-31")->delivered_at;
+  auto b = hBody(r);
   ctx.Assert(b.value("delivered_at", "") == delivered && b.value("window_ends", "") == store::addDays(delivered, 30), "the 422 must carry delivered_at %s and window_ends %s, got %s", delivered, store::addDays(delivered, 30), r.Text());
-  ctx.Equal(left(ctx, "L-31"), 2, "a return outside the window must not take units; the line's returnable units");
+  ctx.Equal(hLeft(ctx, "L-31"), 2, "a return outside the window must not take units; the line's returnable units");
+  ctx.Equal(late_ext.Status, 422, "an extended line delivered 61 days ago (its 60-day window has closed)");
+  delivered = store::lineOf("L-61")->delivered_at;
+  b = hBody(late_ext);
+  ctx.Assert(b.value("delivered_at", "") == delivered && b.value("window_ends", "") == store::addDays(delivered, 60), "the 422 for an extended line must carry delivered_at %s and window_ends %s, got %s", delivered, store::addDays(delivered, 60), late_ext.Text());
+  ctx.Equal(hLeft(ctx, "L-61"), 2, "a return outside the extended window must not take units; the line's returnable units");
 }
 
 void CheckNoClientFlag(harness::Ctx& ctx) {
-  line("L1", 40);
-  auto c = api(ctx);
-  const auto r = post(c, "L1", 1, "changed_mind", "", kTenant, true);
+  hLine("L1", 40);
+  auto c = hApi(ctx);
+  const auto r = hPost(c, "L1", 1, "changed_mind", "", hTenant, {{"eligible", true}});
   ctx.Equal(r.Status, 422, "a standard line delivered 40 days ago, asked with eligible: true in the body (the caller reopened a closed window; eligibility comes from the line, not the request)");
-  ctx.Assert(left(ctx, "L1") == 2 && ctx.Redis.Keys("return:ret-*").empty(), "the refused return still took units (%d of 2 left) or left a record", left(ctx, "L1"));
+  ctx.Assert(hLeft(ctx, "L1") == 2 && ctx.Redis.Keys("return:ret-*").empty(), "the refused return still took units (%d of 2 left) or left a record", hLeft(ctx, "L1"));
 }
 
 void CheckQuantity(harness::Ctx& ctx) {
-  line("L1", 3, "standard", 2);
-  auto c = api(ctx);
+  hLine("L1", 3, "standard", 2);
+  auto c = hApi(ctx);
   for (const long long bad : {0LL, -2LL}) {
-    const auto r = post(c, "L1", bad);
+    const auto r = hPost(c, "L1", bad);
     ctx.Equal(r.Status, 400, "quantity %d", bad);
-    ctx.Equal(left(ctx, "L1"), 2, "quantity %d must leave the line alone (a negative return hands units back); the returnable units", bad);
+    ctx.Equal(hLeft(ctx, "L1"), 2, "quantity %d must leave the line alone (a negative return hands units back); the returnable units", bad);
   }
-  auto r = post(c, "L1", 3);
-  ctx.Assert(r.Status == 409 && body(r).value("remaining", -1LL) == 2, "3 units of a line with 2 returnable answered %d %s, expected 409 with remaining 2", r.Status, r.Text());
-  r = post(c, "L1", 2);
+  auto r = hPost(c, "L1", 3);
+  ctx.Assert(r.Status == 409 && hBody(r).value("remaining", -1LL) == 2, "3 units of a line with 2 returnable answered %d %s, expected 409 with remaining 2", r.Status, r.Text());
+  r = hPost(c, "L1", 2);
   ctx.Equal(r.Status, 201, "2 units of a line with 2 returnable (%s)", r.Text());
-  r = post(c, "L1", 1);
-  ctx.Assert(r.Status == 409 && body(r).value("remaining", -1LL) == 0, "a line with nothing left answered %d %s, expected 409 with remaining 0", r.Status, r.Text());
+  r = hPost(c, "L1", 1);
+  ctx.Assert(r.Status == 409 && hBody(r).value("remaining", -1LL) == 0, "a line with nothing left answered %d %s, expected 409 with remaining 0", r.Status, r.Text());
 }
 
 void CheckReasonPhoto(harness::Ctx& ctx) {
-  line("L1", 3, "standard", 5);
-  auto c = api(ctx);
-  ctx.Equal(post(c, "L1", 1, "it_was_late").Status, 400, "reason_code it_was_late (the reason codes are a fixed set)");
-  ctx.Equal(post(c, "L1", 1, "damaged").Status, 400, "a damaged claim without a photo_ref");
-  ctx.Equal(left(ctx, "L1"), 5, "a refused claim must not take units; the returnable units");
-  auto r = post(c, "L1", 1, "damaged", "photos/kettle-dent.jpg");
+  hLine("L1", 3, "standard", 5);
+  auto c = hApi(ctx);
+  ctx.Equal(hPost(c, "L1", 1, "it_was_late").Status, 400, "reason_code it_was_late (the reason codes are a fixed set)");
+  for (const std::string reason : {"damaged", "wrong_item", "not_as_described"}) {
+    ctx.Equal(hPost(c, "L1", 1, reason).Status, 400, "a %s claim without a photo_ref", reason);
+  }
+  ctx.Equal(hPost(c, "L1", 1, "damaged", "", hTenant, {{"photo_ref", ""}}).Status, 400, "a damaged claim with an empty photo_ref (an empty reference is no evidence)");
+  ctx.Equal(hLeft(ctx, "L1"), 5, "a refused claim must not take units; the returnable units");
+  auto r = hPost(c, "L1", 1, "damaged", "photos/kettle-dent.jpg");
   ctx.Equal(r.Status, 201, "a damaged claim with a photo (%s)", r.Text());
-  ctx.Equal(ctx.Redis.HGet("return:" + body(r).value("return_id", ""), "photo_ref").value_or(""), "photos/kettle-dent.jpg", "the return's photo_ref");
-  r = post(c, "L1", 1, "late_delivery");
+  ctx.Equal(ctx.Redis.HGet("return:" + hBody(r).value("return_id", ""), "photo_ref").value_or(""), "photos/kettle-dent.jpg", "the return's photo_ref");
+  for (const std::string reason : {"wrong_item", "not_as_described"}) {
+    r = hPost(c, "L1", 1, reason, "photos/kettle-box.jpg");
+    ctx.Equal(r.Status, 201, "a %s claim with a photo (%s)", reason, r.Text());
+  }
+  r = hPost(c, "L1", 1, "late_delivery");
   ctx.Equal(r.Status, 201, "late_delivery needs no photo (%s)", r.Text());
 }
 `,

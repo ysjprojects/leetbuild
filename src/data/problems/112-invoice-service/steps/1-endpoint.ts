@@ -22,14 +22,15 @@ with no lines is issued with a number and a total of 0; a client that retries it
 409 instead of its number; and any currency, quantity or price lands in the store.
 
 - A **finalized** invoice is immutable: \`PATCH\` answers **409** and changes nothing.
-- Finalizing an invoice with no line items is **422**, before any number is claimed.
+- Finalizing an invoice with no line items is **422**, before any number is claimed; a line priced 0
+  is still a line item.
 - A finalize carries an \`Idempotency-Key\` (**400** without one): look \`(tenant, key)\` up with
-  \`store.finalize_result\` first, answer the recorded result on a replay, and record a new one with
-  \`store.record_finalize\`.
+  \`store.finalize_result\` first, answer the recorded result on a replay whatever the invoice reads
+  now, and record a new one with \`store.record_finalize\`.
 - \`currency\` is one of \`CURRENCIES\` (\`usd\`, \`eur\`, \`gbp\`); at most \`MAX_LINES\` = 100 line items,
-  each \`description\` 1 to 120 characters, \`quantity\` 1 to \`MAX_QUANTITY\` (1000),
-  \`unit_price_cents\` 0 to \`MAX_UNIT_PRICE_CENTS\` (10 000 000). Anything else is **400**, on create
-  and on \`PATCH\`.`,
+  each \`description\` 1 to 120 characters (characters, not bytes), \`quantity\` 1 to
+  \`MAX_QUANTITY\` (1000), \`unit_price_cents\` 0 to \`MAX_UNIT_PRICE_CENTS\` (10 000 000). Anything else
+  is **400**, on create and on \`PATCH\`.`,
   sequence: {
     participants: ['Issuer', 'Invoice Service', 'invoice store', 'Redis sequence'],
     messages: [
@@ -81,7 +82,7 @@ with no lines is issued with a number and a total of 0; a client that retries it
       id: 'empty-final',
       title: 'An invoice with no line items cannot be finalized',
       detail:
-        'A finalize of an invoice without line items answers **422** before `claim_number`/`claimNumber` runs, so no number is spent on a document that cannot be issued.',
+        'A finalize of an invoice without line items answers **422** before `claim_number`/`claimNumber` runs, so no number is spent on a document that cannot be issued; an invoice whose only line is priced 0 still finalizes.',
       match: {
         python: {order: [/\b422\b/, /sequence\.claim_number\(/]},
         typescript: {order: [/\b422\b/, /claimNumber\(/]},
@@ -94,7 +95,7 @@ with no lines is issued with a number and a total of 0; a client that retries it
       id: 'idempotent-finalize',
       title: 'Keys a finalize by (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required (400 without it); the recorded result is looked up (`finalize_result`/`finalizeResult`) before the claim and answered on a replay, and a new finalize records its result.',
+        '`Idempotency-Key` is required (400 without it); the recorded result is looked up (`finalize_result`/`finalizeResult`) before the claim and answered on a replay, even after the invoice was reopened; the key belongs to its tenant, and a new finalize records its result.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.finalize_result\(/, /store\.record_finalize\(/, /\b400\b/],
@@ -122,7 +123,7 @@ with no lines is issued with a number and a total of 0; a client that retries it
       id: 'line-items-validated',
       title: 'Validates currency and line items on create and edit',
       detail:
-        'The currency is checked against `CURRENCIES` and every line against the `MAX_*` limits (description 1 to 120 characters, quantity 1 to 1000, unit price 0 to 10 000 000, at most 100 lines), on create and on edit; a violation is **400** and stores nothing.',
+        'The currency is checked against `CURRENCIES` and every line against the `MAX_*` limits (description 1 to 120 characters, counted as characters rather than bytes, quantity 1 to 1000, unit price 0 to 10 000 000, at most 100 lines), on create and on edit; a violation is **400** and stores nothing.',
       match: {
         python: {all: [/CURRENCIES/, /MAX_LINES/, /MAX_QUANTITY/, /MAX_UNIT_PRICE_CENTS/, /\b400\b/]},
         typescript: {all: [/CURRENCIES/, /MAX_LINES/, /MAX_QUANTITY/, /MAX_UNIT_PRICE_CENTS/, /\b400\b/]},
@@ -1126,7 +1127,10 @@ async def check_empty_final(ctx):
         assert ctx.redis.get("invoice:seq:t-1") is None, f"the rejected finalize claimed number {ctx.redis.get('invoice:seq:t-1')}: refuse it before claim_number"
         await c.patch(f"/v1/invoices/{invoice_id}", headers=T1, json={"line_items": LINES})
         r = await _finalize(c, invoice_id, "k-2")
-    assert r.status_code == 200 and r.json().get("number") == 1, f"once it has lines the invoice must finalize as number 1, got {r.status_code} {r.text}"
+        assert r.status_code == 200 and r.json().get("number") == 1, f"once it has lines the invoice must finalize as number 1, got {r.status_code} {r.text}"
+        free_id = await _create(c, [{"description": "Onboarding", "quantity": 1, "unit_price_cents": 0}])
+        r = await _finalize(c, free_id, "k-3")
+    assert r.status_code == 200 and r.json().get("number") == 2, f"an invoice whose one line is priced 0 has a line item and must finalize as number 2, got {r.status_code} {r.text}: only an invoice without line items is 422"
 
 
 async def check_idempotent_finalize(ctx):
@@ -1137,6 +1141,16 @@ async def check_idempotent_finalize(ctx):
         replay = await _finalize(c, invoice_id, "k-1")
         assert replay.status_code == 200 and replay.json() == first.json(), f"a retry with the same Idempotency-Key must answer the first result {first.json()}, got {replay.status_code} {replay.text}"
         assert ctx.redis.get("invoice:seq:t-1") == "1", f"the tenant's sequence is at {ctx.redis.get('invoice:seq:t-1')} after one finalize and its retry, expected 1"
+        store.reopen(invoice_id)
+        again = await _finalize(c, invoice_id, "k-1")
+        assert again.status_code == 200 and again.json() == first.json(), f"a replay must answer the recorded result {first.json()} whatever the invoice reads now (it was reopened since), got {again.status_code} {again.text}: look the key up with finalize_result first"
+        assert ctx.redis.get("invoice:seq:t-1") == "1", f"a replay claimed another number: the tenant's sequence is at {ctx.redis.get('invoice:seq:t-1')}, expected 1"
+        T2 = {"X-Tenant-Id": "t-2"}
+        r = await c.post("/v1/invoices", headers=T2, json={"currency": "usd", "customer_id": "cus-9", "line_items": LINES})
+        assert r.status_code in (200, 201), f"POST /v1/invoices for tenant t-2 answered {r.status_code}: {r.text}"
+        theirs = r.json()["id"]
+        r = await c.post(f"/v1/invoices/{theirs}/finalize", headers={**T2, "Idempotency-Key": "k-1"})
+        assert r.status_code == 200 and r.json().get("id") == theirs and r.json().get("number") == 1, f"tenant t-2's finalize with its own key k-1 must finalize {theirs} as its number 1, got {r.status_code} {r.text}: a key is scoped by tenant"
         other = await _create(c)
         none = await c.post(f"/v1/invoices/{other}/finalize", headers=T1)
         assert none.status_code == 400, f"a finalize without Idempotency-Key answered {none.status_code}, expected 400"
@@ -1160,12 +1174,14 @@ async def check_line_items_validated(ctx):
             r = await c.post("/v1/invoices", headers=T1, json=body)
             assert r.status_code == 400, f"an invoice with {what} answered {r.status_code}, expected 400"
         assert ctx.redis.keys("invoice:inv-*") == [], f"rejected invoices were stored: {sorted(ctx.redis.keys('invoice:inv-*'))}"
-        edge = [{"description": "x" * 120, "quantity": 1000, "unit_price_cents": 10_000_000}] + [ok] * 99
+        edge = [{"description": "x" * 120, "quantity": 1000, "unit_price_cents": 10_000_000}, {"description": "é" * 120, "quantity": 1, "unit_price_cents": 0}] + [ok] * 98
         r = await c.post("/v1/invoices", headers=T1, json={"currency": "eur", "line_items": edge})
-        assert r.status_code == 201, f"an invoice at every limit (100 lines, quantity 1000, price 10000000, 120 characters) answered {r.status_code}: {r.text}"
+        assert r.status_code == 201, f"an invoice at every limit (100 lines, quantity 1000, price 0 and 10000000, 120 characters, accented ones too: characters, not bytes) answered {r.status_code}: {r.text}"
         invoice_id = await _create(c)
         r = await c.patch(f"/v1/invoices/{invoice_id}", headers=T1, json={"line_items": [{**ok, "quantity": 0}]})
         assert r.status_code == 400, f"an edit with quantity 0 answered {r.status_code}, expected 400"
+        r = await c.patch(f"/v1/invoices/{invoice_id}", headers=T1, json={"line_items": [ok] * 101})
+        assert r.status_code == 400, f"an edit with 101 line items answered {r.status_code}, expected 400"
     assert store.get(invoice_id)["line_items"] == LINES, f"a rejected edit changed the lines to {store.get(invoice_id)['line_items']}"
 `,
     typescript: `const T1 = {'X-Tenant-Id': 't-1'};
@@ -1230,6 +1246,9 @@ export async function check_empty_final(ctx) {
   await c.patch(\`/v1/invoices/\${invoiceId}\`, {headers: T1, json: {line_items: LINES}});
   r = await finalize(c, invoiceId, 'k-2');
   assert(r.status === 200 && r.json().number === 1, \`once it has lines the invoice must finalize as number 1, got \${r.status} \${r.text}\`);
+  const freeId = await create(c, [{description: 'Onboarding', quantity: 1, unit_price_cents: 0}]);
+  r = await finalize(c, freeId, 'k-3');
+  assert(r.status === 200 && r.json().number === 2, \`an invoice whose one line is priced 0 has a line item and must finalize as number 2, got \${r.status} \${r.text}: only an invoice without line items is 422\`);
 }
 
 export async function check_idempotent_finalize(ctx) {
@@ -1240,6 +1259,16 @@ export async function check_idempotent_finalize(ctx) {
   const replay = await finalize(c, invoiceId, 'k-1');
   assert(replay.status === 200 && JSON.stringify(replay.json()) === JSON.stringify(first.json()), \`a retry with the same Idempotency-Key must answer the first result \${first.text}, got \${replay.status} \${replay.text}\`);
   assert.equal(ctx.redis.get('invoice:seq:t-1'), '1', \`the tenant's sequence is at \${ctx.redis.get('invoice:seq:t-1')} after one finalize and its retry, expected 1\`);
+  await store.reopen(invoiceId);
+  const again = await finalize(c, invoiceId, 'k-1');
+  assert(again.status === 200 && JSON.stringify(again.json()) === JSON.stringify(first.json()), \`a replay must answer the recorded result \${first.text} whatever the invoice reads now (it was reopened since), got \${again.status} \${again.text}: look the key up with finalizeResult first\`);
+  assert.equal(ctx.redis.get('invoice:seq:t-1'), '1', \`a replay claimed another number: the tenant's sequence is at \${ctx.redis.get('invoice:seq:t-1')}, expected 1\`);
+  const T2 = {'X-Tenant-Id': 't-2'};
+  let r = await c.post('/v1/invoices', {headers: T2, json: {currency: 'usd', customer_id: 'cus-9', line_items: LINES}});
+  assert(r.status === 200 || r.status === 201, \`POST /v1/invoices for tenant t-2 answered \${r.status}: \${r.text}\`);
+  const theirs = r.json().id;
+  r = await c.post(\`/v1/invoices/\${theirs}/finalize\`, {headers: {...T2, 'Idempotency-Key': 'k-1'}});
+  assert(r.status === 200 && r.json().id === theirs && r.json().number === 1, \`tenant t-2's finalize with its own key k-1 must finalize \${theirs} as its number 1, got \${r.status} \${r.text}: a key is scoped by tenant\`);
   const other = await create(c);
   const none = await c.post(\`/v1/invoices/\${other}/finalize\`, {headers: T1});
   assert.equal(none.status, 400, \`a finalize without Idempotency-Key answered \${none.status}, expected 400\`);
@@ -1264,12 +1293,14 @@ export async function check_line_items_validated(ctx) {
     assert.equal(r.status, 400, \`an invoice with \${what} answered \${r.status}, expected 400\`);
   }
   assert.deepStrictEqual(ctx.redis.keys('invoice:inv-*'), [], \`rejected invoices were stored: \${JSON.stringify(ctx.redis.keys('invoice:inv-*'))}\`);
-  const edge = [{description: 'x'.repeat(120), quantity: 1000, unit_price_cents: 10_000_000}, ...Array(99).fill(ok)];
+  const edge = [{description: 'x'.repeat(120), quantity: 1000, unit_price_cents: 10_000_000}, {description: 'é'.repeat(120), quantity: 1, unit_price_cents: 0}, ...Array(98).fill(ok)];
   let r = await c.post('/v1/invoices', {headers: T1, json: {currency: 'eur', line_items: edge}});
-  assert.equal(r.status, 201, \`an invoice at every limit (100 lines, quantity 1000, price 10000000, 120 characters) answered \${r.status}: \${r.text}\`);
+  assert.equal(r.status, 201, \`an invoice at every limit (100 lines, quantity 1000, price 0 and 10000000, 120 characters, accented ones too: characters, not bytes) answered \${r.status}: \${r.text}\`);
   const invoiceId = await create(c);
   r = await c.patch(\`/v1/invoices/\${invoiceId}\`, {headers: T1, json: {line_items: [{...ok, quantity: 0}]}});
   assert.equal(r.status, 400, \`an edit with quantity 0 answered \${r.status}, expected 400\`);
+  r = await c.patch(\`/v1/invoices/\${invoiceId}\`, {headers: T1, json: {line_items: Array(101).fill(ok)}});
+  assert.equal(r.status, 400, \`an edit with 101 line items answered \${r.status}, expected 400\`);
   const stored = await store.get(invoiceId);
   assert.equal(JSON.stringify(stored.line_items), JSON.stringify(LINES), \`a rejected edit changed the lines to \${JSON.stringify(stored.line_items)}\`);
 }
@@ -1287,46 +1318,46 @@ import (
 )
 
 var (
-	apiBg = context.Background()
-	lines = []map[string]any{
+	hBg    = context.Background()
+	hLines = []map[string]any{
 		{"description": "Consulting", "quantity": 2, "unit_price_cents": 25000},
 		{"description": "Travel", "quantity": 1, "unit_price_cents": 12000},
 	}
-	wantLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}, {Description: "Travel", Quantity: 1, UnitPriceCents: 12000}}
+	hWantLines = []store.Line{{Description: "Consulting", Quantity: 2, UnitPriceCents: 25000}, {Description: "Travel", Quantity: 1, UnitPriceCents: 12000}}
 )
 
-type summaryBody struct {
+type hSummary struct {
 	ID            string \`json:"id"\`
 	Status        string \`json:"status"\`
 	Number        *int64 \`json:"number"\`
 	SubtotalCents int64  \`json:"subtotal_cents"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func decode(r *harness.Response) summaryBody {
-	var body summaryBody
+func hDecode(r *harness.Response) hSummary {
+	var body hSummary
 	r.Decode(&body)
 	return body
 }
 
-func create(ctx *harness.Ctx, c *harness.HTTP, items []map[string]any) string {
+func hCreate(ctx *harness.Ctx, c *harness.HTTP, items []map[string]any) string {
 	r := c.Post("/v1/invoices", map[string]any{"currency": "usd", "customer_id": "cus-1", "line_items": items}, "X-Tenant-Id", "t-1")
 	ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/invoices answered %d: %s", r.Status, r.Text())
-	body := decode(r)
+	body := hDecode(r)
 	ctx.Assert(body.Status == "draft" && body.Number == nil, "a new invoice must be a draft without a number, got %s", r.Text())
 	return body.ID
 }
 
-func finalize(c *harness.HTTP, invoiceID, key string) *harness.Response {
+func hFinalize(c *harness.HTTP, invoiceID, key string) *harness.Response {
 	return c.Post("/v1/invoices/"+invoiceID+"/finalize", nil, "X-Tenant-Id", "t-1", "Idempotency-Key", key)
 }
 
-func numberOf(body summaryBody) int64 {
+func hNumberOf(body hSummary) int64 {
 	if body.Number == nil {
 		return 0
 	}
@@ -1334,67 +1365,80 @@ func numberOf(body summaryBody) int64 {
 }
 
 func CheckRoutes(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/invoices", map[string]any{"currency": "usd", "line_items": lines})
+	c := hAPI(ctx)
+	r := c.Post("/v1/invoices", map[string]any{"currency": "usd", "line_items": hLines})
 	ctx.Equal(r.Status, 401, "POST /v1/invoices without X-Tenant-Id")
-	invoiceID := create(ctx, c, lines[:1])
-	r = c.Patch("/v1/invoices/"+invoiceID, map[string]any{"line_items": lines}, "X-Tenant-Id", "t-1")
+	invoiceID := hCreate(ctx, c, hLines[:1])
+	r = c.Patch("/v1/invoices/"+invoiceID, map[string]any{"line_items": hLines}, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "PATCH /v1/invoices/%s (%s)", invoiceID, r.Text())
-	ctx.Equal(decode(r).SubtotalCents, 62000, "after replacing the lines, the subtotal")
-	r = finalize(c, invoiceID, "k-1")
+	ctx.Equal(hDecode(r).SubtotalCents, 62000, "after replacing the lines, the subtotal")
+	r = hFinalize(c, invoiceID, "k-1")
 	ctx.Equal(r.Status, 200, "POST /v1/invoices/%s/finalize (%s)", invoiceID, r.Text())
-	body := decode(r)
-	ctx.Assert(body.Status == "finalized" && numberOf(body) == 1 && body.SubtotalCents == 62000, "the finalize must answer number 1, finalized, subtotal 62000, got %s", r.Text())
-	stored := store.Get(apiBg, invoiceID)
+	body := hDecode(r)
+	ctx.Assert(body.Status == "finalized" && hNumberOf(body) == 1 && body.SubtotalCents == 62000, "the finalize must answer number 1, finalized, subtotal 62000, got %s", r.Text())
+	stored := store.Get(hBg, invoiceID)
 	ctx.Assert(stored.Status == "finalized" && stored.Number == 1, "after the finalize the store holds %s number %d", stored.Status, stored.Number)
 }
 
 func CheckImmutableFinal(ctx *harness.Ctx) {
-	c := api(ctx)
-	invoiceID := create(ctx, c, lines)
-	r := finalize(c, invoiceID, "k-1")
+	c := hAPI(ctx)
+	invoiceID := hCreate(ctx, c, hLines)
+	r := hFinalize(c, invoiceID, "k-1")
 	ctx.Equal(r.Status, 200, "the finalize (%s)", r.Text())
 	r = c.Patch("/v1/invoices/"+invoiceID, map[string]any{"line_items": []map[string]any{{"description": "Consulting", "quantity": 20, "unit_price_cents": 25000}}}, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 409, "an edit of a finalized invoice")
-	stored := store.Get(apiBg, invoiceID)
+	stored := store.Get(hBg, invoiceID)
 	ctx.Assert(stored.SubtotalCents == 62000 && len(stored.LineItems) == 2, "the issued invoice changed under its customer: the store now holds %v (%d). Refuse the edit before writing", stored.LineItems, stored.SubtotalCents)
-	ctx.Equal(stored.LineItems, wantLines, "the issued invoice's lines")
-	draftID := create(ctx, c, lines)
-	r = c.Patch("/v1/invoices/"+draftID, map[string]any{"line_items": lines[:1]}, "X-Tenant-Id", "t-1")
+	ctx.Equal(stored.LineItems, hWantLines, "the issued invoice's lines")
+	draftID := hCreate(ctx, c, hLines)
+	r = c.Patch("/v1/invoices/"+draftID, map[string]any{"line_items": hLines[:1]}, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "an edit of a draft (drafts stay editable)")
 }
 
 func CheckEmptyFinal(ctx *harness.Ctx) {
-	c := api(ctx)
-	invoiceID := create(ctx, c, []map[string]any{})
-	r := finalize(c, invoiceID, "k-1")
+	c := hAPI(ctx)
+	invoiceID := hCreate(ctx, c, []map[string]any{})
+	r := hFinalize(c, invoiceID, "k-1")
 	ctx.Equal(r.Status, 422, "finalizing an invoice with no line items")
-	stored := store.Get(apiBg, invoiceID)
+	stored := store.Get(hBg, invoiceID)
 	ctx.Assert(stored.Status == "draft" && stored.Number == 0, "an empty invoice must stay a draft without a number, the store holds %s number %d", stored.Status, stored.Number)
 	seq, claimed := ctx.Redis.Get("invoice:seq:t-1")
 	ctx.Assert(!claimed, "the rejected finalize claimed number %s: refuse it before sequence.ClaimNumber", seq)
-	c.Patch("/v1/invoices/"+invoiceID, map[string]any{"line_items": lines}, "X-Tenant-Id", "t-1")
-	r = finalize(c, invoiceID, "k-2")
-	ctx.Assert(r.Status == 200 && numberOf(decode(r)) == 1, "once it has lines the invoice must finalize as number 1, got %d %s", r.Status, r.Text())
+	c.Patch("/v1/invoices/"+invoiceID, map[string]any{"line_items": hLines}, "X-Tenant-Id", "t-1")
+	r = hFinalize(c, invoiceID, "k-2")
+	ctx.Assert(r.Status == 200 && hNumberOf(hDecode(r)) == 1, "once it has lines the invoice must finalize as number 1, got %d %s", r.Status, r.Text())
+	freeID := hCreate(ctx, c, []map[string]any{{"description": "Onboarding", "quantity": 1, "unit_price_cents": 0}})
+	r = hFinalize(c, freeID, "k-3")
+	ctx.Assert(r.Status == 200 && hNumberOf(hDecode(r)) == 2, "an invoice whose one line is priced 0 has a line item and must finalize as number 2, got %d %s: only an invoice without line items is 422", r.Status, r.Text())
 }
 
 func CheckIdempotentFinalize(ctx *harness.Ctx) {
-	c := api(ctx)
-	invoiceID := create(ctx, c, lines)
-	first := finalize(c, invoiceID, "k-1")
+	c := hAPI(ctx)
+	invoiceID := hCreate(ctx, c, hLines)
+	first := hFinalize(c, invoiceID, "k-1")
 	ctx.Equal(first.Status, 200, "the first finalize (%s)", first.Text())
-	replay := finalize(c, invoiceID, "k-1")
-	ctx.Assert(replay.Status == 200 && numberOf(decode(replay)) == numberOf(decode(first)) && decode(replay).Status == "finalized", "a retry with the same Idempotency-Key must answer the first result %s, got %d %s", first.Text(), replay.Status, replay.Text())
+	replay := hFinalize(c, invoiceID, "k-1")
+	ctx.Assert(replay.Status == 200 && hNumberOf(hDecode(replay)) == hNumberOf(hDecode(first)) && hDecode(replay).Status == "finalized", "a retry with the same Idempotency-Key must answer the first result %s, got %d %s", first.Text(), replay.Status, replay.Text())
 	seq, _ := ctx.Redis.Get("invoice:seq:t-1")
 	ctx.Equal(seq, "1", "the tenant's sequence after one finalize and its retry")
-	other := create(ctx, c, lines)
+	store.Reopen(hBg, invoiceID)
+	again := hFinalize(c, invoiceID, "k-1")
+	ctx.Assert(again.Status == 200 && hDecode(again).ID == invoiceID && hDecode(again).Status == "finalized" && hNumberOf(hDecode(again)) == 1, "a replay must answer the recorded result %s whatever the invoice reads now (it was reopened since), got %d %s: look the key up with store.FinalizeResult first", first.Text(), again.Status, again.Text())
+	seq, _ = ctx.Redis.Get("invoice:seq:t-1")
+	ctx.Equal(seq, "1", "a replay claimed another number: the tenant's sequence")
+	r := c.Post("/v1/invoices", map[string]any{"currency": "usd", "customer_id": "cus-9", "line_items": hLines}, "X-Tenant-Id", "t-2")
+	ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/invoices for tenant t-2 answered %d: %s", r.Status, r.Text())
+	theirs := hDecode(r).ID
+	r = c.Post("/v1/invoices/"+theirs+"/finalize", nil, "X-Tenant-Id", "t-2", "Idempotency-Key", "k-1")
+	ctx.Assert(r.Status == 200 && hDecode(r).ID == theirs && hNumberOf(hDecode(r)) == 1, "tenant t-2's finalize with its own key k-1 must finalize %s as its number 1, got %d %s: a key is scoped by tenant", theirs, r.Status, r.Text())
+	other := hCreate(ctx, c, hLines)
 	none := c.Post("/v1/invoices/"+other+"/finalize", nil, "X-Tenant-Id", "t-1")
 	ctx.Equal(none.Status, 400, "a finalize without Idempotency-Key")
-	ctx.Equal(store.Get(apiBg, other).Status, "draft", "a finalize refused for its missing key must not finalize the invoice; its status")
+	ctx.Equal(store.Get(hBg, other).Status, "draft", "a finalize refused for its missing key must not finalize the invoice; its status")
 }
 
 func CheckLineItemsValidated(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	ok := map[string]any{"description": "Consulting", "quantity": 1, "unit_price_cents": 100}
 	with := func(key string, value any) []map[string]any {
 		line := map[string]any{}
@@ -1426,13 +1470,18 @@ func CheckLineItemsValidated(ctx *harness.Ctx) {
 		ctx.Equal(r.Status, 400, "an invoice with %s", b.what)
 	}
 	ctx.Equal(len(ctx.Redis.Keys("invoice:inv-*")), 0, "rejected invoices were stored (%q); the invoices", ctx.Redis.Keys("invoice:inv-*"))
-	edge := append([]map[string]any{{"description": strings.Repeat("x", 120), "quantity": 1000, "unit_price_cents": 10_000_000}}, many[:99]...)
+	edge := append([]map[string]any{
+		{"description": strings.Repeat("x", 120), "quantity": 1000, "unit_price_cents": 10_000_000},
+		{"description": strings.Repeat("é", 120), "quantity": 1, "unit_price_cents": 0},
+	}, many[:98]...)
 	r := c.Post("/v1/invoices", map[string]any{"currency": "eur", "line_items": edge}, "X-Tenant-Id", "t-1")
-	ctx.Equal(r.Status, 201, "an invoice at every limit (100 lines, quantity 1000, price 10000000, 120 characters) (%s)", r.Text())
-	invoiceID := create(ctx, c, lines)
+	ctx.Equal(r.Status, 201, "an invoice at every limit (100 lines, quantity 1000, price 0 and 10000000, 120 characters, accented ones too: characters, not bytes) (%s)", r.Text())
+	invoiceID := hCreate(ctx, c, hLines)
 	r = c.Patch("/v1/invoices/"+invoiceID, map[string]any{"line_items": with("quantity", 0)}, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 400, "an edit with quantity 0")
-	ctx.Equal(store.Get(apiBg, invoiceID).LineItems, wantLines, "a rejected edit must leave the lines; the lines")
+	r = c.Patch("/v1/invoices/"+invoiceID, map[string]any{"line_items": many}, "X-Tenant-Id", "t-1")
+	ctx.Equal(r.Status, 400, "an edit with 101 line items")
+	ctx.Equal(store.Get(hBg, invoiceID).LineItems, hWantLines, "a rejected edit must leave the lines; the lines")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1449,10 +1498,10 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kLines = json::array({{{"description", "Consulting"}, {"quantity", 2}, {"unit_price_cents", 25000}},
+const json hLines = json::array({{{"description", "Consulting"}, {"quantity", 2}, {"unit_price_cents", 25000}},
                                  {{"description", "Travel"}, {"quantity", 1}, {"unit_price_cents", 12000}}});
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1460,7 +1509,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json bodyOf(const harness::Response& r) {
+json hBodyOf(const harness::Response& r) {
   try {
     return json::parse(r.Text());
   } catch (const std::exception&) {
@@ -1468,43 +1517,43 @@ json bodyOf(const harness::Response& r) {
   }
 }
 
-long numberOf(const harness::Response& r) {
-  const json body = bodyOf(r);
+long hNumberOf(const harness::Response& r) {
+  const json body = hBodyOf(r);
   return body.contains("number") && body["number"].is_number() ? body["number"].get<long>() : 0L;
 }
 
-std::string create(harness::Ctx& ctx, harness::HTTP& c, const json& lines) {
+std::string hCreate(harness::Ctx& ctx, harness::HTTP& c, const json& lines) {
   const auto r = c.Post("/v1/invoices", json{{"currency", "usd"}, {"customer_id", "cus-1"}, {"line_items", lines}}.dump(), "Content-Type",
                         "application/json", "X-Tenant-Id", "t-1");
   ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/invoices answered %d: %s", r.Status, r.Text());
-  const json body = bodyOf(r);
+  const json body = hBodyOf(r);
   ctx.Assert(body.value("status", "") == "draft" && body.contains("number") && body["number"].is_null(),
              "a new invoice must be a draft without a number, got %s", r.Text());
   return body.value("id", "");
 }
 
-harness::Response patch(harness::HTTP& c, const std::string& invoice_id, const json& lines) {
+harness::Response hPatch(harness::HTTP& c, const std::string& invoice_id, const json& lines) {
   return c.Patch("/v1/invoices/" + invoice_id, json{{"line_items", lines}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t-1");
 }
 
-harness::Response finalize(harness::HTTP& c, const std::string& invoice_id, const std::string& key) {
+harness::Response hFinalize(harness::HTTP& c, const std::string& invoice_id, const std::string& key) {
   return c.Post("/v1/invoices/" + invoice_id + "/finalize", "", "X-Tenant-Id", "t-1", "Idempotency-Key", key);
 }
 
 }  // namespace
 
 void CheckRoutes(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = c.Post("/v1/invoices", json{{"currency", "usd"}, {"line_items", kLines}}.dump(), "Content-Type", "application/json");
+  auto c = hApi(ctx);
+  auto r = c.Post("/v1/invoices", json{{"currency", "usd"}, {"line_items", hLines}}.dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "POST /v1/invoices without X-Tenant-Id");
-  const std::string invoice_id = create(ctx, c, json::array({kLines[0]}));
-  r = patch(c, invoice_id, kLines);
+  const std::string invoice_id = hCreate(ctx, c, json::array({hLines[0]}));
+  r = hPatch(c, invoice_id, hLines);
   ctx.Equal(r.Status, 200, "PATCH /v1/invoices/%s (%s)", invoice_id, r.Text());
-  ctx.Equal(bodyOf(r).value("subtotal_cents", 0L), 62000, "after replacing the lines, the subtotal");
-  r = finalize(c, invoice_id, "k-1");
+  ctx.Equal(hBodyOf(r).value("subtotal_cents", 0L), 62000, "after replacing the lines, the subtotal");
+  r = hFinalize(c, invoice_id, "k-1");
   ctx.Equal(r.Status, 200, "POST /v1/invoices/%s/finalize (%s)", invoice_id, r.Text());
-  const json body = bodyOf(r);
-  ctx.Assert(body.value("status", "") == "finalized" && numberOf(r) == 1 && body.value("subtotal_cents", 0L) == 62000,
+  const json body = hBodyOf(r);
+  ctx.Assert(body.value("status", "") == "finalized" && hNumberOf(r) == 1 && body.value("subtotal_cents", 0L) == 62000,
              "the finalize must answer number 1, finalized, subtotal 62000, got %s", r.Text());
   const auto stored = store::get(invoice_id);
   ctx.Assert(stored && stored->status == "finalized" && stored->number == 1, "after the finalize the store holds %s number %d",
@@ -1512,53 +1561,71 @@ void CheckRoutes(harness::Ctx& ctx) {
 }
 
 void CheckImmutableFinal(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string invoice_id = create(ctx, c, kLines);
-  auto r = finalize(c, invoice_id, "k-1");
+  auto c = hApi(ctx);
+  const std::string invoice_id = hCreate(ctx, c, hLines);
+  auto r = hFinalize(c, invoice_id, "k-1");
   ctx.Equal(r.Status, 200, "the finalize (%s)", r.Text());
-  r = patch(c, invoice_id, json::array({{{"description", "Consulting"}, {"quantity", 20}, {"unit_price_cents", 25000}}}));
+  r = hPatch(c, invoice_id, json::array({{{"description", "Consulting"}, {"quantity", 20}, {"unit_price_cents", 25000}}}));
   ctx.Equal(r.Status, 409, "an edit of a finalized invoice");
   const auto stored = store::get(invoice_id);
-  ctx.Assert(stored->subtotal_cents == 62000 && store::linesJson(stored->line_items) == kLines,
+  ctx.Assert(stored->subtotal_cents == 62000 && store::linesJson(stored->line_items) == hLines,
              "the issued invoice changed under its customer: the store now holds %s (%d). Refuse the edit before writing",
              store::linesJson(stored->line_items).dump(), stored->subtotal_cents);
-  const std::string draft_id = create(ctx, c, kLines);
-  r = patch(c, draft_id, json::array({kLines[0]}));
+  const std::string draft_id = hCreate(ctx, c, hLines);
+  r = hPatch(c, draft_id, json::array({hLines[0]}));
   ctx.Equal(r.Status, 200, "an edit of a draft (drafts stay editable)");
 }
 
 void CheckEmptyFinal(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string invoice_id = create(ctx, c, json::array());
-  auto r = finalize(c, invoice_id, "k-1");
+  auto c = hApi(ctx);
+  const std::string invoice_id = hCreate(ctx, c, json::array());
+  auto r = hFinalize(c, invoice_id, "k-1");
   ctx.Equal(r.Status, 422, "finalizing an invoice with no line items");
   const auto stored = store::get(invoice_id);
   ctx.Assert(stored->status == "draft" && stored->number == 0, "an empty invoice must stay a draft without a number, the store holds %s number %d",
              stored->status, stored->number);
   const auto seq = ctx.Redis.Get("invoice:seq:t-1");
   ctx.Assert(!seq, "the rejected finalize claimed number %s: refuse it before sequence::claimNumber", seq.value_or(""));
-  patch(c, invoice_id, kLines);
-  r = finalize(c, invoice_id, "k-2");
-  ctx.Assert(r.Status == 200 && numberOf(r) == 1, "once it has lines the invoice must finalize as number 1, got %d %s", r.Status, r.Text());
+  hPatch(c, invoice_id, hLines);
+  r = hFinalize(c, invoice_id, "k-2");
+  ctx.Assert(r.Status == 200 && hNumberOf(r) == 1, "once it has lines the invoice must finalize as number 1, got %d %s", r.Status, r.Text());
+  const std::string free_id = hCreate(ctx, c, json::array({{{"description", "Onboarding"}, {"quantity", 1}, {"unit_price_cents", 0}}}));
+  r = hFinalize(c, free_id, "k-3");
+  ctx.Assert(r.Status == 200 && hNumberOf(r) == 2,
+             "an invoice whose one line is priced 0 has a line item and must finalize as number 2, got %d %s: only an invoice without line items is 422", r.Status,
+             r.Text());
 }
 
 void CheckIdempotentFinalize(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string invoice_id = create(ctx, c, kLines);
-  const auto first = finalize(c, invoice_id, "k-1");
+  auto c = hApi(ctx);
+  const std::string invoice_id = hCreate(ctx, c, hLines);
+  const auto first = hFinalize(c, invoice_id, "k-1");
   ctx.Equal(first.Status, 200, "the first finalize (%s)", first.Text());
-  const auto replay = finalize(c, invoice_id, "k-1");
-  ctx.Assert(replay.Status == 200 && bodyOf(replay) == bodyOf(first), "a retry with the same Idempotency-Key must answer the first result %s, got %d %s",
+  const auto replay = hFinalize(c, invoice_id, "k-1");
+  ctx.Assert(replay.Status == 200 && hBodyOf(replay) == hBodyOf(first), "a retry with the same Idempotency-Key must answer the first result %s, got %d %s",
              first.Text(), replay.Status, replay.Text());
   ctx.Equal(ctx.Redis.Get("invoice:seq:t-1"), std::optional<std::string>("1"), "the tenant's sequence after one finalize and its retry");
-  const std::string other = create(ctx, c, kLines);
+  store::reopen(invoice_id);
+  const auto again = hFinalize(c, invoice_id, "k-1");
+  ctx.Assert(again.Status == 200 && hBodyOf(again) == hBodyOf(first),
+             "a replay must answer the recorded result %s whatever the invoice reads now (it was reopened since), got %d %s: look the key up with store::finalizeResult first",
+             first.Text(), again.Status, again.Text());
+  ctx.Equal(ctx.Redis.Get("invoice:seq:t-1"), std::optional<std::string>("1"), "a replay claimed another number: the tenant's sequence");
+  auto r = c.Post("/v1/invoices", json{{"currency", "usd"}, {"customer_id", "cus-9"}, {"line_items", hLines}}.dump(), "Content-Type", "application/json",
+                  "X-Tenant-Id", "t-2");
+  ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/invoices for tenant t-2 answered %d: %s", r.Status, r.Text());
+  const std::string theirs = hBodyOf(r).value("id", "");
+  r = c.Post("/v1/invoices/" + theirs + "/finalize", "", "X-Tenant-Id", "t-2", "Idempotency-Key", "k-1");
+  ctx.Assert(r.Status == 200 && hBodyOf(r).value("id", "") == theirs && hNumberOf(r) == 1,
+             "tenant t-2's finalize with its own key k-1 must finalize %s as its number 1, got %d %s: a key is scoped by tenant", theirs, r.Status, r.Text());
+  const std::string other = hCreate(ctx, c, hLines);
   const auto none = c.Post("/v1/invoices/" + other + "/finalize", "", "X-Tenant-Id", "t-1");
   ctx.Equal(none.Status, 400, "a finalize without Idempotency-Key");
   ctx.Equal(store::get(other)->status, "draft", "a finalize refused for its missing key must not finalize the invoice; its status");
 }
 
 void CheckLineItemsValidated(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const json ok = {{"description", "Consulting"}, {"quantity", 1}, {"unit_price_cents", 100}};
   const auto with = [&ok](const std::string& key, const json& value) {
     json line = ok;
@@ -1582,14 +1649,21 @@ void CheckLineItemsValidated(harness::Ctx& ctx) {
     ctx.Equal(r.Status, 400, "an invoice with %s", what);
   }
   ctx.Equal(ctx.Redis.Keys("invoice:inv-*").size(), 0, "rejected invoices were stored; the invoices");
-  json edge = json::array({{{"description", std::string(120, 'x')}, {"quantity", 1000}, {"unit_price_cents", 10000000}}});
-  for (int i = 0; i < 99; i++) edge.push_back(ok);
+  std::string accented;
+  for (int i = 0; i < 120; i++) accented += "é";
+  json edge = json::array({{{"description", std::string(120, 'x')}, {"quantity", 1000}, {"unit_price_cents", 10000000}},
+                           {{"description", accented}, {"quantity", 1}, {"unit_price_cents", 0}}});
+  for (int i = 0; i < 98; i++) edge.push_back(ok);
   auto r = c.Post("/v1/invoices", json{{"currency", "eur"}, {"line_items", edge}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "t-1");
-  ctx.Equal(r.Status, 201, "an invoice at every limit (100 lines, quantity 1000, price 10000000, 120 characters) (%s)", r.Text());
-  const std::string invoice_id = create(ctx, c, kLines);
-  r = patch(c, invoice_id, with("quantity", 0));
+  ctx.Equal(r.Status, 201,
+            "an invoice at every limit (100 lines, quantity 1000, price 0 and 10000000, 120 characters, accented ones too: characters, not bytes) (%s)",
+            r.Text());
+  const std::string invoice_id = hCreate(ctx, c, hLines);
+  r = hPatch(c, invoice_id, with("quantity", 0));
   ctx.Equal(r.Status, 400, "an edit with quantity 0");
-  ctx.Assert(store::linesJson(store::get(invoice_id)->line_items) == kLines, "a rejected edit changed the lines to %s",
+  r = hPatch(c, invoice_id, many);
+  ctx.Equal(r.Status, 400, "an edit with 101 line items");
+  ctx.Assert(store::linesJson(store::get(invoice_id)->line_items) == hLines, "a rejected edit changed the lines to %s",
              store::linesJson(store::get(invoice_id)->line_items).dump());
 }
 `,

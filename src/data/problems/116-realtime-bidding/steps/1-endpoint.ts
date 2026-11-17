@@ -55,7 +55,7 @@ a bid the cap refused goes out anyway.
       id: 'validate',
       title: 'Rejects a request with no bidder or out-of-range numbers',
       detail:
-        'No `X-Bidder-Id` is **401**; an empty `auction_id`, `timeout_ms` outside 1..200 or `floor_cents` outside 0..1 000 000 is **400**, and nothing is priced or claimed. The starter prices whatever arrives.',
+        'No `X-Bidder-Id` is **401**; an empty `auction_id`, `timeout_ms` outside 1..200 or `floor_cents` outside 0..1 000 000 is **400**, and nothing is priced or claimed. Both ends of each range are accepted. The starter prices whatever arrives.',
       match: {
         python: {all: [/\b401\b/, /[<>]=?\s*MAX_FLOOR_CENTS/, /[<>]=?\s*MAX_BUDGET_MS/]},
         typescript: {all: [/\b401\b/, /[<>]=?\s*MAX_FLOOR_CENTS/, /[<>]=?\s*MAX_BUDGET_MS/]},
@@ -68,7 +68,7 @@ a bid the cap refused goes out anyway.
       id: 'deadline',
       title: "The budget is the request's timeout_ms",
       detail:
-        'With `timeout_ms: 20` and features answering in 25 ms, the service answers a no-bid within 20 ms and no call carries more than 20 ms. The starter starts its own 100 ms budget and bids after 75 ms.',
+        'With `timeout_ms: 20` and features answering in 25 ms, the service answers a no-bid within 20 ms and no call carries more than 20 ms; with `timeout_ms: 150` and a model answering in 95 ms, it bids. The starter starts its own 100 ms budget and bids after 75 ms.',
       match: {
         python: {all: [/Deadline\.start\(/], none: [/Deadline\.start\(\s*DEFAULT_BUDGET_MS\s*\)/]},
         typescript: {all: [/Deadline\.start\(/], none: [/Deadline\.start\(\s*DEFAULT_BUDGET_MS\s*\)/]},
@@ -81,7 +81,7 @@ a bid the cap refused goes out anyway.
       id: 'no-late-bid',
       title: 'A quote that used up the budget is a no-bid',
       detail:
-        'With less than `MIN_BID_MS` left after pricing, the answer is `bid_cents: null` with `reason: "deadline_exceeded"` and no spend is claimed. The starter sends the bid however late it is.',
+        'With less than `MIN_BID_MS` left after pricing, the answer is `bid_cents: null` with `reason: "deadline_exceeded"` and no spend is claimed; with exactly `MIN_BID_MS` left it still bids. The starter sends the bid however late it is.',
       match: {
         python: {all: [/remaining_ms\(\)\s*<\s*MIN_BID_MS/, /deadline_exceeded/]},
         typescript: {all: [/remainingMs\(\)\s*<\s*MIN_BID_MS/, /deadline_exceeded/]},
@@ -649,12 +649,20 @@ async def check_validate(ctx):
             ({"floor_cents": -1}, "a negative floor_cents"),
             ({"floor_cents": 1_000_001}, "floor_cents above 1 000 000"),
             ({"timeout_ms": 0}, "timeout_ms 0"),
+            ({"timeout_ms": -1}, "a negative timeout_ms"),
+            ({"timeout_ms": 201}, "timeout_ms 201"),
             ({"timeout_ms": 5000}, "timeout_ms 5000"),
             ({"auction_id": ""}, "an empty auction_id"),
         ):
             r = await _bid(c, **changes)
             assert r.status_code == 400, f"{why} answered {r.status_code}: {r.text}, expected 400"
         assert _spent(ctx) == 0 and not ctx.grpc.calls_to("Identity"), "a rejected request must be neither priced nor claimed"
+        for changes, why in (
+            ({"timeout_ms": 1, "auction_id": "a-3"}, "timeout_ms 1"),
+            ({"floor_cents": 1_000_000, "auction_id": "a-4"}, "floor_cents 1 000 000"),
+        ):
+            r = await _bid(c, **changes)
+            assert r.status_code == 200, f"{why} is in range: the service answered {r.status_code} {r.text}, expected 200"
         r = await _bid(c, timeout_ms=200, floor_cents=0)
     assert r.status_code == 200 and r.json().get("bid_cents") == VALUE, f"timeout_ms 200 and floor_cents 0 are in range: the service answered {r.status_code} {r.text}"
 
@@ -666,13 +674,18 @@ async def check_deadline(ctx):
         started = ctx.clock.time()
         r = await _bid(c, timeout_ms=20)
         took_ms = (ctx.clock.time() - started) * 1000
-    assert r.status_code == 200, f"POST /v1/bids answered {r.status_code}: {r.text}"
-    body = r.json()
-    assert body.get("bid_cents", 0) is None and body.get("reason") == "deadline_exceeded", f"an auction with timeout_ms 20 and features answering in 25 ms got {body} after {took_ms:.0f} ms: the budget is the request's timeout_ms, and a quote that used it up is a no-bid"
-    assert took_ms <= 21, f"the answer to a 20 ms auction took {took_ms:.0f} ms"
-    for call in ctx.grpc.calls_to("Identity") + ctx.grpc.calls_to("Contextual") + ctx.grpc.calls_to("Score"):
-        assert call.timeout is not None and call.timeout <= 0.0201, f"a {call.method} call got a {(call.timeout or 0) * 1000:.0f} ms deadline inside a 20 ms auction"
-    assert _spent(ctx) == 0, f"a no-bid must claim nothing; the counters hold {_spent(ctx)}"
+        assert r.status_code == 200, f"POST /v1/bids answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("bid_cents", 0) is None and body.get("reason") == "deadline_exceeded", f"an auction with timeout_ms 20 and features answering in 25 ms got {body} after {took_ms:.0f} ms: the budget is the request's timeout_ms, and a quote that used it up is a no-bid"
+        assert took_ms <= 21, f"the answer to a 20 ms auction took {took_ms:.0f} ms"
+        for call in ctx.grpc.calls_to("Identity") + ctx.grpc.calls_to("Contextual") + ctx.grpc.calls_to("Score"):
+            assert call.timeout is not None and call.timeout <= 0.0201, f"a {call.method} call got a {(call.timeout or 0) * 1000:.0f} ms deadline inside a 20 ms auction"
+        assert _spent(ctx) == 0, f"a no-bid must claim nothing; the counters hold {_spent(ctx)}"
+        ctx.grpc.set_latency("Identity", 0)
+        ctx.grpc.set_latency("Contextual", 0)
+        ctx.grpc.set_latency("Score", 0.095)
+        r = await _bid(c, auction_id="a-2", timeout_ms=150)
+    assert r.status_code == 200 and r.json().get("bid_cents") == VALUE, f"an auction with timeout_ms 150 and a model answering in 95 ms has 55 ms left to answer, yet the service answered {r.status_code} {r.text}: the budget is the request's timeout_ms, not DEFAULT_BUDGET_MS"
 
 
 async def check_no_late_bid(ctx):
@@ -682,6 +695,8 @@ async def check_no_late_bid(ctx):
         r = await _bid(c, timeout_ms=60)
         _no_bid(r, "deadline_exceeded", "with 5 ms of a 60 ms budget left after pricing (MIN_BID_MS is 10)")
         assert _spent(ctx) == 0, f"a no-bid must claim nothing; the counters hold {_spent(ctx)}"
+        r = await _bid(c, auction_id="a-3", timeout_ms=65)
+        assert r.status_code == 200 and r.json().get("bid_cents") == 250, f"with exactly MIN_BID_MS (10 ms) of a 65 ms budget left after pricing the service must still bid the floor, got {r.status_code} {r.text}"
         ctx.grpc.set_latency("Identity", 0)
         ctx.grpc.set_latency("Contextual", 0)
         r = await _bid(c, auction_id="a-2")
@@ -747,6 +762,8 @@ export async function check_validate(ctx) {
     [{floor_cents: -1}, 'a negative floor_cents'],
     [{floor_cents: 1_000_001}, 'floor_cents above 1 000 000'],
     [{timeout_ms: 0}, 'timeout_ms 0'],
+    [{timeout_ms: -1}, 'a negative timeout_ms'],
+    [{timeout_ms: 201}, 'timeout_ms 201'],
     [{timeout_ms: 5000}, 'timeout_ms 5000'],
     [{auction_id: ''}, 'an empty auction_id'],
   ];
@@ -755,6 +772,14 @@ export async function check_validate(ctx) {
     assert.equal(r.status, 400, \`\${why} answered \${r.status}: \${r.text}, expected 400\`);
   }
   assert(spent(ctx) === 0 && ctx.grpc.callsTo('Identity').length === 0, 'a rejected request must be neither priced nor claimed');
+  const accepted: [Record<string, unknown>, string][] = [
+    [{timeout_ms: 1, auction_id: 'a-3'}, 'timeout_ms 1'],
+    [{floor_cents: 1_000_000, auction_id: 'a-4'}, 'floor_cents 1 000 000'],
+  ];
+  for (const [changes, why] of accepted) {
+    r = await bid(c, changes);
+    assert.equal(r.status, 200, \`\${why} is in range: the service answered \${r.status} \${r.text}, expected 200\`);
+  }
   r = await bid(c, {timeout_ms: 200, floor_cents: 0});
   assert(r.status === 200 && r.json().bid_cents === VALUE, \`timeout_ms 200 and floor_cents 0 are in range: the service answered \${r.status} \${r.text}\`);
 }
@@ -763,7 +788,7 @@ export async function check_deadline(ctx) {
   const c = api(ctx);
   for (const method of ['Identity', 'Contextual', 'Score']) ctx.grpc.setLatency(method, 0.025);
   const started = ctx.clock.now();
-  const r = await bid(c, {timeout_ms: 20});
+  let r = await bid(c, {timeout_ms: 20});
   const tookMs = ctx.clock.now() - started;
   assert.equal(r.status, 200, \`POST /v1/bids answered \${r.status}: \${r.text}\`);
   const body = r.json();
@@ -773,6 +798,11 @@ export async function check_deadline(ctx) {
     assert(call.timeout !== null && call.timeout <= 0.0201, \`a \${call.path} call got a \${Math.round((call.timeout ?? 0) * 1000)} ms deadline inside a 20 ms auction\`);
   }
   assert.equal(spent(ctx), 0, \`a no-bid must claim nothing; the counters hold \${spent(ctx)}\`);
+  ctx.grpc.setLatency('Identity', 0);
+  ctx.grpc.setLatency('Contextual', 0);
+  ctx.grpc.setLatency('Score', 0.095);
+  r = await bid(c, {auction_id: 'a-2', timeout_ms: 150});
+  assert(r.status === 200 && r.json().bid_cents === VALUE, \`an auction with timeout_ms 150 and a model answering in 95 ms has 55 ms left to answer, yet the service answered \${r.status} \${r.text}: the budget is the request's timeout_ms, not DEFAULT_BUDGET_MS\`);
 }
 
 export async function check_no_late_bid(ctx) {
@@ -782,6 +812,8 @@ export async function check_no_late_bid(ctx) {
   let r = await bid(c, {timeout_ms: 60});
   noBid(r, 'deadline_exceeded', 'with 5 ms of a 60 ms budget left after pricing (MIN_BID_MS is 10)');
   assert.equal(spent(ctx), 0, \`a no-bid must claim nothing; the counters hold \${spent(ctx)}\`);
+  r = await bid(c, {auction_id: 'a-3', timeout_ms: 65});
+  assert(r.status === 200 && r.json().bid_cents === 250, \`with exactly MIN_BID_MS (10 ms) of a 65 ms budget left after pricing the service must still bid the floor, got \${r.status} \${r.text}\`);
   ctx.grpc.setLatency('Identity', 0);
   ctx.grpc.setLatency('Contextual', 0);
   r = await bid(c, {auction_id: 'a-2'});
@@ -834,7 +866,7 @@ func (apiScorer) Score(context.Context, *pb.ScoreRequest) (*pb.ScoreReply, error
 	return &pb.ScoreReply{ValueCents: apiValue}, nil
 }
 
-func api(ctx *harness.Ctx, cap int64) *harness.HTTP {
+func apiSetup(ctx *harness.Ctx, cap int64) *harness.HTTP {
 	pb.RegisterFeaturesServer(ctx.GRPC.Server(""), apiFeatures{})
 	pb.RegisterScorerServer(ctx.GRPC.Server(""), apiScorer{})
 	ctx.Redis.Set("cap:b-1", cap)
@@ -887,14 +919,14 @@ func apiNoBid(ctx *harness.Ctx, r *harness.Response, reason, why string) {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx, 100000)
+	c := apiSetup(ctx, 100000)
 	a := apiDecode(ctx, apiBid(c, nil), "a healthy auction")
 	ctx.Assert(a.AuctionID == "a-1" && apiBids(a, apiValue) && !a.Degraded, "a healthy auction must bid the model's %d cents, not degraded, got %+v", apiValue, a)
 	ctx.Equal(apiSpent(ctx), apiValue, "the bid must claim its cents of the day's cap; the counters")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := api(ctx, 100000)
+	c := apiSetup(ctx, 100000)
 	r := c.Post("/v1/bids", apiBody(nil))
 	ctx.Equal(r.Status, 401, "a bid request without X-Bidder-Id (there is no budget to bid from)")
 	cases := []struct {
@@ -904,6 +936,8 @@ func CheckValidate(ctx *harness.Ctx) {
 		{map[string]any{"floor_cents": -1}, "a negative floor_cents"},
 		{map[string]any{"floor_cents": 1000001}, "floor_cents above 1 000 000"},
 		{map[string]any{"timeout_ms": 0}, "timeout_ms 0"},
+		{map[string]any{"timeout_ms": -1}, "a negative timeout_ms"},
+		{map[string]any{"timeout_ms": 201}, "timeout_ms 201"},
 		{map[string]any{"timeout_ms": 5000}, "timeout_ms 5000"},
 		{map[string]any{"auction_id": ""}, "an empty auction_id"},
 	}
@@ -912,12 +946,23 @@ func CheckValidate(ctx *harness.Ctx) {
 		ctx.Equal(r.Status, 400, "%s (%s)", tc.why, r.Text())
 	}
 	ctx.Assert(apiSpent(ctx) == 0 && len(ctx.GRPC.CallsTo("Identity", "")) == 0, "a rejected request must be neither priced nor claimed")
+	accepted := []struct {
+		changes map[string]any
+		why     string
+	}{
+		{map[string]any{"timeout_ms": 1, "auction_id": "a-3"}, "timeout_ms 1 is in range"},
+		{map[string]any{"floor_cents": 1000000, "auction_id": "a-4"}, "floor_cents 1 000 000 is in range"},
+	}
+	for _, tc := range accepted {
+		r = apiBid(c, tc.changes)
+		ctx.Equal(r.Status, 200, "%s (%s)", tc.why, r.Text())
+	}
 	a := apiDecode(ctx, apiBid(c, map[string]any{"timeout_ms": 200, "floor_cents": 0}), "timeout_ms 200 and floor_cents 0 are in range")
 	ctx.Assert(apiBids(a, apiValue), "timeout_ms 200 and floor_cents 0 are in range: the service answered %+v", a)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	c := api(ctx, 100000)
+	c := apiSetup(ctx, 100000)
 	for _, method := range []string{"Identity", "Contextual", "Score"} {
 		ctx.GRPC.SetLatency(method, 0.025, "")
 	}
@@ -931,14 +976,22 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(call.HasDeadline() && call.Timeout <= 20*time.Millisecond+100*time.Microsecond, "a %s call got a %v deadline inside a 20 ms auction", call.Method, call.Timeout)
 	}
 	ctx.Equal(apiSpent(ctx), 0, "a no-bid must claim nothing; the counters")
+	ctx.GRPC.SetLatency("Identity", 0, "")
+	ctx.GRPC.SetLatency("Contextual", 0, "")
+	ctx.GRPC.SetLatency("Score", 0.095, "")
+	r = apiBid(c, map[string]any{"auction_id": "a-2", "timeout_ms": 150})
+	a = apiDecode(ctx, r, "a 150 ms auction")
+	ctx.Assert(apiBids(a, apiValue), "an auction with timeout_ms 150 and a model answering in 95 ms has 55 ms left to answer, yet the service answered %s: the budget is the request's timeout_ms, not defaultBudgetMs", strings.TrimSpace(r.Text()))
 }
 
 func CheckNoLateBid(ctx *harness.Ctx) {
-	c := api(ctx, 100000)
+	c := apiSetup(ctx, 100000)
 	ctx.GRPC.SetLatency("Identity", 0.025, "")
 	ctx.GRPC.SetLatency("Contextual", 0.030, "")
 	apiNoBid(ctx, apiBid(c, map[string]any{"timeout_ms": 60}), "deadline_exceeded", "with 5 ms of a 60 ms budget left after pricing (minBidMs is 10)")
 	ctx.Equal(apiSpent(ctx), 0, "a no-bid must claim nothing; the counters")
+	r := apiBid(c, map[string]any{"auction_id": "a-3", "timeout_ms": 65})
+	ctx.Assert(apiBids(apiDecode(ctx, r, "a 65 ms auction"), 250), "with exactly minBidMs (10 ms) of a 65 ms budget left after pricing the service must still bid the floor, got %s", strings.TrimSpace(r.Text()))
 	ctx.GRPC.SetLatency("Identity", 0, "")
 	ctx.GRPC.SetLatency("Contextual", 0, "")
 	a := apiDecode(ctx, apiBid(c, map[string]any{"auction_id": "a-2"}), "with the whole budget left")
@@ -946,7 +999,7 @@ func CheckNoLateBid(ctx *harness.Ctx) {
 }
 
 func CheckBudget(ctx *harness.Ctx) {
-	c := api(ctx, 300)
+	c := apiSetup(ctx, 300)
 	apiNoBid(ctx, apiBid(c, nil), "budget_exhausted", "with 300 cents of cap left and a quote of 310")
 	ctx.Equal(apiSpent(ctx), 0, "the refused claim must leave the counters at 0; they hold")
 	ctx.Redis.Set("cap:b-1", 1000)
@@ -968,9 +1021,9 @@ using json = nlohmann::json;
 
 namespace {
 
-constexpr long kValue = 310;
+constexpr long kHarnessValue = 310;
 
-class FeaturesPeer final : public rtbfeatures::Features::Service {
+class HarnessFeatures final : public rtbfeatures::Features::Service {
  public:
   grpc::Status Identity(grpc::ServerContext*, const rtbfeatures::IdentityRequest*, rtbfeatures::IdentityFeatures* out) override {
     out->set_segment("sports");
@@ -984,24 +1037,24 @@ class FeaturesPeer final : public rtbfeatures::Features::Service {
   }
 };
 
-class ScorerPeer final : public rtbfeatures::Scorer::Service {
+class HarnessScorer final : public rtbfeatures::Scorer::Service {
  public:
   grpc::Status Score(grpc::ServerContext*, const rtbfeatures::ScoreRequest*, rtbfeatures::ScoreReply* out) override {
-    out->set_value_cents(kValue);
+    out->set_value_cents(kHarnessValue);
     return grpc::Status::OK;
   }
 };
 
-struct World {
-  FeaturesPeer features;
-  ScorerPeer scorer;
+struct HarnessWorld {
+  HarnessFeatures features;
+  HarnessScorer scorer;
   httplib::Server svr;
 };
 
-harness::HTTP api(harness::Ctx& ctx, long cap) {
-  static World* world = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx, long cap) {
+  static HarnessWorld* world = nullptr;
   delete world;
-  world = new World;
+  world = new HarnessWorld;
   ctx.GRPC.Server("")->RegisterService(&world->features);
   ctx.GRPC.Server("")->RegisterService(&world->scorer);
   ctx.Redis.Set("cap:b-1", cap);
@@ -1009,101 +1062,118 @@ harness::HTTP api(harness::Ctx& ctx, long cap) {
   return ctx.HTTP(world->svr);
 }
 
-json body(const json& changes = json::object()) {
+json hBody(const json& changes = json::object()) {
   json out = {{"auction_id", "a-1"}, {"floor_cents", 250}, {"timeout_ms", 100}, {"user_hash", "u-9"}};
   for (const auto& [k, v] : changes.items()) out[k] = v;
   return out;
 }
 
-harness::Response bid(harness::HTTP& c, const json& changes = json::object()) {
-  return c.Post("/v1/bids", body(changes).dump(), "Content-Type", "application/json", "X-Bidder-Id", "b-1");
+harness::Response hBid(harness::HTTP& c, const json& changes = json::object()) {
+  return c.Post("/v1/bids", hBody(changes).dump(), "Content-Type", "application/json", "X-Bidder-Id", "b-1");
 }
 
-long spent(harness::Ctx& ctx) {
+long hSpent(harness::Ctx& ctx) {
   long sum = 0;
   for (const auto& k : ctx.Redis.Keys("spend:*")) sum += std::stol(ctx.Redis.Get(k).value_or("0"));
   return sum;
 }
 
-json answer(harness::Ctx& ctx, const harness::Response& r, const std::string& why) {
+json hAnswer(harness::Ctx& ctx, const harness::Response& r, const std::string& why) {
   ctx.Equal(r.Status, 200, "%s: POST /v1/bids (%s)", why, r.Text());
   const json a = json::parse(r.Text(), nullptr, false);
   ctx.Assert(a.is_object(), "%s: the answer is not a JSON object: %s", why, r.Text());
   return a;
 }
 
-bool bids(const json& a, long cents) { return a.contains("bid_cents") && a["bid_cents"].is_number_integer() && a["bid_cents"].get<long>() == cents; }
+bool hBids(const json& a, long cents) { return a.contains("bid_cents") && a["bid_cents"].is_number_integer() && a["bid_cents"].get<long>() == cents; }
 
-bool noBidWith(const json& a, const std::string& reason) {
+bool hNoBidWith(const json& a, const std::string& reason) {
   return a.contains("bid_cents") && a["bid_cents"].is_null() && a.value("reason", "") == reason;
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx, 100000);
-  const auto r = bid(c);
-  const json a = answer(ctx, r, "a healthy auction");
-  ctx.Assert(a.value("auction_id", "") == "a-1" && bids(a, kValue) && a.value("degraded", true) == false, "a healthy auction must bid the model's %d cents, not degraded, got %s", kValue, r.Text());
-  ctx.Equal(spent(ctx), kValue, "the bid must claim its cents of the day's cap; the counters");
+  auto c = hApi(ctx, 100000);
+  const auto r = hBid(c);
+  const json a = hAnswer(ctx, r, "a healthy auction");
+  ctx.Assert(a.value("auction_id", "") == "a-1" && hBids(a, kHarnessValue) && a.value("degraded", true) == false, "a healthy auction must bid the model's %d cents, not degraded, got %s", kHarnessValue, r.Text());
+  ctx.Equal(hSpent(ctx), kHarnessValue, "the bid must claim its cents of the day's cap; the counters");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = api(ctx, 100000);
-  auto r = c.Post("/v1/bids", body().dump(), "Content-Type", "application/json");
+  auto c = hApi(ctx, 100000);
+  auto r = c.Post("/v1/bids", hBody().dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a bid request without X-Bidder-Id (there is no budget to bid from)");
   const std::vector<std::pair<json, std::string>> cases = {
       {{{"floor_cents", -1}}, "a negative floor_cents"},
       {{{"floor_cents", 1000001}}, "floor_cents above 1 000 000"},
       {{{"timeout_ms", 0}}, "timeout_ms 0"},
+      {{{"timeout_ms", -1}}, "a negative timeout_ms"},
+      {{{"timeout_ms", 201}}, "timeout_ms 201"},
       {{{"timeout_ms", 5000}}, "timeout_ms 5000"},
       {{{"auction_id", ""}}, "an empty auction_id"},
   };
   for (const auto& [changes, why] : cases) {
-    r = bid(c, changes);
+    r = hBid(c, changes);
     ctx.Equal(r.Status, 400, "%s (%s)", why, r.Text());
   }
-  ctx.Assert(spent(ctx) == 0 && ctx.GRPC.CallsTo("Identity").empty(), "a rejected request must be neither priced nor claimed");
-  r = bid(c, {{"timeout_ms", 200}, {"floor_cents", 0}});
-  ctx.Assert(r.Status == 200 && bids(json::parse(r.Text(), nullptr, false), kValue), "timeout_ms 200 and floor_cents 0 are in range: the service answered %d %s", r.Status, r.Text());
+  ctx.Assert(hSpent(ctx) == 0 && ctx.GRPC.CallsTo("Identity").empty(), "a rejected request must be neither priced nor claimed");
+  const std::vector<std::pair<json, std::string>> accepted = {
+      {{{"timeout_ms", 1}, {"auction_id", "a-3"}}, "timeout_ms 1 is in range"},
+      {{{"floor_cents", 1000000}, {"auction_id", "a-4"}}, "floor_cents 1 000 000 is in range"},
+  };
+  for (const auto& [changes, why] : accepted) {
+    r = hBid(c, changes);
+    ctx.Equal(r.Status, 200, "%s (%s)", why, r.Text());
+  }
+  r = hBid(c, {{"timeout_ms", 200}, {"floor_cents", 0}});
+  ctx.Assert(r.Status == 200 && hBids(json::parse(r.Text(), nullptr, false), kHarnessValue), "timeout_ms 200 and floor_cents 0 are in range: the service answered %d %s", r.Status, r.Text());
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto c = api(ctx, 100000);
+  auto c = hApi(ctx, 100000);
   for (const char* method : {"Identity", "Contextual", "Score"}) ctx.GRPC.SetLatency(method, 0.025);
   const int64_t started = ctx.Clock.Now();
-  const auto r = bid(c, {{"timeout_ms", 20}});
+  auto r = hBid(c, {{"timeout_ms", 20}});
   const int64_t took = ctx.Clock.Now() - started;
-  const json a = answer(ctx, r, "a 20 ms auction");
-  ctx.Assert(noBidWith(a, "deadline_exceeded"), "an auction with timeout_ms 20 and features answering in 25 ms got %s after %d ms: the budget is the request's timeout_ms, and a quote that used it up is a no-bid", r.Text(), took);
+  const json a = hAnswer(ctx, r, "a 20 ms auction");
+  ctx.Assert(hNoBidWith(a, "deadline_exceeded"), "an auction with timeout_ms 20 and features answering in 25 ms got %s after %d ms: the budget is the request's timeout_ms, and a quote that used it up is a no-bid", r.Text(), took);
   ctx.Assert(took <= 21, "the answer to a 20 ms auction took %d ms", took);
   for (const auto& call : ctx.GRPC.Calls()) {
     ctx.Assert(call.HasDeadline() && call.TimeoutSeconds() <= 0.0201, "a %s call got a %v s deadline inside a 20 ms auction", call.Method, call.TimeoutSeconds());
   }
-  ctx.Equal(spent(ctx), 0, "a no-bid must claim nothing; the counters");
+  ctx.Equal(hSpent(ctx), 0, "a no-bid must claim nothing; the counters");
+  ctx.GRPC.SetLatency("Identity", 0);
+  ctx.GRPC.SetLatency("Contextual", 0);
+  ctx.GRPC.SetLatency("Score", 0.095);
+  r = hBid(c, {{"auction_id", "a-2"}, {"timeout_ms", 150}});
+  ctx.Assert(hBids(hAnswer(ctx, r, "a 150 ms auction"), kHarnessValue), "an auction with timeout_ms 150 and a model answering in 95 ms has 55 ms left to answer, yet the service answered %s: the budget is the request's timeout_ms, not kDefaultBudgetMs", r.Text());
 }
 
 void CheckNoLateBid(harness::Ctx& ctx) {
-  auto c = api(ctx, 100000);
+  auto c = hApi(ctx, 100000);
   ctx.GRPC.SetLatency("Identity", 0.025);
   ctx.GRPC.SetLatency("Contextual", 0.030);
-  auto r = bid(c, {{"timeout_ms", 60}});
-  ctx.Assert(noBidWith(answer(ctx, r, "a 60 ms auction"), "deadline_exceeded"), "with 5 ms of a 60 ms budget left after pricing (kMinBidMs is 10) the service answered %s, expected the no-bid {bid_cents: null, reason: \\"deadline_exceeded\\"}", r.Text());
-  ctx.Equal(spent(ctx), 0, "a no-bid must claim nothing; the counters");
+  auto r = hBid(c, {{"timeout_ms", 60}});
+  ctx.Assert(hNoBidWith(hAnswer(ctx, r, "a 60 ms auction"), "deadline_exceeded"), "with 5 ms of a 60 ms budget left after pricing (kMinBidMs is 10) the service answered %s, expected the no-bid {bid_cents: null, reason: \\"deadline_exceeded\\"}", r.Text());
+  ctx.Equal(hSpent(ctx), 0, "a no-bid must claim nothing; the counters");
+  r = hBid(c, {{"auction_id", "a-3"}, {"timeout_ms", 65}});
+  ctx.Assert(hBids(hAnswer(ctx, r, "a 65 ms auction"), 250), "with exactly kMinBidMs (10 ms) of a 65 ms budget left after pricing the service must still bid the floor, got %s", r.Text());
   ctx.GRPC.SetLatency("Identity", 0);
   ctx.GRPC.SetLatency("Contextual", 0);
-  r = bid(c, {{"auction_id", "a-2"}});
-  ctx.Assert(bids(answer(ctx, r, "with the whole budget left"), kValue), "with the whole budget left the service must bid, got %s", r.Text());
+  r = hBid(c, {{"auction_id", "a-2"}});
+  ctx.Assert(hBids(hAnswer(ctx, r, "with the whole budget left"), kHarnessValue), "with the whole budget left the service must bid, got %s", r.Text());
 }
 
 void CheckBudget(harness::Ctx& ctx) {
-  auto c = api(ctx, 300);
-  auto r = bid(c);
-  ctx.Assert(noBidWith(answer(ctx, r, "a capped bidder"), "budget_exhausted"), "with 300 cents of cap left and a quote of 310 the service answered %s, expected the no-bid {bid_cents: null, reason: \\"budget_exhausted\\"}", r.Text());
-  ctx.Equal(spent(ctx), 0, "the refused claim must leave the counters at 0; they hold");
+  auto c = hApi(ctx, 300);
+  auto r = hBid(c);
+  ctx.Assert(hNoBidWith(hAnswer(ctx, r, "a capped bidder"), "budget_exhausted"), "with 300 cents of cap left and a quote of 310 the service answered %s, expected the no-bid {bid_cents: null, reason: \\"budget_exhausted\\"}", r.Text());
+  ctx.Equal(hSpent(ctx), 0, "the refused claim must leave the counters at 0; they hold");
   ctx.Redis.Set("cap:b-1", 1000);
-  r = bid(c, {{"auction_id", "a-2"}});
-  ctx.Assert(bids(answer(ctx, r, "with the cap raised"), kValue) && spent(ctx) == kValue, "with the cap raised to 1000 the service must bid %d and claim it, got %s with %d claimed", kValue, r.Text(), spent(ctx));
+  r = hBid(c, {{"auction_id", "a-2"}});
+  ctx.Assert(hBids(hAnswer(ctx, r, "with the cap raised"), kHarnessValue) && hSpent(ctx) == kHarnessValue, "with the cap raised to 1000 the service must bid %d and claim it, got %s with %d claimed", kHarnessValue, r.Text(), hSpent(ctx));
 }
 `,
   },

@@ -20,14 +20,15 @@ another; a key without a TTL keeps every closed tab until Redis evicts something
 verbatim match includes nothing on most keystrokes; one round trip per open tab eats the keystroke
 budget.
 
-- Store each tab under \`tabs:{session}:{path}\` with a **600 s** TTL (\`TAB_TTL_S\`), refreshed on
-  each write.
+- Store each tab under \`tabs:{session}:{path}\` with a **600 s** TTL (\`TAB_TTL_S\`) set by the write
+  itself, refreshed on each write.
 - Score every **500-character** window (\`SNIPPET_CHARS\`, stride 250) of a tab against the
   identifiers (\`[A-Za-z_][A-Za-z0-9_]*\`) of the last **60 lines** (\`CURSOR_WINDOW_LINES\`) of the
-  prefix with \`jaccard(a, b) = |a ∩ b| / |a ∪ b|\`; a tab offers its best window.
+  prefix, the cursor line included, with \`jaccard(a, b) = |a ∩ b| / |a ∪ b|\`; a tab offers its
+  best window.
 - Keep windows scoring at least \`MIN_SNIPPET_SCORE = 0.05\`; when none does, keep the best one if it
   shares any identifier. At most **4** (\`MAX_SNIPPETS\`), best first.
-- Read a session's tabs with one \`MGET\`.`,
+- Read a session's tabs with one \`MGET\`; a tab that has expired is skipped.`,
   sequence: {
     participants: ['completiond', 'Redis'],
     messages: [
@@ -65,7 +66,7 @@ budget.
       id: 'ttl',
       title: 'Tab entries expire after 600 s',
       detail:
-        "Every tab is written with `TAB_TTL_S = 600` as its expiry, refreshed on each write, so a closed tab leaves Redis ten minutes after the editor last sent it. The starter's `SET` has no expiry.",
+        "Every tab is written with `TAB_TTL_S = 600` as its expiry by the write itself (no key is ever without one), refreshed on each write, so a closed tab leaves Redis ten minutes after the editor last sent it. The starter's `SET` has no expiry.",
       match: {
         python: {all: [/TAB_TTL_S\s*=\s*600/, /ex\s*=\s*TAB_TTL_S/]},
         typescript: {all: [/TAB_TTL_S\s*=\s*600/, /['"]EX['"],\s*TAB_TTL_S/]},
@@ -78,7 +79,7 @@ budget.
       id: 'similarity',
       title: 'Scores snippets by Jaccard with a very low bar',
       detail:
-        'Each tab offers its best 500-character window by `jaccard` against the identifiers of the last `CURSOR_WINDOW_LINES` lines; windows at `MIN_SNIPPET_SCORE = 0.05` or above are kept best first, at most 4, and the best one is kept even below the bar. The starter needs the cursor line verbatim.',
+        'Each tab offers its best 500-character window (stride 250) by `jaccard` against the identifiers of the last `CURSOR_WINDOW_LINES` lines of the prefix, the cursor line included; windows scoring 0.05 (`MIN_SNIPPET_SCORE`) or above are kept best first, at most 4, and when none reaches the bar the best one is kept if it shares an identifier. The starter needs the cursor line verbatim.',
       match: {
         python: {
           all: [/MIN_SNIPPET_SCORE\s*=\s*0\.05/, /CURSOR_WINDOW_LINES\s*=\s*60/, /len\(\s*\w+\s*&\s*\w+\s*\)/],
@@ -106,7 +107,7 @@ budget.
       id: 'batched-read',
       title: 'Reads every tab in one MGET',
       detail:
-        "All of a session's tabs are fetched with one `MGET`, one round trip whatever the number of open tabs. The starter sends a `GET` per open tab on every keystroke.",
+        "All of a session's tabs are fetched with one `MGET`, one round trip and one command whatever the number of open tabs, and a tab that has expired is skipped. The starter sends a `GET` per open tab on every keystroke.",
       match: {
         python: {all: [/\.mget\(/], none: [/\br\.get\(/]},
         typescript: {all: [/\.mget\(/], none: [/redis\.get\(/]},
@@ -743,7 +744,10 @@ USER = (
     + "\\n".join(f"# models2 filler line {i} lorem ipsum dolor" for i in range(20))
 )
 NOTES = "Release notes: the cursor blinks faster now. Contributors thanked: alice bob carol dave erin frank grace heidi ivan judy mallory niaj olivia peggy rupert sybil trent victor walter"
-LEGACY = "\\n".join(f"legacy_total_{i} = legacy_sum(report_rows, legacy_col_{i})" for i in range(12))
+LEGACY = "\\n".join(f"legacy_total_{i} = legacy_sum(report_rows, legacy_col_{i})" for i in range(28, 40))
+EXACT = "conn = alpha + beta + gamma + delta + epsilon + zeta\\n"
+LOREM = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n"
+WIDE = "-" * 270 + "\\nload_user(conn, user_id)\\n" + "-" * 380 + "\\nrow = fetchone(USER_QUERY)\\n" + "-" * 600 + "\\n"
 
 
 def _variant(k):
@@ -764,12 +768,14 @@ def check_session_key(ctx):
 
 def check_ttl(ctx):
     m = ctx.load("tab_snippets")
+    probe = ctx.redis_after("tabs:s-ada:db/conn.py", lambda: ctx.redis.ttl("tabs:s-ada:db/conn.py"))
     m.remember_tabs("s-ada", [("db/conn.py", POOL), ("models/user.py", USER)])
     keys = ctx.redis.keys("tabs:*")
     assert len(keys) == 2, f"two open tabs left the keys {keys}"
     for key in keys:
         ttl = ctx.redis.ttl(key)
         assert 590 <= ttl <= 600, f"{key} has TTL {ttl}: every tab is written with a 600 s expiry"
+    assert probe.fired and 590 <= probe.result <= 600, f"right after the command that wrote tabs:s-ada:db/conn.py its TTL was {probe.result}: the expiry is set by the write itself, not by a second command"
     ctx.clock.advance(300)
     m.remember_tabs("s-ada", [("db/conn.py", POOL)])
     conn = [k for k in ctx.redis.keys("tabs:*") if k.endswith("db/conn.py")]
@@ -782,14 +788,21 @@ def check_ttl(ctx):
 def check_similarity(ctx):
     m = ctx.load("tab_snippets")
     tabs = [("docs/notes.py", NOTES), ("models/user.py", USER), ("db/pool.py", POOL), ("legacy/report.py", LEGACY)]
+    tabs += [("docs/exact.py", EXACT), ("docs/lorem.py", LOREM), ("docs/wide.py", WIDE)]
     m.remember_tabs("s-ada", tabs + [(f"lib/pool_{k}.py", _variant(k)) for k in range(6)])
     alone = m.pick_snippets("s-ada", ["docs/notes.py"], PREFIX)
     assert alone == [NOTES], f"docs/notes.py shares one identifier with the cursor (score 0.02): with nothing above 0.05 the best match is still included, got {alone}"
+    nothing = m.pick_snippets("s-ada", ["docs/lorem.py"], PREFIX)
+    assert nothing == [], f"docs/lorem.py shares no identifier with the cursor (score 0): the fallback keeps the best match only when it shares one, got {nothing}"
     mixed = m.pick_snippets("s-ada", ["legacy/report.py", "docs/notes.py", "models/user.py", "db/pool.py"], PREFIX)
-    assert not any("legacy_sum" in s for s in mixed), "legacy/report.py matches only the first 40 lines of the prefix: score the last 60 lines (CURSOR_WINDOW_LINES)"
+    assert not any("legacy_sum" in s for s in mixed), "legacy/report.py matches only lines more than 60 lines from the cursor: score the last 60 lines of the prefix (CURSOR_WINDOW_LINES), the cursor line included"
     assert NOTES not in mixed, "docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar"
     assert len(mixed) == 2 and mixed[0] == POOL, f"db/pool.py (0.22) then models/user.py (0.19) expected, best first; got {mixed}"
     assert "def from_row" in mixed[1] and len(mixed[1]) <= 500, f"models/user.py must offer its best 500-character window (the one with from_row), got {mixed[1]!r}"
+    edge = m.pick_snippets("s-ada", ["docs/exact.py", "db/pool.py"], PREFIX)
+    assert edge == [POOL, EXACT], f"docs/exact.py scores exactly 0.05 (1 shared identifier of 20): at least MIN_SNIPPET_SCORE is kept, got {edge}"
+    wide = m.pick_snippets("s-ada", ["docs/wide.py"], PREFIX)
+    assert wide == [WIDE[250:750]], f"docs/wide.py's best window starts at character 250: score every 500-character window with a stride of 250, got {wide}"
     many = m.pick_snippets("s-ada", [f"lib/pool_{k}.py" for k in (5, 2, 0, 4, 1, 3)], PREFIX)
     assert many == [_variant(k) for k in range(4)], f"six matching tabs must give the 4 best, best first (lib/pool_0 … lib/pool_3), got {len(many)} snippets"
 
@@ -798,11 +811,12 @@ def check_batched_read(ctx):
     m = ctx.load("tab_snippets")
     paths = [f"src/f{k}.py" for k in range(8)]
     m.remember_tabs("s-ada", [(path, POOL) for path in paths])
-    before = METRICS.redis_trips
-    picked = m.pick_snippets("s-ada", paths, PREFIX)
+    before, before_commands = METRICS.redis_trips, METRICS.redis_commands
+    picked = m.pick_snippets("s-ada", paths[:4] + ["src/closed.py"] + paths[4:], PREFIX)
     trips = METRICS.redis_trips - before
-    assert trips == 1, f"pick_snippets made {trips} round trips for 8 open tabs: read them with one MGET"
-    assert len(picked) == 4, f"eight matching tabs must give 4 snippets, got {len(picked)}"
+    commands = METRICS.redis_commands - before_commands
+    assert trips == 1 and commands == 1, f"pick_snippets made {trips} round trips carrying {commands} commands for 9 open tabs: read them with one MGET"
+    assert len(picked) == 4, f"eight stored tabs and one never written (src/closed.py, expired or never sent) must give 4 snippets, got {len(picked)}"
 `,
     typescript: `const lines = (n: number, f: (i: number) => string): string[] => Array.from({length: n}, (_, i) => f(i));
 const OLD = lines(40, i => \`legacy_total_\${i} = legacy_sum(report_rows, legacy_col_\${i})\`).join('\\n');
@@ -814,7 +828,10 @@ const USER =
   '\\nfrom dataclasses import dataclass\\n\\n@dataclass\\nclass User:\\n    user_id: int\\n    email: str\\n\\n    @classmethod\\n    def from_row(cls, row):\\n        return cls(user_id=row[0], email=row[1])\\n' +
   lines(20, i => \`# models2 filler line \${i} lorem ipsum dolor\`).join('\\n');
 const NOTES = 'Release notes: the cursor blinks faster now. Contributors thanked: alice bob carol dave erin frank grace heidi ivan judy mallory niaj olivia peggy rupert sybil trent victor walter';
-const LEGACY = lines(12, i => \`legacy_total_\${i} = legacy_sum(report_rows, legacy_col_\${i})\`).join('\\n');
+const LEGACY = lines(12, i => \`legacy_total_\${i + 28} = legacy_sum(report_rows, legacy_col_\${i + 28})\`).join('\\n');
+const EXACT = 'conn = alpha + beta + gamma + delta + epsilon + zeta\\n';
+const LOREM = 'Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n';
+const WIDE = '-'.repeat(270) + '\\nload_user(conn, user_id)\\n' + '-'.repeat(380) + '\\nrow = fetchone(USER_QUERY)\\n' + '-'.repeat(600) + '\\n';
 /** The pool module with k unrelated names added: each one lowers its score a little. */
 const variant = (k: number): string => POOL + lines(k, j => \`extra_name_\${k}_\${j} = None\\n\`).join('');
 
@@ -831,6 +848,7 @@ export async function check_session_key(ctx) {
 
 export async function check_ttl(ctx) {
   const m = ctx.load('tab_snippets');
+  const probe = ctx.redisAfter('tabs:s-ada:db/conn.py', () => ctx.redis.ttl('tabs:s-ada:db/conn.py'));
   await m.rememberTabs('s-ada', [{path: 'db/conn.py', text: POOL}, {path: 'models/user.py', text: USER}]);
   const keys = ctx.redis.keys('tabs:*');
   assert.equal(keys.length, 2, \`two open tabs left the keys \${JSON.stringify(keys)}\`);
@@ -838,6 +856,7 @@ export async function check_ttl(ctx) {
     const ttl = ctx.redis.ttl(key);
     assert(ttl >= 590 && ttl <= 600, \`\${key} has TTL \${ttl}: every tab is written with a 600 s expiry\`);
   }
+  assert(probe.fired && probe.result >= 590 && probe.result <= 600, \`right after the command that wrote tabs:s-ada:db/conn.py its TTL was \${probe.result}: the expiry is set by the write itself, not by a second command\`);
   ctx.clock.advance(300);
   await m.rememberTabs('s-ada', [{path: 'db/conn.py', text: POOL}]);
   const conn = ctx.redis.keys('tabs:*').filter(k => k.endsWith('db/conn.py'));
@@ -854,16 +873,25 @@ export async function check_similarity(ctx) {
     {path: 'models/user.py', text: USER},
     {path: 'db/pool.py', text: POOL},
     {path: 'legacy/report.py', text: LEGACY},
+    {path: 'docs/exact.py', text: EXACT},
+    {path: 'docs/lorem.py', text: LOREM},
+    {path: 'docs/wide.py', text: WIDE},
     ...lines(6, k => k).map((_, k) => ({path: \`lib/pool_\${k}.py\`, text: variant(k)})),
   ];
   await m.rememberTabs('s-ada', tabs);
   const alone = await m.pickSnippets('s-ada', ['docs/notes.py'], PREFIX);
   assert.deepEqual(alone, [NOTES], \`docs/notes.py shares one identifier with the cursor (score 0.02): with nothing above 0.05 the best match is still included, got \${JSON.stringify(alone)}\`);
+  const nothing = await m.pickSnippets('s-ada', ['docs/lorem.py'], PREFIX);
+  assert.deepEqual(nothing, [], \`docs/lorem.py shares no identifier with the cursor (score 0): the fallback keeps the best match only when it shares one, got \${JSON.stringify(nothing)}\`);
   const mixed = await m.pickSnippets('s-ada', ['legacy/report.py', 'docs/notes.py', 'models/user.py', 'db/pool.py'], PREFIX);
-  assert(!mixed.some(s => s.includes('legacy_sum')), 'legacy/report.py matches only the first 40 lines of the prefix: score the last 60 lines (CURSOR_WINDOW_LINES)');
+  assert(!mixed.some(s => s.includes('legacy_sum')), 'legacy/report.py matches only lines more than 60 lines from the cursor: score the last 60 lines of the prefix (CURSOR_WINDOW_LINES), the cursor line included');
   assert(!mixed.includes(NOTES), 'docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar');
   assert(mixed.length === 2 && mixed[0] === POOL, \`db/pool.py (0.22) then models/user.py (0.19) expected, best first; got \${JSON.stringify(mixed)}\`);
   assert(mixed[1].includes('def from_row') && mixed[1].length <= 500, \`models/user.py must offer its best 500-character window (the one with from_row), got \${JSON.stringify(mixed[1])}\`);
+  const edge = await m.pickSnippets('s-ada', ['docs/exact.py', 'db/pool.py'], PREFIX);
+  assert.deepEqual(edge, [POOL, EXACT], \`docs/exact.py scores exactly 0.05 (1 shared identifier of 20): at least MIN_SNIPPET_SCORE is kept, got \${JSON.stringify(edge)}\`);
+  const wide = await m.pickSnippets('s-ada', ['docs/wide.py'], PREFIX);
+  assert.deepEqual(wide, [WIDE.slice(250, 750)], \`docs/wide.py's best window starts at character 250: score every 500-character window with a stride of 250, got \${JSON.stringify(wide)}\`);
   const many = await m.pickSnippets('s-ada', [5, 2, 0, 4, 1, 3].map(k => \`lib/pool_\${k}.py\`), PREFIX);
   assert.deepEqual(many, [0, 1, 2, 3].map(variant), \`six matching tabs must give the 4 best, best first (lib/pool_0 … lib/pool_3), got \${many.length} snippets\`);
 }
@@ -873,10 +901,10 @@ export async function check_batched_read(ctx) {
   const paths = lines(8, k => \`src/f\${k}.py\`);
   await m.rememberTabs('s-ada', paths.map(path => ({path, text: POOL})));
   const before = ctx.redisRoundTrips().length;
-  const picked = await m.pickSnippets('s-ada', paths, PREFIX);
+  const picked = await m.pickSnippets('s-ada', [...paths.slice(0, 4), 'src/closed.py', ...paths.slice(4)], PREFIX);
   const trips = ctx.redisRoundTrips().slice(before);
-  assert(trips.length === 1 && trips[0][0] === 'MGET', \`pickSnippets made \${trips.length} round trips for 8 open tabs (\${JSON.stringify(trips)}): read them with one MGET\`);
-  assert.equal(picked.length, 4, \`eight matching tabs must give 4 snippets, got \${picked.length}\`);
+  assert(trips.length === 1 && trips[0].length === 1 && trips[0][0] === 'MGET', \`pickSnippets made \${trips.length} round trips for 9 open tabs (\${JSON.stringify(trips)}): read them with one MGET\`);
+  assert.equal(picked.length, 4, \`eight stored tabs and one never written (src/closed.py, expired or never sent) must give 4 snippets, got \${picked.length}\`);
 }
 `,
     go: `package main
@@ -906,7 +934,10 @@ var (
 		"\\nfrom dataclasses import dataclass\\n\\n@dataclass\\nclass User:\\n    user_id: int\\n    email: str\\n\\n    @classmethod\\n    def from_row(cls, row):\\n        return cls(user_id=row[0], email=row[1])\\n" +
 		strings.Join(tabsLines(20, func(i int) string { return fmt.Sprintf("# models2 filler line %d lorem ipsum dolor", i) }), "\\n")
 	tabsNotes  = "Release notes: the cursor blinks faster now. Contributors thanked: alice bob carol dave erin frank grace heidi ivan judy mallory niaj olivia peggy rupert sybil trent victor walter"
-	tabsLegacy = strings.Join(tabsLines(12, func(i int) string { return fmt.Sprintf("legacy_total_%d = legacy_sum(report_rows, legacy_col_%d)", i, i) }), "\\n")
+	tabsLegacy = strings.Join(tabsLines(12, func(i int) string { return fmt.Sprintf("legacy_total_%d = legacy_sum(report_rows, legacy_col_%d)", i+28, i+28) }), "\\n")
+	tabsExact  = "conn = alpha + beta + gamma + delta + epsilon + zeta\\n"
+	tabsLorem  = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n"
+	tabsWide   = strings.Repeat("-", 270) + "\\nload_user(conn, user_id)\\n" + strings.Repeat("-", 380) + "\\nrow = fetchone(USER_QUERY)\\n" + strings.Repeat("-", 600) + "\\n"
 )
 
 // tabsVariant is the pool module with k unrelated names added: each one lowers its score a little.
@@ -937,6 +968,7 @@ func CheckSessionKey(ctx *harness.Ctx) {
 }
 
 func CheckTtl(ctx *harness.Ctx) {
+	created := ctx.Redis.After("tabs:s-ada:db/conn.py", func() any { return ctx.Redis.TTL("tabs:s-ada:db/conn.py") })
 	tabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", tabsPool}, {"models/user.py", tabsUser}})
 	keys := ctx.Redis.Keys("tabs:*")
 	ctx.Equal(len(keys), 2, "two open tabs left the keys %v; keys", keys)
@@ -944,6 +976,8 @@ func CheckTtl(ctx *harness.Ctx) {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 590 && ttl <= 600, "%s has TTL %d: every tab is written with a 600 s expiry", key, ttl)
 	}
+	createdTTL, _ := created.Result.(int64)
+	ctx.Assert(created.Fired && createdTTL >= 590 && createdTTL <= 600, "right after the command that wrote tabs:s-ada:db/conn.py its TTL was %v: the expiry is set by the write itself, not by a second command", created.Result)
 	ctx.Clock.Advance(300)
 	tabsRemember(ctx, "s-ada", []Tab{{"db/conn.py", tabsPool}})
 	conn := []string{}
@@ -959,19 +993,26 @@ func CheckTtl(ctx *harness.Ctx) {
 
 func CheckSimilarity(ctx *harness.Ctx) {
 	open := []Tab{{"docs/notes.py", tabsNotes}, {"models/user.py", tabsUser}, {"db/pool.py", tabsPool}, {"legacy/report.py", tabsLegacy}}
+	open = append(open, Tab{"docs/exact.py", tabsExact}, Tab{"docs/lorem.py", tabsLorem}, Tab{"docs/wide.py", tabsWide})
 	for k := 0; k < 6; k++ {
 		open = append(open, Tab{fmt.Sprintf("lib/pool_%d.py", k), tabsVariant(k)})
 	}
 	tabsRemember(ctx, "s-ada", open)
 	alone := tabsPick(ctx, "s-ada", []string{"docs/notes.py"})
 	ctx.Equal(alone, []string{tabsNotes}, "docs/notes.py shares one identifier with the cursor (score 0.02): with nothing above 0.05 the best match is still included")
+	nothing := tabsPick(ctx, "s-ada", []string{"docs/lorem.py"})
+	ctx.Assert(len(nothing) == 0, "docs/lorem.py shares no identifier with the cursor (score 0): the fallback keeps the best match only when it shares one, got %q", nothing)
 	mixed := tabsPick(ctx, "s-ada", []string{"legacy/report.py", "docs/notes.py", "models/user.py", "db/pool.py"})
 	for _, s := range mixed {
-		ctx.Assert(!strings.Contains(s, "legacy_sum"), "legacy/report.py matches only the first 40 lines of the prefix: score the last 60 lines (cursorWindowLines)")
+		ctx.Assert(!strings.Contains(s, "legacy_sum"), "legacy/report.py matches only lines more than 60 lines from the cursor: score the last 60 lines of the prefix (cursorWindowLines), the cursor line included")
 		ctx.Assert(s != tabsNotes, "docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar")
 	}
 	ctx.Assert(len(mixed) == 2 && mixed[0] == tabsPool, "db/pool.py (0.22) then models/user.py (0.19) expected, best first; got %d snippets %q", len(mixed), mixed)
 	ctx.Assert(strings.Contains(mixed[1], "def from_row") && len(mixed[1]) <= 500, "models/user.py must offer its best 500-character window (the one with from_row), got %q", mixed[1])
+	edge := tabsPick(ctx, "s-ada", []string{"docs/exact.py", "db/pool.py"})
+	ctx.Equal(edge, []string{tabsPool, tabsExact}, "docs/exact.py scores exactly 0.05 (1 shared identifier of 20): at least minSnippetScore is kept; the snippets")
+	wide := tabsPick(ctx, "s-ada", []string{"docs/wide.py"})
+	ctx.Equal(wide, []string{tabsWide[250:750]}, "docs/wide.py's best window starts at character 250: score every 500-character window with a stride of 250; the snippets")
 	paths := []string{}
 	for _, k := range []int{5, 2, 0, 4, 1, 3} {
 		paths = append(paths, fmt.Sprintf("lib/pool_%d.py", k))
@@ -988,14 +1029,16 @@ func CheckBatchedRead(ctx *harness.Ctx) {
 	}
 	tabsRemember(ctx, "s-ada", open)
 	before := len(ctx.Redis.RoundTrips())
-	picked := tabsPick(ctx, "s-ada", paths)
+	picked := tabsPick(ctx, "s-ada", append(append(append([]string{}, paths[:4]...), "src/closed.py"), paths[4:]...))
 	trips := ctx.Redis.RoundTrips()[before:]
-	ctx.Assert(len(trips) == 1 && trips[0][0] == "MGET", "pickSnippets made %d round trips for 8 open tabs (%v): read them with one MGET", len(trips), trips)
-	ctx.Equal(len(picked), 4, "eight matching tabs must give 4 snippets; snippets")
+	ctx.Assert(len(trips) == 1 && len(trips[0]) == 1 && trips[0][0] == "MGET", "pickSnippets made %d round trips for 9 open tabs (%v): read them with one MGET", len(trips), trips)
+	ctx.Equal(len(picked), 4, "eight stored tabs and one never written (src/closed.py, expired or never sent) must give 4 snippets; snippets")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -1007,9 +1050,9 @@ std::string tabsJoin(const std::vector<std::string>& lines, const std::string& s
   return out;
 }
 
-std::string tabsLegacyLines(int n) {
+std::string tabsLegacyLines(int from, int to) {
   std::vector<std::string> lines;
-  for (int i = 0; i < n; i++)
+  for (int i = from; i < to; i++)
     lines.push_back("legacy_total_" + std::to_string(i) + " = legacy_sum(report_rows, legacy_col_" + std::to_string(i) + ")");
   return tabsJoin(lines, "\\n");
 }
@@ -1032,13 +1075,17 @@ std::string tabsPrefix() {
     lines.push_back(repeated.substr(start, nl - start));
     start = nl + 1;
   }
-  return tabsLegacyLines(40) + "\\n" + tabsJoin(lines, "\\n") + "\\n    user = User.from_";
+  return tabsLegacyLines(0, 40) + "\\n" + tabsJoin(lines, "\\n") + "\\n    user = User.from_";
 }
 
 const std::string kTabsPool =
     "import psycopg\\n\\ndef open_conn(dsn):\\n    conn = psycopg.connect(dsn, autocommit=True)\\n    cursor = conn.cursor()\\n    cursor.execute(\\"SET statement_timeout = 500\\")\\n    return conn\\n";
 const std::string kTabsNotes =
     "Release notes: the cursor blinks faster now. Contributors thanked: alice bob carol dave erin frank grace heidi ivan judy mallory niaj olivia peggy rupert sybil trent victor walter";
+const std::string kTabsExact = "conn = alpha + beta + gamma + delta + epsilon + zeta\\n";
+const std::string kTabsLorem = "Lorem ipsum dolor sit amet, consectetur adipiscing elit.\\n";
+const std::string kTabsWide =
+    std::string(270, '-') + "\\nload_user(conn, user_id)\\n" + std::string(380, '-') + "\\nrow = fetchone(USER_QUERY)\\n" + std::string(600, '-') + "\\n";
 
 std::string tabsUser() {
   return tabsFiller("models") +
@@ -1066,6 +1113,8 @@ void CheckSessionKey(harness::Ctx& ctx) {
 }
 
 void CheckTtl(harness::Ctx& ctx) {
+  auto created = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After("tabs:s-ada:db/conn.py", [created, &ctx] { *created = ctx.Redis.TTL("tabs:s-ada:db/conn.py"); });
   rememberTabs("s-ada", {{"db/conn.py", kTabsPool}, {"models/user.py", tabsUser()}});
   const auto keys = ctx.Redis.Keys("tabs:*");
   ctx.Equal(keys.size(), 2, "two open tabs left the keys %v; keys", keys);
@@ -1073,6 +1122,8 @@ void CheckTtl(harness::Ctx& ctx) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl >= 590 && ttl <= 600, "%s has TTL %d: every tab is written with a 600 s expiry", key, ttl);
   }
+  const long long created_ttl = created->value_or(-3);
+  ctx.Assert(created->has_value() && created_ttl >= 590 && created_ttl <= 600, "right after the command that wrote tabs:s-ada:db/conn.py its TTL was %d: the expiry is set by the write itself, not by a second command", created_ttl);
   ctx.Clock.Advance(300);
   rememberTabs("s-ada", {{"db/conn.py", kTabsPool}});
   std::vector<std::string> conn;
@@ -1084,19 +1135,26 @@ void CheckTtl(harness::Ctx& ctx) {
 }
 
 void CheckSimilarity(harness::Ctx& ctx) {
-  std::vector<Tab> open = {{"docs/notes.py", kTabsNotes}, {"models/user.py", tabsUser()}, {"db/pool.py", kTabsPool}, {"legacy/report.py", tabsLegacyLines(12)}};
+  std::vector<Tab> open = {{"docs/notes.py", kTabsNotes}, {"models/user.py", tabsUser()}, {"db/pool.py", kTabsPool}, {"legacy/report.py", tabsLegacyLines(28, 40)},
+                           {"docs/exact.py", kTabsExact}, {"docs/lorem.py", kTabsLorem}, {"docs/wide.py", kTabsWide}};
   for (int k = 0; k < 6; k++) open.push_back({"lib/pool_" + std::to_string(k) + ".py", tabsVariant(k)});
   rememberTabs("s-ada", open);
   const std::string prefix = tabsPrefix();
   ctx.Equal(pickSnippets("s-ada", {"docs/notes.py"}, prefix), {kTabsNotes},
             "docs/notes.py shares one identifier with the cursor (score 0.02): with nothing above 0.05 the best match is still included");
+  const auto nothing = pickSnippets("s-ada", {"docs/lorem.py"}, prefix);
+  ctx.Assert(nothing.empty(), "docs/lorem.py shares no identifier with the cursor (score 0): the fallback keeps the best match only when it shares one, got %d snippets", nothing.size());
   const auto mixed = pickSnippets("s-ada", {"legacy/report.py", "docs/notes.py", "models/user.py", "db/pool.py"}, prefix);
   for (const auto& s : mixed) {
-    ctx.Assert(s.find("legacy_sum") == std::string::npos, "legacy/report.py matches only the first 40 lines of the prefix: score the last 60 lines (kCursorWindowLines)");
+    ctx.Assert(s.find("legacy_sum") == std::string::npos, "legacy/report.py matches only lines more than 60 lines from the cursor: score the last 60 lines of the prefix (kCursorWindowLines), the cursor line included");
     ctx.Assert(s != kTabsNotes, "docs/notes.py scores below 0.05 and two tabs score above it: the best-match fallback is only for when nothing reaches the bar");
   }
   ctx.Assert(mixed.size() == 2 && mixed[0] == kTabsPool, "db/pool.py (0.22) then models/user.py (0.19) expected, best first; got %d snippets", mixed.size());
-  ctx.Assert(mixed[1].find("def from_row") != std::string::npos && mixed[1].size() <= 500, "models/user.py must offer its best 500-character window (the one with from_row), got %q", mixed[1]);
+  ctx.Assert(mixed.size() == 2 && mixed[1].find("def from_row") != std::string::npos && mixed[1].size() <= 500, "models/user.py must offer its best 500-character window (the one with from_row)");
+  ctx.Equal(pickSnippets("s-ada", {"docs/exact.py", "db/pool.py"}, prefix), {kTabsPool, kTabsExact},
+            "docs/exact.py scores exactly 0.05 (1 shared identifier of 20): at least kMinSnippetScore is kept; the snippets");
+  ctx.Equal(pickSnippets("s-ada", {"docs/wide.py"}, prefix), {kTabsWide.substr(250, 500)},
+            "docs/wide.py's best window starts at character 250: score every 500-character window with a stride of 250; the snippets");
   std::vector<std::string> paths;
   for (int k : {5, 2, 0, 4, 1, 3}) paths.push_back("lib/pool_" + std::to_string(k) + ".py");
   ctx.Equal(pickSnippets("s-ada", paths, prefix), {tabsVariant(0), tabsVariant(1), tabsVariant(2), tabsVariant(3)},
@@ -1111,12 +1169,15 @@ void CheckBatchedRead(harness::Ctx& ctx) {
     open.push_back({paths.back(), kTabsPool});
   }
   rememberTabs("s-ada", open);
+  std::vector<std::string> asked(paths.begin(), paths.begin() + 4);
+  asked.push_back("src/closed.py");
+  asked.insert(asked.end(), paths.begin() + 4, paths.end());
   const std::size_t before = ctx.Redis.RoundTrips().size();
-  const auto picked = pickSnippets("s-ada", paths, tabsPrefix());
+  const auto picked = pickSnippets("s-ada", asked, tabsPrefix());
   const auto all = ctx.Redis.RoundTrips();
   const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
-  ctx.Assert(trips.size() == 1 && !trips[0].empty() && trips[0][0] == "MGET", "pickSnippets made %d round trips for 8 open tabs (%v): read them with one MGET", trips.size(), trips);
-  ctx.Equal(picked.size(), 4, "eight matching tabs must give 4 snippets; snippets");
+  ctx.Assert(trips.size() == 1 && trips[0].size() == 1 && trips[0][0] == "MGET", "pickSnippets made %d round trips for 9 open tabs (%v): read them with one MGET", trips.size(), trips);
+  ctx.Equal(picked.size(), 4, "eight stored tabs and one never written (src/closed.py, expired or never sent) must give 4 snippets; snippets");
 }
 `,
   },

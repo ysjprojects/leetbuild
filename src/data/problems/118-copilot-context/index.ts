@@ -85,7 +85,7 @@ that do what steps 2 and 3 build.
    characters and the suffix to its first **1,000**, a fresh \`request_id\` beside the echoed
    \`token\`, and a log line without code.
 2. The **neighboring-tabs cache** in Redis: \`tabs:{session}:{path}\` with a **600 s** TTL, Jaccard
-   scoring against the last **60** lines before the cursor, a **0.05** bar with the best match kept
+   scoring against the last **60** lines of the prefix, a **0.05** bar with the best match kept
    below it, the top **4** chosen, one \`MGET\` per session.
 3. The **gRPC** call \`copilotctx.Model/Complete\` at \`model:9000\`: separate \`prefix\`,
    \`suffix\` and \`snippets\`, a **300 ms** deadline, at most **2** attempts only on

@@ -92,7 +92,7 @@ the sku for good; and a refusal tells the caller neither what is left nor how fa
       id: 'window-expiry',
       title: 'The budget is per hour window and expires',
       detail:
-        'The key carries the window (`guard:{sku}:{window}`, `window = unix time // WINDOW_S`) and the script sets `EXPIRE` on the write that created it. The starter keeps one `guard:{sku}` counter with no TTL, so a busy hour caps the sku for good.',
+        'The key carries the window (`guard:{sku}:{window}`, `window = unix time // WINDOW_S`) and the script sets `EXPIRE` on the write that created it, so the key has a TTL from the moment it exists. The starter keeps one `guard:{sku}` counter with no TTL, so a busy hour caps the sku for good.',
       match: {
         python: {all: [/WINDOW_S\s*=\s*3600/, /\/\/\s*WINDOW_S/, /redis\.call\(\s*['"]P?EXPIRE['"]/]},
         typescript: {all: [/WINDOW_S\s*=\s*3600/, /\/\s*WINDOW_S/, /redis\.call\(\s*['"]P?EXPIRE['"]/]},
@@ -105,7 +105,7 @@ the sku for good; and a refusal tells the caller neither what is left nor how fa
       id: 'refusal-bound',
       title: 'A refusal reports the headroom and the bound',
       detail:
-        "A refused change spends nothing and answers `headroom_bp`, what the window has left, and `bound_cents`, the furthest price that allows from `current_cents` in the change's direction. The starter refuses with both at zero.",
+        "A refused change spends nothing and answers `headroom_bp`, what the window has left, and `bound_cents`, the furthest price that allows from `current_cents` in the change's direction, to the cent. The starter refuses with both at zero.",
       match: {
         python: {all: [/bound_cents\(/], none: [/["']headroom_bp["']\s*:\s*0\b/]},
         typescript: {all: [/boundCents\(/], none: [/headroom_bp:\s*0\b/]},
@@ -633,7 +633,11 @@ def check_atomic_reserve(ctx):
 
 def check_window_expiry(ctx):
     m = ctx.load("state")
+    # The TTL must be there the moment the write that created the key lands, not one command later.
+    ttl_probe = ctx.redis_after(_key(ctx), lambda: ctx.redis.ttl(_key(ctx)))
     assert m.reserve("SKU-1", 1000, 1150)["ok"] is True, "a 15 % change in an empty window must fit"
+    assert ttl_probe.fired, f"the reservation never wrote {_key(ctx)} (guard keys: {sorted(ctx.redis.keys('guard:*'))}): the budget lives in one key per sku and hour window"
+    assert 0 < ttl_probe.result <= 3600, f"right after the command that created {_key(ctx)} its TTL was {ttl_probe.result}: for a moment the window key existed with no expiry, and a crash there leaves it forever"
     key = _key(ctx)
     ttl = ctx.redis.ttl(key)
     assert 0 < ttl <= 3600, f"{key} has TTL {ttl} (guard keys: {sorted(ctx.redis.keys('guard:*'))}): the budget lives in one key per sku and hour window, and the key expires with its window"
@@ -651,6 +655,9 @@ def check_refusal_bound(ctx):
     assert m.reserve("SKU-1", 1000, 1150)["ok"] is True, "a 15 % change after a refusal must fit: a refusal spends nothing"
     cut = m.reserve("SKU-1", 1000, 900)
     assert cut["ok"] is False and cut["headroom_bp"] == 500 and cut["bound_cents"] == 950, f"a 10 % cut with 500 bp left answered {cut}, expected a refusal with headroom_bp 500 and bound_cents 950"
+    for target, bound in ((1600, 1480), (900, 988)):
+        odd = m.reserve("SKU-2", 1234, target)
+        assert odd["ok"] is False and odd["headroom_bp"] == 2000 and odd["bound_cents"] == bound, f"a refused change from 1234 to {target} in an empty window answered {odd}, expected headroom_bp 2000 and bound_cents {bound} (1234 moved by 1234 * 2000 // 10000 cents)"
 `,
     typescript: `const keyOf = (ctx, sku = 'SKU-1') => \`guard:\${sku}:\${Math.floor(ctx.clock.now() / 1000 / 3600)}\`;
 
@@ -681,7 +688,11 @@ export async function check_atomic_reserve(ctx) {
 
 export async function check_window_expiry(ctx) {
   const m = ctx.load('state');
+  // The TTL must be there the moment the write that created the key lands, not one command later.
+  const ttlProbe = ctx.redisAfter(keyOf(ctx), () => ctx.redis.ttl(keyOf(ctx)));
   assert.equal((await m.reserve('SKU-1', 1000, 1150)).ok, true, 'a 15 % change in an empty window must fit');
+  assert(ttlProbe.fired, \`the reservation never wrote \${keyOf(ctx)} (guard keys: \${JSON.stringify(ctx.redis.keys('guard:*'))}): the budget lives in one key per sku and hour window\`);
+  assert(ttlProbe.result > 0 && ttlProbe.result <= 3600, \`right after the command that created \${keyOf(ctx)} its TTL was \${ttlProbe.result}: for a moment the window key existed with no expiry, and a crash there leaves it forever\`);
   const key = keyOf(ctx);
   const ttl = ctx.redis.ttl(key);
   assert(ttl > 0 && ttl <= 3600, \`\${key} has TTL \${ttl} (guard keys: \${JSON.stringify(ctx.redis.keys('guard:*'))}): the budget lives in one key per sku and hour window, and the key expires with its window\`);
@@ -699,6 +710,10 @@ export async function check_refusal_bound(ctx) {
   assert.equal((await m.reserve('SKU-1', 1000, 1150)).ok, true, 'a 15 % change after a refusal must fit: a refusal spends nothing');
   const cut = await m.reserve('SKU-1', 1000, 900);
   assert(cut.ok === false && cut.headroom_bp === 500 && cut.bound_cents === 950, \`a 10 % cut with 500 bp left answered \${JSON.stringify(cut)}, expected a refusal with headroom_bp 500 and bound_cents 950\`);
+  for (const [target, bound] of [[1600, 1480], [900, 988]]) {
+    const odd = await m.reserve('SKU-2', 1234, target);
+    assert(odd.ok === false && odd.headroom_bp === 2000 && odd.bound_cents === bound, \`a refused change from 1234 to \${target} in an empty window answered \${JSON.stringify(odd)}, expected headroom_bp 2000 and bound_cents \${bound} (1234 moved by 1234 * 2000 // 10000 cents)\`);
+  }
 }
 `,
     go: `package main
@@ -710,64 +725,76 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func stateKey(ctx *harness.Ctx) string {
+func hStateKey(ctx *harness.Ctx) string {
 	return fmt.Sprintf("guard:SKU-1:%d", ctx.Clock.Now()/1000/3600)
 }
 
-func mustReserve(ctx *harness.Ctx, current, target int64) Reservation {
-	res, err := reserve(stateBg, "SKU-1", current, target)
-	ctx.NoError(err, "reserve(SKU-1, %d, %d) failed", current, target)
+func hReserve(ctx *harness.Ctx, sku string, current, target int64) Reservation {
+	res, err := reserve(hStateBg, sku, current, target)
+	ctx.NoError(err, "reserve(%s, %d, %d) failed", sku, current, target)
 	return res
 }
 
 func CheckSharedHeadroom(ctx *harness.Ctx) {
-	first := mustReserve(ctx, 1000, 1150)
+	first := hReserve(ctx, "SKU-1", 1000, 1150)
 	ctx.Assert(first.OK && first.HeadroomBP == 500, "the first 15 %% change in an empty window answered %+v, expected ok with headroom_bp 500", first)
-	second := mustReserve(ctx, 1000, 1150)
+	second := hReserve(ctx, "SKU-1", 1000, 1150)
 	ctx.Assert(!second.OK, "a second 15 %% change in the same window answered %+v: two changes that each fit 20 %% moved the price 30 %% in one hour. The window's budget is shared", second)
-	third := mustReserve(ctx, 1000, 1050)
+	third := hReserve(ctx, "SKU-1", 1000, 1050)
 	ctx.Assert(third.OK && third.HeadroomBP == 0, "a 5 %% change that fits the 500 bp left answered %+v, expected ok with headroom_bp 0", third)
 }
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
 	// A second reservation lands right after this one's first command on the guard key.
 	var rivals []Reservation
-	for _, key := range []string{"guard:SKU-1", stateKey(ctx)} {
+	for _, key := range []string{"guard:SKU-1", hStateKey(ctx)} {
 		ctx.Redis.After(key, func() any {
-			res, err := reserve(stateBg, "SKU-1", 1000, 1150)
+			res, err := reserve(hStateBg, "SKU-1", 1000, 1150)
 			ctx.NoError(err, "the rival reservation failed")
 			rivals = append(rivals, res)
 			return nil
 		})
 	}
-	mine := mustReserve(ctx, 1000, 1150)
-	ctx.Assert(len(rivals) > 0, "the reservation touched neither guard:SKU-1 nor %s", stateKey(ctx))
+	mine := hReserve(ctx, "SKU-1", 1000, 1150)
+	ctx.Assert(len(rivals) > 0, "the reservation touched neither guard:SKU-1 nor %s", hStateKey(ctx))
 	ctx.Assert(mine.OK != rivals[0].OK, "two 15 %% changes raced for one window and answered ok=%v (the one that landed in between) and ok=%v: only one fits a 20 %% budget. Read, check and spend in one script", rivals[0].OK, mine.OK)
-	spent, _ := ctx.Redis.HGet(stateKey(ctx), "moved_bp")
-	ctx.Equal(spent, "1500", "%s after the race; moved_bp", stateKey(ctx))
+	spent, _ := ctx.Redis.HGet(hStateKey(ctx), "moved_bp")
+	ctx.Equal(spent, "1500", "%s after the race; moved_bp", hStateKey(ctx))
 }
 
 func CheckWindowExpiry(ctx *harness.Ctx) {
-	ctx.Assert(mustReserve(ctx, 1000, 1150).OK, "a 15 %% change in an empty window must fit")
-	key := stateKey(ctx)
+	// The TTL must be there the moment the write that created the key lands, not one command later.
+	key := hStateKey(ctx)
+	probed, probeTTL := false, int64(0)
+	ctx.Redis.After(key, func() any {
+		probed, probeTTL = true, ctx.Redis.TTL(key)
+		return nil
+	})
+	ctx.Assert(hReserve(ctx, "SKU-1", 1000, 1150).OK, "a 15 %% change in an empty window must fit")
+	ctx.Assert(probed, "the reservation never wrote %s (guard keys: %q): the budget lives in one key per sku and hour window", key, ctx.Redis.Keys("guard:*"))
+	ctx.Assert(probeTTL > 0 && probeTTL <= 3600, "right after the command that created %s its TTL was %d: for a moment the window key existed with no expiry, and a crash there leaves it forever", key, probeTTL)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl > 0 && ttl <= 3600, "%s has TTL %d (guard keys: %q): the budget lives in one key per sku and hour window, and the key expires with its window", key, ttl, ctx.Redis.Keys("guard:*"))
 	ctx.Clock.Advance(3600)
-	later := mustReserve(ctx, 1000, 1150)
+	later := hReserve(ctx, "SKU-1", 1000, 1150)
 	ctx.Assert(later.OK && later.HeadroomBP == 500, "a 15 %% change in the next hour answered %+v: the new window starts with the whole 2000 bp", later)
-	spent, _ := ctx.Redis.HGet(stateKey(ctx), "moved_bp")
-	ctx.Equal(spent, "1500", "the new window %s; moved_bp", stateKey(ctx))
+	spent, _ := ctx.Redis.HGet(hStateKey(ctx), "moved_bp")
+	ctx.Equal(spent, "1500", "the new window %s; moved_bp", hStateKey(ctx))
 }
 
 func CheckRefusalBound(ctx *harness.Ctx) {
-	big := mustReserve(ctx, 1000, 1300)
+	big := hReserve(ctx, "SKU-1", 1000, 1300)
 	ctx.Assert(!big.OK, "a 30 %% rise answered %+v, expected a refusal", big)
 	ctx.Assert(big.HeadroomBP == 2000 && big.BoundCents == 1200, "a refused 30 %% rise in an empty window answered %+v, expected headroom_bp 2000 and bound_cents 1200", big)
-	ctx.Assert(mustReserve(ctx, 1000, 1150).OK, "a 15 %% change after a refusal must fit: a refusal spends nothing")
-	cut := mustReserve(ctx, 1000, 900)
+	ctx.Assert(hReserve(ctx, "SKU-1", 1000, 1150).OK, "a 15 %% change after a refusal must fit: a refusal spends nothing")
+	cut := hReserve(ctx, "SKU-1", 1000, 900)
 	ctx.Assert(!cut.OK && cut.HeadroomBP == 500 && cut.BoundCents == 950, "a 10 %% cut with 500 bp left answered %+v, expected a refusal with headroom_bp 500 and bound_cents 950", cut)
+	for _, tc := range [][2]int64{{1600, 1480}, {900, 988}} {
+		odd := hReserve(ctx, "SKU-2", 1234, tc[0])
+		ctx.Assert(!odd.OK && odd.HeadroomBP == 2000 && odd.BoundCents == tc[1], "a refused change from 1234 to %d in an empty window answered %+v, expected headroom_bp 2000 and bound_cents %d (1234 moved by 1234 * 2000 / 10000 cents)", tc[0], odd, tc[1])
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -779,34 +806,39 @@ func CheckRefusalBound(ctx *harness.Ctx) {
 
 namespace {
 
-std::string stateKey(harness::Ctx& ctx) { return "guard:SKU-1:" + std::to_string(ctx.Clock.Now() / 1000 / 3600); }
+std::string hStateKey(harness::Ctx& ctx) { return "guard:SKU-1:" + std::to_string(ctx.Clock.Now() / 1000 / 3600); }
 
-std::string text(const Reservation& r) {
+std::string hText(const Reservation& r) {
   return "{ok: " + std::string(r.ok ? "true" : "false") + ", moved_bp: " + std::to_string(r.moved_bp) +
          ", headroom_bp: " + std::to_string(r.headroom_bp) + ", bound_cents: " + std::to_string(r.bound_cents) + "}";
 }
 
-struct Rival {
+struct HRival {
   bool fired = false;
   std::optional<Reservation> result;
   std::optional<std::string> err;
+};
+
+struct HTtlProbe {
+  bool fired = false;
+  long long ttl = 0;
 };
 
 }  // namespace
 
 void CheckSharedHeadroom(harness::Ctx& ctx) {
   const Reservation first = reserve("SKU-1", 1000, 1150);
-  ctx.Assert(first.ok && first.headroom_bp == 500, "the first 15 %% change in an empty window answered %s, expected ok with headroom_bp 500", text(first));
+  ctx.Assert(first.ok && first.headroom_bp == 500, "the first 15 %% change in an empty window answered %s, expected ok with headroom_bp 500", hText(first));
   const Reservation second = reserve("SKU-1", 1000, 1150);
-  ctx.Assert(!second.ok, "a second 15 %% change in the same window answered %s: two changes that each fit 20 %% moved the price 30 %% in one hour. The window's budget is shared", text(second));
+  ctx.Assert(!second.ok, "a second 15 %% change in the same window answered %s: two changes that each fit 20 %% moved the price 30 %% in one hour. The window's budget is shared", hText(second));
   const Reservation third = reserve("SKU-1", 1000, 1050);
-  ctx.Assert(third.ok && third.headroom_bp == 0, "a 5 %% change that fits the 500 bp left answered %s, expected ok with headroom_bp 0", text(third));
+  ctx.Assert(third.ok && third.headroom_bp == 0, "a 5 %% change that fits the 500 bp left answered %s, expected ok with headroom_bp 0", hText(third));
 }
 
 void CheckAtomicReserve(harness::Ctx& ctx) {
   // A second reservation lands right after this one's first command on the guard key.
-  auto rival = std::make_shared<Rival>();
-  for (const std::string& key : {std::string("guard:SKU-1"), stateKey(ctx)}) {
+  auto rival = std::make_shared<HRival>();
+  for (const std::string& key : {std::string("guard:SKU-1"), hStateKey(ctx)}) {
     ctx.Redis.After(key, [rival] {
       if (rival->fired) return;
       rival->fired = true;
@@ -818,30 +850,42 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
     });
   }
   const Reservation mine = reserve("SKU-1", 1000, 1150);
-  ctx.Assert(rival->fired, "the reservation touched neither guard:SKU-1 nor %s", stateKey(ctx));
+  ctx.Assert(rival->fired, "the reservation touched neither guard:SKU-1 nor %s", hStateKey(ctx));
   ctx.Assert(!rival->err, "the rival reservation failed: %s", rival->err.value_or(""));
   ctx.Assert(mine.ok != rival->result->ok, "two 15 %% changes raced for one window and answered ok=%t (the one that landed in between) and ok=%t: only one fits a 20 %% budget. Read, check and spend in one script", rival->result->ok, mine.ok);
-  ctx.Equal(ctx.Redis.HGet(stateKey(ctx), "moved_bp"), std::optional<std::string>("1500"), "%s after the race; moved_bp", stateKey(ctx));
+  ctx.Equal(ctx.Redis.HGet(hStateKey(ctx), "moved_bp"), std::optional<std::string>("1500"), "%s after the race; moved_bp", hStateKey(ctx));
 }
 
 void CheckWindowExpiry(harness::Ctx& ctx) {
+  // The TTL must be there the moment the write that created the key lands, not one command later.
+  const std::string key = hStateKey(ctx);
+  auto probe = std::make_shared<HTtlProbe>();
+  ctx.Redis.After(key, [&ctx, probe, key] {
+    probe->fired = true;
+    probe->ttl = ctx.Redis.TTL(key);
+  });
   ctx.Assert(reserve("SKU-1", 1000, 1150).ok, "a 15 %% change in an empty window must fit");
-  const std::string key = stateKey(ctx);
+  ctx.Assert(probe->fired, "the reservation never wrote %s (guard keys: %q): the budget lives in one key per sku and hour window", key, ctx.Redis.Keys("guard:*"));
+  ctx.Assert(probe->ttl > 0 && probe->ttl <= 3600, "right after the command that created %s its TTL was %d: for a moment the window key existed with no expiry, and a crash there leaves it forever", key, probe->ttl);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl > 0 && ttl <= 3600, "%s has TTL %d (guard keys: %q): the budget lives in one key per sku and hour window, and the key expires with its window", key, ttl, ctx.Redis.Keys("guard:*"));
   ctx.Clock.Advance(3600);
   const Reservation later = reserve("SKU-1", 1000, 1150);
-  ctx.Assert(later.ok && later.headroom_bp == 500, "a 15 %% change in the next hour answered %s: the new window starts with the whole 2000 bp", text(later));
-  ctx.Equal(ctx.Redis.HGet(stateKey(ctx), "moved_bp"), std::optional<std::string>("1500"), "the new window %s; moved_bp", stateKey(ctx));
+  ctx.Assert(later.ok && later.headroom_bp == 500, "a 15 %% change in the next hour answered %s: the new window starts with the whole 2000 bp", hText(later));
+  ctx.Equal(ctx.Redis.HGet(hStateKey(ctx), "moved_bp"), std::optional<std::string>("1500"), "the new window %s; moved_bp", hStateKey(ctx));
 }
 
 void CheckRefusalBound(harness::Ctx& ctx) {
   const Reservation big = reserve("SKU-1", 1000, 1300);
-  ctx.Assert(!big.ok, "a 30 %% rise answered %s, expected a refusal", text(big));
-  ctx.Assert(big.headroom_bp == 2000 && big.bound_cents == 1200, "a refused 30 %% rise in an empty window answered %s, expected headroom_bp 2000 and bound_cents 1200", text(big));
+  ctx.Assert(!big.ok, "a 30 %% rise answered %s, expected a refusal", hText(big));
+  ctx.Assert(big.headroom_bp == 2000 && big.bound_cents == 1200, "a refused 30 %% rise in an empty window answered %s, expected headroom_bp 2000 and bound_cents 1200", hText(big));
   ctx.Assert(reserve("SKU-1", 1000, 1150).ok, "a 15 %% change after a refusal must fit: a refusal spends nothing");
   const Reservation cut = reserve("SKU-1", 1000, 900);
-  ctx.Assert(!cut.ok && cut.headroom_bp == 500 && cut.bound_cents == 950, "a 10 %% cut with 500 bp left answered %s, expected a refusal with headroom_bp 500 and bound_cents 950", text(cut));
+  ctx.Assert(!cut.ok && cut.headroom_bp == 500 && cut.bound_cents == 950, "a 10 %% cut with 500 bp left answered %s, expected a refusal with headroom_bp 500 and bound_cents 950", hText(cut));
+  for (const auto& [target, bound] : std::vector<std::pair<long long, long long>>{{1600, 1480}, {900, 988}}) {
+    const Reservation odd = reserve("SKU-2", 1234, target);
+    ctx.Assert(!odd.ok && odd.headroom_bp == 2000 && odd.bound_cents == bound, "a refused change from 1234 to %d in an empty window answered %s, expected headroom_bp 2000 and bound_cents %d (1234 moved by 1234 * 2000 / 10000 cents)", target, hText(odd), bound);
+  }
 }
 `,
   },

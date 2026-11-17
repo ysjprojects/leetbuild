@@ -21,12 +21,14 @@ partitions; a retry after a lost acknowledgement counts an acceptance twice; the
 in the topic and the log is source code with a long retention; and committing first loses a count
 whenever the consumer dies between the commit and the write.
 
-- \`X-Session-Id\` is required (**401**); an \`event\` outside \`ALLOWED_EVENTS\` is **400**. Publish
+- \`X-Session-Id\` is required (**401**), and the session comes from that header only; an \`event\`
+  that is not exactly one of \`ALLOWED_EVENTS\` is **400**. Publish
   \`{request_id, session, language, candidate_len, latency_ms}\` keyed by the **session**.
 - No suggestion text in the event or any log line: report \`candidate_len\`.
 - The producer is **idempotent** with **\`acks=all\`** (Go: confluent-kafka-go, since kafka-go has
-  no idempotent producer).
-- The consumer runs with auto-commit off, \`HINCRBY\` first and **only then** commits.`,
+  no idempotent producer), and a report the broker has not acknowledged is not answered **202**.
+- The consumer runs with auto-commit off, \`HINCRBY\` first and **only then** commits; a record whose
+  \`HINCRBY\` failed is not committed.`,
   sequence: {
     participants: ['Editor', 'completiond', 'completion.accepted', 'Acceptance consumer', 'Redis'],
     messages: [
@@ -59,7 +61,7 @@ whenever the consumer dies between the commit and the write.
       id: 'session-key',
       title: 'Keyed by session, with a session and a known event required',
       detail:
-        "Every record is keyed by the session, so one developer's events share a partition and stay in order; a report without `X-Session-Id` is **401** and an event outside `ALLOWED_EVENTS` is **400** with nothing produced. The starter keys by the request id and produces to whatever topic the body names.",
+        "Every record is keyed by the session and carries `{request_id, session, language, candidate_len, latency_ms}` as reported, so one developer's events share a partition and stay in order; a report without `X-Session-Id` is **401** (a session in the body does not count) and an event that is not exactly one of `ALLOWED_EVENTS` is **400** with nothing produced. The starter keys by the request id and produces to whatever topic the body names.",
       match: {
         python: {all: [/key\s*=\s*session/, /ALLOWED_EVENTS/, /\b401\b/]},
         typescript: {all: [/key:\s*session\b/, /ALLOWED_EVENTS/, /code\(\s*401\s*\)/]},
@@ -72,7 +74,7 @@ whenever the consumer dies between the commit and the write.
       id: 'idempotent-acks',
       title: 'Idempotent producer with acks=all',
       detail:
-        "The producer is idempotent with `acks=all` (`enable.idempotence` plus `acks`, kafkajs `idempotent: true` with `acks: -1`), so a retry after a lost acknowledgement writes the event once. The starter's default producer writes it twice.",
+        "The producer is idempotent with `acks=all` (`enable.idempotence` plus `acks`, kafkajs `idempotent: true` with `acks: -1`), so a retry after a lost acknowledgement writes the event once, and a report the broker never acknowledges (a stalled broker is checked) is not answered 202. The starter's default producer writes it twice.",
       match: {
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["']all["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -98,7 +100,7 @@ whenever the consumer dies between the commit and the write.
       id: 'counters-before-commit',
       title: 'Updates the counter before committing the offset',
       detail:
-        'The consumer runs with auto-commit off, `HINCRBY acceptance:{language} {event} 1` first and commits the record after it, so a crash between the two replays the record instead of losing the count. The starter commits first.',
+        'The consumer runs with auto-commit off, `HINCRBY acceptance:{language} {event} 1` first and commits the record after it, so a crash between the two replays the record instead of losing the count; a record whose `HINCRBY` failed (a key of the wrong type is checked) is not committed. The starter commits first.',
       match: {
         python: {order: [/r\.hincrby\(/, /consumer\.commit\(/], all: [/["']enable\.auto\.commit["']\s*:\s*False/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/], all: [/autoCommit:\s*false/]},
@@ -115,7 +117,7 @@ import logging
 
 import redis
 from confluent_kafka import Consumer, Producer
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 app = FastAPI()
@@ -149,7 +151,8 @@ def telemetry(body: TelemetryReport, request: Request) -> dict:
         "latency_ms": body.latency_ms,
     }
     producer.produce(f"completion.{body.event}", key=body.request_id, value=json.dumps(event))
-    producer.flush(2.0)
+    if producer.flush(2.0) > 0:  # still queued: the broker never acknowledged the report
+        raise HTTPException(status_code=503, detail="telemetry unavailable")
     return {"accepted": True}
 
 
@@ -213,7 +216,8 @@ def telemetry(body: TelemetryReport, request: Request) -> dict:
         "latency_ms": body.latency_ms,
     }
     producer.produce(f"completion.{body.event}", key=session, value=json.dumps(event))
-    producer.flush(2.0)
+    if producer.flush(2.0) > 0:  # still queued: the broker never acknowledged the report
+        raise HTTPException(status_code=503, detail="telemetry unavailable")
     logger.info(
         "telemetry session=%s event=%s request_id=%s candidate_len=%d",
         session,
@@ -963,12 +967,15 @@ async def check_session_key(ctx):
         assert keys == [b"s-ada"] * 3, f"records must be keyed by the session, got {keys}: keyed by request id, one session's events land on several partitions"
         events = [json.loads(v) for v in ctx.kafka.values(SHOWN)]
         assert [e.get("request_id") for e in events] == ["req-1", "req-2"] and all(e.get("session") == "s-ada" for e in events), f"each event carries its request_id and session, got {events}"
+        expected = {"request_id": "req-1", "session": "s-ada", "language": "python", "candidate_len": 18, "latency_ms": 210}
+        assert {k: events[0].get(k) for k in expected} == expected, f"the event is {{request_id, session, language, candidate_len, latency_ms}} as reported: expected {expected}, got {events[0]}"
         before = sorted(ctx.kafka.topics)
-        bad = await c.post("/v1/telemetry", json=_report("copied"), headers=SESSION)
-        assert bad.status_code == 400, f"an event outside ALLOWED_EVENTS answered {bad.status_code}, expected 400"
+        for name in ("copied", "accept", ""):
+            bad = await c.post("/v1/telemetry", json=_report(name), headers=SESSION)
+            assert bad.status_code == 400, f"the event {name!r} is outside ALLOWED_EVENTS and answered {bad.status_code}, expected 400: the event must equal one of them"
         assert sorted(ctx.kafka.topics) == before, f"an unknown event created a topic: {sorted(ctx.kafka.topics)}"
-        anon = await c.post("/v1/telemetry", json=_report())
-    assert anon.status_code == 401, f"a report without X-Session-Id answered {anon.status_code}, expected 401"
+        anon = await c.post("/v1/telemetry", json=_report(session="s-ada"))
+    assert anon.status_code == 401, f"a report without X-Session-Id (a session in its body) answered {anon.status_code}, expected 401: the session comes from the header only"
     assert len(ctx.kafka.records(ACCEPTED)) == 1, "a report without a session reached the topic"
 
 
@@ -977,9 +984,12 @@ async def check_idempotent_acks(ctx):
     ctx.kafka.lose_acks(ACCEPTED, 1)  # the broker wrote it, the acknowledgement never arrived
     async with client as c:
         r = await c.post("/v1/telemetry", json=_report(), headers=SESSION)
-    assert r.status_code == 202, f"POST /v1/telemetry answered {r.status_code}: {r.text}"
-    records = ctx.kafka.records(ACCEPTED)
-    assert len(records) == 1, f"one acceptance whose acknowledgement was lost left {len(records)} records: the producer's retry wrote it twice. Make the producer idempotent with acks=all"
+        assert r.status_code == 202, f"POST /v1/telemetry answered {r.status_code}: {r.text}"
+        records = ctx.kafka.records(ACCEPTED)
+        assert len(records) == 1, f"one acceptance whose acknowledgement was lost left {len(records)} records: the producer's retry wrote it twice. Make the producer idempotent with acks=all"
+        ctx.kafka.stall(SHOWN)  # the broker stops acknowledging completion.shown
+        stalled = await c.post("/v1/telemetry", json=_report("shown", "req-2"), headers=SESSION)
+    assert stalled.status_code != 202, "a report the broker never acknowledged answered 202: the count is lost and the editor is told it was kept. Answer an error when the produce is not acknowledged"
 
 
 async def check_no_code(ctx):
@@ -1007,22 +1017,31 @@ def check_counters_before_commit(ctx):
         ctx.kafka.seed(ACCEPTED, key="s-ada", value=json.dumps({"request_id": f"req-{i}", "session": "s-ada", "language": "python", "candidate_len": 18, "latency_ms": 200}), partition=0)
     for i in range(2):
         ctx.kafka.seed(SHOWN, key="s-ada", value=json.dumps({"request_id": f"req-{i}", "session": "s-ada", "language": "python", "candidate_len": 18, "latency_ms": 200}), partition=0)
+    # The last record's HINCRBY fails: acceptance:rust is not a hash.
+    ctx.kafka.seed(ACCEPTED, key="s-ada", value=json.dumps({"request_id": "req-9", "session": "s-ada", "language": "rust", "candidate_len": 18, "latency_ms": 200}), partition=0)
+    ctx.redis.set("acceptance:rust", "not-a-hash")
+    counted_records = {ACCEPTED: 3, SHOWN: 2}
     early = []
 
     def hook(group, offsets):
         for (topic, partition), offset in offsets.items():
             counted = int(ctx.redis.hget("acceptance:python", topic.split(".", 1)[1]) or 0)
-            if counted < offset:
+            if counted < min(offset, counted_records[topic]):
                 early.append(f"{topic}[{partition}] was committed to offset {offset} with only {counted} counted")
 
     ctx.kafka.on_commit(hook)
     m = ctx.load("telemetry")
-    ctx.drain(m.consume)
+    try:
+        ctx.drain(m.consume)
+    except Exception:  # noqa: BLE001 - the failed HINCRBY may end the consumer; the offsets are the verdict
+        pass
     assert not any(e[0] == "auto-commit" for e in ctx.kafka.events), "auto-commit is on: offsets are committed on a timer, whatever the counter holds"
     assert not early, f"{early[0]}: the commit ran before HINCRBY, so a crash between them loses the count"
     counts = ctx.redis.hgetall("acceptance:python")
     assert counts == {"accepted": "3", "shown": "2"}, f"acceptance:python must read accepted 3, shown 2, got {counts}"
-    assert ctx.kafka.lag("acceptance", ACCEPTED) == 0 and ctx.kafka.lag("acceptance", SHOWN) == 0, "every counted record must be committed"
+    lag = ctx.kafka.lag("acceptance", ACCEPTED)
+    assert lag <= 1 and ctx.kafka.lag("acceptance", SHOWN) == 0, "every counted record must be committed"
+    assert lag == 1, "the HINCRBY of req-9 failed (WRONGTYPE) and its offset was committed anyway: the count is lost for good. Commit only after HINCRBY succeeded"
 `,
     typescript: `const SESSION = {'X-Session-Id': 's-ada'};
 const SHOWN = 'completion.shown';
@@ -1057,12 +1076,17 @@ export async function check_session_key(ctx) {
   assert.deepEqual(keys, ['s-ada', 's-ada', 's-ada'], \`records must be keyed by the session, got \${JSON.stringify(keys)}: keyed by request id, one session's events land on several partitions\`);
   const events = ctx.kafka.records(SHOWN).map(r => JSON.parse(r.value.toString()));
   assert(events.map(e => e.request_id).join() === 'req-1,req-2' && events.every(e => e.session === 's-ada'), \`each event carries its request_id and session, got \${JSON.stringify(events)}\`);
+  const expected = {request_id: 'req-1', session: 's-ada', language: 'python', candidate_len: 18, latency_ms: 210};
+  const got = Object.fromEntries(Object.keys(expected).map(k => [k, events[0][k]]));
+  assert.deepEqual(got, expected, \`the event is {request_id, session, language, candidate_len, latency_ms} as reported: expected \${JSON.stringify(expected)}, got \${JSON.stringify(events[0])}\`);
   const before = ctx.kafka.topics.size;
-  const bad = await c.post('/v1/telemetry', {json: report('copied'), headers: SESSION});
-  assert.equal(bad.status, 400, \`an event outside ALLOWED_EVENTS answered \${bad.status}, expected 400\`);
+  for (const name of ['copied', 'accept', '']) {
+    const bad = await c.post('/v1/telemetry', {json: report(name), headers: SESSION});
+    assert.equal(bad.status, 400, \`the event \${JSON.stringify(name)} is outside ALLOWED_EVENTS and answered \${bad.status}, expected 400: the event must equal one of them\`);
+  }
   assert.equal(ctx.kafka.topics.size, before, \`an unknown event created a topic: \${JSON.stringify([...ctx.kafka.topics.keys()])}\`);
-  const anon = await c.post('/v1/telemetry', {json: report()});
-  assert.equal(anon.status, 401, \`a report without X-Session-Id answered \${anon.status}, expected 401\`);
+  const anon = await c.post('/v1/telemetry', {json: report('accepted', 'req-1', {session: 's-ada'})});
+  assert.equal(anon.status, 401, \`a report without X-Session-Id (a session in its body) answered \${anon.status}, expected 401: the session comes from the header only\`);
   await settle();
   assert.equal(ctx.kafka.records(ACCEPTED).length, 1, 'a report without a session reached the topic');
 }
@@ -1070,11 +1094,15 @@ export async function check_session_key(ctx) {
 export async function check_idempotent_acks(ctx) {
   const m = ctx.load('telemetry');
   ctx.kafka.loseAcks(ACCEPTED, 1); // the broker wrote it, the acknowledgement never arrived
-  const r = await ctx.client(m.app).post('/v1/telemetry', {json: report(), headers: SESSION});
+  const c = ctx.client(m.app);
+  const r = await c.post('/v1/telemetry', {json: report(), headers: SESSION});
   assert.equal(r.status, 202, \`POST /v1/telemetry answered \${r.status}: \${r.text}\`);
   await settle();
   const records = ctx.kafka.records(ACCEPTED);
   assert.equal(records.length, 1, \`one acceptance whose acknowledgement was lost left \${records.length} records: the producer's retry wrote it twice. Make the producer idempotent with acks=all\`);
+  ctx.kafka.stall(SHOWN); // the broker stops acknowledging completion.shown
+  const stalled = await c.post('/v1/telemetry', {json: report('shown', 'req-2'), headers: SESSION});
+  assert.notEqual(stalled.status, 202, 'a report the broker never acknowledged answered 202: the count is lost and the editor is told it was kept. Answer an error when the produce is not acknowledged');
 }
 
 export async function check_no_code(ctx) {
@@ -1101,24 +1129,34 @@ export async function check_no_code(ctx) {
 }
 
 export async function check_counters_before_commit(ctx) {
-  const value = (i: number) => JSON.stringify({request_id: \`req-\${i}\`, session: 's-ada', language: 'python', candidate_len: 18, latency_ms: 200});
+  const value = (i: number, language = 'python') => JSON.stringify({request_id: \`req-\${i}\`, session: 's-ada', language, candidate_len: 18, latency_ms: 200});
   for (let i = 0; i < 3; i++) ctx.kafka.seed(ACCEPTED, {key: 's-ada', value: value(i), partition: 0});
   for (let i = 0; i < 2; i++) ctx.kafka.seed(SHOWN, {key: 's-ada', value: value(i), partition: 0});
+  // The last record's HINCRBY fails: acceptance:rust is not a hash.
+  ctx.kafka.seed(ACCEPTED, {key: 's-ada', value: value(9, 'rust'), partition: 0});
+  ctx.redis.set('acceptance:rust', 'not-a-hash');
+  const countedRecords = {[ACCEPTED]: 3, [SHOWN]: 2};
   const early: string[] = [];
   ctx.kafka.onCommit((group, offsets: Map<string, number>) => {
     for (const [tp, offset] of offsets) {
       const [topic, partition] = tp.split('|');
       const counted = Number(ctx.redis.hget('acceptance:python', topic.split('.')[1]) ?? 0);
-      if (counted < offset) early.push(\`\${topic}[\${partition}] was committed to offset \${offset} with only \${counted} counted\`);
+      if (counted < Math.min(offset, countedRecords[topic])) early.push(\`\${topic}[\${partition}] was committed to offset \${offset} with only \${counted} counted\`);
     }
   });
   const m = ctx.load('telemetry');
-  await ctx.drain(m.consume());
+  try {
+    await ctx.drain(m.consume());
+  } catch {
+    // The failed HINCRBY may end the consumer; the offsets are the verdict.
+  }
   assert(!ctx.kafka.events.some(e => e[0] === 'auto-commit'), 'auto-commit is on: offsets are committed on a timer, whatever the counter holds');
   assert(early.length === 0, \`\${early[0]}: the commit ran before HINCRBY, so a crash between them loses the count\`);
   const counts = ctx.redis.hgetall('acceptance:python');
   assert.deepEqual(counts, {accepted: '3', shown: '2'}, \`acceptance:python must read accepted 3, shown 2, got \${JSON.stringify(counts)}\`);
-  assert(ctx.kafka.lag('acceptance', ACCEPTED) === 0 && ctx.kafka.lag('acceptance', SHOWN) === 0, 'every counted record must be committed');
+  const lag = ctx.kafka.lag('acceptance', ACCEPTED);
+  assert(lag <= 1 && ctx.kafka.lag('acceptance', SHOWN) === 0, 'every counted record must be committed');
+  assert.equal(lag, 1, 'the HINCRBY of req-9 failed (WRONGTYPE) and its offset was committed anyway: the count is lost for good. Commit only after HINCRBY succeeded');
 }
 `,
     go: `package main
@@ -1166,20 +1204,30 @@ func CheckSessionKey(ctx *harness.Ctx) {
 	keys := append(ctx.Kafka.Keys(telShown), ctx.Kafka.Keys(telAccepted)...)
 	ctx.Equal(keys, []string{"s-ada", "s-ada", "s-ada"}, "records must be keyed by the session (keyed by request id, one session's events land on several partitions)")
 	ids := []string{}
+	events := []map[string]any{}
 	for _, v := range ctx.Kafka.Values(telShown) {
 		var e map[string]any
 		json.Unmarshal([]byte(v), &e)
 		ctx.Equal(e["session"], "s-ada", "each event carries its session (%s)", v)
 		id, _ := e["request_id"].(string)
 		ids = append(ids, id)
+		events = append(events, e)
 	}
 	ctx.Equal(ids, []string{"req-1", "req-2"}, "each event carries its request_id")
+	expected := map[string]any{"request_id": "req-1", "session": "s-ada", "language": "python", "candidate_len": float64(18), "latency_ms": float64(210)}
+	got := map[string]any{}
+	for k := range expected {
+		got[k] = events[0][k]
+	}
+	ctx.Equal(got, expected, "the event is {request_id, session, language, candidate_len, latency_ms} as reported (%v)", events[0])
 	before := len(ctx.Kafka.Topics())
-	bad := c.Post("/v1/telemetry", telReport("copied", "req-3", nil), "X-Session-Id", "s-ada")
-	ctx.Equal(bad.Status, 400, "an event outside allowedEvents")
+	for _, name := range []string{"copied", "accept", ""} {
+		bad := c.Post("/v1/telemetry", telReport(name, "req-3", nil), "X-Session-Id", "s-ada")
+		ctx.Equal(bad.Status, 400, "the event %q is outside allowedEvents (the event must equal one of them); the status", name)
+	}
 	ctx.Equal(len(ctx.Kafka.Topics()), before, "an unknown event created a topic (%v); topics", ctx.Kafka.Topics())
-	anon := c.Post("/v1/telemetry", telReport("accepted", "req-4", nil))
-	ctx.Equal(anon.Status, 401, "a report without X-Session-Id")
+	anon := c.Post("/v1/telemetry", telReport("accepted", "req-4", map[string]any{"session": "s-ada"}))
+	ctx.Equal(anon.Status, 401, "a report without X-Session-Id (a session in its body: the session comes from the header only)")
 	ctx.Equal(len(ctx.Kafka.Records(telAccepted)), 1, "a report without a session reached the topic; records")
 }
 
@@ -1190,6 +1238,9 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 202, "POST /v1/telemetry (%s)", r.Text())
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(telAccepted)), 1, "one acceptance whose acknowledgement was lost: the producer's retry wrote it twice. Make the producer idempotent with acks=all; records")
+	ctx.Kafka.Stall(telShown) // the broker stops acknowledging completion.shown
+	stalled := c.Post("/v1/telemetry", telReport("shown", "req-2", nil), "X-Session-Id", "s-ada")
+	ctx.Assert(stalled.Status != 202, "a report the broker never acknowledged answered 202: the count is lost and the editor is told it was kept. Answer an error when the produce is not acknowledged")
 }
 
 func CheckNoCode(ctx *harness.Ctx) {
@@ -1210,22 +1261,30 @@ func CheckNoCode(ctx *harness.Ctx) {
 }
 
 func CheckCountersBeforeCommit(ctx *harness.Ctx) {
-	value := func(i int) string {
-		b, _ := json.Marshal(map[string]any{"request_id": fmt.Sprintf("req-%d", i), "session": "s-ada", "language": "python", "candidate_len": 18, "latency_ms": 200})
+	value := func(i int, language string) string {
+		b, _ := json.Marshal(map[string]any{"request_id": fmt.Sprintf("req-%d", i), "session": "s-ada", "language": language, "candidate_len": 18, "latency_ms": 200})
 		return string(b)
 	}
 	for i := 0; i < 3; i++ {
-		ctx.Kafka.SeedPartition(telAccepted, 0, "s-ada", value(i))
+		ctx.Kafka.SeedPartition(telAccepted, 0, "s-ada", value(i, "python"))
 	}
 	for i := 0; i < 2; i++ {
-		ctx.Kafka.SeedPartition(telShown, 0, "s-ada", value(i))
+		ctx.Kafka.SeedPartition(telShown, 0, "s-ada", value(i, "python"))
 	}
+	// The last record's HINCRBY fails: acceptance:rust is not a hash.
+	ctx.Kafka.SeedPartition(telAccepted, 0, "s-ada", value(9, "rust"))
+	ctx.Redis.Set("acceptance:rust", "not-a-hash")
+	countedRecords := map[string]int64{telAccepted: 3, telShown: 2}
 	early := []string{}
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
 		for tp, offset := range offsets {
 			raw, _ := ctx.Redis.HGet("acceptance:python", strings.TrimPrefix(tp.Topic, "completion."))
 			counted, _ := strconv.ParseInt(raw, 10, 64)
-			if counted < offset {
+			limit := int64(offset)
+			if limit > countedRecords[tp.Topic] {
+				limit = countedRecords[tp.Topic]
+			}
+			if counted < limit {
 				early = append(early, fmt.Sprintf("%s[%d] was committed to offset %d with only %d counted", tp.Topic, tp.Partition, offset, counted))
 			}
 		}
@@ -1238,12 +1297,15 @@ func CheckCountersBeforeCommit(ctx *harness.Ctx) {
 		ctx.Fatalf("%s: the commit ran before HINCRBY, so a crash between them loses the count", early[0])
 	}
 	ctx.Equal(ctx.Redis.HGetAll("acceptance:python"), map[string]string{"accepted": "3", "shown": "2"}, "acceptance:python")
-	ctx.Assert(ctx.Kafka.Lag("acceptance", telAccepted) == 0 && ctx.Kafka.Lag("acceptance", telShown) == 0, "every counted record must be committed")
+	lag := ctx.Kafka.Lag("acceptance", telAccepted)
+	ctx.Assert(lag <= 1 && ctx.Kafka.Lag("acceptance", telShown) == 0, "every counted record must be committed")
+	ctx.Assert(lag == 1, "the HINCRBY of req-9 failed (WRONGTYPE) and its offset was committed anyway: the count is lost for good. Commit only after HINCRBY succeeded")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <iostream>
 #include <map>
@@ -1287,18 +1349,26 @@ void CheckSessionKey(harness::Ctx& ctx) {
   for (const auto& k : ctx.Kafka.Keys(kTelAccepted)) keys.push_back(k);
   ctx.Equal(keys, {"s-ada", "s-ada", "s-ada"}, "records must be keyed by the session (keyed by request id, one session's events land on several partitions)");
   std::vector<std::string> ids;
+  std::vector<nlohmann::json> events;
   for (const auto& v : ctx.Kafka.Values(kTelShown)) {
     const auto e = nlohmann::json::parse(v, nullptr, false);
     ctx.Assert(e.is_object() && e.value("session", "") == "s-ada", "each event carries its session (%s)", v);
     ids.push_back(e.is_object() ? e.value("request_id", "") : "");
+    events.push_back(e);
   }
   ctx.Equal(ids, {"req-1", "req-2"}, "each event carries its request_id");
+  const nlohmann::json expected = {{"request_id", "req-1"}, {"session", "s-ada"}, {"language", "python"}, {"candidate_len", 18}, {"latency_ms", 210}};
+  nlohmann::json got = nlohmann::json::object();
+  for (auto it = expected.begin(); it != expected.end(); ++it) got[it.key()] = events[0].is_object() && events[0].contains(it.key()) ? events[0][it.key()] : nlohmann::json();
+  ctx.Assert(got == expected, "the event is {request_id, session, language, candidate_len, latency_ms} as reported: expected %s, got %s", expected.dump(), events[0].dump());
   const std::size_t before = ctx.Kafka.Topics().size();
-  const auto bad = telPost(c, telReport("copied", "req-3"));
-  ctx.Equal(bad.Status, 400, "an event outside kAllowedEvents");
+  for (const std::string name : {"copied", "accept", ""}) {
+    const auto bad = telPost(c, telReport(name, "req-3"));
+    ctx.Equal(bad.Status, 400, "the event %q is outside kAllowedEvents (the event must equal one of them); the status", name);
+  }
   ctx.Equal(ctx.Kafka.Topics().size(), before, "an unknown event created a topic (%v); topics", ctx.Kafka.Topics());
-  const auto anon = c.Post("/v1/telemetry", telReport("accepted", "req-4"), "Content-Type", "application/json");
-  ctx.Equal(anon.Status, 401, "a report without X-Session-Id");
+  const auto anon = c.Post("/v1/telemetry", telReport("accepted", "req-4", {{"session", "s-ada"}}), "Content-Type", "application/json");
+  ctx.Equal(anon.Status, 401, "a report without X-Session-Id (a session in its body: the session comes from the header only)");
   ctx.Equal(ctx.Kafka.Records(kTelAccepted).size(), 1, "a report without a session reached the topic; records");
 }
 
@@ -1310,6 +1380,9 @@ void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTelAccepted).size(), 1,
             "one acceptance whose acknowledgement was lost: the producer's retry wrote it twice. Set enable.idempotence with acks=all; records");
+  ctx.Kafka.Stall(kTelShown);  // the broker stops acknowledging completion.shown
+  const auto stalled = telPost(c, telReport("shown", "req-2"));
+  ctx.Assert(stalled.Status != 202, "a report the broker never acknowledged answered 202: the count is lost and the editor is told it was kept. Answer an error when the produce is not acknowledged");
 }
 
 void CheckNoCode(harness::Ctx& ctx) {
@@ -1330,25 +1403,37 @@ void CheckNoCode(harness::Ctx& ctx) {
 }
 
 void CheckCountersBeforeCommit(harness::Ctx& ctx) {
-  const auto value = [](int i) {
-    return nlohmann::json{{"request_id", "req-" + std::to_string(i)}, {"session", "s-ada"}, {"language", "python"}, {"candidate_len", 18}, {"latency_ms", 200}}.dump();
+  const auto value = [](int i, const std::string& language) {
+    return nlohmann::json{{"request_id", "req-" + std::to_string(i)}, {"session", "s-ada"}, {"language", language}, {"candidate_len", 18}, {"latency_ms", 200}}.dump();
   };
-  for (int i = 0; i < 3; i++) ctx.Kafka.SeedPartition(kTelAccepted, 0, "s-ada", value(i));
-  for (int i = 0; i < 2; i++) ctx.Kafka.SeedPartition(kTelShown, 0, "s-ada", value(i));
+  for (int i = 0; i < 3; i++) ctx.Kafka.SeedPartition(kTelAccepted, 0, "s-ada", value(i, "python"));
+  for (int i = 0; i < 2; i++) ctx.Kafka.SeedPartition(kTelShown, 0, "s-ada", value(i, "python"));
+  // The last record's HINCRBY fails: acceptance:rust is not a hash.
+  ctx.Kafka.SeedPartition(kTelAccepted, 0, "s-ada", value(9, "rust"));
+  ctx.Redis.Set("acceptance:rust", "not-a-hash");
+  const std::map<std::string, long long> counted_records = {{kTelAccepted, 3}, {kTelShown, 2}};
   std::vector<std::string> early;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
     for (const auto& [tp, offset] : offsets) {
       const auto raw = ctx.Redis.HGet("acceptance:python", tp.Topic.substr(tp.Topic.find('.') + 1));
       const long long counted = raw ? std::strtoll(raw->c_str(), nullptr, 10) : 0;
-      if (counted < offset)
+      const auto limit = counted_records.find(tp.Topic);
+      const long long expected_at_most = limit == counted_records.end() ? static_cast<long long>(offset) : std::min<long long>(offset, limit->second);
+      if (counted < expected_at_most)
         early.push_back(harness::Sprintf("%s[%d] was committed to offset %d with only %d counted", tp.Topic, tp.Partition, offset, counted));
     }
   });
-  ctx.Drain([&] { consume(); });
+  try {
+    ctx.Drain([&] { consume(); });
+  } catch (const std::exception&) {
+    // The failed HINCRBY may end the consumer; the offsets are the verdict.
+  }
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets are committed on a timer, whatever the counter holds");
   if (!early.empty()) ctx.Fatalf("%s: the commit ran before HINCRBY, so a crash between them loses the count", early[0]);
   ctx.Equal(ctx.Redis.HGetAll("acceptance:python"), std::map<std::string, std::string>{{"accepted", "3"}, {"shown", "2"}}, "acceptance:python");
-  ctx.Assert(ctx.Kafka.Lag("acceptance", kTelAccepted) == 0 && ctx.Kafka.Lag("acceptance", kTelShown) == 0, "every counted record must be committed");
+  const auto lag = ctx.Kafka.Lag("acceptance", kTelAccepted);
+  ctx.Assert(lag <= 1 && ctx.Kafka.Lag("acceptance", kTelShown) == 0, "every counted record must be committed");
+  ctx.Assert(lag == 1, "the HINCRBY of req-9 failed (WRONGTYPE) and its offset was committed anyway: the count is lost for good. Commit only after HINCRBY succeeded");
 }
 `,
   },

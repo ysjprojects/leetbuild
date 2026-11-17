@@ -21,10 +21,11 @@ a 20,000-character file goes to the model whole; and the log line carries the co
 keystroke.
 
 - \`X-Session-Id\` is required: **401** before any work. Every reply carries a fresh \`request_id\`
-  and echoes the editor's \`token\`.
+  (one per request, whatever the token) and echoes the editor's \`token\`.
 - The model reads about **6,000 characters** (\`PROMPT_WINDOW_CHARS\`): keep the prefix's **last
   3,500** (\`MAX_PREFIX_CHARS\`), the suffix's **first 1,000** (\`MAX_SUFFIX_CHARS\`) and snippets
-  in the rest. Trim, do not reject. A body over **1 MiB** (\`MAX_BODY_BYTES\`) is **413**.
+  in the rest. Trim, do not reject. A body over **1 MiB** (\`MAX_BODY_BYTES\`, the whole body, open
+  tabs included) is **413** before any work.
 - Log the session, request id, language, prompt size and snippet count; no prefix, suffix or tab
   text.`,
   sequence: {
@@ -61,7 +62,7 @@ keystroke.
       id: 'session',
       title: 'Requires a session and answers with a request id',
       detail:
-        'A missing `X-Session-Id` is **401** before the tabs are stored or the model is called, and every reply carries a fresh `request_id` next to the echoed `token`. The starter serves anyone and answers no id.',
+        'A missing `X-Session-Id` is **401** before the tabs are stored or the model is called, and every reply carries a fresh `request_id` (two requests with the same token get two ids) next to the echoed `token`. The starter serves anyone and answers no id.',
       match: {
         python: {all: [/status_code\s*=\s*401/, /["']request_id["']\s*:/]},
         typescript: {all: [/code\(\s*401\s*\)/, /request_id\s*:/]},
@@ -74,7 +75,7 @@ keystroke.
       id: 'window',
       title: 'Fits the prompt into the 6,000-character window',
       detail:
-        "The model receives the prefix's last `MAX_PREFIX_CHARS` (3,500), the suffix's first `MAX_SUFFIX_CHARS` (1,000) and at most the rest of `PROMPT_WINDOW_CHARS` (6,000) in snippets; a body over `MAX_BODY_BYTES` is **413**. The starter sends whole files.",
+        "The model receives the prefix's last `MAX_PREFIX_CHARS` (3,500), the suffix's first `MAX_SUFFIX_CHARS` (1,000) and at most the rest of `PROMPT_WINDOW_CHARS` (6,000) in snippets. A body over `MAX_BODY_BYTES` (1 MiB = 1,048,576 bytes, open tabs included) is **413** before its tabs are stored; a body just under it is trimmed and served. The starter sends whole files.",
       match: {
         python: {
           all: [
@@ -782,11 +783,13 @@ async def check_session(ctx):
         assert ctx.redis.keys("tabs:*") == [], f"a request without a session stored tabs: {ctx.redis.keys('tabs:*')}"
         first = await c.post("/v1/completions", json=_body(token=17), headers=SESSION)
         second = await c.post("/v1/completions", json=_body(token=18), headers=SESSION)
-    assert first.status_code == 200 and second.status_code == 200, f"two completions answered {first.status_code} and {second.status_code}"
-    a, b = first.json(), second.json()
+        third = await c.post("/v1/completions", json=_body(token=17), headers=SESSION)
+    assert first.status_code == 200 and second.status_code == 200 and third.status_code == 200, f"three completions answered {first.status_code}, {second.status_code} and {third.status_code}"
+    a, b, again = first.json(), second.json(), third.json()
     assert isinstance(a.get("request_id"), str) and a["request_id"] != "", f"the reply must carry a request_id, got {a}"
     assert a["request_id"] != b.get("request_id"), "two requests answered the same request_id: it must be fresh per request"
-    assert a.get("token") == 17 and b.get("token") == 18, f"each reply must echo its own token, got {a.get('token')} and {b.get('token')}"
+    assert again.get("request_id") not in (a["request_id"], b.get("request_id")), "a second request with token 17 answered a request_id already used: the id is fresh per request, not derived from the session or the token"
+    assert a.get("token") == 17 and b.get("token") == 18 and again.get("token") == 17, f"each reply must echo its own token, got {a.get('token')}, {b.get('token')} and {again.get('token')}"
 
 
 async def check_window(ctx):
@@ -800,8 +803,16 @@ async def check_window(ctx):
         snippet_chars = sum(len(s) for s in sent.snippets)
         assert 0 < snippet_chars <= 1500, f"the snippets took {snippet_chars} characters: they get what is left of the 6,000-character window (1,500)"
         calls = len(peer.requests)
+        near = await c.post("/v1/completions", json=_body("a" * 1_040_000), headers=SESSION)
+        assert near.status_code == 200, f"a body of 1,040,000 bytes (under 1 MiB = 1,048,576) answered {near.status_code}: trim it, only a body over MAX_BODY_BYTES is 413"
+        assert len(peer.requests) == calls + 1 and peer.requests[-1].prefix == "a" * 3500, "a body under 1 MiB must reach the model with its prefix trimmed to 3,500 characters"
+        calls = len(peer.requests)
         big = await c.post("/v1/completions", json=_body("a" * 1_100_000), headers=SESSION)
-    assert big.status_code == 413, f"a body over 1 MiB answered {big.status_code}, expected 413"
+        assert big.status_code == 413, f"a body over 1 MiB answered {big.status_code}, expected 413"
+        heavy = [("lib/big_a.py", "x" * 600_000), ("lib/big_b.py", "y" * 600_000)]
+        tabs_big = await c.post("/v1/completions", json=_body(open_tabs=heavy), headers={"X-Session-Id": "s-big"})
+    assert tabs_big.status_code == 413, f"a body of 1.2 MB in its open tabs (short prefix) answered {tabs_big.status_code}: the limit is on the whole body, expected 413"
+    assert ctx.redis.keys("tabs:s-big*") == [], f"a body over 1 MiB stored its tabs {ctx.redis.keys('tabs:s-big*')}: reject it before any work"
     assert len(peer.requests) == calls, "a body over 1 MiB reached the model"
 
 
@@ -826,6 +837,7 @@ async def check_no_code_log(ctx):
     assert canary not in logged, f"the code reached a log line: {logged.strip()!r}"
     request_id = r.json().get("request_id")
     assert request_id and request_id in logged, f"no log line names the request id {request_id!r}; log ids and sizes: {logged.strip()!r}"
+    assert "s-ada" in logged and "python" in logged, f"the log line must name the session (s-ada) and the language (python) beside the request id: {logged.strip()!r}"
 `,
     typescript: `const SESSION = {'X-Session-Id': 's-ada'};
 const ANSWER = ['conn.cursor()', 'conn.close()'];
@@ -879,12 +891,15 @@ export async function check_session(ctx) {
   assert.deepEqual(ctx.redis.keys('tabs:*'), [], \`a request without a session stored tabs: \${JSON.stringify(ctx.redis.keys('tabs:*'))}\`);
   const first = await c.post('/v1/completions', {json: body({token: 17}), headers: SESSION});
   const second = await c.post('/v1/completions', {json: body({token: 18}), headers: SESSION});
-  assert(first.status === 200 && second.status === 200, \`two completions answered \${first.status} and \${second.status}\`);
+  const third = await c.post('/v1/completions', {json: body({token: 17}), headers: SESSION});
+  assert(first.status === 200 && second.status === 200 && third.status === 200, \`three completions answered \${first.status}, \${second.status} and \${third.status}\`);
   const a = first.json();
   const b = second.json();
+  const again = third.json();
   assert(typeof a.request_id === 'string' && a.request_id !== '', \`the reply must carry a request_id, got \${first.text}\`);
   assert.notEqual(a.request_id, b.request_id, 'two requests answered the same request_id: it must be fresh per request');
-  assert(a.token === 17 && b.token === 18, \`each reply must echo its own token, got \${a.token} and \${b.token}\`);
+  assert(again.request_id !== a.request_id && again.request_id !== b.request_id, 'a second request with token 17 answered a request_id already used: the id is fresh per request, not derived from the session or the token');
+  assert(a.token === 17 && b.token === 18 && again.token === 17, \`each reply must echo its own token, got \${a.token}, \${b.token} and \${again.token}\`);
 }
 
 export async function check_window(ctx) {
@@ -896,9 +911,17 @@ export async function check_window(ctx) {
   assert.equal(sent.suffix, SUFFIX.slice(0, 1000), \`the model received a suffix of \${sent.suffix.length} characters: keep the first 1,000\`);
   const snippetChars = (sent.snippets ?? []).reduce((n, s) => n + s.length, 0);
   assert(snippetChars > 0 && snippetChars <= 1500, \`the snippets took \${snippetChars} characters: they get what is left of the 6,000-character window (1,500)\`);
-  const calls = requests.length;
+  let calls = requests.length;
+  const near = await c.post('/v1/completions', {json: body({prefix: 'a'.repeat(1_040_000)}), headers: SESSION});
+  assert.equal(near.status, 200, \`a body of 1,040,000 bytes (under 1 MiB = 1,048,576) answered \${near.status}: trim it, only a body over MAX_BODY_BYTES is 413\`);
+  assert(requests.length === calls + 1 && requests[requests.length - 1].prefix === 'a'.repeat(3500), 'a body under 1 MiB must reach the model with its prefix trimmed to 3,500 characters');
+  calls = requests.length;
   const big = await c.post('/v1/completions', {json: body({prefix: 'a'.repeat(1_100_000)}), headers: SESSION});
   assert.equal(big.status, 413, \`a body over 1 MiB answered \${big.status}, expected 413\`);
+  const heavy = [{path: 'lib/big_a.py', text: 'x'.repeat(600_000)}, {path: 'lib/big_b.py', text: 'y'.repeat(600_000)}];
+  const tabsBig = await c.post('/v1/completions', {json: body({openTabs: heavy}), headers: {'X-Session-Id': 's-big'}});
+  assert.equal(tabsBig.status, 413, \`a body of 1.2 MB in its open tabs (short prefix) answered \${tabsBig.status}: the limit is on the whole body, expected 413\`);
+  assert.deepEqual(ctx.redis.keys('tabs:s-big*'), [], \`a body over 1 MiB stored its tabs \${JSON.stringify(ctx.redis.keys('tabs:s-big*'))}: reject it before any work\`);
   assert.equal(requests.length, calls, 'a body over 1 MiB reached the model');
 }
 
@@ -923,6 +946,8 @@ export async function check_no_code_log(ctx) {
   assert(leak === undefined, \`the code reached a log line: \${leak}\`);
   const requestId = r.json().request_id;
   assert(requestId && logged.some(line => line.includes(requestId)), \`no log line names the request id \${requestId}; log ids and sizes: \${logged.join(' | ')}\`);
+  const line = logged.find(l => l.includes(requestId)) ?? '';
+  assert(line.includes('s-ada') && line.includes('python'), \`the log line must name the session (s-ada) and the language (python) beside the request id: \${line}\`);
 }
 `,
     go: `package main
@@ -1012,13 +1037,16 @@ func CheckSession(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.Keys("tabs:*")), 0, "a request without a session stored tabs (%v); keys", ctx.Redis.Keys("tabs:*"))
 	first := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
 	second := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", nil, 18), "X-Session-Id", "s-ada")
-	ctx.Assert(first.Status == 200 && second.Status == 200, "two completions answered %d and %d", first.Status, second.Status)
+	third := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", nil, 17), "X-Session-Id", "s-ada")
+	ctx.Assert(first.Status == 200 && second.Status == 200 && third.Status == 200, "three completions answered %d, %d and %d", first.Status, second.Status, third.Status)
 	a, _ := first.JSON().(map[string]any)
 	b, _ := second.JSON().(map[string]any)
+	again, _ := third.JSON().(map[string]any)
 	id, _ := a["request_id"].(string)
 	ctx.Assert(id != "", "the reply must carry a request_id, got %s", first.Text())
 	ctx.Assert(a["request_id"] != b["request_id"], "two requests answered the same request_id: it must be fresh per request")
-	ctx.Assert(a["token"] == float64(17) && b["token"] == float64(18), "each reply must echo its own token, got %v and %v", a["token"], b["token"])
+	ctx.Assert(again["request_id"] != a["request_id"] && again["request_id"] != b["request_id"], "a second request with token 17 answered a request_id already used: the id is fresh per request, not derived from the session or the token")
+	ctx.Assert(a["token"] == float64(17) && b["token"] == float64(18) && again["token"] == float64(17), "each reply must echo its own token, got %v, %v and %v", a["token"], b["token"], again["token"])
 }
 
 func CheckWindow(ctx *harness.Ctx) {
@@ -1034,8 +1062,16 @@ func CheckWindow(ctx *harness.Ctx) {
 	}
 	ctx.Assert(snippetChars > 0 && snippetChars <= 1500, "the snippets took %d characters: they get what is left of the 6,000-character window (1,500)", snippetChars)
 	calls := len(peer.requests)
+	near := c.Post("/v1/completions", apiBody(strings.Repeat("a", 1040000), "\\n", nil, 17), "X-Session-Id", "s-ada")
+	ctx.Equal(near.Status, 200, "a body of 1,040,000 bytes (under 1 MiB = 1,048,576) must be trimmed, only a body over the limit is 413; the status")
+	ctx.Assert(len(peer.requests) == calls+1 && peer.requests[len(peer.requests)-1].GetPrefix() == strings.Repeat("a", 3500), "a body under 1 MiB must reach the model with its prefix trimmed to 3,500 characters")
+	calls = len(peer.requests)
 	big := c.Post("/v1/completions", apiBody(strings.Repeat("a", 1100000), "\\n", nil, 17), "X-Session-Id", "s-ada")
 	ctx.Equal(big.Status, 413, "a body over 1 MiB")
+	heavy := []map[string]string{{"path": "lib/big_a.py", "text": strings.Repeat("x", 600000)}, {"path": "lib/big_b.py", "text": strings.Repeat("y", 600000)}}
+	tabsBig := c.Post("/v1/completions", apiBody(apiShortPrefix, "\\n", heavy, 17), "X-Session-Id", "s-big")
+	ctx.Equal(tabsBig.Status, 413, "a body of 1.2 MB in its open tabs (short prefix): the limit is on the whole body; the status")
+	ctx.Assert(len(ctx.Redis.Keys("tabs:s-big*")) == 0, "a body over 1 MiB stored its tabs %v: reject it before any work", ctx.Redis.Keys("tabs:s-big*"))
 	ctx.Equal(len(peer.requests), calls, "a body over 1 MiB reached the model; Complete calls")
 }
 
@@ -1053,6 +1089,7 @@ func CheckNoCodeLog(ctx *harness.Ctx) {
 	out, _ := r.JSON().(map[string]any)
 	id, _ := out["request_id"].(string)
 	ctx.Assert(id != "" && strings.Contains(logged.String(), id), "no log line names the request id %q; log ids and sizes: %q", id, strings.TrimSpace(logged.String()))
+	ctx.Assert(strings.Contains(logged.String(), "s-ada") && strings.Contains(logged.String(), "python"), "the log line must name the session (s-ada) and the language (python) beside the request id: %q", strings.TrimSpace(logged.String()))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1147,13 +1184,18 @@ void CheckSession(harness::Ctx& ctx) {
   ctx.Equal(ctx.Redis.Keys("tabs:*").size(), 0, "a request without a session stored tabs; keys");
   const auto first = apiPost(c, apiBody(kApiShortPrefix, "\\n", nlohmann::json::array(), 17));
   const auto second = apiPost(c, apiBody(kApiShortPrefix, "\\n", nlohmann::json::array(), 18));
-  ctx.Assert(first.Status == 200 && second.Status == 200, "two completions answered %d and %d", first.Status, second.Status);
+  const auto third = apiPost(c, apiBody(kApiShortPrefix, "\\n", nlohmann::json::array(), 17));
+  ctx.Assert(first.Status == 200 && second.Status == 200 && third.Status == 200, "three completions answered %d, %d and %d", first.Status, second.Status, third.Status);
   const auto a = nlohmann::json::parse(first.Text(), nullptr, false);
   const auto b = nlohmann::json::parse(second.Text(), nullptr, false);
+  const auto again = nlohmann::json::parse(third.Text(), nullptr, false);
   const std::string id = a.is_object() ? a.value("request_id", "") : "";
+  const std::string id_b = b.is_object() ? b.value("request_id", "") : "";
+  const std::string id_again = again.is_object() ? again.value("request_id", "") : "";
   ctx.Assert(!id.empty(), "the reply must carry a request_id, got %s", first.Text());
-  ctx.Assert(id != (b.is_object() ? b.value("request_id", "") : ""), "two requests answered the same request_id: it must be fresh per request");
-  ctx.Assert(a.value("token", 0) == 17 && b.value("token", 0) == 18, "each reply must echo its own token, got %s and %s", first.Text(), second.Text());
+  ctx.Assert(id != id_b, "two requests answered the same request_id: it must be fresh per request");
+  ctx.Assert(id_again != id && id_again != id_b, "a second request with token 17 answered a request_id already used: the id is fresh per request, not derived from the session or the token");
+  ctx.Assert(a.value("token", 0) == 17 && b.value("token", 0) == 18 && again.value("token", 0) == 17, "each reply must echo its own token, got %s, %s and %s", first.Text(), second.Text(), third.Text());
 }
 
 void CheckWindow(harness::Ctx& ctx) {
@@ -1169,9 +1211,17 @@ void CheckWindow(harness::Ctx& ctx) {
   std::size_t snippet_chars = 0;
   for (const auto& s : sent.snippets()) snippet_chars += s.size();
   ctx.Assert(snippet_chars > 0 && snippet_chars <= 1500, "the snippets took %d characters: they get what is left of the 6,000-character window (1,500)", snippet_chars);
-  const std::size_t calls = w.peer.requests.size();
+  std::size_t calls = w.peer.requests.size();
+  const auto near = apiPost(c, apiBody(std::string(1040000, 'a'), "\\n", nlohmann::json::array(), 17));
+  ctx.Equal(near.Status, 200, "a body of 1,040,000 bytes (under 1 MiB = 1,048,576) must be trimmed, only a body over the limit is 413; the status");
+  ctx.Assert(w.peer.requests.size() == calls + 1 && w.peer.requests.back().prefix() == std::string(3500, 'a'), "a body under 1 MiB must reach the model with its prefix trimmed to 3,500 characters");
+  calls = w.peer.requests.size();
   const auto big = apiPost(c, apiBody(std::string(1100000, 'a'), "\\n", nlohmann::json::array(), 17));
   ctx.Equal(big.Status, 413, "a body over 1 MiB");
+  nlohmann::json heavy = nlohmann::json::array({{{"path", "lib/big_a.py"}, {"text", std::string(600000, 'x')}}, {{"path", "lib/big_b.py"}, {"text", std::string(600000, 'y')}}});
+  const auto tabs_big = c.Post("/v1/completions", apiBody(kApiShortPrefix, "\\n", heavy, 17), "Content-Type", "application/json", "X-Session-Id", "s-big");
+  ctx.Equal(tabs_big.Status, 413, "a body of 1.2 MB in its open tabs (short prefix): the limit is on the whole body; the status");
+  ctx.Equal(ctx.Redis.Keys("tabs:s-big*").size(), 0, "a body over 1 MiB stored its tabs: reject it before any work; keys");
   ctx.Equal(w.peer.requests.size(), calls, "a body over 1 MiB reached the model; Complete calls");
 }
 
@@ -1191,6 +1241,7 @@ void CheckNoCodeLog(harness::Ctx& ctx) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   const std::string id = body.is_object() ? body.value("request_id", "") : "";
   ctx.Assert(!id.empty() && logged.str().find(id) != std::string::npos, "no log line names the request id %q; log ids and sizes: %q", id, logged.str());
+  ctx.Assert(logged.str().find("s-ada") != std::string::npos && logged.str().find("python") != std::string::npos, "the log line must name the session (s-ada) and the language (python) beside the request id: %q", logged.str());
 }
 `,
   },

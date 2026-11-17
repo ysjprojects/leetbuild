@@ -92,7 +92,7 @@ request the exchange refuses as malformed is retried until it happens to pass.
       id: 'propagate-errors',
       title: 'Raises ExchangeError for any other status',
       detail:
-        'An `INVALID_ARGUMENT` (or any status other than the two above) raises `ExchangeError` after one call: the exchange refused this request, and another try or a house ad would hide the bug. The starter retries it.',
+        'Any status other than the two above (`INVALID_ARGUMENT`, `NOT_FOUND`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `INTERNAL`, one serve each) raises `ExchangeError` after one call: the exchange refused this request, and another try or a house ad would hide the bug. The starter retries it.',
       match: {
         python: {all: [/raise ExchangeError\(/]},
         typescript: {all: [/throw new ExchangeError\(/]},
@@ -597,7 +597,7 @@ def check_deadline(ctx):
     calls = ctx.grpc.calls_to("SelectAd")
     assert len(calls) == 1, f"one serve made {len(calls)} SelectAd calls"
     assert calls[0].timeout is not None, "SelectAd carries no deadline: a stalled exchange holds the page"
-    assert 0.1 <= calls[0].timeout <= 0.2, f"SelectAd carries a {calls[0].timeout} s deadline, expected EXCHANGE_DEADLINE_S = 0.15: the exchange gets a slice of the page budget, not a second"
+    assert 0.14 <= calls[0].timeout <= 0.16, f"SelectAd carries a {calls[0].timeout} s deadline, expected EXCHANGE_DEADLINE_S = 0.15: the exchange gets a 150 ms slice of the page budget"
 
 
 def check_one_call(ctx):
@@ -612,7 +612,7 @@ def check_one_call(ctx):
     before = ctx.clock.time()
     _select(m)
     waited = ctx.clock.time() - before
-    assert waited <= 0.2, f"with the exchange taking 5 s the serve waited {waited:.2f} s, expected one 150 ms deadline"
+    assert waited <= 0.16, f"with the exchange taking 5 s the serve waited {waited:.2f} s, expected one 150 ms deadline"
     assert len(ctx.grpc.calls_to("SelectAd")) == 2, "a slow exchange gets one call per serve"
 
 
@@ -632,17 +632,25 @@ def check_house_fallback(ctx):
 
 def check_propagate_errors(ctx):
     m = _client(ctx)
-    ctx.grpc.fail("SelectAd", grpc.StatusCode.INVALID_ARGUMENT, "placement home-top is not registered")
-    try:
-        got = m.select_ad("home-top", "u-1")
-    except m.ExchangeError:
-        pass
-    except Exception as other:
-        raise AssertionError(f"INVALID_ARGUMENT raised {type(other).__name__}: {other}, expected ExchangeError")
-    else:
-        raise AssertionError(f"INVALID_ARGUMENT from the exchange answered {got}: a request the exchange refuses is a bug to surface, not a slot to fill. Raise ExchangeError")
-    calls = len(ctx.grpc.calls_to("SelectAd"))
-    assert calls == 1, f"an INVALID_ARGUMENT was sent {calls} times: the same request fails the same way"
+    terminal = [
+        grpc.StatusCode.INVALID_ARGUMENT,
+        grpc.StatusCode.NOT_FOUND,
+        grpc.StatusCode.PERMISSION_DENIED,
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+        grpc.StatusCode.INTERNAL,
+    ]
+    for n, code in enumerate(terminal, start=1):
+        ctx.grpc.fail("SelectAd", code, "the exchange refused the request")
+        try:
+            got = m.select_ad("home-top", "u-1")
+        except m.ExchangeError:
+            pass
+        except Exception as other:
+            raise AssertionError(f"{code.name} raised {type(other).__name__}: {other}, expected ExchangeError")
+        else:
+            raise AssertionError(f"{code.name} from the exchange answered {got}: only DEADLINE_EXCEEDED and UNAVAILABLE serve the house ad, any other status is a refusal to surface. Raise ExchangeError")
+        calls = len(ctx.grpc.calls_to("SelectAd"))
+        assert calls == n, f"after {code.name} the exchange has seen {calls} SelectAd calls over {n} serves: a refused request fails the same way, send it once"
 `,
     typescript: `const BID = {campaign_id: 'c-9', creative_id: 'cr-c-9', price_micros: 1200};
 const HOUSE = {campaign_id: 'house', creative_id: 'house-default', price_micros: 0};
@@ -675,7 +683,7 @@ export async function check_deadline(ctx) {
   const calls = ctx.grpc.callsTo('SelectAd');
   assert.equal(calls.length, 1, \`one serve made \${calls.length} SelectAd calls\`);
   assert(calls[0].timeout !== null, 'SelectAd carries no deadline: a stalled exchange holds the page');
-  assert(0.1 <= calls[0].timeout && calls[0].timeout <= 0.2, \`SelectAd carries a \${calls[0].timeout} s deadline, expected EXCHANGE_DEADLINE_MS = 150: the exchange gets a slice of the page budget, not a second\`);
+  assert(0.14 <= calls[0].timeout && calls[0].timeout <= 0.16, \`SelectAd carries a \${calls[0].timeout} s deadline, expected EXCHANGE_DEADLINE_MS = 150: the exchange gets a 150 ms slice of the page budget\`);
 }
 
 export async function check_one_call(ctx) {
@@ -690,7 +698,7 @@ export async function check_one_call(ctx) {
   const before = ctx.clock.now();
   await select(m);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 0.2, \`with the exchange taking 5 s the serve waited \${waited.toFixed(2)} s, expected one 150 ms deadline\`);
+  assert(waited <= 0.16, \`with the exchange taking 5 s the serve waited \${waited.toFixed(2)} s, expected one 150 ms deadline\`);
   assert.equal(ctx.grpc.callsTo('SelectAd').length, 2, 'a slow exchange gets one call per serve');
 }
 
@@ -710,17 +718,21 @@ export async function check_house_fallback(ctx) {
 
 export async function check_propagate_errors(ctx) {
   const m = client(ctx);
-  ctx.grpc.fail('SelectAd', ctx.grpc.status.INVALID_ARGUMENT, 'placement home-top is not registered');
-  let got;
-  try {
-    got = await m.selectAd('home-top', 'u-1');
-  } catch (e) {
-    assert(e instanceof m.ExchangeError, \`INVALID_ARGUMENT threw \${(e as Error).constructor.name}: \${(e as Error).message}, expected ExchangeError\`);
+  const terminal = ['INVALID_ARGUMENT', 'NOT_FOUND', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'INTERNAL'];
+  for (const [i, code] of terminal.entries()) {
+    ctx.grpc.fail('SelectAd', ctx.grpc.status[code], 'the exchange refused the request');
+    let got;
+    let raised = false;
+    try {
+      got = await m.selectAd('home-top', 'u-1');
+    } catch (e) {
+      assert(e instanceof m.ExchangeError, \`\${code} threw \${(e as Error).constructor.name}: \${(e as Error).message}, expected ExchangeError\`);
+      raised = true;
+    }
+    assert(raised, \`\${code} from the exchange answered \${JSON.stringify(got)}: only DEADLINE_EXCEEDED and UNAVAILABLE serve the house ad, any other status is a refusal to surface. Throw ExchangeError\`);
     const calls = ctx.grpc.callsTo('SelectAd').length;
-    assert.equal(calls, 1, \`an INVALID_ARGUMENT was sent \${calls} times: the same request fails the same way\`);
-    return;
+    assert.equal(calls, i + 1, \`after \${code} the exchange has seen \${calls} SelectAd calls over \${i + 1} serves: a refused request fails the same way, send it once\`);
   }
-  assert.fail(\`INVALID_ARGUMENT from the exchange answered \${JSON.stringify(got)}: a request the exchange refuses is a bug to surface, not a slot to fill. Throw ExchangeError\`);
 }
 `,
     go: `package main
@@ -769,7 +781,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 	calls := ctx.GRPC.CallsTo("SelectAd", "")
 	ctx.Equal(len(calls), 1, "one serve's SelectAd calls")
 	ctx.Assert(calls[0].HasDeadline(), "SelectAd carries no deadline: a stalled exchange holds the page")
-	ctx.Assert(100*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 200*time.Millisecond, "SelectAd carries a %v deadline, expected exchangeDeadline = 150 ms: the exchange gets a slice of the page budget, not a second", calls[0].Timeout)
+	ctx.Assert(140*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 160*time.Millisecond, "SelectAd carries a %v deadline, expected exchangeDeadline = 150 ms: the exchange gets a 150 ms slice of the page budget", calls[0].Timeout)
 }
 
 func CheckOneCall(ctx *harness.Ctx) {
@@ -784,7 +796,7 @@ func CheckOneCall(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	selectAd(clientBg, "home-top", "u-1")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 0.2, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited)
+	ctx.Assert(waited <= 0.16, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited)
 	ctx.Equal(len(ctx.GRPC.CallsTo("SelectAd", "")), 2, "a slow exchange gets one call per serve; the calls")
 }
 
@@ -802,16 +814,21 @@ func CheckHouseFallback(ctx *harness.Ctx) {
 
 func CheckPropagateErrors(ctx *harness.Ctx) {
 	clientPeer(ctx)
-	ctx.GRPC.Fail("SelectAd", codes.InvalidArgument, "placement home-top is not registered", 1, "")
-	got, err := selectAd(clientBg, "home-top", "u-1")
-	ctx.Assert(err != nil, "INVALID_ARGUMENT from the exchange answered %+v: a request the exchange refuses is a bug to surface, not a slot to fill. Return an error wrapping ErrExchange", got)
-	ctx.ErrorIs(err, ErrExchange, "INVALID_ARGUMENT returned %v", err)
-	ctx.Equal(len(ctx.GRPC.CallsTo("SelectAd", "")), 1, "an INVALID_ARGUMENT fails the same way every time; the calls")
+	terminal := []codes.Code{codes.InvalidArgument, codes.NotFound, codes.PermissionDenied, codes.ResourceExhausted, codes.Internal}
+	for i, code := range terminal {
+		ctx.GRPC.Fail("SelectAd", code, "the exchange refused the request", 1, "")
+		got, err := selectAd(clientBg, "home-top", "u-1")
+		ctx.Assert(err != nil, "%v from the exchange answered %+v: only DEADLINE_EXCEEDED and UNAVAILABLE serve the house ad, any other status is a refusal to surface. Return an error wrapping ErrExchange", code, got)
+		ctx.ErrorIs(err, ErrExchange, "%v returned %v", code, err)
+		ctx.Equal(len(ctx.GRPC.CallsTo("SelectAd", "")), i+1, "a refused request fails the same way, send it once; the SelectAd calls after %v", code)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "ad_serving.grpc.pb.h"
 #include "ads/store.h"
@@ -871,8 +888,8 @@ void CheckDeadline(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("SelectAd");
   ctx.Equal(calls.size(), 1, "one serve's SelectAd calls");
   ctx.Assert(calls[0].HasDeadline(), "SelectAd carries no deadline: a stalled exchange holds the page");
-  ctx.Assert(0.1 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.2,
-             "SelectAd carries a %v s deadline, expected kExchangeDeadline = 150 ms: the exchange gets a slice of the page budget, not a second", calls[0].TimeoutSeconds());
+  ctx.Assert(0.14 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.16,
+             "SelectAd carries a %v s deadline, expected kExchangeDeadline = 150 ms: the exchange gets a 150 ms slice of the page budget", calls[0].TimeoutSeconds());
 }
 
 void CheckOneCall(harness::Ctx& ctx) {
@@ -886,7 +903,7 @@ void CheckOneCall(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   clientQuiet();
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 0.2, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited);
+  ctx.Assert(waited <= 0.16, "with the exchange taking 5 s the serve waited %.2f s, expected one 150 ms deadline", waited);
   ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), 2, "a slow exchange gets one call per serve; the calls");
 }
 
@@ -907,18 +924,28 @@ void CheckHouseFallback(harness::Ctx& ctx) {
 
 void CheckPropagateErrors(harness::Ctx& ctx) {
   clientPeer(ctx);
-  ctx.GRPC.Fail("SelectAd", grpc::StatusCode::INVALID_ARGUMENT, "placement home-top is not registered");
-  bool raised = false;
-  Selection got;
-  try {
-    got = selectAd("home-top", "u-1");
-  } catch (const ExchangeError&) {
-    raised = true;
-  } catch (const std::exception& e) {
-    ctx.Fatalf("INVALID_ARGUMENT threw %s: %s, expected ExchangeError", harness::CurrentExceptionType(), e.what());
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}, {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+  };
+  size_t serves = 0;
+  for (const auto& [code, name] : terminal) {
+    serves++;
+    ctx.GRPC.Fail("SelectAd", code, "the exchange refused the request");
+    bool raised = false;
+    Selection got;
+    try {
+      got = selectAd("home-top", "u-1");
+    } catch (const ExchangeError&) {
+      raised = true;
+    } catch (const std::exception& e) {
+      ctx.Fatalf("%s threw %s: %s, expected ExchangeError", name, harness::CurrentExceptionType(), e.what());
+    }
+    ctx.Assert(raised, "%s from the exchange answered %s: only DEADLINE_EXCEEDED and UNAVAILABLE serve the house ad, any other status is a refusal to surface. Throw ExchangeError", name,
+               clientShow(got));
+    ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), serves, "a refused request fails the same way, send it once; the SelectAd calls after %s", name);
   }
-  ctx.Assert(raised, "INVALID_ARGUMENT from the exchange answered %s: a request the exchange refuses is a bug to surface, not a slot to fill. Throw ExchangeError", clientShow(got));
-  ctx.Equal(ctx.GRPC.CallsTo("SelectAd").size(), 1, "an INVALID_ARGUMENT fails the same way every time; the calls");
 }
 `,
   },

@@ -660,6 +660,16 @@ def check_atomic_register(ctx):
     assert all(record.get(k) == v for k, v in want.items()), f"{records[0]} holds {record}, expected {want}"
     assert m.register_return("L1", "ret-3", 1, FIELDS) is False, "a return of 1 unit on a line with none left must be refused"
     assert not ctx.redis.exists("return:ret-3") and _left(ctx) == 0, "a refused return must write nothing"
+    # 2 of 10: compared as numbers, and the counter and the record change in the same execution.
+    _units(ctx, 10)
+    record_seen = ctx.redis_after("line:L1:returnable", lambda: ctx.redis.hgetall("return:ret-4"))
+    left_seen = ctx.redis_after("return:ret-4", lambda: _left(ctx))
+    assert m.register_return("L1", "ret-4", 2, FIELDS) is True, "a return of 2 units on a line with 10 left must be registered"
+    assert _left(ctx) == 8, f"line:L1:returnable is {_left(ctx)} after a return of 2 of 10, expected 8"
+    record = _settled(record_seen, "line:L1:returnable")
+    assert record.get("quantity") == "2" and record.get("state") == "registered", f"right after the counter moved, return:ret-4 held {record}: the decrement and its record are written in one script"
+    left = _settled(left_seen, "return:ret-4")
+    assert left == 8, f"right after return:ret-4 was written, the line still had {left} units: the record and its decrement are written in one script"
 
 
 def check_cancel_exact(ctx):
@@ -688,6 +698,12 @@ def check_cancel_once(ctx):
     mine = m.cancel_return("L1", "ret-2")
     theirs = _settled(rival, "return:ret-2")
     assert mine + theirs == 1 and _left(ctx) == 4, f"two concurrent cancels of a return of 1 unit restored {mine} and {theirs}, leaving {_left(ctx)} returnable units of the 4 ordered"
+    # A return that has moved past registered (graded and refunded) is no longer cancelable.
+    m.register_return("L1", "ret-3", 1, FIELDS)
+    ctx.redis.hset("return:ret-3", "state", "refunded")
+    restored = m.cancel_return("L1", "ret-3")
+    state = ctx.redis.hget("return:ret-3", "state")
+    assert restored == 0 and _left(ctx) == 3 and state == "refunded", f"canceling a refunded return restored {restored} units, left the line at {_left(ctx)} of 3 and its state {state!r}: only a registered return is canceled"
 `,
     typescript: `const FIELDS = {tenant: 't-1', reason_code: 'changed_mind', photo_ref: ''};
 
@@ -718,6 +734,16 @@ export async function check_atomic_register(ctx) {
   assert(Object.entries(want).every(([k, v]) => record[k] === v), \`\${records[0]} holds \${JSON.stringify(record)}, expected \${JSON.stringify(want)}\`);
   assert.equal(await m.registerReturn('L1', 'ret-3', 1, FIELDS), false, 'a return of 1 unit on a line with none left must be refused');
   assert(ctx.redis.exists('return:ret-3') === 0 && left(ctx) === 0, 'a refused return must write nothing');
+  // 2 of 10: compared as numbers, and the counter and the record change in the same execution.
+  units(ctx, 10);
+  const recordSeen = ctx.redisAfter('line:L1:returnable', () => ctx.redis.hgetall('return:ret-4'));
+  const leftSeen = ctx.redisAfter('return:ret-4', () => left(ctx));
+  assert.equal(await m.registerReturn('L1', 'ret-4', 2, FIELDS), true, 'a return of 2 units on a line with 10 left must be registered');
+  assert.equal(left(ctx), 8, \`line:L1:returnable is \${left(ctx)} after a return of 2 of 10, expected 8\`);
+  const seen = await settled(recordSeen, 'line:L1:returnable');
+  assert(seen.quantity === '2' && seen.state === 'registered', \`right after the counter moved, return:ret-4 held \${JSON.stringify(seen)}: the decrement and its record are written in one script\`);
+  const leftThen = await settled(leftSeen, 'return:ret-4');
+  assert.equal(leftThen, 8, \`right after return:ret-4 was written, the line still had \${leftThen} units: the record and its decrement are written in one script\`);
 }
 
 export async function check_cancel_exact(ctx) {
@@ -746,6 +772,12 @@ export async function check_cancel_once(ctx) {
   const mine = await m.cancelReturn('L1', 'ret-2');
   const theirs = await settled(rival, 'return:ret-2');
   assert(mine + theirs === 1 && left(ctx) === 4, \`two concurrent cancels of a return of 1 unit restored \${mine} and \${theirs}, leaving \${left(ctx)} returnable units of the 4 ordered\`);
+  // A return that has moved past registered (graded and refunded) is no longer cancelable.
+  await m.registerReturn('L1', 'ret-3', 1, FIELDS);
+  ctx.redis.hset('return:ret-3', 'state', 'refunded');
+  const restored = await m.cancelReturn('L1', 'ret-3');
+  const state = ctx.redis.hget('return:ret-3', 'state');
+  assert(restored === 0 && left(ctx) === 3 && state === 'refunded', \`canceling a refunded return restored \${restored} units, left the line at \${left(ctx)} of 3 and its state \${state}: only a registered return is canceled\`);
 }
 `,
     go: `package main
@@ -770,13 +802,13 @@ func stateLeft(ctx *harness.Ctx) int {
 	return n
 }
 
-func mustRegister(ctx *harness.Ctx, returnID string, quantity int64) bool {
+func stateMustRegister(ctx *harness.Ctx, returnID string, quantity int64) bool {
 	ok, err := registerReturn(stateBg, "L1", returnID, quantity, stateFields)
 	ctx.NoError(err, "registerReturn(L1, %s, %d) failed", returnID, quantity)
 	return ok
 }
 
-func mustCancel(ctx *harness.Ctx, returnID string) int64 {
+func stateMustCancel(ctx *harness.Ctx, returnID string) int64 {
 	n, err := cancelReturn(stateBg, "L1", returnID)
 	ctx.NoError(err, "cancelReturn(L1, %s) failed", returnID)
 	return n
@@ -790,7 +822,7 @@ func CheckAtomicRegister(ctx *harness.Ctx) {
 		ctx.NoError(err, "the rival registerReturn failed")
 		return ok
 	})
-	mine := mustRegister(ctx, "ret-1", 1)
+	mine := stateMustRegister(ctx, "ret-1", 1)
 	ctx.Assert(rival.Fired, "nothing touched line:L1:returnable")
 	theirs, _ := rival.Result.(bool)
 	ctx.Assert(mine != theirs, "two returns raced for the last unit and registerReturn answered %v and %v: exactly one may take it", mine, theirs)
@@ -804,41 +836,59 @@ func CheckAtomicRegister(ctx *harness.Ctx) {
 	ctx.Equal(len(records), 1, "the race must leave one record, the winner's (records %v)", records)
 	record := ctx.Redis.HGetAll(records[0])
 	ctx.Assert(record["order_line_id"] == "L1" && record["quantity"] == "1" && record["state"] == "registered" && record["tenant"] == "t-1" && record["reason_code"] == "changed_mind", "%s holds %v", records[0], record)
-	ctx.Equal(mustRegister(ctx, "ret-3", 1), false, "a return of 1 unit on a line with none left must be refused; registered")
+	ctx.Equal(stateMustRegister(ctx, "ret-3", 1), false, "a return of 1 unit on a line with none left must be refused; registered")
 	ctx.Assert(ctx.Redis.Exists("return:ret-3") == 0 && stateLeft(ctx) == 0, "a refused return must write nothing")
+	// 2 of 10: compared as numbers, and the counter and the record change in the same execution.
+	stateUnits(ctx, 10)
+	recordSeen := ctx.Redis.After("line:L1:returnable", func() any { return ctx.Redis.HGetAll("return:ret-4") })
+	leftSeen := ctx.Redis.After("return:ret-4", func() any { return stateLeft(ctx) })
+	ctx.Equal(stateMustRegister(ctx, "ret-4", 2), true, "a return of 2 units on a line with 10 left; registered")
+	ctx.Equal(stateLeft(ctx), 8, "line:L1:returnable after a return of 2 of 10")
+	ctx.Assert(recordSeen.Fired, "nothing touched line:L1:returnable")
+	seen, _ := recordSeen.Result.(map[string]string)
+	ctx.Assert(seen["quantity"] == "2" && seen["state"] == "registered", "right after the counter moved, return:ret-4 held %v: the decrement and its record are written in one script", seen)
+	ctx.Assert(leftSeen.Fired, "nothing touched return:ret-4")
+	leftThen, _ := leftSeen.Result.(int)
+	ctx.Equal(leftThen, 8, "the line's units right after return:ret-4 was written (the record and its decrement are written in one script)")
 }
 
 func CheckCancelExact(ctx *harness.Ctx) {
 	stateUnits(ctx, 5)
-	ctx.Equal(mustRegister(ctx, "ret-1", 3), true, "a return of 3 of 5 units; registered")
-	ctx.Equal(mustRegister(ctx, "ret-2", 1), true, "a return of 1 of the 2 units left; registered")
-	restored := mustCancel(ctx, "ret-1")
+	ctx.Equal(stateMustRegister(ctx, "ret-1", 3), true, "a return of 3 of 5 units; registered")
+	ctx.Equal(stateMustRegister(ctx, "ret-2", 1), true, "a return of 1 of the 2 units left; registered")
+	restored := stateMustCancel(ctx, "ret-1")
 	ctx.Assert(restored == 3 && stateLeft(ctx) == 4, "canceling the return of 3 units restored %d and left the line at %d, expected 3 restored and 4 left: a cancel gives back exactly what its return took", restored, stateLeft(ctx))
 	state, _ := ctx.Redis.HGet("return:ret-1", "state")
 	ctx.Equal(state, "canceled", "return:ret-1's state after its cancel")
 	state, _ = ctx.Redis.HGet("return:ret-2", "state")
 	ctx.Equal(state, "registered", "return:ret-2's state (canceling ret-1 must not touch it)")
-	restored = mustCancel(ctx, "ret-404")
+	restored = stateMustCancel(ctx, "ret-404")
 	ctx.Assert(restored == 0 && stateLeft(ctx) == 4, "canceling a return that does not exist restored %d units", restored)
 }
 
 func CheckCancelOnce(ctx *harness.Ctx) {
 	stateUnits(ctx, 4)
-	mustRegister(ctx, "ret-1", 1)
-	first := mustCancel(ctx, "ret-1")
-	again := mustCancel(ctx, "ret-1")
+	stateMustRegister(ctx, "ret-1", 1)
+	first := stateMustCancel(ctx, "ret-1")
+	again := stateMustCancel(ctx, "ret-1")
 	ctx.Assert(first == 1 && again == 0 && stateLeft(ctx) == 4, "a cancel and its replay restored %d and %d, and the line now has %d returnable units of the 4 ordered: a return is canceled once", first, again, stateLeft(ctx))
-	mustRegister(ctx, "ret-2", 1)
+	stateMustRegister(ctx, "ret-2", 1)
 	// Two cancels of the same return land together: the second right after the first touches the record.
 	rival := ctx.Redis.After("return:ret-2", func() any {
 		n, err := cancelReturn(stateBg, "L1", "ret-2")
 		ctx.NoError(err, "the rival cancelReturn failed")
 		return n
 	})
-	mine := mustCancel(ctx, "ret-2")
+	mine := stateMustCancel(ctx, "ret-2")
 	ctx.Assert(rival.Fired, "nothing touched return:ret-2")
 	theirs, _ := rival.Result.(int64)
 	ctx.Assert(mine+theirs == 1 && stateLeft(ctx) == 4, "two concurrent cancels of a return of 1 unit restored %d and %d, leaving %d returnable units of the 4 ordered", mine, theirs, stateLeft(ctx))
+	// A return that has moved past registered (graded and refunded) is no longer cancelable.
+	stateMustRegister(ctx, "ret-3", 1)
+	ctx.Redis.Do("HSET", "return:ret-3", "state", "refunded")
+	restored := stateMustCancel(ctx, "ret-3")
+	state, _ := ctx.Redis.HGet("return:ret-3", "state")
+	ctx.Assert(restored == 0 && stateLeft(ctx) == 3 && state == "refunded", "canceling a refunded return restored %d units, left the line at %d of 3 and its state %q: only a registered return is canceled", restored, stateLeft(ctx), state)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -851,25 +901,25 @@ func CheckCancelOnce(ctx *harness.Ctx) {
 
 namespace {
 
-const std::map<std::string, std::string> kFields = {{"tenant", "t-1"}, {"reason_code", "changed_mind"}, {"photo_ref", ""}};
+const std::map<std::string, std::string> hFields = {{"tenant", "t-1"}, {"reason_code", "changed_mind"}, {"photo_ref", ""}};
 
-void units(harness::Ctx& ctx, long long n) { ctx.Redis.Set("line:L1:returnable", std::to_string(n)); }
+void hUnits(harness::Ctx& ctx, long long n) { ctx.Redis.Set("line:L1:returnable", std::to_string(n)); }
 
-long long unitsLeft(harness::Ctx& ctx) {
+long long hUnitsLeft(harness::Ctx& ctx) {
   const auto v = ctx.Redis.Get("line:L1:returnable");
   return v ? std::stoll(*v) : 0;
 }
 
 // A probe's outcome: whether it fired, what the rival call returned, what it threw.
-struct Rival {
+struct HRival {
   bool fired = false;
   long long result = 0;
   std::optional<std::string> err;
 };
 
 template <class F>
-std::shared_ptr<Rival> rival(harness::Ctx& ctx, const std::string& key, F call) {
-  auto out = std::make_shared<Rival>();
+std::shared_ptr<HRival> hRival(harness::Ctx& ctx, const std::string& key, F call) {
+  auto out = std::make_shared<HRival>();
   ctx.Redis.After(key, [out, call] {
     out->fired = true;
     try {
@@ -881,7 +931,7 @@ std::shared_ptr<Rival> rival(harness::Ctx& ctx, const std::string& key, F call) 
   return out;
 }
 
-void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
+void hSettled(harness::Ctx& ctx, const HRival& r, const std::string& what) {
   ctx.Assert(r.fired, "nothing touched %s", what);
   ctx.Assert(!r.err, "the rival call failed: %s", r.err.value_or(""));
 }
@@ -889,14 +939,14 @@ void settled(harness::Ctx& ctx, const Rival& r, const std::string& what) {
 }  // namespace
 
 void CheckAtomicRegister(harness::Ctx& ctx) {
-  units(ctx, 1);
+  hUnits(ctx, 1);
   // A second return for the last unit lands right after this one first touches the counter.
-  const auto other = rival(ctx, "line:L1:returnable", [] { return registerReturn("L1", "ret-2", 1, kFields) ? 1LL : 0LL; });
-  const bool mine = registerReturn("L1", "ret-1", 1, kFields);
-  settled(ctx, *other, "line:L1:returnable");
+  const auto other = hRival(ctx, "line:L1:returnable", [] { return registerReturn("L1", "ret-2", 1, hFields) ? 1LL : 0LL; });
+  const bool mine = registerReturn("L1", "ret-1", 1, hFields);
+  hSettled(ctx, *other, "line:L1:returnable");
   const bool theirs = other->result == 1;
   ctx.Assert(mine != theirs, "two returns raced for the last unit and registerReturn answered %t and %t: exactly one may take it", mine, theirs);
-  ctx.Equal(unitsLeft(ctx), 0, "line:L1:returnable after the race for its last unit");
+  ctx.Equal(hUnitsLeft(ctx), 0, "line:L1:returnable after the race for its last unit");
   std::vector<std::string> records;
   for (const std::string key : {"return:ret-1", "return:ret-2"}) {
     if (ctx.Redis.Exists(key) == 1) records.push_back(key);
@@ -905,34 +955,53 @@ void CheckAtomicRegister(harness::Ctx& ctx) {
   auto record = ctx.Redis.HGetAll(records[0]);
   ctx.Assert(record["order_line_id"] == "L1" && record["quantity"] == "1" && record["state"] == "registered" && record["tenant"] == "t-1" && record["reason_code"] == "changed_mind",
              "%s holds order_line_id %q, quantity %q, state %q, tenant %q", records[0], record["order_line_id"], record["quantity"], record["state"], record["tenant"]);
-  ctx.Equal(registerReturn("L1", "ret-3", 1, kFields), false, "a return of 1 unit on a line with none left must be refused; registered");
-  ctx.Assert(ctx.Redis.Exists("return:ret-3") == 0 && unitsLeft(ctx) == 0, "a refused return must write nothing");
+  ctx.Equal(registerReturn("L1", "ret-3", 1, hFields), false, "a return of 1 unit on a line with none left must be refused; registered");
+  ctx.Assert(ctx.Redis.Exists("return:ret-3") == 0 && hUnitsLeft(ctx) == 0, "a refused return must write nothing");
+  // 2 of 10: compared as numbers, and the counter and the record change in the same execution.
+  hUnits(ctx, 10);
+  auto record_seen = std::make_shared<std::optional<std::map<std::string, std::string>>>();
+  auto left_seen = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After("line:L1:returnable", [&ctx, record_seen] { *record_seen = ctx.Redis.HGetAll("return:ret-4"); });
+  ctx.Redis.After("return:ret-4", [&ctx, left_seen] { *left_seen = hUnitsLeft(ctx); });
+  ctx.Equal(registerReturn("L1", "ret-4", 2, hFields), true, "a return of 2 units on a line with 10 left; registered");
+  ctx.Equal(hUnitsLeft(ctx), 8, "line:L1:returnable after a return of 2 of 10");
+  ctx.Assert(record_seen->has_value(), "nothing touched line:L1:returnable");
+  auto seen = record_seen->value();
+  ctx.Assert(seen["quantity"] == "2" && seen["state"] == "registered", "right after the counter moved, return:ret-4 held quantity %q and state %q: the decrement and its record are written in one script", seen["quantity"], seen["state"]);
+  ctx.Assert(left_seen->has_value(), "nothing touched return:ret-4");
+  ctx.Equal(left_seen->value(), 8, "the line's units right after return:ret-4 was written (the record and its decrement are written in one script)");
 }
 
 void CheckCancelExact(harness::Ctx& ctx) {
-  units(ctx, 5);
-  ctx.Equal(registerReturn("L1", "ret-1", 3, kFields), true, "a return of 3 of 5 units; registered");
-  ctx.Equal(registerReturn("L1", "ret-2", 1, kFields), true, "a return of 1 of the 2 units left; registered");
+  hUnits(ctx, 5);
+  ctx.Equal(registerReturn("L1", "ret-1", 3, hFields), true, "a return of 3 of 5 units; registered");
+  ctx.Equal(registerReturn("L1", "ret-2", 1, hFields), true, "a return of 1 of the 2 units left; registered");
   long long restored = cancelReturn("L1", "ret-1");
-  ctx.Assert(restored == 3 && unitsLeft(ctx) == 4, "canceling the return of 3 units restored %d and left the line at %d, expected 3 restored and 4 left: a cancel gives back exactly what its return took", restored, unitsLeft(ctx));
+  ctx.Assert(restored == 3 && hUnitsLeft(ctx) == 4, "canceling the return of 3 units restored %d and left the line at %d, expected 3 restored and 4 left: a cancel gives back exactly what its return took", restored, hUnitsLeft(ctx));
   ctx.Equal(ctx.Redis.HGet("return:ret-1", "state").value_or(""), "canceled", "return:ret-1's state after its cancel");
   ctx.Equal(ctx.Redis.HGet("return:ret-2", "state").value_or(""), "registered", "return:ret-2's state (canceling ret-1 must not touch it)");
   restored = cancelReturn("L1", "ret-404");
-  ctx.Assert(restored == 0 && unitsLeft(ctx) == 4, "canceling a return that does not exist restored %d units", restored);
+  ctx.Assert(restored == 0 && hUnitsLeft(ctx) == 4, "canceling a return that does not exist restored %d units", restored);
 }
 
 void CheckCancelOnce(harness::Ctx& ctx) {
-  units(ctx, 4);
-  registerReturn("L1", "ret-1", 1, kFields);
+  hUnits(ctx, 4);
+  registerReturn("L1", "ret-1", 1, hFields);
   const long long first = cancelReturn("L1", "ret-1");
   const long long again = cancelReturn("L1", "ret-1");
-  ctx.Assert(first == 1 && again == 0 && unitsLeft(ctx) == 4, "a cancel and its replay restored %d and %d, and the line now has %d returnable units of the 4 ordered: a return is canceled once", first, again, unitsLeft(ctx));
-  registerReturn("L1", "ret-2", 1, kFields);
+  ctx.Assert(first == 1 && again == 0 && hUnitsLeft(ctx) == 4, "a cancel and its replay restored %d and %d, and the line now has %d returnable units of the 4 ordered: a return is canceled once", first, again, hUnitsLeft(ctx));
+  registerReturn("L1", "ret-2", 1, hFields);
   // Two cancels of the same return land together: the second right after the first touches the record.
-  const auto other = rival(ctx, "return:ret-2", [] { return cancelReturn("L1", "ret-2"); });
+  const auto other = hRival(ctx, "return:ret-2", [] { return cancelReturn("L1", "ret-2"); });
   const long long mine = cancelReturn("L1", "ret-2");
-  settled(ctx, *other, "return:ret-2");
-  ctx.Assert(mine + other->result == 1 && unitsLeft(ctx) == 4, "two concurrent cancels of a return of 1 unit restored %d and %d, leaving %d returnable units of the 4 ordered", mine, other->result, unitsLeft(ctx));
+  hSettled(ctx, *other, "return:ret-2");
+  ctx.Assert(mine + other->result == 1 && hUnitsLeft(ctx) == 4, "two concurrent cancels of a return of 1 unit restored %d and %d, leaving %d returnable units of the 4 ordered", mine, other->result, hUnitsLeft(ctx));
+  // A return that has moved past registered (graded and refunded) is no longer cancelable.
+  registerReturn("L1", "ret-3", 1, hFields);
+  ctx.Redis.Do("HSET", "return:ret-3", "state", "refunded");
+  const long long restored = cancelReturn("L1", "ret-3");
+  const std::string state = ctx.Redis.HGet("return:ret-3", "state").value_or("");
+  ctx.Assert(restored == 0 && hUnitsLeft(ctx) == 3 && state == "refunded", "canceling a refunded return restored %d units, left the line at %d of 3 and its state %q: only a registered return is canceled", restored, hUnitsLeft(ctx), state);
 }
 `,
   },

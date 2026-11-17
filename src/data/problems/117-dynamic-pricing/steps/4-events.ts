@@ -57,7 +57,7 @@ the call reports success.
       id: 'envelope',
       title: 'Carries both prices, the reason and the window spend',
       detail:
-        'The value names `sku`, `old_price_cents`, `new_price_cents`, `reason`, `updated_at`, `moved_bp` and `headroom_bp`, so an audit reader can say what moved, why, and how close the sku is to its limit. The starter sends the sku and the new price.',
+        'The value names `sku`, `old_price_cents`, `new_price_cents`, `reason`, `updated_at`, `moved_bp` and `headroom_bp`, so an audit reader can say what moved, why, and how close the sku is to its limit; a delivered event returns true and leaves the outbox empty. The starter sends the sku and the new price.',
       match: {
         python: {all: [/old_price_cents/, /new_price_cents/, /headroom_bp/, /["']reason["']/]},
         typescript: {all: [/old_price_cents/, /new_price_cents/, /headroom_bp/, /reason:/]},
@@ -96,7 +96,7 @@ the call reports success.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery and falls back to the outbox',
       detail:
-        'A failed delivery, or none within 2 s, leaves an outbox row with the topic, the sku and the payload, and the call returns false. The starter polls once and reports success.',
+        'A failed delivery, or none within 2 s (the call returns by 2.5 s), leaves an outbox row with the topic, the sku and the whole event as its payload, and the call returns false. The starter polls once and reports success.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -576,7 +576,9 @@ def check_sku_key(ctx):
 def check_envelope(ctx):
     m = ctx.load("events")
     store.seed("SKU-1", 1000)
-    m.publish_change("SKU-1", 1050, "competitor match", RESERVED)
+    ok = m.publish_change("SKU-1", 1050, "competitor match", RESERVED)
+    assert ok is True, f"publish_change returned {ok!r} after the broker acknowledged the event, expected True"
+    assert _outbox(ctx) == [], f"the broker took the event and the outbox holds {_outbox(ctx)}: the outbox keeps only what the broker did not take"
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one change produced {len(records)} records"
     value = json.loads(records[0].value)
@@ -623,14 +625,18 @@ def check_outbox_on_failure(ctx):
     ok = m.publish_change("SKU-1", 1050, "weekend promo", RESERVED)
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the change vanishes from the audit trail"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "SKU-1" and rows[0].get("payload", {}).get("new_price_cents") == 1050, f"the outbox row is {rows[0]}, expected the topic, the key SKU-1 and the payload"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "SKU-1", f"the outbox row is {rows[0]}, expected the topic and the key SKU-1"
+    want = {"sku": "SKU-1", "old_price_cents": 1000, "new_price_cents": 1050, "reason": "weekend promo", "updated_at": store.get_sku("SKU-1")["updated_at"], "moved_bp": 500, "headroom_bp": 1500}
+    payload = rows[0].get("payload") or {}
+    wrong = {k: payload.get(k) for k in want if payload.get(k) != want[k]}
+    assert not wrong, f"the outbox row's payload is {payload}: these fields are missing or wrong {wrong}; the row keeps the event itself, {want}, for the relay to republish"
     assert ok is False, f"publish_change returned {ok!r} after a failed delivery, expected False"
     assert store.get_sku("SKU-1")["price_cents"] == 1050, "the price must stay committed when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_change("SKU-1", 1100, "weekend promo", RESERVED)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_change waited {waited:.0f} s for a broker that does not answer: wait at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_change waited {waited:.1f} s for a broker that does not answer: wait at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("new_price_cents") == 1100, f"no delivery within the window and the outbox holds {rows}"
     assert ok is False, f"publish_change returned {ok!r} without a delivery, expected False"
@@ -669,8 +675,10 @@ export async function check_sku_key(ctx) {
 export async function check_envelope(ctx) {
   const {m, store} = events(ctx);
   await store.seed('SKU-1', 1000);
-  await m.publishChange('SKU-1', 1050, 'competitor match', RESERVED);
+  const ok = await m.publishChange('SKU-1', 1050, 'competitor match', RESERVED);
   await settle();
+  assert.equal(ok, true, \`publishChange resolved \${JSON.stringify(ok)} after the broker acknowledged the event, expected true\`);
+  assert.deepEqual(outboxRows(ctx), [], \`the broker took the event and the outbox holds \${JSON.stringify(outboxRows(ctx))}: the outbox keeps only what the broker did not take\`);
   const values = ctx.kafka.values(TOPIC);
   assert.equal(values.length, 1, \`one change produced \${values.length} records\`);
   const value = JSON.parse(values[0]);
@@ -720,14 +728,18 @@ export async function check_outbox_on_failure(ctx) {
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the change vanishes from the audit trail\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'SKU-1' && rows[0].payload?.new_price_cents === 1050, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key SKU-1 and the payload\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'SKU-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic and the key SKU-1\`);
+  const want = {sku: 'SKU-1', old_price_cents: 1000, new_price_cents: 1050, reason: 'weekend promo', updated_at: (await store.getSku('SKU-1')).updated_at, moved_bp: 500, headroom_bp: 1500};
+  const payload = rows[0].payload ?? {};
+  const wrong = Object.keys(want).filter(k => payload[k] !== want[k]);
+  assert.equal(wrong.length, 0, \`the outbox row's payload is \${JSON.stringify(payload)}: \${JSON.stringify(wrong)} missing or wrong; the row keeps the event itself, \${JSON.stringify(want)}, for the relay to republish\`);
   assert.equal(ok, false, \`publishChange resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   assert.equal((await store.getSku('SKU-1')).price_cents, 1050, 'the price must stay committed when only the produce failed');
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishChange('SKU-1', 1100, 'weekend promo', RESERVED);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishChange waited \${waited.toFixed(0)} s for a broker that does not answer: wait at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishChange waited \${waited.toFixed(1)} s for a broker that does not answer: wait at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.new_price_cents === 1100, \`no delivery within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishChange resolved \${JSON.stringify(ok)} without a delivery, expected false\`);
@@ -745,29 +757,29 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "price.changed"
+const hEventsTopic = "price.changed"
 
 var (
-	eventsBg = context.Background()
-	reserved = guard.Reservation{OK: true, MovedBP: 500, HeadroomBP: 1500, BoundCents: 1200}
+	hEventsBg = context.Background()
+	hReserved = guard.Reservation{OK: true, MovedBP: 500, HeadroomBP: 1500, BoundCents: 1200}
 )
 
-func change(ctx *harness.Ctx, sku string, priceCents int64, reason string) bool {
-	ok, err := publishChange(eventsBg, sku, priceCents, reason, reserved)
+func hChange(ctx *harness.Ctx, sku string, priceCents int64, reason string) bool {
+	ok, err := publishChange(hEventsBg, sku, priceCents, reason, hReserved)
 	ctx.NoError(err, "publishChange(%s, %d)", sku, priceCents)
 	return ok
 }
 
-type outboxRow struct {
+type hOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outboxRows(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutboxRows(ctx *harness.Ctx) []hOutboxRow {
+	var rows []hOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row hOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -775,23 +787,25 @@ func outboxRows(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckSkuKey(ctx *harness.Ctx) {
-	store.Seed(eventsBg, "SKU-1", 1000)
-	store.Seed(eventsBg, "SKU-2", 2000)
-	change(ctx, "SKU-1", 1050, "weekend promo")
-	change(ctx, "SKU-2", 2100, "weekend promo")
-	change(ctx, "SKU-1", 1100, "weekend promo")
+	store.Seed(hEventsBg, "SKU-1", 1000)
+	store.Seed(hEventsBg, "SKU-2", 2000)
+	hChange(ctx, "SKU-1", 1050, "weekend promo")
+	hChange(ctx, "SKU-2", 2100, "weekend promo")
+	hChange(ctx, "SKU-1", 1100, "weekend promo")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(hEventsTopic)
 	ctx.Equal(len(records), 3, "three changes must produce three records on price.changed; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"SKU-1", "SKU-2", "SKU-1"}, "the records must be keyed by the skus")
+	ctx.Equal(ctx.Kafka.Keys(hEventsTopic), []string{"SKU-1", "SKU-2", "SKU-1"}, "the records must be keyed by the skus")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both SKU-1 events must land on one partition, or a consumer replays one sku's prices out of order; the partitions")
 }
 
 func CheckEnvelope(ctx *harness.Ctx) {
-	store.Seed(eventsBg, "SKU-1", 1000)
-	change(ctx, "SKU-1", 1050, "competitor match")
+	store.Seed(hEventsBg, "SKU-1", 1000)
+	ok := hChange(ctx, "SKU-1", 1050, "competitor match")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(ok, true, "publishChange's result after the broker acknowledged the event")
+	ctx.Equal(len(hOutboxRows(ctx)), 0, "the broker took the event, so the outbox (which keeps only what the broker did not take) must stay empty; the rows")
+	values := ctx.Kafka.Values(hEventsTopic)
 	ctx.Equal(len(values), 1, "one change must produce one record; the records")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the event must be JSON")
@@ -799,11 +813,11 @@ func CheckEnvelope(ctx *harness.Ctx) {
 	for k, v := range want {
 		ctx.Assert(value[k] == v, "the event is %s: %s is %v, expected %v", values[0], k, value[k], v)
 	}
-	ctx.Equal(value["updated_at"], float64(store.GetSKU(eventsBg, "SKU-1").UpdatedAt), "the event's updated_at must be the committed row's")
+	ctx.Equal(value["updated_at"], float64(store.GetSKU(hEventsBg, "SKU-1").UpdatedAt), "the event's updated_at must be the committed row's")
 }
 
 func CheckPublishAfterCommit(ctx *harness.Ctx) {
-	store.Seed(eventsBg, "SKU-1", 1000)
+	store.Seed(hEventsBg, "SKU-1", 1000)
 	type observation struct {
 		price  string
 		events int
@@ -813,49 +827,53 @@ func CheckPublishAfterCommit(ctx *harness.Ctx) {
 	watch = func() any {
 		// Every command on the price row: what the row holds and how many events are already out.
 		price, _ := ctx.Redis.HGet("price:SKU-1", "price_cents")
-		seen = append(seen, observation{price, len(ctx.Kafka.Records(eventsTopic))})
+		seen = append(seen, observation{price, len(ctx.Kafka.Records(hEventsTopic))})
 		ctx.Redis.After("price:SKU-1", watch)
 		return nil
 	}
 	ctx.Redis.After("price:SKU-1", watch)
-	change(ctx, "SKU-1", 1050, "weekend promo")
+	hChange(ctx, "SKU-1", 1050, "weekend promo")
 	ctx.Settle()
 	observed := append([]observation(nil), seen...)
 	ctx.Assert(len(observed) > 0, "publishChange never touched price:SKU-1: the change was not committed")
 	for _, o := range observed {
 		ctx.Assert(!(o.price == "1000" && o.events > 0), "the event was on price.changed while the row still held 1000 (observed %+v): an event for a price the store may never commit. Commit first, then produce", observed)
 	}
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "the event must still be produced after the commit; the records")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	store.Seed(eventsBg, "SKU-1", 1000)
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	change(ctx, "SKU-1", 1050, "weekend promo")
+	store.Seed(hEventsBg, "SKU-1", 1000)
+	ctx.Kafka.LoseAcks(hEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hChange(ctx, "SKU-1", 1050, "weekend promo")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	change(ctx, "SKU-1", 1100, "weekend promo")
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hChange(ctx, "SKU-1", 1100, "weekend promo")
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	store.Seed(eventsBg, "SKU-1", 1000)
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := change(ctx, "SKU-1", 1050, "weekend promo")
+	store.Seed(hEventsBg, "SKU-1", 1000)
+	ctx.Kafka.FailNext(hEventsTopic, 1)
+	ok := hChange(ctx, "SKU-1", 1050, "weekend promo")
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the change vanishes from the audit trail; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "SKU-1" && rows[0].Payload["new_price_cents"] == 1050.0, "the outbox row is %+v, expected the topic, the key SKU-1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == hEventsTopic && rows[0].Key == "SKU-1", "the outbox row is %+v, expected the topic and the key SKU-1", rows[0])
+	want := map[string]any{"sku": "SKU-1", "old_price_cents": 1000.0, "new_price_cents": 1050.0, "reason": "weekend promo", "updated_at": float64(store.GetSKU(hEventsBg, "SKU-1").UpdatedAt), "moved_bp": 500.0, "headroom_bp": 1500.0}
+	for k, v := range want {
+		ctx.Assert(rows[0].Payload[k] == v, "the outbox row's payload is %v: %s is %v, expected %v; the row keeps the event itself for the relay to republish", rows[0].Payload, k, rows[0].Payload[k], v)
+	}
 	ctx.Equal(ok, false, "publishChange's result after a failed delivery")
-	ctx.Equal(store.GetSKU(eventsBg, "SKU-1").PriceCents, int64(1050), "the price must stay committed when only the produce failed")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Equal(store.GetSKU(hEventsBg, "SKU-1").PriceCents, int64(1050), "the price must stay committed when only the produce failed")
+	ctx.Kafka.Stall(hEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = change(ctx, "SKU-1", 1100, "weekend promo")
+	ok = hChange(ctx, "SKU-1", 1100, "weekend promo")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishChange waited %.0f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited)
-	rows = outboxRows(ctx)
+	ctx.Assert(waited <= 2.5, "publishChange waited %.1f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["new_price_cents"] == 1100.0, "no delivery within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "publishChange's result without a delivery")
 }
@@ -875,10 +893,10 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "price.changed";
-const guard::Reservation kReserved{true, 500, 1500, 1200};
+const std::string hEventsTopic = "price.changed";
+const guard::Reservation hReserved{true, 500, 1500, 1200};
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -888,11 +906,11 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
   return rows;
 }
 
-long long number(const nlohmann::json& j, const std::string& field) {
+long long hNumber(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_number() ? j[field].get<long long>() : -1;
 }
 
-std::string text(const nlohmann::json& j, const std::string& field) {
+std::string hString(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
@@ -901,27 +919,29 @@ std::string text(const nlohmann::json& j, const std::string& field) {
 void CheckSkuKey(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
   store::seed("SKU-2", 2000);
-  publishChange("SKU-1", 1050, "weekend promo", kReserved);
-  publishChange("SKU-2", 2100, "weekend promo", kReserved);
-  publishChange("SKU-1", 1100, "weekend promo", kReserved);
+  publishChange("SKU-1", 1050, "weekend promo", hReserved);
+  publishChange("SKU-2", 2100, "weekend promo", hReserved);
+  publishChange("SKU-1", 1100, "weekend promo", hReserved);
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(hEventsTopic);
   ctx.Equal(records.size(), 3, "three changes must produce three records on price.changed; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"SKU-1", "SKU-2", "SKU-1"}, "the records must be keyed by the skus");
+  ctx.Equal(ctx.Kafka.Keys(hEventsTopic), {"SKU-1", "SKU-2", "SKU-1"}, "the records must be keyed by the skus");
   ctx.Equal(records[0].Partition, records[2].Partition, "both SKU-1 events must land on one partition, or a consumer replays one sku's prices out of order; the partitions");
 }
 
 void CheckEnvelope(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  publishChange("SKU-1", 1050, "competitor match", kReserved);
+  const bool ok = publishChange("SKU-1", 1050, "competitor match", hReserved);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(ok, true, "publishChange's result after the broker acknowledged the event");
+  ctx.Equal(hOutboxRows(ctx).size(), 0, "the broker took the event, so the outbox (which keeps only what the broker did not take) must stay empty; the rows");
+  const auto values = ctx.Kafka.Values(hEventsTopic);
   ctx.Equal(values.size(), 1, "one change must produce one record; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(text(value, "sku") == "SKU-1" && number(value, "old_price_cents") == 1000 && number(value, "new_price_cents") == 1050 &&
-                 text(value, "reason") == "competitor match" && number(value, "moved_bp") == 500 && number(value, "headroom_bp") == 1500,
+  ctx.Assert(hString(value, "sku") == "SKU-1" && hNumber(value, "old_price_cents") == 1000 && hNumber(value, "new_price_cents") == 1050 &&
+                 hString(value, "reason") == "competitor match" && hNumber(value, "moved_bp") == 500 && hNumber(value, "headroom_bp") == 1500,
              "the event is %s, expected sku SKU-1, old_price_cents 1000, new_price_cents 1050, reason, moved_bp 500 and headroom_bp 1500", values[0]);
-  ctx.Equal(number(value, "updated_at"), store::getSku("SKU-1")->updated_at, "the event's updated_at must be the committed row's");
+  ctx.Equal(hNumber(value, "updated_at"), store::getSku("SKU-1")->updated_at, "the event's updated_at must be the committed row's");
 }
 
 void CheckPublishAfterCommit(harness::Ctx& ctx) {
@@ -930,50 +950,54 @@ void CheckPublishAfterCommit(harness::Ctx& ctx) {
   auto watch = std::make_shared<std::function<void()>>();
   *watch = [&ctx, seen, watch] {
     // Every command on the price row: what the row holds and how many events are already out.
-    seen->emplace_back(ctx.Redis.HGet("price:SKU-1", "price_cents").value_or(""), ctx.Kafka.Records(kEventsTopic).size());
+    seen->emplace_back(ctx.Redis.HGet("price:SKU-1", "price_cents").value_or(""), ctx.Kafka.Records(hEventsTopic).size());
     ctx.Redis.After("price:SKU-1", [watch] { (*watch)(); });
   };
   ctx.Redis.After("price:SKU-1", [watch] { (*watch)(); });
-  publishChange("SKU-1", 1050, "weekend promo", kReserved);
+  publishChange("SKU-1", 1050, "weekend promo", hReserved);
   ctx.Settle();
   const auto observed = *seen;
   ctx.Assert(!observed.empty(), "publishChange never touched price:SKU-1: the change was not committed");
   for (const auto& [price, events] : observed) {
     ctx.Assert(!(price == "1000" && events > 0), "the event was on price.changed while the row still held 1000: an event for a price the store may never commit. Commit first, then produce");
   }
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(hEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishChange("SKU-1", 1050, "weekend promo", kReserved);
+  ctx.Kafka.LoseAcks(hEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishChange("SKU-1", 1050, "weekend promo", hReserved);
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishChange("SKU-1", 1100, "weekend promo", kReserved);
+  ctx.Equal(ctx.Kafka.Records(hEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  publishChange("SKU-1", 1100, "weekend promo", hReserved);
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(hEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(hEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
   store::seed("SKU-1", 1000);
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishChange("SKU-1", 1050, "weekend promo", kReserved);
+  ctx.Kafka.FailNext(hEventsTopic, 1);
+  bool ok = publishChange("SKU-1", 1050, "weekend promo", hReserved);
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the change vanishes from the audit trail; the rows");
-  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "SKU-1" && rows[0].contains("payload") && number(rows[0]["payload"], "new_price_cents") == 1050,
-             "the outbox row is %s, expected the topic, the key SKU-1 and the payload", rows[0].dump());
+  ctx.Assert(hString(rows[0], "topic") == hEventsTopic && hString(rows[0], "key") == "SKU-1", "the outbox row is %s, expected the topic and the key SKU-1", rows[0].dump());
+  const nlohmann::json payload = rows[0].contains("payload") ? rows[0]["payload"] : nlohmann::json::object();
+  ctx.Assert(hString(payload, "sku") == "SKU-1" && hNumber(payload, "old_price_cents") == 1000 && hNumber(payload, "new_price_cents") == 1050 &&
+                 hString(payload, "reason") == "weekend promo" && hNumber(payload, "updated_at") == store::getSku("SKU-1")->updated_at &&
+                 hNumber(payload, "moved_bp") == 500 && hNumber(payload, "headroom_bp") == 1500,
+             "the outbox row's payload is %s, expected the event itself (sku, old_price_cents 1000, new_price_cents 1050, reason, updated_at, moved_bp 500, headroom_bp 1500) for the relay to republish", payload.dump());
   ctx.Equal(ok, false, "publishChange's result after a failed delivery");
   ctx.Equal(store::getSku("SKU-1")->price_cents, 1050, "the price must stay committed when only the produce failed");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(hEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishChange("SKU-1", 1100, "weekend promo", kReserved);
+  ok = publishChange("SKU-1", 1100, "weekend promo", hReserved);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishChange waited %.0f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited);
-  rows = outboxRows(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && number(rows[1]["payload"], "new_price_cents") == 1100, "no delivery within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(waited <= 2.5, "publishChange waited %.1f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited);
+  rows = hOutboxRows(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && hNumber(rows[1]["payload"], "new_price_cents") == 1100, "no delivery within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishChange's result without a delivery");
 }
 `,
