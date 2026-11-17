@@ -45,3 +45,14 @@ var Sources = [...]string{
 	// syncAtomicSource,
 	// syncSource,
 }
+
+// LeetBuild: atomic.Pointer[T], interpreted from source alongside binary sync/atomic.
+//
+//go:embed go1_22_sync_atomic_leetbuild.go.txt
+var syncAtomicPointerSource string
+
+// Packages are generic parts of binary packages (LeetBuild), each compiled under the binary
+// package's import path: a selector its symbol table lacks resolves in the source.
+var Packages = [...]struct{ Path, Source string }{
+	{"sync/atomic", syncAtomicPointerSource},
+}

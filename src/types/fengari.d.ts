@@ -31,9 +31,15 @@ declare module 'fengari' {
     lua_tolstring(L: LuaState, idx: number): Uint8Array | null;
     lua_pcall(L: LuaState, nargs: number, nresults: number, errfunc: number): number;
     lua_error(L: LuaState): number;
+    lua_next(L: LuaState, idx: number): number;
+    lua_rawset(L: LuaState, idx: number): void;
+    lua_pushlightuserdata(L: LuaState, p: unknown): void;
+    lua_touserdata(L: LuaState, idx: number): unknown;
+    lua_typename(L: LuaState, t: number): Uint8Array;
     LUA_OK: number;
     LUA_TNIL: number;
     LUA_TBOOLEAN: number;
+    LUA_TLIGHTUSERDATA: number;
     LUA_TNUMBER: number;
     LUA_TSTRING: number;
     LUA_TTABLE: number;
@@ -42,6 +48,8 @@ declare module 'fengari' {
   export const lauxlib: {
     luaL_newstate(): LuaState;
     luaL_loadstring(L: LuaState, s: Uint8Array): number;
+    luaL_argcheck(L: LuaState, cond: boolean, arg: number, extramsg: Uint8Array): void;
+    luaL_checklstring(L: LuaState, arg: number): Uint8Array;
   };
 
   export const lualib: {

@@ -6,6 +6,8 @@
  */
 import {type LuaState, lauxlib, lua, lualib} from 'fengari';
 
+import {openCjson} from './cjson';
+
 /** RESP2 reply / Lua value as JSON: `{t:'int'|'str'|'nil'|'arr'|'ok'|'err', v}`; strings are latin-1 (byte-safe). */
 export type Tagged =
   | {t: 'int'; v: number}
@@ -133,6 +135,8 @@ export function luaEval(
   lua.lua_pushnil(L);
   lua.lua_setfield(L, -2, bytes('unpack'));
   lua.lua_pop(L, 1);
+  // Redis loads lua-cjson as the global `cjson` (cmsgpack, bit and struct are not modelled).
+  openCjson(L);
   const call =
     (pcall: boolean) =>
     (S: LuaState): number => {

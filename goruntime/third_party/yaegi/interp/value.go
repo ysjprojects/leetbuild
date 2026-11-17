@@ -255,6 +255,15 @@ func genValueInterface(n *node) func(*frame) reflect.Value {
 			return v
 		}
 
+		// LeetBuild: an interface holds a copy of its value, as Go's conversion makes one. An
+		// addressable v is a variable's (or a temporary's) frame slot, which the next assignment
+		// overwrites in place: `out = append(out, &T{…})` in a loop otherwise appended the same
+		// slot each time, and every element ended as the last pointer.
+		if v.CanAddr() {
+			c := reflect.New(v.Type()).Elem()
+			c.Set(v)
+			v = c
+		}
 		return reflect.ValueOf(valueInterface{nod, v})
 	}
 }

@@ -72,7 +72,13 @@ Status BadRequest() { return Status(StatusCode::INTERNAL, "grpc: error parsing t
 
 // A server's state, shared by the Server object and the calls in flight on it.
 struct ServerState {
-  std::vector<Service*> services;
+  // A service and the service names its methods serve, read when it was registered: lookups by
+  // name never touch a service a harness peer has replaced (its object may be destroyed by then).
+  struct Registered {
+    Service* service;
+    std::set<std::string> names;
+  };
+  std::vector<Registered> services;
   bool peer = false;      // a harness peer
   bool stopped = false;   // takes no more calls
   bool shut_down = false; // Shutdown finished: Wait returns
@@ -84,18 +90,22 @@ struct ServerState {
     const size_t slash = path.rfind('/');
     return slash == std::string::npos || slash == 0 ? "" : path.substr(1, slash - 1);
   }
+  static Registered registered(Service* service) {
+    Registered r{service, {}};
+    for (const auto& m : service->lb_methods()) r.names.insert(service_of(m.path));
+    return r;
+  }
   bool has_service(const std::string& name) const {
-    for (const Service* s : services) {
-      for (const auto& m : s->lb_methods()) {
-        if (service_of(m.path) == name) return true;
-      }
+    for (const Registered& r : services) {
+      if (r.names.count(name) > 0) return true;
     }
     return false;
   }
   bool serves(const std::string& path) const { return has_service(service_of(path)); }
   const Service::LbMethod* lookup(const std::string& path) const {
-    for (const Service* s : services) {
-      for (const auto& m : s->lb_methods()) {
+    for (const Registered& r : services) {
+      if (r.names.count(service_of(path)) == 0) continue;
+      for (const auto& m : r.service->lb_methods()) {
         if (m.path == path) return &m;
       }
     }
@@ -642,8 +652,21 @@ void Server::lb_shutdown(double deadline_ms) {
   state_->waiting.notify_all();
 }
 
+// A harness peer given a service whose names an earlier one serves (a world rebuilt with new
+// service objects): the new one replaces the earlier, as a new grpc++ server built with the same
+// services would serve only its own. The earlier object is not touched — it may be destroyed.
 bool Server::RegisterService(Service* service) {
-  state_->services.push_back(service);
+  internal::ServerState::Registered added = internal::ServerState::registered(service);
+  auto& services = state_->services;
+  services.erase(std::remove_if(services.begin(), services.end(),
+                                [&](const internal::ServerState::Registered& r) {
+                                  for (const std::string& name : r.names) {
+                                    if (added.names.count(name) > 0) return true;
+                                  }
+                                  return false;
+                                }),
+                 services.end());
+  services.push_back(std::move(added));
   return true;
 }
 
@@ -661,7 +684,7 @@ ServerBuilder& ServerBuilder::RegisterService(Service* service) {
 std::unique_ptr<Server> ServerBuilder::BuildAndStart() {
   Registry& r = reg();
   auto state = std::make_shared<ServerState>();
-  state->services = services_;
+  for (Service* service : services_) state->services.push_back(internal::ServerState::registered(service));
   std::vector<std::string> keys;
   for (const auto& [address, selected] : ports_) {
     std::string key = listen_key(address);

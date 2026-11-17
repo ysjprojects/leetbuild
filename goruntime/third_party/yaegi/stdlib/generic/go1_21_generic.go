@@ -31,3 +31,6 @@ var Sources = [...]string{
 	// syncAtomicSource,
 	// syncSource,
 }
+
+// Packages are generic parts of binary packages (LeetBuild; the go1.22 build has sync/atomic's).
+var Packages = [...]struct{ Path, Source string }{}

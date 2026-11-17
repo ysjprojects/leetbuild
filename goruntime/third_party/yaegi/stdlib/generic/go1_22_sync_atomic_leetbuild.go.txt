@@ -1,0 +1,39 @@
+// LeetBuild: sync/atomic's generic Pointer[T] (go1_22_sync_atomic_type.go.txt), which the binary
+// package's symbol table cannot carry. The interpreter registers this file under "sync/atomic", so
+// atomic.Pointer resolves here while the package's other symbols (Int64, Bool, Value, LoadInt32, …)
+// stay the native ones. The original swaps an unsafe.Pointer with LoadPointer/StorePointer; this
+// one reads and writes a *T. Each method is still atomic where the runtime runs it: Go on
+// GOARCH=wasm has one thread and no sysmon to preempt a goroutine, so goroutines switch only where
+// one blocks, and nothing here blocks. The file imports nothing: an instantiated generic type
+// resolves its body in its user's scope.
+
+package atomic
+
+// A Pointer is an atomic pointer of type *T. The zero value is a nil *T.
+type Pointer[T any] struct {
+	// Mention *T in a field to disallow conversion between Pointer types.
+	_ [0]*T
+
+	v *T
+}
+
+// Load atomically loads and returns the value stored in x.
+func (x *Pointer[T]) Load() *T { return x.v }
+
+// Store atomically stores val into x.
+func (x *Pointer[T]) Store(val *T) { x.v = val }
+
+// Swap atomically stores new into x and returns the previous value.
+func (x *Pointer[T]) Swap(new *T) (old *T) {
+	old, x.v = x.v, new
+	return old
+}
+
+// CompareAndSwap executes the compare-and-swap operation for x.
+func (x *Pointer[T]) CompareAndSwap(old, new *T) (swapped bool) {
+	if x.v != old {
+		return false
+	}
+	x.v = new
+	return true
+}

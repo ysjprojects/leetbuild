@@ -5,13 +5,31 @@
  * `assert` with the usual methods, a small `EventEmitter`, `promisify` and `inspect`.
  */
 
-import {Buffer} from './buffer';
+import {Buffer, normalizeEncoding} from './buffer';
 
 // ---- crypto ----------------------------------------------------------------------------------------
 
 const encoder = new TextEncoder();
 
 const toBytes = (data: string | Uint8Array): Uint8Array => (typeof data === 'string' ? encoder.encode(data) : data);
+
+/**
+ * The bytes `hash.update(data, inputEncoding)` hashes (lib/internal/crypto/hash.js): a string is
+ * written in inputEncoding as Buffer.from writes it — utf8 when it is absent or unknown — and an
+ * odd-length hex string is refused, as Node's validateEncoding does.
+ */
+const updateBytes = (data: string | Uint8Array, inputEncoding?: string): Uint8Array => {
+  if (typeof data !== 'string') return data;
+  const encoding = normalizeEncoding(inputEncoding) ?? 'utf8';
+  if (encoding === 'hex' && data.length % 2 !== 0)
+    throw Object.assign(
+      new TypeError(
+        `The argument 'encoding' is invalid for data of length ${data.length}. Received '${inputEncoding}'`,
+      ),
+      {code: 'ERR_INVALID_ARG_VALUE'},
+    );
+  return Buffer.from(data, encoding);
+};
 
 const rotr = (x: number, n: number): number => (x >>> n) | (x << (32 - n));
 const rotl = (x: number, n: number): number => (x << n) | (x >>> (32 - n));
@@ -174,17 +192,13 @@ const md5 = (message: Uint8Array): Uint8Array => {
 
 const DIGESTS: Record<string, (m: Uint8Array) => Uint8Array> = {sha256, sha1, md5};
 
-/** Node's `digest()` and `digest('buffer')` answer a Buffer (`.subarray(0, 8).toString('hex')` works on it). */
+/**
+ * Node's `digest(outputEncoding)`: a string in any encoding Buffer writes (hex, base64, base64url,
+ * latin1, …); a Buffer without one, for 'buffer' or an unknown one (ParseEncoding's default).
+ */
 const encode = (bytes: Uint8Array, encoding?: string): string | Uint8Array => {
-  if (encoding === undefined || encoding === 'buffer') return Buffer.from(bytes);
-  if (encoding === 'hex') return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
-  if (encoding === 'base64') return btoa(String.fromCharCode(...bytes));
-  if (encoding === 'base64url')
-    return btoa(String.fromCharCode(...bytes))
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
-  throw new Error(`unsupported digest encoding '${encoding}'`);
+  const known = encoding ? normalizeEncoding(encoding) : undefined;
+  return known === undefined ? Buffer.from(bytes) : Buffer.from(bytes).toString(known);
 };
 
 export class Hash {
@@ -193,8 +207,8 @@ export class Hash {
     if (!(algorithm.toLowerCase().replace('-', '') in DIGESTS))
       throw new Error(`Digest method not supported: ${algorithm}`);
   }
-  update(data: string | Uint8Array): this {
-    this.chunks.push(toBytes(data));
+  update(data: string | Uint8Array, inputEncoding?: string): this {
+    this.chunks.push(updateBytes(data, inputEncoding));
     return this;
   }
   digest(encoding?: string): string | Uint8Array {
@@ -229,8 +243,8 @@ const hmac = (algorithm: string, key: string | Uint8Array, message: Uint8Array):
 export class Hmac {
   private readonly chunks: Uint8Array[] = [];
   constructor(private readonly algorithm: string, private readonly key: string | Uint8Array) {}
-  update(data: string | Uint8Array): this {
-    this.chunks.push(toBytes(data));
+  update(data: string | Uint8Array, inputEncoding?: string): this {
+    this.chunks.push(updateBytes(data, inputEncoding));
     return this;
   }
   digest(encoding?: string): string | Uint8Array {

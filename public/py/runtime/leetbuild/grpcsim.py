@@ -466,12 +466,31 @@ def invoke_sync(path, request, timeout, metadata, serializer, deserializer, targ
 
 
 def invoke_sync_stream(path, request, timeout, metadata, serializer, deserializer, target=None):
-    """Server-streaming over a sync channel: a generator that translates aborts as they happen."""
-    call, handler = _begin(path, request, timeout, metadata, target)
+    """
+    Server-streaming over a sync channel: a generator that translates aborts as they happen. As
+    grpcio's _MultiThreadedRendezvous, opening the call only starts it (the request is sent, the
+    deadline runs from here); its failure — an injected one, nothing serving, the deadline passing
+    while it waits out the latency — is raised when the stream is iterated, as is the wait itself.
+    """
     ctx = ServicerContext(metadata, timeout)
-    req = _roundtrip(request, serializer, handler.request_deserializer)
+    wire = request if serializer is None else serializer(request)
+    try:
+        admitted, refused = _admit(path, request, timeout, metadata, target), None
+    except CallError as exc:
+        admitted, refused = None, exc
 
     def generator():
+        if refused is not None:
+            ctx._finish()
+            raise refused
+        call, wait, expired = admitted
+        CLOCK.advance(wait)
+        try:
+            call, handler = _connect(call, path, target, expired)
+        except CallError:
+            ctx._finish()
+            raise
+        req = wire if serializer is None or handler.request_deserializer is None else handler.request_deserializer(wire)
         try:
             for item in handler.behavior(req, ctx):
                 yield _roundtrip(item, handler.response_serializer, deserializer)

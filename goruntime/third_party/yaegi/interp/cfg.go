@@ -1093,8 +1093,16 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				name := t.id() + "[" + n.child[1].typ.id() + "]"
 				sym, _, ok := sc.lookup(name)
 				if !ok {
-					err = n.cfgErrorf("type not found: %s", name)
-					return
+					// LeetBuild: an instance first met in an expression (new(atomic.Pointer[int]))
+					// is generated here, as a declaration's type would have been.
+					var it *itype
+					if it, err = nodeType(interp, sc, n); err != nil {
+						return
+					}
+					if sym, _, ok = sc.lookup(name); !ok || it == nil {
+						err = n.cfgErrorf("type not found: %s", name)
+						return
+					}
 				}
 				n.gen = nop
 				n.typ = sym.typ
@@ -1964,6 +1972,10 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 					}
 					n.action = aGetSym
 					n.gen = nop
+				} else if sym, ok := interp.srcPkg[pkg][name]; ok {
+					// LeetBuild: a generic part of the binary package, interpreted from source
+					// (compileBinPkgSource): atomic.Pointer.
+					n.getSrcSym(sym)
 				} else {
 					err = n.cfgErrorf("package %s \"%s\" has no symbol %s", n.child[0].ident, pkg, name)
 				}
@@ -1971,17 +1983,7 @@ func (interp *Interpreter) cfg(root *node, sc *scope, importPath, pkgName string
 				pkg, name := n.child[0].sym.typ.path, n.child[1].ident
 				// Resolve source package symbol
 				if sym, ok := interp.srcPkg[pkg][name]; ok {
-					n.findex = sym.index
-					if sym.global {
-						n.level = globalFrame
-					}
-					n.val = sym.node
-					n.gen = nop
-					n.action = aGetSym
-					n.typ = sym.typ
-					n.sym = sym
-					n.recv = sym.recv
-					n.rval = sym.rval
+					n.getSrcSym(sym)
 				} else {
 					err = n.cfgErrorf("undefined selector: %s.%s", pkg, name)
 				}

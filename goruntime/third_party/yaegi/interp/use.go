@@ -183,6 +183,11 @@ func (interp *Interpreter) Use(values Exports) error {
 				return err
 			}
 		}
+		for _, p := range gen.Packages {
+			if err := interp.compileBinPkgSource(p.Path, p.Source); err != nil {
+				return err
+			}
+		}
 	}
 	interp.mapPrintTypes()
 	return nil

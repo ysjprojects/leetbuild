@@ -2,7 +2,8 @@
  * `Buffer` for the browser worker: kafkajs hands message keys and values to the learner as Buffers
  * (`message.value?.toString()`), grpc-js does the same for `bytes` fields, and learner code reaches
  * for `Buffer.from(...)`. Node already has one (`yarn verify`); the browser gets this subset —
- * `from`, `alloc`, `concat`, `isBuffer`, `byteLength`, `toString` (utf8/hex/base64/base64url/latin1),
+ * `from`, `alloc`, `concat`, `isBuffer`, `byteLength`, `toString` (Node's encodings: utf8, hex, base64,
+ * base64url, latin1/binary, ascii, utf16le/ucs2, case-insensitive),
  * `equals`, `toJSON`, `write`, `subarray`/`slice` (views, as Node's), 32-bit reads and writes —
  * installed as the global when none exists.
  */
@@ -10,25 +11,97 @@
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
-type Encoding = 'utf8' | 'utf-8' | 'hex' | 'base64' | 'base64url' | 'latin1' | 'binary' | 'ascii';
+type Encoding =
+  | 'utf8'
+  | 'utf-8'
+  | 'hex'
+  | 'base64'
+  | 'base64url'
+  | 'latin1'
+  | 'binary'
+  | 'ascii'
+  | 'utf16le'
+  | 'utf-16le'
+  | 'ucs2'
+  | 'ucs-2';
 
-const fromString = (text: string, encoding: Encoding = 'utf8'): Uint8Array => {
-  switch (encoding) {
+/** Node's `normalizeEncoding` (lib/internal/util.js): case-insensitive, aliases folded; undefined when unknown. */
+export const normalizeEncoding = (
+  encoding: string | undefined,
+): 'utf8' | 'hex' | 'base64' | 'base64url' | 'latin1' | 'ascii' | 'utf16le' | undefined => {
+  switch ((encoding ?? 'utf8').toLowerCase()) {
+    case 'utf8':
+    case 'utf-8':
+    case '':
+      return 'utf8';
+    case 'ucs2':
+    case 'ucs-2':
+    case 'utf16le':
+    case 'utf-16le':
+      return 'utf16le';
+    case 'latin1':
+    case 'binary':
+      return 'latin1';
+    case 'hex':
+    case 'base64':
+    case 'base64url':
+    case 'ascii':
+      return encoding?.toLowerCase() as 'hex' | 'base64' | 'base64url' | 'ascii';
+    default:
+      return undefined;
+  }
+};
+
+const BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+
+/** The bytes of `text` in `encoding`, as Node's `Buffer.from(text, encoding)` writes them (src/string_bytes.cc). */
+const fromString = (text: string, encoding?: string): Uint8Array => {
+  switch (normalizeEncoding(encoding)) {
     case 'hex': {
-      const out = new Uint8Array(Math.floor(text.length / 2));
-      for (let i = 0; i < out.length; i++) out[i] = parseInt(text.slice(i * 2, i * 2 + 2), 16);
-      return out;
+      // Pairs up to the first that is not hex; an odd last digit is dropped.
+      const out: number[] = [];
+      for (let i = 0; i + 1 < text.length; i += 2) {
+        const pair = text.slice(i, i + 2);
+        if (!/^[0-9a-fA-F]{2}$/.test(pair)) break;
+        out.push(parseInt(pair, 16));
+      }
+      return Uint8Array.from(out);
     }
     case 'base64':
     case 'base64url': {
-      const normalized = text.replace(/-/g, '+').replace(/_/g, '/');
-      const padded = normalized + '='.repeat((4 - (normalized.length % 4)) % 4);
-      return Uint8Array.from(atob(padded), c => c.charCodeAt(0));
+      // Either alphabet, characters outside it skipped, ended by the first '='.
+      const out: number[] = [];
+      let acc = 0;
+      let bits = 0;
+      for (const c of text) {
+        if (c === '=') break;
+        const v = c === '+' || c === '-' ? 62 : c === '/' || c === '_' ? 63 : BASE64.indexOf(c);
+        if (v < 0) continue;
+        acc = (acc << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+          bits -= 8;
+          out.push((acc >> bits) & 0xff);
+        }
+      }
+      return Uint8Array.from(out);
     }
     case 'latin1':
-    case 'binary':
-    case 'ascii':
-      return Uint8Array.from(text, c => c.charCodeAt(0) & 0xff);
+    case 'ascii': {
+      // Each UTF-16 unit's low byte (a surrogate pair is two), not each code point's.
+      const out = new Uint8Array(text.length);
+      for (let i = 0; i < text.length; i++) out[i] = text.charCodeAt(i) & 0xff;
+      return out;
+    }
+    case 'utf16le': {
+      const out = new Uint8Array(text.length * 2);
+      for (let i = 0; i < text.length; i++) {
+        const unit = text.charCodeAt(i);
+        out[i * 2] = unit & 0xff;
+        out[i * 2 + 1] = unit >> 8;
+      }
+      return out;
+    }
     default:
       return encoder.encode(text);
   }
@@ -43,7 +116,7 @@ const compare = (a: Uint8Array, b: Uint8Array): number => {
 class BufferImpl extends Uint8Array {
   toString(encoding: Encoding = 'utf8', start = 0, end = this.length): string {
     const view = this.subarray(start, end);
-    switch (encoding) {
+    switch (normalizeEncoding(encoding)) {
       case 'hex':
         return [...view].map(b => b.toString(16).padStart(2, '0')).join('');
       case 'base64':
@@ -54,9 +127,15 @@ class BufferImpl extends Uint8Array {
           .replace(/\//g, '_')
           .replace(/=+$/, '');
       case 'latin1':
-      case 'binary':
-      case 'ascii':
         return String.fromCharCode(...view);
+      case 'ascii':
+        // Node unsets each byte's high bit when decoding ascii.
+        return String.fromCharCode(...view.map(b => b & 0x7f));
+      case 'utf16le': {
+        let out = '';
+        for (let i = 0; i + 1 < view.length; i += 2) out += String.fromCharCode(view[i] | (view[i + 1] << 8));
+        return out;
+      }
       default:
         return decoder.decode(view);
     }

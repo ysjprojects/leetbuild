@@ -419,7 +419,8 @@ std::string arg_text(const T& v) {
 }  // namespace detail
 
 // The harness's own Redis client, on the server the learner's code uses: its commands are not
-// counted as the learner's round trips and fire no probes.
+// counted as the learner's round trips. Like every client's, a command touching a probe's key
+// fires the probe (in Python, TypeScript and Go too).
 class Redis {
  public:
   explicit Redis(Ctx& ctx) : ctx_(ctx) {}

@@ -25,7 +25,8 @@ export function redisBridge(world: BridgeWorld): Bridge {
   const subscriptions = new Map<number, () => void>();
   return {
     calls: {
-      // `record`: the learner's command (a round trip the harness counts, probes fire); the harness's are not.
+      // `record`: the learner's command, a round trip the harness counts; the harness's own are not
+      // counted. Probes fire on either, as in every runtime.
       'redis.execute': ({args, record}: {args: string[]; record: boolean}): Tagged =>
         tagged(() => redis.SERVER.execute(args, record)),
       'redis.pipeline': (commands: string[][]): Tagged[] => each(redis.SERVER.executePipeline(commands)),

@@ -29,7 +29,8 @@ class Server {
     lb_shutdown(internal::to_ms(deadline));
   }
 
-  // The model's: add a service to a running server (how the harness's peers get theirs).
+  // The model's: add a service to a running server (how the harness's peers get theirs); one serving
+  // a name an earlier service serves replaces it (a peer rebuilt with new service objects).
   bool RegisterService(Service* service);
   void lb_shutdown(double deadline_ms);
   const std::shared_ptr<internal::ServerState>& lb_state() const { return state_; }

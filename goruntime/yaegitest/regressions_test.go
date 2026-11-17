@@ -1490,3 +1490,95 @@ func Run() string {
 		t.Errorf("Run() = %q, want 6truep", got)
 	}
 }
+
+// A value converted to an interface is a copy: `append(out, &T{…})` in a loop appends a new
+// pointer each time, not the frame slot the literal's address was written to (which every element
+// then shared, ending as the last one). The same through a variable, an empty interface, a map and
+// an index assignment.
+func TestInterfaceConversionCopiesValue(t *testing.T) {
+	expect(t, `package main
+
+type peer struct{ target string }
+
+func (p *peer) Name() string { return p.target }
+
+type namer interface{ Name() string }
+
+func Run() string {
+	out := []namer{}
+	viaVar := []namer{}
+	empty := []any{}
+	byKey := map[string]namer{}
+	indexed := make([]namer, 3)
+	for i, t := range []string{"a", "b", "c"} {
+		out = append(out, &peer{target: t})
+		var n namer = &peer{target: t}
+		viaVar = append(viaVar, n)
+		var e any = &peer{target: t}
+		empty = append(empty, e)
+		byKey[t] = &peer{target: t}
+		indexed[i] = &peer{target: t}
+	}
+	s := ""
+	for _, n := range out {
+		s += n.Name()
+	}
+	for _, n := range viaVar {
+		s += n.Name()
+	}
+	for _, e := range empty {
+		s += e.(*peer).target
+	}
+	s += byKey["a"].Name() + byKey["b"].Name() + byKey["c"].Name()
+	for _, n := range indexed {
+		s += n.Name()
+	}
+	return s
+}`, "abcabcabcabcabc")
+}
+
+// sync/atomic's generic Pointer[T] (interpreted from source under the package's path) beside its
+// native types: Load, Store, Swap and CompareAndSwap, as a package-level var, a field and through new.
+func TestAtomicPointerAndTypes(t *testing.T) {
+	expect(t, `package main
+
+import (
+	"fmt"
+	"sync/atomic"
+)
+
+type snapshot struct{ n int }
+
+var latest atomic.Pointer[snapshot]
+
+type holder struct{ cur atomic.Pointer[string] }
+
+func Run() string {
+	first := latest.Load() == nil
+	a, b := &snapshot{1}, &snapshot{2}
+	latest.Store(a)
+	old := latest.Swap(b)
+	casWrong := latest.CompareAndSwap(a, &snapshot{3})
+	casRight := latest.CompareAndSwap(b, &snapshot{4})
+	var h holder
+	s := "x"
+	h.cur.Store(&s)
+	p := new(atomic.Pointer[int])
+	v := 7
+	p.Store(&v)
+	var i32 atomic.Int32
+	var i64 atomic.Int64
+	var u32 atomic.Uint32
+	var u64 atomic.Uint64
+	var ok atomic.Bool
+	var val atomic.Value
+	i32.Add(2)
+	i64.Store(5)
+	u32.Add(3)
+	u64.CompareAndSwap(0, 9)
+	ok.Store(true)
+	val.Store("v")
+	return fmt.Sprint(first, old.n, casWrong, casRight, latest.Load().n, *h.cur.Load(), *p.Load(),
+		i32.Load(), i64.Add(1), u32.Load(), u64.Load(), ok.Load(), val.Load())
+}`, "true 1 false true 4x7 2 6 3 9 truev")
+}

@@ -29,3 +29,45 @@ func (interp *Interpreter) Lookup(importPath, name string) (reflect.Value, bool)
 	}
 	return reflect.Value{}, false
 }
+
+// compileBinPkgSource interprets src, a generic part of the binary package at importPath that its
+// symbol table cannot carry (sync/atomic's Pointer[T]), and registers it as the source package at
+// that path (LeetBuild): a selector the binary package lacks falls through to it (nodeType2's
+// binPkgT case), while every other symbol of the package stays the native one.
+func (interp *Interpreter) compileBinPkgSource(importPath, src string) error {
+	f, err := interp.parse(src, importPath, false)
+	if err != nil {
+		return err
+	}
+	pkgName, root, err := interp.ast(f)
+	if err != nil {
+		return err
+	}
+	if err := interp.gtaRetry([]*node{root}, importPath, pkgName); err != nil {
+		return err
+	}
+	initNodes, err := interp.cfg(root, nil, importPath, pkgName)
+	if err != nil {
+		return err
+	}
+	interp.mutex.Lock()
+	interp.srcPkg[importPath] = interp.scopes[importPath].sym
+	interp.mutex.Unlock()
+	_, err = interp.Execute(&Program{importPath, root, initNodes})
+	return err
+}
+
+// getSrcSym makes the selector n read sym, a package-level symbol of a source package.
+func (n *node) getSrcSym(sym *symbol) {
+	n.findex = sym.index
+	if sym.global {
+		n.level = globalFrame
+	}
+	n.val = sym.node
+	n.gen = nop
+	n.action = aGetSym
+	n.typ = sym.typ
+	n.sym = sym
+	n.recv = sym.recv
+	n.rval = sym.rval
+}

@@ -18,6 +18,11 @@ from typing import Callable
 
 from .clock import CLOCK
 
+
+class _Drained(KeyboardInterrupt):
+    """The interrupt that stops a harness's consumer loop once every seeded record was delivered."""
+
+
 # How long a record acknowledged by the leader alone (acks 0/1) stays only on the leader.
 REPLICATION_LAG = 0.1
 
@@ -570,17 +575,24 @@ class Consumer:
             for tp in self._assignment
         )
         if BROKER.stop_when_drained and not remaining:
-            raise KeyboardInterrupt("every seeded message was delivered")
+            raise _Drained("every seeded message was delivered")
         if timeout:
-            from .clock import CLOCK
-
             CLOCK.advance(timeout)
         return None
 
     def consume(self, num_messages: int = 1, timeout: float | None = None) -> list[Message]:
+        # librdkafka's rd_kafka_consume_batch_queue: up to num_messages records, waiting at most
+        # `timeout` for the batch to fill; what was gathered is returned when it does not. Each record
+        # is one poll, so a harness hook on poll sees the batch being gathered.
         out = []
         for _ in range(num_messages):
-            msg = self.poll(timeout)
+            try:
+                msg = self.poll(timeout)
+            except _Drained:
+                if not out:
+                    raise
+                # The topic drained mid-batch: the batch is returned, the next call stops the loop.
+                break
             if msg is None:
                 break
             out.append(msg)
