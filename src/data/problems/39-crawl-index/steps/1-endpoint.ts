@@ -59,7 +59,7 @@ every client retry into a second copy in the frontier.
       id: 'host-policy',
       title: 'Accepts only http(s) URLs on an allowlisted host',
       detail:
-        'The scheme must be in `ALLOWED_SCHEMES` and the host in `ALLOWED_HOSTS`; anything else, the metadata address and `localhost` included, is **400** and registers nothing. The starter accepts any absolute URL.',
+        'The scheme must be in `ALLOWED_SCHEMES` and the host exactly in `ALLOWED_HOSTS`; anything else, other schemes, other subdomains, the metadata address and `localhost` included, is **400** and registers nothing. The starter accepts any absolute URL.',
       match: {
         python: {all: [/ALLOWED_SCHEMES/, /ALLOWED_HOSTS/, /status_code\s*=\s*400/]},
         typescript: {all: [/ALLOWED_SCHEMES/, /ALLOWED_HOSTS/, /code\(\s*400\s*\)/]},
@@ -85,7 +85,7 @@ every client retry into a second copy in the frontier.
       id: 'robots',
       title: 'A disallowed path is 403 quoting the robots rule',
       detail:
-        "The host's robots rules are read before the insert, and a path under a `Disallow` prefix answers **403** `disallowed by robots: <rule>` and registers nothing. The starter never reads `robots.txt`.",
+        "The host's robots rules are read before the insert, and a path that starts with a `Disallow` prefix answers **403** `disallowed by robots: <rule>` and registers nothing, while a path that only contains a rule further in is accepted. The starter never reads `robots.txt`.",
       match: {
         python: {
           all: [/status_code\s*=\s*403/, /disallowed by robots/],
@@ -104,7 +104,7 @@ every client retry into a second copy in the frontier.
       id: 'dedupe',
       title: 'One target per (job_id, url)',
       detail:
-        'The registry is looked up (`find`) before the insert and a replay answers the stored `target_id` without enqueuing the URL again. The starter inserts and enqueues on every request.',
+        'The registry is looked up (`find`) before the insert and a replay answers the stored `target_id` without enqueuing the URL again, while the same URL under another job is a new target. The starter inserts and enqueues on every request.',
       match: {
         python: {order: [/registry\.find\(/, /registry\.insert\(/]},
         typescript: {order: [/(?<![.\w])find\(|registry\.find\(/, /(?<![.\w])insert\(|registry\.insert\(/]},
@@ -548,6 +548,9 @@ REFUSED = [
     "http://169.254.169.254/latest/meta-data/",
     "http://localhost:8080/admin",
     "https://blog.example.com.attacker.net/posts",
+    "https://internal.example.com/",
+    "gopher://blog.example.com/posts",
+    "wss://blog.example.com/live",
 ]
 
 
@@ -612,10 +615,10 @@ async def check_robots(ctx):
         assert "disallowed by robots: /private" in r.text, f"the 403 must quote the rule (disallowed by robots: /private), got {r.text}"
         everything = await _register(c, "https://docs.example.com/guide")
         assert everything.status_code == 403 and "disallowed by robots: /" in everything.text, f"Disallow: / covers every path, yet docs.example.com/guide answered {everything.status_code} {everything.text}"
-        ok = await _register(c, "https://blog.example.com/posts/1")
-    assert ok.status_code == 200, f"a path no rule covers answered {ok.status_code}: {ok.text}"
+        ok = await _register(c, "https://blog.example.com/posts/private-notes")
+    assert ok.status_code == 200, f"a path no rule starts (/posts/private-notes; rules are path prefixes) answered {ok.status_code}: {ok.text}"
     assert registry.find(JOB, "https://blog.example.com/private/notes") is None, "a disallowed URL was registered"
-    assert _queue(ctx) == ["https://blog.example.com/posts/1"], f"the host's queue holds {_queue(ctx)}: only the allowed URL may be queued"
+    assert _queue(ctx) == ["https://blog.example.com/posts/private-notes"], f"the host's queue holds {_queue(ctx)}: only the allowed URL may be queued"
 
 
 async def check_dedupe(ctx):
@@ -623,10 +626,14 @@ async def check_dedupe(ctx):
         first = await _register(c, POSTS)
         replay = await _register(c, POSTS)
         other = await _register(c, "https://blog.example.com/about")
+        weekly = await c.post("/v1/crawl/targets", json={"job_id": "weekly", "url": POSTS}, headers=TENANT)
     assert first.status_code == 200 and replay.status_code == 200, f"registration answered {first.status_code}, then {replay.status_code} for its replay"
     assert replay.json().get("target_id") == first.json().get("target_id"), f"a replay of ({JOB}, {POSTS}) answered target {replay.json().get('target_id')}, the first answer was {first.json().get('target_id')}: one target per (job_id, url)"
     assert other.json().get("target_id") != first.json().get("target_id"), "another URL must get its own target"
     assert _queue(ctx) == [POSTS, "https://blog.example.com/about"], f"the host's queue holds {_queue(ctx)}: a replay must not queue the URL a second time"
+    assert weekly.status_code == 200 and weekly.json().get("target_id") not in (None, "", first.json().get("target_id")), f"the same URL under another job (weekly) answered {weekly.status_code} {weekly.text}: one target per (job_id, url), so it is a new target"
+    weekly_queue = ctx.redis.lrange("frontier:weekly:blog.example.com", 0, -1)
+    assert weekly_queue == [POSTS], f"the weekly job's queue holds {weekly_queue}: the same URL under another job is queued for that job"
 `,
     typescript: `const JOB = 'nightly';
 const TENANT = {'X-Tenant-Id': 'acme'};
@@ -637,6 +644,9 @@ const REFUSED = [
   'http://169.254.169.254/latest/meta-data/',
   'http://localhost:8080/admin',
   'https://blog.example.com.attacker.net/posts',
+  'https://internal.example.com/',
+  'gopher://blog.example.com/posts',
+  'wss://blog.example.com/live',
 ];
 
 function api(ctx) {
@@ -691,10 +701,10 @@ export async function check_robots(ctx) {
   assert(r.text.includes('disallowed by robots: /private'), \`the 403 must quote the rule (disallowed by robots: /private), got \${r.text}\`);
   const everything = await post(c, 'https://docs.example.com/guide');
   assert(everything.status === 403 && everything.text.includes('disallowed by robots: /'), \`Disallow: / covers every path, yet docs.example.com/guide answered \${everything.status} \${everything.text}\`);
-  const ok = await post(c, 'https://blog.example.com/posts/1');
-  assert.equal(ok.status, 200, \`a path no rule covers answered \${ok.status}: \${ok.text}\`);
+  const ok = await post(c, 'https://blog.example.com/posts/private-notes');
+  assert.equal(ok.status, 200, \`a path no rule starts (/posts/private-notes; rules are path prefixes) answered \${ok.status}: \${ok.text}\`);
   assert.equal(await registry.find(JOB, 'https://blog.example.com/private/notes'), null, 'a disallowed URL was registered');
-  assert.deepStrictEqual(queue(ctx), ['https://blog.example.com/posts/1'], \`the host's queue holds \${JSON.stringify(queue(ctx))}: only the allowed URL may be queued\`);
+  assert.deepStrictEqual(queue(ctx), ['https://blog.example.com/posts/private-notes'], \`the host's queue holds \${JSON.stringify(queue(ctx))}: only the allowed URL may be queued\`);
 }
 
 export async function check_dedupe(ctx) {
@@ -706,6 +716,10 @@ export async function check_dedupe(ctx) {
   assert.equal(replay.json().target_id, first.json().target_id, \`a replay of (\${JOB}, \${POSTS}) answered target \${replay.json().target_id}, the first answer was \${first.json().target_id}: one target per (job_id, url)\`);
   assert.notEqual(other.json().target_id, first.json().target_id, 'another URL must get its own target');
   assert.deepStrictEqual(queue(ctx), [POSTS, 'https://blog.example.com/about'], \`the host's queue holds \${JSON.stringify(queue(ctx))}: a replay must not queue the URL a second time\`);
+  const weekly = await c.post('/v1/crawl/targets', {json: {job_id: 'weekly', url: POSTS}, headers: TENANT});
+  assert(weekly.status === 200 && weekly.json().target_id && weekly.json().target_id !== first.json().target_id, \`the same URL under another job (weekly) answered \${weekly.status} \${weekly.text}: one target per (job_id, url), so it is a new target\`);
+  const weeklyQueue = ctx.redis.lrange('frontier:weekly:blog.example.com', 0, -1);
+  assert.deepStrictEqual(weeklyQueue, [POSTS], \`the weekly job's queue holds \${JSON.stringify(weeklyQueue)}: the same URL under another job is queued for that job\`);
 }
 `,
     go: `package main
@@ -731,6 +745,9 @@ var refusedTargets = []string{
 	"http://169.254.169.254/latest/meta-data/",
 	"http://localhost:8080/admin",
 	"https://blog.example.com.attacker.net/posts",
+	"https://internal.example.com/",
+	"gopher://blog.example.com/posts",
+	"wss://blog.example.com/live",
 }
 
 func api(ctx *harness.Ctx) *harness.HTTP {
@@ -801,10 +818,10 @@ func CheckRobots(ctx *harness.Ctx) {
 	ctx.Assert(strings.Contains(r.Text(), "disallowed by robots: /private"), "the 403 must quote the rule (disallowed by robots: /private), got %s", r.Text())
 	everything := postTarget(c, "https://docs.example.com/guide")
 	ctx.Assert(everything.Status == 403 && strings.Contains(everything.Text(), "disallowed by robots: /"), "Disallow: / covers every path, yet docs.example.com/guide answered %d %s", everything.Status, everything.Text())
-	ok := postTarget(c, "https://blog.example.com/posts/1")
-	ctx.Equal(ok.Status, 200, "a path no rule covers (%s)", ok.Text())
+	ok := postTarget(c, "https://blog.example.com/posts/private-notes")
+	ctx.Equal(ok.Status, 200, "a path no rule starts (/posts/private-notes; rules are path prefixes) (%s)", ok.Text())
 	ctx.Assert(registry.Find(context.Background(), apiJob, "https://blog.example.com/private/notes") == nil, "a disallowed URL was registered")
-	ctx.Equal(blogQueue(ctx), []string{"https://blog.example.com/posts/1"}, "only the allowed URL may be queued; the host's queue")
+	ctx.Equal(blogQueue(ctx), []string{"https://blog.example.com/posts/private-notes"}, "only the allowed URL may be queued; the host's queue")
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
@@ -816,6 +833,9 @@ func CheckDedupe(ctx *harness.Ctx) {
 	ctx.Equal(answeredID(replay), answeredID(first), "a replay of (%s, %s) must answer the first target (one target per (job_id, url)); the replay's target_id", apiJob, apiPosts)
 	ctx.Assert(answeredID(other) != answeredID(first), "another URL must get its own target")
 	ctx.Equal(blogQueue(ctx), []string{apiPosts, "https://blog.example.com/about"}, "a replay must not queue the URL a second time; the host's queue")
+	weekly := c.Post("/v1/crawl/targets", map[string]string{"job_id": "weekly", "url": apiPosts}, "X-Tenant-Id", "acme")
+	ctx.Assert(weekly.Status == 200 && answeredID(weekly) != "" && answeredID(weekly) != answeredID(first), "the same URL under another job (weekly) answered %d %s: one target per (job_id, url), so it is a new target", weekly.Status, weekly.Text())
+	ctx.Equal(ctx.Redis.LRange("frontier:weekly:blog.example.com", 0, -1), []string{apiPosts}, "the same URL under another job is queued for that job; the weekly job's queue")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -835,6 +855,9 @@ const std::vector<std::string> kRefused = {
     "http://169.254.169.254/latest/meta-data/",
     "http://localhost:8080/admin",
     "https://blog.example.com.attacker.net/posts",
+    "https://internal.example.com/",
+    "gopher://blog.example.com/posts",
+    "wss://blog.example.com/live",
 };
 
 harness::HTTP api(harness::Ctx& ctx) {
@@ -904,10 +927,10 @@ void CheckRobots(harness::Ctx& ctx) {
   ctx.Assert(r.Text().find("disallowed by robots: /private") != std::string::npos, "the 403 must quote the rule (disallowed by robots: /private), got %s", r.Text());
   const auto everything = postTarget(c, "https://docs.example.com/guide");
   ctx.Assert(everything.Status == 403 && everything.Text().find("disallowed by robots: /") != std::string::npos, "Disallow: / covers every path, yet docs.example.com/guide answered %d %s", everything.Status, everything.Text());
-  const auto ok = postTarget(c, "https://blog.example.com/posts/1");
-  ctx.Equal(ok.Status, 200, "a path no rule covers (%s)", ok.Text());
+  const auto ok = postTarget(c, "https://blog.example.com/posts/private-notes");
+  ctx.Equal(ok.Status, 200, "a path no rule starts (/posts/private-notes; rules are path prefixes) (%s)", ok.Text());
   ctx.Assert(!registry::find(kJob, "https://blog.example.com/private/notes"), "a disallowed URL was registered");
-  ctx.Equal(blogQueue(ctx), {std::string("https://blog.example.com/posts/1")}, "only the allowed URL may be queued; the host's queue");
+  ctx.Equal(blogQueue(ctx), {std::string("https://blog.example.com/posts/private-notes")}, "only the allowed URL may be queued; the host's queue");
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
@@ -919,6 +942,9 @@ void CheckDedupe(harness::Ctx& ctx) {
   ctx.Equal(answeredId(replay), answeredId(first), "a replay of (%s, %s) must answer the first target (one target per (job_id, url)); the replay's target_id", kJob, kPosts);
   ctx.Assert(answeredId(other) != answeredId(first), "another URL must get its own target");
   ctx.Equal(blogQueue(ctx), {kPosts, std::string("https://blog.example.com/about")}, "a replay must not queue the URL a second time; the host's queue");
+  const auto weekly = c.Post("/v1/crawl/targets", nlohmann::json{{"job_id", "weekly"}, {"url", kPosts}}.dump(), "Content-Type", "application/json", "X-Tenant-Id", "acme");
+  ctx.Assert(weekly.Status == 200 && !answeredId(weekly).empty() && answeredId(weekly) != answeredId(first), "the same URL under another job (weekly) answered %d %s: one target per (job_id, url), so it is a new target", weekly.Status, weekly.Text());
+  ctx.Equal(ctx.Redis.LRange("frontier:weekly:blog.example.com", 0, -1), {kPosts}, "the same URL under another job is queued for that job; the weekly job's queue");
 }
 `,
   },

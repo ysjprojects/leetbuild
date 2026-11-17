@@ -41,7 +41,7 @@ expires; and the far end of a new edge keeps its old list.
       id: 'ttl',
       title: 'Caches a neighbour list for at most 5 minutes',
       detail:
-        'Every fill of `adj:{id}` carries `EX 300` (`TTL_S`); the starter caches with no expiry, so an entry a missed invalidation left behind is served forever.',
+        'Every fill of `adj:{id}`, the refill of a stale entry included, carries `EX 300` (`TTL_S`) in the command that writes it; the starter caches with no expiry, so an entry a missed invalidation left behind is served forever.',
       match: {
         python: {all: [/TTL_S\s*=\s*300\b/, /\.set\([^\n]*adj_key\([^\n]*ex\s*=\s*TTL_S|\.setex\(\s*adj_key\(/]},
         typescript: {all: [/TTL_S\s*=\s*300\b/, /\.set\([^\n]*adjKey\([^\n]*['"]EX['"]\s*,\s*TTL_S/]},
@@ -82,7 +82,7 @@ expires; and the far end of a new edge keeps its old list.
       id: 'both-ends',
       title: 'An edge bumps the version of both ends',
       detail:
-        '`apply_edge`/`applyEdge` increments `adj:{left}:version` and `adj:{right}:version`; the starter deletes the left entry only, which races a reader and leaves the right end stale.',
+        '`apply_edge`/`applyEdge` increments `adj:{left}:version` and `adj:{right}:version` after the edge is stored, so a reader that fills right after a bump already sees the edge; the starter deletes the left entry only, which races a reader and leaves the right end stale.',
       match: {
         python: {all: [/\.incr\(\s*version_key\(/]},
         typescript: {all: [/\.incr\(\s*versionKey\(/]},
@@ -480,9 +480,31 @@ def _edge(ctx, left, right):
 def check_ttl(ctx):
     m = ctx.load("state")
     _edge(ctx, "e-1", "e-2")
-    assert m.read_neighbors("e-1") == ["e-2"], f"read_neighbors(e-1) gave {m.read_neighbors('e-1')}, expected ['e-2']"
+    written = []
+
+    def watch():
+        # The TTL right after the command that wrote adj:e-1: a crash before a later EXPIRE leaves it forever.
+        ttl = ctx.redis.ttl("adj:e-1")
+        if ttl == -2:
+            ctx.redis_after("adj:e-1", watch)
+        elif not written:
+            written.append(ttl)
+        return ttl
+
+    ctx.redis_after("adj:e-1", watch)
+    first = m.read_neighbors("e-1")
+    assert first == ["e-2"], f"read_neighbors(e-1) gave {first}, expected ['e-2']"
+    assert written, "read_neighbors(e-1) never wrote adj:e-1 on a miss"
+    assert written[0] > 0, f"right after the command that wrote adj:e-1 its TTL was {written[0]}: a crash before a later EXPIRE leaves an entry that never expires. The TTL belongs in the SET"
     ttl = ctx.redis.ttl("adj:e-1")
-    assert 0 < ttl <= 300, f"adj:e-1 has TTL {ttl}: a cached neighbour list must expire within 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever"
+    assert 240 <= ttl <= 300, f"adj:e-1 has TTL {ttl}: a cached neighbour list must expire after 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever"
+    # An edge change, then a refill of the stale entry: every fill carries the TTL.
+    _edge(ctx, "e-1", "e-3")
+    ctx.redis.incr("adj:e-1:version")
+    again = m.read_neighbors("e-1")
+    assert again == ["e-2", "e-3"], f"after adj:e-1:version moved read_neighbors(e-1) gave {again}, expected ['e-2', 'e-3']"
+    ttl = ctx.redis.ttl("adj:e-1")
+    assert 240 <= ttl <= 300, f"after the refill of a stale entry adj:e-1 has TTL {ttl}: every fill of adj:e-1 carries EX 300, the refill too"
 
 
 def check_version_stamp(ctx):
@@ -518,6 +540,20 @@ def check_both_ends(ctx):
     assert right == ["e-1"], f"after apply_edge(e-1, e-3) read_neighbors(e-3) still serves {right}: an edge changes the neighbour lists of both its ends"
     versions = (ctx.redis.get("adj:e-1:version"), ctx.redis.get("adj:e-3:version"))
     assert versions == ("1", "1"), f"apply_edge must increment adj:e-1:version and adj:e-3:version, they hold {versions}: a delete races a reader's fill, a version bump does not"
+
+    def other_reader(end):
+        # Another worker reads end right after its version moved and caches what the store holds then.
+        def fill():
+            version = int(ctx.redis.get(f"adj:{end}:version") or 0)
+            ctx.redis.set(f"adj:{end}", json.dumps({"version": version, "neighbors": sorted(ctx.redis.smembers(f"edges:{end}"))}), ex=300)
+
+        return fill
+
+    probes = [ctx.redis_after(f"adj:{end}:version", other_reader(end)) for end in ("e-1", "e-4")]
+    m.apply_edge("e-1", "e-4")
+    assert all(p.fired for p in probes), "apply_edge(e-1, e-4) must increment adj:e-1:version and adj:e-4:version"
+    left, right = m.read_neighbors("e-1"), m.read_neighbors("e-4")
+    assert left == ["e-2", "e-3", "e-4"] and right == ["e-1"], f"a reader that filled the cache right after apply_edge(e-1, e-4) bumped a version left e-1 -> {left} and e-4 -> {right} served: it cached the list before the edge under the new version. Bump after store.add_edge"
 `,
     typescript: `function edge(ctx, left: string, right: string): void {
   ctx.redis.sadd(\`edges:\${left}\`, right);
@@ -527,9 +563,26 @@ def check_both_ends(ctx):
 export async function check_ttl(ctx) {
   const m = ctx.load('state');
   edge(ctx, 'e-1', 'e-2');
+  const written: number[] = [];
+  // The TTL right after the command that wrote adj:e-1: a crash before a later EXPIRE leaves it forever.
+  const watch = (): number => {
+    const ttl = ctx.redis.ttl('adj:e-1');
+    if (ttl === -2) ctx.redisAfter('adj:e-1', watch);
+    else if (written.length === 0) written.push(ttl);
+    return ttl;
+  };
+  ctx.redisAfter('adj:e-1', watch);
   assert.deepEqual(await m.readNeighbors('e-1'), ['e-2'], 'readNeighbors(e-1) must give [e-2]');
-  const ttl = ctx.redis.ttl('adj:e-1');
-  assert(0 < ttl && ttl <= 300, \`adj:e-1 has TTL \${ttl}: a cached neighbour list must expire within 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever\`);
+  assert(written.length > 0, 'readNeighbors(e-1) never wrote adj:e-1 on a miss');
+  assert(written[0] > 0, \`right after the command that wrote adj:e-1 its TTL was \${written[0]}: a crash before a later EXPIRE leaves an entry that never expires. The TTL belongs in the SET\`);
+  let ttl = ctx.redis.ttl('adj:e-1');
+  assert(240 <= ttl && ttl <= 300, \`adj:e-1 has TTL \${ttl}: a cached neighbour list must expire after 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever\`);
+  // An edge change, then a refill of the stale entry: every fill carries the TTL.
+  edge(ctx, 'e-1', 'e-3');
+  ctx.redis.incr('adj:e-1:version');
+  assert.deepEqual(await m.readNeighbors('e-1'), ['e-2', 'e-3'], 'after adj:e-1:version moved readNeighbors(e-1) must give [e-2, e-3]');
+  ttl = ctx.redis.ttl('adj:e-1');
+  assert(240 <= ttl && ttl <= 300, \`after the refill of a stale entry adj:e-1 has TTL \${ttl}: every fill of adj:e-1 carries EX 300, the refill too\`);
 }
 
 export async function check_version_stamp(ctx) {
@@ -564,6 +617,19 @@ export async function check_both_ends(ctx) {
   assert.deepEqual(right, ['e-1'], \`after applyEdge(e-1, e-3) readNeighbors(e-3) still serves \${JSON.stringify(right)}: an edge changes the neighbour lists of both its ends\`);
   const versions = [ctx.redis.get('adj:e-1:version'), ctx.redis.get('adj:e-3:version')];
   assert.deepEqual(versions, ['1', '1'], \`applyEdge must increment adj:e-1:version and adj:e-3:version, they hold \${JSON.stringify(versions)}: a delete races a reader's fill, a version bump does not\`);
+  // Another worker reads each end right after its version moved and caches what the store holds then.
+  const probes = ['e-1', 'e-4'].map(end =>
+    ctx.redisAfter(\`adj:\${end}:version\`, () => {
+      const version = Number(ctx.redis.get(\`adj:\${end}:version\`) ?? 0);
+      const found = [...ctx.redis.smembers(\`edges:\${end}\`)].sort();
+      ctx.redis.set(\`adj:\${end}\`, JSON.stringify({version, neighbors: found}), 'EX', 300);
+    }),
+  );
+  await m.applyEdge('e-1', 'e-4');
+  assert(probes.every(p => p.fired), 'applyEdge(e-1, e-4) must increment adj:e-1:version and adj:e-4:version');
+  const grown = await m.readNeighbors('e-1');
+  const far = await m.readNeighbors('e-4');
+  assert(JSON.stringify(grown) === '["e-2","e-3","e-4"]' && JSON.stringify(far) === '["e-1"]', \`a reader that filled the cache right after applyEdge(e-1, e-4) bumped a version left e-1 -> \${JSON.stringify(grown)} and e-4 -> \${JSON.stringify(far)} served: it cached the list before the edge under the new version. Bump after addEdge\`);
 }
 `,
     go: `package main
@@ -571,6 +637,7 @@ export async function check_both_ends(ctx) {
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"leetbuild/harness"
@@ -589,11 +656,44 @@ func stateRead(ctx *harness.Ctx, entityID string) string {
 	return strings.Join(ids, ",")
 }
 
+// stateFiller is another worker reading end right after its version moved and caching what the store holds then.
+func stateFiller(ctx *harness.Ctx, end string) func() any {
+	return func() any {
+		raw, _ := ctx.Redis.Get("adj:" + end + ":version")
+		version, _ := strconv.Atoi(raw)
+		entry, _ := json.Marshal(map[string]any{"version": version, "neighbors": ctx.Redis.SMembers("edges:" + end)})
+		ctx.Redis.Set("adj:"+end, string(entry), "EX", 300)
+		return nil
+	}
+}
+
 func CheckTtl(ctx *harness.Ctx) {
 	stateEdge(ctx, "e-1", "e-2")
+	var writtenTTL int64
+	written := false
+	// The TTL right after the command that wrote adj:e-1: a crash before a later EXPIRE leaves it forever.
+	var watch func() any
+	watch = func() any {
+		n := ctx.Redis.TTL("adj:e-1")
+		if n == -2 {
+			ctx.Redis.After("adj:e-1", watch)
+		} else if !written {
+			written, writtenTTL = true, n
+		}
+		return n
+	}
+	ctx.Redis.After("adj:e-1", watch)
 	ctx.Equal(stateRead(ctx, "e-1"), "e-2", "readNeighbors(e-1)")
+	ctx.Assert(written, "readNeighbors(e-1) never wrote adj:e-1 on a miss")
+	ctx.Assert(writtenTTL > 0, "right after the command that wrote adj:e-1 its TTL was %d: a crash before a later EXPIRE leaves an entry that never expires. The TTL belongs in the SET", writtenTTL)
 	ttl := ctx.Redis.TTL("adj:e-1")
-	ctx.Assert(0 < ttl && ttl <= 300, "adj:e-1 has TTL %d: a cached neighbour list must expire within 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever", ttl)
+	ctx.Assert(240 <= ttl && ttl <= 300, "adj:e-1 has TTL %d: a cached neighbour list must expire after 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever", ttl)
+	// An edge change, then a refill of the stale entry: every fill carries the TTL.
+	stateEdge(ctx, "e-1", "e-3")
+	ctx.Redis.Do("INCR", "adj:e-1:version")
+	ctx.Equal(stateRead(ctx, "e-1"), "e-2,e-3", "readNeighbors(e-1) after adj:e-1:version moved")
+	ttl = ctx.Redis.TTL("adj:e-1")
+	ctx.Assert(240 <= ttl && ttl <= 300, "after the refill of a stale entry adj:e-1 has TTL %d: every fill of adj:e-1 carries EX 300, the refill too", ttl)
 }
 
 func CheckVersionStamp(ctx *harness.Ctx) {
@@ -628,12 +728,19 @@ func CheckBothEnds(ctx *harness.Ctx) {
 	v1, _ := ctx.Redis.Get("adj:e-1:version")
 	v3, _ := ctx.Redis.Get("adj:e-3:version")
 	ctx.Assert(v1 == "1" && v3 == "1", "applyEdge must increment adj:e-1:version and adj:e-3:version, they hold %q and %q: a delete races a reader's fill, a version bump does not", v1, v3)
+	nearProbe := ctx.Redis.After("adj:e-1:version", stateFiller(ctx, "e-1"))
+	farProbe := ctx.Redis.After("adj:e-4:version", stateFiller(ctx, "e-4"))
+	ctx.NoError(applyEdge(stateBg, "e-1", "e-4"), "applyEdge(e-1, e-4) failed")
+	ctx.Assert(nearProbe.Fired && farProbe.Fired, "applyEdge(e-1, e-4) must increment adj:e-1:version and adj:e-4:version")
+	grown, far := stateRead(ctx, "e-1"), stateRead(ctx, "e-4")
+	ctx.Assert(grown == "e-2,e-3,e-4" && far == "e-1", "a reader that filled the cache right after applyEdge(e-1, e-4) bumped a version left e-1 -> %q and e-4 -> %q served: it cached the list before the edge under the new version. Bump after store.AddEdge", grown, far)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -650,13 +757,44 @@ std::string stateRead(const std::string& entity_id) {
   return out;
 }
 
+// Another worker reading end right after its version moved and caching what the store holds then.
+std::function<void()> stateFiller(harness::Ctx& ctx, const std::string& end, bool& fired) {
+  return [&ctx, end, &fired] {
+    fired = true;
+    const std::string raw = ctx.Redis.Get("adj:" + end + ":version").value_or("0");
+    const nlohmann::json entry = {{"version", std::stoll(raw)}, {"neighbors", ctx.Redis.SMembers("edges:" + end)}};
+    ctx.Redis.Do("SET", "adj:" + end, entry.dump(), "EX", "300");
+  };
+}
+
 }  // namespace
 
 void CheckTtl(harness::Ctx& ctx) {
   stateEdge(ctx, "e-1", "e-2");
+  bool written = false;
+  long long writtenTtl = 0;
+  // The TTL right after the command that wrote adj:e-1: a crash before a later EXPIRE leaves it forever.
+  std::function<void()> watch = [&] {
+    const long long n = ctx.Redis.TTL("adj:e-1");
+    if (n == -2) {
+      ctx.Redis.After("adj:e-1", watch);
+    } else if (!written) {
+      written = true;
+      writtenTtl = n;
+    }
+  };
+  ctx.Redis.After("adj:e-1", watch);
   ctx.Equal(stateRead("e-1"), "e-2", "readNeighbors(e-1)");
-  const long long ttl = ctx.Redis.TTL("adj:e-1");
-  ctx.Assert(0 < ttl && ttl <= 300, "adj:e-1 has TTL %d: a cached neighbour list must expire within 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever", ttl);
+  ctx.Assert(written, "readNeighbors(e-1) never wrote adj:e-1 on a miss");
+  ctx.Assert(writtenTtl > 0, "right after the command that wrote adj:e-1 its TTL was %d: a crash before a later EXPIRE leaves an entry that never expires. The TTL belongs in the SET", writtenTtl);
+  long long ttl = ctx.Redis.TTL("adj:e-1");
+  ctx.Assert(240 <= ttl && ttl <= 300, "adj:e-1 has TTL %d: a cached neighbour list must expire after 5 minutes (EX 300), or an entry a missed invalidation left behind is served forever", ttl);
+  // An edge change, then a refill of the stale entry: every fill carries the TTL.
+  stateEdge(ctx, "e-1", "e-3");
+  ctx.Redis.Do("INCR", "adj:e-1:version");
+  ctx.Equal(stateRead("e-1"), "e-2,e-3", "readNeighbors(e-1) after adj:e-1:version moved");
+  ttl = ctx.Redis.TTL("adj:e-1");
+  ctx.Assert(240 <= ttl && ttl <= 300, "after the refill of a stale entry adj:e-1 has TTL %d: every fill of adj:e-1 carries EX 300, the refill too", ttl);
 }
 
 void CheckVersionStamp(harness::Ctx& ctx) {
@@ -692,6 +830,15 @@ void CheckBothEnds(harness::Ctx& ctx) {
   const std::string v1 = ctx.Redis.Get("adj:e-1:version").value_or("");
   const std::string v3 = ctx.Redis.Get("adj:e-3:version").value_or("");
   ctx.Assert(v1 == "1" && v3 == "1", "applyEdge must increment adj:e-1:version and adj:e-3:version, they hold %q and %q: a delete races a reader's fill, a version bump does not", v1, v3);
+  bool nearFired = false;
+  bool farFired = false;
+  ctx.Redis.After("adj:e-1:version", stateFiller(ctx, "e-1", nearFired));
+  ctx.Redis.After("adj:e-4:version", stateFiller(ctx, "e-4", farFired));
+  applyEdge("e-1", "e-4");
+  ctx.Assert(nearFired && farFired, "applyEdge(e-1, e-4) must increment adj:e-1:version and adj:e-4:version");
+  const std::string grown = stateRead("e-1");
+  const std::string far = stateRead("e-4");
+  ctx.Assert(grown == "e-2,e-3,e-4" && far == "e-1", "a reader that filled the cache right after applyEdge(e-1, e-4) bumped a version left e-1 -> %q and e-4 -> %q served: it cached the list before the edge under the new version. Bump after store::addEdge", grown, far);
 }
 `,
   },

@@ -79,7 +79,7 @@ crashes between its commit and its write loses the turn.
       id: 'idempotent-producer',
       title: 'Idempotent producer with acks=all',
       detail:
-        'The producer sets idempotence with `acks=all` (`enable.idempotence` plus `acks`, kafkajs `idempotent: true` with `acks: -1`), so a retry after a lost acknowledgement writes the turn once and a leader failover keeps it.',
+        'The producer sets idempotence with `acks=all` (`enable.idempotence` plus `acks`, kafkajs `idempotent: true` with `acks: -1`), so a retry after a lost acknowledgement writes the turn once and a leader failover keeps it; a delivery the broker refuses still fails `record_turn`.',
       match: {
         python: {all: [/["']enable\.idempotence["']\s*:\s*True/, /["']acks["']\s*:\s*["'](all|-1)["']/]},
         typescript: {all: [/idempotent:\s*true/, /acks:\s*-1/]},
@@ -92,7 +92,7 @@ crashes between its commit and its write loses the turn.
       id: 'persist-before-commit',
       title: 'Stores the turn before committing its offset',
       detail:
-        'The consumer calls `insert_turn` and commits only afterwards, so a crash or a failed write redelivers the turn; the starter commits first.',
+        'The consumer calls `insert_turn` and commits only afterwards, the offset just past the record, so a crash or a failed write redelivers the turn; nothing at or past a failed write is committed. The starter commits first.',
       match: {
         python: {order: [/transcripts\.insert_turn\(/, /consumer\.commit\(/]},
         typescript: {order: [/await insertTurn\(/, /commitOffsets\(/]},
@@ -909,25 +909,33 @@ def check_idempotent_producer(ctx):
     m.record_turn(CALL, _turn(1))
     ctx.kafka.failover(TOPIC)
     assert len(ctx.kafka.records(TOPIC)) == 2, f"after a leader failover the topic holds {len(ctx.kafka.records(TOPIC))} records, expected 2: with acks=1 the leader alone acknowledged the second turn and lost it. Use acks=all"
+    # The broker refuses the next turn: the caller must hear about it, not lose the turn silently.
+    ctx.kafka.fail_next(TOPIC)
+    try:
+        refused = m.record_turn(CALL, _turn(2))
+    except Exception:
+        refused = None
+    assert refused is None, f"the broker refused turn 2 and record_turn returned {refused}: a refused delivery must raise, or the turn is lost without anyone knowing"
 
 
 def check_persist_before_commit(ctx):
     _seed(ctx, 0, transcripts.redact("vs-1", 0, SPOKEN))
+    # Turn 1's write fails and turn 2 is behind it: turn 1's offset must stay uncommitted, so it is redelivered.
+    _seed(ctx, 1, "voice:redacted:vs-1:missing")
+    _seed(ctx, 2, transcripts.redact("vs-1", 2, SPOKEN))
     m = ctx.load("events")
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(ctx.redis.exists("voice:turn:vs-1:0")))
-    ctx.drain(m.run)
-    assert at_commit, "the transcript consumer never committed an offset"
-    assert at_commit[0] == 1, "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insert_turn loses the turn"
-    stored = transcripts.list_turns("vs-1", -1, 10)
-    assert [t["text"] for t in stored] == [REDACTED], f"the consumer must store the turn, the store holds {stored}"
-    # The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
-    _seed(ctx, 1, "voice:redacted:vs-1:missing")
     try:
         ctx.drain(m.run)
     except Exception:
         pass  # the consumer surfaces the store's error; what matters is what was committed
-    assert ctx.kafka.lag(GROUP, TOPIC) == 1, f"insert_turn failed for turn 1 but its offset was committed (lag {ctx.kafka.lag(GROUP, TOPIC)}): the turn is lost"
+    assert at_commit, "the transcript consumer never committed an offset"
+    assert at_commit[0] == 1, "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insert_turn loses the turn"
+    lag = ctx.kafka.lag(GROUP, TOPIC)
+    assert lag == 2, f"insert_turn failed for turn 1 but the consumer committed past it (lag {lag}, expected 2 with turns 1 and 2 uncommitted): the turn is lost" if lag < 2 else f"turn 0 was stored but the commit left lag {lag}, expected 2: commit the offset after turn 0's record, or a restart redelivers it"
+    stored = transcripts.list_turns("vs-1", -1, 10)
+    assert [t["text"] for t in stored] == [REDACTED], f"the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds {stored}"
 `,
     typescript: `const TOPIC = 'voice.turn';
 const GROUP = 'transcripts';
@@ -994,27 +1002,37 @@ export async function check_idempotent_producer(ctx) {
   ctx.kafka.failover(TOPIC);
   n = ctx.kafka.records(TOPIC).length;
   assert.equal(n, 2, \`after a leader failover the topic holds \${n} records, expected 2: with acks 1 the leader alone acknowledged the second turn and lost it. Use acks -1 (all)\`);
+  // The broker refuses the next turn: the caller must hear about it, not lose the turn silently.
+  ctx.kafka.failNext(TOPIC);
+  let refused: unknown = null;
+  try {
+    refused = await m.recordTurn(CALL, turnAt(2));
+  } catch {
+    refused = null;
+  }
+  assert.equal(refused, null, \`the broker refused turn 2 and recordTurn returned \${JSON.stringify(refused)}: a refused delivery must throw, or the turn is lost without anyone knowing\`);
 }
 
 export async function check_persist_before_commit(ctx) {
   const transcripts = ctx.load('/support/voice/transcripts.ts');
   seed(ctx, 0, await transcripts.redact('vs-1', 0, SPOKEN));
+  // Turn 1's write fails and turn 2 is behind it: turn 1's offset must stay uncommitted, so it is redelivered.
+  seed(ctx, 1, 'voice:redacted:vs-1:missing');
+  seed(ctx, 2, await transcripts.redact('vs-1', 2, SPOKEN));
   const m = ctx.load('events');
   const atCommit: number[] = [];
   ctx.kafka.onCommit(() => atCommit.push(ctx.redis.exists('voice:turn:vs-1:0')));
-  await ctx.drain(m.run());
-  assert(atCommit.length > 0, 'the transcript consumer never committed an offset');
-  assert.equal(atCommit[0], 1, 'the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insertTurn loses the turn');
-  const stored = await transcripts.listTurns('vs-1', -1, 10);
-  assert.deepStrictEqual(stored.map(t => t.text), [REDACTED], \`the consumer must store the turn, the store holds \${JSON.stringify(stored)}\`);
-  // The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
-  seed(ctx, 1, 'voice:redacted:vs-1:missing');
   try {
     await ctx.drain(m.run());
   } catch {
     // the consumer surfaces the store's error; what matters is what was committed
   }
-  assert.equal(ctx.kafka.lag(GROUP, TOPIC), 1, \`insertTurn failed for turn 1 but its offset was committed (lag \${ctx.kafka.lag(GROUP, TOPIC)}): the turn is lost\`);
+  assert(atCommit.length > 0, 'the transcript consumer never committed an offset');
+  assert.equal(atCommit[0], 1, 'the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insertTurn loses the turn');
+  const lag = ctx.kafka.lag(GROUP, TOPIC);
+  assert.equal(lag, 2, lag < 2 ? \`insertTurn failed for turn 1 but the consumer committed past it (lag \${lag}, expected 2 with turns 1 and 2 uncommitted): the turn is lost\` : \`turn 0 was stored but the commit left lag \${lag}, expected 2: commit the offset after turn 0's record, or a restart redelivers it\`);
+  const stored = await transcripts.listTurns('vs-1', -1, 10);
+  assert.deepStrictEqual(stored.map(t => t.text), [REDACTED], \`the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds \${JSON.stringify(stored)}\`);
 }
 `,
     go: `package main
@@ -1122,21 +1140,25 @@ func CheckIdempotentProducer(ctx *harness.Ctx) {
 	mustRecord(ctx, callOne, turnAt(1))
 	lost := ctx.Kafka.Failover(eventsTopic)
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost)
+	// The broker refuses the next turn: the caller must hear about it, not lose the turn silently.
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	_, err := recordTurn(eventsBg, callOne, turnAt(2))
+	ctx.Assert(err != nil, "the broker refused turn 2 and recordTurn returned no error: a refused delivery must fail, or the turn is lost without anyone knowing")
 }
 
 func CheckPersistBeforeCommit(ctx *harness.Ctx) {
 	seedTurn(ctx, 0, transcripts.Redact(eventsBg, "vs-1", 0, spoken))
+	// Turn 1's write fails and turn 2 is behind it: turn 1's offset must stay uncommitted, so it is redelivered.
+	seedTurn(ctx, 1, "voice:redacted:vs-1:missing")
+	seedTurn(ctx, 2, transcripts.Redact(eventsBg, "vs-1", 2, spoken))
 	var atCommit []int64
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, ctx.Redis.Exists("voice:turn:vs-1:0")) })
 	ctx.Drain(func() { run(eventsBg) })
 	ctx.Assert(len(atCommit) > 0, "the transcript consumer never committed an offset")
 	ctx.Equal(atCommit[0], int64(1), "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and InsertTurn loses the turn; the row at the commit")
+	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), int64(2), "turn 0 was stored and InsertTurn failed for turn 1: the commit must cover turn 0 (else a restart redelivers it) and nothing at or past turn 1 (else the turn is lost); turns 1 and 2 uncommitted, the lag")
 	stored := transcripts.ListTurns(eventsBg, "vs-1", -1, 10)
-	ctx.Assert(len(stored) == 1 && stored[0].Text == redacted, "the consumer must store the turn, the store holds %+v", stored)
-	// The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
-	seedTurn(ctx, 1, "voice:redacted:vs-1:missing")
-	ctx.Drain(func() { run(eventsBg) })
-	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), int64(1), "InsertTurn failed for turn 1 and its offset must stay uncommitted (else the turn is lost); the lag")
+	ctx.Assert(len(stored) == 1 && stored[0].Text == redacted, "the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds %+v", stored)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1235,19 +1257,24 @@ void CheckIdempotentProducer(harness::Ctx& ctx) {
   mustRecord(ctx, kCall, turnAt(1));
   const int lost = ctx.Kafka.Failover(kTopic);
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the turn. Use acks=all; the records", lost);
+  // The broker refuses the next turn: the caller must hear about it, not lose the turn silently.
+  ctx.Kafka.FailNext(kTopic, 1);
+  bool threw = false;
+  try {
+    record_turn(kCall, turnAt(2));
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Assert(threw, "the broker refused turn 2 and record_turn returned: a refused delivery must throw, or the turn is lost without anyone knowing");
 }
 
 void CheckPersistBeforeCommit(harness::Ctx& ctx) {
   seedTurn(ctx, 0, transcripts::redact("vs-1", 0, kSpoken));
+  // Turn 1's write fails and turn 2 is behind it: turn 1's offset must stay uncommitted, so it is redelivered.
+  seedTurn(ctx, 1, "voice:redacted:vs-1:missing");
+  seedTurn(ctx, 2, transcripts::redact("vs-1", 2, kSpoken));
   std::vector<long long> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.Exists("voice:turn:vs-1:0")); });
-  ctx.Drain([] { run(); });
-  ctx.Assert(!atCommit.empty(), "the transcript consumer never committed an offset");
-  ctx.Equal(atCommit[0], 1, "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insertTurn loses the turn; the row at the commit");
-  const auto stored = transcripts::listTurns("vs-1", -1, 10);
-  ctx.Assert(stored.size() == 1 && stored[0].text == kRedacted, "the consumer must store the turn, the store holds %d turn(s)", stored.size());
-  // The next turn's write fails: its offset must stay uncommitted, so the turn is redelivered.
-  seedTurn(ctx, 1, "voice:redacted:vs-1:missing");
   ctx.Drain([] {
     try {
       run();
@@ -1255,7 +1282,11 @@ void CheckPersistBeforeCommit(harness::Ctx& ctx) {
       // the consumer surfaces the store's error; what matters is what was committed
     }
   });
-  ctx.Equal(ctx.Kafka.Lag(kGroup, kTopic), 1, "insertTurn failed for turn 1 and its offset must stay uncommitted (else the turn is lost); the lag");
+  ctx.Assert(!atCommit.empty(), "the transcript consumer never committed an offset");
+  ctx.Equal(atCommit[0], 1, "the offset was committed before voice:turn:vs-1:0 existed: a crash between the commit and insertTurn loses the turn; the row at the commit");
+  ctx.Equal(ctx.Kafka.Lag(kGroup, kTopic), 2, "turn 0 was stored and insertTurn failed for turn 1: the commit must cover turn 0 (else a restart redelivers it) and nothing at or past turn 1 (else the turn is lost); turns 1 and 2 uncommitted, the lag");
+  const auto stored = transcripts::listTurns("vs-1", -1, 10);
+  ctx.Assert(stored.size() == 1 && stored[0].text == kRedacted, "the consumer must store turn 0 and stop at turn 1, whose write failed; the store holds %d turn(s)", stored.size());
 }
 `,
   },

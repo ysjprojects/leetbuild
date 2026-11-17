@@ -22,9 +22,9 @@ the window key never expires and every refusal says to retry in an hour; and an 
 still costs a detector call.
 
 - One Lua script (\`RESERVE_LUA\`) reads, refuses and charges. A request is refused when
-  \`used + chars\` exceeds the cap, and a refusal charges nothing.
-- The first charge of a window sets the key's TTL to the seconds left in the window; \`retry_after\`
-  is those seconds, \`remaining\` what the cap still allows.
+  \`used + chars\` exceeds the cap, and a refusal charges nothing, not even for a moment.
+- The first charge of a window sets the key's TTL, in the same script, to the seconds left in the
+  window; \`retry_after\` is those seconds, \`remaining\` what the cap still allows.
 - \`detect_within_budget\` reserves before it calls \`detect\`.`,
   sequence: {
     participants: ['Redactor', 'Redis', 'Detector'],
@@ -59,7 +59,7 @@ still costs a detector call.
       id: 'fits-whole',
       title: 'A request that does not fit is refused and charges nothing',
       detail:
-        'The script refuses when `used + chars` is over the cap and charges nothing then; the starter compares the count alone with the cap, so a tenant at 1 900 000 sends 200 000 more and ends the hour over its budget.',
+        'The script refuses when `used + chars` is over the cap and charges nothing then, not even for a moment: while a 200 000-character request is being refused, another request for the 100 000 left still fits; the starter compares the count alone with the cap, so a tenant at 1 900 000 sends 200 000 more and ends the hour over its budget.',
       match: {
         python: {all: [/\+\s*(?:chars|tonumber\(ARGV\[1\]\))\s*>/], none: [/used\s*>=\s*BUDGET_PER_HOUR/]},
         typescript: {all: [/\+\s*(?:chars|tonumber\(ARGV\[1\]\))\s*>/], none: [/used\s*>=\s*BUDGET_PER_HOUR/]},
@@ -72,7 +72,7 @@ still costs a detector call.
       id: 'hourly-window',
       title: 'The window key expires with its hour and a refusal says when',
       detail:
-        'The first charge of a window sets `EXPIRE` to the seconds left in the window, and `retry_after` is those seconds; the starter sets no TTL and answers `WINDOW_S` whatever the time, so a client refused at 12:59 waits until 13:59.',
+        'The first charge of a window sets `EXPIRE` to the seconds left in the window, in the same script, so the key has its TTL from the moment it exists, and `retry_after` is those seconds; the starter sets no TTL and answers `WINDOW_S` whatever the time, so a client refused at 12:59 waits until 13:59.',
       match: {
         python: {all: [/EXPIRE/], none: [/Reservation\([^)]*WINDOW_S\)/]},
         typescript: {all: [/EXPIRE/], none: [/retryAfter:\s*WINDOW_S\b/]},
@@ -692,13 +692,31 @@ def check_fits_whole(ctx):
     res = m.reserve_budget("acme", 100_000)
     assert res.allowed is True and res.remaining == 0, f"a request that exactly fits must be allowed with nothing remaining, got {res}"
     assert _used(ctx, key) == CAP, f"the budget holds {_used(ctx, key)}, expected exactly {CAP}"
+    other_key = key.replace("acme", "globex")
+    ctx.redis.set(other_key, 1_900_000)
+
+    def other_request():
+        # another replica reserving the 100 000 globex still has, between two of this one's commands
+        if _used(ctx, other_key) + 100_000 > CAP:
+            return "refused"
+        ctx.redis.incrby(other_key, 100_000)
+        return "charged"
+
+    probe = ctx.redis_after(other_key, other_request)
+    res = m.reserve_budget("globex", 200_000)
+    assert res.allowed is False and probe.fired, f"with 1 900 000 used, a 200 000-character request must be refused, got {res}"
+    assert probe.result == "charged", "while a 200 000-character request was being refused, another request for the 100 000 left was refused too: the refusal charged the budget for a moment. A refusal charges nothing"
+    assert _used(ctx, other_key) == CAP, f"the budget holds {_used(ctx, other_key)}, expected exactly {CAP}"
 
 
 def check_hourly_window(ctx):
     m = ctx.load("state")
     key = f"budget:acme:{_window(ctx, 1800)}"
+    probe = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
     res = m.reserve_budget("acme", 1_000)
     assert res.allowed, f"the first reservation of the hour was refused: {res}"
+    # -2: the first command only read the key, before anything created it
+    assert probe.fired and (probe.result == -2 or 1790 <= probe.result <= 1800), f"right after the command that created {key} its TTL was {probe.result}: the TTL must be set by the same script that charges, or a crash in between leaves a key that never expires"
     ttl = ctx.redis.ttl(key)
     assert 1790 <= ttl <= 1800, f"halfway through the hour {key} has TTL {ttl}, expected the 1800 s left in its window: a key without one outlives its hour"
     res = m.reserve_budget("acme", CAP)
@@ -766,13 +784,28 @@ export async function check_fits_whole(ctx) {
   res = await m.reserveBudget('acme', 100_000);
   assert(res.allowed === true && res.remaining === 0, \`a request that exactly fits must be allowed with nothing remaining, got \${JSON.stringify(res)}\`);
   assert.equal(used(ctx, key), CAP, 'the budget must hold exactly the cap');
+  const otherKey = key.replace('acme', 'globex');
+  ctx.redis.set(otherKey, '1900000');
+  // another replica reserving the 100 000 globex still has, between two of this one's commands
+  const probe = ctx.redisAfter(otherKey, () => {
+    if (used(ctx, otherKey) + 100_000 > CAP) return 'refused';
+    ctx.redis.incrby(otherKey, 100_000);
+    return 'charged';
+  });
+  res = await m.reserveBudget('globex', 200_000);
+  assert(res.allowed === false && probe.fired, \`with 1 900 000 used, a 200 000-character request must be refused, got \${JSON.stringify(res)}\`);
+  assert.equal(probe.result, 'charged', 'while a 200 000-character request was being refused, another request for the 100 000 left was refused too: the refusal charged the budget for a moment. A refusal charges nothing');
+  assert.equal(used(ctx, otherKey), CAP, 'the budget must hold exactly the cap');
 }
 
 export async function check_hourly_window(ctx) {
   const m = ctx.load('state');
   const key = \`budget:acme:\${windowAt(ctx, 1800)}\`;
+  const probe = ctx.redisAfter(key, () => ctx.redis.ttl(key));
   let res = await m.reserveBudget('acme', 1_000);
   assert(res.allowed, \`the first reservation of the hour was refused: \${JSON.stringify(res)}\`);
+  // -2: the first command only read the key, before anything created it
+  assert(probe.fired && (probe.result === -2 || (probe.result >= 1790 && probe.result <= 1800)), \`right after the command that created \${key} its TTL was \${probe.result}: the TTL must be set by the same script that charges, or a crash in between leaves a key that never expires\`);
   const ttl = ctx.redis.ttl(key);
   assert(ttl >= 1790 && ttl <= 1800, \`halfway through the hour \${key} has TTL \${ttl}, expected the 1800 s left in its window: a key without one outlives its hour\`);
   res = await m.reserveBudget('acme', CAP);
@@ -897,12 +930,36 @@ func CheckFitsWhole(ctx *harness.Ctx) {
 	res = stateReserve(ctx, "acme", 100_000)
 	ctx.Assert(res.Allowed && res.Remaining == 0, "a request that exactly fits must be allowed with nothing remaining, got %+v", res)
 	ctx.Equal(stateUsed(ctx, key), stateCap, "the budget must hold exactly the cap")
+	otherKey := stateKey("globex", stateWindow(ctx, 10))
+	ctx.Redis.Set(otherKey, 1_900_000)
+	other := ""
+	// another replica reserving the 100 000 globex still has, between two of this one's commands
+	probe := ctx.Redis.After(otherKey, func() any {
+		if stateUsed(ctx, otherKey)+100_000 > stateCap {
+			other = "refused"
+			return nil
+		}
+		ctx.Redis.Do("INCRBY", otherKey, 100_000)
+		other = "charged"
+		return nil
+	})
+	res = stateReserve(ctx, "globex", 200_000)
+	ctx.Assert(!res.Allowed && probe.Fired, "with 1 900 000 used, a 200 000-character request must be refused, got %+v", res)
+	ctx.Equal(other, "charged", "while a 200 000-character request was being refused, another request for the 100 000 left was refused too: the refusal charged the budget for a moment. A refusal charges nothing; the other request")
+	ctx.Equal(stateUsed(ctx, otherKey), stateCap, "the budget must hold exactly the cap")
 }
 
 func CheckHourlyWindow(ctx *harness.Ctx) {
 	key := stateKey("acme", stateWindow(ctx, 1800))
+	var created int64
+	probe := ctx.Redis.After(key, func() any {
+		created = ctx.Redis.TTL(key)
+		return nil
+	})
 	res := stateReserve(ctx, "acme", 1_000)
 	ctx.Assert(res.Allowed, "the first reservation of the hour was refused: %+v", res)
+	// -2: the first command only read the key, before anything created it
+	ctx.Assert(probe.Fired && (created == -2 || (created >= 1790 && created <= 1800)), "right after the command that created %s its TTL was %d: the TTL must be set by the same script that charges, or a crash in between leaves a key that never expires", key, created)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl >= 1790 && ttl <= 1800, "halfway through the hour %s has TTL %d, expected the 1800 s left in its window: a key without one outlives its hour", key, ttl)
 	res = stateReserve(ctx, "acme", stateCap)
@@ -1003,12 +1060,38 @@ void CheckFitsWhole(harness::Ctx& ctx) {
   res = reserve_budget("acme", 100000);
   ctx.Assert(res.allowed && res.remaining == 0, "a request that exactly fits must be allowed with nothing remaining, got allowed=%t remaining=%d", res.allowed, res.remaining);
   ctx.Equal(used(ctx, key), kCap, "the budget must hold exactly the cap");
+  const std::string other_key = key_of("globex", window_at(ctx, 10));
+  ctx.Redis.Set(other_key, 1900000);
+  std::string other;
+  // another replica reserving the 100 000 globex still has, between two of this one's commands
+  ctx.Redis.After(other_key, [&] {
+    if (used(ctx, other_key) + 100000 > kCap) {
+      other = "refused";
+      return;
+    }
+    ctx.Redis.Do("INCRBY", other_key, 100000);
+    other = "charged";
+  });
+  res = reserve_budget("globex", 200000);
+  ctx.Assert(!res.allowed && !other.empty(), "with 1 900 000 used, a 200 000-character request must be refused, got allowed=%t", res.allowed);
+  ctx.Equal(other, "charged",
+            "while a 200 000-character request was being refused, another request for the 100 000 left was refused too: the refusal charged the budget for a moment. A refusal charges nothing; the other request");
+  ctx.Equal(used(ctx, other_key), kCap, "the budget must hold exactly the cap");
 }
 
 void CheckHourlyWindow(harness::Ctx& ctx) {
   const std::string key = key_of("acme", window_at(ctx, 1800));
+  bool fired = false;
+  long long created = 0;
+  ctx.Redis.After(key, [&] {
+    fired = true;
+    created = ctx.Redis.TTL(key);
+  });
   Reservation res = reserve_budget("acme", 1000);
   ctx.Assert(res.allowed, "the first reservation of the hour was refused");
+  // -2: the first command only read the key, before anything created it
+  ctx.Assert(fired && (created == -2 || (created >= 1790 && created <= 1800)),
+             "right after the command that created %s its TTL was %d: the TTL must be set by the same script that charges, or a crash in between leaves a key that never expires", key, created);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl >= 1790 && ttl <= 1800, "halfway through the hour %s has TTL %d, expected the 1800 s left in its window: a key without one outlives its hour", key, ttl);
   res = reserve_budget("acme", kCap);

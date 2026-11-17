@@ -58,7 +58,7 @@ Requirements:
       id: 'token-range',
       title: 'Bounds both token counts to 0..1 000 000',
       detail:
-        'A negative, fractional, textual or over-cap count is 400 and stores nothing; 0 and 1 000 000 are accepted. The starter stores whatever the body says, a negative count included.',
+        'A negative, fractional, textual, boolean, missing or over-cap count (either one) is 400 and stores nothing; 0 and 1 000 000 are accepted. The starter stores whatever the body says, a negative count included.',
       match: {
         python: {
           all: [/[<>]=?\s*MAX_TOKENS_PER_REPORT|MAX_TOKENS_PER_REPORT\s*[<>]/, /[<>]=?\s*0\b|\b0\s*[<>]=?/],
@@ -107,7 +107,7 @@ Requirements:
       id: 'validate-before-store',
       title: 'Rejects before it stores the row',
       detail:
-        'A report without a model, or with an empty one, is 400, and no rejected report leaves a row in the usage store. The starter stores first and has nothing to reject with.',
+        'A report without a model, with an empty one or with one that is not a string is 400, and no rejected report leaves a row in the usage store. The starter stores first and has nothing to reject with.',
       match: {
         python: {order: [/[<>]=?\s*MAX_TOKENS_PER_REPORT|MAX_TOKENS_PER_REPORT\s*[<>]/, /store\.put\(/]},
         typescript: {order: [/[<>]=?\s*MAX_TOKENS_PER_REPORT|MAX_TOKENS_PER_REPORT\s*[<>]/, /store\.put\(/]},
@@ -645,7 +645,7 @@ int main() {
 
 GOOD = {"model": "gpt-4o", "input_tokens": 1200, "output_tokens": 300}
 FIELDS = ("usage_id", "tenant", "model", "input_tokens", "output_tokens")
-BAD_COUNTS = ((-1, 10), (10, -5), (0, 1_000_001), (2.5, 10), ("300", 10))
+BAD_COUNTS = ((-1, 10), (10, -5), (0, 1_000_001), (1_000_001, 0), (2.5, 10), (10, 2.5), ("300", 10), (10, "300"), (True, 10), (4_294_967_306, 10))
 
 
 def _api(ctx):
@@ -683,6 +683,8 @@ async def check_token_range(ctx):
         for i, (inp, out) in enumerate(BAD_COUNTS):
             r = await _post(c, {**GOOD, "input_tokens": inp, "output_tokens": out}, key=f"k-bad-{i}")
             assert r.status_code == 400, f"input_tokens={inp!r}, output_tokens={out!r} answered {r.status_code}, expected 400: a negative count erases spend that happened, and only integers 0..1000000 are token counts"
+        r = await _post(c, {"model": "gpt-4o", "output_tokens": 10}, key="k-bad-missing")
+        assert r.status_code == 400, f"a report without input_tokens answered {r.status_code}, expected 400: a missing count is not a count of 0"
         assert _rows(ctx) == [], f"refused reports must store nothing, found {_rows(ctx)}"
         for i, (inp, out) in enumerate(((0, 0), (1_000_000, 1_000_000))):
             r = await _post(c, {**GOOD, "input_tokens": inp, "output_tokens": out}, key=f"k-ok-{i}")
@@ -708,7 +710,7 @@ async def check_key_reuse(ctx):
     async with _api(ctx) as c:
         first = await _post(c, GOOD, key="k-9")
         assert first.status_code == 202, f"the first report answered {first.status_code}: {first.text}"
-        for change in ({"output_tokens": 3000}, {"model": "gpt-4o-mini"}):
+        for change in ({"output_tokens": 3000}, {"input_tokens": 1201}, {"model": "gpt-4o-mini"}):
             r = await _post(c, {**GOOD, **change}, key="k-9")
             assert r.status_code == 409, f"Idempotency-Key k-9 reused with {change} answered {r.status_code}, expected 409: answering the old row hides a report the client believes was billed"
         keys = _rows(ctx)
@@ -721,16 +723,16 @@ async def check_key_reuse(ctx):
 
 async def check_validate_before_store(ctx):
     async with _api(ctx) as c:
-        for i, body in enumerate(({**GOOD, "model": ""}, {"input_tokens": 10, "output_tokens": 10})):
+        for i, body in enumerate(({**GOOD, "model": ""}, {"input_tokens": 10, "output_tokens": 10}, {**GOOD, "model": 42})):
             r = await _post(c, body, key=f"k-m-{i}")
-            assert r.status_code == 400, f"a report without a model ({body}) answered {r.status_code}, expected 400: an unnamed model cannot be priced or audited"
+            assert r.status_code == 400, f"a report without a model name ({body}) answered {r.status_code}, expected 400: model is a non-empty string, and an unnamed model cannot be priced or audited"
         r = await _post(c, {**GOOD, "input_tokens": -40}, key="k-neg")
         assert r.status_code == 400, f"a negative count answered {r.status_code}, expected 400"
         assert ctx.redis.keys("*") == [], f"rejected reports must leave nothing in Redis, found {sorted(ctx.redis.keys('*'))}: validate before store.put"
 `,
     typescript: `const GOOD = {model: 'gpt-4o', input_tokens: 1200, output_tokens: 300};
 const FIELDS = ['usage_id', 'tenant', 'model', 'input_tokens', 'output_tokens'];
-const BAD_COUNTS: [unknown, unknown][] = [[-1, 10], [10, -5], [0, 1_000_001], [2.5, 10], ['300', 10]];
+const BAD_COUNTS: [unknown, unknown][] = [[-1, 10], [10, -5], [0, 1_000_001], [1_000_001, 0], [2.5, 10], [10, 2.5], ['300', 10], [10, '300'], [true, 10], [4_294_967_306, 10]];
 
 function api(ctx) {
   return ctx.client(ctx.load('api').app);
@@ -764,6 +766,8 @@ export async function check_token_range(ctx) {
     const r = await post(c, {...GOOD, input_tokens: inp, output_tokens: out}, {key: \`k-bad-\${i}\`});
     assert.equal(r.status, 400, \`input_tokens=\${JSON.stringify(inp)}, output_tokens=\${JSON.stringify(out)} answered \${r.status}, expected 400: a negative count erases spend that happened, and only integers 0..1000000 are token counts\`);
   }
+  const missing = await post(c, {model: 'gpt-4o', output_tokens: 10}, {key: 'k-bad-missing'});
+  assert.equal(missing.status, 400, \`a report without input_tokens answered \${missing.status}, expected 400: a missing count is not a count of 0\`);
   assert.deepEqual(rows(ctx), [], \`refused reports must store nothing, found \${JSON.stringify(rows(ctx))}\`);
   for (const [i, [inp, out]] of [[0, 0], [1_000_000, 1_000_000]].entries()) {
     const r = await post(c, {...GOOD, input_tokens: inp, output_tokens: out}, {key: \`k-ok-\${i}\`});
@@ -790,7 +794,7 @@ export async function check_key_reuse(ctx) {
   const c = api(ctx);
   const first = await post(c, GOOD, {key: 'k-9'});
   assert.equal(first.status, 202, \`the first report answered \${first.status}: \${first.text}\`);
-  for (const change of [{output_tokens: 3000}, {model: 'gpt-4o-mini'}]) {
+  for (const change of [{output_tokens: 3000}, {input_tokens: 1201}, {model: 'gpt-4o-mini'}]) {
     const r = await post(c, {...GOOD, ...change}, {key: 'k-9'});
     assert.equal(r.status, 409, \`Idempotency-Key k-9 reused with \${JSON.stringify(change)} answered \${r.status}, expected 409: answering the old row hides a report the client believes was billed\`);
   }
@@ -804,9 +808,9 @@ export async function check_key_reuse(ctx) {
 
 export async function check_validate_before_store(ctx) {
   const c = api(ctx);
-  for (const [i, body] of [{...GOOD, model: ''}, {input_tokens: 10, output_tokens: 10}].entries()) {
+  for (const [i, body] of [{...GOOD, model: ''}, {input_tokens: 10, output_tokens: 10}, {...GOOD, model: 42}].entries()) {
     const r = await post(c, body, {key: \`k-m-\${i}\`});
-    assert.equal(r.status, 400, \`a report without a model (\${JSON.stringify(body)}) answered \${r.status}, expected 400: an unnamed model cannot be priced or audited\`);
+    assert.equal(r.status, 400, \`a report without a model name (\${JSON.stringify(body)}) answered \${r.status}, expected 400: model is a non-empty string, and an unnamed model cannot be priced or audited\`);
   }
   const r = await post(c, {...GOOD, input_tokens: -40}, {key: 'k-neg'});
   assert.equal(r.status, 400, \`a negative count answered \${r.status}, expected 400\`);
@@ -885,11 +889,13 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckTokenRange(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	bad := [][2]any{{-1, 10}, {10, -5}, {0, 1_000_001}, {2.5, 10}, {"300", 10}}
+	bad := [][2]any{{-1, 10}, {10, -5}, {0, 1_000_001}, {1_000_001, 0}, {2.5, 10}, {10, 2.5}, {"300", 10}, {10, "300"}, {true, 10}, {4_294_967_306, 10}}
 	for i, counts := range bad {
 		r := apiPost(c, apiWith(map[string]any{"input_tokens": counts[0], "output_tokens": counts[1]}), fmt.Sprintf("k-bad-%d", i), "t1")
 		ctx.Equal(r.Status, 400, "input_tokens=%v, output_tokens=%v (a negative count erases spend that happened, and only integers 0..1000000 are token counts)", counts[0], counts[1])
 	}
+	missing := apiPost(c, map[string]any{"model": "gpt-4o", "output_tokens": 10}, "k-bad-missing", "t1")
+	ctx.Equal(missing.Status, 400, "a report without input_tokens (a missing count is not a count of 0)")
 	ctx.Equal(len(apiRows(ctx)), 0, "refused reports must store nothing (%v); rows", apiRows(ctx))
 	for i, n := range []int{0, 1_000_000} {
 		r := apiPost(c, apiWith(map[string]any{"input_tokens": n, "output_tokens": n}), fmt.Sprintf("k-ok-%d", i), "t1")
@@ -916,7 +922,7 @@ func CheckKeyReuse(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	first := apiPost(c, apiGood, "k-9", "t1")
 	ctx.Equal(first.Status, 202, "the first report (%s)", first.Text())
-	for _, change := range []map[string]any{{"output_tokens": 3000}, {"model": "gpt-4o-mini"}} {
+	for _, change := range []map[string]any{{"output_tokens": 3000}, {"input_tokens": 1201}, {"model": "gpt-4o-mini"}} {
 		r := apiPost(c, apiWith(change), "k-9", "t1")
 		ctx.Equal(r.Status, 409, "Idempotency-Key k-9 reused with %v (answering the old row hides a report the client believes was billed)", change)
 	}
@@ -930,9 +936,9 @@ func CheckKeyReuse(ctx *harness.Ctx) {
 
 func CheckValidateBeforeStore(ctx *harness.Ctx) {
 	c := apiClient(ctx)
-	for i, body := range []map[string]any{apiWith(map[string]any{"model": ""}), {"input_tokens": 10, "output_tokens": 10}} {
+	for i, body := range []map[string]any{apiWith(map[string]any{"model": ""}), {"input_tokens": 10, "output_tokens": 10}, apiWith(map[string]any{"model": 42})} {
 		r := apiPost(c, body, fmt.Sprintf("k-m-%d", i), "t1")
-		ctx.Equal(r.Status, 400, "a report without a model (%v): an unnamed model cannot be priced or audited", body)
+		ctx.Equal(r.Status, 400, "a report without a model name (%v): model is a non-empty string, and an unnamed model cannot be priced or audited", body)
 	}
 	r := apiPost(c, apiWith(map[string]any{"input_tokens": -40}), "k-neg", "t1")
 	ctx.Equal(r.Status, 400, "a negative count")
@@ -1005,12 +1011,15 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckTokenRange(harness::Ctx& ctx) {
   Api api(ctx);
-  const std::vector<std::pair<json, json>> bad = {{-1, 10}, {10, -5}, {0, 1000001}, {2.5, 10}, {"300", 10}};
+  const std::vector<std::pair<json, json>> bad = {{-1, 10}, {10, -5}, {0, 1000001}, {1000001, 0}, {2.5, 10},
+                                                  {10, 2.5}, {"300", 10}, {10, "300"}, {true, 10}, {4294967306LL, 10}};
   int i = 0;
   for (const auto& [inp, out] : bad) {
     const auto r = api.post(with(with(kGood, "input_tokens", inp), "output_tokens", out), "k-bad-" + std::to_string(i++));
     ctx.Equal(r.Status, 400, "input_tokens=%s, output_tokens=%s (a negative count erases spend that happened, and only integers 0..1000000 are token counts)", inp.dump(), out.dump());
   }
+  const auto missing = api.post(json{{"model", "gpt-4o"}, {"output_tokens", 10}}, "k-bad-missing");
+  ctx.Equal(missing.Status, 400, "a report without input_tokens (a missing count is not a count of 0)");
   ctx.Equal(rows(ctx).size(), 0, "refused reports must store nothing (%v); rows", rows(ctx));
   for (long long n : {0LL, 1000000LL}) {
     const auto r = api.post(with(with(kGood, "input_tokens", n), "output_tokens", n), "k-ok-" + std::to_string(n));
@@ -1038,7 +1047,8 @@ void CheckKeyReuse(harness::Ctx& ctx) {
   Api api(ctx);
   const auto first = api.post(kGood, "k-9");
   ctx.Equal(first.Status, 202, "the first report (%s)", first.Text());
-  for (const auto& [field, value] : std::vector<std::pair<std::string, json>>{{"output_tokens", 3000}, {"model", "gpt-4o-mini"}}) {
+  for (const auto& [field, value] :
+       std::vector<std::pair<std::string, json>>{{"output_tokens", 3000}, {"input_tokens", 1201}, {"model", "gpt-4o-mini"}}) {
     const auto r = api.post(with(kGood, field, value), "k-9");
     ctx.Equal(r.Status, 409, "Idempotency-Key k-9 reused with %s=%s (answering the old row hides a report the client believes was billed)", field, value.dump());
   }
@@ -1052,11 +1062,11 @@ void CheckKeyReuse(harness::Ctx& ctx) {
 
 void CheckValidateBeforeStore(harness::Ctx& ctx) {
   Api api(ctx);
-  const std::vector<json> bodies = {with(kGood, "model", ""), json{{"input_tokens", 10}, {"output_tokens", 10}}};
+  const std::vector<json> bodies = {with(kGood, "model", ""), json{{"input_tokens", 10}, {"output_tokens", 10}}, with(kGood, "model", 42)};
   int i = 0;
   for (const auto& body : bodies) {
     const auto r = api.post(body, "k-m-" + std::to_string(i++));
-    ctx.Equal(r.Status, 400, "a report without a model (%s): an unnamed model cannot be priced or audited", body.dump());
+    ctx.Equal(r.Status, 400, "a report without a model name (%s): model is a non-empty string, and an unnamed model cannot be priced or audited", body.dump());
   }
   const auto r = api.post(with(kGood, "input_tokens", -40), "k-neg");
   ctx.Equal(r.Status, 400, "a negative count");

@@ -62,7 +62,7 @@ image twice, so search returns it twice.
       id: 'tenant-header',
       title: 'Takes the tenant from X-Tenant-Id, never from the body',
       detail:
-        "The tenant is the authenticated `X-Tenant-Id` header and a request without it is **401**; the starter prefers the body's `tenant`, so any client can register into another tenant's library.",
+        "The tenant is the authenticated `X-Tenant-Id` header and a request without it, or with it empty, is **401**; the starter prefers the body's `tenant`, so any client can register into another tenant's library.",
       match: {
         python: {all: [/headers\.get\(\s*["']x-tenant-id["']/i, /\b401\b/], none: [/body\.tenant\b/]},
         typescript: {all: [/headers\[\s*['"]x-tenant-id['"]\s*\]/i, /\b401\b/], none: [/body\.tenant\b/]},
@@ -104,7 +104,7 @@ image twice, so search returns it twice.
       id: 'content-hash',
       title: 'Keys the registration by tenant and content hash',
       detail:
-        '`Idempotency-Key` must be `sha256:<64 hex>` (**400** otherwise) and is looked up with `assets.find(tenant, checksum)` before `assets.create`, so a retried upload answers **200** with the original asset instead of registering a second one.',
+        '`Idempotency-Key` must be exactly `sha256:<64 lowercase hex>` (**400** otherwise) and is looked up with `assets.find(tenant, checksum)` before `assets.create`, so a retried upload answers **200** with the original asset instead of registering a second one.',
       match: {
         python: {all: [/sha256:/, /\b400\b/], order: [/assets\.find\(/, /assets\.create\(/]},
         typescript: {all: [/sha256:/, /\b400\b/], order: [/\bfind\(/, /\bcreate\(/]},
@@ -602,17 +602,19 @@ async def check_tenant_header(ctx):
         assert r.status_code == 201, f"a registration by t1 answered {r.status_code}: {r.text}"
         assert r.json().get("tenant") == "t1" and assets.find("t2", H1) is None, f"a request authenticated as t1 named tenant t2 in its body and the asset was registered for {r.json().get('tenant')!r}: the tenant is X-Tenant-Id, never the body"
         missing = await c.post("/v1/assets", json=PNG, headers=_headers(None, H2))
+        blank = await c.post("/v1/assets", json=PNG, headers=_headers("", H2))
     assert missing.status_code == 401, f"a registration without X-Tenant-Id answered {missing.status_code} {missing.text}, expected 401"
+    assert blank.status_code == 401, f"a registration with an empty X-Tenant-Id answered {blank.status_code} {blank.text}, expected 401: an empty header names no tenant"
     assert ctx.redis.get("asset:seq") == "1", "a registration without a tenant must not create an asset"
 
 
 async def check_mime_allowlist(ctx):
     async with _api(ctx) as c:
-        for i, mime in enumerate(("image/svg+xml", "text/html", "application/pdf")):
+        for i, mime in enumerate(("image/svg+xml", "text/html", "application/pdf", "image/tiff", "image/heic")):
             r = await c.post("/v1/assets", json={**PNG, "mime": mime}, headers=_headers(key=_key(i)))
             assert r.status_code == 415, f"a registration declaring {mime} answered {r.status_code}, expected 415: only ALLOWED_MIME_TYPES reach the indexer"
             assert assets.find("t1", _key(i)) is None, f"the {mime} registration was stored"
-        for i, mime in enumerate(("image/jpeg", "image/webp", "image/gif", "image/avif"), start=3):
+        for i, mime in enumerate(("image/jpeg", "image/webp", "image/gif", "image/avif"), start=5):
             r = await c.post("/v1/assets", json={**PNG, "mime": mime}, headers=_headers(key=_key(i)))
             assert r.status_code == 201, f"a registration declaring {mime} answered {r.status_code}: {r.text}"
 
@@ -638,9 +640,9 @@ async def check_content_hash(ctx):
         assert retry.status_code == 200 and retry.json().get("asset_id") == first.json()["asset_id"], f"a retry with the same content hash answered {retry.status_code} {retry.text}; expected 200 with the original asset {first.json()['asset_id']}, or search returns the image twice"
         other = await c.post("/v1/assets", json=PNG, headers=_headers("t2"))
         assert other.status_code == 201 and other.json().get("asset_id") != first.json()["asset_id"], f"the same image registered by another tenant answered {other.status_code} {other.text}: each tenant gets its own asset"
-        for key in (None, "md5:0cc175b9c0f1b6a831c399e269772661", "sha256:" + "z" * 64):
+        for key in (None, "md5:0cc175b9c0f1b6a831c399e269772661", "sha256:" + "z" * 64, "sha256:" + "A" * 64, "SHA256:" + "a" * 64, "sha256:" + "a" * 63, "sha256:" + "a" * 65, "x-sha256:" + "a" * 64):
             r = await c.post("/v1/assets", json=PNG, headers=_headers(key=key))
-            assert r.status_code == 400, f"Idempotency-Key {key!r} answered {r.status_code}, expected 400: the key is the content hash, sha256:<64 hex>"
+            assert r.status_code == 400, f"Idempotency-Key {key!r} answered {r.status_code}, expected 400: the key is the content hash, sha256:<64 lowercase hex>"
     assert ctx.redis.get("asset:seq") == "2", f"{ctx.redis.get('asset:seq')} assets were created, expected 2 (t1's and t2's)"
 `,
     typescript: `const H1 = 'sha256:' + 'a'.repeat(64);
@@ -677,18 +679,20 @@ export async function check_tenant_header(ctx) {
   assert(r.json().tenant === 't1' && (await assets.find('t2', H1)) === null, \`a request authenticated as t1 named tenant t2 in its body and the asset was registered for \${r.json().tenant}: the tenant is X-Tenant-Id, never the body\`);
   const missing = await c.post('/v1/assets', {json: PNG, headers: headers(null, H2)});
   assert.equal(missing.status, 401, \`a registration without X-Tenant-Id answered \${missing.status} \${missing.text}, expected 401\`);
+  const blank = await c.post('/v1/assets', {json: PNG, headers: headers('', H2)});
+  assert.equal(blank.status, 401, \`a registration with an empty X-Tenant-Id answered \${blank.status} \${blank.text}, expected 401: an empty header names no tenant\`);
   assert.equal(ctx.redis.get('asset:seq'), '1', 'a registration without a tenant must not create an asset');
 }
 
 export async function check_mime_allowlist(ctx) {
   const {c, assets} = api(ctx);
-  for (const [i, mime] of ['image/svg+xml', 'text/html', 'application/pdf'].entries()) {
+  for (const [i, mime] of ['image/svg+xml', 'text/html', 'application/pdf', 'image/tiff', 'image/heic'].entries()) {
     const r = await c.post('/v1/assets', {json: {...PNG, mime}, headers: headers('t1', key(i))});
     assert.equal(r.status, 415, \`a registration declaring \${mime} answered \${r.status}, expected 415: only ALLOWED_MIME_TYPES reach the indexer\`);
     assert.equal(await assets.find('t1', key(i)), null, \`the \${mime} registration was stored\`);
   }
   for (const [i, mime] of ['image/jpeg', 'image/webp', 'image/gif', 'image/avif'].entries()) {
-    const r = await c.post('/v1/assets', {json: {...PNG, mime}, headers: headers('t1', key(i + 3))});
+    const r = await c.post('/v1/assets', {json: {...PNG, mime}, headers: headers('t1', key(i + 5))});
     assert.equal(r.status, 201, \`a registration declaring \${mime} answered \${r.status}: \${r.text}\`);
   }
 }
@@ -716,9 +720,9 @@ export async function check_content_hash(ctx) {
   assert(retry.status === 200 && retry.json().asset_id === original, \`a retry with the same content hash answered \${retry.status} \${retry.text}; expected 200 with the original asset \${original}, or search returns the image twice\`);
   const other = await c.post('/v1/assets', {json: PNG, headers: headers('t2')});
   assert(other.status === 201 && other.json().asset_id !== original, \`the same image registered by another tenant answered \${other.status} \${other.text}: each tenant gets its own asset\`);
-  for (const k of [null, 'md5:0cc175b9c0f1b6a831c399e269772661', 'sha256:' + 'z'.repeat(64)]) {
+  for (const k of [null, 'md5:0cc175b9c0f1b6a831c399e269772661', 'sha256:' + 'z'.repeat(64), 'sha256:' + 'A'.repeat(64), 'SHA256:' + 'a'.repeat(64), 'sha256:' + 'a'.repeat(63), 'sha256:' + 'a'.repeat(65), 'x-sha256:' + 'a'.repeat(64)]) {
     const r = await c.post('/v1/assets', {json: PNG, headers: headers('t1', k)});
-    assert.equal(r.status, 400, \`Idempotency-Key \${JSON.stringify(k)} answered \${r.status}, expected 400: the key is the content hash, sha256:<64 hex>\`);
+    assert.equal(r.status, 400, \`Idempotency-Key \${JSON.stringify(k)} answered \${r.status}, expected 400: the key is the content hash, sha256:<64 lowercase hex>\`);
   }
   assert.equal(ctx.redis.get('asset:seq'), '2', \`\${ctx.redis.get('asset:seq')} assets were created, expected 2 (t1's and t2's)\`);
 }
@@ -798,18 +802,20 @@ func CheckTenantHeader(ctx *harness.Ctx) {
 	ctx.Assert(assetOf(r).Tenant == "t1" && assets.Find(apiBg, "t2", apiH1) == nil, "a request authenticated as t1 named tenant t2 in its body and the asset was registered for %q: the tenant is X-Tenant-Id, never the body", assetOf(r).Tenant)
 	missing := postAsset(c, apiPNG, "", apiH2)
 	ctx.Equal(missing.Status, 401, "a registration without X-Tenant-Id (%s)", missing.Text())
+	blank := c.Post("/v1/assets", apiPNG, "X-Tenant-Id", "", "Idempotency-Key", apiH2)
+	ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id, which names no tenant (%s)", blank.Text())
 	ctx.Equal(seq(ctx), "1", "a registration without a tenant must not create an asset; the assets created")
 }
 
 func CheckMimeAllowlist(ctx *harness.Ctx) {
 	c := apiServer(ctx)
-	for i, mime := range []string{"image/svg+xml", "text/html", "application/pdf"} {
+	for i, mime := range []string{"image/svg+xml", "text/html", "application/pdf", "image/tiff", "image/heic"} {
 		r := postAsset(c, apiWith("mime", mime), "t1", apiKey(i))
 		ctx.Equal(r.Status, 415, "a registration declaring %s (only the allowed mime types reach the indexer)", mime)
 		ctx.Assert(assets.Find(apiBg, "t1", apiKey(i)) == nil, "the %s registration was stored", mime)
 	}
 	for i, mime := range []string{"image/jpeg", "image/webp", "image/gif", "image/avif"} {
-		r := postAsset(c, apiWith("mime", mime), "t1", apiKey(i+3))
+		r := postAsset(c, apiWith("mime", mime), "t1", apiKey(i+5))
 		ctx.Equal(r.Status, 201, "a registration declaring %s (%s)", mime, r.Text())
 	}
 }
@@ -841,9 +847,9 @@ func CheckContentHash(ctx *harness.Ctx) {
 	ctx.Assert(retry.Status == 200 && assetOf(retry).AssetID == original, "a retry with the same content hash answered %d %s; expected 200 with the original asset %s, or search returns the image twice", retry.Status, retry.Text(), original)
 	other := postAsset(c, apiPNG, "t2", apiH1)
 	ctx.Assert(other.Status == 201 && assetOf(other).AssetID != original, "the same image registered by another tenant answered %d %s: each tenant gets its own asset", other.Status, other.Text())
-	for _, key := range []string{"", "md5:0cc175b9c0f1b6a831c399e269772661", "sha256:" + strings.Repeat("z", 64)} {
+	for _, key := range []string{"", "md5:0cc175b9c0f1b6a831c399e269772661", "sha256:" + strings.Repeat("z", 64), "sha256:" + strings.Repeat("A", 64), "SHA256:" + strings.Repeat("a", 64), "sha256:" + strings.Repeat("a", 63), "sha256:" + strings.Repeat("a", 65), "x-sha256:" + strings.Repeat("a", 64)} {
 		r := postAsset(c, apiPNG, "t1", key)
-		ctx.Equal(r.Status, 400, "Idempotency-Key %q (the key is the content hash, sha256:<64 hex>)", key)
+		ctx.Equal(r.Status, 400, "Idempotency-Key %q (the key is the content hash, sha256:<64 lowercase hex>)", key)
 	}
 	ctx.Equal(seq(ctx), "2", "the assets created (t1's and t2's)")
 }
@@ -915,12 +921,14 @@ void CheckTenantHeader(harness::Ctx& ctx) {
              bodyOf(r).value("tenant", ""));
   const auto missing = postAsset(c, kPng, "", kH2);
   ctx.Equal(missing.Status, 401, "a registration without X-Tenant-Id (%s)", missing.Text());
+  const auto blank = c.Post("/v1/assets", kPng.dump(), "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", kH2);
+  ctx.Equal(blank.Status, 401, "a registration with an empty X-Tenant-Id, which names no tenant (%s)", blank.Text());
   ctx.Equal(seq(ctx), "1", "a registration without a tenant must not create an asset; the assets created");
 }
 
 void CheckMimeAllowlist(harness::Ctx& ctx) {
   auto c = api(ctx);
-  const std::vector<std::string> refused = {"image/svg+xml", "text/html", "application/pdf"};
+  const std::vector<std::string> refused = {"image/svg+xml", "text/html", "application/pdf", "image/tiff", "image/heic"};
   for (int i = 0; i < static_cast<int>(refused.size()); i++) {
     const auto r = postAsset(c, with("mime", refused[i]), "t1", keyOf(i));
     ctx.Equal(r.Status, 415, "a registration declaring %s (only the allowed mime types reach the indexer)", refused[i]);
@@ -928,7 +936,7 @@ void CheckMimeAllowlist(harness::Ctx& ctx) {
   }
   const std::vector<std::string> accepted = {"image/jpeg", "image/webp", "image/gif", "image/avif"};
   for (int i = 0; i < static_cast<int>(accepted.size()); i++) {
-    const auto r = postAsset(c, with("mime", accepted[i]), "t1", keyOf(i + 3));
+    const auto r = postAsset(c, with("mime", accepted[i]), "t1", keyOf(i + 5));
     ctx.Equal(r.Status, 201, "a registration declaring %s (%s)", accepted[i], r.Text());
   }
 }
@@ -962,9 +970,10 @@ void CheckContentHash(harness::Ctx& ctx) {
   const auto other = postAsset(c, kPng, "t2", kH1);
   ctx.Assert(other.Status == 201 && bodyOf(other).value("asset_id", "") != original,
              "the same image registered by another tenant answered %d %s: each tenant gets its own asset", other.Status, other.Text());
-  for (const std::string key : {std::string(), std::string("md5:0cc175b9c0f1b6a831c399e269772661"), "sha256:" + std::string(64, 'z')}) {
+  for (const std::string key : {std::string(), std::string("md5:0cc175b9c0f1b6a831c399e269772661"), "sha256:" + std::string(64, 'z'), "sha256:" + std::string(64, 'A'),
+                                "SHA256:" + std::string(64, 'a'), "sha256:" + std::string(63, 'a'), "sha256:" + std::string(65, 'a'), "x-sha256:" + std::string(64, 'a')}) {
     const auto r = postAsset(c, kPng, "t1", key);
-    ctx.Equal(r.Status, 400, "Idempotency-Key %q (the key is the content hash, sha256:<64 hex>)", key);
+    ctx.Equal(r.Status, 400, "Idempotency-Key %q (the key is the content hash, sha256:<64 lowercase hex>)", key);
   }
   ctx.Equal(seq(ctx), "2", "the assets created (t1's and t2's)");
 }

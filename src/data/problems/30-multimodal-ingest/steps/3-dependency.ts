@@ -102,7 +102,7 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
       id: 'text-only-fallback',
       title: 'An outage indexes no caption, marked degraded',
       detail:
-        'A deadline or `UNAVAILABLE` answers caption null, `caption_source: "none"`, `degraded: true`; the starter indexes the placeholder "an image", which matches every query about an image.',
+        'Any failure other than `PERMISSION_DENIED` (a deadline, `UNAVAILABLE`, `RESOURCE_EXHAUSTED`, `INTERNAL`, `UNAUTHENTICATED`) answers after one call and no sleep with caption null, `caption_source: "none"`, `degraded: true`; the starter indexes the placeholder "an image", which matches every query about an image.',
       match: {
         python: {all: [/["']none["']/, /["']degraded["']\s*:\s*True/], none: [/an image/]},
         typescript: {all: [/['"]none['"]/, /degraded:\s*true/], none: [/an image/]},
@@ -115,7 +115,7 @@ service Vision { rpc Caption(CaptionRequest) returns (CaptionReply); }  // PERMI
       id: 'backfill',
       title: 'Queues every degraded asset for the caption backfill',
       detail:
-        'An asset indexed without a caption is added to `ingest:backfill` with `queue_backfill`/`queueBackfill`; the starter records nothing, so after an outage nothing finds the assets to caption.',
+        'Every asset indexed without a caption, after an outage or a missed deadline, is added to `ingest:backfill` with `queue_backfill`/`queueBackfill`; the starter records nothing, so after an outage nothing finds the assets to caption.',
       match: {
         python: {all: [/assets\.queue_backfill\(/]},
         typescript: {all: [/queueBackfill\(/]},
@@ -595,19 +595,32 @@ def check_policy_terminal(ctx):
 
 def check_text_only_fallback(ctx):
     m, _ = _client(ctx)
-    ctx.grpc.fail("Caption", grpc.StatusCode.UNAVAILABLE, "vision is restarting", times=10)
+    ctx.grpc.fail("Caption", grpc.StatusCode.UNAVAILABLE, "vision is restarting")
     got = m.caption_asset(ASSET)
     assert got.get("caption") != "an image", "an outage indexed the caption 'an image': every query about an image now matches every asset captioned during the outage"
     assert got == {"caption": None, "caption_source": "none", "degraded": True}, f"with the vision service unavailable caption_asset gave {got}, expected caption None, caption_source none, degraded True"
+    calls = len(ctx.grpc.calls_to("Caption"))
+    assert calls == 1 and ctx.clock.sleeps == 0, f"an UNAVAILABLE took {calls} Caption calls and {ctx.clock.sleeps} sleeps: the asset is indexed without a caption at once and the backfill captions it later"
+    # Every failure other than a policy refusal says nothing about the image, whatever its code.
+    for i, code in enumerate((grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INTERNAL, grpc.StatusCode.UNAUTHENTICATED), start=2):
+        ctx.grpc.fail("Caption", code, "vision failed")
+        try:
+            got = m.caption_asset({**ASSET, "asset_id": f"a-{i}"})
+        except Exception as exc:
+            raise AssertionError(f"a Caption that failed with {code.name} raised {type(exc).__name__}: {exc}; only PERMISSION_DENIED fails the asset, any other failure indexes it without a caption")
+        assert got == {"caption": None, "caption_source": "none", "degraded": True}, f"a Caption that failed with {code.name} gave {got}, expected caption None, caption_source none, degraded True"
 
 
 def check_backfill(ctx):
     m, _ = _client(ctx)
     m.caption_asset(ASSET)
     assert not _backfill(ctx), "a captioned asset was queued for the backfill"
-    ctx.grpc.fail("Caption", grpc.StatusCode.UNAVAILABLE, "vision is restarting", times=10)
+    ctx.grpc.fail("Caption", grpc.StatusCode.UNAVAILABLE, "vision is restarting")
     m.caption_asset({**ASSET, "asset_id": "a-2"})
     assert _backfill(ctx) == {"a-2"}, f"after an outage the backfill set holds {sorted(_backfill(ctx))}, expected a-2: without it nothing finds the assets to caption later"
+    ctx.grpc.set_latency("Caption", 30.0)
+    m.caption_asset({**ASSET, "asset_id": "a-3"})
+    assert _backfill(ctx) == {"a-2", "a-3"}, f"after a Caption missed its deadline the backfill set holds {sorted(_backfill(ctx))}, expected a-2 and a-3: an asset indexed without a caption is captioned later, whatever the failure"
 `,
     typescript: `const ASSET = {
   asset_id: 'a-1', tenant: 't1', checksum: 'sha256:' + 'a'.repeat(64), mime: 'image/png', byte_size: 48213,
@@ -672,19 +685,34 @@ export async function check_policy_terminal(ctx) {
 
 export async function check_text_only_fallback(ctx) {
   const {m} = client(ctx);
-  ctx.grpc.fail('Caption', ctx.grpc.status.UNAVAILABLE, 'vision is restarting', 10);
-  const got = await m.captionAsset(ASSET);
+  ctx.grpc.fail('Caption', ctx.grpc.status.UNAVAILABLE, 'vision is restarting', 1);
+  let got = await m.captionAsset(ASSET);
   assert.notEqual(got.caption, 'an image', "an outage indexed the caption 'an image': every query about an image now matches every asset captioned during the outage");
   assert.deepStrictEqual(got, {caption: null, caption_source: 'none', degraded: true}, \`with the vision service unavailable captionAsset gave \${JSON.stringify(got)}, expected caption null, caption_source none, degraded true\`);
+  const calls = ctx.grpc.callsTo('Caption').length;
+  assert(calls === 1 && ctx.clock.sleeps === 0, \`an UNAVAILABLE took \${calls} Caption calls and \${ctx.clock.sleeps} sleeps: the asset is indexed without a caption at once and the backfill captions it later\`);
+  // Every failure other than a policy refusal says nothing about the image, whatever its code.
+  for (const [i, code] of ['RESOURCE_EXHAUSTED', 'INTERNAL', 'UNAUTHENTICATED'].entries()) {
+    ctx.grpc.fail('Caption', ctx.grpc.status[code], 'vision failed', 1);
+    try {
+      got = await m.captionAsset({...ASSET, asset_id: \`a-\${i + 2}\`});
+    } catch (e) {
+      assert.fail(\`a Caption that failed with \${code} threw \${(e as Error).constructor.name}: \${(e as Error).message}; only PERMISSION_DENIED fails the asset, any other failure indexes it without a caption\`);
+    }
+    assert.deepStrictEqual(got, {caption: null, caption_source: 'none', degraded: true}, \`a Caption that failed with \${code} gave \${JSON.stringify(got)}, expected caption null, caption_source none, degraded true\`);
+  }
 }
 
 export async function check_backfill(ctx) {
   const {m} = client(ctx);
   await m.captionAsset(ASSET);
   assert.deepStrictEqual(backfill(ctx), [], 'a captioned asset was queued for the backfill');
-  ctx.grpc.fail('Caption', ctx.grpc.status.UNAVAILABLE, 'vision is restarting', 10);
+  ctx.grpc.fail('Caption', ctx.grpc.status.UNAVAILABLE, 'vision is restarting', 1);
   await m.captionAsset({...ASSET, asset_id: 'a-2'});
   assert.deepStrictEqual(backfill(ctx), ['a-2'], \`after an outage the backfill set holds \${JSON.stringify(backfill(ctx))}, expected a-2: without it nothing finds the assets to caption later\`);
+  ctx.grpc.setLatency('Caption', 30.0);
+  await m.captionAsset({...ASSET, asset_id: 'a-3'});
+  assert.deepStrictEqual(backfill(ctx), ['a-2', 'a-3'], \`after a Caption missed its deadline the backfill set holds \${JSON.stringify(backfill(ctx))}, expected a-2 and a-3: an asset indexed without a caption is captioned later, whatever the failure\`);
 }
 `,
     go: `package main
@@ -692,6 +720,7 @@ export async function check_backfill(ctx) {
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -778,25 +807,41 @@ func CheckPolicyTerminal(ctx *harness.Ctx) {
 
 func CheckTextOnlyFallback(ctx *harness.Ctx) {
 	visionServer(ctx)
-	ctx.GRPC.Fail("Caption", codes.Unavailable, "vision is restarting", 10, "")
+	ctx.GRPC.Fail("Caption", codes.Unavailable, "vision is restarting", 1, "")
 	got := mustCaption(ctx, clientAsset)
 	ctx.Assert(got.Caption != "an image", "an outage indexed the caption 'an image': every query about an image now matches every asset captioned during the outage")
 	ctx.Equal(got, assets.Captioned{Source: "none", Degraded: true}, "with the vision service unavailable, the asset is indexed without a caption (caption_source none, degraded)")
+	calls := len(ctx.GRPC.CallsTo("Caption", ""))
+	ctx.Assert(calls == 1 && ctx.Clock.Sleeps() == 0, "an UNAVAILABLE took %d Caption calls and %d sleeps: the asset is indexed without a caption at once and the backfill captions it later", calls, ctx.Clock.Sleeps())
+	// Every failure other than a policy refusal says nothing about the image, whatever its code.
+	for i, code := range []codes.Code{codes.ResourceExhausted, codes.Internal, codes.Unauthenticated} {
+		ctx.GRPC.Fail("Caption", code, "vision failed", 1, "")
+		got, err := captionAsset(clientBg, withID(clientAsset, fmt.Sprintf("a-%d", i+2)))
+		ctx.NoError(err, "a Caption that failed with %s must index the asset without a caption; only PERMISSION_DENIED fails it", code)
+		ctx.Equal(got, assets.Captioned{Source: "none", Degraded: true}, "a Caption that failed with %s indexes the asset without a caption (caption_source none, degraded)", code)
+	}
 }
 
 func CheckBackfill(ctx *harness.Ctx) {
 	visionServer(ctx)
 	mustCaption(ctx, clientAsset)
 	ctx.Equal(len(ctx.Redis.SMembers("ingest:backfill")), 0, "a captioned asset must not be queued for the backfill; the backfill set's size")
-	ctx.GRPC.Fail("Caption", codes.Unavailable, "vision is restarting", 10, "")
+	ctx.GRPC.Fail("Caption", codes.Unavailable, "vision is restarting", 1, "")
 	mustCaption(ctx, withID(clientAsset, "a-2"))
 	ctx.Equal(ctx.Redis.SMembers("ingest:backfill"), []string{"a-2"}, "after an outage the backfill set must hold the uncaptioned asset, or nothing finds it later")
+	ctx.GRPC.SetLatency("Caption", 30.0, "")
+	mustCaption(ctx, withID(clientAsset, "a-3"))
+	queued := ctx.Redis.SMembers("ingest:backfill")
+	sort.Strings(queued)
+	ctx.Equal(queued, []string{"a-2", "a-3"}, "after a Caption missed its deadline the backfill set must hold every asset indexed without a caption, whatever the failure")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <set>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -889,21 +934,44 @@ void CheckPolicyTerminal(harness::Ctx& ctx) {
 
 void CheckTextOnlyFallback(harness::Ctx& ctx) {
   visionServer(ctx);
-  ctx.GRPC.Fail("Caption", grpc::StatusCode::UNAVAILABLE, "vision is restarting", 10);
+  ctx.GRPC.Fail("Caption", grpc::StatusCode::UNAVAILABLE, "vision is restarting", 1);
   const auto got = mustCaption(ctx, baseAsset("a-1"));
   ctx.Assert(got.caption != "an image", "an outage indexed the caption 'an image': every query about an image now matches every asset captioned during the outage");
   ctx.Assert(got.caption.empty() && got.source == "none" && got.degraded,
              "with the vision service unavailable captionAsset gave %q (%s, degraded %t), expected no caption, caption_source none, degraded", got.caption, got.source,
              got.degraded);
+  const auto calls = ctx.GRPC.CallsTo("Caption").size();
+  ctx.Assert(calls == 1 && ctx.Clock.Sleeps() == 0, "an UNAVAILABLE took %d Caption calls and %d sleeps: the asset is indexed without a caption at once and the backfill captions it later", calls,
+             ctx.Clock.Sleeps());
+  // Every failure other than a policy refusal says nothing about the image, whatever its code.
+  const std::vector<std::pair<grpc::StatusCode, std::string>> codes = {
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::UNAUTHENTICATED, "UNAUTHENTICATED"}};
+  for (size_t i = 0; i < codes.size(); i++) {
+    ctx.GRPC.Fail("Caption", codes[i].first, "vision failed", 1);
+    assets::Captioned other;
+    try {
+      other = captionAsset(baseAsset("a-" + std::to_string(i + 2)));
+    } catch (const std::exception& e) {
+      ctx.Fatalf("a Caption that failed with %s threw %s: %s; only PERMISSION_DENIED fails the asset, any other failure indexes it without a caption", codes[i].second,
+                 harness::CurrentExceptionType(), e.what());
+    }
+    ctx.Assert(other.caption.empty() && other.source == "none" && other.degraded, "a Caption that failed with %s gave %q (%s, degraded %t), expected no caption, caption_source none, degraded",
+               codes[i].second, other.caption, other.source, other.degraded);
+  }
 }
 
 void CheckBackfill(harness::Ctx& ctx) {
   visionServer(ctx);
   mustCaption(ctx, baseAsset("a-1"));
   ctx.Equal(ctx.Redis.SCard("ingest:backfill"), 0, "a captioned asset must not be queued for the backfill; the backfill set's size");
-  ctx.GRPC.Fail("Caption", grpc::StatusCode::UNAVAILABLE, "vision is restarting", 10);
+  ctx.GRPC.Fail("Caption", grpc::StatusCode::UNAVAILABLE, "vision is restarting", 1);
   mustCaption(ctx, baseAsset("a-2"));
   ctx.Equal(ctx.Redis.SMembers("ingest:backfill"), {"a-2"}, "after an outage the backfill set must hold the uncaptioned asset, or nothing finds it later");
+  ctx.GRPC.SetLatency("Caption", 30.0);
+  mustCaption(ctx, baseAsset("a-3"));
+  const auto members = ctx.Redis.SMembers("ingest:backfill");
+  ctx.Assert(std::set<std::string>(members.begin(), members.end()) == std::set<std::string>{"a-2", "a-3"},
+             "after a Caption missed its deadline the backfill set holds %d assets, expected a-2 and a-3: every asset indexed without a caption is captioned later, whatever the failure", members.size());
 }
 `,
   },

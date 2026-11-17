@@ -55,7 +55,7 @@ image through the API, a third larger as base64.
       id: 'tenant-scope',
       title: "Answers another tenant's asset with 404",
       detail:
-        "A request without `X-Tenant-Id` is **401**, and an asset whose tenant is not the caller's is **404**, exactly like an unknown id; the starter serves any asset to anyone who knows its id.",
+        "A request without `X-Tenant-Id`, or with it empty, is **401**, and an asset whose tenant is not the caller's is **404** with the same answer as an unknown id; the starter serves any asset to anyone who knows its id.",
       match: {
         python: {all: [/\b401\b/, /\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']tenant["']\]/]},
         typescript: {all: [/\b401\b/, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/]},
@@ -548,10 +548,13 @@ async def check_tenant_scope(ctx):
         foreign = await _get(c, "a-2", "t1")
         unknown = await _get(c, "a-404", "t1")
         anonymous = await _get(c, "a-1", None)
+        blank = await c.get("/v1/assets/a-1", headers={"X-Tenant-Id": ""})
     assert foreign.status_code == 404, f"t1 reading t2's asset a-2 answered {foreign.status_code}: {foreign.text[:200]}. Another tenant's asset is 404, the answer for an id that does not exist"
     assert "private" not in foreign.text, "the refusal leaked t2's caption"
     assert unknown.status_code == 404, f"an unknown asset id answered {unknown.status_code}, expected 404"
+    assert foreign.text.replace("a-2", "{id}") == unknown.text.replace("a-404", "{id}"), f"t2's asset answers t1 with {foreign.text!r} and an unknown id with {unknown.text!r}: the difference tells t1 the id is real"
     assert anonymous.status_code == 401, f"a request without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert blank.status_code == 401, f"a request with an empty X-Tenant-Id answered {blank.status_code}, expected 401: an empty header names no tenant"
 
 
 async def check_url_expiry(ctx):
@@ -619,10 +622,13 @@ export async function check_tenant_scope(ctx) {
   const foreign = await get(c, 'a-2', 't1');
   const unknown = await get(c, 'a-404', 't1');
   const anonymous = await get(c, 'a-1', null);
+  const blank = await get(c, 'a-1', '');
   assert.equal(foreign.status, 404, \`t1 reading t2's asset a-2 answered \${foreign.status}: \${foreign.text.slice(0, 200)}. Another tenant's asset is 404, the answer for an id that does not exist\`);
   assert(!foreign.text.includes('private'), "the refusal leaked t2's caption");
   assert.equal(unknown.status, 404, \`an unknown asset id answered \${unknown.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll('a-2', '{id}'), unknown.text.replaceAll('a-404', '{id}'), \`t2's asset answers t1 with \${foreign.text} and an unknown id with \${unknown.text}: the difference tells t1 the id is real\`);
   assert.equal(anonymous.status, 401, \`a request without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(blank.status, 401, \`a request with an empty X-Tenant-Id answered \${blank.status}, expected 401: an empty header names no tenant\`);
 }
 
 export async function check_url_expiry(ctx) {
@@ -726,8 +732,11 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	foreign := readGet(c, "a-2", "t1")
 	ctx.Equal(foreign.Status, 404, "t1 reading t2's asset a-2 (another tenant's asset is 404, the answer for an id that does not exist)")
 	ctx.Assert(!strings.Contains(foreign.Text(), "private"), "the refusal leaked t2's caption")
-	ctx.Equal(readGet(c, "a-404", "t1").Status, 404, "an unknown asset id")
+	unknown := readGet(c, "a-404", "t1")
+	ctx.Equal(unknown.Status, 404, "an unknown asset id")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), "a-2", "{id}"), strings.ReplaceAll(unknown.Text(), "a-404", "{id}"), "t2's asset and an unknown id must answer t1 alike, or the difference tells t1 the id is real; the answers")
 	ctx.Equal(readGet(c, "a-1", "").Status, 401, "a request without X-Tenant-Id")
+	ctx.Equal(c.Get("/v1/assets/a-1", "X-Tenant-Id", "").Status, 401, "a request with an empty X-Tenant-Id, which names no tenant")
 }
 
 func CheckUrlExpiry(ctx *harness.Ctx) {
@@ -825,8 +834,15 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const auto foreign = readGet(c, "a-2", "t1");
   ctx.Equal(foreign.Status, 404, "t1 reading t2's asset a-2 (another tenant's asset is 404, the answer for an id that does not exist)");
   ctx.Assert(foreign.Text().find("private") == std::string::npos, "the refusal leaked t2's caption");
-  ctx.Equal(readGet(c, "a-404", "t1").Status, 404, "an unknown asset id");
+  const auto unknown = readGet(c, "a-404", "t1");
+  ctx.Equal(unknown.Status, 404, "an unknown asset id");
+  const auto masked = [](std::string text, const std::string& id) {
+    for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
+    return text;
+  };
+  ctx.Equal(masked(foreign.Text(), "a-2"), masked(unknown.Text(), "a-404"), "t2's asset and an unknown id must answer t1 alike, or the difference tells t1 the id is real; the answers");
   ctx.Equal(readGet(c, "a-1", "").Status, 401, "a request without X-Tenant-Id");
+  ctx.Equal(c.Get("/v1/assets/a-1", "X-Tenant-Id", "").Status, 401, "a request with an empty X-Tenant-Id, which names no tenant");
 }
 
 void CheckUrlExpiry(harness::Ctx& ctx) {

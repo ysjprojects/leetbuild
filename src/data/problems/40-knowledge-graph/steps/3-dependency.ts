@@ -69,7 +69,7 @@ service Resolver { rpc Score(PairRequest) returns (PairScore); }  // FAILED_PREC
       id: 'timeout-parks',
       title: 'A timeout parks the pair for review',
       detail:
-        'An error other than `FAILED_PRECONDITION` parks the pair (`park`, reason `unresolved`) and merges nothing; the starter reads `DEADLINE_EXCEEDED` as a mismatch and returns `rejected`, so an outage splits real duplicates.',
+        'An error other than `FAILED_PRECONDITION` (a deadline, `UNAVAILABLE`, `INTERNAL`) parks the pair (`park`, reason `unresolved`) after one call and merges nothing; the starter reads `DEADLINE_EXCEEDED` as a mismatch and returns `rejected`, so an outage splits real duplicates.',
       match: {
         python: {all: [/store\.park\(/], none: [/DEADLINE_EXCEEDED:\s*\n\s*return\s+["']rejected["']/]},
         typescript: {all: [/await park\(/], none: [/DEADLINE_EXCEEDED\)\s*return\s*['"]rejected['"]/]},
@@ -95,7 +95,7 @@ service Resolver { rpc Score(PairRequest) returns (PairScore); }  // FAILED_PREC
       id: 'threshold-merge',
       title: 'Only a score at or above 0.9 merges',
       detail:
-        'A score `>= MERGE_THRESHOLD` (0.9) merges; a lower one is parked with reason `below_threshold` and its score. The starter merges whatever the resolver answers.',
+        'A score `>= MERGE_THRESHOLD` (0.9) merges, exactly 0.9 included; a lower one, 0.89 included, is parked with reason `below_threshold` and its score. The starter merges whatever the resolver answers.',
       match: {
         python: {all: [/MERGE_THRESHOLD\s*=\s*0\.9\b/, />=\s*MERGE_THRESHOLD/]},
         typescript: {all: [/MERGE_THRESHOLD\s*=\s*0\.9\b/, />=\s*MERGE_THRESHOLD/]},
@@ -549,6 +549,20 @@ def check_timeout_parks(ctx):
     assert outcome == "parked", f"a resolver that timed out gave {outcome!r}: no answer is not a mismatch, park the pair for review"
     rows = _parked(ctx)
     assert len(rows) == 1 and rows[0].get("left") == left and rows[0].get("right") == right and rows[0].get("reason") == "unresolved", f"the review queue holds {rows}, expected the pair with reason unresolved"
+    calls = len(ctx.grpc.calls_to("Score"))
+    assert calls == 1, f"a resolver that timed out was called {calls} times: one call under DEADLINE_S, no retry loop, or one stalled resolver holds the caller for every attempt"
+    ctx.grpc.set_latency("Score", 0.0)
+    # Any error other than FAILED_PRECONDITION is no answer: it parks, one call each.
+    for code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.INTERNAL):
+        twin = store.create_entity("t1", "person", "Ada King", [f"ada king {code.name.lower()}"])["id"]
+        resolver.scores[(left, twin)] = 0.95
+        before = len(ctx.grpc.calls_to("Score"))
+        ctx.grpc.fail("Score", code)
+        outcome = m.resolve_pair("t1", left, twin)
+        calls = len(ctx.grpc.calls_to("Score")) - before
+        assert _merged_into(twin) is None and outcome == "parked" and calls == 1, f"a resolver answering {code.name} gave {outcome!r} after {calls} calls and {twin} is merged into {_merged_into(twin)}: any error other than FAILED_PRECONDITION parks the pair after one call"
+        last = _parked(ctx)[-1]
+        assert last.get("right") == twin and last.get("reason") == "unresolved", f"after {code.name} the review queue ends with {last}, expected ({left}, {twin}) with reason unresolved"
 
 
 def check_rejection_terminal(ctx):
@@ -570,9 +584,14 @@ def check_threshold_merge(ctx):
     assert outcome == "parked", f"a 0.6 score gave {outcome!r}, expected parked"
     rows = _parked(ctx)
     assert len(rows) == 1 and rows[0].get("reason") == "below_threshold" and rows[0].get("score") == 0.6, f"the review queue holds {rows}, expected the pair with reason below_threshold and score 0.6"
-    resolver.scores[(left, right)] = 0.95
+    # The threshold itself, on both sides: 0.89 parks, exactly 0.9 merges.
+    resolver.scores[(left, right)] = 0.89
     outcome = m.resolve_pair("t1", left, right)
-    assert outcome == "merged" and _merged_into(right) == left, f"a 0.95 score gave {outcome!r} and {right} is merged into {_merged_into(right)}, expected a merge into {left}"
+    rows = _parked(ctx)
+    assert outcome == "parked" and _merged_into(right) is None and len(rows) == 2 and rows[1].get("score") == 0.89, f"a 0.89 score gave {outcome!r} and the review queue holds {rows}: below MERGE_THRESHOLD (0.9) a pair is parked with its score"
+    resolver.scores[(left, right)] = 0.9
+    outcome = m.resolve_pair("t1", left, right)
+    assert outcome == "merged" and _merged_into(right) == left, f"a score of exactly 0.9 gave {outcome!r} and {right} is merged into {_merged_into(right)}: a score at or above MERGE_THRESHOLD merges into {left}"
     assert "a. lovelace" in store.get_entity(left)["aliases"], f"the merge must move the aliases to {left}: {store.get_entity(left)}"
 `,
     typescript: `async function world(ctx) {
@@ -618,6 +637,22 @@ export async function check_timeout_parks(ctx) {
   assert.equal(outcome, 'parked', \`a resolver that timed out gave \${outcome}: no answer is not a mismatch, park the pair for review\`);
   const rows = parked(ctx);
   assert(rows.length === 1 && rows[0].left === left && rows[0].right === right && rows[0].reason === 'unresolved', \`the review queue holds \${JSON.stringify(rows)}, expected the pair with reason unresolved\`);
+  const calls = ctx.grpc.callsTo('Score').length;
+  assert.equal(calls, 1, \`a resolver that timed out was called \${calls} times: one call under DEADLINE_MS, no retry loop, or one stalled resolver holds the caller for every attempt\`);
+  ctx.grpc.setLatency('Score', 0);
+  // Any error other than FAILED_PRECONDITION is no answer: it parks, one call each.
+  for (const name of ['UNAVAILABLE', 'INTERNAL']) {
+    const twin = (await store.createEntity('t1', 'person', 'Ada King', [\`ada king \${name.toLowerCase()}\`])).id;
+    scores.set(\`\${left}/\${twin}\`, 0.95);
+    const before = ctx.grpc.callsTo('Score').length;
+    ctx.grpc.fail('Score', ctx.grpc.status[name]);
+    const got = await m.resolvePair('t1', left, twin);
+    const made = ctx.grpc.callsTo('Score').length - before;
+    const twinInto = (await store.getEntity(twin)).merged_into;
+    assert(twinInto == null && got === 'parked' && made === 1, \`a resolver answering \${name} gave \${got} after \${made} calls and \${twin} is merged into \${twinInto}: any error other than FAILED_PRECONDITION parks the pair after one call\`);
+    const last = parked(ctx).at(-1);
+    assert(last?.right === twin && last?.reason === 'unresolved', \`after \${name} the review queue ends with \${JSON.stringify(last)}, expected (\${left}, \${twin}) with reason unresolved\`);
+  }
 }
 
 export async function check_rejection_terminal(ctx) {
@@ -641,10 +676,16 @@ export async function check_threshold_merge(ctx) {
   assert.equal(outcome, 'parked', \`a 0.6 score gave \${outcome}, expected parked\`);
   const rows = parked(ctx);
   assert(rows.length === 1 && rows[0].reason === 'below_threshold' && rows[0].score === 0.6, \`the review queue holds \${JSON.stringify(rows)}, expected the pair with reason below_threshold and score 0.6\`);
-  scores.set(pair, 0.95);
+  // The threshold itself, on both sides: 0.89 parks, exactly 0.9 merges.
+  scores.set(pair, 0.89);
   outcome = await m.resolvePair('t1', left, right);
   into = (await store.getEntity(right)).merged_into;
-  assert(outcome === 'merged' && into === left, \`a 0.95 score gave \${outcome} and \${right} is merged into \${into}, expected a merge into \${left}\`);
+  const after = parked(ctx);
+  assert(outcome === 'parked' && into == null && after.length === 2 && after[1].score === 0.89, \`a 0.89 score gave \${outcome} and the review queue holds \${JSON.stringify(after)}: below MERGE_THRESHOLD (0.9) a pair is parked with its score\`);
+  scores.set(pair, 0.9);
+  outcome = await m.resolvePair('t1', left, right);
+  into = (await store.getEntity(right)).merged_into;
+  assert(outcome === 'merged' && into === left, \`a score of exactly 0.9 gave \${outcome} and \${right} is merged into \${into}: a score at or above MERGE_THRESHOLD merges into \${left}\`);
   assert((await store.getEntity(left)).aliases.includes('a. lovelace'), \`the merge must move the aliases to \${left}\`);
 }
 `,
@@ -735,6 +776,24 @@ func CheckTimeoutParks(ctx *harness.Ctx) {
 	ctx.Equal(outcome, "parked", "a resolver that timed out must park the pair (no answer is not a mismatch); the outcome")
 	rows := clientParked(ctx)
 	ctx.Assert(len(rows) == 1 && rows[0].Left == left && rows[0].Right == right && rows[0].Reason == "unresolved", "the review queue holds %+v, expected the pair with reason unresolved", rows)
+	calls := len(ctx.GRPC.CallsTo("Score", ""))
+	ctx.Assert(calls == 1, "a resolver that timed out was called %d times: one call under the 1-second deadline, no retry loop, or one stalled resolver holds the caller for every attempt", calls)
+	ctx.GRPC.SetLatency("Score", 0, "")
+	// Any error other than FAILED_PRECONDITION is no answer: it parks, one call each.
+	failures := []codes.Code{codes.Unavailable, codes.Internal}
+	names := []string{"unavailable", "internal"}
+	for i, code := range failures {
+		twin := store.CreateEntity(clientBg, "t1", "person", "Ada King", []string{"ada king " + names[i]}).ID
+		peer.scores[left+"/"+twin] = 0.95
+		before := len(ctx.GRPC.CallsTo("Score", ""))
+		ctx.GRPC.Fail("Score", code, "", 1, "")
+		got := clientResolve(ctx, left, twin)
+		made := len(ctx.GRPC.CallsTo("Score", "")) - before
+		ctx.Assert(mergedInto(twin) == "" && got == "parked" && made == 1, "a resolver answering %v gave %q after %d calls and %s is merged into %q: any error other than FAILED_PRECONDITION parks the pair after one call", code, got, made, twin, mergedInto(twin))
+		queue := clientParked(ctx)
+		last := queue[len(queue)-1]
+		ctx.Assert(last.Right == twin && last.Reason == "unresolved", "after %v the review queue ends with %+v, expected (%s, %s) with reason unresolved", code, last, left, twin)
+	}
 }
 
 func CheckRejectionTerminal(ctx *harness.Ctx) {
@@ -755,9 +814,14 @@ func CheckThresholdMerge(ctx *harness.Ctx) {
 	ctx.Equal(outcome, "parked", "a 0.6 score; the outcome")
 	rows := clientParked(ctx)
 	ctx.Assert(len(rows) == 1 && rows[0].Reason == "below_threshold" && rows[0].Score != nil && *rows[0].Score == 0.6, "the review queue holds %+v, expected the pair with reason below_threshold and score 0.6", rows)
-	peer.scores[left+"/"+right] = 0.95
+	// The threshold itself, on both sides: 0.89 parks, exactly 0.9 merges.
+	peer.scores[left+"/"+right] = 0.89
 	outcome = clientResolve(ctx, left, right)
-	ctx.Assert(outcome == "merged" && mergedInto(right) == left, "a 0.95 score gave %q and %s is merged into %q, expected a merge into %s", outcome, right, mergedInto(right), left)
+	rows = clientParked(ctx)
+	ctx.Assert(outcome == "parked" && mergedInto(right) == "" && len(rows) == 2 && rows[1].Score != nil && *rows[1].Score == 0.89, "a 0.89 score gave %q and the review queue holds %+v: below the 0.9 threshold a pair is parked with its score", outcome, rows)
+	peer.scores[left+"/"+right] = 0.9
+	outcome = clientResolve(ctx, left, right)
+	ctx.Assert(outcome == "merged" && mergedInto(right) == left, "a score of exactly 0.9 gave %q and %s is merged into %q: a score at or above the threshold merges into %s", outcome, right, mergedInto(right), left)
 	ctx.Assert(len(store.GetEntity(clientBg, left).Aliases) == 2, "the merge must move the aliases to %s: %+v", left, store.GetEntity(clientBg, left))
 }
 `,
@@ -768,6 +832,7 @@ func CheckThresholdMerge(ctx *harness.Ctx) {
 #include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -835,6 +900,22 @@ void CheckTimeoutParks(harness::Ctx& ctx) {
   const auto rows = clientParked(ctx);
   ctx.Assert(rows.size() == 1 && rows[0].value("left", "") == w.left && rows[0].value("right", "") == w.right && rows[0].value("reason", "") == "unresolved",
              "the review queue holds %d rows (%s), expected the pair with reason unresolved", rows.size(), rows.empty() ? "" : rows[0].dump());
+  const size_t calls = ctx.GRPC.CallsTo("Score").size();
+  ctx.Assert(calls == 1, "a resolver that timed out was called %d times: one call under kDeadline, no retry loop, or one stalled resolver holds the caller for every attempt", calls);
+  ctx.GRPC.SetLatency("Score", 0);
+  // Any error other than FAILED_PRECONDITION is no answer: it parks, one call each.
+  const std::vector<std::pair<grpc::StatusCode, std::string>> failures = {{grpc::StatusCode::UNAVAILABLE, "UNAVAILABLE"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}};
+  for (const auto& [code, name] : failures) {
+    const std::string twin = store::createEntity("t1", "person", "Ada King", {"ada king " + name}).id;
+    w.peer.scores[w.left + "/" + twin] = 0.95;
+    const size_t before = ctx.GRPC.CallsTo("Score").size();
+    ctx.GRPC.Fail("Score", code);
+    const std::string got = resolvePair("t1", w.left, twin);
+    const size_t made = ctx.GRPC.CallsTo("Score").size() - before;
+    ctx.Assert(mergedInto(twin).empty() && got == "parked" && made == 1, "a resolver answering %s gave %q after %d calls and %s is merged into %q: any error other than FAILED_PRECONDITION parks the pair after one call", name, got, made, twin, mergedInto(twin));
+    const auto queue = clientParked(ctx);
+    ctx.Assert(!queue.empty() && queue.back().value("right", "") == twin && queue.back().value("reason", "") == "unresolved", "after %s the review queue ends with %s, expected (%s, %s) with reason unresolved", name, queue.empty() ? "" : queue.back().dump(), w.left, twin);
+  }
 }
 
 void CheckRejectionTerminal(harness::Ctx& ctx) {
@@ -856,9 +937,15 @@ void CheckThresholdMerge(harness::Ctx& ctx) {
   const auto rows = clientParked(ctx);
   ctx.Assert(rows.size() == 1 && rows[0].value("reason", "") == "below_threshold" && rows[0].contains("score") && rows[0]["score"].is_number() && rows[0]["score"].get<double>() == 0.6,
              "the review queue holds %d rows (%s), expected the pair with reason below_threshold and score 0.6", rows.size(), rows.empty() ? "" : rows[0].dump());
-  w.peer.scores[w.pair()] = 0.95;
+  // The threshold itself, on both sides: 0.89 parks, exactly 0.9 merges.
+  w.peer.scores[w.pair()] = 0.89;
   outcome = resolvePair("t1", w.left, w.right);
-  ctx.Assert(outcome == "merged" && mergedInto(w.right) == w.left, "a 0.95 score gave %q and %s is merged into %q, expected a merge into %s", outcome, w.right, mergedInto(w.right), w.left);
+  const auto after = clientParked(ctx);
+  ctx.Assert(outcome == "parked" && mergedInto(w.right).empty() && after.size() == 2 && after[1].contains("score") && after[1]["score"].is_number() && after[1]["score"].get<double>() == 0.89,
+             "a 0.89 score gave %q and the review queue holds %d rows (last %s): below kMergeThreshold (0.9) a pair is parked with its score", outcome, after.size(), after.empty() ? "" : after.back().dump());
+  w.peer.scores[w.pair()] = 0.9;
+  outcome = resolvePair("t1", w.left, w.right);
+  ctx.Assert(outcome == "merged" && mergedInto(w.right) == w.left, "a score of exactly 0.9 gave %q and %s is merged into %q: a score at or above kMergeThreshold merges into %s", outcome, w.right, mergedInto(w.right), w.left);
   ctx.Equal(store::getEntity(w.left)->aliases.size(), 2, "the merge must move the aliases to %s; its alias count", w.left);
 }
 `,

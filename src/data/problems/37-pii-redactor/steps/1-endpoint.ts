@@ -19,9 +19,9 @@ oversized text is quoted back in the 413 body; an entity type nobody declared re
 and redacts nothing; and a text with nothing to redact is never recorded, so the audit read cannot
 tell it from a text that was skipped.
 
-- A text over \`MAX_TEXT_BYTES\` (256 KiB) is **413** with a constant body.
-- Every requested entity is in \`ENTITY_TYPES\` (the default is \`DEFAULT_ENTITIES\`); anything else
-  is **400**, before the detector is called.
+- A text over \`MAX_TEXT_BYTES\` (256 KiB, counted in bytes) is **413** with a constant body.
+- Every requested entity is in \`ENTITY_TYPES\`, spelled exactly (the default is \`DEFAULT_ENTITIES\`);
+  anything else is **400**, before the detector is called.
 - \`DetectorUnavailable\` is **503** \`{"error": "detector_unavailable"}\`, and nothing is saved.
 - Every 200 is saved first and answers \`{document_id, status: "processed", redacted_text, spans,
   entity_counts, detector_version, source, degraded}\`, an empty span list included.`,
@@ -64,7 +64,7 @@ tell it from a text that was skipped.
       id: 'size-cap',
       title: 'An oversized text is 413 with a constant body',
       detail:
-        'A text over `MAX_TEXT_BYTES` (256 KiB) answers **413** `{"error": "text_too_large"}`; the starter quotes the first 80 characters of the payload back in a `preview` field, so the error path copies customer text into every log that records a response.',
+        'A text over `MAX_TEXT_BYTES` (256 KiB, counted in bytes, so multi-byte characters count for each of their bytes) answers **413** `{"error": "text_too_large"}`, and a text of exactly 256 KiB is served; the starter quotes the first 80 characters of the payload back in a `preview` field, so the error path copies customer text into every log that records a response.',
       match: {
         python: {all: [/MAX_TEXT_BYTES/, /\b413\b/], none: [/["']preview["']/, /text\[\s*:\s*\d+\s*\]/]},
         typescript: {all: [/MAX_TEXT_BYTES/, /\b413\b/], none: [/\bpreview\s*:/, /text\.slice\(\s*0/]},
@@ -77,7 +77,7 @@ tell it from a text that was skipped.
       id: 'entity-whitelist',
       title: 'Unknown entity types are 400 before the detector runs',
       detail:
-        'Each requested entity is checked against `ENTITY_TYPES` before `detect` is called, and an unknown one is **400**; the starter passes the list through, so a typo in a type name returns 200 with that type left unredacted.',
+        'Each requested entity is checked against `ENTITY_TYPES`, spelled exactly, before `detect` is called: an unknown one (`PHONE_NUMBER`, or `email` in lower case) is **400**, and every listed type, `LOCATION` and `ORGANIZATION` included, is accepted; the starter passes the list through, so a typo in a type name returns 200 with that type left unredacted.',
       match: {
         python: {all: [/\bin ENTITY_TYPES\b/, /\b400\b/], order: [/\bin ENTITY_TYPES\b/, /\bdetect\(/]},
         typescript: {all: [/ENTITY_TYPES\.includes\(/, /\b400\b/], order: [/ENTITY_TYPES\.includes\(/, /\bdetect\(/]},
@@ -99,7 +99,7 @@ tell it from a text that was skipped.
       id: 'fail-closed',
       title: 'A detector failure is 503 with no text',
       detail:
-        '`DetectorUnavailable` answers **503** `{"error": "detector_unavailable"}` and saves nothing; the starter catches it and answers 200 with the caller\'s own text as `redacted_text`, so an outage leaks every document it touches.',
+        '`DetectorUnavailable` answers **503** `{"error": "detector_unavailable"}` and saves nothing, while a request the patterns cover gets the regex fallback\'s degraded 200 with `source: "regex"`; the starter catches it and answers 200 with the caller\'s own text as `redacted_text`, so an outage leaks every document it touches.',
       match: {
         python: {all: [/\b503\b/, /detector_unavailable/], none: [/["']redacted_text["']\s*:\s*text\b/]},
         typescript: {all: [/\b503\b/, /detector_unavailable/], none: [/redacted_text:\s*text\b/]},
@@ -757,6 +757,9 @@ async def check_size_cap(ctx):
         r = await _redact(c, {"document_id": "d-big", "text": big})
         assert r.status_code == 413, f"a {len(big)}-byte text answered {r.status_code}, expected 413"
         assert "415-555-0132" not in r.text and "lorem" not in r.text, f"the 413 body quotes the payload: {r.text[:200]}. An error body is logged and traced; keep it constant"
+        wide = "\\u00e9" * (CAP // 2 + 1)
+        r = await _redact(c, {"document_id": "d-wide", "text": wide})
+        assert r.status_code == 413, f"a text of {len(wide)} characters and {len(wide.encode())} bytes answered {r.status_code}, expected 413: the cap is in bytes"
         exact = "x@example.com " + ("lorem ipsum " * 30_000)[: CAP - 14]
         r = await _redact(c, {"document_id": "d-cap", "text": exact, "entities": ["EMAIL"]})
     assert r.status_code == 200, f"a text of exactly 256 KiB answered {r.status_code}, expected 200"
@@ -766,10 +769,14 @@ async def check_entity_whitelist(ctx):
     async with _api(ctx) as c:
         r = await _redact(c, {"document_id": "d-1", "text": TEXT, "entities": ["EMAIL", "PHONE_NUMBER"]})
         assert r.status_code == 400, f"an unknown entity type (PHONE_NUMBER) answered {r.status_code}, expected 400: the phone number went back unredacted"
+        r = await _redact(c, {"document_id": "d-1", "text": TEXT, "entities": ["email"]})
+        assert r.status_code == 400, f"the entity type email (not EMAIL) answered {r.status_code}, expected 400: ENTITY_TYPES is the whole list"
         assert ctx.grpc.calls_to("Detect") == [], "the detector was called for a request with an unknown entity type: reject it first"
         assert store.load("d-1") is None, "a rejected request must not be saved"
         r = await _redact(c, {"document_id": "d-2", "text": TEXT, "entities": ["EMAIL"]})
-    assert r.status_code == 200 and r.json().get("redacted_text") == "Reach Ada at [EMAIL] or 415-555-0132.", f"a request for EMAIL only answered {r.status_code} {r.text}"
+        assert r.status_code == 200 and r.json().get("redacted_text") == "Reach Ada at [EMAIL] or 415-555-0132.", f"a request for EMAIL only answered {r.status_code} {r.text}"
+        r = await _redact(c, {"document_id": "d-3", "text": TEXT, "entities": ["LOCATION", "ORGANIZATION"]})
+    assert r.status_code == 200, f"a request for LOCATION and ORGANIZATION, both in ENTITY_TYPES, answered {r.status_code} {r.text}"
 
 
 async def check_fail_closed(ctx):
@@ -780,7 +787,7 @@ async def check_fail_closed(ctx):
         assert r.json() == {"error": "detector_unavailable"}, f"the 503 body is {r.text}, expected {{\\"error\\": \\"detector_unavailable\\"}}"
         assert store.load("d-1") is None, "a request that could not be redacted must not be saved"
         r = await _redact(c, {"document_id": "d-2", "text": TEXT})
-    assert r.status_code == 200 and r.json().get("degraded") is True, f"with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got {r.status_code} {r.text}"
+    assert r.status_code == 200 and r.json().get("degraded") is True and r.json().get("source") == "regex", f"with the detector down and only pattern types requested, the regex fallback answers a degraded 200 with source regex; got {r.status_code} {r.text}"
 
 
 async def check_processed(ctx):
@@ -838,6 +845,9 @@ export async function check_size_cap(ctx) {
   let r = await redact(c, {document_id: 'd-big', text: big});
   assert.equal(r.status, 413, \`a \${big.length}-byte text answered \${r.status}, expected 413\`);
   assert(!r.text.includes('415-555-0132') && !r.text.includes('lorem'), \`the 413 body quotes the payload: \${r.text.slice(0, 200)}. An error body is logged and traced; keep it constant\`);
+  const wide = '\\u00e9'.repeat(CAP / 2 + 1);
+  r = await redact(c, {document_id: 'd-wide', text: wide});
+  assert.equal(r.status, 413, \`a text of \${wide.length} characters and \${Buffer.byteLength(wide)} bytes answered \${r.status}, expected 413: the cap is in bytes\`);
   const exact = 'x@example.com ' + 'lorem ipsum '.repeat(30_000).slice(0, CAP - 14);
   r = await redact(c, {document_id: 'd-cap', text: exact, entities: ['EMAIL']});
   assert.equal(r.status, 200, \`a text of exactly 256 KiB answered \${r.status}, expected 200\`);
@@ -847,10 +857,14 @@ export async function check_entity_whitelist(ctx) {
   const {c, store} = api(ctx);
   let r = await redact(c, {document_id: 'd-1', text: TEXT, entities: ['EMAIL', 'PHONE_NUMBER']});
   assert.equal(r.status, 400, \`an unknown entity type (PHONE_NUMBER) answered \${r.status}, expected 400: the phone number went back unredacted\`);
+  r = await redact(c, {document_id: 'd-1', text: TEXT, entities: ['email']});
+  assert.equal(r.status, 400, \`the entity type email (not EMAIL) answered \${r.status}, expected 400: ENTITY_TYPES is the whole list\`);
   assert.equal(ctx.grpc.callsTo('Detect').length, 0, 'the detector was called for a request with an unknown entity type: reject it first');
   assert.equal(await store.load('d-1'), null, 'a rejected request must not be saved');
   r = await redact(c, {document_id: 'd-2', text: TEXT, entities: ['EMAIL']});
   assert(r.status === 200 && r.json().redacted_text === 'Reach Ada at [EMAIL] or 415-555-0132.', \`a request for EMAIL only answered \${r.status} \${r.text}\`);
+  r = await redact(c, {document_id: 'd-3', text: TEXT, entities: ['LOCATION', 'ORGANIZATION']});
+  assert.equal(r.status, 200, \`a request for LOCATION and ORGANIZATION, both in ENTITY_TYPES, answered \${r.status} \${r.text}\`);
 }
 
 export async function check_fail_closed(ctx) {
@@ -861,7 +875,7 @@ export async function check_fail_closed(ctx) {
   assert.deepStrictEqual(r.json(), {error: 'detector_unavailable'}, \`the 503 body is \${r.text}, expected {"error": "detector_unavailable"}\`);
   assert.equal(await store.load('d-1'), null, 'a request that could not be redacted must not be saved');
   r = await redact(c, {document_id: 'd-2', text: TEXT});
-  assert(r.status === 200 && r.json().degraded === true, \`with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got \${r.status} \${r.text}\`);
+  assert(r.status === 200 && r.json().degraded === true && r.json().source === 'regex', \`with the detector down and only pattern types requested, the regex fallback answers a degraded 200 with source regex; got \${r.status} \${r.text}\`);
 }
 
 export async function check_processed(ctx) {
@@ -959,6 +973,9 @@ func CheckSizeCap(ctx *harness.Ctx) {
 	r := apiRedact(c, map[string]any{"document_id": "d-big", "text": big})
 	ctx.Equal(r.Status, 413, "a %d-byte text", len(big))
 	ctx.Assert(!strings.Contains(r.Text(), "415-555-0132") && !strings.Contains(r.Text(), "lorem"), "the 413 body quotes the payload: %.200s. An error body is logged and traced; keep it constant", r.Text())
+	wide := strings.Repeat("\\u00e9", apiCap/2+1)
+	r = apiRedact(c, map[string]any{"document_id": "d-wide", "text": wide})
+	ctx.Equal(r.Status, 413, "a text of %d characters and %d bytes (the cap is in bytes)", apiCap/2+1, len(wide))
 	exact := "x@example.com " + strings.Repeat("lorem ipsum ", 30000)[:apiCap-14]
 	r = apiRedact(c, map[string]any{"document_id": "d-cap", "text": exact, "entities": []string{"EMAIL"}})
 	ctx.Equal(r.Status, 200, "a text of exactly 256 KiB")
@@ -968,10 +985,14 @@ func CheckEntityWhitelist(ctx *harness.Ctx) {
 	c := apiClient(ctx, true)
 	r := apiRedact(c, map[string]any{"document_id": "d-1", "text": apiText, "entities": []string{"EMAIL", "PHONE_NUMBER"}})
 	ctx.Equal(r.Status, 400, "an unknown entity type (PHONE_NUMBER) must be rejected, the phone number went back unredacted")
+	r = apiRedact(c, map[string]any{"document_id": "d-1", "text": apiText, "entities": []string{"email"}})
+	ctx.Equal(r.Status, 400, "the entity type email (not EMAIL) must be rejected: ENTITY_TYPES is the whole list")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", "")), 0, "the detector was called for a request with an unknown entity type: reject it first; Detect calls")
 	ctx.Assert(apiLoad(ctx, "d-1") == nil, "a rejected request must not be saved")
 	r = apiRedact(c, map[string]any{"document_id": "d-2", "text": apiText, "entities": []string{"EMAIL"}})
 	ctx.Assert(r.Status == 200 && apiBody(r)["redacted_text"] == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text())
+	r = apiRedact(c, map[string]any{"document_id": "d-3", "text": apiText, "entities": []string{"LOCATION", "ORGANIZATION"}})
+	ctx.Equal(r.Status, 200, "a request for LOCATION and ORGANIZATION, both in ENTITY_TYPES (%s)", r.Text())
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
@@ -982,7 +1003,7 @@ func CheckFailClosed(ctx *harness.Ctx) {
 	ctx.Equal(apiBody(r), map[string]any{"error": "detector_unavailable"}, "the 503 body")
 	ctx.Assert(apiLoad(ctx, "d-1") == nil, "a request that could not be redacted must not be saved")
 	r = apiRedact(c, map[string]any{"document_id": "d-2", "text": apiText})
-	ctx.Assert(r.Status == 200 && apiBody(r)["degraded"] == true, "with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got %d %s", r.Status, r.Text())
+	ctx.Assert(r.Status == 200 && apiBody(r)["degraded"] == true && apiBody(r)["source"] == "regex", "with the detector down and only pattern types requested, the regex fallback answers a degraded 200 with source regex; got %d %s", r.Status, r.Text())
 }
 
 func CheckProcessed(ctx *harness.Ctx) {
@@ -1071,6 +1092,10 @@ void CheckSizeCap(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 413, "a %d-byte text", big.size());
   ctx.Assert(r.Text().find("415-555-0132") == std::string::npos && r.Text().find("lorem") == std::string::npos,
              "the 413 body quotes the payload: %s. An error body is logged and traced; keep it constant", r.Text().substr(0, 200));
+  std::string wide;
+  for (size_t i = 0; i <= kCap / 2; i++) wide += "\\xc3\\xa9";
+  r = post(c, {{"document_id", "d-wide"}, {"text", wide}});
+  ctx.Equal(r.Status, 413, "a text of %d characters and %d bytes (the cap is in bytes)", kCap / 2 + 1, wide.size());
   std::string filler;
   while (filler.size() < kCap) filler += "lorem ipsum ";
   const std::string exact = "x@example.com " + filler.substr(0, kCap - 14);
@@ -1082,10 +1107,14 @@ void CheckEntityWhitelist(harness::Ctx& ctx) {
   auto c = api(ctx, true);
   auto r = post(c, {{"document_id", "d-1"}, {"text", kText}, {"entities", nlohmann::json::array({"EMAIL", "PHONE_NUMBER"})}});
   ctx.Equal(r.Status, 400, "an unknown entity type (PHONE_NUMBER) must be rejected, the phone number went back unredacted");
+  r = post(c, {{"document_id", "d-1"}, {"text", kText}, {"entities", nlohmann::json::array({"email"})}});
+  ctx.Equal(r.Status, 400, "the entity type email (not EMAIL) must be rejected: ENTITY_TYPES is the whole list");
   ctx.Equal(ctx.GRPC.CallsTo("Detect").size(), 0, "the detector was called for a request with an unknown entity type: reject it first; Detect calls");
   ctx.Assert(!store::load("d-1"), "a rejected request must not be saved");
   r = post(c, {{"document_id", "d-2"}, {"text", kText}, {"entities", nlohmann::json::array({"EMAIL"})}});
   ctx.Assert(r.Status == 200 && parsed(r).value("redacted_text", "") == "Reach Ada at [EMAIL] or 415-555-0132.", "a request for EMAIL only answered %d %s", r.Status, r.Text());
+  r = post(c, {{"document_id", "d-3"}, {"text", kText}, {"entities", nlohmann::json::array({"LOCATION", "ORGANIZATION"})}});
+  ctx.Equal(r.Status, 200, "a request for LOCATION and ORGANIZATION, both in ENTITY_TYPES (%s)", r.Text());
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
@@ -1096,7 +1125,8 @@ void CheckFailClosed(harness::Ctx& ctx) {
   ctx.Equal(parsed(r), nlohmann::json({{"error", "detector_unavailable"}}), "the 503 body");
   ctx.Assert(!store::load("d-1"), "a request that could not be redacted must not be saved");
   r = post(c, {{"document_id", "d-2"}, {"text", kText}});
-  ctx.Assert(r.Status == 200 && parsed(r).value("degraded", false), "with the detector down and only pattern types requested, the regex fallback answers a degraded 200; got %d %s", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && parsed(r).value("degraded", false) && parsed(r).value("source", "") == "regex",
+             "with the detector down and only pattern types requested, the regex fallback answers a degraded 200 with source regex; got %d %s", r.Status, r.Text());
 }
 
 void CheckProcessed(harness::Ctx& ctx) {

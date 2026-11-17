@@ -70,7 +70,7 @@ Requirements:
       id: 'idempotency-key',
       title: 'Carries the idempotency key and the rate version',
       detail:
-        'The event carries idempotency_key beside usage_id, tenant_id, model, both counts, cost_micros and rate_version, so the ledger can drop a replay and a disputed charge traces to a rate table. The starter ships no idempotency key.',
+        'The event is exactly usage_id, idempotency_key, tenant_id, model, both counts, cost_micros and rate_version, so the ledger can drop a replay and a disputed charge traces to a rate table; a field outside that list fails. The starter ships no idempotency key.',
       match: {
         python: {all: [/["']idempotency_key["']\s*:/]},
         typescript: {all: [/idempotency_key:/]},
@@ -96,7 +96,7 @@ Requirements:
       id: 'outbox-fallback',
       title: 'Writes an outbox row from the delivery report',
       detail:
-        'A refused produce, or no report within 2 s, leaves the event in the outbox and publish_usage returns false; a healthy produce adds no row. The starter never looks at the delivery report.',
+        'A refused produce, or no report within 2 s (the call returns within about 2.5 s), leaves the event itself in the outbox and publish_usage returns false; a healthy produce adds no row. The starter never looks at the delivery report.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /catch/]},
@@ -109,7 +109,7 @@ Requirements:
       id: 'no-content',
       title: 'No completion text in the event, the outbox or the logs',
       detail:
-        'Neither the payload, an outbox row nor a log line carries the completion: the topic is retained and replicated, so tenant content written there outlives every retention promise. The starter copies it into the event and the log.',
+        'Neither the payload, an outbox row nor a log line carries the completion or any piece of it: the topic is retained and replicated, so tenant content written there outlives every retention promise. The starter copies it into the event and the log.',
       match: {
         python: {none: [/output_text/]},
         typescript: {none: [/output_text/]},
@@ -591,10 +591,20 @@ from meter.records import UsageRecord
 TOPIC = "billing.usage"
 TEXT = "Your refund for order 4417 was approved on Monday."
 VERSION = "rates-2026-11-01"
+# pieces of the completion: a preview or a slice of it leaks it as surely as the whole text
+FRAGMENTS = ("Your refund", "order 4417", "approved on Monday")
 
 
 def _usage(n=1, tenant="t1", model="gpt-4o"):
     return UsageRecord(usage_id=f"u-{n}", idempotency_key=f"k-{n}", tenant_id=tenant, model=model, input_tokens=1200, output_tokens=300, cost_micros=6000, rate_version=VERSION, output_text=TEXT)
+
+
+def _event(n=1):
+    return {"usage_id": f"u-{n}", "idempotency_key": f"k-{n}", "tenant_id": "t1", "model": "gpt-4o", "input_tokens": 1200, "output_tokens": 300, "cost_micros": 6000, "rate_version": VERSION}
+
+
+def _leaks(text):
+    return [f for f in FRAGMENTS if f in text]
 
 
 def _events(ctx):
@@ -622,9 +632,7 @@ def check_idempotency_key(ctx):
     m.publish_usage(_usage(7))
     events = _events(ctx)
     assert len(events) == 1, f"one report produced {len(events)} records"
-    expected = {"usage_id": "u-7", "idempotency_key": "k-7", "tenant_id": "t1", "model": "gpt-4o", "input_tokens": 1200, "output_tokens": 300, "cost_micros": 6000, "rate_version": VERSION}
-    for key, value in expected.items():
-        assert events[0].get(key) == value, f"the event must carry {key}={value!r}, got {events[0]}: without the idempotency key the ledger cannot tell a retry from a second charge"
+    assert events[0] == _event(7), f"the event must be exactly {_event(7)}, got {events[0]}: without the idempotency key the ledger cannot tell a retry from a second charge, and a field outside the contract is where tenant content leaks"
 
 
 def check_idempotent_acks(ctx):
@@ -646,7 +654,7 @@ def check_outbox_fallback(ctx):
         raise AssertionError(f"publish_usage raised when the broker refused the produce: {e!r}; the event goes to the outbox") from e
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the broker refused one produce and the outbox holds {len(rows)} rows: a refused charge must be kept for the relay, not dropped"
-    assert rows[0].get("usage_id") == "u-1" and rows[0].get("idempotency_key") == "k-1", f"the outbox row must be the event itself, got {rows[0]}"
+    assert rows[0] == _event(1), f"the outbox row must be the event itself, {_event(1)}, got {rows[0]}"
     assert ok is False, f"publish_usage returned {ok!r} after a refused produce, expected False"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused produce"
     assert m.publish_usage(_usage(2)) is True, "a healthy produce returns True"
@@ -655,7 +663,7 @@ def check_outbox_fallback(ctx):
     before = ctx.clock.time()
     ok = m.publish_usage(_usage(3))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_usage waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_usage waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("usage_id") == "u-3", f"no report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_usage returned {ok!r} without a delivery report, expected False"
@@ -671,26 +679,34 @@ def check_no_content(ctx):
             self.lines.append(record.getMessage())
 
     capture = Capture()
-    logging.getLogger().addHandler(capture)
+    root = logging.getLogger()
+    level = root.level
+    # every level: a debug or info line is as retained as a warning once it is shipped
+    root.setLevel(logging.DEBUG)
+    root.addHandler(capture)
     try:
         m = ctx.load("events")
         ctx.kafka.fail_next(TOPIC, 1)
         m.publish_usage(_usage(1))
         m.publish_usage(_usage(2))
     finally:
-        logging.getLogger().removeHandler(capture)
+        root.removeHandler(capture)
+        root.setLevel(level)
     assert ctx.kafka.records(TOPIC), "the healthy report must reach the topic"
     for value in ctx.kafka.values(TOPIC):
-        assert b"order 4417" not in value, f"the event carries the completion text: {value!r}; the topic is retained and replicated"
+        assert not _leaks(value.decode()), f"the event carries the completion text: {value!r}; the topic is retained and replicated"
         assert "output_text" not in json.loads(value), f"the event has an output_text field: {value!r}"
     for row in ctx.redis.lrange("billing:outbox", 0, -1):
-        assert "order 4417" not in row, f"the outbox row carries the completion text: {row}"
+        assert not _leaks(row), f"the outbox row carries the completion text: {row}"
     for line in capture.lines:
-        assert "order 4417" not in line, f"a log line carries the completion text: {line!r}"
+        assert not _leaks(line), f"a log line carries the completion text: {line!r}"
 `,
     typescript: `const TOPIC = 'billing.usage';
 const TEXT = 'Your refund for order 4417 was approved on Monday.';
 const VERSION = 'rates-2026-11-01';
+// pieces of the completion: a preview or a slice of it leaks it as surely as the whole text
+const FRAGMENTS = ['Your refund', 'order 4417', 'approved on Monday'];
+const event = (n = 1) => ({usage_id: \`u-\${n}\`, idempotency_key: \`k-\${n}\`, tenant_id: 't1', model: 'gpt-4o', input_tokens: 1200, output_tokens: 300, cost_micros: 6000, rate_version: VERSION});
 
 const usage = (n = 1, tenant = 't1', model = 'gpt-4o') => ({
   usage_id: \`u-\${n}\`, idempotency_key: \`k-\${n}\`, tenant_id: tenant, model, input_tokens: 1200, output_tokens: 300, cost_micros: 6000, rate_version: VERSION, output_text: TEXT,
@@ -716,9 +732,7 @@ export async function check_idempotency_key(ctx) {
   await m.publishUsage(usage(7));
   const all = events(ctx);
   assert.equal(all.length, 1, \`one report produced \${all.length} records\`);
-  const expected = {usage_id: 'u-7', idempotency_key: 'k-7', tenant_id: 't1', model: 'gpt-4o', input_tokens: 1200, output_tokens: 300, cost_micros: 6000, rate_version: VERSION};
-  for (const [key, value] of Object.entries(expected))
-    assert.deepEqual(all[0][key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(all[0])}: without the idempotency key the ledger cannot tell a retry from a second charge\`);
+  assert.deepEqual(all[0], event(7), \`the event must be exactly \${JSON.stringify(event(7))}, got \${JSON.stringify(all[0])}: without the idempotency key the ledger cannot tell a retry from a second charge, and a field outside the contract is where tenant content leaks\`);
 }
 
 export async function check_idempotent_acks(ctx) {
@@ -742,7 +756,7 @@ export async function check_outbox_fallback(ctx) {
   }
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the broker refused one produce and the outbox holds \${rows.length} rows: a refused charge must be kept for the relay, not dropped\`);
-  assert(rows[0].usage_id === 'u-1' && rows[0].idempotency_key === 'k-1', \`the outbox row must be the event itself, got \${JSON.stringify(rows[0])}\`);
+  assert.deepEqual(rows[0], event(1), \`the outbox row must be the event itself, \${JSON.stringify(event(1))}, got \${JSON.stringify(rows[0])}\`);
   assert.equal(ok, false, \`publishUsage resolved \${ok} after a refused produce, expected false\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused produce');
   assert.equal(await m.publishUsage(usage(2)), true, 'a healthy produce resolves true');
@@ -751,7 +765,7 @@ export async function check_outbox_fallback(ctx) {
   const before = ctx.clock.now();
   ok = await m.publishUsage(usage(3));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishUsage waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishUsage waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].usage_id === 'u-3', \`no report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishUsage resolved \${ok} without a delivery report, expected false\`);
@@ -764,10 +778,11 @@ export async function check_no_content(ctx) {
   await m.publishUsage(usage(2));
   assert(ctx.kafka.records(TOPIC).length > 0, 'the healthy report must reach the topic');
   for (const value of ctx.kafka.values(TOPIC)) {
-    assert(!value.includes('order 4417'), \`the event carries the completion text: \${value}; the topic is retained and replicated\`);
+    assert.deepEqual(FRAGMENTS.filter(f => value.toString().includes(f)), [], \`the event carries the completion text: \${value}; the topic is retained and replicated\`);
     assert(!('output_text' in JSON.parse(value)), \`the event has an output_text field: \${value}\`);
   }
-  for (const row of ctx.redis.lrange('billing:outbox', 0, -1)) assert(!row.includes('order 4417'), \`the outbox row carries the completion text: \${row}\`);
+  for (const row of ctx.redis.lrange('billing:outbox', 0, -1))
+    assert.deepEqual(FRAGMENTS.filter(f => row.includes(f)), [], \`the outbox row carries the completion text: \${row}\`);
 }
 `,
     go: `package main
@@ -787,6 +802,14 @@ const (
 	eventsText    = "Your refund for order 4417 was approved on Monday."
 	eventsVersion = "rates-2026-11-01"
 )
+
+// pieces of the completion: a preview or a slice of it leaks it as surely as the whole text
+var eventsFragments = []string{"Your refund", "order 4417", "approved on Monday"}
+
+// eventsEvent is the event for eventsUsage(n, "t1", "gpt-4o"), as JSON decodes it.
+func eventsEvent(n string) map[string]any {
+	return map[string]any{"usage_id": "u-" + n, "idempotency_key": "k-" + n, "tenant_id": "t1", "model": "gpt-4o", "input_tokens": float64(1200), "output_tokens": float64(300), "cost_micros": float64(6000), "rate_version": eventsVersion}
+}
 
 func eventsUsage(n, tenant, model string) records.UsageRecord {
 	return records.UsageRecord{UsageID: "u-" + n, IdempotencyKey: "k-" + n, TenantID: tenant, Model: model, InputTokens: 1200, OutputTokens: 300, CostMicros: 6000, RateVersion: eventsVersion, OutputText: eventsText}
@@ -828,8 +851,8 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	ctx.Settle()
 	all := eventsDecode(ctx, ctx.Kafka.Values(eventsTopic))
 	ctx.Equal(len(all), 1, "one report; records")
-	ctx.Equal(all[0], map[string]any{"usage_id": "u-7", "idempotency_key": "k-7", "tenant_id": "t1", "model": "gpt-4o", "input_tokens": float64(1200), "output_tokens": float64(300), "cost_micros": float64(6000), "rate_version": eventsVersion},
-		"the event must carry usage_id, idempotency_key, tenant_id, model, both counts, cost_micros and rate_version, and nothing else (without the idempotency key the ledger cannot tell a retry from a second charge)")
+	ctx.Equal(all[0], eventsEvent("7"),
+		"the event must carry usage_id, idempotency_key, tenant_id, model, both counts, cost_micros and rate_version, and nothing else (without the idempotency key the ledger cannot tell a retry from a second charge, and a field outside the contract is where tenant content leaks)")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
@@ -849,7 +872,7 @@ func CheckOutboxFallback(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused one produce: a refused charge must be kept for the relay, not dropped; outbox rows")
-	ctx.Assert(rows[0]["usage_id"] == "u-1" && rows[0]["idempotency_key"] == "k-1", "the outbox row must be the event itself, got %v", rows[0])
+	ctx.Equal(rows[0], eventsEvent("1"), "the outbox row must be the event itself")
 	ctx.Equal(ok, false, "publishUsage's result after a refused produce")
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
 	ctx.Assert(eventsPublish(ctx, eventsUsage("2", "t1", "gpt-4o")), "a healthy produce returns true")
@@ -859,7 +882,7 @@ func CheckOutboxFallback(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsUsage("3", "t1", "gpt-4o"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishUsage waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishUsage waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["usage_id"] == "u-3", "no report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishUsage's result without a delivery report")
@@ -872,14 +895,18 @@ func CheckNoContent(ctx *harness.Ctx) {
 	ctx.Settle()
 	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) > 0, "the healthy report must reach the topic")
 	for _, value := range ctx.Kafka.Values(eventsTopic) {
-		ctx.Assert(!strings.Contains(value, "order 4417"), "the event carries the completion text: %s; the topic is retained and replicated", value)
+		for _, fragment := range eventsFragments {
+			ctx.Assert(!strings.Contains(value, fragment), "the event carries the completion text: %s; the topic is retained and replicated", value)
+		}
 		var e map[string]any
 		json.Unmarshal([]byte(value), &e)
 		_, has := e["output_text"]
 		ctx.Assert(!has, "the event has an output_text field: %s", value)
 	}
 	for _, row := range ctx.Redis.LRange("billing:outbox", 0, -1) {
-		ctx.Assert(!strings.Contains(row, "order 4417"), "the outbox row carries the completion text: %s", row)
+		for _, fragment := range eventsFragments {
+			ctx.Assert(!strings.Contains(row, fragment), "the outbox row carries the completion text: %s", row)
+		}
 	}
 }
 `,
@@ -896,9 +923,24 @@ namespace {
 const std::string kEventsTopic = "billing.usage";
 const std::string kText = "Your refund for order 4417 was approved on Monday.";
 const std::string kVersion = "rates-2026-11-01";
+// pieces of the completion: a preview or a slice of it leaks it as surely as the whole text
+const std::vector<std::string> kFragments = {"Your refund", "order 4417", "approved on Monday"};
 
 records::UsageRecord eventsUsage(const std::string& n, const std::string& tenant, const std::string& model) {
   return {"u-" + n, "k-" + n, tenant, model, 1200, 300, 6000, kVersion, kText};
+}
+
+// The event for eventsUsage(n, "t1", "gpt-4o").
+nlohmann::json eventsEvent(const std::string& n) {
+  return {{"usage_id", "u-" + n}, {"idempotency_key", "k-" + n}, {"tenant_id", "t1"}, {"model", "gpt-4o"}, {"input_tokens", 1200},
+          {"output_tokens", 300}, {"cost_micros", 6000}, {"rate_version", kVersion}};
+}
+
+bool leaks(const std::string& text) {
+  for (const auto& fragment : kFragments) {
+    if (text.find(fragment) != std::string::npos) return true;
+  }
+  return false;
 }
 
 std::vector<nlohmann::json> decode(const std::vector<std::string>& raw) {
@@ -931,10 +973,8 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   ctx.Settle();
   const auto all = decode(ctx.Kafka.Values(kEventsTopic));
   ctx.Equal(all.size(), 1, "one report; records");
-  ctx.Equal(all[0],
-            nlohmann::json({{"usage_id", "u-7"}, {"idempotency_key", "k-7"}, {"tenant_id", "t1"}, {"model", "gpt-4o"}, {"input_tokens", 1200},
-                            {"output_tokens", 300}, {"cost_micros", 6000}, {"rate_version", kVersion}}),
-            "the event must carry usage_id, idempotency_key, tenant_id, model, both counts, cost_micros and rate_version, and nothing else (without the idempotency key the ledger cannot tell a retry from a second charge)");
+  ctx.Equal(all[0], eventsEvent("7"),
+            "the event must carry usage_id, idempotency_key, tenant_id, model, both counts, cost_micros and rate_version, and nothing else (without the idempotency key the ledger cannot tell a retry from a second charge, and a field outside the contract is where tenant content leaks)");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
@@ -959,7 +999,7 @@ void CheckOutboxFallback(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: a refused charge must be kept for the relay, not dropped; outbox rows");
-  ctx.Assert(str(rows[0], "usage_id") == "u-1" && str(rows[0], "idempotency_key") == "k-1", "the outbox row must be the event itself, got %s", rows[0].dump());
+  ctx.Equal(rows[0], eventsEvent("1"), "the outbox row must be the event itself");
   ctx.Equal(ok, false, "publish_usage's result after a refused produce");
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
   ctx.Assert(publish_usage(eventsUsage("2", "t1", "gpt-4o")), "a healthy produce returns true");
@@ -969,7 +1009,7 @@ void CheckOutboxFallback(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = publish_usage(eventsUsage("3", "t1", "gpt-4o"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publish_usage waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publish_usage waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && str(rows[1], "usage_id") == "u-3", "no report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish_usage's result without a delivery report");
@@ -982,12 +1022,12 @@ void CheckNoContent(harness::Ctx& ctx) {
   ctx.Settle();
   ctx.Assert(!ctx.Kafka.Records(kEventsTopic).empty(), "the healthy report must reach the topic");
   for (const auto& value : ctx.Kafka.Values(kEventsTopic)) {
-    ctx.Assert(value.find("order 4417") == std::string::npos, "the event carries the completion text: %s; the topic is retained and replicated", value);
+    ctx.Assert(!leaks(value), "the event carries the completion text: %s; the topic is retained and replicated", value);
     const auto e = nlohmann::json::parse(value, nullptr, false);
     ctx.Assert(!e.is_object() || !e.contains("output_text"), "the event has an output_text field: %s", value);
   }
   for (const auto& row : ctx.Redis.LRange("billing:outbox", 0, -1)) {
-    ctx.Assert(row.find("order 4417") == std::string::npos, "the outbox row carries the completion text: %s", row);
+    ctx.Assert(!leaks(row), "the outbox row carries the completion text: %s", row);
   }
 }
 `,

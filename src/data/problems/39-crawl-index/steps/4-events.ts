@@ -42,7 +42,7 @@ index refused is announced and counted; a leader failover loses events only the 
       id: 'host-key',
       title: 'Keyed by host',
       detail:
-        "Every record's key is the URL's host, so a host's pages and their re-crawls stay on one partition in the order they were produced. The starter sends no key.",
+        "Every record's key, and the event's `host`, is the URL's host as `web.split_url` gives it (lower-cased, without a port), so a host's pages and their re-crawls stay on one partition in the order they were produced. The starter sends no key.",
       match: {
         python: {all: [/key\s*=\s*host\b/]},
         typescript: {all: [/key:\s*host\b/]},
@@ -55,7 +55,7 @@ index refused is announced and counted; a leader failover loses events only the 
       id: 'references-only',
       title: 'Carries references, never the page',
       detail:
-        'The payload is `{job_id, url, host, status, content_hash, body_ref}`: the page stays in the page store, and the topic, which is retained and replicated, carries where to find it. The starter copies the body into every event.',
+        'The payload is exactly `{job_id, url, host, status, content_hash, body_ref}`, no other field: the page stays in the page store, and the topic, which is retained and replicated, carries where to find it. The starter copies the body into every event.',
       match: {
         python: {all: [/["']body_ref["']\s*:/, /["']host["']\s*:/], none: [/["'](content|body|html)["']\s*:/]},
         typescript: {all: [/body_ref:/], none: [/\b(content|body|html):\s*page\.body/]},
@@ -591,10 +591,13 @@ def check_host_key(ctx):
     _index(m, BLOG, "/posts/2")
     _index(m, DOCS, "/guide")
     _index(m, BLOG, "/posts/1")
+    _index(m, "Blog.Example.com:8443", "/posts/3")
     recs = ctx.kafka.records(TOPIC)
-    assert len(recs) == 4, f"four indexed pages left {len(recs)} records on {TOPIC}"
+    assert len(recs) == 5, f"five indexed pages left {len(recs)} records on {TOPIC}"
     keys = [r.key for r in recs]
-    assert keys == [BLOG.encode(), BLOG.encode(), DOCS.encode(), BLOG.encode()], f"records must be keyed by the URL's host, got {keys}"
+    assert keys == [BLOG.encode(), BLOG.encode(), DOCS.encode(), BLOG.encode(), BLOG.encode()], f"records must be keyed by the URL's host as web.split_url gives it (lower-cased, no port; the last URL is https://Blog.Example.com:8443/posts/3), got {keys}"
+    host = _payload(recs[-1]).get("host")
+    assert host == BLOG, f"the event for https://Blog.Example.com:8443/posts/3 carries host {host!r}, expected {BLOG!r} as web.split_url gives it"
     partitions = {r.partition for r in recs if r.key == BLOG.encode()}
     assert len(partitions) == 1, f"{BLOG}'s pages landed on partitions {sorted(partitions)}: a host's pages and their re-crawls must stay on one partition, in order"
 
@@ -610,6 +613,7 @@ def check_references_only(ctx):
     expected = {"job_id": JOB, "url": _url(BLOG, "/posts/1"), "host": BLOG, "status": 200, "content_hash": "sha256:/posts/1", "body_ref": "pages/posts/1"}
     missing = {k: v for k, v in expected.items() if payload.get(k) != v}
     assert not missing, f"the event must carry {expected}; it has {payload}"
+    assert sorted(payload) == sorted(expected), f"the event carries the fields {sorted(payload)}: the payload is exactly {sorted(expected)}, an allow-list of references"
 
 
 def check_index_before_announce(ctx):
@@ -674,10 +678,13 @@ export async function check_host_key(ctx) {
   await index(world, BLOG, '/posts/2');
   await index(world, DOCS, '/guide');
   await index(world, BLOG, '/posts/1');
+  await index(world, 'Blog.Example.com:8443', '/posts/3');
   const recs = ctx.kafka.records(TOPIC);
-  assert.equal(recs.length, 4, \`four indexed pages left \${recs.length} records on \${TOPIC}\`);
+  assert.equal(recs.length, 5, \`five indexed pages left \${recs.length} records on \${TOPIC}\`);
   const keys = recs.map(r => r.key?.toString() ?? null);
-  assert.deepStrictEqual(keys, [BLOG, BLOG, DOCS, BLOG], \`records must be keyed by the URL's host, got \${JSON.stringify(keys)}\`);
+  assert.deepStrictEqual(keys, [BLOG, BLOG, DOCS, BLOG, BLOG], \`records must be keyed by the URL's host as splitUrl gives it (lower-cased, no port; the last URL is https://Blog.Example.com:8443/posts/3), got \${JSON.stringify(keys)}\`);
+  const host = payload(recs[4]).host;
+  assert.equal(host, BLOG, \`the event for https://Blog.Example.com:8443/posts/3 carries host \${JSON.stringify(host)}, expected \${BLOG} as splitUrl gives it\`);
   const partitions = [...new Set(recs.filter(r => r.key?.toString() === BLOG).map(r => r.partition))];
   assert.equal(partitions.length, 1, \`\${BLOG}'s pages landed on partitions \${JSON.stringify(partitions)}: a host's pages and their re-crawls must stay on one partition, in order\`);
 }
@@ -693,6 +700,7 @@ export async function check_references_only(ctx) {
   assert(!record.value.toString().includes('descale'), \`the event carries the page's text: \${record.value}\`);
   const expected = {job_id: JOB, url: url(BLOG, '/posts/1'), host: BLOG, status: 200, content_hash: 'sha256:/posts/1', body_ref: 'pages/posts/1'};
   for (const [k, v] of Object.entries(expected)) assert.equal(p[k], v, \`the event must carry \${JSON.stringify(expected)}; it has \${JSON.stringify(p)}\`);
+  assert.deepStrictEqual(Object.keys(p).sort(), Object.keys(expected).sort(), \`the event carries the fields \${JSON.stringify(Object.keys(p).sort())}: the payload is exactly \${JSON.stringify(Object.keys(expected).sort())}, an allow-list of references\`);
 }
 
 export async function check_index_before_announce(ctx) {
@@ -775,11 +783,13 @@ func CheckHostKey(ctx *harness.Ctx) {
 	mustIndex(ctx, eventBlog, "/posts/2")
 	mustIndex(ctx, eventDocs, "/guide")
 	mustIndex(ctx, eventBlog, "/posts/1")
+	mustIndex(ctx, "Blog.Example.com:8443", "/posts/3")
 	recs := ctx.Kafka.Records(topic)
-	ctx.Equal(len(recs), 4, "four indexed pages; the records on %s", topic)
+	ctx.Equal(len(recs), 5, "five indexed pages; the records on %s", topic)
 	keys := ctx.Kafka.Keys(topic)
 	sort.Strings(keys)
-	ctx.Equal(keys, []string{eventBlog, eventBlog, eventBlog, eventDocs}, "records must be keyed by the URL's host; the keys")
+	ctx.Equal(keys, []string{eventBlog, eventBlog, eventBlog, eventBlog, eventDocs}, "records must be keyed by the URL's host as web.SplitURL gives it (lower-cased, no port; one URL is https://Blog.Example.com:8443/posts/3); the keys")
+	ctx.Equal(payloadOf(ctx, recs[4].Value)["host"], eventBlog, "the event for https://Blog.Example.com:8443/posts/3 must carry the host as web.SplitURL gives it; its host")
 	partitions := map[int]bool{}
 	for _, r := range recs {
 		if string(r.Key) == eventBlog {
@@ -802,6 +812,7 @@ func CheckReferencesOnly(ctx *harness.Ctx) {
 	for k, v := range expected {
 		ctx.Equal(p[k], v, "the event must carry %v; it has %v; its %s", expected, p, k)
 	}
+	ctx.Equal(len(p), len(expected), "the payload is exactly %v, an allow-list of references; it has %v; its field count", expected, p)
 }
 
 func CheckIndexBeforeAnnounce(ctx *harness.Ctx) {
@@ -878,9 +889,11 @@ void CheckHostKey(harness::Ctx& ctx) {
   mustIndex(ctx, kBlog, "/posts/2");
   mustIndex(ctx, kDocs, "/guide");
   mustIndex(ctx, kBlog, "/posts/1");
+  mustIndex(ctx, "Blog.Example.com:8443", "/posts/3");
   const auto recs = ctx.Kafka.Records(kTopic);
-  ctx.Equal(recs.size(), 4, "four indexed pages; the records on %s", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {kBlog, kBlog, kDocs, kBlog}, "records must be keyed by the URL's host; the keys");
+  ctx.Equal(recs.size(), 5, "five indexed pages; the records on %s", kTopic);
+  ctx.Equal(ctx.Kafka.Keys(kTopic), {kBlog, kBlog, kDocs, kBlog, kBlog}, "records must be keyed by the URL's host as web::splitUrl gives it (lower-cased, no port; the last URL is https://Blog.Example.com:8443/posts/3); the keys");
+  ctx.Equal(payloadOf(ctx, recs.at(4)).value("host", ""), kBlog, "the event for https://Blog.Example.com:8443/posts/3 must carry the host as web::splitUrl gives it; its host");
   std::set<int> partitions;
   for (const auto& r : recs) {
     if (r.Key && *r.Key == kBlog) partitions.insert(r.Partition);
@@ -900,6 +913,7 @@ void CheckReferencesOnly(harness::Ctx& ctx) {
   for (const auto& [k, v] : expected.items()) {
     ctx.Assert(p.contains(k) && p[k] == v, "the event must carry %s; it has %s", expected.dump(), p.dump());
   }
+  ctx.Equal(p.size(), expected.size(), "the payload is exactly %s, an allow-list of references; it has %s; its field count", expected.dump(), p.dump());
 }
 
 void CheckIndexBeforeAnnounce(harness::Ctx& ctx) {

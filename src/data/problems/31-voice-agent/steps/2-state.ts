@@ -70,7 +70,7 @@ silent stays in Redis.
       id: 'stale-frame',
       title: 'A late frame of an interrupted answer is dropped',
       detail:
-        "`record_frame`'s script compares the stored `turn_index` with the frame's turn and returns 0 without writing once barge-in moved the session on; the starter writes every frame.",
+        "`record_frame`'s script compares the stored `turn_index` (0 for an absent key) with the frame's turn and returns 0 without writing unless they are equal, so a frame of an interrupted answer, or of a turn the session has not reached, is dropped; the starter writes every frame.",
       match: {
         python: {all: [/redis\.call\(\s*['"]HGET['"],\s*KEYS\[1\],\s*['"]turn_index['"]\s*\)/, /return 0/]},
         typescript: {all: [/redis\.call\(\s*['"]HGET['"],\s*KEYS\[1\],\s*['"]turn_index['"]\s*\)/, /return 0/]},
@@ -83,7 +83,7 @@ silent stays in Redis.
       id: 'truncate',
       title: 'Truncates the answer at what the caller heard',
       detail:
-        '`barge_in` stores and returns `math.min(sent, heard_tokens)`: the stream runs ahead of playback, so the offset it sent is not what the caller heard.',
+        '`barge_in` stores and returns `math.min(sent, heard_tokens)`, reading `sent` in the same script, so a frame that lands during the barge-in cannot be lost: the stream runs ahead of playback, so the offset it sent is not what the caller heard.',
       match: {
         python: {all: [/math\.min\(/]},
         typescript: {all: [/math\.min\(/]},
@@ -96,7 +96,7 @@ silent stays in Redis.
       id: 'ttl-refresh',
       title: 'Turn state expires 30 s after the last frame',
       detail:
-        'Both scripts `EXPIRE` the key for `STATE_TTL_S` (30), so every frame and every barge-in refresh it and a silent call ends; the starter never sets an expiry.',
+        'Both scripts `EXPIRE` the key for `STATE_TTL_S` (30) themselves, so the key never exists without a TTL and every frame and every barge-in refresh it; a silent call ends. The starter never sets an expiry.',
       match: {
         python: {all: [/STATE_TTL_S\s*=\s*30/, /redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/STATE_TTL_S\s*=\s*30/, /redis\.call\(\s*['"]EXPIRE['"]/]},
@@ -646,6 +646,10 @@ def check_stale_frame(ctx):
     assert state is not None and state["current_speaker"] == "user" and state["turn_index"] == 1, f"a late frame of turn 0 changed the state to {state}: the agent took the floor back from the caller"
     assert m.record_frame("vs-1", 1, 3) is True, "a frame of the current turn (1) must be recorded"
     assert m.read_state("vs-1") == {"current_speaker": "agent", "turn_index": 1, "tts_offset": 3}, f"after a frame of turn 1 the state is {m.read_state('vs-1')}"
+    future = m.record_frame("vs-1", 2, 9)
+    assert future is False and m.read_state("vs-1") == {"current_speaker": "agent", "turn_index": 1, "tts_offset": 3}, f"a frame of turn 2 arrived while the session is on turn 1 and was applied (state {m.read_state('vs-1')}): a frame counts only while turn_index is its own turn"
+    orphan = m.record_frame("vs-3", 1, 5)
+    assert orphan is False and m.read_state("vs-3") is None, f"a frame of turn 1 for a session with no state was applied (state {m.read_state('vs-3')}): an absent key is turn 0"
 
 
 def check_truncate(ctx):
@@ -658,6 +662,14 @@ def check_truncate(ctx):
     m.record_frame("vs-2", 0, 12)
     stop = m.barge_in("vs-2", 30)
     assert stop == 12, f"barge_in claimed {stop} tokens heard when the stream had sent 12: the caller cannot have heard more than was sent"
+    m.record_frame("vs-3", 0, 12)
+    # Playback reports token 20 of turn 0 the instant the barge-in's first command has run.
+    rival = ctx.redis_after("voice:state:vs-3", lambda: m.record_frame("vs-3", 0, 20))
+    stop = m.barge_in("vs-3", 30)
+    applied = _settled(rival, "voice:state:vs-3")
+    expected = 20 if applied else 12
+    state = m.read_state("vs-3")
+    assert stop == expected and state is not None and state["tts_offset"] == expected, f"a frame of turn 0 played up to token 20 raced the barge-in and was {'recorded' if applied else 'dropped'}, yet barge_in stopped at {stop} with the state {state}: expected {expected}. Read what was sent and truncate in the same script"
 
 
 def check_ttl_refresh(ctx):
@@ -675,6 +687,15 @@ def check_ttl_refresh(ctx):
     ctx.clock.advance(31)
     assert not ctx.redis.exists(KEY), "31 s after the last write the state is still there: a silent call must end"
     assert m.read_state("vs-1") is None, "an expired state must read as None"
+    created = ctx.redis_after("voice:state:vs-2", lambda: ctx.redis.ttl("voice:state:vs-2"))
+    m.record_frame("vs-2", 0, 5)
+    first = _settled(created, "voice:state:vs-2")
+    assert 0 < first <= 30, f"right after the frame's script created voice:state:vs-2 its TTL was {first}: set the expiry in the same script, so the key never exists without one"
+    ctx.clock.advance(20)
+    refreshed = ctx.redis_after("voice:state:vs-2", lambda: ctx.redis.ttl("voice:state:vs-2"))
+    m.barge_in("vs-2", 3)
+    ttl = _settled(refreshed, "voice:state:vs-2")
+    assert ttl > 25, f"right after the barge-in's script ran, voice:state:vs-2 had TTL {ttl}: refresh the expiry in the same script"
 `,
     typescript: `const KEY = 'voice:state:vs-1';
 const BEFORE = {current_speaker: 'agent', turn_index: 0, tts_offset: 40};
@@ -721,6 +742,12 @@ export async function check_stale_frame(ctx) {
   assert.equal(await m.recordFrame('vs-1', 1, 3), true, 'a frame of the current turn (1) must be recorded');
   const now = await m.readState('vs-1');
   assert(same(now, {current_speaker: 'agent', turn_index: 1, tts_offset: 3}), \`after a frame of turn 1 the state is \${JSON.stringify(now)}\`);
+  const future = await m.recordFrame('vs-1', 2, 9);
+  const still = await m.readState('vs-1');
+  assert(future === false && same(still, {current_speaker: 'agent', turn_index: 1, tts_offset: 3}), \`a frame of turn 2 arrived while the session is on turn 1 and was applied (state \${JSON.stringify(still)}): a frame counts only while turn_index is its own turn\`);
+  const orphan = await m.recordFrame('vs-3', 1, 5);
+  const none = await m.readState('vs-3');
+  assert(orphan === false && none === null, \`a frame of turn 1 for a session with no state was applied (state \${JSON.stringify(none)}): an absent key is turn 0\`);
 }
 
 export async function check_truncate(ctx) {
@@ -733,6 +760,14 @@ export async function check_truncate(ctx) {
   await m.recordFrame('vs-2', 0, 12);
   stop = await m.bargeIn('vs-2', 30);
   assert.equal(stop, 12, \`bargeIn claimed \${stop} tokens heard when the stream had sent 12: the caller cannot have heard more than was sent\`);
+  await m.recordFrame('vs-3', 0, 12);
+  // Playback reports token 20 of turn 0 the instant the barge-in's first command has run.
+  const rival = ctx.redisAfter('voice:state:vs-3', () => m.recordFrame('vs-3', 0, 20));
+  stop = await m.bargeIn('vs-3', 30);
+  const applied = await settled(rival, 'voice:state:vs-3');
+  const expected = applied ? 20 : 12;
+  const raced = await m.readState('vs-3');
+  assert(stop === expected && raced !== null && raced.tts_offset === expected, \`a frame of turn 0 played up to token 20 raced the barge-in and was \${applied ? 'recorded' : 'dropped'}, yet bargeIn stopped at \${stop} with the state \${JSON.stringify(raced)}: expected \${expected}. Read what was sent and truncate in the same script\`);
 }
 
 export async function check_ttl_refresh(ctx) {
@@ -750,6 +785,15 @@ export async function check_ttl_refresh(ctx) {
   ctx.clock.advance(31);
   assert.equal(ctx.redis.exists(KEY), 0, '31 s after the last write the state is still there: a silent call must end');
   assert.equal(await m.readState('vs-1'), null, 'an expired state must read as null');
+  const created = ctx.redisAfter('voice:state:vs-2', () => Number(ctx.redis.ttl('voice:state:vs-2')));
+  await m.recordFrame('vs-2', 0, 5);
+  const first = await settled(created, 'voice:state:vs-2');
+  assert(0 < first && first <= 30, \`right after the frame's script created voice:state:vs-2 its TTL was \${first}: set the expiry in the same script, so the key never exists without one\`);
+  ctx.clock.advance(20);
+  const refreshed = ctx.redisAfter('voice:state:vs-2', () => Number(ctx.redis.ttl('voice:state:vs-2')));
+  await m.bargeIn('vs-2', 3);
+  const ttl2 = await settled(refreshed, 'voice:state:vs-2');
+  assert(ttl2 > 25, \`right after the barge-in's script ran, voice:state:vs-2 had TTL \${ttl2}: refresh the expiry in the same script\`);
 }
 `,
     go: `package main
@@ -823,6 +867,12 @@ func CheckStaleFrame(ctx *harness.Ctx) {
 	ctx.Assert(state.CurrentSpeaker == "user" && state.TurnIndex == 1, "a late frame of turn 0 changed the state to %+v: the agent took the floor back from the caller", state)
 	ctx.Equal(mustFrame(ctx, "vs-1", 1, 3), true, "a frame of the current turn (1) must be recorded; applied")
 	ctx.Equal(mustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "agent", TurnIndex: 1, TTSOffset: 3}, "after a frame of turn 1, the state")
+	ctx.Equal(mustFrame(ctx, "vs-1", 2, 9), false, "a frame of turn 2 arrived while the session is on turn 1: a frame counts only while turn_index is its own turn; applied")
+	ctx.Equal(mustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "agent", TurnIndex: 1, TTSOffset: 3}, "after a frame of turn 2 on turn 1, the state")
+	ctx.Equal(mustFrame(ctx, "vs-3", 1, 5), false, "a frame of turn 1 for a session with no state (an absent key is turn 0); applied")
+	orphan, err := readState(stateBg, "vs-3")
+	ctx.NoError(err, "readState(vs-3) failed")
+	ctx.Assert(orphan == nil, "a dropped frame of turn 1 left state %+v for a session that had none", orphan)
 }
 
 func CheckTruncate(ctx *harness.Ctx) {
@@ -831,6 +881,22 @@ func CheckTruncate(ctx *harness.Ctx) {
 	ctx.Equal(mustState(ctx, "vs-1"), TurnState{CurrentSpeaker: "user", TurnIndex: 1, TTSOffset: 25}, "after the barge-in, the state")
 	mustFrame(ctx, "vs-2", 0, 12)
 	ctx.Equal(mustBargeIn(ctx, "vs-2", 30), 12, "the stream had sent 12 tokens and the caller cannot have heard more; bargeIn returned")
+	mustFrame(ctx, "vs-3", 0, 12)
+	// Playback reports token 20 of turn 0 the instant the barge-in's first command has run.
+	applied := false
+	rival := ctx.Redis.After("voice:state:vs-3", func() any {
+		ok, err := recordFrame(stateBg, "vs-3", 0, 20)
+		applied = ok
+		return err
+	})
+	stop := mustBargeIn(ctx, "vs-3", 30)
+	ctx.Assert(rival.Fired, "nothing touched voice:state:vs-3")
+	expected := 12
+	if applied {
+		expected = 20
+	}
+	raced := mustState(ctx, "vs-3")
+	ctx.Assert(stop == expected && raced.TTSOffset == expected, "a frame of turn 0 played up to token 20 raced the barge-in (recorded: %v), yet bargeIn stopped at %d with the state %+v: expected %d. Read what was sent and truncate in the same script", applied, stop, raced, expected)
 }
 
 func CheckTtlRefresh(ctx *harness.Ctx) {
@@ -849,6 +915,23 @@ func CheckTtlRefresh(ctx *harness.Ctx) {
 	s, err := readState(stateBg, "vs-1")
 	ctx.NoError(err, "readState of an expired state failed")
 	ctx.Assert(s == nil, "an expired state must read as nil, got %+v", s)
+	const k2 = "voice:state:vs-2"
+	var first, refreshed int64
+	created := ctx.Redis.After(k2, func() any {
+		first = ctx.Redis.TTL(k2)
+		return nil
+	})
+	mustFrame(ctx, "vs-2", 0, 5)
+	ctx.Assert(created.Fired, "nothing touched %s", k2)
+	ctx.Assert(0 < first && first <= 30, "right after the frame's script created %s its TTL was %d: set the expiry in the same script, so the key never exists without one", k2, first)
+	ctx.Clock.Advance(20)
+	again := ctx.Redis.After(k2, func() any {
+		refreshed = ctx.Redis.TTL(k2)
+		return nil
+	})
+	mustBargeIn(ctx, "vs-2", 3)
+	ctx.Assert(again.Fired, "nothing touched %s", k2)
+	ctx.Assert(refreshed > 25, "right after the barge-in's script ran, %s had TTL %d: refresh the expiry in the same script", k2, refreshed)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -924,6 +1007,11 @@ void CheckStaleFrame(harness::Ctx& ctx) {
   ctx.Equal(recordFrame("vs-1", 1, 3), true, "a frame of the current turn (1) must be recorded; applied");
   const TurnState now = mustState(ctx, "vs-1");
   ctx.Assert(same(now, TurnState{"agent", 1, 3}), "after a frame of turn 1 the state is %s", show(now));
+  ctx.Equal(recordFrame("vs-1", 2, 9), false, "a frame of turn 2 arrived while the session is on turn 1: a frame counts only while turn_index is its own turn; applied");
+  const TurnState still = mustState(ctx, "vs-1");
+  ctx.Assert(same(still, TurnState{"agent", 1, 3}), "after a frame of turn 2 on turn 1 the state is %s", show(still));
+  ctx.Equal(recordFrame("vs-3", 1, 5), false, "a frame of turn 1 for a session with no state (an absent key is turn 0); applied");
+  ctx.Assert(!readState("vs-3").has_value(), "a dropped frame of turn 1 left state %s for a session that had none", show(readState("vs-3")));
 }
 
 void CheckTruncate(harness::Ctx& ctx) {
@@ -933,6 +1021,21 @@ void CheckTruncate(harness::Ctx& ctx) {
   ctx.Assert(same(state, TurnState{"user", 1, 25}), "after the barge-in the state is %s, expected the caller on turn 1 at offset 25", show(state));
   recordFrame("vs-2", 0, 12);
   ctx.Equal(bargeIn("vs-2", 30), 12, "the stream had sent 12 tokens and the caller cannot have heard more; bargeIn returned");
+  recordFrame("vs-3", 0, 12);
+  // Playback reports token 20 of turn 0 the instant the barge-in's first command has run.
+  auto fired = std::make_shared<bool>(false);
+  auto applied = std::make_shared<bool>(false);
+  ctx.Redis.After("voice:state:vs-3", [fired, applied] {
+    *fired = true;
+    *applied = recordFrame("vs-3", 0, 20);
+  });
+  const long stop = bargeIn("vs-3", 30);
+  ctx.Assert(*fired, "nothing touched voice:state:vs-3");
+  const long expected = *applied ? 20 : 12;
+  const TurnState raced = mustState(ctx, "vs-3");
+  ctx.Assert(stop == expected && raced.tts_offset == expected,
+             "a frame of turn 0 played up to token 20 raced the barge-in (recorded: %v), yet bargeIn stopped at %d with the state %s: expected %d. Read what was sent and truncate in the same script",
+             *applied, stop, show(raced), expected);
 }
 
 void CheckTtlRefresh(harness::Ctx& ctx) {
@@ -949,6 +1052,16 @@ void CheckTtlRefresh(harness::Ctx& ctx) {
   ctx.Clock.Advance(31);
   ctx.Equal(ctx.Redis.Exists(kKey), 0, "31 s after the last write the state must be gone (a silent call ends); exists");
   ctx.Assert(!readState("vs-1").has_value(), "an expired state must read as none");
+  const std::string k2 = "voice:state:vs-2";
+  auto first = std::make_shared<long long>(-3);
+  ctx.Redis.After(k2, [&ctx, k2, first] { *first = ctx.Redis.TTL(k2); });
+  recordFrame("vs-2", 0, 5);
+  ctx.Assert(0 < *first && *first <= 30, "right after the frame's script created %s its TTL was %d: set the expiry in the same script, so the key never exists without one", k2, *first);
+  ctx.Clock.Advance(20);
+  auto refreshed = std::make_shared<long long>(-3);
+  ctx.Redis.After(k2, [&ctx, k2, refreshed] { *refreshed = ctx.Redis.TTL(k2); });
+  bargeIn("vs-2", 3);
+  ctx.Assert(*refreshed > 25, "right after the barge-in's script ran, %s had TTL %d: refresh the expiry in the same script", k2, *refreshed);
 }
 `,
   },

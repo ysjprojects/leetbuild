@@ -106,7 +106,7 @@ answered 429 keeps being fetched; and every host ever crawled keeps a bucket in 
       id: 'refill-cap',
       title: 'Tokens are capped at BURST',
       detail:
-        'The refill is `min(burst, tokens + elapsed_ms * rate / 60000)`: a host idle for an hour gets `BURST` URLs, then one per refill interval. The starter adds the elapsed time without a cap.',
+        'The refill is `min(burst, tokens + elapsed_ms * rate / 60000)`: a host idle for an hour gets `BURST` URLs, then one per refill interval, and a take on an empty queue spends no token. The starter adds the elapsed time without a cap.',
       match: {
         python: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
         typescript: {all: [/math\.min\(\s*burst|tokens\s*>\s*burst/]},
@@ -132,7 +132,7 @@ answered 429 keeps being fetched; and every host ever crawled keeps a bucket in 
       id: 'bucket-ttl',
       title: "An idle host's bucket expires",
       detail:
-        "Every take sets the bucket's expiry to `BUCKET_TTL_MS` (`PEXPIRE`), so a host the crawl stopped visiting stops costing memory; after an hour its bucket would be full anyway. The starter writes buckets that never expire.",
+        "Every take sets the bucket's expiry to the full `BUCKET_TTL_MS` (`PEXPIRE`) in the same script that writes the bucket, so a host the crawl stopped visiting stops costing memory; after an hour its bucket would be full anyway. The starter writes buckets that never expire.",
       match: {
         python: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BUCKET_TTL_MS/]},
         typescript: {all: [/P?EXPIRE['"]|\.p?expire\(/i, /BUCKET_TTL_MS/]},
@@ -794,10 +794,11 @@ def check_atomic_take(ctx):
 
 def check_refill_cap(ctx):
     m = ctx.load("state")
+    assert m.take(JOB, BLOG, 60) is None, "a take on an empty queue must answer None"
     for n in range(8):
         m.enqueue(JOB, BLOG, _url(BLOG, n))
     first = [m.take(JOB, BLOG, 60) for _ in range(3)]
-    assert None not in first[:2] and first[2] is None, f"a new bucket holds BURST = 2 tokens: three takes answered {first}"
+    assert None not in first[:2] and first[2] is None, f"a new bucket holds BURST = 2 tokens and a take on an empty queue spends none: three takes answered {first}"
     ctx.clock.advance(0.5)
     assert m.take(JOB, BLOG, 60) is None, "half a second at 60 per minute refills half a token: the take must answer None"
     ctx.clock.advance(0.5)
@@ -826,11 +827,21 @@ def check_throttle(ctx):
 def check_bucket_ttl(ctx):
     m = ctx.load("state")
     m.enqueue(JOB, BLOG, _url(BLOG, 1))
-    m.take(JOB, BLOG, 60)
+    m.enqueue(JOB, BLOG, _url(BLOG, 2))
     key = f"bucket:{JOB}:{BLOG}"
+    probe = ctx.redis_after(key, lambda: ctx.redis.pttl(key))
+    m.take(JOB, BLOG, 60)
+    assert probe.fired, f"take never touched {key}"
+    assert probe.result is not None and probe.result > 0, f"right after the command that wrote {key} its PTTL was {probe.result}: the expiry is set in the same script as the write, or a crash in between leaves a bucket that never expires"
     ttl = ctx.redis.pttl(key)
-    assert 0 < ttl <= 3_600_000, f"{key} has PTTL {ttl}: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis"
-    ctx.clock.advance(3601)
+    assert 3_590_000 <= ttl <= 3_600_000, f"{key} has PTTL {ttl}: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis"
+    ctx.clock.advance(3000)
+    assert m.take(JOB, BLOG, 60) == _url(BLOG, 2), "the host's second URL must be handed out 3000 s later"
+    ttl = ctx.redis.pttl(key)
+    assert 3_590_000 <= ttl <= 3_600_000, f"{key} has PTTL {ttl} right after a take: every take sets the expiry to BUCKET_TTL_MS again, not only the take that created the bucket"
+    ctx.clock.advance(3590)
+    assert ctx.redis.exists(key), f"{key} expired before an hour had passed since the host's last take"
+    ctx.clock.advance(11)
     assert not ctx.redis.exists(key), f"an hour after the host's last take {key} is still in Redis"
 `,
     typescript: `const JOB = 'nightly';
@@ -869,9 +880,10 @@ export async function check_atomic_take(ctx) {
 
 export async function check_refill_cap(ctx) {
   const m = ctx.load('state');
+  assert.equal(await m.take(JOB, BLOG, 60), null, 'a take on an empty queue must answer null');
   for (let n = 0; n < 8; n++) await m.enqueue(JOB, BLOG, url(BLOG, n));
   const first = [await m.take(JOB, BLOG, 60), await m.take(JOB, BLOG, 60), await m.take(JOB, BLOG, 60)];
-  assert(first[0] !== null && first[1] !== null && first[2] === null, \`a new bucket holds BURST = 2 tokens: three takes answered \${JSON.stringify(first)}\`);
+  assert(first[0] !== null && first[1] !== null && first[2] === null, \`a new bucket holds BURST = 2 tokens and a take on an empty queue spends none: three takes answered \${JSON.stringify(first)}\`);
   ctx.clock.advance(0.5);
   assert.equal(await m.take(JOB, BLOG, 60), null, 'half a second at 60 per minute refills half a token: the take must answer null');
   ctx.clock.advance(0.5);
@@ -900,11 +912,22 @@ export async function check_throttle(ctx) {
 export async function check_bucket_ttl(ctx) {
   const m = ctx.load('state');
   await m.enqueue(JOB, BLOG, url(BLOG, 1));
-  await m.take(JOB, BLOG, 60);
+  await m.enqueue(JOB, BLOG, url(BLOG, 2));
   const key = \`bucket:\${JOB}:\${BLOG}\`;
-  const ttl = ctx.redis.pttl(key);
-  assert(ttl > 0 && ttl <= 3_600_000, \`\${key} has PTTL \${ttl}: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis\`);
-  ctx.clock.advance(3601);
+  const probe = ctx.redisAfter(key, () => ctx.redis.pttl(key));
+  await m.take(JOB, BLOG, 60);
+  assert(probe.fired, \`take never touched \${key}\`);
+  const early = await probe.result;
+  assert(typeof early === 'number' && early > 0, \`right after the command that wrote \${key} its PTTL was \${early}: the expiry is set in the same script as the write, or a crash in between leaves a bucket that never expires\`);
+  let ttl = ctx.redis.pttl(key);
+  assert(ttl >= 3_590_000 && ttl <= 3_600_000, \`\${key} has PTTL \${ttl}: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis\`);
+  ctx.clock.advance(3000);
+  assert.equal(await m.take(JOB, BLOG, 60), url(BLOG, 2), "the host's second URL must be handed out 3000 s later");
+  ttl = ctx.redis.pttl(key);
+  assert(ttl >= 3_590_000 && ttl <= 3_600_000, \`\${key} has PTTL \${ttl} right after a take: every take sets the expiry to BUCKET_TTL_MS again, not only the take that created the bucket\`);
+  ctx.clock.advance(3590);
+  assert.equal(ctx.redis.exists(key), 1, \`\${key} expired before an hour had passed since the host's last take\`);
+  ctx.clock.advance(11);
   assert.equal(ctx.redis.exists(key), 0, \`an hour after the host's last take \${key} is still in Redis\`);
 }
 `,
@@ -976,11 +999,12 @@ func CheckAtomicTake(ctx *harness.Ctx) {
 }
 
 func CheckRefillCap(ctx *harness.Ctx) {
+	ctx.Equal(mustTake(ctx, blogHost, 60), "", "a take on an empty queue must answer nothing")
 	for n := 0; n < 8; n++ {
 		mustEnqueue(ctx, blogHost, n)
 	}
 	first := []string{mustTake(ctx, blogHost, 60), mustTake(ctx, blogHost, 60), mustTake(ctx, blogHost, 60)}
-	ctx.Assert(first[0] != "" && first[1] != "" && first[2] == "", "a new bucket holds BURST = 2 tokens: three takes answered %q", first)
+	ctx.Assert(first[0] != "" && first[1] != "" && first[2] == "", "a new bucket holds BURST = 2 tokens and a take on an empty queue spends none: three takes answered %q", first)
 	ctx.Clock.Advance(0.5)
 	ctx.Equal(mustTake(ctx, blogHost, 60), "", "half a second at 60 per minute refills half a token: the take must answer nothing")
 	ctx.Clock.Advance(0.5)
@@ -1010,11 +1034,22 @@ func CheckThrottle(ctx *harness.Ctx) {
 
 func CheckBucketTtl(ctx *harness.Ctx) {
 	mustEnqueue(ctx, blogHost, 1)
-	mustTake(ctx, blogHost, 60)
+	mustEnqueue(ctx, blogHost, 2)
 	key := "bucket:" + stateJob + ":" + blogHost
+	probe := ctx.Redis.After(key, func() any { return ctx.Redis.PTTL(key) })
+	mustTake(ctx, blogHost, 60)
+	ctx.Assert(probe.Fired, "take never touched %s", key)
+	early, _ := probe.Result.(int64)
+	ctx.Assert(early > 0, "right after the command that wrote %s its PTTL was %d: the expiry is set in the same script as the write, or a crash in between leaves a bucket that never expires", key, early)
 	ttl := ctx.Redis.PTTL(key)
-	ctx.Assert(ttl > 0 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl)
-	ctx.Clock.Advance(3601)
+	ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire BUCKET_TTL_MS (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl)
+	ctx.Clock.Advance(3000)
+	ctx.Equal(mustTake(ctx, blogHost, 60), pageURL(blogHost, 2), "the host's second URL must be handed out 3000 s later")
+	ttl = ctx.Redis.PTTL(key)
+	ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d right after a take: every take sets the expiry to BUCKET_TTL_MS again, not only the take that created the bucket", key, ttl)
+	ctx.Clock.Advance(3590)
+	ctx.Equal(ctx.Redis.Exists(key), 1, "%s expired before an hour had passed since the host's last take", key)
+	ctx.Clock.Advance(11)
 	ctx.Equal(ctx.Redis.Exists(key), 0, "an hour after the host's last take %s is still in Redis", key)
 }
 `,
@@ -1072,9 +1107,10 @@ void CheckAtomicTake(harness::Ctx& ctx) {
 }
 
 void CheckRefillCap(harness::Ctx& ctx) {
+  ctx.Equal(taken(take(kJob, kBlog, 60)), "", "a take on an empty queue must answer nothing");
   for (int n = 0; n < 8; n++) enqueue(kJob, kBlog, pageUrl(kBlog, n));
   const std::vector<std::string> first = {taken(take(kJob, kBlog, 60)), taken(take(kJob, kBlog, 60)), taken(take(kJob, kBlog, 60))};
-  ctx.Assert(!first[0].empty() && !first[1].empty() && first[2].empty(), "a new bucket holds kBurst = 2 tokens: three takes answered %q", first);
+  ctx.Assert(!first[0].empty() && !first[1].empty() && first[2].empty(), "a new bucket holds kBurst = 2 tokens and a take on an empty queue spends none: three takes answered %q", first);
   ctx.Clock.Advance(0.5);
   ctx.Equal(taken(take(kJob, kBlog, 60)), "", "half a second at 60 per minute refills half a token: the take must answer nothing");
   ctx.Clock.Advance(0.5);
@@ -1102,11 +1138,26 @@ void CheckThrottle(harness::Ctx& ctx) {
 
 void CheckBucketTtl(harness::Ctx& ctx) {
   enqueue(kJob, kBlog, pageUrl(kBlog, 1));
-  take(kJob, kBlog, 60);
+  enqueue(kJob, kBlog, pageUrl(kBlog, 2));
   const std::string key = "bucket:" + kJob + ":" + kBlog;
-  const long long ttl = ctx.Redis.PTTL(key);
-  ctx.Assert(ttl > 0 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire kBucketTtlMs (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl);
-  ctx.Clock.Advance(3601);
+  auto fired = std::make_shared<bool>(false);
+  auto early = std::make_shared<long long>(0);
+  ctx.Redis.After(key, [&ctx, key, fired, early] {
+    *fired = true;
+    *early = ctx.Redis.PTTL(key);
+  });
+  take(kJob, kBlog, 60);
+  ctx.Assert(*fired, "take never touched %s", key);
+  ctx.Assert(*early > 0, "right after the command that wrote %s its PTTL was %d: the expiry is set in the same script as the write, or a crash in between leaves a bucket that never expires", key, *early);
+  long long ttl = ctx.Redis.PTTL(key);
+  ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d: a bucket must expire kBucketTtlMs (one hour) after its last take, or every host ever crawled stays in Redis", key, ttl);
+  ctx.Clock.Advance(3000);
+  ctx.Equal(taken(take(kJob, kBlog, 60)), pageUrl(kBlog, 2), "the host's second URL must be handed out 3000 s later");
+  ttl = ctx.Redis.PTTL(key);
+  ctx.Assert(ttl >= 3590000 && ttl <= 3600000, "%s has PTTL %d right after a take: every take sets the expiry to kBucketTtlMs again, not only the take that created the bucket", key, ttl);
+  ctx.Clock.Advance(3590);
+  ctx.Equal(ctx.Redis.Exists(key), 1, "%s expired before an hour had passed since the host's last take", key);
+  ctx.Clock.Advance(11);
   ctx.Equal(ctx.Redis.Exists(key), 0, "an hour after the host's last take %s is still in Redis", key);
 }
 `,

@@ -80,7 +80,7 @@ lost.
       id: 'outbox',
       title: 'Falls back to the outbox on a failed or missing delivery report',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter only catches the error `produce` raises while enqueueing.',
+        'A failed delivery, or no report within 2 s (the call gives up by then), leaves an outbox row with the topic, the key and the whole payload, `old_name` and `version` included, and the call returns false. The starter only catches the error `produce` raises while enqueueing.',
       match: {
         python: {
           all: [/on_delivery\s*=|callback\s*=/, /producer\.flush\(/, /store\.insert_outbox\(/],
@@ -539,10 +539,19 @@ def check_payload_fields(ctx):
 def check_after_commit(ctx):
     m = ctx.load("events")
     (ada,) = _entities("Ada")
-    probe = ctx.redis_after(f"entity:{ada}", lambda: len(ctx.kafka.records(TOPIC)))
+    at_commit = []
+
+    def watch():
+        # The topic at the command that commits the new name; a read of the entity before it decides nothing.
+        if ctx.redis.hget(f"entity:{ada}", "name") != "Ada Lovelace":
+            ctx.redis_after(f"entity:{ada}", watch)
+        elif not at_commit:
+            at_commit.append(len(ctx.kafka.records(TOPIC)))
+
+    ctx.redis_after(f"entity:{ada}", watch)
     m.rename_entity("t1", ada, "Ada Lovelace")
-    assert probe.fired, f"rename_entity never committed the rename (nothing touched entity:{ada})"
-    assert probe.result == 0, f"when the rename reached the store the topic already held {probe.result} record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce"
+    assert at_commit, f"rename_entity never committed the rename (entity:{ada} never got the new name)"
+    assert at_commit[0] == 0, f"when the rename reached the store the topic already held {at_commit[0]} record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce"
     assert len(ctx.kafka.records(TOPIC)) == 1, "the event must still be produced after the commit"
     try:
         m.rename_entity("t1", "e-404", "Nobody")
@@ -559,13 +568,14 @@ def check_outbox(ctx):
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: the rename is committed and no consumer will ever hear of it"
     assert rows[0].get("topic") == TOPIC and rows[0].get("key") == ada and rows[0].get("payload", {}).get("new_name") == "Ada Lovelace", f"the outbox row is {rows[0]}, expected the topic, the key {ada} and the payload"
+    assert rows[0]["payload"].get("old_name") == "Ada" and rows[0]["payload"].get("version") == 2, f"the outbox payload is {rows[0]['payload']}: the relay produces it later, so it is the event itself, old_name and version included"
     assert ok is False, f"rename_entity returned {ok!r} after a failed delivery, expected False"
     assert store.get_entity(ada)["name"] == "Ada Lovelace", "the rename must stay committed when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.rename_entity("t1", grace, "Grace Hopper")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"rename_entity waited {waited:.0f} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"rename_entity waited {waited:.1f} s for a broker that does not answer: wait for the delivery report at most 2 s (ACK_TIMEOUT_S), then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("key") == grace, f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"rename_entity returned {ok!r} without a delivery report, expected False"
@@ -618,11 +628,17 @@ export async function check_payload_fields(ctx) {
 export async function check_after_commit(ctx) {
   const {m, ids} = await world(ctx, 'Ada');
   const [ada] = ids;
-  const probe = ctx.redisAfter(\`entity:\${ada}\`, () => ctx.kafka.records(TOPIC).length);
+  const atCommit: number[] = [];
+  // The topic at the command that commits the new name; a read of the entity before it decides nothing.
+  const watch = (): void => {
+    if (ctx.redis.hget(\`entity:\${ada}\`, 'name') !== 'Ada Lovelace') ctx.redisAfter(\`entity:\${ada}\`, watch);
+    else if (atCommit.length === 0) atCommit.push(ctx.kafka.records(TOPIC).length);
+  };
+  ctx.redisAfter(\`entity:\${ada}\`, watch);
   await m.renameEntity('t1', ada, 'Ada Lovelace');
   await settle();
-  assert(probe.fired, \`renameEntity never committed the rename (nothing touched entity:\${ada})\`);
-  assert.equal(probe.result, 0, \`when the rename reached the store the topic already held \${probe.result} record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce\`);
+  assert(atCommit.length > 0, \`renameEntity never committed the rename (entity:\${ada} never got the new name)\`);
+  assert.equal(atCommit[0], 0, \`when the rename reached the store the topic already held \${atCommit[0]} record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must still be produced after the commit');
   try {
     await m.renameEntity('t1', 'e-404', 'Nobody');
@@ -642,13 +658,14 @@ export async function check_outbox(ctx) {
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: the rename is committed and no consumer will ever hear of it\`);
   assert(rows[0].topic === TOPIC && rows[0].key === ada && rows[0].payload?.new_name === 'Ada Lovelace', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key \${ada} and the payload\`);
+  assert(rows[0].payload.old_name === 'Ada' && rows[0].payload.version === 2, \`the outbox payload is \${JSON.stringify(rows[0].payload)}: the relay produces it later, so it is the event itself, old_name and version included\`);
   assert.equal(ok, false, \`renameEntity resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   assert.equal((await store.getEntity(ada)).name, 'Ada Lovelace', 'the rename must stay committed when only the produce failed');
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.renameEntity('t1', grace, 'Grace Hopper');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`renameEntity waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`renameEntity waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the delivery report at most 2 s (ACK_TIMEOUT_MS), then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].key === grace, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`renameEntity resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -727,11 +744,22 @@ func CheckPayloadFields(ctx *harness.Ctx) {
 
 func CheckAfterCommit(ctx *harness.Ctx) {
 	ada := eventsEntities("Ada")[0]
-	probe := ctx.Redis.After("entity:"+ada, func() any { return len(ctx.Kafka.Records(eventsTopic)) })
+	atCommit := -1
+	// The topic at the command that commits the new name; a read of the entity before it decides nothing.
+	var watch func() any
+	watch = func() any {
+		if name, _ := ctx.Redis.HGet("entity:"+ada, "name"); name != "Ada Lovelace" {
+			ctx.Redis.After("entity:"+ada, watch)
+		} else if atCommit < 0 {
+			atCommit = len(ctx.Kafka.Records(eventsTopic))
+		}
+		return nil
+	}
+	ctx.Redis.After("entity:"+ada, watch)
 	eventsRename(ctx, ada, "Ada Lovelace")
 	ctx.Settle()
-	ctx.Assert(probe.Fired, "renameEntity never committed the rename (nothing touched entity:%s)", ada)
-	ctx.Equal(probe.Result, 0, "when the rename reached the store the topic already held records: a consumer can be told about a change it cannot read yet. Commit first, then produce; the records at commit time")
+	ctx.Assert(atCommit >= 0, "renameEntity never committed the rename (entity:%s never got the new name)", ada)
+	ctx.Assert(atCommit == 0, "when the rename reached the store the topic already held %d record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce", atCommit)
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
 	renameEntity(eventsBg, "t1", "e-404", "Nobody")
 	ctx.Settle()
@@ -747,13 +775,14 @@ func CheckOutbox(ctx *harness.Ctx) {
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the rename is committed and no consumer will ever hear of it; the rows")
 	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == ada && rows[0].Payload["new_name"] == "Ada Lovelace", "the outbox row is %+v, expected the topic, the key %s and the payload", rows[0], ada)
+	ctx.Assert(rows[0].Payload["old_name"] == "Ada" && rows[0].Payload["version"] == float64(2), "the outbox payload is %v: the relay produces it later, so it is the event itself, old_name and version included", rows[0].Payload)
 	ctx.Equal(ok, false, "renameEntity's result after a failed delivery")
 	ctx.Equal(store.GetEntity(eventsBg, ada).Name, "Ada Lovelace", "the rename must stay committed when only the produce failed; the name")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsRename(ctx, grace, "Grace Hopper")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "renameEntity waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "renameEntity waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s (ackTimeout), then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == grace, "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "renameEntity's result without a delivery report")
@@ -763,6 +792,7 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -819,15 +849,21 @@ void CheckPayloadFields(harness::Ctx& ctx) {
 void CheckAfterCommit(harness::Ctx& ctx) {
   const std::string ada = eventsEntity("Ada");
   size_t atCommit = 999;
-  bool fired = false;
-  ctx.Redis.After("entity:" + ada, [&] {
-    fired = true;
-    atCommit = ctx.Kafka.Records(kEventsTopic).size();
-  });
+  bool committed = false;
+  // The topic at the command that commits the new name; a read of the entity before it decides nothing.
+  std::function<void()> watch = [&] {
+    if (ctx.Redis.HGet("entity:" + ada, "name").value_or("") != "Ada Lovelace") {
+      ctx.Redis.After("entity:" + ada, watch);
+    } else if (!committed) {
+      committed = true;
+      atCommit = ctx.Kafka.Records(kEventsTopic).size();
+    }
+  };
+  ctx.Redis.After("entity:" + ada, watch);
   renameEntity("t1", ada, "Ada Lovelace");
   ctx.Settle();
-  ctx.Assert(fired, "renameEntity never committed the rename (nothing touched entity:%s)", ada);
-  ctx.Equal(atCommit, 0, "when the rename reached the store the topic already held records: a consumer can be told about a change it cannot read yet. Commit first, then produce; the records at commit time");
+  ctx.Assert(committed, "renameEntity never committed the rename (entity:%s never got the new name)", ada);
+  ctx.Assert(atCommit == 0, "when the rename reached the store the topic already held %d record(s): a consumer can be told about a change it cannot read yet. Commit first, then produce", atCommit);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
   try {
     renameEntity("t1", "e-404", "Nobody");
@@ -848,13 +884,16 @@ void CheckOutbox(harness::Ctx& ctx) {
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the rename is committed and no consumer will ever hear of it; the rows");
   ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == ada && rows[0].contains("payload") && eventsField(rows[0]["payload"], "new_name") == "Ada Lovelace",
              "the outbox row is %s, expected the topic, the key %s and the payload", rows[0].dump(), ada);
+  const auto& parked = rows[0]["payload"];
+  ctx.Assert(eventsField(parked, "old_name") == "Ada" && parked.contains("version") && parked["version"].is_number() && parked["version"].get<long>() == 2,
+             "the outbox payload is %s: the relay produces it later, so it is the event itself, old_name and version included", parked.dump());
   ctx.Equal(ok, false, "renameEntity's result after a failed delivery");
   ctx.Equal(store::getEntity(ada)->name, "Ada Lovelace", "the rename must stay committed when only the produce failed; the name");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = renameEntity("t1", grace, "Grace Hopper");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "renameEntity waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "renameEntity waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s (kAckTimeoutMs), then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && eventsField(rows[1], "key") == grace, "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "renameEntity's result without a delivery report");

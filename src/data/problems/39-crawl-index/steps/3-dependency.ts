@@ -23,11 +23,12 @@ nine more requests; and two workers fetch the same URL because it never left the
 service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, content_hash, body_ref, retry_after_s}
 \`\`\`
 
-- The URL leaves the queue through \`frontier.take\` (the host's bucket) before the call.
-- Every call carries \`DEADLINE_S\` = 5 s. At most \`MAX_ATTEMPTS\` = 3, retrying only \`UNAVAILABLE\`
-  and \`DEADLINE_EXCEEDED\`; then \`mark_failed\` (outcome \`failed\`).
+- The URL leaves the queue through \`frontier.take\` (the host's bucket, at the worker's
+  \`rate_per_minute\`) before the call.
+- Every call carries its own \`DEADLINE_S\` = 5 s. At most \`MAX_ATTEMPTS\` = 3, retrying only
+  \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\`; then \`mark_failed\` (outcome \`failed\`).
 - 403 is \`mark_refused(job_id, url, "forbidden")\` (\`refused\`), 404 \`mark_gone\` (\`gone\`): one call.
-- 429 calls \`frontier.throttle(job_id, host, retry_after_s)\` and \`frontier.requeue\`, records no
+- 429 calls \`frontier.throttle(job_id, host, retry_after_s)\`, then \`frontier.requeue\`, records no
   outcome, and answers \`throttled\`.`,
   sequence: {
     participants: ['Crawl worker', 'Redis frontier', 'Fetcher', 'Web host'],
@@ -60,7 +61,7 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
       id: 'deadline',
       title: 'Every fetch carries a 5-second deadline',
       detail:
-        'Each `Fetch` call is made with `DEADLINE_S` (5 s), so a host slower than that ends in `DEADLINE_EXCEEDED` and, after the attempts, a failed page. The starter sets no deadline.',
+        "Each `Fetch` attempt is made with its own full `DEADLINE_S` (5 s), not what is left of the first attempt's, so a host slower than that ends in `DEADLINE_EXCEEDED` three times and then a failed page. The starter sets no deadline.",
       match: {
         python: {all: [/DEADLINE_S\s*=\s*5\b/, /Fetch\([\s\S]{0,200}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /Fetch\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -73,7 +74,7 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
       id: 'bounded-retry',
       title: 'At most three attempts, only on UNAVAILABLE and DEADLINE_EXCEEDED',
       detail:
-        'A URL is tried at most `MAX_ATTEMPTS` (3) times, and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; any other error fails the page at once. The starter retries every error, ten times.',
+        'A URL is tried at most `MAX_ATTEMPTS` (3) times, and only `UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried; any other error (`INVALID_ARGUMENT`, `NOT_FOUND`, `PERMISSION_DENIED`, `INTERNAL` …) fails the page at once, and a third attempt that succeeds fetches the page. The starter retries every error, ten times.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*3\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
@@ -114,7 +115,7 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
       id: 'throttle-429',
       title: 'A 429 throttles the host and requeues the URL',
       detail:
-        "A 429 calls `frontier.throttle` with the reply's `retry_after_s` and `frontier.requeue`s the URL, records no outcome and makes no further call. The starter answers a 429 with more requests.",
+        "A 429 calls `frontier.throttle` with the reply's own `retry_after_s` before it `frontier.requeue`s the URL, so no other worker's take gets the host in between; it records no outcome and makes no further call. The starter answers a 429 with more requests.",
       match: {
         python: {all: [/==\s*429/, /frontier\.throttle\(/, /frontier\.requeue\(/, /retry_after_s/]},
         typescript: {all: [/===\s*429/, /throttle\(/, /requeue\(/, /retry_after_s/]},
@@ -127,7 +128,7 @@ service Fetcher { rpc Fetch(FetchRequest) returns (FetchReply); }  // {status, c
       id: 'take-first',
       title: 'Takes the URL through the bucket before fetching it',
       detail:
-        "The URL comes from `frontier.take`, which pops it and spends the host's token, before `Fetch` is called. The starter peeks with `LINDEX`, so the URL stays visible to every other worker and the host's pace is never asked.",
+        "The URL comes from `frontier.take` at the worker's `rate_per_minute`, which pops it and spends the host's token, before `Fetch` is called. The starter peeks with `LINDEX`, so the URL stays visible to every other worker and the host's pace is never asked.",
       match: {
         python: {order: [/frontier\.take\(/, /\.Fetch\(/], none: [/\.lindex\(/]},
         typescript: {order: [/(?<![.\w])take\(|frontier\.take\(/, /\.Fetch\(/], none: [/\.lindex\(/]},
@@ -716,11 +717,12 @@ def _url(path):
 
 
 class Fetcher(fetcher_pb2_grpc.FetcherServicer):
-    """The web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429 (Retry-After 30), anything else 200."""
+    """The web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429 (Retry-After 45), anything else 200."""
 
     def __init__(self, ctx):
         self.ctx = ctx
         self.queued_during = []
+        self.rival = None
 
     def Fetch(self, request, context):
         self.queued_during.append((request.url, self.ctx.redis.lrange(f"frontier:{JOB}:{HOST}", 0, -1)))
@@ -730,7 +732,9 @@ class Fetcher(fetcher_pb2_grpc.FetcherServicer):
         if path.startswith("/gone"):
             return fetcher_pb2.FetchReply(status=404)
         if path.startswith("/busy"):
-            return fetcher_pb2.FetchReply(status=429, retry_after_s=30)
+            # Another worker's take lands right after the worker's next write to the host's queue.
+            self.rival = self.ctx.redis_after(f"frontier:{JOB}:{HOST}", lambda: frontier.take(JOB, HOST, 60))
+            return fetcher_pb2.FetchReply(status=429, retry_after_s=45)
         return fetcher_pb2.FetchReply(status=200, content_hash=f"sha256:{path}", body_ref=f"pages{path}")
 
 
@@ -758,21 +762,32 @@ def check_deadline(ctx):
     out = m.fetch_one(JOB, HOST, 60)
     assert out is not None and out.get("outcome") == "failed", f"a host slower than the deadline on every attempt answered {out}, expected outcome failed"
     assert _status("/posts/2") == "failed", f"the slow URL is recorded as {_status('/posts/2')!r}, expected failed"
+    slow = [call.timeout for call in ctx.grpc.calls_to("Fetch")[1:]]
+    assert len(slow) == 3, f"a host slower than the deadline was tried {len(slow)} times: DEADLINE_EXCEEDED is retried up to MAX_ATTEMPTS = 3"
+    for timeout in slow:
+        assert timeout is not None and 4.5 <= timeout <= 5.5, f"the attempts at a slow host carried deadlines {slow} s: every attempt gets its own DEADLINE_S = 5, not what is left of the first one's"
 
 
 def check_bounded_retry(ctx):
-    m, _ = _client(ctx, "/posts/1", "/posts/2", "/posts/3")
+    m, _ = _client(ctx, *[f"/posts/{n}" for n in range(1, 8)])
     ctx.grpc.fail("Fetch", grpc.StatusCode.UNAVAILABLE, "host down", times=3)
     out = m.fetch_one(JOB, HOST, 60)
     calls = len(ctx.grpc.calls_to("Fetch"))
     assert calls == 3, f"the fetcher answered UNAVAILABLE three times and the URL was tried {calls} times: at most MAX_ATTEMPTS = 3, then the page fails"
     assert out is not None and out.get("outcome") == "failed" and _status("/posts/1") == "failed", f"after three UNAVAILABLE the worker answered {out} and recorded {_status('/posts/1')!r}, expected failed"
+    for code in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.NOT_FOUND, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INTERNAL):
+        ctx.clock.advance(1)
+        ctx.grpc.fail("Fetch", code, "refused", times=1)
+        out = m.fetch_one(JOB, HOST, 60)
+        extra = len(ctx.grpc.calls_to("Fetch")) - calls
+        calls += extra
+        assert extra == 1, f"{code.name} was retried ({extra} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert out is not None and out.get("outcome") == "failed", f"a {code.name} answered {out}, expected outcome failed"
     ctx.clock.advance(1)
-    ctx.grpc.fail("Fetch", grpc.StatusCode.INVALID_ARGUMENT, "bad url", times=1)
+    ctx.grpc.fail("Fetch", grpc.StatusCode.UNAVAILABLE, "host down", times=2)
     out = m.fetch_one(JOB, HOST, 60)
     extra = len(ctx.grpc.calls_to("Fetch")) - calls
-    assert extra == 1, f"INVALID_ARGUMENT was retried ({extra} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
-    assert out is not None and out.get("outcome") == "failed", f"an INVALID_ARGUMENT answered {out}, expected outcome failed"
+    assert extra == 3 and out is not None and out.get("outcome") == "fetched", f"two UNAVAILABLE, then a 200: the worker answered {out} after {extra} calls, expected the third attempt to fetch the page"
     ctx.clock.advance(1)
     ctx.grpc.fail("Fetch", grpc.StatusCode.DEADLINE_EXCEEDED, "slow", times=1)
     out = m.fetch_one(JOB, HOST, 60)
@@ -785,6 +800,8 @@ def check_terminal_status(ctx):
     calls = len(ctx.grpc.calls_to("Fetch"))
     assert calls == 1, f"a 403 was fetched {calls} times: it is the site's answer about the URL, recorded after one call"
     assert out is not None and out.get("outcome") == "refused" and _status("/forbidden/a") == "refused", f"a 403 answered {out} and recorded {_status('/forbidden/a')!r}, expected refused"
+    reason = records.page_of(JOB, _url("/forbidden/a")).get("reason")
+    assert reason == "forbidden", f"a 403 was recorded with reason {reason!r}, expected mark_refused(job_id, url, 'forbidden')"
     ctx.clock.advance(1)
     out = m.fetch_one(JOB, HOST, 60)
     calls = len(ctx.grpc.calls_to("Fetch"))
@@ -793,17 +810,24 @@ def check_terminal_status(ctx):
 
 
 def check_throttle_429(ctx):
-    m, _ = _client(ctx, "/busy/a", "/posts/1")
+    m, peer = _client(ctx, "/busy/a", "/posts/1")
     out = m.fetch_one(JOB, HOST, 60)
     calls = len(ctx.grpc.calls_to("Fetch"))
     assert calls == 1, f"a 429 was answered with {calls - 1} more request(s): the host asked for room"
     assert out is not None and out.get("outcome") == "throttled", f"a 429 answered {out}, expected outcome throttled"
+    assert peer.rival is not None and peer.rival.fired, "a 429 never put the URL back on the host's queue"
+    if peer.rival.error is not None:
+        raise peer.rival.error
+    assert peer.rival.result is None, f"another worker's take landed when the throttled URL went back and got {peer.rival.result}: the host was not throttled yet. Throttle the host before the URL goes back"
     assert _status("/busy/a") is None, f"a 429 recorded the URL as {_status('/busy/a')!r}: it is not the URL's outcome, the URL goes back"
     queued = ctx.redis.lrange(f"frontier:{JOB}:{HOST}", 0, -1)
     assert queued == [_url("/posts/1"), _url("/busy/a")], f"the host's queue holds {queued}: the throttled URL must go back to its tail"
     again = m.fetch_one(JOB, HOST, 60)
-    assert again is None and len(ctx.grpc.calls_to("Fetch")) == 1, f"right after a 429 with Retry-After 30 the worker fetched again ({again}): the whole host must wait"
+    assert again is None and len(ctx.grpc.calls_to("Fetch")) == 1, f"right after a 429 with Retry-After 45 the worker fetched again ({again}): the whole host must wait"
     ctx.clock.advance(31)
+    again = m.fetch_one(JOB, HOST, 60)
+    assert again is None and len(ctx.grpc.calls_to("Fetch")) == 1, f"31 s into a 429's Retry-After of 45 s the worker fetched again ({again}): the host waits the reply's retry_after_s"
+    ctx.clock.advance(15)
     out = m.fetch_one(JOB, HOST, 60)
     assert out is not None and out.get("url") == _url("/posts/1") and out.get("outcome") == "fetched", f"after Retry-After the host's next URL must be fetched, got {out}"
 
@@ -818,27 +842,36 @@ def check_take_first(ctx):
     third = m.fetch_one(JOB, HOST, 60)
     calls = len(ctx.grpc.calls_to("Fetch"))
     assert third is None and calls == 2, f"a third fetch in the same instant answered {third} after {calls} calls: the host's bucket holds BURST = 2 tokens, the third URL must wait for frontier.take"
+    ctx.clock.advance(0.5)
+    fourth = m.fetch_one(JOB, HOST, 120)
+    assert fourth is not None and fourth.get("outcome") == "fetched", f"half a second later at rate_per_minute = 120 the worker answered {fourth}: the bucket refills at the rate the worker was given, which hands out the next URL"
 `,
     typescript: `const JOB = 'nightly';
 const HOST = 'blog.example.com';
 const url = (path: string): string => \`https://\${HOST}\${path}\`;
 
-/** The web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429 (Retry-After 30), anything else 200. */
+/** The web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429 (Retry-After 45), anything else 200. */
 function client(ctx, ...paths: string[]) {
   const pkg = ctx.proto('fetcher.proto');
+  const frontier = ctx.load('/support/crawl/frontier.ts');
   const queuedDuring: [string, string[]][] = [];
+  const busy: {rival: {fired: boolean; error?: unknown; result: unknown} | null} = {rival: null};
   ctx.grpc.serve(pkg.crawl.Fetcher.service, {
     Fetch(call, callback) {
       queuedDuring.push([call.request.url, ctx.redis.lrange(\`frontier:\${JOB}:\${HOST}\`, 0, -1)]);
       const path = call.request.url.slice(url('').length);
       if (path.startsWith('/forbidden')) return callback(null, {status: 403});
       if (path.startsWith('/gone')) return callback(null, {status: 404});
-      if (path.startsWith('/busy')) return callback(null, {status: 429, retry_after_s: 30});
+      if (path.startsWith('/busy')) {
+        // Another worker's take lands right after the worker's next write to the host's queue.
+        busy.rival = ctx.redisAfter(\`frontier:\${JOB}:\${HOST}\`, () => frontier.take(JOB, HOST, 60));
+        return callback(null, {status: 429, retry_after_s: 45});
+      }
       callback(null, {status: 200, content_hash: \`sha256:\${path}\`, body_ref: \`pages\${path}\`});
     },
   });
   const m = ctx.load('client');
-  return {m, queuedDuring, frontier: ctx.load('/support/crawl/frontier.ts'), records: ctx.load('/support/crawl/records.ts')};
+  return {m, queuedDuring, busy, frontier, records: ctx.load('/support/crawl/records.ts')};
 }
 
 async function setup(ctx, ...paths: string[]) {
@@ -860,21 +893,34 @@ export async function check_deadline(ctx) {
   out = await m.fetchOne(JOB, HOST, 60);
   assert(out !== null && out.outcome === 'failed', \`a host slower than the deadline on every attempt answered \${JSON.stringify(out)}, expected outcome failed\`);
   assert.equal(await status('/posts/2'), 'failed', 'the slow URL must be recorded as failed');
+  const slow = ctx.grpc.callsTo('Fetch').slice(1).map(call => call.timeout);
+  assert.equal(slow.length, 3, \`a host slower than the deadline was tried \${slow.length} times: DEADLINE_EXCEEDED is retried up to MAX_ATTEMPTS = 3\`);
+  for (const timeout of slow) {
+    assert(timeout !== null && 4.5 <= timeout && timeout <= 5.5, \`the attempts at a slow host carried deadlines \${JSON.stringify(slow)} s: every attempt gets its own DEADLINE_MS = 5000, not what is left of the first one's\`);
+  }
 }
 
 export async function check_bounded_retry(ctx) {
-  const {m, status} = await setup(ctx, '/posts/1', '/posts/2', '/posts/3');
+  const {m, status} = await setup(ctx, ...[1, 2, 3, 4, 5, 6, 7].map(n => \`/posts/\${n}\`));
   ctx.grpc.fail('Fetch', ctx.grpc.status.UNAVAILABLE, 'host down', 3);
   let out = await m.fetchOne(JOB, HOST, 60);
-  const calls = ctx.grpc.callsTo('Fetch').length;
+  let calls = ctx.grpc.callsTo('Fetch').length;
   assert.equal(calls, 3, \`the fetcher answered UNAVAILABLE three times and the URL was tried \${calls} times: at most MAX_ATTEMPTS = 3, then the page fails\`);
   assert(out !== null && out.outcome === 'failed' && (await status('/posts/1')) === 'failed', \`after three UNAVAILABLE the worker answered \${JSON.stringify(out)}, expected failed\`);
+  for (const code of ['INVALID_ARGUMENT', 'NOT_FOUND', 'PERMISSION_DENIED', 'INTERNAL']) {
+    ctx.clock.advance(1);
+    ctx.grpc.fail('Fetch', ctx.grpc.status[code], 'refused', 1);
+    out = await m.fetchOne(JOB, HOST, 60);
+    const extra = ctx.grpc.callsTo('Fetch').length - calls;
+    calls += extra;
+    assert.equal(extra, 1, \`\${code} was retried (\${extra} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert(out !== null && out.outcome === 'failed', \`a \${code} answered \${JSON.stringify(out)}, expected outcome failed\`);
+  }
   ctx.clock.advance(1);
-  ctx.grpc.fail('Fetch', ctx.grpc.status.INVALID_ARGUMENT, 'bad url', 1);
+  ctx.grpc.fail('Fetch', ctx.grpc.status.UNAVAILABLE, 'host down', 2);
   out = await m.fetchOne(JOB, HOST, 60);
   const extra = ctx.grpc.callsTo('Fetch').length - calls;
-  assert.equal(extra, 1, \`INVALID_ARGUMENT was retried (\${extra} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
-  assert(out !== null && out.outcome === 'failed', \`an INVALID_ARGUMENT answered \${JSON.stringify(out)}, expected outcome failed\`);
+  assert(extra === 3 && out !== null && out.outcome === 'fetched', \`two UNAVAILABLE, then a 200: the worker answered \${JSON.stringify(out)} after \${extra} calls, expected the third attempt to fetch the page\`);
   ctx.clock.advance(1);
   ctx.grpc.fail('Fetch', ctx.grpc.status.DEADLINE_EXCEEDED, 'slow', 1);
   out = await m.fetchOne(JOB, HOST, 60);
@@ -882,11 +928,13 @@ export async function check_bounded_retry(ctx) {
 }
 
 export async function check_terminal_status(ctx) {
-  const {m, status} = await setup(ctx, '/forbidden/a', '/gone/b');
+  const {m, status, records} = await setup(ctx, '/forbidden/a', '/gone/b');
   let out = await m.fetchOne(JOB, HOST, 60);
   let calls = ctx.grpc.callsTo('Fetch').length;
   assert.equal(calls, 1, \`a 403 was fetched \${calls} times: it is the site's answer about the URL, recorded after one call\`);
   assert(out !== null && out.outcome === 'refused' && (await status('/forbidden/a')) === 'refused', \`a 403 answered \${JSON.stringify(out)}, expected refused\`);
+  const reason = (await records.pageOf(JOB, url('/forbidden/a')))?.reason;
+  assert.equal(reason, 'forbidden', \`a 403 was recorded with reason \${JSON.stringify(reason)}, expected markRefused(jobId, url, 'forbidden')\`);
   ctx.clock.advance(1);
   out = await m.fetchOne(JOB, HOST, 60);
   calls = ctx.grpc.callsTo('Fetch').length;
@@ -895,17 +943,24 @@ export async function check_terminal_status(ctx) {
 }
 
 export async function check_throttle_429(ctx) {
-  const {m, status} = await setup(ctx, '/busy/a', '/posts/1');
+  const {m, status, busy} = await setup(ctx, '/busy/a', '/posts/1');
   let out = await m.fetchOne(JOB, HOST, 60);
   const calls = ctx.grpc.callsTo('Fetch').length;
   assert.equal(calls, 1, \`a 429 was answered with \${calls - 1} more request(s): the host asked for room\`);
   assert(out !== null && out.outcome === 'throttled', \`a 429 answered \${JSON.stringify(out)}, expected outcome throttled\`);
+  assert(busy.rival !== null && busy.rival.fired, 'a 429 never put the URL back on the host\\'s queue');
+  if (busy.rival.error !== undefined) throw busy.rival.error;
+  const rival = await busy.rival.result;
+  assert.equal(rival, null, \`another worker's take landed when the throttled URL went back and got \${rival}: the host was not throttled yet. Throttle the host before the URL goes back\`);
   assert.equal(await status('/busy/a'), null, 'a 429 is not the URL\\'s outcome: nothing may be recorded, the URL goes back');
   const queued = ctx.redis.lrange(\`frontier:\${JOB}:\${HOST}\`, 0, -1);
   assert.deepStrictEqual(queued, [url('/posts/1'), url('/busy/a')], \`the host's queue holds \${JSON.stringify(queued)}: the throttled URL must go back to its tail\`);
-  const again = await m.fetchOne(JOB, HOST, 60);
-  assert(again === null && ctx.grpc.callsTo('Fetch').length === 1, \`right after a 429 with Retry-After 30 the worker fetched again (\${JSON.stringify(again)}): the whole host must wait\`);
+  let again = await m.fetchOne(JOB, HOST, 60);
+  assert(again === null && ctx.grpc.callsTo('Fetch').length === 1, \`right after a 429 with Retry-After 45 the worker fetched again (\${JSON.stringify(again)}): the whole host must wait\`);
   ctx.clock.advance(31);
+  again = await m.fetchOne(JOB, HOST, 60);
+  assert(again === null && ctx.grpc.callsTo('Fetch').length === 1, \`31 s into a 429's Retry-After of 45 s the worker fetched again (\${JSON.stringify(again)}): the host waits the reply's retry_after_s\`);
+  ctx.clock.advance(15);
   out = await m.fetchOne(JOB, HOST, 60);
   assert(out !== null && out.url === url('/posts/1') && out.outcome === 'fetched', \`after Retry-After the host's next URL must be fetched, got \${JSON.stringify(out)}\`);
 }
@@ -920,6 +975,9 @@ export async function check_take_first(ctx) {
   const third = await m.fetchOne(JOB, HOST, 60);
   const calls = ctx.grpc.callsTo('Fetch').length;
   assert(third === null && calls === 2, \`a third fetch in the same instant answered \${JSON.stringify(third)} after \${calls} calls: the host's bucket holds BURST = 2 tokens, the third URL must wait for take\`);
+  ctx.clock.advance(0.5);
+  const fourth = await m.fetchOne(JOB, HOST, 120);
+  assert(fourth !== null && fourth.outcome === 'fetched', \`half a second later at ratePerMinute = 120 the worker answered \${JSON.stringify(fourth)}: the bucket refills at the rate the worker was given, which hands out the next URL\`);
 }
 `,
     go: `package main
@@ -948,12 +1006,14 @@ var clientBg = context.Background()
 func hostURL(path string) string { return "https://" + clientHost + path }
 
 // fetcherPeer is the web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429
-// (Retry-After 30), anything else 200. It notes what the host's queue held during each call.
+// (Retry-After 45), anything else 200. It notes what the host's queue held during each call.
 type fetcherPeer struct {
 	pb.UnimplementedFetcherServer
 	ctx          *harness.Ctx
 	fetchedURLs  []string
 	queuedDuring [][]string
+	// rival reports the probe a 429 arms: whether it fired, what another worker's take got, its error.
+	rival func() (bool, any, error)
 }
 
 func (f *fetcherPeer) Fetch(_ context.Context, req *pb.FetchRequest) (*pb.FetchReply, error) {
@@ -967,7 +1027,13 @@ func (f *fetcherPeer) Fetch(_ context.Context, req *pb.FetchRequest) (*pb.FetchR
 		return &pb.FetchReply{Status: 404}, nil
 	}
 	if strings.HasPrefix(path, "/busy") {
-		return &pb.FetchReply{Status: 429, RetryAfterS: 30}, nil
+		// Another worker's take lands right after the worker's next write to the host's queue.
+		probe := f.ctx.Redis.After("frontier:"+clientJob+":"+clientHost, func() any {
+			url, _ := frontier.Take(clientBg, clientJob, clientHost, 60)
+			return url
+		})
+		f.rival = func() (bool, any, error) { return probe.Fired, probe.Result, probe.Err }
+		return &pb.FetchReply{Status: 429, RetryAfterS: 45}, nil
 	}
 	return &pb.FetchReply{Status: 200, ContentHash: "sha256:" + path, BodyRef: "pages" + path}, nil
 }
@@ -1014,20 +1080,34 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.GRPC.SetLatency("Fetch", 10.0, "")
 	ctx.Equal(outcomeOf(fetchNext(ctx)), "failed", "a host slower than the deadline on every attempt; the outcome")
 	ctx.Equal(recorded("/posts/2"), "failed", "the slow URL's record")
+	slow := ctx.GRPC.CallsTo("Fetch", "")[1:]
+	ctx.Equal(len(slow), 3, "a host slower than the deadline: DEADLINE_EXCEEDED is retried up to maxAttempts = 3; the attempts")
+	for _, call := range slow {
+		ctx.Assert(call.HasDeadline() && 4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "an attempt at a slow host carried a %v deadline: every attempt gets its own 5 s, not what is left of the first one's", call.Timeout)
+	}
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	clientWorld(ctx, "/posts/1", "/posts/2", "/posts/3")
+	clientWorld(ctx, "/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5", "/posts/6", "/posts/7")
 	ctx.GRPC.Fail("Fetch", codes.Unavailable, "host down", 3, "")
 	out := fetchNext(ctx)
 	calls := fetchCalls(ctx)
 	ctx.Equal(calls, 3, "the fetcher answered UNAVAILABLE three times: at most maxAttempts = 3, then the page fails; the calls for one URL")
 	ctx.Assert(outcomeOf(out) == "failed" && recorded("/posts/1") == "failed", "after three UNAVAILABLE the worker answered %s and recorded %q, expected failed", outcomeOf(out), recorded("/posts/1"))
+	for _, code := range []codes.Code{codes.InvalidArgument, codes.NotFound, codes.PermissionDenied, codes.Internal} {
+		ctx.Clock.Advance(1)
+		ctx.GRPC.Fail("Fetch", code, "refused", 1, "")
+		out = fetchNext(ctx)
+		extra := fetchCalls(ctx) - calls
+		calls += extra
+		ctx.Equal(extra, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for a %s", code)
+		ctx.Equal(outcomeOf(out), "failed", "a %s; the outcome", code)
+	}
 	ctx.Clock.Advance(1)
-	ctx.GRPC.Fail("Fetch", codes.InvalidArgument, "bad url", 1, "")
+	ctx.GRPC.Fail("Fetch", codes.Unavailable, "host down", 2, "")
 	out = fetchNext(ctx)
-	ctx.Equal(fetchCalls(ctx)-calls, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for an INVALID_ARGUMENT")
-	ctx.Equal(outcomeOf(out), "failed", "an INVALID_ARGUMENT; the outcome")
+	extra := fetchCalls(ctx) - calls
+	ctx.Assert(extra == 3 && outcomeOf(out) == "fetched", "two UNAVAILABLE, then a 200: the worker answered %s after %d calls, expected the third attempt to fetch the page", outcomeOf(out), extra)
 	ctx.Clock.Advance(1)
 	ctx.GRPC.Fail("Fetch", codes.DeadlineExceeded, "slow", 1, "")
 	ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "one DEADLINE_EXCEEDED, then a 200: a retry must fetch the page; the outcome")
@@ -1038,6 +1118,7 @@ func CheckTerminalStatus(ctx *harness.Ctx) {
 	out := fetchNext(ctx)
 	ctx.Equal(fetchCalls(ctx), 1, "a 403 is the site's answer about the URL, recorded after one call; the calls")
 	ctx.Assert(outcomeOf(out) == "refused" && recorded("/forbidden/a") == "refused", "a 403 answered %s and recorded %q, expected refused", outcomeOf(out), recorded("/forbidden/a"))
+	ctx.Equal(records.PageOf(clientBg, clientJob, hostURL("/forbidden/a"))["reason"], "forbidden", "a 403 is records.MarkRefused(jobID, url, \\"forbidden\\"); the recorded reason")
 	ctx.Clock.Advance(1)
 	out = fetchNext(ctx)
 	ctx.Equal(fetchCalls(ctx), 2, "a 404 is one call, then gone; the calls")
@@ -1045,15 +1126,23 @@ func CheckTerminalStatus(ctx *harness.Ctx) {
 }
 
 func CheckThrottle429(ctx *harness.Ctx) {
-	clientWorld(ctx, "/busy/a", "/posts/1")
+	peer := clientWorld(ctx, "/busy/a", "/posts/1")
 	out := fetchNext(ctx)
 	ctx.Equal(fetchCalls(ctx), 1, "a 429 means the host asked for room: no more requests; the calls")
 	ctx.Equal(outcomeOf(out), "throttled", "a 429; the outcome")
+	ctx.Assert(peer.rival != nil, "the fetcher never answered a 429")
+	fired, rival, rivalErr := peer.rival()
+	ctx.Assert(fired, "a 429 never put the URL back on the host's queue")
+	ctx.NoError(rivalErr, "another worker's take")
+	ctx.Equal(rival, "", "another worker's take landed when the throttled URL went back: the host was not throttled yet. Throttle the host before the URL goes back; the rival's take")
 	ctx.Equal(recorded("/busy/a"), "", "a 429 is not the URL's outcome: nothing may be recorded, the URL goes back; the record")
 	ctx.Equal(ctx.Redis.LRange("frontier:"+clientJob+":"+clientHost, 0, -1), []string{hostURL("/posts/1"), hostURL("/busy/a")}, "the throttled URL must go back to the tail of the host's queue")
 	again := fetchNext(ctx)
-	ctx.Assert(again == nil && fetchCalls(ctx) == 1, "right after a 429 with Retry-After 30 the worker fetched again (%s): the whole host must wait", outcomeOf(again))
+	ctx.Assert(again == nil && fetchCalls(ctx) == 1, "right after a 429 with Retry-After 45 the worker fetched again (%s): the whole host must wait", outcomeOf(again))
 	ctx.Clock.Advance(31)
+	again = fetchNext(ctx)
+	ctx.Assert(again == nil && fetchCalls(ctx) == 1, "31 s into a 429's Retry-After of 45 s the worker fetched again (%s): the host waits the reply's retry_after_s", outcomeOf(again))
+	ctx.Clock.Advance(15)
 	out = fetchNext(ctx)
 	ctx.Assert(out != nil && out.URL == hostURL("/posts/1") && out.Outcome == "fetched", "after Retry-After the host's next URL must be fetched, got %+v", out)
 }
@@ -1067,6 +1156,10 @@ func CheckTakeFirst(ctx *harness.Ctx) {
 	fetchNext(ctx)
 	third := fetchNext(ctx)
 	ctx.Assert(third == nil && fetchCalls(ctx) == 2, "a third fetch in the same instant answered %s after %d calls: the host's bucket holds Burst = 2 tokens, the third URL must wait for frontier.Take", outcomeOf(third), fetchCalls(ctx))
+	ctx.Clock.Advance(0.5)
+	fourth, err := fetchOne(clientBg, clientJob, clientHost, 120)
+	ctx.NoError(err, "fetchOne failed")
+	ctx.Equal(outcomeOf(fourth), "fetched", "half a second later at ratePerMinute = 120 the bucket refills at the rate the worker was given, which hands out the next URL; the outcome")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1084,12 +1177,15 @@ const std::string kHost = "blog.example.com";
 
 std::string hostUrl(const std::string& path) { return "https://" + kHost + path; }
 
-// The web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429 (Retry-After 30),
+// The web host behind the fetcher: /forbidden is 403, /gone 404, /busy 429 (Retry-After 45),
 // anything else 200. It notes what the host's queue held during each call.
 class FetcherPeer final : public crawl::Fetcher::Service {
  public:
   explicit FetcherPeer(harness::Ctx& ctx) : ctx_(ctx) {}
   std::vector<std::pair<std::string, std::vector<std::string>>> queued_during;
+  // What another worker's take got when a 429 sent the URL back, once a 429 armed the probe.
+  std::shared_ptr<bool> rival_fired;
+  std::shared_ptr<std::string> rival_took;
 
   grpc::Status Fetch(grpc::ServerContext*, const crawl::FetchRequest* req, crawl::FetchReply* out) override {
     queued_during.emplace_back(req->url(), ctx_.Redis.LRange("frontier:" + kJob + ":" + kHost, 0, -1));
@@ -1099,8 +1195,15 @@ class FetcherPeer final : public crawl::Fetcher::Service {
     } else if (path.rfind("/gone", 0) == 0) {
       out->set_status(404);
     } else if (path.rfind("/busy", 0) == 0) {
+      // Another worker's take lands right after the worker's next write to the host's queue.
+      auto fired = rival_fired = std::make_shared<bool>(false);
+      auto took = rival_took = std::make_shared<std::string>();
+      ctx_.Redis.After("frontier:" + kJob + ":" + kHost, [fired, took] {
+        *fired = true;
+        *took = frontier::take(kJob, kHost, 60).value_or("");
+      });
       out->set_status(429);
-      out->set_retry_after_s(30);
+      out->set_retry_after_s(45);
     } else {
       out->set_status(200);
       out->set_content_hash("sha256:" + path);
@@ -1151,20 +1254,40 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Fetch", 10.0);
   ctx.Equal(outcomeOf(fetchNext(ctx)), "failed", "a host slower than the deadline on every attempt; the outcome");
   ctx.Equal(recorded("/posts/2"), "failed", "the slow URL's record");
+  const auto calls = ctx.GRPC.CallsTo("Fetch");
+  ctx.Equal(calls.size(), 4, "a host slower than the deadline: DEADLINE_EXCEEDED is retried up to kMaxAttempts = 3; the calls, the healthy one included");
+  for (size_t i = 1; i < calls.size(); i++) {
+    ctx.Assert(calls[i].HasDeadline() && 4.5 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 5.5, "an attempt at a slow host carried a %v s deadline: every attempt gets its own kDeadline = 5 s, not what is left of the first one's", calls[i].TimeoutSeconds());
+  }
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  world(ctx, {"/posts/1", "/posts/2", "/posts/3"});
+  world(ctx, {"/posts/1", "/posts/2", "/posts/3", "/posts/4", "/posts/5", "/posts/6", "/posts/7"});
   ctx.GRPC.Fail("Fetch", grpc::StatusCode::UNAVAILABLE, "host down", 3);
   auto out = fetchNext(ctx);
-  const size_t calls = fetchCalls(ctx);
+  size_t calls = fetchCalls(ctx);
   ctx.Equal(calls, 3, "the fetcher answered UNAVAILABLE three times: at most kMaxAttempts = 3, then the page fails; the calls for one URL");
   ctx.Assert(outcomeOf(out) == "failed" && recorded("/posts/1") == "failed", "after three UNAVAILABLE the worker answered %s and recorded %q, expected failed", outcomeOf(out), recorded("/posts/1"));
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+      {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+  };
+  for (const auto& [code, name] : terminal) {
+    ctx.Clock.Advance(1);
+    ctx.GRPC.Fail("Fetch", code, "refused", 1);
+    out = fetchNext(ctx);
+    const size_t extra = fetchCalls(ctx) - calls;
+    calls += extra;
+    ctx.Equal(extra, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for a %s", name);
+    ctx.Equal(outcomeOf(out), "failed", "a %s; the outcome", name);
+  }
   ctx.Clock.Advance(1);
-  ctx.GRPC.Fail("Fetch", grpc::StatusCode::INVALID_ARGUMENT, "bad url", 1);
+  ctx.GRPC.Fail("Fetch", grpc::StatusCode::UNAVAILABLE, "host down", 2);
   out = fetchNext(ctx);
-  ctx.Equal(fetchCalls(ctx) - calls, 1, "only UNAVAILABLE and DEADLINE_EXCEEDED are retried; the calls for an INVALID_ARGUMENT");
-  ctx.Equal(outcomeOf(out), "failed", "an INVALID_ARGUMENT; the outcome");
+  const size_t extra = fetchCalls(ctx) - calls;
+  ctx.Assert(extra == 3 && outcomeOf(out) == "fetched", "two UNAVAILABLE, then a 200: the worker answered %s after %d calls, expected the third attempt to fetch the page", outcomeOf(out), extra);
   ctx.Clock.Advance(1);
   ctx.GRPC.Fail("Fetch", grpc::StatusCode::DEADLINE_EXCEEDED, "slow", 1);
   ctx.Equal(outcomeOf(fetchNext(ctx)), "fetched", "one DEADLINE_EXCEEDED, then a 200: a retry must fetch the page; the outcome");
@@ -1175,6 +1298,9 @@ void CheckTerminalStatus(harness::Ctx& ctx) {
   auto out = fetchNext(ctx);
   ctx.Equal(fetchCalls(ctx), 1, "a 403 is the site's answer about the URL, recorded after one call; the calls");
   ctx.Assert(outcomeOf(out) == "refused" && recorded("/forbidden/a") == "refused", "a 403 answered %s and recorded %q, expected refused", outcomeOf(out), recorded("/forbidden/a"));
+  const auto page = records::pageOf(kJob, hostUrl("/forbidden/a"));
+  const std::string reason = page && page->count("reason") ? page->at("reason") : "";
+  ctx.Equal(reason, "forbidden", "a 403 is records::markRefused(job_id, url, \\"forbidden\\"); the recorded reason");
   ctx.Clock.Advance(1);
   out = fetchNext(ctx);
   ctx.Equal(fetchCalls(ctx), 2, "a 404 is one call, then gone; the calls");
@@ -1182,15 +1308,20 @@ void CheckTerminalStatus(harness::Ctx& ctx) {
 }
 
 void CheckThrottle429(harness::Ctx& ctx) {
-  world(ctx, {"/busy/a", "/posts/1"});
+  FetcherPeer& peer = world(ctx, {"/busy/a", "/posts/1"});
   auto out = fetchNext(ctx);
   ctx.Equal(fetchCalls(ctx), 1, "a 429 means the host asked for room: no more requests; the calls");
   ctx.Equal(outcomeOf(out), "throttled", "a 429; the outcome");
+  ctx.Assert(peer.rival_fired && *peer.rival_fired, "a 429 never put the URL back on the host's queue");
+  ctx.Equal(peer.rival_took ? *peer.rival_took : std::string(), "", "another worker's take landed when the throttled URL went back: the host was not throttled yet. Throttle the host before the URL goes back; the rival's take");
   ctx.Equal(recorded("/busy/a"), "", "a 429 is not the URL's outcome: nothing may be recorded, the URL goes back; the record");
   ctx.Equal(ctx.Redis.LRange("frontier:" + kJob + ":" + kHost, 0, -1), {hostUrl("/posts/1"), hostUrl("/busy/a")}, "the throttled URL must go back to the tail of the host's queue");
-  const auto again = fetchNext(ctx);
-  ctx.Assert(!again && fetchCalls(ctx) == 1, "right after a 429 with Retry-After 30 the worker fetched again (%s): the whole host must wait", outcomeOf(again));
+  auto again = fetchNext(ctx);
+  ctx.Assert(!again && fetchCalls(ctx) == 1, "right after a 429 with Retry-After 45 the worker fetched again (%s): the whole host must wait", outcomeOf(again));
   ctx.Clock.Advance(31);
+  again = fetchNext(ctx);
+  ctx.Assert(!again && fetchCalls(ctx) == 1, "31 s into a 429's Retry-After of 45 s the worker fetched again (%s): the host waits the reply's retry_after_s", outcomeOf(again));
+  ctx.Clock.Advance(15);
   out = fetchNext(ctx);
   ctx.Assert(out && out->url == hostUrl("/posts/1") && out->outcome == "fetched", "after Retry-After the host's next URL must be fetched, got %s", outcomeOf(out));
 }
@@ -1205,6 +1336,14 @@ void CheckTakeFirst(harness::Ctx& ctx) {
   fetchNext(ctx);
   const auto third = fetchNext(ctx);
   ctx.Assert(!third && fetchCalls(ctx) == 2, "a third fetch in the same instant answered %s after %d calls: the host's bucket holds kBurst = 2 tokens, the third URL must wait for frontier::take", outcomeOf(third), fetchCalls(ctx));
+  ctx.Clock.Advance(0.5);
+  std::optional<Outcome> fourth;
+  try {
+    fourth = fetchOne(kJob, kHost, 120);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("fetchOne threw %s: %s", harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Equal(outcomeOf(fourth), "fetched", "half a second later at rate_per_minute = 120 the bucket refills at the rate the worker was given, which hands out the next URL; the outcome");
 }
 `,
   },

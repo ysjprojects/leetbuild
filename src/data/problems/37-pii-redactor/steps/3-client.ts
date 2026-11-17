@@ -24,7 +24,8 @@ retried anyway; a large document comes back with no spans; a regex answer is lab
 model's; and a name no pattern can see goes back unredacted.
 
 - Every attempt carries a **600 ms** deadline (\`DEADLINE_S\`).
-- At most \`MAX_ATTEMPTS\` = 2, the second only after \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\`.
+- At most \`MAX_ATTEMPTS\` = 2, the second only after \`UNAVAILABLE\` or \`DEADLINE_EXCEEDED\`; any
+  other code is one attempt.
 - The fallback scans the whole text, whatever its size, and answers \`source: "regex"\`
   (\`FALLBACK_SOURCE\`), \`degraded: true\` and \`PATTERNS_VERSION\`.
 - When a requested type has no entry in \`ENTITY_PATTERNS\`, the fallback raises
@@ -63,7 +64,7 @@ model's; and a name no pattern can see goes back unredacted.
       id: 'bounded-retry',
       title: 'Two attempts, and only transient codes are retried',
       detail:
-        "At most `MAX_ATTEMPTS` = 2 calls, the second only after `UNAVAILABLE` or `DEADLINE_EXCEEDED`; the starter makes four and retries any code, so an outage quadruples the detector's load and a request it rejected is sent again unchanged.",
+        "At most `MAX_ATTEMPTS` = 2 calls, the second only after `UNAVAILABLE` or `DEADLINE_EXCEEDED`, each probed on its own; every other code (`INVALID_ARGUMENT`, `INTERNAL`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `UNAUTHENTICATED`) is one call; the starter makes four and retries any code, so an outage quadruples the detector's load and a request it rejected is sent again unchanged.",
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/ATTEMPTS\s*=\s*4\b/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/], none: [/ATTEMPTS\s*=\s*4\b/]},
@@ -92,7 +93,7 @@ model's; and a name no pattern can see goes back unredacted.
       id: 'size-independent',
       title: 'The fallback scans texts of every size',
       detail:
-        'The regex pass runs over the whole text whatever its length; the starter skips texts over 10 KiB and answers no spans, and the largest documents are the likeliest to carry what must be removed.',
+        'The regex pass runs over the whole text whatever its length, about 200 KiB here, and finds an email that crosses the 10 KiB mark at its true offsets; the starter skips texts over 10 KiB and answers no spans, and the largest documents are the likeliest to carry what must be removed.',
       match: {
         python: {all: [/scan\(text/], none: [/10\s*\*\s*1024|10_?240/]},
         typescript: {all: [/scan\(text/], none: [/10\s*\*\s*1024|10_?240/]},
@@ -105,7 +106,7 @@ model's; and a name no pattern can see goes back unredacted.
       id: 'uncovered-fails-closed',
       title: 'A type no pattern covers fails closed',
       detail:
-        'When a requested type has no entry in `ENTITY_PATTERNS`, the fallback raises `DetectorUnavailable` instead of answering; the starter scans the types it can and drops the rest, so with the detector down a `PERSON` request answers with the name in place.',
+        'When any requested type has no entry in `ENTITY_PATTERNS` (`PERSON`, `LOCATION`, `ORGANIZATION`), the fallback raises `DetectorUnavailable` instead of answering; the starter scans the types it can and drops the rest, so with the detector down a `PERSON` request answers with the name in place.',
       match: {
         python: {all: [/not in ENTITY_PATTERNS/, /raise DetectorUnavailable/]},
         typescript: {
@@ -614,6 +615,17 @@ def check_bounded_retry(ctx):
     m.detect(TEXT, ["EMAIL"])
     n = len(ctx.grpc.calls_to("Detect")) - 2
     assert n == 1, f"an INVALID_ARGUMENT was retried ({n} attempts): the request itself was refused, and a second attempt fails the same way"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.UNAUTHENTICATED):
+        peer.code = code
+        before = len(ctx.grpc.calls_to("Detect"))
+        m.detect(TEXT, ["EMAIL"])
+        n = len(ctx.grpc.calls_to("Detect")) - before
+        assert n == 1, f"the code {code.name} was retried ({n} attempts): only UNAVAILABLE and DEADLINE_EXCEEDED are worth a second attempt"
+    peer.code = grpc.StatusCode.DEADLINE_EXCEEDED
+    before = len(ctx.grpc.calls_to("Detect"))
+    m.detect(TEXT, ["EMAIL"])
+    n = len(ctx.grpc.calls_to("Detect")) - before
+    assert n == 2, f"with the detector answering DEADLINE_EXCEEDED detect made {n} attempts, expected MAX_ATTEMPTS = 2: a deadline is transient and earns the second attempt"
 
 
 def check_degraded_marker(ctx):
@@ -631,9 +643,11 @@ def check_degraded_marker(ctx):
 def check_size_independent(ctx):
     m, peer = _client(ctx)
     peer.code = grpc.StatusCode.UNAVAILABLE
-    text = "lorem ipsum dolor sit amet " * 800 + "Write to ada@example.com."
+    # an email across the 10 KiB mark, where the starter stopped scanning, and one at the end of about 200 KiB
+    head = ("lorem ipsum dolor sit amet " * 400)[: 10 * 1024 - 6]
+    text = head + " ada@example.com " + "lorem ipsum dolor sit amet " * 7000 + "Write to bob@example.org."
     detection = m.detect(text, ["EMAIL"])
-    assert _found(detection, text) == [("ada@example.com", "EMAIL")], f"a {len(text)}-character text came back with spans {_found(detection, text)}: the fallback must scan texts of every size"
+    assert _found(detection, text) == [("ada@example.com", "EMAIL"), ("bob@example.org", "EMAIL")], f"a {len(text)}-character text came back with spans {_found(detection, text)}: the fallback must scan the whole text, whatever its size"
 
 
 def check_uncovered_fails_closed(ctx):
@@ -646,6 +660,12 @@ def check_uncovered_fails_closed(ctx):
         pass
     else:
         raise AssertionError(f"with the detector down, a PERSON request answered {_found(detection, text)}: no pattern covers PERSON, so the name went back in place. Raise DetectorUnavailable")
+    for entities in (["LOCATION"], ["EMAIL", "ORGANIZATION"]):
+        try:
+            detection = m.detect(text, entities)
+        except m.DetectorUnavailable:
+            continue
+        raise AssertionError(f"with the detector down, a request for {entities} answered {_found(detection, text)}: no pattern covers {entities[-1]}. Every type without a pattern fails closed, not only PERSON")
     peer.code = None
     detection = m.detect(text, ["EMAIL", "PERSON"])
     assert sorted(_found(detection, text)) == [("Ada Lovelace", "PERSON"), ("ada@example.com", "EMAIL")], f"with the detector up the model answers both types, got {_found(detection, text)}"
@@ -698,6 +718,18 @@ export async function check_bounded_retry(ctx) {
   await m.detect(TEXT, ['EMAIL']);
   n = ctx.grpc.callsTo('Detect').length - 2;
   assert.equal(n, 1, \`an INVALID_ARGUMENT was retried (\${n} attempts): the request itself was refused, and a second attempt fails the same way\`);
+  for (const name of ['INTERNAL', 'PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'UNAUTHENTICATED']) {
+    peer.code = ctx.grpc.status[name];
+    const before = ctx.grpc.callsTo('Detect').length;
+    await m.detect(TEXT, ['EMAIL']);
+    n = ctx.grpc.callsTo('Detect').length - before;
+    assert.equal(n, 1, \`the code \${name} was retried (\${n} attempts): only UNAVAILABLE and DEADLINE_EXCEEDED are worth a second attempt\`);
+  }
+  peer.code = ctx.grpc.status.DEADLINE_EXCEEDED;
+  const before = ctx.grpc.callsTo('Detect').length;
+  await m.detect(TEXT, ['EMAIL']);
+  n = ctx.grpc.callsTo('Detect').length - before;
+  assert.equal(n, 2, \`with the detector answering DEADLINE_EXCEEDED detect made \${n} attempts, expected MAX_ATTEMPTS = 2: a deadline is transient and earns the second attempt\`);
 }
 
 export async function check_degraded_marker(ctx) {
@@ -715,9 +747,11 @@ export async function check_degraded_marker(ctx) {
 export async function check_size_independent(ctx) {
   const {m, peer} = client(ctx);
   peer.code = ctx.grpc.status.UNAVAILABLE;
-  const text = 'lorem ipsum dolor sit amet '.repeat(800) + 'Write to ada@example.com.';
+  // an email across the 10 KiB mark, where the starter stopped scanning, and one at the end of about 200 KiB
+  const head = 'lorem ipsum dolor sit amet '.repeat(400).slice(0, 10 * 1024 - 6);
+  const text = head + ' ada@example.com ' + 'lorem ipsum dolor sit amet '.repeat(7000) + 'Write to bob@example.org.';
   const detection = await m.detect(text, ['EMAIL']);
-  assert.deepStrictEqual(found(detection, text), [['ada@example.com', 'EMAIL']], \`a \${text.length}-character text came back with spans \${JSON.stringify(found(detection, text))}: the fallback must scan texts of every size\`);
+  assert.deepStrictEqual(found(detection, text), [['ada@example.com', 'EMAIL'], ['bob@example.org', 'EMAIL']], \`a \${text.length}-character text came back with spans \${JSON.stringify(found(detection, text))}: the fallback must scan the whole text, whatever its size\`);
 }
 
 export async function check_uncovered_fails_closed(ctx) {
@@ -731,6 +765,15 @@ export async function check_uncovered_fails_closed(ctx) {
     assert.equal((e as Error).constructor.name, 'DetectorUnavailable', \`detect threw \${(e as Error).constructor.name}: \${(e as Error).message}, expected DetectorUnavailable\`);
   }
   assert(answered === null, \`with the detector down, a PERSON request answered \${JSON.stringify(answered && found(answered, text))}: no pattern covers PERSON, so the name went back in place. Throw DetectorUnavailable\`);
+  for (const entities of [['LOCATION'], ['EMAIL', 'ORGANIZATION']]) {
+    answered = null;
+    try {
+      answered = await m.detect(text, entities);
+    } catch (e) {
+      assert.equal((e as Error).constructor.name, 'DetectorUnavailable', \`detect threw \${(e as Error).constructor.name}: \${(e as Error).message}, expected DetectorUnavailable\`);
+    }
+    assert(answered === null, \`with the detector down, a request for \${JSON.stringify(entities)} answered \${JSON.stringify(answered && found(answered, text))}: no pattern covers \${entities[entities.length - 1]}. Every type without a pattern fails closed, not only PERSON\`);
+  }
   peer.code = null;
   const detection = await m.detect(text, ['EMAIL', 'PERSON']);
   assert.deepStrictEqual(found(detection, text).sort(), [['Ada Lovelace', 'PERSON'], ['ada@example.com', 'EMAIL']], \`with the detector up the model answers both types, got \${JSON.stringify(found(detection, text))}\`);
@@ -824,6 +867,16 @@ func CheckBoundedRetry(ctx *harness.Ctx) {
 	peer.code = codes.InvalidArgument
 	detect(context.Background(), clientText, []string{"EMAIL"})
 	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", ""))-2, 1, "an INVALID_ARGUMENT means the request itself was refused, and a second attempt fails the same way; attempts")
+	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.ResourceExhausted, codes.Unauthenticated} {
+		peer.code = code
+		before := len(ctx.GRPC.CallsTo("Detect", ""))
+		detect(context.Background(), clientText, []string{"EMAIL"})
+		ctx.Equal(len(ctx.GRPC.CallsTo("Detect", ""))-before, 1, "the code %v was retried: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a second attempt; attempts", code)
+	}
+	peer.code = codes.DeadlineExceeded
+	before := len(ctx.GRPC.CallsTo("Detect", ""))
+	detect(context.Background(), clientText, []string{"EMAIL"})
+	ctx.Equal(len(ctx.GRPC.CallsTo("Detect", ""))-before, 2, "with the detector answering DEADLINE_EXCEEDED, detect must make MAX_ATTEMPTS = 2 attempts: a deadline is transient and earns the second attempt; attempts")
 }
 
 func CheckDegradedMarker(ctx *harness.Ctx) {
@@ -841,9 +894,11 @@ func CheckDegradedMarker(ctx *harness.Ctx) {
 func CheckSizeIndependent(ctx *harness.Ctx) {
 	peer := clientServe(ctx)
 	peer.code = codes.Unavailable
-	text := strings.Repeat("lorem ipsum dolor sit amet ", 800) + "Write to ada@example.com."
+	// an email across the 10 KiB mark, where the starter stopped scanning, and one at the end of about 200 KiB
+	head := strings.Repeat("lorem ipsum dolor sit amet ", 400)[:10*1024-6]
+	text := head + " ada@example.com " + strings.Repeat("lorem ipsum dolor sit amet ", 7000) + "Write to bob@example.org."
 	detection := clientDetect(ctx, text, "EMAIL")
-	ctx.Equal(clientFound(detection, text), []string{"ada@example.com EMAIL"}, "a %d-character text: the fallback must scan texts of every size; the spans", len(text))
+	ctx.Equal(clientFound(detection, text), []string{"ada@example.com EMAIL", "bob@example.org EMAIL"}, "a %d-character text: the fallback must scan the whole text, whatever its size; the spans", len(text))
 }
 
 func CheckUncoveredFailsClosed(ctx *harness.Ctx) {
@@ -853,6 +908,10 @@ func CheckUncoveredFailsClosed(ctx *harness.Ctx) {
 	detection, err := detect(context.Background(), text, []string{"EMAIL", "PERSON"})
 	ctx.Assert(err != nil, "with the detector down, a PERSON request answered %v: no pattern covers PERSON, so the name went back in place. Return spans.ErrDetectorUnavailable", clientFound(detection, text))
 	ctx.Assert(errors.Is(err, spans.ErrDetectorUnavailable), "detect returned %v, expected an error wrapping spans.ErrDetectorUnavailable", err)
+	for _, entities := range [][]string{{"LOCATION"}, {"EMAIL", "ORGANIZATION"}} {
+		detection, err := detect(context.Background(), text, entities)
+		ctx.Assert(errors.Is(err, spans.ErrDetectorUnavailable), "with the detector down, a request for %v answered %v (error %v): no pattern covers %s. Every type without a pattern fails closed, not only PERSON", entities, clientFound(detection, text), err, entities[len(entities)-1])
+	}
 	peer.code = codes.OK
 	detection = clientDetect(ctx, text, "EMAIL", "PERSON")
 	got := clientFound(detection, text)
@@ -864,6 +923,7 @@ func CheckUncoveredFailsClosed(ctx *harness.Ctx) {
 
 #include <algorithm>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -934,6 +994,21 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
   peer.code = grpc::StatusCode::INVALID_ARGUMENT;
   detect(kText, {"EMAIL"});
   ctx.Equal(ctx.GRPC.CallsTo("Detect").size() - 2, 1, "an INVALID_ARGUMENT means the request itself was refused, and a second attempt fails the same way; attempts");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INTERNAL, "INTERNAL"},
+                                                                          {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+                                                                          {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+                                                                          {grpc::StatusCode::UNAUTHENTICATED, "UNAUTHENTICATED"}};
+  for (const auto& [code, name] : terminal) {
+    peer.code = code;
+    const size_t before = ctx.GRPC.CallsTo("Detect").size();
+    detect(kText, {"EMAIL"});
+    ctx.Equal(ctx.GRPC.CallsTo("Detect").size() - before, 1, "the code %s was retried: only UNAVAILABLE and DEADLINE_EXCEEDED are worth a second attempt; attempts", name);
+  }
+  peer.code = grpc::StatusCode::DEADLINE_EXCEEDED;
+  const size_t before = ctx.GRPC.CallsTo("Detect").size();
+  detect(kText, {"EMAIL"});
+  ctx.Equal(ctx.GRPC.CallsTo("Detect").size() - before, 2,
+            "with the detector answering DEADLINE_EXCEEDED, detect must make kMaxAttempts = 2 attempts: a deadline is transient and earns the second attempt; attempts");
 }
 
 void CheckDegradedMarker(harness::Ctx& ctx) {
@@ -951,11 +1026,14 @@ void CheckDegradedMarker(harness::Ctx& ctx) {
 void CheckSizeIndependent(harness::Ctx& ctx) {
   DetectorPeer& peer = serve(ctx);
   peer.code = grpc::StatusCode::UNAVAILABLE;
+  // an email across the 10 KiB mark, where the starter stopped scanning, and one at the end of about 200 KiB
   std::string text;
-  for (int i = 0; i < 800; i++) text += "lorem ipsum dolor sit amet ";
-  text += "Write to ada@example.com.";
+  while (text.size() < 10 * 1024) text += "lorem ipsum dolor sit amet ";
+  text = text.substr(0, 10 * 1024 - 6) + " ada@example.com ";
+  for (int i = 0; i < 7000; i++) text += "lorem ipsum dolor sit amet ";
+  text += "Write to bob@example.org.";
   const spans::Detection detection = detect(text, {"EMAIL"});
-  ctx.Equal(found_in(detection, text), {"ada@example.com EMAIL"}, "a %d-character text: the fallback must scan texts of every size; the spans", text.size());
+  ctx.Equal(found_in(detection, text), {"ada@example.com EMAIL", "bob@example.org EMAIL"}, "a %d-character text: the fallback must scan the whole text, whatever its size; the spans", text.size());
 }
 
 void CheckUncoveredFailsClosed(harness::Ctx& ctx) {
@@ -970,6 +1048,16 @@ void CheckUncoveredFailsClosed(harness::Ctx& ctx) {
     refused = true;
   }
   ctx.Assert(refused, "with the detector down, a PERSON request answered %v: no pattern covers PERSON, so the name went back in place. Throw spans::DetectorUnavailable", answered);
+  for (const std::vector<std::string>& entities : std::vector<std::vector<std::string>>{{"LOCATION"}, {"EMAIL", "ORGANIZATION"}}) {
+    refused = false;
+    answered.clear();
+    try {
+      answered = found_in(detect(text, entities), text);
+    } catch (const spans::DetectorUnavailable&) {
+      refused = true;
+    }
+    ctx.Assert(refused, "with the detector down, a request for %v answered %v: no pattern covers %s. Every type without a pattern fails closed, not only PERSON", entities, answered, entities.back());
+  }
   peer.code = grpc::StatusCode::OK;
   std::vector<std::string> got = found_in(detect(text, {"EMAIL", "PERSON"}), text);
   std::sort(got.begin(), got.end());

@@ -23,12 +23,13 @@ dropped with nothing to replay.
 
 - Key by \`asset_id\`.
 - The payload is \`asset_id\`, \`tenant\`, \`checksum\`, \`mime\`, \`embedding_ids\` (what
-  \`vectors.upsert\` returned) and \`degraded\`; no URL.
+  \`vectors.upsert\` returned) and \`degraded\` (the captioned result's); no URL, no caption.
 - \`vectors.upsert\` first, then produce.
 - An idempotent producer with \`acks=all\` (kafkajs: \`idempotent: true\`, \`acks: -1\`; Go uses
   confluent-kafka-go, since kafka-go has no idempotent producer).
 - Wait for the delivery report at most \`ACK_TIMEOUT_S\` = 2 s; on an error or no report, call
-  \`assets.insert_outbox(topic, key, payload)\` and return \`False\`.`,
+  \`assets.insert_outbox(topic, key, payload)\` and return \`False\` (an acknowledged event returns
+  \`True\`). A failed outbox write reaches the caller.`,
   sequence: {
     participants: ['Ingest pipeline', 'Index', 'asset.indexed', 'Outbox'],
     messages: [
@@ -62,7 +63,7 @@ dropped with nothing to replay.
       id: 'payload-facts',
       title: 'Carries checksum and embedding ids, and no URL',
       detail:
-        'The value holds `asset_id`, `tenant`, `checksum`, `mime`, `embedding_ids` and `degraded`; the starter sends a permanent `object_url` and no checksum or embedding ids.',
+        "The value holds `asset_id`, `tenant`, `checksum`, `mime`, the `embedding_ids` that `vectors.upsert` returned and the captioned result's `degraded`, with no URL and no caption; the starter sends a permanent `object_url` and the caption, and no checksum or embedding ids.",
       match: {
         python: {all: [/["']checksum["']\s*:/, /["']embedding_ids["']\s*:/], none: [/object_url|https?:\/\//]},
         typescript: {all: [/checksum:/, /embedding_ids:/], none: [/object_url|https?:\/\//]},
@@ -88,7 +89,7 @@ dropped with nothing to replay.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or none within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter fires and forgets.',
+        'An acknowledged event returns true. A failed delivery, or none within 2 s, leaves an outbox row with the topic, the key and the whole payload, and the call returns false; when the outbox write fails too, the error reaches the caller. The starter fires and forgets.',
       match: {
         python: {all: [/assets\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
@@ -630,15 +631,24 @@ def check_asset_key(ctx):
 def check_payload_facts(ctx):
     m = ctx.load("events")
     a1 = _asset(1)
-    m.index_and_publish(a1, CAPTIONED)
+    ok = m.index_and_publish(a1, CAPTIONED)
+    assert ok is True, f"index_and_publish returned {ok!r} after the broker acknowledged the event, expected True"
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one call produced {len(records)} records"
     text = records[0].value.decode()
     assert "http" not in text, f"the event carries a URL: {text}. The topic is kept and replayed to every consumer; a link to the original bytes there skips the signed, expiring read path"
+    assert CAPTIONED["caption"] not in text, f"the event carries the caption: {text}. The topic is kept and replayed to every consumer; the event carries the asset's facts, not its content"
     p = _payload(records[0])
     want = {"asset_id": "a-1", "tenant": "t1", "checksum": a1["checksum"], "mime": "image/png", "embedding_ids": ["a-1:image", "a-1:caption"], "degraded": False}
     got = {k: p.get(k) for k in want}
     assert got == want, f"the event carries {got}, expected {want}: a consumer needs the checksum to verify the bytes and the embedding ids to find the vectors"
+    # An asset indexed without a caption: one vector, and the event says it is degraded.
+    a2 = _asset(2)
+    m.index_and_publish(a2, {"caption": None, "caption_source": "none", "degraded": True})
+    p = _payload(ctx.kafka.records(TOPIC)[-1])
+    want = {"asset_id": "a-2", "embedding_ids": ["a-2:image"], "degraded": True}
+    got = {k: p.get(k) for k in want}
+    assert got == want, f"for an asset indexed without a caption the event carries {got}, expected {want}: the embedding ids are the ones vectors.upsert returned, degraded is the captioned result's"
 
 
 def check_index_before_publish(ctx):
@@ -658,16 +668,26 @@ def check_outbox_on_failure(ctx):
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row nothing ever tells the platform a-1 is searchable"
     assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "a-1" and rows[0].get("payload", {}).get("asset_id") == "a-1", f"the outbox row is {rows[0]}, expected the topic, the key a-1 and the payload"
+    assert rows[0]["payload"].get("checksum") == "sha256:" + "1" * 64 and rows[0]["payload"].get("embedding_ids") == ["a-1:image", "a-1:caption"], f"the outbox row's payload is {rows[0]['payload']}: the relay publishes it as the event, so it is the event's whole payload"
     assert ok is False, f"index_and_publish returned {ok!r} after a failed delivery, expected False"
     assert ctx.redis.exists("index:a-1") == 1, "the index write must stand when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.index_and_publish(_asset(2), CAPTIONED)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"index_and_publish waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"index_and_publish waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("asset_id") == "a-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"index_and_publish returned {ok!r} without a delivery report, expected False"
+    # The outbox write fails too (the broker still does not answer): the caller must hear of it, or the event is lost with nobody told.
+    ctx.redis.delete("outbox")
+    ctx.redis.set("outbox", "not a list")
+    try:
+        ok = m.index_and_publish(_asset(3), CAPTIONED)
+    except Exception:
+        pass
+    else:
+        raise AssertionError(f"the delivery and then the outbox write failed, and index_and_publish returned {ok!r}: the event is in neither place and nothing says so. A failed outbox write must reach the caller")
 
 
 def check_idempotent_producer(ctx):
@@ -724,15 +744,24 @@ export async function check_asset_key(ctx) {
 export async function check_payload_facts(ctx) {
   const {m, assets} = events(ctx);
   const a1 = await asset(assets, 1);
-  await publish(m, a1);
+  const ok = await publish(m, a1);
+  assert.equal(ok, true, \`indexAndPublish resolved \${JSON.stringify(ok)} after the broker acknowledged the event, expected true\`);
   await settle();
   const values = ctx.kafka.values(TOPIC).map(v => v.toString());
   assert.equal(values.length, 1, \`one call produced \${values.length} records\`);
   assert(!values[0].includes('http'), \`the event carries a URL: \${values[0]}. The topic is kept and replayed to every consumer; a link to the original bytes there skips the signed, expiring read path\`);
+  assert(!values[0].includes(CAPTIONED.caption), \`the event carries the caption: \${values[0]}. The topic is kept and replayed to every consumer; the event carries the asset's facts, not its content\`);
   const p = JSON.parse(values[0]);
-  const want = {asset_id: 'a-1', tenant: 't1', checksum: a1.checksum, mime: 'image/png', embedding_ids: ['a-1:image', 'a-1:caption'], degraded: false};
-  const got = Object.fromEntries(Object.keys(want).map(k => [k, p[k]]));
+  let want: Record<string, unknown> = {asset_id: 'a-1', tenant: 't1', checksum: a1.checksum, mime: 'image/png', embedding_ids: ['a-1:image', 'a-1:caption'], degraded: false};
+  let got = Object.fromEntries(Object.keys(want).map(k => [k, p[k]]));
   assert.deepStrictEqual(got, want, \`the event carries \${JSON.stringify(got)}, expected \${JSON.stringify(want)}: a consumer needs the checksum to verify the bytes and the embedding ids to find the vectors\`);
+  // An asset indexed without a caption: one vector, and the event says it is degraded.
+  await publish(m, await asset(assets, 2), {caption: null, caption_source: 'none', degraded: true});
+  await settle();
+  const p2 = JSON.parse(ctx.kafka.values(TOPIC).at(-1).toString());
+  want = {asset_id: 'a-2', embedding_ids: ['a-2:image'], degraded: true};
+  got = Object.fromEntries(Object.keys(want).map(k => [k, p2[k]]));
+  assert.deepStrictEqual(got, want, \`for an asset indexed without a caption the event carries \${JSON.stringify(got)}, expected \${JSON.stringify(want)}: the embedding ids are the ones upsert returned, degraded is the captioned result's\`);
 }
 
 export async function check_index_before_publish(ctx) {
@@ -754,16 +783,26 @@ export async function check_outbox_on_failure(ctx) {
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row nothing ever tells the platform a-1 is searchable\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'a-1' && rows[0].payload?.asset_id === 'a-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key a-1 and the payload\`);
+  assert(rows[0].payload.checksum === 'sha256:' + '1'.repeat(64) && JSON.stringify(rows[0].payload.embedding_ids) === '["a-1:image","a-1:caption"]', \`the outbox row's payload is \${JSON.stringify(rows[0].payload)}: the relay publishes it as the event, so it is the event's whole payload\`);
   assert.equal(ok, false, \`indexAndPublish resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   assert.equal(ctx.redis.exists('index:a-1'), 1, 'the index write must stand when only the produce failed');
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await publish(m, await asset(assets, 2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`indexAndPublish waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`indexAndPublish waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.asset_id === 'a-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`indexAndPublish resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
+  // The outbox write fails too (the broker still does not answer): the caller must hear of it, or the event is lost with nobody told.
+  ctx.redis.del('outbox');
+  ctx.redis.set('outbox', 'not a list');
+  const a3 = await asset(assets, 3);
+  let rejected = false;
+  const lost = await m.indexAndPublish(a3, CAPTIONED).catch(() => {
+    rejected = true;
+  });
+  assert(rejected, \`the delivery and then the outbox write failed, and indexAndPublish resolved \${JSON.stringify(lost)}: the event is in neither place and nothing says so. A failed outbox write must reach the caller\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -840,11 +879,13 @@ func CheckAssetKey(ctx *harness.Ctx) {
 
 func CheckPayloadFacts(ctx *harness.Ctx) {
 	a1 := eventsAsset(ctx, 1)
-	eventsPublish(ctx, a1, eventsCaptioned)
+	ok := eventsPublish(ctx, a1, eventsCaptioned)
+	ctx.Equal(ok, true, "indexAndPublish's result after the broker acknowledged the event")
 	ctx.Settle()
 	values := ctx.Kafka.Values(indexedTopic)
 	ctx.Equal(len(values), 1, "one call must produce one record; the records")
 	ctx.Assert(!strings.Contains(values[0], "http"), "the event carries a URL: %s. The topic is kept and replayed to every consumer; a link to the original bytes there skips the signed, expiring read path", values[0])
+	ctx.Assert(!strings.Contains(values[0], eventsCaptioned.Caption), "the event carries the caption: %s. The topic is kept and replayed to every consumer; the event carries the asset's facts, not its content", values[0])
 	var p map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &p), "the payload must be JSON")
 	got := map[string]any{}
@@ -853,6 +894,15 @@ func CheckPayloadFacts(ctx *harness.Ctx) {
 	}
 	want := map[string]any{"asset_id": "a-1", "tenant": "t1", "checksum": a1.Checksum, "mime": "image/png", "embedding_ids": []any{"a-1:image", "a-1:caption"}, "degraded": false}
 	ctx.Equal(got, want, "the event's facts (a consumer needs the checksum to verify the bytes and the embedding ids to find the vectors)")
+	// An asset indexed without a caption: one vector, and the event says it is degraded.
+	eventsPublish(ctx, eventsAsset(ctx, 2), assets.Captioned{Source: "none", Degraded: true})
+	ctx.Settle()
+	values = ctx.Kafka.Values(indexedTopic)
+	var p2 map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[len(values)-1]), &p2), "the payload must be JSON")
+	got = map[string]any{"asset_id": p2["asset_id"], "embedding_ids": p2["embedding_ids"], "degraded": p2["degraded"]}
+	want = map[string]any{"asset_id": "a-2", "embedding_ids": []any{"a-2:image"}, "degraded": true}
+	ctx.Equal(got, want, "for an asset indexed without a caption, the event's facts (the embedding ids are the ones Upsert returned, degraded is the captioned result's)")
 }
 
 func CheckIndexBeforePublish(ctx *harness.Ctx) {
@@ -872,16 +922,24 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row nothing ever tells the platform a-1 is searchable; the rows")
 	ctx.Assert(rows[0].Topic == indexedTopic && rows[0].Key == "a-1" && rows[0].Payload["asset_id"] == "a-1", "the outbox row is %+v, expected the topic, the key a-1 and the payload", rows[0])
+	ids, _ := json.Marshal(rows[0].Payload["embedding_ids"])
+	ctx.Assert(rows[0].Payload["checksum"] == "sha256:"+strings.Repeat("1", 64) && string(ids) == \`["a-1:image","a-1:caption"]\`, "the outbox row's payload is %v: the relay publishes it as the event, so it is the event's whole payload", rows[0].Payload)
 	ctx.Equal(ok, false, "indexAndPublish's result after a failed delivery")
 	ctx.Equal(ctx.Redis.Exists("index:a-1"), int64(1), "the index write must stand when only the produce failed")
 	ctx.Kafka.Stall(indexedTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsAsset(ctx, 2), eventsCaptioned)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "indexAndPublish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "indexAndPublish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["asset_id"] == "a-2", "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "indexAndPublish's result without a delivery report")
+	// The outbox write fails too (the broker still does not answer): the caller must hear of it, or the event is lost with nobody told.
+	ctx.Redis.Do("DEL", "outbox")
+	ctx.Redis.Do("SET", "outbox", "not a list")
+	a3 := eventsAsset(ctx, 3)
+	ok, err := indexAndPublish(eventsBg, a3, eventsCaptioned)
+	ctx.Assert(err != nil, "the delivery and then the outbox write failed, and indexAndPublish returned %v with no error: the event is in neither place and nothing says so. A failed outbox write must reach the caller", ok)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
@@ -951,12 +1009,15 @@ void CheckAssetKey(harness::Ctx& ctx) {
 
 void CheckPayloadFacts(harness::Ctx& ctx) {
   const assets::Asset a1 = eventsAsset(1);
-  eventsPublish(ctx, a1, captioned());
+  const bool ok = eventsPublish(ctx, a1, captioned());
+  ctx.Equal(ok, true, "indexAndPublish's result after the broker acknowledged the event");
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kIndexedTopic);
   ctx.Equal(values.size(), 1, "one call must produce one record; the records");
   ctx.Assert(values[0].find("http") == std::string::npos,
              "the event carries a URL: %s. The topic is kept and replayed to every consumer; a link to the original bytes there skips the signed, expiring read path", values[0]);
+  ctx.Assert(values[0].find("a red kettle on a stove") == std::string::npos,
+             "the event carries the caption: %s. The topic is kept and replayed to every consumer; the event carries the asset's facts, not its content", values[0]);
   const auto p = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(p.is_object(), "the payload must be JSON, got %s", values[0]);
   nlohmann::json got = nlohmann::json::object();
@@ -964,6 +1025,15 @@ void CheckPayloadFacts(harness::Ctx& ctx) {
   const nlohmann::json want = {{"asset_id", "a-1"}, {"tenant", "t1"}, {"checksum", a1.checksum}, {"mime", "image/png"},
                                {"embedding_ids", {"a-1:image", "a-1:caption"}}, {"degraded", false}};
   ctx.Equal(got, want, "the event's facts (a consumer needs the checksum to verify the bytes and the embedding ids to find the vectors)");
+  // An asset indexed without a caption: one vector, and the event says it is degraded.
+  eventsPublish(ctx, eventsAsset(2), assets::Captioned{"", "none", true});
+  ctx.Settle();
+  const auto all = ctx.Kafka.Values(kIndexedTopic);
+  const auto p2 = nlohmann::json::parse(all.back(), nullptr, false);
+  ctx.Assert(p2.is_object(), "the payload must be JSON, got %s", all.back());
+  const nlohmann::json got2 = {{"asset_id", p2.value("asset_id", nlohmann::json())}, {"embedding_ids", p2.value("embedding_ids", nlohmann::json())}, {"degraded", p2.value("degraded", nlohmann::json())}};
+  const nlohmann::json want2 = {{"asset_id", "a-2"}, {"embedding_ids", nlohmann::json::array({"a-2:image"})}, {"degraded", true}};
+  ctx.Equal(got2, want2, "for an asset indexed without a caption, the event's facts (the embedding ids are the ones upsert returned, degraded is the captioned result's)");
 }
 
 void CheckIndexBeforePublish(harness::Ctx& ctx) {
@@ -991,17 +1061,30 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Assert(eventsField(rows[0], "topic") == kIndexedTopic && eventsField(rows[0], "key") == "a-1" && rows[0].contains("payload") &&
                  eventsField(rows[0]["payload"], "asset_id") == "a-1",
              "the outbox row is %s, expected the topic, the key a-1 and the payload", rows[0].dump());
+  ctx.Assert(eventsField(rows[0]["payload"], "checksum") == "sha256:" + std::string(64, '1') && rows[0]["payload"].value("embedding_ids", nlohmann::json()) == nlohmann::json{"a-1:image", "a-1:caption"},
+             "the outbox row's payload is %s: the relay publishes it as the event, so it is the event's whole payload", rows[0]["payload"].dump());
   ctx.Equal(ok, false, "indexAndPublish's result after a failed delivery");
   ctx.Equal(ctx.Redis.Exists("index:a-1"), 1, "the index write must stand when only the produce failed");
   ctx.Kafka.Stall(kIndexedTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = eventsPublish(ctx, eventsAsset(2), captioned());
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "indexAndPublish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "indexAndPublish waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "asset_id") == "a-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "indexAndPublish's result without a delivery report");
+  // The outbox write fails too (the broker still does not answer): the caller must hear of it, or the event is lost with nobody told.
+  ctx.Redis.Do("DEL", "outbox");
+  ctx.Redis.Do("SET", "outbox", "not a list");
+  const assets::Asset a3 = eventsAsset(3);
+  bool raised = false;
+  try {
+    ok = indexAndPublish(a3, captioned());
+  } catch (const std::exception&) {
+    raised = true;
+  }
+  ctx.Assert(raised, "the delivery and then the outbox write failed, and indexAndPublish returned %t: the event is in neither place and nothing says so. A failed outbox write must reach the caller", ok);
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {

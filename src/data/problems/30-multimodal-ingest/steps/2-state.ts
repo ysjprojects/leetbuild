@@ -77,7 +77,7 @@ re-uploads spend quota and are refused once it runs out; every refused client co
       id: 'window-ttl',
       title: 'Counts per minute window and expires every key',
       detail:
-        'The counter is keyed by `floor(unix_seconds / WINDOW_S)` and expires with its window, the dedupe mark after a day; the starter keeps one counter per tenant forever, so a busy minute refuses the tenant from then on.',
+        'The counter is keyed by `floor(unix_seconds / WINDOW_S)` and expires with its window, the dedupe mark after a day, each key with its TTL from the moment it is created; the starter keeps one counter per tenant forever, so a busy minute refuses the tenant from then on.',
       match: {
         python: {all: [/\/\/\s*WINDOW_S/, /EXPIRE/, /'EX'|"EX"/]},
         typescript: {all: [/\/\s*WINDOW_S/, /EXPIRE/, /'EX'|"EX"/]},
@@ -111,7 +111,7 @@ re-uploads spend quota and are refused once it runs out; every refused client co
       id: 'retry-after',
       title: 'A refusal says when the window resets',
       detail:
-        '`retry_after` is the seconds left in the current window (`WINDOW_S - now % WINDOW_S`) and the refusal reserves nothing; the starter always says 60.',
+        'The 500th reservation of a window is granted and the 501st is `throttled`, with `retry_after` the seconds left in the current window (`WINDOW_S - now % WINDOW_S`); the refusal reserves nothing. The starter always says 60.',
       match: {
         python: {all: [/%\s*WINDOW_S/]},
         typescript: {all: [/%\s*WINDOW_S/]},
@@ -568,7 +568,11 @@ def check_atomic_reserve(ctx):
 def check_window_ttl(ctx):
     m = ctx.load("state")
     _fresh_window(ctx)
+    # Each key's TTL, read right after the command that created it: a TTL set by a later command is lost when the replica dies in between.
+    created = {key: ctx.redis_after(key, lambda key=key: ctx.redis.ttl(key)) for key in ("ingest:dedupe:t1:" + H1, f"ingest:quota:t1:{int(time.time()) // 60}")}
     m.reserve("t1", H1, "a-1")
+    for key, probe in created.items():
+        assert not probe.fired or probe.result != -1, f"right after the command that created {key}, it had no TTL: a replica that dies before the EXPIRE leaves it in Redis forever. Set the TTL in the same script"
     keys = ctx.redis.keys("ingest:*")
     assert keys, "reserve wrote no ingest:* key"
     for key in keys:
@@ -603,7 +607,9 @@ def check_retry_after(ctx):
     m = ctx.load("state")
     _fresh_window(ctx)
     m.reserve("t1", H1, "a-1")
-    _fill_quota(ctx)
+    _fill_quota(ctx, to=499)
+    last = m.reserve("t1", "sha256:" + "c" * 64, "a-3")
+    assert last["outcome"] == "reserved", f"the 500th upload of the minute was answered {last}: the quota is 500 reservations a minute"
     refused = m.reserve("t1", H2, "a-2")
     assert refused["outcome"] == "throttled", f"the 501st upload of the minute was answered {refused}"
     assert 57 <= refused["retry_after"] <= 59, f"one second into the minute a refusal says retry_after {refused['retry_after']}: it is the seconds left in the window (59), when the counter resets"
@@ -665,7 +671,12 @@ export async function check_atomic_reserve(ctx) {
 export async function check_window_ttl(ctx) {
   const m = ctx.load('state');
   freshWindow(ctx);
+  // Each key's TTL, read right after the command that created it: a TTL set by a later command is lost when the replica dies in between.
+  const created = ['ingest:dedupe:t1:' + H1, \`ingest:quota:t1:\${Math.floor(ctx.clock.now() / 60000)}\`].map(key => ({key, probe: ctx.redisAfter(key, () => Number(ctx.redis.ttl(key)))}));
   await m.reserve('t1', H1, 'a-1');
+  for (const {key, probe} of created) {
+    assert(!probe.fired || probe.result !== -1, \`right after the command that created \${key}, it had no TTL: a replica that dies before the EXPIRE leaves it in Redis forever. Set the TTL in the same script\`);
+  }
   const keys = ctx.redis.keys('ingest:*') as string[];
   assert(keys.length > 0, 'reserve wrote no ingest:* key');
   for (const key of keys) {
@@ -700,7 +711,9 @@ export async function check_retry_after(ctx) {
   const m = ctx.load('state');
   freshWindow(ctx);
   await m.reserve('t1', H1, 'a-1');
-  fillQuota(ctx);
+  fillQuota(ctx, 't1', 499);
+  const last = await m.reserve('t1', 'sha256:' + 'c'.repeat(64), 'a-3');
+  assert.equal(last.outcome, 'reserved', \`the 500th upload of the minute was answered \${JSON.stringify(last)}: the quota is 500 reservations a minute\`);
   const refused = await m.reserve('t1', H2, 'a-2');
   assert.equal(refused.outcome, 'throttled', \`the 501st upload of the minute was answered \${JSON.stringify(refused)}\`);
   assert(refused.retry_after >= 57 && refused.retry_after <= 59, \`one second into the minute a refusal says retry_after \${refused.retry_after}: it is the seconds left in the window (59), when the counter resets\`);
@@ -800,7 +813,13 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 
 func CheckWindowTtl(ctx *harness.Ctx) {
 	freshWindow(ctx)
+	// Each key's TTL, read right after the command that created it: a TTL set by a later command is lost when the replica dies in between.
+	dedupeKey, quotaKey := "ingest:dedupe:t1:"+stateH1, "ingest:quota:t1:"+strconv.FormatInt(ctx.Clock.Now()/60000, 10)
+	dedupe := ctx.Redis.After(dedupeKey, func() any { return ctx.Redis.TTL(dedupeKey) })
+	quota := ctx.Redis.After(quotaKey, func() any { return ctx.Redis.TTL(quotaKey) })
 	mustReserve(ctx, "t1", stateH1, "a-1")
+	ctx.Assert(!dedupe.Fired || dedupe.Result != int64(-1), "right after the command that created %s, it had no TTL: a replica that dies before the EXPIRE leaves it in Redis forever. Set the TTL in the same script", dedupeKey)
+	ctx.Assert(!quota.Fired || quota.Result != int64(-1), "right after the command that created %s, it had no TTL: a replica that dies before the EXPIRE leaves it in Redis forever. Set the TTL in the same script", quotaKey)
 	keys := ctx.Redis.Keys("ingest:*")
 	ctx.Assert(len(keys) > 0, "reserve wrote no ingest:* key")
 	for _, key := range keys {
@@ -836,7 +855,9 @@ func CheckDuplicateFree(ctx *harness.Ctx) {
 func CheckRetryAfter(ctx *harness.Ctx) {
 	freshWindow(ctx)
 	mustReserve(ctx, "t1", stateH1, "a-1")
-	fillQuota(ctx, "t1", 500)
+	fillQuota(ctx, "t1", 499)
+	last := mustReserve(ctx, "t1", "sha256:"+strings.Repeat("c", 64), "a-3")
+	ctx.Equal(last.Outcome, "reserved", "the 500th upload of the minute (the quota is 500 reservations a minute)")
 	refused := mustReserve(ctx, "t1", stateH2, "a-2")
 	ctx.Equal(refused.Outcome, "throttled", "the 501st upload of the minute")
 	ctx.Assert(refused.RetryAfter >= 57 && refused.RetryAfter <= 59, "one second into the minute a refusal says retry_after %d: it is the seconds left in the window (59), when the counter resets", refused.RetryAfter)
@@ -919,7 +940,14 @@ void CheckAtomicReserve(harness::Ctx& ctx) {
 
 void CheckWindowTtl(harness::Ctx& ctx) {
   freshWindow(ctx);
+  // Each key's TTL, read right after the command that created it: a TTL set by a later command is lost when the replica dies in between.
+  const std::vector<std::string> created = {"ingest:dedupe:t1:" + kH1, "ingest:quota:t1:" + std::to_string(ctx.Clock.Now() / 60000)};
+  std::vector<long long> ttls(created.size(), -2);
+  for (size_t i = 0; i < created.size(); i++) ctx.Redis.After(created[i], [&ctx, &ttls, &created, i] { ttls[i] = ctx.Redis.TTL(created[i]); });
   reserve("t1", kH1, "a-1");
+  for (size_t i = 0; i < created.size(); i++) {
+    ctx.Assert(ttls[i] != -1, "right after the command that created %s, it had no TTL: a replica that dies before the EXPIRE leaves it in Redis forever. Set the TTL in the same script", created[i]);
+  }
   const auto keys = ctx.Redis.Keys("ingest:*");
   ctx.Assert(!keys.empty(), "reserve wrote no ingest:* key");
   for (const auto& key : keys) {
@@ -953,7 +981,9 @@ void CheckDuplicateFree(harness::Ctx& ctx) {
 void CheckRetryAfter(harness::Ctx& ctx) {
   freshWindow(ctx);
   reserve("t1", kH1, "a-1");
-  fillQuota(ctx, "t1", 500);
+  fillQuota(ctx, "t1", 499);
+  const Reservation last = reserve("t1", "sha256:" + std::string(64, 'c'), "a-3");
+  ctx.Equal(last.outcome, "reserved", "the 500th upload of the minute (the quota is 500 reservations a minute)");
   const Reservation refused = reserve("t1", kH2, "a-2");
   ctx.Equal(refused.outcome, "throttled", "the 501st upload of the minute");
   ctx.Assert(refused.retry_after >= 57 && refused.retry_after <= 59,

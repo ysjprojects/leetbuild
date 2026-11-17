@@ -110,7 +110,7 @@ day; and a phone that reconnects on a flaky network forks the call into a second
       id: 'idempotent-resume',
       title: 'A replayed Idempotency-Key resumes the session it created',
       detail:
-        '`Idempotency-Key` is required (400 without it) and `sessions.find(tenant, key)` runs before `sessions.create`: a replay answers 200 with the stored session, a new one is recorded with `sessions.remember`.',
+        '`Idempotency-Key` is required (400 when it is missing or empty) and `sessions.find(tenant, key)` runs before `sessions.create`: a replay answers 200 with the stored session, a new one is recorded with `sessions.remember`.',
       match: {
         python: {
           all: [/idempotency-key/i, /sessions\.find\(/, /sessions\.remember\(/],
@@ -527,13 +527,14 @@ void create_session(const httplib::Request& req, httplib::Response& res) {
   const auto format = kSupportedFormats.find(codec);
   if (format == kSupportedFormats.end() || format->second.count(sample_rate) == 0)
     return fail(res, 415, "unsupported audio format " + codec + " at " + std::to_string(sample_rate) + " Hz");
-  const long duration = body.contains("max_duration_s") ? body["max_duration_s"].get<long>() : kDefaultDurationS;
+  // long is 32 bits on some targets: read the full width, so 2^32 + 1800 is refused rather than wrapped to 1800.
+  const long long duration = body.contains("max_duration_s") ? body["max_duration_s"].get<long long>() : kDefaultDurationS;
   if (duration < 1 || duration > kMaxDurationS) return fail(res, 400, "max_duration_s must be 1 to 1800");
   if (const auto existing = sessions::find(tenant, key)) {
     res.set_content(sessions::toJson(*existing).dump(), "application/json");  // a reconnect resumes the call it started
     return;
   }
-  const sessions::Session session = sessions::create(tenant, codec, sample_rate, duration);
+  const sessions::Session session = sessions::create(tenant, codec, sample_rate, static_cast<long>(duration));
   sessions::remember(tenant, key, session.session_id);
   res.status = 201;
   res.set_content(sessions::toJson(session).dump(), "application/json");
@@ -588,7 +589,7 @@ async def check_formats(ctx):
         for codec, rate in (("flac", 44100), ("opus", 44100), ("g711_ulaw", 48000), ("pcm16", 8000)):
             r = await c.post("/v1/voice/sessions", json={"codec": codec, "sample_rate": rate}, headers=_headers(key=f"k-{codec}-{rate}"))
             assert r.status_code == 415, f"{codec} at {rate} Hz answered {r.status_code}, expected 415: the media pipeline cannot decode that pair"
-        for codec, rate in (("opus", 48000), ("pcm16", 16000), ("g711_ulaw", 8000)):
+        for codec, rate in (("opus", 16000), ("opus", 48000), ("pcm16", 16000), ("pcm16", 24000), ("g711_ulaw", 8000)):
             r = await c.post("/v1/voice/sessions", json={"codec": codec, "sample_rate": rate}, headers=_headers(key=f"k-{codec}-{rate}"))
             assert r.status_code == 201, f"{codec} at {rate} Hz is a supported pair but answered {r.status_code}: {r.text}"
 
@@ -598,11 +599,12 @@ async def check_duration(ctx):
         r = await c.post("/v1/voice/sessions", json=BODY, headers=_headers())
         assert r.status_code == 201, f"a session without max_duration_s answered {r.status_code}: {r.text}"
         assert r.json().get("max_duration_s") == 1800, f"an omitted max_duration_s became {r.json().get('max_duration_s')}, expected the 1800 s default"
-        for value in (3600, 86400, 0, -5):
+        for value in (1801, 3600, 86400, 0, -5, 4294969096):
             r = await c.post("/v1/voice/sessions", json={**BODY, "max_duration_s": value}, headers=_headers(key=f"k-{value}"))
             assert r.status_code == 400, f"max_duration_s = {value} answered {r.status_code}, expected 400: a session lasts 1 to 1800 s"
-        r = await c.post("/v1/voice/sessions", json={**BODY, "max_duration_s": 1800}, headers=_headers(key="k-max"))
-    assert r.status_code == 201 and r.json().get("max_duration_s") == 1800, f"max_duration_s = 1800 is allowed, it answered {r.status_code} {r.text}"
+        for value in (1800, 1):
+            r = await c.post("/v1/voice/sessions", json={**BODY, "max_duration_s": value}, headers=_headers(key=f"k-ok-{value}"))
+            assert r.status_code == 201 and r.json().get("max_duration_s") == value, f"max_duration_s = {value} is allowed, it answered {r.status_code} {r.text}"
 
 
 async def check_idempotent_resume(ctx):
@@ -620,7 +622,9 @@ async def check_idempotent_resume(ctx):
         fresh = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(key="k-2"))
         assert fresh.status_code == 201 and fresh.json().get("session_id") != session_id, f"a new key must create a new session, got {fresh.status_code} {fresh.text}"
         none = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(key=None))
+        blank = await c.post("/v1/voice/sessions", json=BODY, headers=_headers(key=""))
     assert none.status_code == 400, f"a create without Idempotency-Key answered {none.status_code}, expected 400"
+    assert blank.status_code == 400, f"a create with an empty Idempotency-Key answered {blank.status_code}, expected 400"
 `,
     typescript: `const BODY = {codec: 'pcm16', sample_rate: 24000};
 
@@ -665,7 +669,7 @@ export async function check_formats(ctx) {
     const r = await post(c, {codec, sample_rate: rate}, headers('acme', \`k-\${codec}-\${rate}\`));
     assert.equal(r.status, 415, \`\${codec} at \${rate} Hz answered \${r.status}, expected 415: the media pipeline cannot decode that pair\`);
   }
-  for (const [codec, rate] of [['opus', 48000], ['pcm16', 16000], ['g711_ulaw', 8000]] as const) {
+  for (const [codec, rate] of [['opus', 16000], ['opus', 48000], ['pcm16', 16000], ['pcm16', 24000], ['g711_ulaw', 8000]] as const) {
     const r = await post(c, {codec, sample_rate: rate}, headers('acme', \`k-\${codec}-\${rate}\`));
     assert.equal(r.status, 201, \`\${codec} at \${rate} Hz is a supported pair but answered \${r.status}: \${r.text}\`);
   }
@@ -676,12 +680,14 @@ export async function check_duration(ctx) {
   let r = await post(c, BODY, headers());
   assert.equal(r.status, 201, \`a session without max_duration_s answered \${r.status}: \${r.text}\`);
   assert.equal(r.json().max_duration_s, 1800, \`an omitted max_duration_s became \${r.json().max_duration_s}, expected the 1800 s default\`);
-  for (const value of [3600, 86400, 0, -5]) {
+  for (const value of [1801, 3600, 86400, 0, -5, 4294969096]) {
     r = await post(c, {...BODY, max_duration_s: value}, headers('acme', \`k-\${value}\`));
     assert.equal(r.status, 400, \`max_duration_s = \${value} answered \${r.status}, expected 400: a session lasts 1 to 1800 s\`);
   }
-  r = await post(c, {...BODY, max_duration_s: 1800}, headers('acme', 'k-max'));
-  assert(r.status === 201 && r.json().max_duration_s === 1800, \`max_duration_s = 1800 is allowed, it answered \${r.status} \${r.text}\`);
+  for (const value of [1800, 1]) {
+    r = await post(c, {...BODY, max_duration_s: value}, headers('acme', \`k-ok-\${value}\`));
+    assert(r.status === 201 && r.json().max_duration_s === value, \`max_duration_s = \${value} is allowed, it answered \${r.status} \${r.text}\`);
+  }
 }
 
 export async function check_idempotent_resume(ctx) {
@@ -700,6 +706,8 @@ export async function check_idempotent_resume(ctx) {
   assert(fresh.status === 201 && fresh.json().session_id !== sessionId, \`a new key must create a new session, got \${fresh.status} \${fresh.text}\`);
   const none = await post(c, BODY, headers('acme', null));
   assert.equal(none.status, 400, \`a create without Idempotency-Key answered \${none.status}, expected 400\`);
+  const blank = await post(c, BODY, headers('acme', ''));
+  assert.equal(blank.status, 400, \`a create with an empty Idempotency-Key answered \${blank.status}, expected 400\`);
 }
 `,
     go: `package main
@@ -772,7 +780,7 @@ func CheckFormats(ctx *harness.Ctx) {
 	for _, f := range []struct {
 		codec string
 		rate  int
-	}{{"opus", 48000}, {"pcm16", 16000}, {"g711_ulaw", 8000}} {
+	}{{"opus", 16000}, {"opus", 48000}, {"pcm16", 16000}, {"pcm16", 24000}, {"g711_ulaw", 8000}} {
 		r := c.Post("/v1/voice/sessions", map[string]any{"codec": f.codec, "sample_rate": f.rate}, "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-%s-%d", f.codec, f.rate))
 		ctx.Equal(r.Status, 201, "%s at %d Hz is a supported pair (%s); the status", f.codec, f.rate, r.Text())
 	}
@@ -783,12 +791,14 @@ func CheckDuration(ctx *harness.Ctx) {
 	r := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "k-1")
 	ctx.Equal(r.Status, 201, "a session without max_duration_s (%s)", r.Text())
 	ctx.Equal(answerOf(r).MaxDurationS, 1800, "an omitted max_duration_s must become the 1800 s default; it became")
-	for _, value := range []int{3600, 86400, 0, -5} {
+	for _, value := range []int{1801, 3600, 86400, 0, -5, 4294969096} {
 		r = c.Post("/v1/voice/sessions", withDuration(value), "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-%d", value))
 		ctx.Equal(r.Status, 400, "max_duration_s = %d: a session lasts 1 to 1800 s; the status", value)
 	}
-	r = c.Post("/v1/voice/sessions", withDuration(1800), "X-Tenant-Id", "acme", "Idempotency-Key", "k-max")
-	ctx.Assert(r.Status == 201 && answerOf(r).MaxDurationS == 1800, "max_duration_s = 1800 is allowed, it answered %d %s", r.Status, r.Text())
+	for _, value := range []int{1800, 1} {
+		r = c.Post("/v1/voice/sessions", withDuration(value), "X-Tenant-Id", "acme", "Idempotency-Key", fmt.Sprintf("k-ok-%d", value))
+		ctx.Assert(r.Status == 201 && answerOf(r).MaxDurationS == value, "max_duration_s = %d is allowed, it answered %d %s", value, r.Status, r.Text())
+	}
 }
 
 func CheckIdempotentResume(ctx *harness.Ctx) {
@@ -807,6 +817,8 @@ func CheckIdempotentResume(ctx *harness.Ctx) {
 	ctx.Assert(fresh.Status == 201 && answerOf(fresh).SessionID != sessionID, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text())
 	none := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme")
 	ctx.Equal(none.Status, 400, "a create without Idempotency-Key; the status")
+	blank := c.Post("/v1/voice/sessions", sessionBody, "X-Tenant-Id", "acme", "Idempotency-Key", "")
+	ctx.Equal(blank.Status, 400, "a create with an empty Idempotency-Key; the status")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -837,7 +849,7 @@ nlohmann::json answerOf(const harness::Response& r) {
   return r.Status == 200 || r.Status == 201 ? nlohmann::json::parse(r.Text()) : nlohmann::json::object();
 }
 
-std::string withDuration(long seconds) {
+std::string withDuration(long long seconds) {
   return R"({"codec": "pcm16", "sample_rate": 24000, "max_duration_s": )" + std::to_string(seconds) + "}";
 }
 
@@ -875,7 +887,7 @@ void CheckFormats(harness::Ctx& ctx) {
     const auto r = create(c, format(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
     ctx.Equal(r.Status, 415, "%s at %d Hz: the media pipeline cannot decode that pair; the status", codec, rate);
   }
-  const std::vector<std::pair<std::string, long>> accepted = {{"opus", 48000}, {"pcm16", 16000}, {"g711_ulaw", 8000}};
+  const std::vector<std::pair<std::string, long>> accepted = {{"opus", 16000}, {"opus", 48000}, {"pcm16", 16000}, {"pcm16", 24000}, {"g711_ulaw", 8000}};
   for (const auto& [codec, rate] : accepted) {
     const auto r = create(c, format(codec, rate), "acme", "k-" + codec + "-" + std::to_string(rate));
     ctx.Equal(r.Status, 201, "%s at %d Hz is a supported pair (%s); the status", codec, rate, r.Text());
@@ -887,12 +899,14 @@ void CheckDuration(harness::Ctx& ctx) {
   auto r = create(c, kBody, "acme", "k-1");
   ctx.Equal(r.Status, 201, "a session without max_duration_s (%s)", r.Text());
   ctx.Equal(answerOf(r).value("max_duration_s", 0L), 1800, "an omitted max_duration_s must become the 1800 s default; it became");
-  for (const long value : {3600L, 86400L, 0L, -5L}) {
+  for (const long long value : {1801LL, 3600LL, 86400LL, 0LL, -5LL, 4294969096LL}) {
     r = create(c, withDuration(value), "acme", "k-" + std::to_string(value));
     ctx.Equal(r.Status, 400, "max_duration_s = %d: a session lasts 1 to 1800 s; the status", value);
   }
-  r = create(c, withDuration(1800), "acme", "k-max");
-  ctx.Assert(r.Status == 201 && answerOf(r).value("max_duration_s", 0L) == 1800, "max_duration_s = 1800 is allowed, it answered %d %s", r.Status, r.Text());
+  for (const long long value : {1800LL, 1LL}) {
+    r = create(c, withDuration(value), "acme", "k-ok-" + std::to_string(value));
+    ctx.Assert(r.Status == 201 && answerOf(r).value("max_duration_s", 0LL) == value, "max_duration_s = %d is allowed, it answered %d %s", value, r.Status, r.Text());
+  }
 }
 
 void CheckIdempotentResume(harness::Ctx& ctx) {
@@ -911,6 +925,8 @@ void CheckIdempotentResume(harness::Ctx& ctx) {
   ctx.Assert(fresh.Status == 201 && answerOf(fresh).value("session_id", "") != session_id, "a new key must create a new session, got %d %s", fresh.Status, fresh.Text());
   const auto none = c.Post("/v1/voice/sessions", kBody, "Content-Type", "application/json", "X-Tenant-Id", "acme");
   ctx.Equal(none.Status, 400, "a create without Idempotency-Key; the status");
+  const auto blank = create(c, kBody, "acme", "");
+  ctx.Equal(blank.Status, 400, "a create with an empty Idempotency-Key; the status");
 }
 `,
   },

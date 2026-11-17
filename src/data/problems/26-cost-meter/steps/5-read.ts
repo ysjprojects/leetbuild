@@ -42,7 +42,7 @@ Requirements:
       id: 'tenant-scope',
       title: "Answers only the caller's own tenant",
       detail:
-        'Without X-Tenant-Id the read is 401; a caller asking for another tenant gets 403 and none of its numbers. The starter trusts the path.',
+        'Without X-Tenant-Id the read is 401; a caller asking for another tenant gets 403 and none of its numbers, whether or not that tenant has spend this hour. The starter trusts the path.',
       match: {
         python: {all: [/X-Tenant-Id/, /status_code\s*=\s*403/]},
         typescript: {all: [/x-tenant-id/, /code\(\s*403\s*\)/]},
@@ -55,7 +55,7 @@ Requirements:
       id: 'current-window',
       title: 'Reads the current window only',
       detail:
-        "Spend is the current hour's window, meter:{tenant}:{bucket_of(now)}, the one the limiter enforces; the previous window, still alive in its grace hour, does not count. The starter sums every window KEYS finds.",
+        "Spend is the current hour's window, meter:{tenant}:{bucket_of(now)}, the one the limiter enforces, up to the hour's last second; the previous window, still alive in its grace hour, does not count, and a new hour reads as zeros. The starter sums every window KEYS finds.",
       match: {
         python: {all: [/bucket_of\(/, /window_key\(/], none: [/\.keys\(|\.scan(_iter)?\(/]},
         typescript: {all: [/bucketOf\(/, /windowKey\(/], none: [/\.keys\(|\.scan(Stream)?\(/]},
@@ -617,6 +617,8 @@ async def check_tenant_scope(ctx):
     r = await _get(ctx, "t2", caller="t1")
     assert r.status_code == 403, f"t1 reading t2's spend answered {r.status_code}, expected 403: another tenant's spend is one URL away"
     assert "99000" not in r.text, f"the 403 must not carry t2's numbers: {r.text}"
+    r = await _get(ctx, "t3", caller="t1")
+    assert r.status_code == 403, f"t1 reading t3, a tenant with no window, answered {r.status_code}, expected 403: the caller decides, not whether the other tenant has spend"
     r = await _get(ctx, "t1", caller=None)
     assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
 
@@ -629,6 +631,13 @@ async def check_current_window(ctx):
     got = (body.get("input_tokens"), body.get("output_tokens"), body.get("events"), body.get("spend_micros"))
     assert got == (1200, 300, 1, 6000), f"the read answered tokens, events and spend {got}, expected the current window's (1200, 300, 1, 6000): last hour's window is not what the limiter enforces now"
     assert body.get("bucket") == bucket, f"the answer must name the window it read, bucket {bucket}: {body}"
+    ctx.clock.advance(WINDOW / 2 - 1)
+    late = _body(await _get(ctx, "t1"))
+    assert (late.get("bucket"), late.get("spend_micros")) == (bucket, 6000), f"in the last second of the hour the read is still bucket {bucket} with spend 6000, got {late}"
+    ctx.clock.advance(2)
+    fresh = _body(await _get(ctx, "t1"))
+    got = (fresh.get("bucket"), fresh.get("input_tokens"), fresh.get("output_tokens"), fresh.get("events"), fresh.get("spend_micros"))
+    assert got == (bucket + 1, 0, 0, 0, 0), f"a second into the next hour the read is bucket {bucket + 1}, empty so far, got {fresh}"
 
 
 async def check_counter_source(ctx):
@@ -703,6 +712,8 @@ export async function check_tenant_scope(ctx) {
   let r = await get(ctx, 't2', 't1');
   assert.equal(r.status, 403, \`t1 reading t2's spend answered \${r.status}, expected 403: another tenant's spend is one URL away\`);
   assert(!r.text.includes('99000'), \`the 403 must not carry t2's numbers: \${r.text}\`);
+  r = await get(ctx, 't3', 't1');
+  assert.equal(r.status, 403, \`t1 reading t3, a tenant with no window, answered \${r.status}, expected 403: the caller decides, not whether the other tenant has spend\`);
   r = await get(ctx, 't1', null);
   assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
 }
@@ -714,6 +725,12 @@ export async function check_current_window(ctx) {
   const b = body(await get(ctx, 't1'));
   assert.deepEqual(numbers(b), [1200, 300, 1, 6000], \`the read answered tokens, events and spend \${JSON.stringify(numbers(b))}, expected the current window's [1200, 300, 1, 6000]: last hour's window is not what the limiter enforces now\`);
   assert.equal(b.bucket, bucket, \`the answer must name the window it read, bucket \${bucket}: \${JSON.stringify(b)}\`);
+  ctx.clock.advance(WINDOW / 2 - 1);
+  const late = body(await get(ctx, 't1', 't1'));
+  assert(late.bucket === bucket && late.spend_micros === 6000, \`in the last second of the hour the read is still bucket \${bucket} with spend 6000, got \${JSON.stringify(late)}\`);
+  ctx.clock.advance(2);
+  const fresh = body(await get(ctx, 't1', 't1'));
+  assert.deepEqual([fresh.bucket, ...numbers(fresh)], [bucket + 1, 0, 0, 0, 0], \`a second into the next hour the read is bucket \${bucket + 1}, empty so far, got \${JSON.stringify(fresh)}\`);
 }
 
 export async function check_counter_source(ctx) {
@@ -812,6 +829,7 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	r := readGet(ctx, "t2", "t1")
 	ctx.Equal(r.Status, 403, "t1 reading t2's spend: another tenant's spend is one URL away")
 	ctx.Assert(!strings.Contains(r.Text(), "99000"), "the 403 must not carry t2's numbers: %s", r.Text())
+	ctx.Equal(readGet(ctx, "t3", "t1").Status, 403, "t1 reading t3, a tenant with no window (the caller decides, not whether the other tenant has spend)")
 	ctx.Equal(readGet(ctx, "t1", "").Status, 401, "a read without X-Tenant-Id")
 }
 
@@ -822,6 +840,12 @@ func CheckCurrentWindow(ctx *harness.Ctx) {
 	b := readBody(ctx, readGet(ctx, "t1", "t1"))
 	ctx.Equal(readNumbers(b), []any{float64(1200), float64(300), float64(1), float64(6000)}, "the current window's tokens, events and spend (last hour's window is not what the limiter enforces now)")
 	ctx.Equal(b["bucket"], float64(bucket), "the answer must name the window it read; bucket")
+	ctx.Clock.Advance(readWindow/2 - 1)
+	late := readBody(ctx, readGet(ctx, "t1", "t1"))
+	ctx.Assert(late["bucket"] == float64(bucket) && late["spend_micros"] == float64(6000), "in the last second of the hour the read is still bucket %d with spend 6000, got %v", bucket, late)
+	ctx.Clock.Advance(2)
+	fresh := readBody(ctx, readGet(ctx, "t1", "t1"))
+	ctx.Equal(append([]any{fresh["bucket"]}, readNumbers(fresh)...), []any{float64(bucket + 1), float64(0), float64(0), float64(0), float64(0)}, "a second into the next hour the read is the next bucket, empty so far; bucket, tokens, events and spend")
 }
 
 func CheckCounterSource(ctx *harness.Ctx) {
@@ -919,6 +943,7 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const auto r = get(ctx, "t2", "t1");
   ctx.Equal(r.Status, 403, "t1 reading t2's spend: another tenant's spend is one URL away");
   ctx.Assert(r.Text().find("99000") == std::string::npos, "the 403 must not carry t2's numbers: %s", r.Text());
+  ctx.Equal(get(ctx, "t3", "t1").Status, 403, "t1 reading t3, a tenant with no window (the caller decides, not whether the other tenant has spend)");
   ctx.Equal(get(ctx, "t1", "").Status, 401, "a read without X-Tenant-Id");
 }
 
@@ -929,6 +954,13 @@ void CheckCurrentWindow(harness::Ctx& ctx) {
   const json b = bodyOf(ctx, get(ctx, "t1", "t1"));
   ctx.Equal(numbers(b), json::array({1200, 300, 1, 6000}), "the current window's tokens, events and spend (last hour's window is not what the limiter enforces now)");
   ctx.Equal(b.value("bucket", json()), json(bucket), "the answer must name the window it read; bucket");
+  ctx.Clock.Advance(kWindow / 2 - 1);
+  const json late = bodyOf(ctx, get(ctx, "t1", "t1"));
+  ctx.Assert(late.value("bucket", json()) == json(bucket) && late.value("spend_micros", json()) == 6000, "in the last second of the hour the read is still bucket %d with spend 6000, got %s", bucket, late.dump());
+  ctx.Clock.Advance(2);
+  const json fresh = bodyOf(ctx, get(ctx, "t1", "t1"));
+  ctx.Equal(fresh.value("bucket", json()), json(bucket + 1), "a second into the next hour the read is the next bucket; bucket");
+  ctx.Equal(numbers(fresh), json::array({0, 0, 0, 0}), "a second into the next hour the window is empty so far; tokens, events and spend");
 }
 
 void CheckCounterSource(harness::Ctx& ctx) {

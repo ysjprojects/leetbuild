@@ -20,10 +20,10 @@ creates one (201). It serves the demo and hides three flaws.
 out and retries creates a second copy of the entity.
 
 - \`AUTHORITY_FIELDS\` (\`merge_into\`, \`force\`, \`merge_policy\`) are the server's to decide: a body
-  carrying any of them is **400** naming the field, and nothing is written.
-- An alias claimed by an entity of a **different type** is **409** with both candidates under
-  \`candidates\` (the claimant's id and type, and the proposed type); nothing is written. An alias of
-  the same type still extends that entity.
+  carrying any of them, whatever its value, is **400** naming the field, and nothing is written.
+- Any alias claimed by an entity of a **different type** is **409** with both candidates under
+  \`candidates\` (the claimant's id and type, and the proposed type); nothing is written, even when
+  another alias is claimed by the same type. An alias of the same type still extends that entity.
 - \`Idempotency-Key\` is required (**400**). Look \`(tenant, key)\` up with \`store.idem_result\` before
   any write, answer the recorded status and body on a replay, and record a fresh result with
   \`store.record_idem\`.`,
@@ -58,7 +58,7 @@ out and retries creates a second copy of the entity.
       id: 'merge-policy',
       title: 'Refuses a caller-supplied merge decision',
       detail:
-        'A body carrying any of `AUTHORITY_FIELDS` (`merge_into`, `force`, `merge_policy`) is 400 naming the field and writes nothing; the starter reads `merge_into` and adds the aliases to that entity.',
+        'A body carrying any of `AUTHORITY_FIELDS` (`merge_into`, `force`, `merge_policy`), whatever its value, is 400 naming the field and writes nothing; the starter reads `merge_into` and adds the aliases to that entity.',
       match: {
         python: {all: [/AUTHORITY_FIELDS/], none: [/get\(\s*["']merge_into["']|\[\s*["']merge_into["']\s*\]/]},
         typescript: {all: [/AUTHORITY_FIELDS/], none: [/\.merge_into\b|\[\s*['"]merge_into['"]\s*\]/]},
@@ -71,7 +71,7 @@ out and retries creates a second copy of the entity.
       id: 'cross-type-409',
       title: 'A cross-type alias collision is 409 with both candidates',
       detail:
-        'When an alias is claimed by an entity of another type the answer is 409 with `candidates` naming the claimant and the proposed type, and nothing is written; the starter merges whatever claims the alias.',
+        'When any of the aliases is claimed by an entity of another type, even after one claimed by the same type, the answer is 409 with `candidates` naming the claimant and the proposed type, and nothing is written; the starter merges whatever claims the alias.',
       match: {
         python: {all: [/\b409\b/, /candidates/]},
         typescript: {all: [/code\(\s*409\s*\)/, /candidates/]},
@@ -736,6 +736,11 @@ async def check_merge_policy(ctx):
         assert store.find_alias("t1", "grace") is None, "the refused request must write nothing, yet the alias grace is claimed"
         r = await c.post("/v1/entities", json={"type": "person", "name": "Grace Hopper", "aliases": ["grace"], "force": True}, headers=_headers("k-3"))
         assert r.status_code == 400, f"a body carrying force answered {r.status_code}, expected 400"
+        r = await c.post("/v1/entities", json={"type": "person", "name": "Grace Hopper", "aliases": ["grace"], "merge_policy": "auto"}, headers=_headers("k-5"))
+        assert r.status_code == 400 and "merge_policy" in r.text, f"a body carrying merge_policy answered {r.status_code} {r.text}, expected 400 naming merge_policy: every AUTHORITY_FIELDS key is refused"
+        r = await c.post("/v1/entities", json={"type": "person", "name": "Grace Hopper", "aliases": ["grace"], "force": False}, headers=_headers("k-6"))
+        assert r.status_code == 400, f"a body carrying force false answered {r.status_code} {r.text}, expected 400: a body carrying the field is refused whatever its value"
+        assert store.find_alias("t1", "grace") is None, "a refused request must write nothing, yet the alias grace is claimed"
         r = await c.post("/v1/entities", json={"type": "person", "name": "Grace Hopper", "aliases": ["grace"]}, headers=_headers("k-4"))
     assert r.status_code == 201, f"the same entity without authority fields answered {r.status_code}: {r.text}"
 
@@ -751,6 +756,11 @@ async def check_cross_type_409(ctx):
     assert stored["aliases"] == ["jordan"] and stored["type"] == "person", f"the 409 must write nothing, yet {person} is now {stored}"
     assert store.find_alias("t1", "jordan ltd") is None, "the 409 must write nothing, yet the alias jordan ltd is claimed"
     assert ctx.redis.get("entity:seq") == "1", f"the 409 must create nothing, yet {ctx.redis.get('entity:seq')} entities exist"
+    async with _api(ctx) as c:
+        acme = await _create(c, "k-3", {"type": "company", "name": "Acme", "aliases": ["acme"]})
+        r = await c.post("/v1/entities", json={"type": "company", "name": "Acme Jordan", "aliases": ["Acme", "Jordan"]}, headers=_headers("k-4"))
+    assert r.status_code == 409, f"a company whose first alias belongs to a company and whose second belongs to a person answered {r.status_code} {r.text}: every alias is checked, a cross-type claimant on any of them is 409"
+    assert store.get_entity(acme)["aliases"] == ["acme"] and store.find_alias("t1", "jordan")["id"] == person, f"the 409 must write nothing, yet {acme} holds {store.get_entity(acme)['aliases']} and jordan is claimed by {store.find_alias('t1', 'jordan')['id']}"
 
 
 async def check_idempotency(ctx):
@@ -803,6 +813,11 @@ export async function check_merge_policy(ctx) {
   assert.equal(await store.findAlias('t1', 'grace'), null, 'the refused request must write nothing, yet the alias grace is claimed');
   r = await c.post('/v1/entities', {json: {type: 'person', name: 'Grace Hopper', aliases: ['grace'], force: true}, headers: headers('k-3')});
   assert.equal(r.status, 400, \`a body carrying force answered \${r.status}, expected 400\`);
+  r = await c.post('/v1/entities', {json: {type: 'person', name: 'Grace Hopper', aliases: ['grace'], merge_policy: 'auto'}, headers: headers('k-5')});
+  assert(r.status === 400 && r.text.includes('merge_policy'), \`a body carrying merge_policy answered \${r.status} \${r.text}, expected 400 naming merge_policy: every AUTHORITY_FIELDS key is refused\`);
+  r = await c.post('/v1/entities', {json: {type: 'person', name: 'Grace Hopper', aliases: ['grace'], force: false}, headers: headers('k-6')});
+  assert.equal(r.status, 400, \`a body carrying force false answered \${r.status} \${r.text}, expected 400: a body carrying the field is refused whatever its value\`);
+  assert.equal(await store.findAlias('t1', 'grace'), null, 'a refused request must write nothing, yet the alias grace is claimed');
   r = await c.post('/v1/entities', {json: {type: 'person', name: 'Grace Hopper', aliases: ['grace']}, headers: headers('k-4')});
   assert.equal(r.status, 201, \`the same entity without authority fields answered \${r.status}: \${r.text}\`);
 }
@@ -819,6 +834,12 @@ export async function check_cross_type_409(ctx) {
   assert(JSON.stringify(stored.aliases) === '["jordan"]' && stored.type === 'person', \`the 409 must write nothing, yet \${person} is now \${JSON.stringify(stored)}\`);
   assert.equal(await store.findAlias('t1', 'jordan ltd'), null, 'the 409 must write nothing, yet the alias jordan ltd is claimed');
   assert.equal(ctx.redis.get('entity:seq'), '1', \`the 409 must create nothing, yet \${ctx.redis.get('entity:seq')} entities exist\`);
+  const acme = await create(c, 'k-3', {type: 'company', name: 'Acme', aliases: ['acme']});
+  const mixed = await c.post('/v1/entities', {json: {type: 'company', name: 'Acme Jordan', aliases: ['Acme', 'Jordan']}, headers: headers('k-4')});
+  assert.equal(mixed.status, 409, \`a company whose first alias belongs to a company and whose second belongs to a person answered \${mixed.status} \${mixed.text}: every alias is checked, a cross-type claimant on any of them is 409\`);
+  const acmeAliases = (await store.getEntity(acme)).aliases;
+  const jordan = (await store.findAlias('t1', 'jordan'))?.id;
+  assert(JSON.stringify(acmeAliases) === '["acme"]' && jordan === person, \`the 409 must write nothing, yet \${acme} holds \${JSON.stringify(acmeAliases)} and jordan is claimed by \${jordan}\`);
 }
 
 export async function check_idempotency(ctx) {
@@ -914,6 +935,11 @@ func CheckMergePolicy(ctx *harness.Ctx) {
 	ctx.Assert(store.FindAlias(apiBg, "t1", "grace") == nil, "the refused request must write nothing, yet the alias grace is claimed")
 	r = upsert(c, "k-3", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "force": true})
 	ctx.Equal(r.Status, 400, "a body carrying force")
+	r = upsert(c, "k-5", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "merge_policy": "auto"})
+	ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "merge_policy"), "a body carrying merge_policy answered %d %s, expected 400 naming merge_policy: every authorityFields key is refused", r.Status, r.Text())
+	r = upsert(c, "k-6", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}, "force": false})
+	ctx.Assert(r.Status == 400, "a body carrying force false answered %d %s, expected 400: a body carrying the field is refused whatever its value", r.Status, r.Text())
+	ctx.Assert(store.FindAlias(apiBg, "t1", "grace") == nil, "a refused request must write nothing, yet the alias grace is claimed")
 	r = upsert(c, "k-4", map[string]any{"type": "person", "name": "Grace Hopper", "aliases": []string{"grace"}})
 	ctx.Equal(r.Status, 201, "the same entity without authority fields (%s)", r.Text())
 }
@@ -935,6 +961,15 @@ func CheckCrossType409(ctx *harness.Ctx) {
 	ctx.Assert(strings.Join(stored.Aliases, ",") == "jordan" && stored.Type == "person", "the 409 must write nothing, yet %s is now %+v", person, stored)
 	ctx.Assert(store.FindAlias(apiBg, "t1", "jordan ltd") == nil, "the 409 must write nothing, yet the alias jordan ltd is claimed")
 	ctx.Equal(seq(ctx), "1", "the 409 must create nothing; the entities that exist")
+	acme := create(ctx, c, "k-3", map[string]any{"type": "company", "name": "Acme", "aliases": []string{"acme"}})
+	r = upsert(c, "k-4", map[string]any{"type": "company", "name": "Acme Jordan", "aliases": []string{"Acme", "Jordan"}})
+	ctx.Assert(r.Status == 409, "a company whose first alias belongs to a company and whose second belongs to a person answered %d %s: every alias is checked, a cross-type claimant on any of them is 409", r.Status, r.Text())
+	acmeAliases := strings.Join(store.GetEntity(apiBg, acme).Aliases, ",")
+	jordan := ""
+	if claimant := store.FindAlias(apiBg, "t1", "jordan"); claimant != nil {
+		jordan = claimant.ID
+	}
+	ctx.Assert(acmeAliases == "acme" && jordan == person, "the 409 must write nothing, yet %s holds %s and jordan is claimed by %s", acme, acmeAliases, jordan)
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
@@ -1022,6 +1057,11 @@ void CheckMergePolicy(harness::Ctx& ctx) {
   ctx.Assert(!store::findAlias("t1", "grace"), "the refused request must write nothing, yet the alias grace is claimed");
   r = upsert(c, "k-3", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"force", true}});
   ctx.Equal(r.Status, 400, "a body carrying force");
+  r = upsert(c, "k-5", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"merge_policy", "auto"}});
+  ctx.Assert(r.Status == 400 && r.Text().find("merge_policy") != std::string::npos, "a body carrying merge_policy answered %d %s, expected 400 naming merge_policy: every kAuthorityFields key is refused", r.Status, r.Text());
+  r = upsert(c, "k-6", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}, {"force", false}});
+  ctx.Assert(r.Status == 400, "a body carrying force false answered %d %s, expected 400: a body carrying the field is refused whatever its value", r.Status, r.Text());
+  ctx.Assert(!store::findAlias("t1", "grace"), "a refused request must write nothing, yet the alias grace is claimed");
   r = upsert(c, "k-4", {{"type", "person"}, {"name", "Grace Hopper"}, {"aliases", {"grace"}}});
   ctx.Equal(r.Status, 201, "the same entity without authority fields (%s)", r.Text());
 }
@@ -1046,6 +1086,13 @@ void CheckCrossType409(harness::Ctx& ctx) {
   ctx.Assert(joined(stored->aliases) == "jordan" && stored->type == "person", "the 409 must write nothing, yet %s now holds the aliases %s as a %s", person, joined(stored->aliases), stored->type);
   ctx.Assert(!store::findAlias("t1", "jordan ltd"), "the 409 must write nothing, yet the alias jordan ltd is claimed");
   ctx.Equal(ctx.Redis.Get("entity:seq").value_or(""), "1", "the 409 must create nothing; the entities that exist");
+  const std::string acme = create(ctx, c, "k-3", {{"type", "company"}, {"name", "Acme"}, {"aliases", {"acme"}}});
+  const auto mixed = upsert(c, "k-4", {{"type", "company"}, {"name", "Acme Jordan"}, {"aliases", {"Acme", "Jordan"}}});
+  ctx.Assert(mixed.Status == 409, "a company whose first alias belongs to a company and whose second belongs to a person answered %d %s: every alias is checked, a cross-type claimant on any of them is 409", mixed.Status, mixed.Text());
+  const std::string acmeAliases = joined(store::getEntity(acme)->aliases);
+  const auto claimant = store::findAlias("t1", "jordan");
+  const std::string jordan = claimant ? claimant->id : "";
+  ctx.Assert(acmeAliases == "acme" && jordan == person, "the 409 must write nothing, yet %s holds %s and jordan is claimed by %s", acme, acmeAliases, jordan);
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {

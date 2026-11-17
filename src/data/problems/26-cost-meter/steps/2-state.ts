@@ -47,7 +47,7 @@ Requirements:
       id: 'window-key',
       title: 'Keys the spend by tenant and hour window',
       detail:
-        'A report lands in meter:{tenant}:{bucket} for the current hour; the next hour starts a new hash from zero, and another tenant has its own. The starter keys by tenant alone, so spend never resets.',
+        'A report lands in meter:{tenant}:{bucket} for the current hour, up to its last second; the next hour starts a new hash from zero, and another tenant has its own. The starter keys by tenant alone, so spend never resets.',
       match: {
         python: {all: [/window_key\(/, /bucket_of\(/]},
         typescript: {all: [/windowKey\(/, /bucketOf\(/]},
@@ -82,7 +82,7 @@ Requirements:
       id: 'window-expiry',
       title: 'Expires the window an hour after it closes',
       detail:
-        'A write at half past the hour leaves a TTL of about 5400 s (window end plus GRACE_S), a later write leaves the expiry where it was, and the hash is gone once the grace hour is over. The starter sets no expiry.',
+        'A write at half past the hour leaves a TTL of about 5400 s (window end plus GRACE_S), already set the moment the command that created the hash returns; a later write leaves the expiry where it was, and the hash is gone once the grace hour is over. The starter sets no expiry.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /GRACE_S/], none: [/['"]EXPIRE['"]|\.expire\(/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIREAT['"]/, /GRACE_S/], none: [/['"]EXPIRE['"]|\.expire\(/]},
@@ -496,6 +496,12 @@ def check_window_key(ctx):
     totals = m.record_usage("t1", 10, 20, 300)
     assert _totals(totals) == (10, 20, 300, 1), f"the next hour starts a new window from zero, record_usage answered {totals}: without the hour in the key, last week's spend still counts against this hour's budget"
     assert _hash(ctx, f"meter:t1:{bucket + 1}").get("input_tokens") == "10", f"the next hour's report must land in meter:t1:{bucket + 1}, the keys are {sorted(ctx.redis.keys('*'))}"
+    ctx.clock.advance(WINDOW / 2 - 1)
+    late = m.record_usage("t1", 1, 1, 1)
+    assert _totals(late)[3] == 2, f"a report in the last second of the hour belongs to that hour's window meter:t1:{bucket + 1}, record_usage answered {late}"
+    ctx.clock.advance(2)
+    fresh = m.record_usage("t1", 1, 1, 1)
+    assert _totals(fresh)[3] == 1, f"a report a second into the next hour starts meter:t1:{bucket + 2} from zero, record_usage answered {fresh}"
 
 
 def check_atomic_script(ctx):
@@ -522,7 +528,12 @@ def check_window_expiry(ctx):
     m = ctx.load("state")
     bucket = _mid_window(ctx)
     key = f"meter:t1:{bucket}"
+    first_ttl = []
+    # the TTL the window has the moment the command that created it returns: a second command is too late
+    probe = ctx.redis_after(key, lambda: first_ttl.append(ctx.redis.ttl(key)))
     m.record_usage("t1", 100, 10, 400)
+    assert probe.fired, f"record_usage never touched {key}, the keys are {sorted(ctx.redis.keys('*'))}"
+    assert first_ttl[0] > 0, f"right after the command that created {key} its TTL was {first_ttl[0]}: the expiry must be set by the same script that writes the window, or a crash in between leaves a window that never expires"
     expected = (bucket + 1) * WINDOW + GRACE - time.time()
     ttl = ctx.redis.ttl(key)
     assert ttl > 0, f"{key} has TTL {ttl}: a window that never expires keeps last hour's spend in Redis for good"
@@ -570,6 +581,12 @@ export async function check_window_key(ctx) {
   const totals = await m.recordUsage('t1', 10, 20, 300);
   assert.deepEqual(totalsOf(totals), [10, 20, 300, 1], \`the next hour starts a new window from zero, recordUsage answered \${JSON.stringify(totals)}: without the hour in the key, last week's spend still counts against this hour's budget\`);
   assert.equal(hash(ctx, \`meter:t1:\${bucket + 1}\`).input_tokens, '10', \`the next hour's report must land in meter:t1:\${bucket + 1}, the keys are \${JSON.stringify(ctx.redis.keys('*').sort())}\`);
+  ctx.clock.advance(WINDOW / 2 - 1);
+  const late = await m.recordUsage('t1', 1, 1, 1);
+  assert.equal(late.events, 2, \`a report in the last second of the hour belongs to that hour's window meter:t1:\${bucket + 1}, recordUsage answered \${JSON.stringify(late)}\`);
+  ctx.clock.advance(2);
+  const fresh = await m.recordUsage('t1', 1, 1, 1);
+  assert.equal(fresh.events, 1, \`a report a second into the next hour starts meter:t1:\${bucket + 2} from zero, recordUsage answered \${JSON.stringify(fresh)}\`);
 }
 
 export async function check_atomic_script(ctx) {
@@ -594,7 +611,14 @@ export async function check_window_expiry(ctx) {
   const m = ctx.load('state');
   const bucket = midWindow(ctx);
   const key = \`meter:t1:\${bucket}\`;
+  let firstTtl = 0;
+  // the TTL the window has the moment the command that created it returns: a second command is too late
+  const probe = ctx.redisAfter(key, () => {
+    firstTtl = Number(ctx.redis.ttl(key));
+  });
   await m.recordUsage('t1', 100, 10, 400);
+  assert(probe.fired, \`recordUsage never touched \${key}, the keys are \${JSON.stringify(ctx.redis.keys('*'))}\`);
+  assert(firstTtl > 0, \`right after the command that created \${key} its TTL was \${firstTtl}: the expiry must be set by the same script that writes the window, or a crash in between leaves a window that never expires\`);
   const expected = (bucket + 1) * WINDOW + GRACE - ctx.clock.now() / 1000;
   const ttl = Number(ctx.redis.ttl(key));
   assert(ttl > 0, \`\${key} has TTL \${ttl}: a window that never expires keeps last hour's spend in Redis for good\`);
@@ -662,6 +686,12 @@ func CheckWindowKey(ctx *harness.Ctx) {
 	totals := stateRecord(ctx, "t1", 10, 20, 300)
 	ctx.Equal(totals, Totals{InputTokens: 10, OutputTokens: 20, CostMicros: 300, Events: 1}, "the next hour starts a new window from zero (without the hour in the key, last week's spend still counts against this hour's budget); recordUsage's totals")
 	ctx.Equal(ctx.Redis.HGetAll(stateKey("t1", bucket+1))["input_tokens"], "10", "the next hour's report must land in %s (keys %v); its input_tokens", stateKey("t1", bucket+1), ctx.Redis.Keys("*"))
+	ctx.Clock.Advance(stateWindow/2 - 1)
+	late := stateRecord(ctx, "t1", 1, 1, 1)
+	ctx.Equal(late.Events, int64(2), "a report in the last second of the hour belongs to that hour's window %s; its events", stateKey("t1", bucket+1))
+	ctx.Clock.Advance(2)
+	fresh := stateRecord(ctx, "t1", 1, 1, 1)
+	ctx.Equal(fresh.Events, int64(1), "a report a second into the next hour starts %s from zero; its events", stateKey("t1", bucket+2))
 }
 
 func CheckAtomicScript(ctx *harness.Ctx) {
@@ -687,7 +717,15 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 func CheckWindowExpiry(ctx *harness.Ctx) {
 	bucket := stateMidWindow(ctx)
 	key := stateKey("t1", bucket)
+	fired, firstTTL := false, int64(0)
+	// the TTL the window has the moment the command that created it returns: a second command is too late
+	ctx.Redis.After(key, func() any {
+		fired, firstTTL = true, ctx.Redis.TTL(key)
+		return nil
+	})
 	stateRecord(ctx, "t1", 100, 10, 400)
+	ctx.Assert(fired, "recordUsage never touched %s, the keys are %v", key, ctx.Redis.Keys("*"))
+	ctx.Assert(firstTTL > 0, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the window, or a crash in between leaves a window that never expires", key, firstTTL)
 	expected := float64((bucket+1)*stateWindow+stateGrace) - float64(ctx.Clock.Now())/1000
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl > 0, "%s has TTL %d: a window that never expires keeps last hour's spend in Redis for good", key, ttl)
@@ -754,6 +792,12 @@ void CheckWindowKey(harness::Ctx& ctx) {
              "the next hour starts a new window from zero, record_usage answered (%d, %d, %d, %d events): without the hour in the key, last week's spend still counts against this hour's budget",
              totals.input_tokens, totals.output_tokens, totals.cost_micros, totals.events);
   ctx.Equal(field(ctx, windowOf("t1", bucket + 1), "input_tokens"), "10", "the next hour's report must land in %s (keys %v); its input_tokens", windowOf("t1", bucket + 1), ctx.Redis.Keys("*"));
+  ctx.Clock.Advance(kWindow / 2 - 1);
+  const Totals late = record_usage("t1", 1, 1, 1);
+  ctx.Equal(late.events, 2, "a report in the last second of the hour belongs to that hour's window %s; its events", windowOf("t1", bucket + 1));
+  ctx.Clock.Advance(2);
+  const Totals fresh = record_usage("t1", 1, 1, 1);
+  ctx.Equal(fresh.events, 1, "a report a second into the next hour starts %s from zero; its events", windowOf("t1", bucket + 2));
 }
 
 void CheckAtomicScript(harness::Ctx& ctx) {
@@ -780,7 +824,16 @@ void CheckAtomicScript(harness::Ctx& ctx) {
 void CheckWindowExpiry(harness::Ctx& ctx) {
   const long long bucket = midWindow(ctx);
   const std::string key = windowOf("t1", bucket);
+  bool fired = false;
+  long long firstTtl = 0;
+  // the TTL the window has the moment the command that created it returns: a second command is too late
+  ctx.Redis.After(key, [&] {
+    fired = true;
+    firstTtl = ctx.Redis.TTL(key);
+  });
   record_usage("t1", 100, 10, 400);
+  ctx.Assert(fired, "record_usage never touched %s, the keys are %v", key, ctx.Redis.Keys("*"));
+  ctx.Assert(firstTtl > 0, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the window, or a crash in between leaves a window that never expires", key, firstTtl);
   const double expected = static_cast<double>((bucket + 1) * kWindow + kGrace) - static_cast<double>(ctx.Clock.Now()) / 1000;
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl > 0, "%s has TTL %d: a window that never expires keeps last hour's spend in Redis for good", key, ttl);

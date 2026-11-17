@@ -58,7 +58,7 @@ itself included; and a hub with thousands of neighbours answers all of them.
       id: 'tenant-scope',
       title: 'Another tenant’s entity is 404',
       detail:
-        'The entity’s `tenant` is compared with `X-Tenant-Id` and a mismatch answers 404, as an unknown id does; the starter only checks that the entity exists.',
+        'The entity’s `tenant` is compared with `X-Tenant-Id` and a mismatch answers 404 with the same body an unknown id gets; the starter only checks that the entity exists.',
       match: {
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*\w+\[["']tenant["']\]/, /\b404\b/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/, /code\(\s*404\s*\)/]},
@@ -84,7 +84,7 @@ itself included; and a hub with thousands of neighbours answers all of them.
       id: 'bounded-traversal',
       title: 'Walks breadth-first with a visited set',
       detail:
-        'A `frontier` per distance and a `visited` set seeded with the entity: each neighbour appears once at its shortest distance. The starter recurses into every neighbour, so paths are enumerated and the entity lists itself.',
+        'A `frontier` per distance and a `visited` set seeded with the entity: each neighbour appears once at its shortest distance, so a triangle’s third corner is at distance 1, not 2. The starter recurses into every neighbour, so paths are enumerated and the entity lists itself.',
       match: {
         python: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
         typescript: {all: [/visited/, /frontier/], none: [/walk\(\s*neighbor/]},
@@ -97,7 +97,7 @@ itself included; and a hub with thousands of neighbours answers all of them.
       id: 'result-cap',
       title: 'Caps the answer at 500 neighbours with a truncation marker',
       detail:
-        'The walk stops at `MAX_RESULTS` (500) and answers `truncated: true` when more neighbours were left; the starter answers every neighbour and always says `false`.',
+        'The walk stops at `MAX_RESULTS` (500) in breadth-first order (every distance-1 neighbour before any at distance 2) and answers `truncated: true` only when more neighbours were left: exactly 500 is complete. The starter answers every neighbour and always says `false`.',
       match: {
         python: {all: [/MAX_RESULTS\s*=\s*500\b/, /len\(\w+\)\s*(==|>=)\s*MAX_RESULTS/]},
         typescript: {all: [/MAX_RESULTS\s*=\s*500\b/, /\.length\s*(===|>=)\s*MAX_RESULTS/]},
@@ -688,11 +688,12 @@ async def check_tenant_scope(ctx):
     mine, theirs, friend = _entity("t1"), _entity("t2"), _entity("t2")
     _edge(ctx, theirs, friend)
     async with _api(ctx) as client:
-        r = await _get(client, theirs, depth=1, tenant="t1")
-        assert r.status_code == 404, f"tenant t1 asked for the neighbours of {theirs}, an entity of t2, and got {r.status_code} {r.text}: another tenant's entity is 404"
-        assert friend not in r.text, f"the answer to t1 leaks {friend}, a neighbour in t2"
-        r = await _get(client, "e-999", depth=1)
-        assert r.status_code == 404, f"an unknown entity answered {r.status_code}, expected 404"
+        foreign = await _get(client, theirs, depth=1, tenant="t1")
+        assert foreign.status_code == 404, f"tenant t1 asked for the neighbours of {theirs}, an entity of t2, and got {foreign.status_code} {foreign.text}: another tenant's entity is 404"
+        assert friend not in foreign.text, f"the answer to t1 leaks {friend}, a neighbour in t2"
+        unknown = await _get(client, "e-999", depth=1)
+        assert unknown.status_code == 404, f"an unknown entity answered {unknown.status_code}, expected 404"
+        assert foreign.text.replace(theirs, "{id}") == unknown.text.replace("e-999", "{id}"), f"another tenant's entity answered {foreign.text} and an unknown one {unknown.text}: the two 404s must be the same answer, or the difference confirms that the id exists"
         r = await _get(client, mine, depth=1, tenant=None)
         assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}, expected 401"
         r = await _get(client, theirs, depth=1, tenant="t2")
@@ -723,6 +724,13 @@ async def check_bounded_traversal(ctx):
     assert r.status_code == 200, f"depth=2 answered {r.status_code}: {r.text}"
     pairs = _pairs(r)
     assert pairs == sorted([(b, 1), (c, 1), (d, 2)]), f"a depth-2 walk over the diamond {a}-{b}/{c}-{d} answered {pairs}: each entity must appear once, at its shortest distance, and never {a} itself. Walk breadth-first with a visited set"
+    x, y, z = _entity(), _entity(), _entity()
+    for left, right in ((x, y), (y, z), (x, z)):
+        _edge(ctx, left, right)
+    async with _api(ctx) as client:
+        r = await _get(client, x, depth=2)
+    pairs = _pairs(r)
+    assert r.status_code == 200 and pairs == sorted([(y, 1), (z, 1)]), f"a depth-2 walk over the triangle {x}-{y}-{z} answered {r.status_code} {pairs}: {z} is a direct neighbour of {x}, so its distance is 1. A depth-first walk reaches it through {y} first; walk breadth-first"
 
 
 async def check_result_cap(ctx):
@@ -736,7 +744,21 @@ async def check_result_cap(ctx):
         assert len(ids) == 500 and len(set(ids)) == 500, f"a hub with 600 neighbours answered {len(ids)} entries: cap the answer at MAX_RESULTS = 500"
         assert r.json().get("truncated") is True, f"the answer was cut at 500 and says truncated={r.json().get('truncated')!r}: a client cannot tell a complete answer from a clipped one"
         r = await _get(client, small, depth=1)
-    assert r.json().get("truncated") is False and _pairs(r) == [("l-000", 1)], f"a complete answer must say truncated false, got {r.text}"
+        assert r.json().get("truncated") is False and _pairs(r) == [("l-000", 1)], f"a complete answer must say truncated false, got {r.text}"
+        # Exactly MAX_RESULTS neighbours: nothing was left, so the answer is complete.
+        exact = _entity()
+        ctx.redis.sadd(f"edges:{exact}", *[f"m-{i:03d}" for i in range(500)])
+        r = await _get(client, exact, depth=1)
+        ids = [n.get("id") for n in r.json().get("neighbors", [])]
+        assert r.status_code == 200 and len(set(ids)) == 500 and r.json().get("truncated") is False, f"a hub with exactly 500 neighbours answered {len(ids)} entries with truncated={r.json().get('truncated')!r}: nothing was left out, so the answer is complete (truncated false)"
+        # The cut keeps the walk's order: every distance-1 neighbour before any distance-2 one.
+        deep = _entity()
+        ctx.redis.sadd(f"edges:{deep}", *[f"z-{i:03d}" for i in range(499)])
+        ctx.redis.sadd("edges:z-000", deep, *[f"a-{i:03d}" for i in range(10)])
+        r = await _get(client, deep, depth=2)
+    pairs = _pairs(r)
+    near = [p for p in pairs if p[1] == 1]
+    assert r.status_code == 200 and len(pairs) == 500 and len(near) == 499 and r.json().get("truncated") is True, f"a depth-2 walk from a hub with 499 direct neighbours and 10 more behind them answered {len(near)} at distance 1 out of {len(pairs)} with truncated={r.json().get('truncated')!r}: the first 500 of the breadth-first walk are all 499 direct neighbours and one more, cut in walk order"
 `,
     typescript: `function api(ctx) {
   return {c: ctx.client(ctx.load('read').app), store: ctx.load('/support/graph/store.ts')};
@@ -777,12 +799,13 @@ export async function check_tenant_scope(ctx) {
   const [mine] = await entities(store, 1, 't1');
   const [theirs, friend] = await entities(store, 2, 't2');
   edge(ctx, theirs, friend);
-  let r = await get(c, theirs, '1', 't1');
-  assert.equal(r.status, 404, \`tenant t1 asked for the neighbours of \${theirs}, an entity of t2, and got \${r.status} \${r.text}: another tenant's entity is 404\`);
-  assert(!r.text.includes(friend), \`the answer to t1 leaks \${friend}, a neighbour in t2\`);
-  r = await get(c, 'e-999', '1');
-  assert.equal(r.status, 404, \`an unknown entity answered \${r.status}, expected 404\`);
-  r = await get(c, mine, '1', null);
+  const foreign = await get(c, theirs, '1', 't1');
+  assert.equal(foreign.status, 404, \`tenant t1 asked for the neighbours of \${theirs}, an entity of t2, and got \${foreign.status} \${foreign.text}: another tenant's entity is 404\`);
+  assert(!foreign.text.includes(friend), \`the answer to t1 leaks \${friend}, a neighbour in t2\`);
+  const unknown = await get(c, 'e-999', '1');
+  assert.equal(unknown.status, 404, \`an unknown entity answered \${unknown.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll(theirs, '{id}'), unknown.text.replaceAll('e-999', '{id}'), \`another tenant's entity answered \${foreign.text} and an unknown one \${unknown.text}: the two 404s must be the same answer, or the difference confirms that the id exists\`);
+  let r = await get(c, mine, '1', null);
   assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}, expected 401\`);
   r = await get(c, theirs, '1', 't2');
   assert(r.status === 200 && pairs(r) === expect(\`\${friend}@1\`), \`the owning tenant must still read \${theirs}, got \${r.status} \${r.text}\`);
@@ -811,6 +834,10 @@ export async function check_bounded_traversal(ctx) {
   const r = await get(c, a, '2');
   assert.equal(r.status, 200, \`depth=2 answered \${r.status}: \${r.text}\`);
   assert.equal(pairs(r), expect(\`\${b}@1\`, \`\${cc}@1\`, \`\${d}@2\`), \`a depth-2 walk over the diamond answered \${pairs(r)}: each entity must appear once, at its shortest distance, and never \${a} itself. Walk breadth-first with a visited set\`);
+  const [x, y, z] = await entities(store, 3);
+  for (const [left, right] of [[x, y], [y, z], [x, z]]) edge(ctx, left, right);
+  const tri = await get(c, x, '2');
+  assert(tri.status === 200 && pairs(tri) === expect(\`\${y}@1\`, \`\${z}@1\`), \`a depth-2 walk over the triangle \${x}-\${y}-\${z} answered \${tri.status} \${pairs(tri)}: \${z} is a direct neighbour of \${x}, so its distance is 1. A depth-first walk reaches it through \${y} first; walk breadth-first\`);
 }
 
 export async function check_result_cap(ctx) {
@@ -826,6 +853,19 @@ export async function check_result_cap(ctx) {
   assert.equal(r.json().truncated, true, \`the answer was cut at 500 and says truncated=\${r.json().truncated}: a client cannot tell a complete answer from a clipped one\`);
   r = await get(c, small, '1');
   assert(r.json().truncated === false && pairs(r) === expect('l-000@1'), \`a complete answer must say truncated false, got \${r.text}\`);
+  // Exactly MAX_RESULTS neighbours: nothing was left, so the answer is complete.
+  const [exact, deep] = await entities(store, 2);
+  ctx.redis.sadd(\`edges:\${exact}\`, ...Array.from({length: 500}, (_, i) => \`m-\${String(i).padStart(3, '0')}\`));
+  r = await get(c, exact, '1');
+  const all = (r.json().neighbors ?? []).map(n => n.id);
+  assert(r.status === 200 && new Set(all).size === 500 && r.json().truncated === false, \`a hub with exactly 500 neighbours answered \${all.length} entries with truncated=\${r.json().truncated}: nothing was left out, so the answer is complete (truncated false)\`);
+  // The cut keeps the walk's order: every distance-1 neighbour before any distance-2 one.
+  ctx.redis.sadd(\`edges:\${deep}\`, ...Array.from({length: 499}, (_, i) => \`z-\${String(i).padStart(3, '0')}\`));
+  ctx.redis.sadd('edges:z-000', deep, ...Array.from({length: 10}, (_, i) => \`a-\${String(i).padStart(3, '0')}\`));
+  r = await get(c, deep, '2');
+  const found = r.json().neighbors ?? [];
+  const near = found.filter(n => n.distance === 1).length;
+  assert(r.status === 200 && found.length === 500 && near === 499 && r.json().truncated === true, \`a depth-2 walk from a hub with 499 direct neighbours and 10 more behind them answered \${near} at distance 1 out of \${found.length} with truncated=\${r.json().truncated}: the first 500 of the breadth-first walk are all 499 direct neighbours and one more, cut in walk order\`);
 }
 `,
     go: `package main
@@ -895,6 +935,18 @@ func readExpect(pairs ...string) string {
 	return strings.Join(pairs, ",")
 }
 
+// readFill adds the extra members and n neighbours prefix-000, prefix-001, ... to the entity's edge set.
+func readFill(ctx *harness.Ctx, entityID, prefix string, n int, extra ...string) {
+	args := []any{"SADD", "edges:" + entityID}
+	for _, member := range extra {
+		args = append(args, member)
+	}
+	for i := 0; i < n; i++ {
+		args = append(args, fmt.Sprintf("%s-%03d", prefix, i))
+	}
+	ctx.Redis.Do(args...)
+}
+
 func CheckRoute(ctx *harness.Ctx) {
 	root, left, right := readEntity("t1"), readEntity("t1"), readEntity("t1")
 	readEdge(ctx, root, left)
@@ -909,12 +961,14 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	mine, theirs, friend := readEntity("t1"), readEntity("t2"), readEntity("t2")
 	readEdge(ctx, theirs, friend)
 	c := readAPI(ctx)
-	r := readGet(c, theirs, "?depth=1", "t1")
-	ctx.Assert(r.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, r.Status, r.Text())
-	ctx.Assert(!strings.Contains(r.Text(), friend), "the answer to t1 leaks %s, a neighbour in t2", friend)
-	ctx.Equal(readGet(c, "e-999", "?depth=1", "t1").Status, 404, "an unknown entity")
+	foreign := readGet(c, theirs, "?depth=1", "t1")
+	ctx.Assert(foreign.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, foreign.Status, foreign.Text())
+	ctx.Assert(!strings.Contains(foreign.Text(), friend), "the answer to t1 leaks %s, a neighbour in t2", friend)
+	unknown := readGet(c, "e-999", "?depth=1", "t1")
+	ctx.Equal(unknown.Status, 404, "an unknown entity")
+	ctx.Assert(strings.ReplaceAll(foreign.Text(), theirs, "{id}") == strings.ReplaceAll(unknown.Text(), "e-999", "{id}"), "another tenant's entity answered %s and an unknown one %s: the two 404s must be the same answer, or the difference confirms that the id exists", foreign.Text(), unknown.Text())
 	ctx.Equal(readGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id")
-	r = readGet(c, theirs, "?depth=1", "t2")
+	r := readGet(c, theirs, "?depth=1", "t2")
 	ctx.Assert(r.Status == 200 && readPairs(r) == friend+"@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text())
 }
 
@@ -944,6 +998,13 @@ func CheckBoundedTraversal(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 200, "depth=2 (%s)", r.Text())
 	got := readPairs(r)
 	ctx.Assert(got == readExpect(b+"@1", c3+"@1", d+"@2"), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a)
+	x, y, z := readEntity("t1"), readEntity("t1"), readEntity("t1")
+	readEdge(ctx, x, y)
+	readEdge(ctx, y, z)
+	readEdge(ctx, x, z)
+	r = readGet(readAPI(ctx), x, "?depth=2", "t1")
+	got = readPairs(r)
+	ctx.Assert(r.Status == 200 && got == readExpect(y+"@1", z+"@1"), "a depth-2 walk over the triangle %s-%s-%s answered %d %s: %s is a direct neighbour of %s, so its distance is 1. A depth-first walk reaches it through %s first; walk breadth-first", x, y, z, r.Status, got, z, x, y)
 }
 
 func CheckResultCap(ctx *harness.Ctx) {
@@ -967,6 +1028,28 @@ func CheckResultCap(ctx *harness.Ctx) {
 	r = readGet(c, small, "?depth=1", "t1")
 	complete := readDecode(r)
 	ctx.Assert(complete.Truncated != nil && !*complete.Truncated && readPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text())
+	// Exactly maxResults neighbours: nothing was left, so the answer is complete.
+	exact, deep := readEntity("t1"), readEntity("t1")
+	readFill(ctx, exact, "m", 500)
+	r = readGet(c, exact, "?depth=1", "t1")
+	full := readDecode(r)
+	seen := map[string]bool{}
+	for _, n := range full.Neighbors {
+		seen[n.ID] = true
+	}
+	ctx.Assert(r.Status == 200 && len(seen) == 500 && full.Truncated != nil && !*full.Truncated, "a hub with exactly 500 neighbours answered %d entries without truncated false: nothing was left out, so the answer is complete", len(full.Neighbors))
+	// The cut keeps the walk's order: every distance-1 neighbour before any distance-2 one.
+	readFill(ctx, deep, "z", 499)
+	readFill(ctx, "z-000", "a", 10, deep)
+	r = readGet(c, deep, "?depth=2", "t1")
+	cut := readDecode(r)
+	near := 0
+	for _, n := range cut.Neighbors {
+		if n.Distance == 1 {
+			near++
+		}
+	}
+	ctx.Assert(r.Status == 200 && len(cut.Neighbors) == 500 && near == 499 && cut.Truncated != nil && *cut.Truncated, "a depth-2 walk from a hub with 499 direct neighbours and 10 more behind them answered %d at distance 1 out of %d: the first 500 of the breadth-first walk are all 499 direct neighbours and one more, cut in walk order, with truncated true", near, len(cut.Neighbors))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1024,6 +1107,20 @@ std::string readExpect(std::vector<std::string> pairs) {
   return out;
 }
 
+// Adds n neighbours prefix-000, prefix-001, ... to the entity's edge set.
+void readFill(harness::Ctx& ctx, const std::string& entity_id, const std::string& prefix, int n) {
+  for (int i = 0; i < n; i++) {
+    char member[16];
+    std::snprintf(member, sizeof member, "%s-%03d", prefix.c_str(), i);
+    ctx.Redis.Do("SADD", "edges:" + entity_id, std::string(member));
+  }
+}
+
+std::string readReplaced(std::string text, const std::string& from, const std::string& to) {
+  for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) text.replace(at, from.size(), to);
+  return text;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -1041,12 +1138,14 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const std::string mine = readEntity("t1"), theirs = readEntity("t2"), friend_ = readEntity("t2");
   readEdge(ctx, theirs, friend_);
   auto c = readAPI(ctx);
-  auto r = readGet(c, theirs, "?depth=1", "t1");
-  ctx.Assert(r.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, r.Status, r.Text());
-  ctx.Assert(r.Text().find(friend_) == std::string::npos, "the answer to t1 leaks %s, a neighbour in t2", friend_);
-  ctx.Equal(readGet(c, "e-999", "?depth=1", "t1").Status, 404, "an unknown entity");
+  const auto foreign = readGet(c, theirs, "?depth=1", "t1");
+  ctx.Assert(foreign.Status == 404, "tenant t1 asked for the neighbours of %s, an entity of t2, and got %d %s: another tenant's entity is 404", theirs, foreign.Status, foreign.Text());
+  ctx.Assert(foreign.Text().find(friend_) == std::string::npos, "the answer to t1 leaks %s, a neighbour in t2", friend_);
+  const auto unknown = readGet(c, "e-999", "?depth=1", "t1");
+  ctx.Equal(unknown.Status, 404, "an unknown entity");
+  ctx.Assert(readReplaced(foreign.Text(), theirs, "{id}") == readReplaced(unknown.Text(), "e-999", "{id}"), "another tenant's entity answered %s and an unknown one %s: the two 404s must be the same answer, or the difference confirms that the id exists", foreign.Text(), unknown.Text());
   ctx.Equal(readGet(c, mine, "?depth=1", "").Status, 401, "a request without X-Tenant-Id");
-  r = readGet(c, theirs, "?depth=1", "t2");
+  auto r = readGet(c, theirs, "?depth=1", "t2");
   ctx.Assert(r.Status == 200 && readPairs(r) == friend_ + "@1", "the owning tenant must still read %s, got %d %s", theirs, r.Status, r.Text());
 }
 
@@ -1077,6 +1176,13 @@ void CheckBoundedTraversal(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 200, "depth=2 (%s)", r.Text());
   const std::string got = readPairs(r);
   ctx.Assert(got == readExpect({b + "@1", c3 + "@1", d + "@2"}), "a depth-2 walk over the diamond answered %s: each entity must appear once, at its shortest distance, and never %s itself. Walk breadth-first with a visited set", got, a);
+  const std::string x = readEntity("t1"), y = readEntity("t1"), z = readEntity("t1");
+  readEdge(ctx, x, y);
+  readEdge(ctx, y, z);
+  readEdge(ctx, x, z);
+  const auto tri = readGet(c, x, "?depth=2", "t1");
+  const std::string triangle = readPairs(tri);
+  ctx.Assert(tri.Status == 200 && triangle == readExpect({y + "@1", z + "@1"}), "a depth-2 walk over the triangle %s-%s-%s answered %d %s: %s is a direct neighbour of %s, so its distance is 1. A depth-first walk reaches it through %s first; walk breadth-first", x, y, z, tri.Status, triangle, z, x, y);
 }
 
 void CheckResultCap(harness::Ctx& ctx) {
@@ -1104,6 +1210,31 @@ void CheckResultCap(harness::Ctx& ctx) {
   r = readGet(c, small, "?depth=1", "t1");
   const auto complete = readBody(r);
   ctx.Assert(complete.is_object() && complete.contains("truncated") && complete["truncated"] == false && readPairs(r) == "l-000@1", "a complete answer must say truncated false, got %s", r.Text());
+  // Exactly kMaxResults neighbours: nothing was left, so the answer is complete.
+  const std::string exact = readEntity("t1"), deep = readEntity("t1");
+  readFill(ctx, exact, "m", 500);
+  r = readGet(c, exact, "?depth=1", "t1");
+  const auto full = readBody(r);
+  std::set<std::string> seen;
+  if (full.is_object() && full.contains("neighbors") && full["neighbors"].is_array()) {
+    for (const auto& n : full["neighbors"]) seen.insert(n.value("id", ""));
+  }
+  ctx.Assert(r.Status == 200 && seen.size() == 500 && full.is_object() && full.value("truncated", true) == false, "a hub with exactly 500 neighbours answered %d distinct entries without truncated false: nothing was left out, so the answer is complete", seen.size());
+  // The cut keeps the walk's order: every distance-1 neighbour before any distance-2 one.
+  readFill(ctx, deep, "z", 499);
+  readFill(ctx, "z-000", "a", 10);
+  ctx.Redis.Do("SADD", "edges:z-000", deep);
+  r = readGet(c, deep, "?depth=2", "t1");
+  const auto cut = readBody(r);
+  size_t total = 0;
+  size_t near = 0;
+  if (cut.is_object() && cut.contains("neighbors") && cut["neighbors"].is_array()) {
+    for (const auto& n : cut["neighbors"]) {
+      total++;
+      if (n.value("distance", 0) == 1) near++;
+    }
+  }
+  ctx.Assert(r.Status == 200 && total == 500 && near == 499 && cut.value("truncated", false) == true, "a depth-2 walk from a hub with 499 direct neighbours and 10 more behind them answered %d at distance 1 out of %d: the first 500 of the breadth-first walk are all 499 direct neighbours and one more, cut in walk order, with truncated true", near, total);
 }
 `,
   },

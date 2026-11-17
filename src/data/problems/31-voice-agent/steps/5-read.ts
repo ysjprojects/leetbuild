@@ -59,7 +59,7 @@ redaction was meant to stand in for.
       id: 'tenant-scope',
       title: "A foreign session is 404, never another tenant's transcript",
       detail:
-        'The tenant is `X-Tenant-Id` (401 without it) and a session whose tenant differs answers **404** with the same body as a missing one; the starter never reads the tenant.',
+        'The tenant is `X-Tenant-Id` (401 when it is missing or empty) and a session whose tenant differs answers **404** with the same body as a missing one; the starter never reads the tenant.',
       match: {
         python: {all: [/x-tenant-id/i, /\btenant\b[^\n]*!=|!=[^\n]*\btenant\b/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==|!==\s*[\w.]*tenant/]},
@@ -72,7 +72,7 @@ redaction was meant to stand in for.
       id: 'turn-cap',
       title: 'Caps every page at 500 turns, 100 by default',
       detail:
-        'A page holds `limit` turns, `DEFAULT_LIMIT` (100) when the caller sends none, clamped to `MAX_TURNS` (500); the starter reads 10,000.',
+        'A page holds `limit` turns, `DEFAULT_LIMIT` (100) when the caller sends none, clamped to `MAX_TURNS` (500); a `limit` of 0, a negative one or one that is not a number answers **400**. The starter reads 10,000.',
       match: {
         python: {all: [/MAX_TURNS\s*=\s*500/, /DEFAULT_LIMIT\s*=\s*100/], none: [/10_?000/]},
         typescript: {all: [/MAX_TURNS\s*=\s*500/, /DEFAULT_LIMIT\s*=\s*100/], none: [/10_?000/]},
@@ -85,7 +85,7 @@ redaction was meant to stand in for.
       id: 'cursor',
       title: 'Pages the transcript with a cursor over the turn index',
       detail:
-        'The response carries `next_cursor`, the last `turn_index` of a full page or null on the last one, and `?cursor=` continues after it, so a client walks a long call page by page.',
+        'The response carries `next_cursor`, the last `turn_index` of the page when more turns follow and null otherwise (a call of exactly two full pages ends with null on the second), and `?cursor=` continues after it, so a client walks a long call page by page.',
       match: {
         python: {all: [/next_cursor/, /["']cursor["']/]},
         typescript: {all: [/next_cursor/, /cursor\?\s*:/]},
@@ -535,9 +535,11 @@ async def check_tenant_scope(ctx):
         foreign = await c.get(f"/v1/voice/sessions/{session_id}", headers={"X-Tenant-Id": "globex"})
         missing = await c.get("/v1/voice/sessions/vs-999", headers={"X-Tenant-Id": "globex"})
         anonymous = await c.get(f"/v1/voice/sessions/{session_id}")
+        blank = await c.get(f"/v1/voice/sessions/{session_id}", headers={"X-Tenant-Id": ""})
     assert foreign.status_code == 404, f"tenant globex read acme's session and got {foreign.status_code}: {foreign.text[:200]}. Another tenant's session must be 404"
     assert foreign.text == missing.text, f"a foreign session answered {foreign.text!r}, a missing one {missing.text!r}: the two must be indistinguishable"
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert blank.status_code == 401, f"a read with an empty X-Tenant-Id answered {blank.status_code}, expected 401"
 
 
 async def check_turn_cap(ctx):
@@ -545,30 +547,35 @@ async def check_turn_cap(ctx):
     async with _api(ctx) as c:
         big = await c.get(f"/v1/voice/sessions/{session_id}", params={"limit": 1000}, headers={"X-Tenant-Id": "acme"})
         default = await c.get(f"/v1/voice/sessions/{session_id}", headers={"X-Tenant-Id": "acme"})
-        bad = await c.get(f"/v1/voice/sessions/{session_id}", params={"limit": 0}, headers={"X-Tenant-Id": "acme"})
+        bad = {value: await c.get(f"/v1/voice/sessions/{session_id}", params={"limit": value}, headers={"X-Tenant-Id": "acme"}) for value in ("0", "-1", "abc")}
+        one = await c.get(f"/v1/voice/sessions/{session_id}", params={"limit": 1}, headers={"X-Tenant-Id": "acme"})
     assert big.status_code == 200, f"limit=1000 answered {big.status_code}: {big.text[:200]}"
     assert len(big.json()["turns"]) == 500, f"limit=1000 on a 520-turn call answered {len(big.json()['turns'])} turns: a page holds at most MAX_TURNS (500)"
     assert len(default.json()["turns"]) == 100, f"without limit the page holds {len(default.json()['turns'])} turns, expected DEFAULT_LIMIT (100)"
-    assert bad.status_code == 400, f"limit=0 answered {bad.status_code}, expected 400"
+    for value, r in bad.items():
+        assert r.status_code == 400, f"limit={value} answered {r.status_code}, expected 400: a limit must be a positive integer"
+    assert one.status_code == 200 and len(one.json()["turns"]) == 1, f"limit=1 answered {one.status_code} with {len(one.json().get('turns', [])) if one.status_code == 200 else 0} turns, expected 1"
 
 
 async def check_cursor(ctx):
-    session_id = _call(250)
-    seen, sizes, cursor = [], [], None
     async with _api(ctx) as c:
-        for _ in range(5):
-            params = {"limit": 100} if cursor is None else {"limit": 100, "cursor": cursor}
-            r = await c.get(f"/v1/voice/sessions/{session_id}", params=params, headers={"X-Tenant-Id": "acme"})
-            assert r.status_code == 200, f"a page answered {r.status_code}: {r.text[:200]}"
-            body = r.json()
-            assert "next_cursor" in body, f"the response carries no next_cursor: a client cannot walk past the first page (keys: {sorted(body)})"
-            seen += [t["turn_index"] for t in body["turns"]]
-            sizes.append(len(body["turns"]))
-            cursor = body["next_cursor"]
-            if cursor is None:
-                break
-    assert sizes == [100, 100, 50], f"walking 250 turns 100 at a time gave pages of {sizes}, expected 100, 100, 50 and then next_cursor null"
-    assert seen == list(range(250)), "following next_cursor must visit every turn once, in order"
+        # 200 turns are exactly two pages: the second one is the last, so its next_cursor is null.
+        for total, expected in ((250, [100, 100, 50]), (200, [100, 100])):
+            session_id = _call(total)
+            seen, sizes, cursor = [], [], None
+            for _ in range(5):
+                params = {"limit": 100} if cursor is None else {"limit": 100, "cursor": cursor}
+                r = await c.get(f"/v1/voice/sessions/{session_id}", params=params, headers={"X-Tenant-Id": "acme"})
+                assert r.status_code == 200, f"a page answered {r.status_code}: {r.text[:200]}"
+                body = r.json()
+                assert "next_cursor" in body, f"the response carries no next_cursor: a client cannot walk past the first page (keys: {sorted(body)})"
+                seen += [t["turn_index"] for t in body["turns"]]
+                sizes.append(len(body["turns"]))
+                cursor = body["next_cursor"]
+                if cursor is None:
+                    break
+            assert sizes == expected, f"walking {total} turns 100 at a time gave pages of {sizes}, expected {expected} and then next_cursor null: next_cursor is set only when more turns follow"
+            assert seen == list(range(total)), "following next_cursor must visit every turn once, in order"
 
 
 async def check_no_audio_path(ctx):
@@ -616,9 +623,11 @@ export async function check_tenant_scope(ctx) {
   const foreign = await read(c, sessionId, {}, 'globex');
   const missing = await read(c, 'vs-999', {}, 'globex');
   const anonymous = await read(c, sessionId, {}, null);
+  const blank = await read(c, sessionId, {}, '');
   assert.equal(foreign.status, 404, \`tenant globex read acme's session and got \${foreign.status}: \${foreign.text.slice(0, 200)}. Another tenant's session must be 404\`);
   assert.equal(foreign.text, missing.text, \`a foreign session answered \${foreign.text}, a missing one \${missing.text}: the two must be indistinguishable\`);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(blank.status, 401, \`a read with an empty X-Tenant-Id answered \${blank.status}, expected 401\`);
 }
 
 export async function check_turn_cap(ctx) {
@@ -626,31 +635,41 @@ export async function check_turn_cap(ctx) {
   const c = api(ctx);
   const big = await read(c, sessionId, {limit: '1000'});
   const fallback = await read(c, sessionId);
-  const bad = await read(c, sessionId, {limit: '0'});
   assert.equal(big.status, 200, \`limit=1000 answered \${big.status}: \${big.text.slice(0, 200)}\`);
   assert.equal(big.json().turns.length, 500, \`limit=1000 on a 520-turn call answered \${big.json().turns.length} turns: a page holds at most MAX_TURNS (500)\`);
   assert.equal(fallback.json().turns.length, 100, \`without limit the page holds \${fallback.json().turns.length} turns, expected DEFAULT_LIMIT (100)\`);
-  assert.equal(bad.status, 400, \`limit=0 answered \${bad.status}, expected 400\`);
+  for (const value of ['0', '-1', 'abc']) {
+    const bad = await read(c, sessionId, {limit: value});
+    assert.equal(bad.status, 400, \`limit=\${value} answered \${bad.status}, expected 400: a limit must be a positive integer\`);
+  }
+  const one = await read(c, sessionId, {limit: '1'});
+  assert(one.status === 200 && one.json().turns.length === 1, \`limit=1 answered \${one.status}: \${one.text.slice(0, 200)}, expected 1 turn\`);
 }
 
 export async function check_cursor(ctx) {
-  const sessionId = await call(ctx, 250);
   const c = api(ctx);
-  const seen: number[] = [];
-  const sizes: number[] = [];
-  let cursor: string | null = null;
-  for (let i = 0; i < 5; i += 1) {
-    const r = await read(c, sessionId, cursor === null ? {limit: '100'} : {limit: '100', cursor});
-    assert.equal(r.status, 200, \`a page answered \${r.status}: \${r.text.slice(0, 200)}\`);
-    const body = r.json();
-    assert('next_cursor' in body, \`the response carries no next_cursor: a client cannot walk past the first page (keys: \${Object.keys(body)})\`);
-    seen.push(...body.turns.map(t => t.turn_index));
-    sizes.push(body.turns.length);
-    cursor = body.next_cursor;
-    if (cursor === null) break;
+  // 200 turns are exactly two pages: the second one is the last, so its next_cursor is null.
+  for (const [total, expected] of [
+    [250, [100, 100, 50]],
+    [200, [100, 100]],
+  ] as const) {
+    const sessionId = await call(ctx, total);
+    const seen: number[] = [];
+    const sizes: number[] = [];
+    let cursor: string | null = null;
+    for (let i = 0; i < 5; i += 1) {
+      const r = await read(c, sessionId, cursor === null ? {limit: '100'} : {limit: '100', cursor});
+      assert.equal(r.status, 200, \`a page answered \${r.status}: \${r.text.slice(0, 200)}\`);
+      const body = r.json();
+      assert('next_cursor' in body, \`the response carries no next_cursor: a client cannot walk past the first page (keys: \${Object.keys(body)})\`);
+      seen.push(...body.turns.map(t => t.turn_index));
+      sizes.push(body.turns.length);
+      cursor = body.next_cursor === null ? null : String(body.next_cursor);
+      if (cursor === null) break;
+    }
+    assert.deepStrictEqual(sizes, expected, \`walking \${total} turns 100 at a time gave pages of \${JSON.stringify(sizes)}, expected \${JSON.stringify(expected)} and then next_cursor null: next_cursor is set only when more turns follow\`);
+    assert.deepStrictEqual(seen, Array.from({length: total}, (_, i) => i), 'following next_cursor must visit every turn once, in order');
   }
-  assert.deepStrictEqual(sizes, [100, 100, 50], \`walking 250 turns 100 at a time gave pages of \${JSON.stringify(sizes)}, expected 100, 100, 50 and then next_cursor null\`);
-  assert.deepStrictEqual(seen, Array.from({length: 250}, (_, i) => i), 'following next_cursor must visit every turn once, in order');
 }
 
 export async function check_no_audio_path(ctx) {
@@ -706,7 +725,7 @@ func readAPI(ctx *harness.Ctx) *harness.HTTP {
 
 type page struct {
 	Turns      []map[string]any \`json:"turns"\`
-	NextCursor *string          \`json:"next_cursor"\`
+	NextCursor any              \`json:"next_cursor"\` // a string or a number; null on the last page
 }
 
 func pageOf(r *harness.Response) (page, map[string]any) {
@@ -742,9 +761,11 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	foreign := c.Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "globex")
 	missing := c.Get("/v1/voice/sessions/vs-999", "X-Tenant-Id", "globex")
 	anonymous := c.Get("/v1/voice/sessions/" + sessionID)
+	blank := c.Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "")
 	ctx.Equal(foreign.Status, 404, "tenant globex read acme's session (%.200s): another tenant's session must be 404; the status", foreign.Text())
 	ctx.Equal(foreign.Text(), missing.Text(), "a foreign session and a missing one must be indistinguishable; the bodies")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id; the status")
+	ctx.Equal(blank.Status, 401, "a read with an empty X-Tenant-Id; the status")
 }
 
 func CheckTurnCap(ctx *harness.Ctx) {
@@ -756,44 +777,55 @@ func CheckTurnCap(ctx *harness.Ctx) {
 	ctx.Equal(len(p.Turns), 500, "limit=1000 on a 520-turn call: a page holds at most maxTurns (500); the turns")
 	fallback, _ := pageOf(c.Get("/v1/voice/sessions/"+sessionID, "X-Tenant-Id", "acme"))
 	ctx.Equal(len(fallback.Turns), 100, "without limit, the page must hold defaultLimit (100) turns; the turns")
-	bad := c.Get("/v1/voice/sessions/"+sessionID+"?limit=0", "X-Tenant-Id", "acme")
-	ctx.Equal(bad.Status, 400, "limit=0; the status")
+	for _, value := range []string{"0", "-1", "abc"} {
+		bad := c.Get("/v1/voice/sessions/"+sessionID+"?limit="+value, "X-Tenant-Id", "acme")
+		ctx.Equal(bad.Status, 400, "limit=%s: a limit must be a positive integer; the status", value)
+	}
+	one := c.Get("/v1/voice/sessions/"+sessionID+"?limit=1", "X-Tenant-Id", "acme")
+	onePage, _ := pageOf(one)
+	ctx.Assert(one.Status == 200 && len(onePage.Turns) == 1, "limit=1 answered %d: %.200s, expected 1 turn", one.Status, one.Text())
 }
 
 func CheckCursor(ctx *harness.Ctx) {
-	sessionID := seedCall(ctx, 250, "acme")
 	c := readAPI(ctx)
-	seen := []any{}
-	sizes := []int{}
-	cursor := ""
-	for i := 0; i < 5; i++ {
-		path := "/v1/voice/sessions/" + sessionID + "?limit=100"
-		if cursor != "" {
-			path += "&cursor=" + cursor
+	// 200 turns are exactly two pages: the second one is the last, so its next_cursor is null.
+	for _, walk := range []struct {
+		total    int
+		expected []int
+	}{{250, []int{100, 100, 50}}, {200, []int{100, 100}}} {
+		sessionID := seedCall(ctx, walk.total, "acme")
+		seen := []any{}
+		sizes := []int{}
+		cursor := ""
+		for i := 0; i < 5; i++ {
+			path := "/v1/voice/sessions/" + sessionID + "?limit=100"
+			if cursor != "" {
+				path += "&cursor=" + cursor
+			}
+			r := c.Get(path, "X-Tenant-Id", "acme")
+			ctx.Equal(r.Status, 200, "a page (%.200s)", r.Text())
+			p, raw := pageOf(r)
+			_, has := raw["next_cursor"]
+			keys := []string{}
+			for k := range raw {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			ctx.Assert(has, "the response carries no next_cursor: a client cannot walk past the first page (keys: %v)", keys)
+			seen = append(seen, turnIndexes(p)...)
+			sizes = append(sizes, len(p.Turns))
+			if p.NextCursor == nil {
+				break
+			}
+			cursor = fmt.Sprint(p.NextCursor)
 		}
-		r := c.Get(path, "X-Tenant-Id", "acme")
-		ctx.Equal(r.Status, 200, "a page (%.200s)", r.Text())
-		p, raw := pageOf(r)
-		_, has := raw["next_cursor"]
-		keys := []string{}
-		for k := range raw {
-			keys = append(keys, k)
+		ctx.Equal(sizes, walk.expected, "walking %d turns 100 at a time, then next_cursor null (it is set only when more turns follow); the page sizes", walk.total)
+		want := []any{}
+		for i := 0; i < walk.total; i++ {
+			want = append(want, i)
 		}
-		sort.Strings(keys)
-		ctx.Assert(has, "the response carries no next_cursor: a client cannot walk past the first page (keys: %v)", keys)
-		seen = append(seen, turnIndexes(p)...)
-		sizes = append(sizes, len(p.Turns))
-		if p.NextCursor == nil {
-			break
-		}
-		cursor = *p.NextCursor
+		ctx.Assert(fmt.Sprint(seen) == fmt.Sprint(want), "following next_cursor must visit every turn once, in order")
 	}
-	ctx.Equal(sizes, []int{100, 100, 50}, "walking 250 turns 100 at a time, then next_cursor null; the page sizes")
-	want := []any{}
-	for i := 0; i < 250; i++ {
-		want = append(want, i)
-	}
-	ctx.Assert(fmt.Sprint(seen) == fmt.Sprint(want), "following next_cursor must visit every turn once, in order")
 }
 
 func CheckNoAudioPath(ctx *harness.Ctx) {
@@ -818,6 +850,7 @@ func CheckNoAudioPath(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
 #include <vector>
 
 using json = nlohmann::json;
@@ -879,9 +912,11 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const auto foreign = c.Get("/v1/voice/sessions/" + session_id, "X-Tenant-Id", "globex");
   const auto missing = c.Get("/v1/voice/sessions/vs-999", "X-Tenant-Id", "globex");
   const auto anonymous = c.Get("/v1/voice/sessions/" + session_id);
+  const auto blank = c.Get("/v1/voice/sessions/" + session_id, "X-Tenant-Id", "");
   ctx.Equal(foreign.Status, 404, "tenant globex read acme's session (%.200s): another tenant's session must be 404; the status", foreign.Text());
   ctx.Equal(foreign.Text(), missing.Text(), "a foreign session and a missing one must be indistinguishable; the bodies");
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id; the status");
+  ctx.Equal(blank.Status, 401, "a read with an empty X-Tenant-Id; the status");
 }
 
 void CheckTurnCap(harness::Ctx& ctx) {
@@ -892,31 +927,41 @@ void CheckTurnCap(harness::Ctx& ctx) {
   ctx.Equal(bodyOf(ctx, big)["turns"].size(), 500, "limit=1000 on a 520-turn call: a page holds at most kMaxTurns (500); the turns");
   const auto fallback = c.Get("/v1/voice/sessions/" + session_id, "X-Tenant-Id", "acme");
   ctx.Equal(bodyOf(ctx, fallback)["turns"].size(), 100, "without limit, the page must hold kDefaultLimit (100) turns; the turns");
-  const auto bad = c.Get("/v1/voice/sessions/" + session_id + "?limit=0", "X-Tenant-Id", "acme");
-  ctx.Equal(bad.Status, 400, "limit=0; the status");
+  for (const std::string value : {"0", "-1", "abc"}) {
+    const auto bad = c.Get("/v1/voice/sessions/" + session_id + "?limit=" + value, "X-Tenant-Id", "acme");
+    ctx.Equal(bad.Status, 400, "limit=%s: a limit must be a positive integer; the status", value);
+  }
+  const auto one = c.Get("/v1/voice/sessions/" + session_id + "?limit=1", "X-Tenant-Id", "acme");
+  ctx.Equal(one.Status, 200, "limit=1 (%.200s)", one.Text());
+  ctx.Equal(bodyOf(ctx, one)["turns"].size(), 1, "limit=1; the turns");
 }
 
 void CheckCursor(harness::Ctx& ctx) {
-  const std::string session_id = seedCall(250);
   auto c = api(ctx);
-  std::vector<long> seen;
-  std::vector<size_t> sizes;
-  std::string cursor;
-  for (int i = 0; i < 5; i++) {
-    const std::string path = "/v1/voice/sessions/" + session_id + "?limit=100" + (cursor.empty() ? "" : "&cursor=" + cursor);
-    const auto r = c.Get(path, "X-Tenant-Id", "acme");
-    ctx.Equal(r.Status, 200, "a page (%.200s)", r.Text());
-    const json body = bodyOf(ctx, r);
-    ctx.Assert(body.contains("next_cursor"), "the response carries no next_cursor: a client cannot walk past the first page (%.200s)", r.Text());
-    for (const long t : indexes(body)) seen.push_back(t);
-    sizes.push_back(body["turns"].size());
-    if (body["next_cursor"].is_null()) break;
-    cursor = body["next_cursor"].get<std::string>();
+  // 200 turns are exactly two pages: the second one is the last, so its next_cursor is null.
+  const std::vector<std::pair<long, std::vector<size_t>>> walks = {{250, {100, 100, 50}}, {200, {100, 100}}};
+  for (const auto& [total, expected] : walks) {
+    const std::string session_id = seedCall(total);
+    std::vector<long> seen;
+    std::vector<size_t> sizes;
+    std::string cursor;
+    for (int i = 0; i < 5; i++) {
+      const std::string path = "/v1/voice/sessions/" + session_id + "?limit=100" + (cursor.empty() ? "" : "&cursor=" + cursor);
+      const auto r = c.Get(path, "X-Tenant-Id", "acme");
+      ctx.Equal(r.Status, 200, "a page (%.200s)", r.Text());
+      const json body = bodyOf(ctx, r);
+      ctx.Assert(body.contains("next_cursor"), "the response carries no next_cursor: a client cannot walk past the first page (%.200s)", r.Text());
+      for (const long t : indexes(body)) seen.push_back(t);
+      sizes.push_back(body["turns"].size());
+      const json& next = body["next_cursor"];
+      if (next.is_null()) break;
+      cursor = next.is_string() ? next.get<std::string>() : next.dump();  // a string or a number
+    }
+    ctx.Equal(sizes, expected, "walking %d turns 100 at a time, then next_cursor null (it is set only when more turns follow); the page sizes", total);
+    std::vector<long> want;
+    for (long i = 0; i < total; i++) want.push_back(i);
+    ctx.Assert(seen == want, "following next_cursor must visit every turn once, in order");
   }
-  ctx.Equal(sizes, std::vector<size_t>{100, 100, 50}, "walking 250 turns 100 at a time, then next_cursor null; the page sizes");
-  std::vector<long> want;
-  for (long i = 0; i < 250; i++) want.push_back(i);
-  ctx.Assert(seen == want, "following next_cursor must visit every turn once, in order");
 }
 
 void CheckNoAudioPath(harness::Ctx& ctx) {

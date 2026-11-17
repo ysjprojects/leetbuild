@@ -55,7 +55,7 @@ Requirements:
       id: 'deadline',
       title: '200 ms deadline on the pricing call',
       detail:
-        'Each GetRates call carries a deadline of about 200 ms; a service that hangs is cut there and the report is priced from the fresh cached table. The starter sends no deadline.',
+        'Every GetRates call carries its own deadline of about 200 ms, a later call included; a service that hangs is cut there and the report is priced from the fresh cached table. The starter sends no deadline.',
       match: {
         python: {all: [/timeout\s*=\s*PRICE_DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*PRICE_DEADLINE_MS/]},
@@ -68,7 +68,7 @@ Requirements:
       id: 'cache-fallback',
       title: 'Prices from the last good table when the service fails',
       detail:
-        "After one good reply, a failed call prices any model in that table from it, with source cache and the table's version. The starter prices a failed lookup at an invented FALLBACK_RATE.",
+        "After one good reply, a failed call prices any model in that table from it, with source cache and the table's version, whatever status code the call failed with. The starter prices a failed lookup at an invented FALLBACK_RATE.",
       match: {
         python: {all: [/["']cache["']/], none: [/FALLBACK_RATE/]},
         typescript: {all: [/['"]cache['"]/], none: [/FALLBACK_RATE/]},
@@ -81,7 +81,7 @@ Requirements:
       id: 'cache-freshness',
       title: 'Uses the cached table for an hour at most',
       detail:
-        'A table 3500 s old still prices a report when the service fails; one older than PRICE_MAX_AGE_S makes the report uncosted. The starter serves a cached rate for the life of the process, without asking the service.',
+        'A table 3500 s old still prices a report when the service fails; one older than PRICE_MAX_AGE_S makes the report uncosted, and the next reply replaces the table and starts its hour again. The starter serves a cached rate for the life of the process, without asking the service.',
       match: {
         python: {all: [/PRICE_MAX_AGE_S/]},
         typescript: {all: [/PRICE_MAX_AGE_S/]},
@@ -94,7 +94,7 @@ Requirements:
       id: 'uncosted-model',
       title: 'Marks a model the table lacks as uncosted',
       detail:
-        'A model missing from the served table answers priced false, source uncosted, cost 0, for a reconcile job to price later. The starter bills it at FALLBACK_RATE as if it were priced.',
+        'A model missing from the served table answers priced false, source uncosted, cost 0, for a reconcile job to price later; a listed model costs (input_tokens × input_rate + output_tokens × output_rate) // 1000, rounded down once on the sum. The starter bills a missing model at FALLBACK_RATE as if it were priced.',
       match: {
         python: {all: [/["']uncosted["']/], none: [/FALLBACK_RATE/]},
         typescript: {all: [/['"]uncosted['"]/], none: [/FALLBACK_RATE/]},
@@ -720,8 +720,8 @@ def _calls(ctx):
     return ctx.grpc.calls_to("GetRates")
 
 
-def _fail(ctx, times=1):
-    ctx.grpc.fail("GetRates", grpc.StatusCode.UNAVAILABLE, "pricing restarting", times=times, target=config.PRICING)
+def _fail(ctx, times=1, code=grpc.StatusCode.UNAVAILABLE):
+    ctx.grpc.fail("GetRates", code, "pricing failed", times=times, target=config.PRICING)
 
 
 def _expect(price, cost, source, priced=True, version=pricing.VERSION):
@@ -737,12 +737,16 @@ def check_deadline(ctx):
     assert len(calls) == 1, f"one lookup must make one GetRates call, saw {len(calls)}"
     assert calls[0].timeout is not None, "the GetRates call carries no deadline: a hung pricing replica holds the report path as long as it hangs"
     assert 0.15 <= calls[0].timeout <= 0.25, f"the deadline must be PRICE_DEADLINE_S = 0.2 s, got {calls[0].timeout} s"
+    # a second later: every call carries its own 200 ms, not what is left of one shared deadline
+    ctx.clock.advance(1)
     ctx.grpc.set_latency("GetRates", 5.0, config.PRICING)
     started = ctx.clock.offset
     price = m.cost_of("gpt-4o", 1200, 300)
     waited = ctx.clock.offset - started
     assert waited <= 0.3, f"the lookup waited {waited:.1f} s on a pricing service that hangs: the deadline must cut it at 0.2 s"
     _expect(price, 6000, "cache")
+    for call in _calls(ctx):
+        assert call.timeout is not None and 0.15 <= call.timeout <= 0.25, f"every GetRates call carries its own 200 ms deadline, saw {[c.timeout for c in _calls(ctx)]} s"
 
 
 def check_cache_fallback(ctx):
@@ -752,6 +756,11 @@ def check_cache_fallback(ctx):
     price = m.cost_of("gpt-4o-mini", 1200, 300)
     assert len(_calls(ctx)) == 2, f"a lookup asks the service first, then falls back: saw {len(_calls(ctx))} GetRates calls for two lookups"
     _expect(price, 360, "cache")
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED):
+        _fail(ctx, code=code)
+        price = m.cost_of("claude-sonnet-4", 1000, 1000)
+        assert isinstance(price, dict) and price.get("source") == "cache", f"a lookup that failed with {code.name} must be priced from the cached table too, cost_of answered {price}"
+        _expect(price, 18000, "cache")
 
 
 def check_cache_freshness(ctx):
@@ -765,6 +774,13 @@ def check_cache_freshness(ctx):
     price = m.cost_of("gpt-4o", 1200, 300)
     assert len(_calls(ctx)) == 3, f"every lookup asks the service: saw {len(_calls(ctx))} GetRates calls for three lookups"
     _expect(price, 0, "uncosted", priced=False, version="")
+    # a later reply replaces the table and restarts its hour
+    _expect(m.cost_of("gpt-4o", 1200, 300), 6000, "service")
+    ctx.clock.advance(3000)
+    _fail(ctx)
+    price = m.cost_of("gpt-4o", 1200, 300)
+    assert isinstance(price, dict) and price.get("source") == "cache", f"a table fetched 3000 s ago must price a failed lookup, cost_of answered {price}: each reply replaces the cached table and its fetch time"
+    _expect(price, 6000, "cache")
 
 
 def check_uncosted_model(ctx):
@@ -772,6 +788,9 @@ def check_uncosted_model(ctx):
     price = m.cost_of("llama-3-70b-local", 5000, 500)
     _expect(price, 0, "uncosted", priced=False, version="")
     _expect(m.cost_of("claude-sonnet-4", 1000, 1000), 18000, "service")
+    # the cost is the floor of the sum: (input * input_rate + output * output_rate) // 1000
+    _expect(m.cost_of("gpt-4o-mini", 6, 2), 2, "service")
+    _expect(m.cost_of("gpt-4o-mini", 9, 1), 1, "service")
 
 
 def check_failure_not_cached(ctx):
@@ -810,12 +829,16 @@ export async function check_deadline(ctx) {
   const call = calls(ctx)[0];
   assert(call.timeout !== null, 'the GetRates call carries no deadline: a hung pricing replica holds the report path as long as it hangs');
   assert(0.15 <= call.timeout && call.timeout <= 0.25, \`the deadline must be PRICE_DEADLINE_MS = 200 ms, got \${call.timeout} s\`);
+  // a second later: every call carries its own 200 ms, not what is left of one shared deadline
+  ctx.clock.advance(1);
   ctx.grpc.setLatency('GetRates', 5.0, config.PRICING);
   const started = ctx.clock.now();
   const price = await m.costOf('gpt-4o', 1200, 300);
   const waited = (ctx.clock.now() - started) / 1000;
   assert(waited <= 0.3, \`the lookup waited \${waited.toFixed(1)} s on a pricing service that hangs: the deadline must cut it at 0.2 s\`);
   expect(price, 6000, 'cache');
+  for (const c of calls(ctx))
+    assert(c.timeout !== null && 0.15 <= c.timeout && c.timeout <= 0.25, \`every GetRates call carries its own 200 ms deadline, saw \${JSON.stringify(calls(ctx).map(x => x.timeout))} s\`);
 }
 
 export async function check_cache_fallback(ctx) {
@@ -825,6 +848,12 @@ export async function check_cache_fallback(ctx) {
   const price = await m.costOf('gpt-4o-mini', 1200, 300);
   assert.equal(calls(ctx).length, 2, \`a lookup asks the service first, then falls back: saw \${calls(ctx).length} GetRates calls for two lookups\`);
   expect(price, 360, 'cache');
+  for (const code of ['INTERNAL', 'RESOURCE_EXHAUSTED']) {
+    ctx.grpc.fail('GetRates', ctx.grpc.status[code], 'pricing failed', 1, config.PRICING);
+    const again = await m.costOf('claude-sonnet-4', 1000, 1000);
+    assert(again?.source === 'cache', \`a lookup that failed with \${code} must be priced from the cached table too, costOf answered \${JSON.stringify(again)}\`);
+    expect(again, 18000, 'cache');
+  }
 }
 
 export async function check_cache_freshness(ctx) {
@@ -838,12 +867,22 @@ export async function check_cache_freshness(ctx) {
   const price = await m.costOf('gpt-4o', 1200, 300);
   assert.equal(calls(ctx).length, 3, \`every lookup asks the service: saw \${calls(ctx).length} GetRates calls for three lookups\`);
   expect(price, 0, 'uncosted', false, '');
+  // a later reply replaces the table and restarts its hour
+  expect(await m.costOf('gpt-4o', 1200, 300), 6000, 'service');
+  ctx.clock.advance(3000);
+  ctx.grpc.fail('GetRates', ctx.grpc.status.UNAVAILABLE, 'pricing restarting', 1, config.PRICING);
+  const refreshed = await m.costOf('gpt-4o', 1200, 300);
+  assert(refreshed?.source === 'cache', \`a table fetched 3000 s ago must price a failed lookup, costOf answered \${JSON.stringify(refreshed)}: each reply replaces the cached table and its fetch time\`);
+  expect(refreshed, 6000, 'cache');
 }
 
 export async function check_uncosted_model(ctx) {
   const {m} = await world(ctx);
   expect(await m.costOf('llama-3-70b-local', 5000, 500), 0, 'uncosted', false, '');
   expect(await m.costOf('claude-sonnet-4', 1000, 1000), 18000, 'service');
+  // the cost is the floor of the sum: (input * input_rate + output * output_rate) / 1000, rounded down
+  expect(await m.costOf('gpt-4o-mini', 6, 2), 2, 'service');
+  expect(await m.costOf('gpt-4o-mini', 9, 1), 1, 'service');
 }
 
 export async function check_failure_not_cached(ctx) {
@@ -905,12 +944,17 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Equal(len(calls), 1, "one lookup must make one GetRates call; calls")
 	ctx.Assert(calls[0].HasDeadline(), "the GetRates call carries no deadline: a hung pricing replica holds the report path as long as it hangs")
 	ctx.Assert(150*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 250*time.Millisecond, "the deadline must be 200 ms, got %v", calls[0].Timeout)
+	// a second later: every call carries its own 200 ms, not what is left of one shared deadline
+	ctx.Clock.Advance(1)
 	ctx.GRPC.SetLatency("GetRates", 5.0, config.Pricing)
 	started := ctx.Clock.Now()
 	price := costOf(context.Background(), "gpt-4o", 1200, 300)
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited <= 0.3, "the lookup waited %.1f s on a pricing service that hangs: the deadline must cut it at 0.2 s", waited)
 	clientExpect(ctx, price, 6000, "cache", true, pricing.Version)
+	for _, call := range clientCalls(ctx) {
+		ctx.Assert(call.HasDeadline() && 150*time.Millisecond <= call.Timeout && call.Timeout <= 250*time.Millisecond, "every GetRates call carries its own 200 ms deadline, one carried %v", call.Timeout)
+	}
 }
 
 func CheckCacheFallback(ctx *harness.Ctx) {
@@ -920,6 +964,12 @@ func CheckCacheFallback(ctx *harness.Ctx) {
 	price := costOf(context.Background(), "gpt-4o-mini", 1200, 300)
 	ctx.Equal(len(clientCalls(ctx)), 2, "a lookup asks the service first, then falls back; GetRates calls for two lookups")
 	clientExpect(ctx, price, 360, "cache", true, pricing.Version)
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted} {
+		ctx.GRPC.Fail("GetRates", code, "pricing failed", 1, config.Pricing)
+		again := costOf(context.Background(), "claude-sonnet-4", 1000, 1000)
+		ctx.Equal(again.Source, "cache", "a lookup that failed with %v must be priced from the cached table too (%+v); its source", code, again)
+		clientExpect(ctx, again, 18000, "cache", true, pricing.Version)
+	}
 }
 
 func CheckCacheFreshness(ctx *harness.Ctx) {
@@ -933,12 +983,22 @@ func CheckCacheFreshness(ctx *harness.Ctx) {
 	price := costOf(context.Background(), "gpt-4o", 1200, 300)
 	ctx.Equal(len(clientCalls(ctx)), 3, "every lookup asks the service; GetRates calls for three lookups")
 	clientExpect(ctx, price, 0, "uncosted", false, "")
+	// a later reply replaces the table and restarts its hour
+	clientExpect(ctx, costOf(context.Background(), "gpt-4o", 1200, 300), 6000, "service", true, pricing.Version)
+	ctx.Clock.Advance(3000)
+	clientFail(ctx)
+	refreshed := costOf(context.Background(), "gpt-4o", 1200, 300)
+	ctx.Equal(refreshed.Source, "cache", "a table fetched 3000 s ago must price a failed lookup (%+v): each reply replaces the cached table and its fetch time; its source", refreshed)
+	clientExpect(ctx, refreshed, 6000, "cache", true, pricing.Version)
 }
 
 func CheckUncostedModel(ctx *harness.Ctx) {
 	clientWorld(ctx)
 	clientExpect(ctx, costOf(context.Background(), "llama-3-70b-local", 5000, 500), 0, "uncosted", false, "")
 	clientExpect(ctx, costOf(context.Background(), "claude-sonnet-4", 1000, 1000), 18000, "service", true, pricing.Version)
+	// the cost is the floor of the sum: (input * input_rate + output * output_rate) / 1000, rounded down
+	clientExpect(ctx, costOf(context.Background(), "gpt-4o-mini", 6, 2), 2, "service", true, pricing.Version)
+	clientExpect(ctx, costOf(context.Background(), "gpt-4o-mini", 9, 1), 1, "service", true, pricing.Version)
 }
 
 func CheckFailureNotCached(ctx *harness.Ctx) {
@@ -997,12 +1057,18 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Equal(calls.size(), 1, "one lookup must make one GetRates call; calls");
   ctx.Assert(calls[0].HasDeadline(), "the GetRates call carries no deadline: a hung pricing replica holds the report path as long as it hangs");
   ctx.Assert(0.15 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.25, "the deadline must be 200 ms, got %vs", calls[0].TimeoutSeconds());
+  // a second later: every call carries its own 200 ms, not what is left of one shared deadline
+  ctx.Clock.Advance(1);
   ctx.GRPC.SetLatency("GetRates", 5.0, config::kPricing);
   const int64_t started = ctx.Clock.Now();
   const Price price = cost_of("gpt-4o", 1200, 300);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited <= 0.3, "the lookup waited %.1f s on a pricing service that hangs: the deadline must cut it at 0.2 s", waited);
   clientExpect(ctx, price, 6000, "cache", true, pricing::kVersion);
+  for (const auto& call : ctx.GRPC.CallsTo("GetRates")) {
+    ctx.Assert(call.HasDeadline() && 0.15 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.25,
+               "every GetRates call carries its own 200 ms deadline, one carried %vs", call.TimeoutSeconds());
+  }
 }
 
 void CheckCacheFallback(harness::Ctx& ctx) {
@@ -1012,6 +1078,12 @@ void CheckCacheFallback(harness::Ctx& ctx) {
   const Price price = cost_of("gpt-4o-mini", 1200, 300);
   ctx.Equal(ctx.GRPC.CallsTo("GetRates").size(), 2, "a lookup asks the service first, then falls back; GetRates calls for two lookups");
   clientExpect(ctx, price, 360, "cache", true, pricing::kVersion);
+  for (const auto& [code, name] : {std::pair{grpc::StatusCode::INTERNAL, "INTERNAL"}, std::pair{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
+    ctx.GRPC.Fail("GetRates", code, "pricing failed", 1, config::kPricing);
+    const Price again = cost_of("claude-sonnet-4", 1000, 1000);
+    ctx.Equal(again.source, std::string("cache"), "a lookup that failed with %s must be priced from the cached table too; its source", name);
+    clientExpect(ctx, again, 18000, "cache", true, pricing::kVersion);
+  }
 }
 
 void CheckCacheFreshness(harness::Ctx& ctx) {
@@ -1025,12 +1097,22 @@ void CheckCacheFreshness(harness::Ctx& ctx) {
   const Price price = cost_of("gpt-4o", 1200, 300);
   ctx.Equal(ctx.GRPC.CallsTo("GetRates").size(), 3, "every lookup asks the service; GetRates calls for three lookups");
   clientExpect(ctx, price, 0, "uncosted", false, "");
+  // a later reply replaces the table and restarts its hour
+  clientExpect(ctx, cost_of("gpt-4o", 1200, 300), 6000, "service", true, pricing::kVersion);
+  ctx.Clock.Advance(3000);
+  clientFail(ctx);
+  const Price refreshed = cost_of("gpt-4o", 1200, 300);
+  ctx.Equal(refreshed.source, std::string("cache"), "a table fetched 3000 s ago must price a failed lookup (each reply replaces the cached table and its fetch time); its source");
+  clientExpect(ctx, refreshed, 6000, "cache", true, pricing::kVersion);
 }
 
 void CheckUncostedModel(harness::Ctx& ctx) {
   clientWorld(ctx);
   clientExpect(ctx, cost_of("llama-3-70b-local", 5000, 500), 0, "uncosted", false, "");
   clientExpect(ctx, cost_of("claude-sonnet-4", 1000, 1000), 18000, "service", true, pricing::kVersion);
+  // the cost is the floor of the sum: (input * input_rate + output * output_rate) / 1000, rounded down
+  clientExpect(ctx, cost_of("gpt-4o-mini", 6, 2), 2, "service", true, pricing::kVersion);
+  clientExpect(ctx, cost_of("gpt-4o-mini", 9, 1), 1, "service", true, pricing::kVersion);
 }
 
 void CheckFailureNotCached(harness::Ctx& ctx) {

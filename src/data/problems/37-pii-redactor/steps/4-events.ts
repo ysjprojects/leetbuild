@@ -20,7 +20,7 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
 
 - One event per redaction, keyed by the **document id**: \`{document_id, tenant, text_length,
   spans: [{start, end, entity}], entity_counts, detector_version, source}\`, an empty span list
-  included, and nothing taken from the text.
+  included, and nothing taken from the text: no value, no part of one, no text around them.
 - A delivery failure, read where the broker answers (the delivery callback, the rejected \`send\`,
   the delivery channel, \`dr_cb\`, the producer \`Callback\`), goes to
   \`store.insert_outbox(event, reason)\`.
@@ -62,7 +62,7 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
       id: 'content-free',
       title: 'Offsets and counts, no removed values',
       detail:
-        'The event carries `spans` as offsets and types, `entity_counts`, `text_length` and `detector_version`, and nothing cut from the text; the starter adds a `sample` of every removed value to a topic that is retained and copied to every consumer.',
+        'The event carries `spans` as offsets and types, `entity_counts`, `text_length`, `detector_version` and `source`, and no string in it shares four characters with the text: no removed value, no masked part of one, no redacted copy; the starter adds a `sample` of every removed value to a topic that is retained and copied to every consumer.',
       match: {
         python: {all: [/["']spans["']/, /entity_counts/], none: [/["']sample["']/, /text\[\s*\w+\.start/]},
         typescript: {all: [/spans:/, /entity_counts/], none: [/\bsample:/, /text\.slice\(/]},
@@ -75,7 +75,7 @@ delivery the broker refuses is lost; and a lost acknowledgement writes the event
       id: 'outbox',
       title: 'A refused delivery goes to the outbox',
       detail:
-        "A delivery error, read where the broker's answer arrives (`on_delivery`, the rejected `send`, the delivery channel's `TopicPartition.Error`, `dr_cb`, the `Callback`), writes the event to `store.insert_outbox`; the starter wraps the enqueue in a `try`, which sees only local errors, and the refused event is gone.",
+        "A delivery error, read where the broker's answer arrives (`on_delivery`, the rejected `send`, the delivery channel's `TopicPartition.Error`, `dr_cb`, the `Callback`), writes the whole event, spans and `text_length` included, to `store.insert_outbox`; the starter wraps the enqueue in a `try`, which sees only local errors, and the refused event is gone.",
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /catch/]},
@@ -513,6 +513,18 @@ def _events(ctx):
     return [json.loads(r.value) for r in ctx.kafka.records(TOPIC)]
 
 
+def _strings(value):
+    """Every string value in a decoded event, at any depth (the keys left out)."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for v in value.values():
+            yield from _strings(v)
+    elif isinstance(value, list):
+        for v in value:
+            yield from _strings(v)
+
+
 def check_document_key(ctx):
     m = ctx.load("events")
     _emit(m, "d-1")
@@ -527,6 +539,9 @@ def check_content_free(ctx):
     _emit(m, "d-1")
     for value in ctx.kafka.values(TOPIC):
         assert b"ada@example.com" not in value and b"415-555-0132" not in value, f"the audit event carries a removed value: {value!r}. The topic is retained and replicated; offsets and types only"
+    for s in _strings(_events(ctx)):
+        leaked = sorted({TEXT[i:i + 4] for i in range(len(TEXT) - 3)} & {s[i:i + 4] for i in range(len(s) - 3)})
+        assert not leaked, f"the audit event carries text from the document ({s!r} shares {leaked} with it). Neither part of a removed value nor the text around it belongs in the topic"
     events = _events(ctx)
     assert len(events) == 1, f"one redaction produced {len(events)} records"
     event = events[0]
@@ -535,6 +550,7 @@ def check_content_free(ctx):
     assert got == [(email, email + 15, "EMAIL"), (phone, phone + 12, "PHONE")], f"the event's spans are {got}, expected the offsets and types"
     assert event.get("entity_counts") == {"EMAIL": 1, "PHONE": 1}, f"the event's entity_counts are {event.get('entity_counts')}"
     assert event.get("text_length") == len(TEXT) and event.get("detector_version") == "ner-2026.10" and event.get("tenant") == "acme", f"the event must carry tenant, text_length and detector_version, got {event}"
+    assert event.get("source") == "model", f"the event must carry the detection's source (model), got {event}"
 
 
 def check_outbox(ctx):
@@ -546,7 +562,11 @@ def check_outbox(ctx):
         raise AssertionError(f"emit_redacted raised when the broker refused the delivery: {e!r}; the event goes to the outbox and the redaction goes on") from e
     rows = store.outbox_rows()
     assert len(rows) == 1, f"the broker refused one delivery and the outbox holds {len(rows)} rows: the audit fact of that redaction is gone"
-    assert rows[0].get("event", {}).get("document_id") == "d-1", f"the outbox row must hold the event, got {rows[0]}"
+    event = rows[0].get("event", {})
+    assert event.get("document_id") == "d-1", f"the outbox row must hold the event, got {rows[0]}"
+    email, phone = TEXT.index("ada@"), TEXT.index("415")
+    got = [(s.get("start"), s.get("end"), s.get("entity")) for s in event.get("spans") or []]
+    assert got == [(email, email + 15, "EMAIL"), (phone, phone + 12, "PHONE")] and event.get("text_length") == len(TEXT), f"the outbox row must hold the whole event the relay will produce (its spans and text_length), got {rows[0]}"
     assert "ada@example.com" not in json.dumps(rows[0]), f"the outbox row carries a removed value: {rows[0]}"
     _emit(m, "d-2")
     assert len(store.outbox_rows()) == 1 and len(_events(ctx)) >= 1, "a healthy delivery after the failure reaches the topic and adds no outbox row"
@@ -578,6 +598,12 @@ function events(ctx) {
 
 const parsed = ctx => ctx.kafka.records(TOPIC).map(r => JSON.parse(r.value.toString()));
 
+/** Every string value in a decoded event, at any depth (the keys left out). */
+const strings = (value): string[] =>
+  typeof value === 'string' ? [value] : value !== null && typeof value === 'object' ? Object.values(value).flatMap(strings) : [];
+
+const grams = (s: string): Set<string> => new Set(Array.from({length: Math.max(s.length - 3, 0)}, (_, i) => s.slice(i, i + 4)));
+
 export async function check_document_key(ctx) {
   const {emit} = events(ctx);
   await emit('d-1');
@@ -593,6 +619,11 @@ export async function check_content_free(ctx) {
     const text = value.toString();
     assert(!text.includes('ada@example.com') && !text.includes('415-555-0132'), \`the audit event carries a removed value: \${text}. The topic is retained and replicated; offsets and types only\`);
   }
+  const textGrams = grams(TEXT);
+  for (const s of strings(parsed(ctx))) {
+    const leaked = [...grams(s)].filter(g => textGrams.has(g)).sort();
+    assert.equal(leaked.length, 0, \`the audit event carries text from the document (\${JSON.stringify(s)} shares \${JSON.stringify(leaked)} with it). Neither part of a removed value nor the text around it belongs in the topic\`);
+  }
   const all = parsed(ctx);
   assert.equal(all.length, 1, \`one redaction produced \${all.length} records\`);
   const event = all[0];
@@ -602,6 +633,7 @@ export async function check_content_free(ctx) {
   assert.deepStrictEqual(got, [[email, email + 15, 'EMAIL'], [phone, phone + 12, 'PHONE']], \`the event's spans are \${JSON.stringify(got)}, expected the offsets and types\`);
   assert.deepStrictEqual(event.entity_counts, {EMAIL: 1, PHONE: 1}, \`the event's entity_counts are \${JSON.stringify(event.entity_counts)}\`);
   assert(event.text_length === TEXT.length && event.detector_version === 'ner-2026.10' && event.tenant === 'acme', \`the event must carry tenant, text_length and detector_version, got \${JSON.stringify(event)}\`);
+  assert.equal(event.source, 'model', \`the event must carry the detection's source (model), got \${JSON.stringify(event)}\`);
 }
 
 export async function check_outbox(ctx) {
@@ -614,7 +646,15 @@ export async function check_outbox(ctx) {
   }
   const rows = await store.outboxRows();
   assert.equal(rows.length, 1, \`the broker refused one delivery and the outbox holds \${rows.length} rows: the audit fact of that redaction is gone\`);
-  assert.equal(rows[0].event?.document_id, 'd-1', \`the outbox row must hold the event, got \${JSON.stringify(rows[0])}\`);
+  const event = rows[0].event ?? {};
+  assert.equal(event.document_id, 'd-1', \`the outbox row must hold the event, got \${JSON.stringify(rows[0])}\`);
+  const email = TEXT.indexOf('ada@');
+  const phone = TEXT.indexOf('415');
+  const got = (event.spans ?? []).map(s => [s.start, s.end, s.entity]);
+  assert(
+    JSON.stringify(got) === JSON.stringify([[email, email + 15, 'EMAIL'], [phone, phone + 12, 'PHONE']]) && event.text_length === TEXT.length,
+    \`the outbox row must hold the whole event the relay will produce (its spans and text_length), got \${JSON.stringify(rows[0])}\`,
+  );
   assert(!JSON.stringify(rows[0]).includes('ada@example.com'), \`the outbox row carries a removed value: \${JSON.stringify(rows[0])}\`);
   await emit('d-2');
   assert((await store.outboxRows()).length === 1 && parsed(ctx).length >= 1, 'a healthy delivery after the failure reaches the topic and adds no outbox row');
@@ -664,6 +704,27 @@ func eventsParsed(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
+// eventsStrings is every string value in a decoded event, at any depth (the keys left out).
+func eventsStrings(value any) []string {
+	switch v := value.(type) {
+	case string:
+		return []string{v}
+	case map[string]any:
+		var out []string
+		for _, e := range v {
+			out = append(out, eventsStrings(e)...)
+		}
+		return out
+	case []any:
+		var out []string
+		for _, e := range v {
+			out = append(out, eventsStrings(e)...)
+		}
+		return out
+	}
+	return nil
+}
+
 func CheckDocumentKey(ctx *harness.Ctx) {
 	eventsEmit(ctx, "d-1", eventsText)
 	eventsEmit(ctx, "d-2", "Nothing personal in this sentence.")
@@ -676,6 +737,17 @@ func CheckContentFree(ctx *harness.Ctx) {
 		ctx.Assert(!strings.Contains(value, "ada@example.com") && !strings.Contains(value, "415-555-0132"), "the audit event carries a removed value: %s. The topic is retained and replicated; offsets and types only", value)
 	}
 	all := eventsParsed(ctx)
+	for _, event := range all {
+		for _, s := range eventsStrings(event) {
+			var leaked []string
+			for i := 0; i+4 <= len(s); i++ {
+				if strings.Contains(eventsText, s[i:i+4]) {
+					leaked = append(leaked, s[i:i+4])
+				}
+			}
+			ctx.Assert(len(leaked) == 0, "the audit event carries text from the document (%q shares %q with it). Neither part of a removed value nor the text around it belongs in the topic", s, leaked)
+		}
+	}
 	ctx.Equal(len(all), 1, "one redaction; the records")
 	email, phone := strings.Index(eventsText, "ada@"), strings.Index(eventsText, "415")
 	ctx.Equal(all[0]["spans"], []any{
@@ -684,6 +756,7 @@ func CheckContentFree(ctx *harness.Ctx) {
 	}, "the event's spans must be the offsets and types")
 	ctx.Equal(all[0]["entity_counts"], map[string]any{"EMAIL": float64(1), "PHONE": float64(1)}, "the event's entity_counts")
 	ctx.Assert(all[0]["text_length"] == float64(len(eventsText)) && all[0]["detector_version"] == "ner-2026.10" && all[0]["tenant"] == "acme", "the event must carry tenant, text_length and detector_version, got %v", all[0])
+	ctx.Equal(all[0]["source"], "model", "the event must carry the detection's source")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
@@ -702,6 +775,12 @@ func CheckOutbox(ctx *harness.Ctx) {
 	var event map[string]any
 	json.Unmarshal(rows[0].Event, &event)
 	ctx.Equal(event["document_id"], "d-1", "the outbox row must hold the event; its document_id")
+	email, phone := strings.Index(eventsText, "ada@"), strings.Index(eventsText, "415")
+	ctx.Equal(event["spans"], []any{
+		map[string]any{"start": float64(email), "end": float64(email + 15), "entity": "EMAIL"},
+		map[string]any{"start": float64(phone), "end": float64(phone + 12), "entity": "PHONE"},
+	}, "the outbox row must hold the whole event the relay will produce; its spans")
+	ctx.Equal(event["text_length"], float64(len(eventsText)), "the outbox row must hold the whole event the relay will produce; its text_length")
 	ctx.Assert(!strings.Contains(string(rows[0].Event), "ada@example.com"), "the outbox row carries a removed value: %s", rows[0].Event)
 	eventsEmit(ctx, "d-2", eventsText)
 	rows, _ = store.OutboxRows(context.Background())
@@ -742,6 +821,15 @@ std::vector<nlohmann::json> parsed(harness::Ctx& ctx) {
   return out;
 }
 
+// Every string value in a decoded event, at any depth (the keys left out).
+void strings_in(const nlohmann::json& value, std::vector<std::string>& out) {
+  if (value.is_string()) {
+    out.push_back(value.get<std::string>());
+  } else if (value.is_structured()) {
+    for (const auto& e : value) strings_in(e, out);
+  }
+}
+
 }  // namespace
 
 void CheckDocumentKey(harness::Ctx& ctx) {
@@ -756,12 +844,22 @@ void CheckContentFree(harness::Ctx& ctx) {
     ctx.Assert(value.find("ada@example.com") == std::string::npos && value.find("415-555-0132") == std::string::npos, "the audit event carries a removed value: %s. The topic is retained and replicated; offsets and types only", value);
   }
   const auto all = parsed(ctx);
+  std::vector<std::string> values;
+  for (const auto& event : all) strings_in(event, values);
+  for (const std::string& s : values) {
+    std::vector<std::string> leaked;
+    for (size_t i = 0; i + 4 <= s.size(); i++) {
+      if (kText.find(s.substr(i, 4)) != std::string::npos) leaked.push_back(s.substr(i, 4));
+    }
+    ctx.Assert(leaked.empty(), "the audit event carries text from the document (%s shares %v with it). Neither part of a removed value nor the text around it belongs in the topic", s, leaked);
+  }
   ctx.Equal(all.size(), 1, "one redaction; the records");
   const long email = static_cast<long>(kText.find("ada@"));
   const long phone = static_cast<long>(kText.find("415"));
   ctx.Equal(all[0].value("spans", nlohmann::json()), nlohmann::json::array({{{"start", email}, {"end", email + 15}, {"entity", "EMAIL"}}, {{"start", phone}, {"end", phone + 12}, {"entity", "PHONE"}}}), "the event's spans must be the offsets and types");
   ctx.Equal(all[0].value("entity_counts", nlohmann::json()), nlohmann::json({{"EMAIL", 1}, {"PHONE", 1}}), "the event's entity_counts");
   ctx.Assert(all[0].value("text_length", 0L) == static_cast<long>(kText.size()) && all[0].value("detector_version", "") == "ner-2026.10" && all[0].value("tenant", "") == "acme", "the event must carry tenant, text_length and detector_version, got %s", all[0].dump());
+  ctx.Equal(all[0].value("source", ""), "model", "the event must carry the detection's source");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
@@ -773,7 +871,13 @@ void CheckOutbox(harness::Ctx& ctx) {
   }
   auto rows = store::outbox_rows();
   ctx.Equal(rows.size(), 1, "the broker refused one delivery: without an outbox row the audit fact of that redaction is gone; outbox rows");
-  ctx.Equal(rows[0]["event"].value("document_id", ""), "d-1", "the outbox row must hold the event; its document_id");
+  const nlohmann::json event = rows[0]["event"];
+  ctx.Equal(event.value("document_id", ""), "d-1", "the outbox row must hold the event; its document_id");
+  const long email = static_cast<long>(kText.find("ada@"));
+  const long phone = static_cast<long>(kText.find("415"));
+  ctx.Equal(event.value("spans", nlohmann::json()), nlohmann::json::array({{{"start", email}, {"end", email + 15}, {"entity", "EMAIL"}}, {{"start", phone}, {"end", phone + 12}, {"entity", "PHONE"}}}),
+            "the outbox row must hold the whole event the relay will produce; its spans");
+  ctx.Equal(event.value("text_length", 0L), static_cast<long>(kText.size()), "the outbox row must hold the whole event the relay will produce; its text_length");
   ctx.Assert(rows[0].dump().find("ada@example.com") == std::string::npos, "the outbox row carries a removed value: %s", rows[0].dump());
   emit(ctx, "d-2", kText);
   rows = store::outbox_rows();

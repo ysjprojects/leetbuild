@@ -18,11 +18,11 @@ is none. It serves the demo and hides four flaws.
 exist answers 200; the read hands back the stored output, a second and less guarded copy of the
 customer's text; and without offsets nobody can check a redaction against the output they hold.
 
-- The tenant comes from \`X-Tenant-Id\` (**401** when absent). Another tenant's record answers
-  exactly what a missing one does: **404**.
+- The tenant comes from \`X-Tenant-Id\` (**401** when absent, whether or not the document exists).
+  Another tenant's record answers exactly what a missing one does: **404**.
 - The answer is \`{document_id, spans, entity_types, entity_counts, detector_version,
-  redacted_length}\`: spans as \`{start, end, entity, replacement}\`, \`entity_types\` sorted,
-  \`redacted_length\` the length of the stored output, and no text.
+  redacted_length}\`: spans as \`{start, end, entity, replacement}\`, \`entity_types\` sorted with
+  each type once, \`redacted_length\` the length of the stored output, and no text.
 - With the spans, a caller holding the redacted output finds every replacement in it: each sits at
   its \`start\` plus what the earlier replacements added to the length.`,
   sequence: {
@@ -59,7 +59,7 @@ customer's text; and without offsets nobody can check a redaction against the ou
       id: 'tenant-scope',
       title: "Another tenant's record is 404, like a missing one",
       detail:
-        "The tenant comes from `X-Tenant-Id` (401 when absent) and a record owned by another tenant answers the same 404 as a missing one; the starter does not read the header, so any caller reads any tenant's audit record.",
+        "The tenant comes from `X-Tenant-Id` (401 when absent, for a missing document too) and a record owned by another tenant answers the same 404 as a missing one; the starter does not read the header, so any caller reads any tenant's audit record.",
       match: {
         python: {all: [/x-tenant-id/i, /\.tenant\s*!=\s*tenant|tenant\s*!=\s*\w+\.tenant/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*\w+\.tenant/]},
@@ -98,7 +98,7 @@ customer's text; and without offsets nobody can check a redaction against the ou
       id: 'offsets',
       title: 'Spans and the redacted length let a caller verify the output',
       detail:
-        'The answer carries `spans` with their replacements, sorted `entity_types` and `redacted_length`, so a caller holding the redacted output can check every replacement is where the spans say; the starter answers counts only.',
+        'The answer carries `spans` with their replacements, `entity_types` sorted with each type once (checked on a document whose phone number comes before its two emails) and `redacted_length`, so a caller holding the redacted output can check every replacement is where the spans say; the starter answers counts only.',
       match: {
         python: {all: [/redacted_length/, /len\(\w+\.redacted_text\)/, /entity_types/, /["']spans["']/]},
         typescript: {all: [/redacted_length:\s*\w+\.redacted_text\.length/, /entity_types/, /spans:/]},
@@ -426,11 +426,13 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/documents/([\\w-]+)/
 from redactor.spans import apply_spans, scan
 
 TEXT = "Reach Ada at ada@example.com or 415-555-0132."
+# the phone first and two emails: the types appear out of order and one of them twice
+MIXED = "Call 415-555-0132, mail ada@example.com or bob@example.org."
 
 
-def _seed(document_id="d-1", tenant="acme"):
-    found = scan(TEXT, ["EMAIL", "PHONE"])
-    redacted = apply_spans(TEXT, found)
+def _seed(document_id="d-1", tenant="acme", text=TEXT):
+    found = scan(text, ["EMAIL", "PHONE"])
+    redacted = apply_spans(text, found)
     store.save(tenant, document_id, found, "ner-2026.10", redacted)
     return redacted
 
@@ -460,10 +462,12 @@ async def check_tenant_scope(ctx):
         foreign = await _get(c, "d-1", tenant="globex")
         missing = await _get(c, "d-none", tenant="globex")
         anonymous = await _get(c, "d-1", tenant=None)
+        anonymous_missing = await _get(c, "d-none", tenant=None)
         own = await _get(c, "d-1")
     assert foreign.status_code == 404, f"tenant globex read acme's document d-1: {foreign.status_code} {foreign.text[:200]}. The record's tenant must be the caller's"
     assert foreign.text == missing.text, f"another tenant's record must answer exactly what a missing one does: {foreign.text} against {missing.text}"
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+    assert anonymous_missing.status_code == 401, f"a read of a missing document without X-Tenant-Id answered {anonymous_missing.status_code}, expected 401: the caller is identified before anything is looked up"
     assert own.status_code == 200, f"the owner's read answered {own.status_code}: {own.text}"
 
 
@@ -483,29 +487,35 @@ async def check_no_text(ctx):
 
 
 async def check_offsets(ctx):
-    redacted = _seed()
+    seeded = {"d-1": _seed(), "d-2": _seed("d-2", "acme", MIXED)}
     async with _api(ctx) as c:
-        r = await _get(c, "d-1")
-    body = r.json()
-    found = body.get("spans")
-    assert found and all("replacement" in s for s in found), f"the answer must carry the spans with their replacements, got {found}"
-    assert body.get("entity_types") == ["EMAIL", "PHONE"], f"entity_types must be the sorted types, got {body.get('entity_types')}"
-    assert body.get("redacted_length") == len(redacted), f"redacted_length is {body.get('redacted_length')}, the output the caller holds is {len(redacted)} long"
-    shift = 0
-    for s in found:
-        at = s["start"] + shift
-        assert redacted[at:at + len(s["replacement"])] == s["replacement"], f"the span {s} does not match the output at {at}: {redacted!r}"
-        shift += len(s["replacement"]) - (s["end"] - s["start"])
+        bodies = {document_id: (await _get(c, document_id)).json() for document_id in seeded}
+    for document_id, redacted in seeded.items():
+        body = bodies[document_id]
+        found = body.get("spans")
+        assert found and all("replacement" in s for s in found), f"the answer for {document_id} must carry the spans with their replacements, got {found}"
+        assert body.get("entity_types") == ["EMAIL", "PHONE"], f"entity_types must be the sorted types, each once, got {body.get('entity_types')} for {document_id}"
+        assert body.get("redacted_length") == len(redacted), f"redacted_length is {body.get('redacted_length')}, the output the caller holds is {len(redacted)} long"
+        shift = 0
+        for s in found:
+            at = s["start"] + shift
+            assert redacted[at:at + len(s["replacement"])] == s["replacement"], f"the span {s} does not match the output at {at}: {redacted!r}"
+            shift += len(s["replacement"]) - (s["end"] - s["start"])
 `,
     typescript: `const TEXT = 'Reach Ada at ada@example.com or 415-555-0132.';
+// the phone first and two emails: the types appear out of order and one of them twice
+const MIXED = 'Call 415-555-0132, mail ada@example.com or bob@example.org.';
 
-async function setup(ctx, seed: [string, string][] = [['d-1', 'acme']]) {
+async function setup(ctx, seed: [string, string, string?][] = [['d-1', 'acme']]) {
   const {scan, applySpans} = ctx.load('/support/redactor/spans.ts');
   const store = ctx.load('/support/redactor/store.ts');
-  const found = scan(TEXT, ['EMAIL', 'PHONE']);
-  const redacted = applySpans(TEXT, found);
-  for (const [documentId, tenant] of seed) await store.save(tenant, documentId, found, 'ner-2026.10', redacted);
-  return {c: ctx.client(ctx.load('read').app), redacted};
+  const redactedOf: Record<string, string> = {};
+  for (const [documentId, tenant, text = TEXT] of seed) {
+    const found = scan(text, ['EMAIL', 'PHONE']);
+    redactedOf[documentId] = applySpans(text, found);
+    await store.save(tenant, documentId, found, 'ner-2026.10', redactedOf[documentId]);
+  }
+  return {c: ctx.client(ctx.load('read').app), redacted: redactedOf['d-1'], redactedOf};
 }
 
 const get = (c, documentId: string, tenant: string | null = 'acme') =>
@@ -525,10 +535,12 @@ export async function check_tenant_scope(ctx) {
   const foreign = await get(c, 'd-1', 'globex');
   const missing = await get(c, 'd-none', 'globex');
   const anonymous = await get(c, 'd-1', null);
+  const anonymousMissing = await get(c, 'd-none', null);
   const own = await get(c, 'd-1');
   assert.equal(foreign.status, 404, \`tenant globex read acme's document d-1: \${foreign.status} \${foreign.text.slice(0, 200)}. The record's tenant must be the caller's\`);
   assert.equal(foreign.text, missing.text, \`another tenant's record must answer exactly what a missing one does: \${foreign.text} against \${missing.text}\`);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(anonymousMissing.status, 401, \`a read of a missing document without X-Tenant-Id answered \${anonymousMissing.status}, expected 401: the caller is identified before anything is looked up\`);
   assert.equal(own.status, 200, \`the owner's read answered \${own.status}: \${own.text}\`);
 }
 
@@ -547,17 +559,22 @@ export async function check_no_text(ctx) {
 }
 
 export async function check_offsets(ctx) {
-  const {c, redacted} = await setup(ctx);
-  const body = (await get(c, 'd-1')).json();
-  const found = body.spans;
-  assert(Array.isArray(found) && found.length > 0 && found.every(s => 'replacement' in s), \`the answer must carry the spans with their replacements, got \${JSON.stringify(found)}\`);
-  assert.deepStrictEqual(body.entity_types, ['EMAIL', 'PHONE'], \`entity_types must be the sorted types, got \${JSON.stringify(body.entity_types)}\`);
-  assert.equal(body.redacted_length, redacted.length, \`redacted_length is \${body.redacted_length}, the output the caller holds is \${redacted.length} long\`);
-  let shift = 0;
-  for (const s of found) {
-    const at = s.start + shift;
-    assert.equal(redacted.slice(at, at + s.replacement.length), s.replacement, \`the span \${JSON.stringify(s)} does not match the output at \${at}: \${redacted}\`);
-    shift += s.replacement.length - (s.end - s.start);
+  const {c, redactedOf} = await setup(ctx, [
+    ['d-1', 'acme'],
+    ['d-2', 'acme', MIXED],
+  ]);
+  for (const [documentId, redacted] of Object.entries(redactedOf)) {
+    const body = (await get(c, documentId)).json();
+    const found = body.spans;
+    assert(Array.isArray(found) && found.length > 0 && found.every(s => 'replacement' in s), \`the answer for \${documentId} must carry the spans with their replacements, got \${JSON.stringify(found)}\`);
+    assert.deepStrictEqual(body.entity_types, ['EMAIL', 'PHONE'], \`entity_types must be the sorted types, each once, got \${JSON.stringify(body.entity_types)} for \${documentId}\`);
+    assert.equal(body.redacted_length, redacted.length, \`redacted_length is \${body.redacted_length}, the output the caller holds is \${redacted.length} long\`);
+    let shift = 0;
+    for (const s of found) {
+      const at = s.start + shift;
+      assert.equal(redacted.slice(at, at + s.replacement.length), s.replacement, \`the span \${JSON.stringify(s)} does not match the output at \${at}: \${redacted}\`);
+      shift += s.replacement.length - (s.end - s.start);
+    }
   }
 }
 `,
@@ -576,9 +593,12 @@ import (
 
 const readText = "Reach Ada at ada@example.com or 415-555-0132."
 
-func readSeed(ctx *harness.Ctx, documentID, tenant string) string {
-	found := spans.Scan(readText, []string{"EMAIL", "PHONE"})
-	redacted := spans.ApplySpans(readText, found)
+// readMixed has the phone first and two emails: the types appear out of order and one of them twice.
+const readMixed = "Call 415-555-0132, mail ada@example.com or bob@example.org."
+
+func readSeed(ctx *harness.Ctx, documentID, tenant, text string) string {
+	found := spans.Scan(text, []string{"EMAIL", "PHONE"})
+	redacted := spans.ApplySpans(text, found)
 	ctx.NoError(store.Save(context.Background(), tenant, documentID, found, "ner-2026.10", redacted), "store.Save")
 	return redacted
 }
@@ -603,7 +623,7 @@ func readBody(r *harness.Response) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSeed(ctx, "d-1", "acme")
+	readSeed(ctx, "d-1", "acme", readText)
 	r := readGet(readClient(ctx), "d-1", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/documents/d-1/redaction (%s)", r.Text())
 	body := readBody(r)
@@ -612,15 +632,17 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	readSeed(ctx, "d-1", "acme")
+	readSeed(ctx, "d-1", "acme", readText)
 	c := readClient(ctx)
 	foreign := readGet(c, "d-1", "globex")
 	missing := readGet(c, "d-none", "globex")
 	anonymous := readGet(c, "d-1", "")
+	anonymousMissing := readGet(c, "d-none", "")
 	own := readGet(c, "d-1", "acme")
 	ctx.Equal(foreign.Status, 404, "tenant globex read acme's document d-1 (%.200s); the record's tenant must be the caller's", foreign.Text())
 	ctx.Equal(foreign.Text(), missing.Text(), "another tenant's record must answer exactly what a missing one does")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(anonymousMissing.Status, 401, "a read of a missing document without X-Tenant-Id: the caller is identified before anything is looked up")
 	ctx.Equal(own.Status, 200, "the owner's read (%s)", own.Text())
 }
 
@@ -630,7 +652,7 @@ func CheckNotFound(ctx *harness.Ctx) {
 }
 
 func CheckNoText(ctx *harness.Ctx) {
-	redacted := readSeed(ctx, "d-1", "acme")
+	redacted := readSeed(ctx, "d-1", "acme", readText)
 	r := readGet(readClient(ctx), "d-1", "acme")
 	ctx.Equal(r.Status, 200, "the owner's read (%s)", r.Text())
 	_, has := readBody(r)["redacted_text"]
@@ -639,20 +661,24 @@ func CheckNoText(ctx *harness.Ctx) {
 }
 
 func CheckOffsets(ctx *harness.Ctx) {
-	redacted := readSeed(ctx, "d-1", "acme")
-	body := readBody(readGet(readClient(ctx), "d-1", "acme"))
-	found, _ := body["spans"].([]any)
-	ctx.Assert(len(found) > 0, "the answer must carry the spans with their replacements, got %v", body["spans"])
-	ctx.Equal(body["entity_types"], []any{"EMAIL", "PHONE"}, "entity_types must be the sorted types")
-	ctx.Equal(body["redacted_length"], float64(len(redacted)), "redacted_length must be the length of the output the caller holds")
-	shift := 0
-	for _, item := range found {
-		s := item.(map[string]any)
-		replacement, _ := s["replacement"].(string)
-		ctx.Assert(replacement != "", "the span %v carries no replacement", s)
-		at := int(s["start"].(float64)) + shift
-		ctx.Assert(at+len(replacement) <= len(redacted) && redacted[at:at+len(replacement)] == replacement, "the span %v does not match the output at %d: %s", s, at, redacted)
-		shift += len(replacement) - int(s["end"].(float64)-s["start"].(float64))
+	c := readClient(ctx)
+	for _, seeded := range [][2]string{{"d-1", readText}, {"d-2", readMixed}} {
+		documentID := seeded[0]
+		redacted := readSeed(ctx, documentID, "acme", seeded[1])
+		body := readBody(readGet(c, documentID, "acme"))
+		found, _ := body["spans"].([]any)
+		ctx.Assert(len(found) > 0, "the answer for %s must carry the spans with their replacements, got %v", documentID, body["spans"])
+		ctx.Equal(body["entity_types"], []any{"EMAIL", "PHONE"}, "entity_types must be the sorted types, each once, for %s", documentID)
+		ctx.Equal(body["redacted_length"], float64(len(redacted)), "redacted_length must be the length of the output the caller holds")
+		shift := 0
+		for _, item := range found {
+			s := item.(map[string]any)
+			replacement, _ := s["replacement"].(string)
+			ctx.Assert(replacement != "", "the span %v carries no replacement", s)
+			at := int(s["start"].(float64)) + shift
+			ctx.Assert(at+len(replacement) <= len(redacted) && redacted[at:at+len(replacement)] == replacement, "the span %v does not match the output at %d: %s", s, at, redacted)
+			shift += len(replacement) - int(s["end"].(float64)-s["start"].(float64))
+		}
 	}
 }
 `,
@@ -661,14 +687,18 @@ func CheckOffsets(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
 const std::string kText = "Reach Ada at ada@example.com or 415-555-0132.";
+// the phone first and two emails: the types appear out of order and one of them twice
+const std::string kMixed = "Call 415-555-0132, mail ada@example.com or bob@example.org.";
 
-std::string seed(const std::string& document_id, const std::string& tenant) {
-  const auto found = spans::scan(kText, {"EMAIL", "PHONE"});
-  const std::string redacted = spans::apply_spans(kText, found);
+std::string seed(const std::string& document_id, const std::string& tenant, const std::string& text = kText) {
+  const auto found = spans::scan(text, {"EMAIL", "PHONE"});
+  const std::string redacted = spans::apply_spans(text, found);
   store::save(tenant, document_id, found, "ner-2026.10", redacted);
   return redacted;
 }
@@ -706,10 +736,12 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const auto foreign = get(c, "d-1", "globex");
   const auto missing = get(c, "d-none", "globex");
   const auto anonymous = get(c, "d-1", "");
+  const auto anonymous_missing = get(c, "d-none", "");
   const auto own = get(c, "d-1", "acme");
   ctx.Equal(foreign.Status, 404, "tenant globex read acme's document d-1 (%s); the record's tenant must be the caller's", foreign.Text().substr(0, 200));
   ctx.Equal(foreign.Text(), missing.Text(), "another tenant's record must answer exactly what a missing one does");
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(anonymous_missing.Status, 401, "a read of a missing document without X-Tenant-Id: the caller is identified before anything is looked up");
   ctx.Equal(own.Status, 200, "the owner's read (%s)", own.Text());
 }
 
@@ -729,20 +761,22 @@ void CheckNoText(harness::Ctx& ctx) {
 }
 
 void CheckOffsets(harness::Ctx& ctx) {
-  const std::string redacted = seed("d-1", "acme");
   auto c = api(ctx);
-  const auto body = parsed(get(c, "d-1", "acme"));
-  const auto found = body.value("spans", nlohmann::json::array());
-  ctx.Assert(!found.empty(), "the answer must carry the spans with their replacements, got %s", body.dump());
-  ctx.Equal(body.value("entity_types", nlohmann::json()), nlohmann::json::array({"EMAIL", "PHONE"}), "entity_types must be the sorted types");
-  ctx.Equal(body.value("redacted_length", -1L), redacted.size(), "redacted_length must be the length of the output the caller holds");
-  long shift = 0;
-  for (const auto& s : found) {
-    const std::string replacement = s.value("replacement", "");
-    ctx.Assert(!replacement.empty(), "the span %s carries no replacement", s.dump());
-    const long at = s.value("start", 0L) + shift;
-    ctx.Assert(redacted.compare(at, replacement.size(), replacement) == 0, "the span %s does not match the output at %d: %s", s.dump(), at, redacted);
-    shift += static_cast<long>(replacement.size()) - (s.value("end", 0L) - s.value("start", 0L));
+  for (const auto& [document_id, text] : std::vector<std::pair<std::string, std::string>>{{"d-1", kText}, {"d-2", kMixed}}) {
+    const std::string redacted = seed(document_id, "acme", text);
+    const auto body = parsed(get(c, document_id, "acme"));
+    const auto found = body.value("spans", nlohmann::json::array());
+    ctx.Assert(!found.empty(), "the answer for %s must carry the spans with their replacements, got %s", document_id, body.dump());
+    ctx.Equal(body.value("entity_types", nlohmann::json()), nlohmann::json::array({"EMAIL", "PHONE"}), "entity_types must be the sorted types, each once, for %s", document_id);
+    ctx.Equal(body.value("redacted_length", -1L), redacted.size(), "redacted_length must be the length of the output the caller holds");
+    long shift = 0;
+    for (const auto& s : found) {
+      const std::string replacement = s.value("replacement", "");
+      ctx.Assert(!replacement.empty(), "the span %s carries no replacement", s.dump());
+      const long at = s.value("start", 0L) + shift;
+      ctx.Assert(redacted.compare(at, replacement.size(), replacement) == 0, "the span %s does not match the output at %d: %s", s.dump(), at, redacted);
+      shift += static_cast<long>(replacement.size()) - (s.value("end", 0L) - s.value("start", 0L));
+    }
   }
 }
 `,

@@ -48,7 +48,7 @@ refused pages against the crawl, then jumps to 1.0 the moment the queue drains.
       id: 'tenant-404',
       title: "Another tenant's job is 404",
       detail:
-        'A job that belongs to another tenant answers **404**, exactly like an unknown job, so the answer reveals nothing about which ids exist; no request answers 403. The starter answers 403 for a tenant mismatch.',
+        'A job that belongs to another tenant answers **404** with the same body as an unknown job, so the answer reveals nothing about which ids exist; no request answers 403. The starter answers 403 for a tenant mismatch.',
       match: {
         python: {all: [/status_code\s*=\s*404/], none: [/status_code\s*=\s*403/]},
         typescript: {all: [/code\(\s*404\s*\)/], none: [/code\(\s*403\s*\)/]},
@@ -74,7 +74,7 @@ refused pages against the crawl, then jumps to 1.0 the moment the queue drains.
       id: 'stalled',
       title: 'Ages the oldest pending URL and flags a stall',
       detail:
-        '`oldest_pending_age_s` comes from the first member of `pending:{job_id}` (`ZRANGE … 0 0 WITHSCORES`), and `stalled` is true when URLs are pending and the oldest has waited longer than `STALL_AFTER_S`. The starter ages the newest URL and has no stall flag.',
+        '`oldest_pending_age_s` comes from the first member of `pending:{job_id}` (`ZRANGE … 0 0 WITHSCORES`), and `stalled` is true when URLs are pending and the oldest has waited longer than `STALL_AFTER_S`: exactly 600 s is not a stall yet. The starter ages the newest URL and has no stall flag.',
       match: {
         python: {
           all: [/STALL_AFTER_S/, /["']stalled["']/, /zrange\([\s\S]{0,80}?,\s*0\s*,\s*0\b/],
@@ -96,7 +96,7 @@ refused pages against the crawl, then jumps to 1.0 the moment the queue drains.
       id: 'coverage',
       title: 'Coverage leaves refused and gone pages out',
       detail:
-        "`coverage = indexed / (fetched + failed + pending)`: refused and gone pages are the site's answer, not work the crawl owes, and a drained queue is no reason to answer 1.0. The starter divides by fetched + refused + pending and answers 1.0 whenever nothing is pending.",
+        "`coverage = indexed / (fetched + failed + pending)`, rounded to 3 places and 0 when nothing is owed: refused and gone pages are the site's answer, not work the crawl owes, and a drained queue is no reason to answer 1.0. The starter divides by fetched + refused + pending and answers 1.0 whenever nothing is pending.",
       match: {
         python: {all: [/counts\[["']failed["']\]/], none: [/counts\[["']refused["']\]/, /1\.0 if/]},
         typescript: {all: [/\bc(ounts)?\.failed/], none: [/\bc(ounts)?\.refused/, /\?\s*1(\.0)?\s*:/]},
@@ -669,6 +669,7 @@ async def check_tenant_404(ctx):
     assert own.status_code == 200, f"the job's own tenant got {own.status_code}: {own.text}"
     assert unknown.status_code == 404, f"an unknown job answered {unknown.status_code}, expected 404"
     assert other.status_code == 404, f"another tenant's job answered {other.status_code} while an unknown job answers 404: the difference tells a probe which job ids exist"
+    assert other.text.replace(JOB, "<job>") == unknown.text.replace("weekly", "<job>"), f"another tenant's job answered {other.text!r} and an unknown job {unknown.text!r}: the answers must be the same, or the body tells a probe which job ids exist"
     assert anonymous.status_code == 401, f"a request without X-Tenant-Id answered {anonymous.status_code}, expected 401"
 
 
@@ -678,14 +679,16 @@ async def check_live_counts(ctx):
         assert first.get("pending") == 2 and first.get("fetched") == 0, f"a job with two queued URLs reports {first}"
         records.mark_fetched(JOB, _url(1), "sha256:1", "pages/1")
         records.mark_indexed(JOB, _url(1))
-        ctx.clock.advance(10)
         second = (await _report(c)).json()
-    assert second.get("fetched") == 1 and second.get("indexed") == 1 and second.get("pending") == 1, f"10 s after a page was fetched and indexed the report still says {second}: every request must read the live counts"
+    assert second.get("fetched") == 1 and second.get("indexed") == 1 and second.get("pending") == 1, f"right after a page was fetched and indexed the report still says {second}: every request must read the live counts"
 
 
 async def check_stalled(ctx):
     async with _world(ctx, _url(1)) as c:
-        ctx.clock.advance(700)
+        ctx.clock.advance(600)
+        edge = (await _report(c)).json()
+        assert _number(edge, "oldest_pending_age_s") == 600 and edge.get("stalled") is False, f"a URL that has waited exactly STALL_AFTER_S = 600 s is not stalled yet (stalled means longer than 600 s), the report says {edge}"
+        ctx.clock.advance(100)
         frontier.enqueue(JOB, HOST, _url(2))
         report = (await _report(c)).json()
         assert report.get("pending") == 2, f"two URLs are pending, the report says {report}"
@@ -707,12 +710,22 @@ async def check_coverage(ctx):
         records.mark_gone(JOB, urls[2])
         records.mark_fetched(JOB, urls[3], "sha256:4", "pages/4")
         cov = _number((await _report(c)).json(), "coverage")
-        assert abs(cov - 1 / 3) < 0.01, f"1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333, the report says {cov}: refused and gone pages are the site's answer, not work the crawl owes"
+        assert abs(cov - 0.333) < 1e-9, f"1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333 (rounded to 3 places), the report says {cov}: refused and gone pages are the site's answer, not work the crawl owes"
         records.mark_failed(JOB, urls[4], "UNAVAILABLE")
         ctx.clock.advance(1)
         drained = (await _report(c)).json()
-    cov = _number(drained, "coverage")
-    assert drained.get("pending") == 0 and abs(cov - 1 / 3) < 0.01, f"with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says {cov}: a drained queue is no reason to answer 1.0"
+        cov = _number(drained, "coverage")
+        assert drained.get("pending") == 0 and abs(cov - 0.333) < 1e-9, f"with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says {cov}: a drained queue is no reason to answer 1.0"
+        records.mark_indexed(JOB, urls[3])
+        cov = _number((await _report(c)).json(), "coverage")
+        assert abs(cov - 0.667) < 1e-9, f"2 indexed of 2 fetched + 1 failed is 0.667 rounded to 3 places, the report says {cov}"
+        registry.insert("weekly", _url(9), "acme")
+        frontier.enqueue("weekly", HOST, _url(9))
+        records.mark_refused("weekly", _url(9), "forbidden")
+        owed_nothing = await _report(c, job="weekly")
+    assert owed_nothing.status_code == 200, f"a job whose only page was refused answered {owed_nothing.status_code}: {owed_nothing.text}"
+    cov = _number(owed_nothing.json(), "coverage")
+    assert cov == 0, f"a job that owes nothing (its only page was refused) must report coverage 0, the report says {cov}"
 `,
     typescript: `const JOB = 'nightly';
 const HOST = 'blog.example.com';
@@ -725,7 +738,7 @@ async function world(ctx, ...urls: string[]) {
   const records = ctx.load('/support/crawl/records.ts');
   await registry.insert(JOB, url(0), 'acme');
   for (const u of urls) await frontier.enqueue(JOB, HOST, u);
-  return {c: ctx.client(ctx.load('read').app), frontier, records};
+  return {c: ctx.client(ctx.load('read').app), registry, frontier, records};
 }
 
 const report = (c, headers: Record<string, string> = ACME, job = JOB) => c.get(\`/v1/crawl/jobs/\${job}\`, {headers});
@@ -744,6 +757,7 @@ export async function check_tenant_404(ctx) {
   assert.equal(own.status, 200, \`the job's own tenant got \${own.status}: \${own.text}\`);
   assert.equal(unknown.status, 404, \`an unknown job answered \${unknown.status}, expected 404\`);
   assert.equal(other.status, 404, \`another tenant's job answered \${other.status} while an unknown job answers 404: the difference tells a probe which job ids exist\`);
+  assert.equal(other.text.replaceAll(JOB, '<job>'), unknown.text.replaceAll('weekly', '<job>'), \`another tenant's job answered \${other.text} and an unknown job \${unknown.text}: the answers must be the same, or the body tells a probe which job ids exist\`);
   assert.equal(anonymous.status, 401, \`a request without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
 }
 
@@ -753,14 +767,16 @@ export async function check_live_counts(ctx) {
   assert(first.pending === 2 && first.fetched === 0, \`a job with two queued URLs reports \${JSON.stringify(first)}\`);
   await records.markFetched(JOB, url(1), 'sha256:1', 'pages/1');
   await records.markIndexed(JOB, url(1));
-  ctx.clock.advance(10);
   const second = (await report(c)).json();
-  assert(second.fetched === 1 && second.indexed === 1 && second.pending === 1, \`10 s after a page was fetched and indexed the report still says \${JSON.stringify(second)}: every request must read the live counts\`);
+  assert(second.fetched === 1 && second.indexed === 1 && second.pending === 1, \`right after a page was fetched and indexed the report still says \${JSON.stringify(second)}: every request must read the live counts\`);
 }
 
 export async function check_stalled(ctx) {
   const {c, frontier, records} = await world(ctx, url(1));
-  ctx.clock.advance(700);
+  ctx.clock.advance(600);
+  const edge = (await report(c)).json();
+  assert(numberOf(edge, 'oldest_pending_age_s') === 600 && edge.stalled === false, \`a URL that has waited exactly STALL_AFTER_S = 600 s is not stalled yet (stalled means longer than 600 s), the report says \${JSON.stringify(edge)}\`);
+  ctx.clock.advance(100);
   await frontier.enqueue(JOB, HOST, url(2));
   const r = (await report(c)).json();
   assert.equal(r.pending, 2, \`two URLs are pending, the report says \${JSON.stringify(r)}\`);
@@ -775,19 +791,29 @@ export async function check_stalled(ctx) {
 
 export async function check_coverage(ctx) {
   const urls = [1, 2, 3, 4, 5].map(url);
-  const {c, records} = await world(ctx, ...urls);
+  const {c, registry, frontier, records} = await world(ctx, ...urls);
   await records.markFetched(JOB, urls[0], 'sha256:1', 'pages/1');
   await records.markIndexed(JOB, urls[0]);
   await records.markRefused(JOB, urls[1], 'forbidden');
   await records.markGone(JOB, urls[2]);
   await records.markFetched(JOB, urls[3], 'sha256:4', 'pages/4');
   let cov = numberOf((await report(c)).json(), 'coverage');
-  assert(Math.abs(cov - 1 / 3) < 0.01, \`1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333, the report says \${cov}: refused and gone pages are the site's answer, not work the crawl owes\`);
+  assert(Math.abs(cov - 0.333) < 1e-9, \`1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333 (rounded to 3 places), the report says \${cov}: refused and gone pages are the site's answer, not work the crawl owes\`);
   await records.markFailed(JOB, urls[4], 'UNAVAILABLE');
   ctx.clock.advance(1);
   const drained = (await report(c)).json();
   cov = numberOf(drained, 'coverage');
-  assert(drained.pending === 0 && Math.abs(cov - 1 / 3) < 0.01, \`with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says \${cov}: a drained queue is no reason to answer 1.0\`);
+  assert(drained.pending === 0 && Math.abs(cov - 0.333) < 1e-9, \`with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says \${cov}: a drained queue is no reason to answer 1.0\`);
+  await records.markIndexed(JOB, urls[3]);
+  cov = numberOf((await report(c)).json(), 'coverage');
+  assert(Math.abs(cov - 0.667) < 1e-9, \`2 indexed of 2 fetched + 1 failed is 0.667 rounded to 3 places, the report says \${cov}\`);
+  await registry.insert('weekly', url(9), 'acme');
+  await frontier.enqueue('weekly', HOST, url(9));
+  await records.markRefused('weekly', url(9), 'forbidden');
+  const owedNothing = await report(c, ACME, 'weekly');
+  assert.equal(owedNothing.status, 200, \`a job whose only page was refused answered \${owedNothing.status}: \${owedNothing.text}\`);
+  cov = numberOf(owedNothing.json(), 'coverage');
+  assert.equal(cov, 0, \`a job that owes nothing (its only page was refused) must report coverage 0, the report says \${cov}\`);
 }
 `,
     go: `package main
@@ -797,6 +823,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"strings"
 
 	"crawl/frontier"
 	"crawl/records"
@@ -847,6 +874,7 @@ func CheckTenant404(ctx *harness.Ctx) {
 	ctx.Equal(own.Status, 200, "the job's own tenant (%s)", own.Text())
 	ctx.Equal(unknown.Status, 404, "an unknown job")
 	ctx.Equal(other.Status, 404, "another tenant's job must answer like an unknown job, or the difference tells a probe which job ids exist; the status")
+	ctx.Equal(strings.ReplaceAll(other.Text(), readJob, "<job>"), strings.ReplaceAll(unknown.Text(), "weekly", "<job>"), "another tenant's job must answer exactly like an unknown job, or the body tells a probe which job ids exist; its body")
 	ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id")
 }
 
@@ -856,14 +884,16 @@ func CheckLiveCounts(ctx *harness.Ctx) {
 	ctx.Assert(first["pending"] == float64(2) && first["fetched"] == float64(0), "a job with two queued URLs reports %v", first)
 	records.MarkFetched(readBg, readJob, readURL(1), "sha256:1", "pages/1")
 	records.MarkIndexed(readBg, readJob, readURL(1))
-	ctx.Clock.Advance(10)
 	second := reportOf(ctx, c)
-	ctx.Assert(second["fetched"] == float64(1) && second["indexed"] == float64(1) && second["pending"] == float64(1), "10 s after a page was fetched and indexed the report still says %v: every request must read the live counts", second)
+	ctx.Assert(second["fetched"] == float64(1) && second["indexed"] == float64(1) && second["pending"] == float64(1), "right after a page was fetched and indexed the report still says %v: every request must read the live counts", second)
 }
 
 func CheckStalled(ctx *harness.Ctx) {
 	c := readWorld(ctx, readURL(1))
-	ctx.Clock.Advance(700)
+	ctx.Clock.Advance(600)
+	edge := reportOf(ctx, c)
+	ctx.Assert(numberIn(ctx, edge, "oldest_pending_age_s") == 600 && edge["stalled"] == false, "a URL that has waited exactly STALL_AFTER_S = 600 s is not stalled yet (stalled means longer than 600 s), the report says %v", edge)
+	ctx.Clock.Advance(100)
 	ctx.NoError(frontier.Enqueue(readBg, readJob, readHost, readURL(2)), "enqueue")
 	report := reportOf(ctx, c)
 	ctx.Equal(report["pending"], 2, "two URLs are pending; the report's pending")
@@ -885,12 +915,23 @@ func CheckCoverage(ctx *harness.Ctx) {
 	records.MarkGone(readBg, readJob, urls[2])
 	records.MarkFetched(readBg, readJob, urls[3], "sha256:4", "pages/4")
 	cov := numberIn(ctx, reportOf(ctx, c), "coverage")
-	ctx.Assert(math.Abs(cov-1.0/3) < 0.01, "1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333, the report says %v: refused and gone pages are the site's answer, not work the crawl owes", cov)
+	ctx.Assert(math.Abs(cov-0.333) < 1e-9, "1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333 (rounded to 3 places), the report says %v: refused and gone pages are the site's answer, not work the crawl owes", cov)
 	records.MarkFailed(readBg, readJob, urls[4], "UNAVAILABLE")
 	ctx.Clock.Advance(1)
 	drained := reportOf(ctx, c)
 	cov = numberIn(ctx, drained, "coverage")
-	ctx.Assert(drained["pending"] == float64(0) && math.Abs(cov-1.0/3) < 0.01, "with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says %v: a drained queue is no reason to answer 1.0", cov)
+	ctx.Assert(drained["pending"] == float64(0) && math.Abs(cov-0.333) < 1e-9, "with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says %v: a drained queue is no reason to answer 1.0", cov)
+	records.MarkIndexed(readBg, readJob, urls[3])
+	cov = numberIn(ctx, reportOf(ctx, c), "coverage")
+	ctx.Assert(math.Abs(cov-0.667) < 1e-9, "2 indexed of 2 fetched + 1 failed is 0.667 rounded to 3 places, the report says %v", cov)
+	registry.Insert(readBg, "weekly", readURL(9), "acme")
+	ctx.NoError(frontier.Enqueue(readBg, "weekly", readHost, readURL(9)), "enqueue")
+	records.MarkRefused(readBg, "weekly", readURL(9), "forbidden")
+	r := c.Get("/v1/crawl/jobs/weekly", "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "a job whose only page was refused (%s)", r.Text())
+	owedNothing, _ := r.JSON().(map[string]any)
+	ctx.Assert(owedNothing != nil, "the report is not a JSON object: %s", r.Text())
+	ctx.Equal(numberIn(ctx, owedNothing, "coverage"), 0.0, "a job that owes nothing (its only page was refused) must report coverage 0; the coverage")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -935,6 +976,12 @@ double numberIn(harness::Ctx& ctx, const json& report, const std::string& name) 
   return report[name].get<double>();
 }
 
+// The body with the job id masked, so two answers for two ids compare.
+std::string masked(std::string text, const std::string& job) {
+  for (size_t at = text.find(job); at != std::string::npos; at = text.find(job, at + 5)) text.replace(at, job.size(), "<job>");
+  return text;
+}
+
 }  // namespace
 
 void CheckTenant404(harness::Ctx& ctx) {
@@ -946,6 +993,7 @@ void CheckTenant404(harness::Ctx& ctx) {
   ctx.Equal(own.Status, 200, "the job's own tenant (%s)", own.Text());
   ctx.Equal(unknown.Status, 404, "an unknown job");
   ctx.Equal(other.Status, 404, "another tenant's job must answer like an unknown job, or the difference tells a probe which job ids exist; the status");
+  ctx.Equal(masked(other.Text(), kJob), masked(unknown.Text(), "weekly"), "another tenant's job must answer exactly like an unknown job, or the body tells a probe which job ids exist; its body");
   ctx.Equal(anonymous.Status, 401, "a request without X-Tenant-Id");
 }
 
@@ -955,15 +1003,18 @@ void CheckLiveCounts(harness::Ctx& ctx) {
   ctx.Assert(first.value("pending", -1) == 2 && first.value("fetched", -1) == 0, "a job with two queued URLs reports %s", first.dump());
   records::markFetched(kJob, readUrl(1), "sha256:1", "pages/1");
   records::markIndexed(kJob, readUrl(1));
-  ctx.Clock.Advance(10);
   const json second = reportOf(ctx, c);
   ctx.Assert(second.value("fetched", -1) == 1 && second.value("indexed", -1) == 1 && second.value("pending", -1) == 1,
-             "10 s after a page was fetched and indexed the report still says %s: every request must read the live counts", second.dump());
+             "right after a page was fetched and indexed the report still says %s: every request must read the live counts", second.dump());
 }
 
 void CheckStalled(harness::Ctx& ctx) {
   auto c = readWorld(ctx, {readUrl(1)});
-  ctx.Clock.Advance(700);
+  ctx.Clock.Advance(600);
+  const json edge = reportOf(ctx, c);
+  ctx.Assert(numberIn(ctx, edge, "oldest_pending_age_s") == 600 && edge.contains("stalled") && edge["stalled"] == false,
+             "a URL that has waited exactly kStallAfterS = 600 s is not stalled yet (stalled means longer than 600 s), the report says %s", edge.dump());
+  ctx.Clock.Advance(100);
   frontier::enqueue(kJob, kHost, readUrl(2));
   const json report = reportOf(ctx, c);
   ctx.Equal(report.value("pending", -1), 2, "two URLs are pending; the report's pending");
@@ -986,12 +1037,27 @@ void CheckCoverage(harness::Ctx& ctx) {
   records::markGone(kJob, urls[2]);
   records::markFetched(kJob, urls[3], "sha256:4", "pages/4");
   double cov = numberIn(ctx, reportOf(ctx, c), "coverage");
-  ctx.Assert(std::abs(cov - 1.0 / 3) < 0.01, "1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333, the report says %v: refused and gone pages are the site's answer, not work the crawl owes", cov);
+  ctx.Assert(std::abs(cov - 0.333) < 1e-9, "1 indexed of 2 fetched + 0 failed + 1 pending is coverage 0.333 (rounded to 3 places), the report says %v: refused and gone pages are the site's answer, not work the crawl owes", cov);
   records::markFailed(kJob, urls[4], "UNAVAILABLE");
   ctx.Clock.Advance(1);
   const json drained = reportOf(ctx, c);
   cov = numberIn(ctx, drained, "coverage");
-  ctx.Assert(drained.value("pending", -1) == 0 && std::abs(cov - 1.0 / 3) < 0.01, "with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says %v: a drained queue is no reason to answer 1.0", cov);
+  ctx.Assert(drained.value("pending", -1) == 0 && std::abs(cov - 0.333) < 1e-9, "with the queue drained and one page failed coverage is 1 / (2 + 1) = 0.333, the report says %v: a drained queue is no reason to answer 1.0", cov);
+  records::markIndexed(kJob, urls[3]);
+  cov = numberIn(ctx, reportOf(ctx, c), "coverage");
+  ctx.Assert(std::abs(cov - 0.667) < 1e-9, "2 indexed of 2 fetched + 1 failed is 0.667 rounded to 3 places, the report says %v", cov);
+  registry::insert("weekly", readUrl(9), "acme");
+  frontier::enqueue("weekly", kHost, readUrl(9));
+  records::markRefused("weekly", readUrl(9), "forbidden");
+  const auto r = c.Get("/v1/crawl/jobs/weekly", "X-Tenant-Id", "acme");
+  ctx.Equal(r.Status, 200, "a job whose only page was refused (%s)", r.Text());
+  json owedNothing;
+  try {
+    owedNothing = json::parse(r.Text());
+  } catch (const std::exception&) {
+    ctx.Fatalf("the report is not JSON: %s", r.Text());
+  }
+  ctx.Equal(numberIn(ctx, owedNothing, "coverage"), 0.0, "a job that owes nothing (its only page was refused) must report coverage 0; the coverage");
 }
 `,
   },
