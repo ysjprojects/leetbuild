@@ -813,7 +813,16 @@ async function precompileCpp(problems: Problem[]): Promise<void> {
         new Promise<void>((done, fail) => {
           const args = [file, cppPrograms(), String(i), String(workers)];
           const child = fork('scripts/cpp-compile-worker.ts', args, {execArgv: ['--import', 'tsx']});
-          child.on('exit', code => (code === 0 ? done() : fail(new Error(`a C++ compile worker exited with ${code}`))));
+          // A worker the system killed (out of memory, most likely, on a crowded runner) leaves no
+          // half-written program (each lands by rename): the rest of its share compiles on demand in
+          // this process, one at a time. A worker that failed on its own still fails the run.
+          child.on('exit', (code, signal) => {
+            if (code === 0) done();
+            else if (signal !== null) {
+              console.warn(`! a C++ compile worker was killed (${signal}); its programs compile on demand`);
+              done();
+            } else fail(new Error(`a C++ compile worker exited with ${code}`));
+          });
         }),
     ),
   );
