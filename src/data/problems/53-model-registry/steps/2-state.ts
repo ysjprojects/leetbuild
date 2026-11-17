@@ -59,7 +59,7 @@ the eval record it failed with.
       id: 'atomic-promote',
       title: 'The stage and the pointer move in one script',
       detail:
-        'Promotion is one Lua script (`register_script`/`eval`, `defineCommand`, `NewScript`) that sets the stage and the pointer; separate `HSET` and `SET` round trips let a rollback land between them.',
+        'Promotion is one Lua script (`register_script`/`eval`, `defineCommand`, `NewScript`) that checks the stage and sets the stage and the pointer; a rollback racing the promote of the same eval record must leave the version rolled back with no pointer, whichever runs first.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]SET['"]/],
@@ -75,7 +75,7 @@ the eval record it failed with.
       id: 'rollback-clears',
       title: 'A rollback clears the pointer that still holds the version',
       detail:
-        "The rollback script sets `stage = rolled_back` and deletes `active:{pool}` when it still holds this version (`GET` compared, then `DEL`), so traffic stops and another version's pointer is left alone.",
+        "The rollback script sets `stage = rolled_back` and deletes `active:{pool}` when it still holds this version (`GET` compared, then `DEL`), so traffic stops and another version's pointer is left alone, even one another instance sets while the rollback runs.",
       match: {
         python: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]DEL['"]/, /redis\.call\(\s*['"]GET['"]/]},
@@ -88,7 +88,7 @@ the eval record it failed with.
       id: 'new-eval-gate',
       title: 'A rolled-back version needs a new eval record',
       detail:
-        "The promote script reads the stage and, for `rolled_back`, compares the stored `eval_id` with the caller's: the same record is refused, a new one is recorded and promoted.",
+        "The promote script reads the stage and, for `rolled_back`, compares the stored `eval_id` with the caller's: the same record is refused, a new one is recorded and promoted. A promoted version can still be promoted into another pool.",
       match: {
         python: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
         typescript: {all: [/rolled_back/, /['"]HGET['"][^)\n]*eval_id/]},
@@ -595,10 +595,8 @@ def check_atomic_promote(ctx):
     if rival.error is not None:
         raise rival.error
     stage, pointer = _stage(ctx), ctx.redis.get("active:prod")
-    if stage == "promoted":
-        assert pointer == "fraud:3", f"fraud version 3 is promoted and active:prod holds {pointer!r}"
-    else:
-        assert pointer != "fraud:3", f"a rollback landed between the promote's writes: fraud version 3 is {stage} and prod still serves it. The stage and the pointer must move in one script"
+    # In either order the version ends rolled back: after the rollback, its own eval record e-3 cannot promote it again.
+    assert stage == "rolled_back" and pointer is None, f"a promote on eval e-3 and a rollback of fraud version 3 overlapped and left it {stage} with active:prod {pointer!r}; in either order it ends rolled_back with prod cleared. The stage check, the stage and the pointer must move in one script"
 
 
 def check_rollback_clears(ctx):
@@ -612,6 +610,15 @@ def check_rollback_clears(ctx):
     assert pointer is None, f"active:prod still holds {pointer!r} after version 3 was rolled back: prod keeps serving the version it was taken out of"
     assert m.resolve_active("prod") is None, f"resolve_active('prod') answers {m.resolve_active('prod')!r} after the rollback"
     assert m.rollback("fraud", 9, "prod") is False, "rolling back a version that does not exist must answer False"
+    assert m.promote("fraud", 3, "prod", "e-3b") is True, "fraud version 3 with a new eval record must be promoted again"
+    # Another instance promotes version 2 the moment this rollback touches the pointer.
+    rival = ctx.redis_after("active:prod", lambda: m.promote("fraud", 2, "prod", "e-2b"))
+    m.rollback("fraud", 3, "prod")
+    assert rival.fired, "the rollback of fraud version 3 never touched active:prod"
+    if rival.error is not None:
+        raise rival.error
+    pointer = ctx.redis.get("active:prod")
+    assert pointer == "fraud:2", f"another instance promoted fraud version 2 while version 3 was rolled back, and active:prod holds {pointer!r}: the rollback deleted a pointer it had compared in another round trip. Compare and delete in the script"
 
 
 def check_new_eval_gate(ctx):
@@ -624,6 +631,7 @@ def check_new_eval_gate(ctx):
     assert m.promote("fraud", 3, "prod", "e-3b") is True, "with a new eval record the rolled-back version must be promoted"
     assert _stage(ctx) == "promoted" and ctx.redis.hget("model:fraud:v3", "eval_id") == "e-3b", f"after the re-promotion fraud version 3 is {ctx.redis.hgetall('model:fraud:v3')}, expected promoted with eval_id e-3b"
     assert ctx.redis.get("active:prod") == "fraud:3", f"active:prod holds {ctx.redis.get('active:prod')!r} after the re-promotion"
+    assert m.promote("fraud", 3, "canary", "e-3b") is True and ctx.redis.get("active:canary") == "fraud:3", f"a promoted version must also be promotable into canary on its eval record (active:canary {ctx.redis.get('active:canary')!r})"
     assert m.promote("fraud", 9, "prod", "e-9") is False, "promoting a version that does not exist must answer False"
     assert ctx.redis.exists("model:fraud:v9") == 0, "promoting a missing version created model:fraud:v9"
     assert ctx.redis.get("active:prod") == "fraud:3", f"promoting a missing version moved active:prod to {ctx.redis.get('active:prod')!r}"
@@ -662,8 +670,8 @@ export async function check_atomic_promote(ctx) {
   await rival.result;
   const s = stage(ctx);
   const pointer = ctx.redis.get('active:prod');
-  if (s === 'promoted') assert.equal(pointer, 'fraud:3', \`fraud version 3 is promoted and active:prod holds \${pointer}\`);
-  else assert.notEqual(pointer, 'fraud:3', \`a rollback landed between the promote's writes: fraud version 3 is \${s} and prod still serves it. The stage and the pointer must move in one script\`);
+  // In either order the version ends rolled back: after the rollback, its own eval record e-3 cannot promote it again.
+  assert(s === 'rolled_back' && pointer === null, \`a promote on eval e-3 and a rollback of fraud version 3 overlapped and left it \${s} with active:prod \${pointer}; in either order it ends rolled_back with prod cleared. The stage check, the stage and the pointer must move in one script\`);
 }
 
 export async function check_rollback_clears(ctx) {
@@ -677,6 +685,15 @@ export async function check_rollback_clears(ctx) {
   assert.equal(pointer, null, \`active:prod still holds \${pointer} after version 3 was rolled back: prod keeps serving the version it was taken out of\`);
   assert.equal(await m.resolveActive('prod'), null, 'resolveActive(prod) must answer null after the rollback');
   assert.equal(await m.rollback('fraud', 9, 'prod'), false, 'rolling back a version that does not exist must answer false');
+  assert.equal(await m.promote('fraud', 3, 'prod', 'e-3b'), true, 'fraud version 3 with a new eval record must be promoted again');
+  // Another instance promotes version 2 the moment this rollback touches the pointer.
+  const rival = ctx.redisAfter('active:prod', () => m.promote('fraud', 2, 'prod', 'e-2b'));
+  await m.rollback('fraud', 3, 'prod');
+  assert(rival.fired, 'the rollback of fraud version 3 never touched active:prod');
+  if (rival.error !== undefined) throw rival.error;
+  await rival.result;
+  const after = ctx.redis.get('active:prod');
+  assert.equal(after, 'fraud:2', \`another instance promoted fraud version 2 while version 3 was rolled back, and active:prod holds \${after}: the rollback deleted a pointer it had compared in another round trip. Compare and delete in the script\`);
 }
 
 export async function check_new_eval_gate(ctx) {
@@ -689,6 +706,8 @@ export async function check_new_eval_gate(ctx) {
   assert.equal(await m.promote('fraud', 3, 'prod', 'e-3b'), true, 'with a new eval record the rolled-back version must be promoted');
   assert(stage(ctx) === 'promoted' && ctx.redis.hget('model:fraud:v3', 'eval_id') === 'e-3b', \`after the re-promotion fraud version 3 is \${stage(ctx)} with eval_id \${ctx.redis.hget('model:fraud:v3', 'eval_id')}, expected promoted with e-3b\`);
   assert.equal(ctx.redis.get('active:prod'), 'fraud:3', 'active:prod must hold fraud:3 after the re-promotion');
+  const canary = await m.promote('fraud', 3, 'canary', 'e-3b');
+  assert(canary === true && ctx.redis.get('active:canary') === 'fraud:3', \`a promoted version must also be promotable into canary on its eval record (returned \${canary}, active:canary \${ctx.redis.get('active:canary')})\`);
   assert.equal(await m.promote('fraud', 9, 'prod', 'e-9'), false, 'promoting a version that does not exist must answer false');
   assert.equal(ctx.redis.exists('model:fraud:v9'), 0, 'promoting a missing version created model:fraud:v9');
   assert.equal(ctx.redis.get('active:prod'), 'fraud:3', 'promoting a missing version must leave active:prod at fraud:3');
@@ -764,11 +783,8 @@ func CheckAtomicPromote(ctx *harness.Ctx) {
 	ctx.Assert(rival.Fired, "the promote never touched model:fraud:v3")
 	ctx.Assert(rival.Err == nil, "the rival rollback failed: %v", rival.Err)
 	stage, pointer := stageOf(ctx, 3), pointerOf(ctx)
-	if stage == "promoted" {
-		ctx.Equal(pointer, "fraud:3", "fraud version 3 is promoted; active:prod")
-	} else {
-		ctx.Assert(pointer != "fraud:3", "a rollback landed between the promote's writes: fraud version 3 is %s and prod still serves it. The stage and the pointer must move in one script", stage)
-	}
+	// In either order the version ends rolled back: after the rollback, its own eval record e-3 cannot promote it again.
+	ctx.Assert(stage == "rolled_back" && pointer == "", "a promote on eval e-3 and a rollback of fraud version 3 overlapped and left it %s with active:prod %q; in either order it ends rolled_back with prod cleared. The stage check, the stage and the pointer must move in one script", stage, pointer)
 }
 
 func CheckRollbackClears(ctx *harness.Ctx) {
@@ -781,6 +797,17 @@ func CheckRollbackClears(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.Exists("active:prod"), 0, "active:prod still holds fraud:3 after version 3 was rolled back: prod keeps serving the version it was taken out of; active:prod exists")
 	ctx.Equal(mustResolve(ctx), "", "resolveActive(prod) after the rollback")
 	ctx.Equal(mustRollback(ctx, 9), false, "rolling back a version that does not exist; done")
+	ctx.Equal(mustPromote(ctx, 3, "e-3b"), true, "fraud version 3 with a new eval record must be promoted again; moved")
+	// Another instance promotes version 2 the moment this rollback touches the pointer.
+	rival := ctx.Redis.After("active:prod", func() any {
+		moved, err := promote(stateBg, "fraud", 2, "prod", "e-2b")
+		ctx.NoError(err, "the rival promote failed")
+		return moved
+	})
+	mustRollback(ctx, 3)
+	ctx.Assert(rival.Fired, "the rollback of fraud version 3 never touched active:prod")
+	ctx.Assert(rival.Err == nil, "the rival promote failed: %v", rival.Err)
+	ctx.Equal(pointerOf(ctx), "fraud:2", "another instance promoted fraud version 2 while version 3 was rolled back: the rollback must not delete a pointer it compared in another round trip. Compare and delete in the script; active:prod")
 }
 
 func CheckNewEvalGate(ctx *harness.Ctx) {
@@ -794,6 +821,10 @@ func CheckNewEvalGate(ctx *harness.Ctx) {
 	evalID, _ := ctx.Redis.HGet("model:fraud:v3", "eval_id")
 	ctx.Assert(stageOf(ctx, 3) == "promoted" && evalID == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", stageOf(ctx, 3), evalID)
 	ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the re-promotion")
+	canary, err := promote(stateBg, "fraud", 3, "canary", "e-3b")
+	ctx.NoError(err, "promote(fraud, 3, canary, e-3b) failed")
+	inCanary, _ := ctx.Redis.Get("active:canary")
+	ctx.Assert(canary && inCanary == "fraud:3", "a promoted version must also be promotable into canary on its eval record (returned %v, active:canary %q)", canary, inCanary)
 	ctx.Equal(mustPromote(ctx, 9, "e-9"), false, "promoting a version that does not exist; moved")
 	ctx.Equal(ctx.Redis.Exists("model:fraud:v9"), 0, "promoting a missing version must not create it; model:fraud:v9 exists")
 	ctx.Equal(pointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod")
@@ -851,12 +882,9 @@ void CheckAtomicPromote(harness::Ctx& ctx) {
   ctx.Assert(!err->has_value(), "the rival rollback failed: %s", err->value_or(""));
   const std::string stage = stageOf(ctx, 3);
   const std::string pointer = pointerOf(ctx);
-  if (stage == "promoted") {
-    ctx.Equal(pointer, "fraud:3", "fraud version 3 is promoted; active:prod");
-  } else {
-    ctx.Assert(pointer != "fraud:3",
-               "a rollback landed between the promote's writes: fraud version 3 is %s and prod still serves it. The stage and the pointer must move in one script", stage);
-  }
+  // In either order the version ends rolled back: after the rollback, its own eval record e-3 cannot promote it again.
+  ctx.Assert(stage == "rolled_back" && pointer.empty(),
+             "a promote on eval e-3 and a rollback of fraud version 3 overlapped and left it %s with active:prod %q; in either order it ends rolled_back with prod cleared. The stage check, the stage and the pointer must move in one script", stage, pointer);
 }
 
 void CheckRollbackClears(harness::Ctx& ctx) {
@@ -870,6 +898,23 @@ void CheckRollbackClears(harness::Ctx& ctx) {
             "active:prod still holds fraud:3 after version 3 was rolled back: prod keeps serving the version it was taken out of; active:prod exists");
   ctx.Assert(!resolveActive("prod"), "resolveActive(prod) answers %s after the rollback", resolveActive("prod").value_or(""));
   ctx.Equal(rollback("fraud", 9, "prod"), false, "rolling back a version that does not exist; done");
+  ctx.Equal(promote("fraud", 3, "prod", "e-3b"), true, "fraud version 3 with a new eval record must be promoted again; moved");
+  // Another instance promotes version 2 the moment this rollback touches the pointer.
+  auto fired = std::make_shared<bool>(false);
+  auto err = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After("active:prod", [fired, err] {
+    *fired = true;
+    try {
+      promote("fraud", 2, "prod", "e-2b");
+    } catch (const std::exception& e) {
+      *err = e.what();
+    }
+  });
+  rollback("fraud", 3, "prod");
+  ctx.Assert(*fired, "the rollback of fraud version 3 never touched active:prod");
+  ctx.Assert(!err->has_value(), "the rival promote failed: %s", err->value_or(""));
+  ctx.Equal(pointerOf(ctx), "fraud:2",
+            "another instance promoted fraud version 2 while version 3 was rolled back: the rollback must not delete a pointer it compared in another round trip. Compare and delete in the script; active:prod");
 }
 
 void CheckNewEvalGate(harness::Ctx& ctx) {
@@ -884,6 +929,9 @@ void CheckNewEvalGate(harness::Ctx& ctx) {
   const std::string eval_id = ctx.Redis.HGet("model:fraud:v3", "eval_id").value_or("");
   ctx.Assert(stageOf(ctx, 3) == "promoted" && eval_id == "e-3b", "after the re-promotion fraud version 3 is %s with eval_id %s, expected promoted with e-3b", stageOf(ctx, 3), eval_id);
   ctx.Equal(pointerOf(ctx), "fraud:3", "active:prod after the re-promotion");
+  const bool canary = promote("fraud", 3, "canary", "e-3b");
+  const std::string in_canary = ctx.Redis.Get("active:canary").value_or("");
+  ctx.Assert(canary && in_canary == "fraud:3", "a promoted version must also be promotable into canary on its eval record (returned %t, active:canary %q)", canary, in_canary);
   ctx.Equal(promote("fraud", 9, "prod", "e-9"), false, "promoting a version that does not exist; moved");
   ctx.Equal(ctx.Redis.Exists("model:fraud:v9"), 0, "promoting a missing version must not create it; model:fraud:v9 exists");
   ctx.Equal(pointerOf(ctx), "fraud:3", "promoting a missing version must leave active:prod");

@@ -73,7 +73,7 @@ erases the crossing.
       id: 'crossings-only',
       title: 'Publishes crossings, summarizes quiet ticks',
       detail:
-        'A crossing publishes `drift.crossed`; a quiet evaluation is counted (`count_quiet`/`countQuiet`) and only every `SUMMARY_EVERY` = 60th publishes a `drift.summary` with `quiet_ticks`.',
+        'A crossing (`distance >= threshold`, the threshold itself included) publishes `drift.crossed`; a quiet evaluation is counted (`count_quiet`/`countQuiet`) and every `SUMMARY_EVERY` = 60th quiet one, the 60th, the 120th and so on, publishes a `drift.summary` with `quiet_ticks`.',
       match: {
         python: {all: [/SUMMARY_EVERY\s*=\s*60\b/, /store\.count_quiet\(/]},
         typescript: {all: [/SUMMARY_EVERY\s*=\s*60\b/, /countQuiet\(/]},
@@ -86,7 +86,7 @@ erases the crossing.
       id: 'payload-evidence',
       title: 'Carries the window and the sample count',
       detail:
-        'The event carries `window_start`, `window_end` and `sample_count` next to the metric, distance and threshold, so a consumer can join it to a report and judge it.',
+        'The event carries `window_start`, `window_end` and `sample_count` next to the metric, distance and threshold, all taken from the evaluation and its monitor, so a consumer can join it to a report and judge it.',
       match: {
         python: {all: [/["']window_start["']/, /["']window_end["']/, /["']sample_count["']/]},
         typescript: {all: [/window_start:/, /window_end:/, /sample_count:/]},
@@ -112,7 +112,7 @@ erases the crossing.
       id: 'outbox-fallback',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the event, and the call returns false; the starter fires and forgets.',
+        'A failed delivery, or no report within `ACK_TIMEOUT_S` = 2 s, leaves an outbox row with the topic, the key and the whole event, and the call returns false; the starter fires and forgets.',
       match: {
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
@@ -588,6 +588,9 @@ TOPIC = "drift.evaluated"
 M1 = {"monitor_id": "m-1", "tenant": "t1", "model_version": "v3", "metric": "input_distribution", "window_s": 300, "baseline": "baseline:v3:2026-10-01", "threshold": 0.2}
 M2 = {**M1, "monitor_id": "m-2"}
 CROSSED = {"type": "drift.crossed", "monitor_id": "m-1", "metric": "input_distribution", "distance": 0.31, "threshold": 0.2, "window_start": 900, "window_end": 1200, "sample_count": 640}
+# A monitor with its own window and threshold: the event takes both from the monitor.
+M3 = {**M1, "monitor_id": "m-3", "window_s": 3600, "threshold": 0.25}
+CROSSED_M3 = {"type": "drift.crossed", "monitor_id": "m-3", "metric": "input_distribution", "distance": 0.31, "threshold": 0.25, "window_start": 3600, "window_end": 7200, "sample_count": 900}
 
 
 def _events(ctx):
@@ -615,12 +618,18 @@ def check_crossings_only(ctx):
     for _ in range(59):
         m.publish_evaluation(M1, 900, 0.05, 640)
     assert len(ctx.kafka.records(TOPIC)) == 0, f"59 quiet evaluations put {len(ctx.kafka.records(TOPIC))} events on {TOPIC}: quiet ticks are counted (store.count_quiet) and summarized every 60th, not published one by one"
+    m.publish_evaluation(M1, 900, 0.2, 640)
+    events = _events(ctx)
+    assert len(events) == 1 and events[0].get("type") == "drift.crossed", f"a distance of 0.2 against the threshold 0.2 is a crossing (distance >= threshold) and must publish a drift.crossed event at once, the topic holds {events}"
     m.publish_evaluation(M1, 900, 0.05, 640)
     events = _events(ctx)
-    assert len(events) == 1 and events[0].get("type") == "drift.summary" and events[0].get("quiet_ticks") == 60, f"the 60th quiet evaluation must publish one drift.summary with quiet_ticks 60, the topic holds {events}"
-    m.publish_evaluation(M1, 900, 0.31, 640)
+    assert len(events) == 2 and events[1].get("type") == "drift.summary" and events[1].get("quiet_ticks") == 60, f"the 60th quiet evaluation (a crossing in between is not quiet) must publish one drift.summary with quiet_ticks 60, the topic holds {events}"
+    for _ in range(59):
+        m.publish_evaluation(M1, 900, 0.05, 640)
+    assert len(_events(ctx)) == 2, f"59 more quiet evaluations put {len(_events(ctx)) - 2} more events on {TOPIC}, expected none before the 120th"
+    m.publish_evaluation(M1, 900, 0.05, 640)
     events = _events(ctx)
-    assert len(events) == 2 and events[1].get("type") == "drift.crossed", f"a crossing must publish a drift.crossed event at once, the topic holds {events}"
+    assert len(events) == 3 and events[2].get("type") == "drift.summary" and events[2].get("quiet_ticks") == 60, f"the 120th quiet evaluation must publish a second drift.summary with quiet_ticks 60 (one every SUMMARY_EVERY), the topic holds {events[2:]}"
 
 
 def check_payload_evidence(ctx):
@@ -630,6 +639,10 @@ def check_payload_evidence(ctx):
     assert len(events) == 1, f"one crossing produced {len(events)} events"
     seen = {name: events[0].get(name) for name in CROSSED}
     assert seen == CROSSED, f"the event carries {events[0]}, expected {CROSSED}: without the window and the sample count a consumer cannot join it to a report or judge it"
+    m.publish_evaluation(M3, 3600, 0.31, 900)
+    events = _events(ctx)
+    seen = {name: events[-1].get(name) for name in CROSSED_M3} if len(events) == 2 else None
+    assert seen == CROSSED_M3, f"a crossing of m-3 (window_s 3600, threshold 0.25) published {events[1:]}, expected {CROSSED_M3}: the window end and the threshold come from the monitor"
 
 
 def check_idempotent_acks(ctx):
@@ -648,13 +661,15 @@ def check_outbox_fallback(ctx):
     ok = m.publish_evaluation(M1, 900, 0.31, 640)
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the crossing is gone from the history"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "m-1" and rows[0].get("payload", {}).get("window_start") == 900, f"the outbox row is {rows[0]}, expected the topic, the key m-1 and the event"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "m-1", f"the outbox row is {rows[0]}, expected the topic {TOPIC} and the key m-1"
+    payload = rows[0].get("payload") if isinstance(rows[0].get("payload"), dict) else {}
+    assert {name: payload.get(name) for name in CROSSED} == CROSSED, f"the outbox row carries the event {rows[0].get('payload')!r}, expected the whole event {CROSSED}: the relay publishes it as it is"
     assert ok is False, f"publish_evaluation returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_evaluation(M1, 1200, 0.33, 650)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_evaluation waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_evaluation waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S = 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("window_start") == 1200, f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_evaluation returned {ok!r} without a delivery report, expected False"
@@ -663,6 +678,10 @@ def check_outbox_fallback(ctx):
 const M1 = {monitor_id: 'm-1', tenant: 't1', model_version: 'v3', metric: 'input_distribution', window_s: 300, baseline: 'baseline:v3:2026-10-01', threshold: 0.2};
 const M2 = {...M1, monitor_id: 'm-2'};
 const CROSSED = {type: 'drift.crossed', monitor_id: 'm-1', metric: 'input_distribution', distance: 0.31, threshold: 0.2, window_start: 900, window_end: 1200, sample_count: 640};
+// A monitor with its own window and threshold: the event takes both from the monitor.
+const M3 = {...M1, monitor_id: 'm-3', window_s: 3600, threshold: 0.25};
+const CROSSED_M3 = {type: 'drift.crossed', monitor_id: 'm-3', metric: 'input_distribution', distance: 0.31, threshold: 0.25, window_start: 3600, window_end: 7200, sample_count: 900};
+const pick = (event, want) => Object.fromEntries(Object.keys(want).map(name => [name, event?.[name]]));
 
 const events = ctx => (ctx.kafka.values(TOPIC) as string[]).map(value => JSON.parse(value));
 const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
@@ -692,14 +711,21 @@ export async function check_crossings_only(ctx) {
   for (let i = 0; i < 59; i += 1) await m.publishEvaluation(M1, 900, 0.05, 640);
   await settle();
   assert.equal(ctx.kafka.records(TOPIC).length, 0, \`59 quiet evaluations put \${ctx.kafka.records(TOPIC).length} events on \${TOPIC}: quiet ticks are counted (countQuiet) and summarized every 60th, not published one by one\`);
-  await m.publishEvaluation(M1, 900, 0.05, 640);
+  await m.publishEvaluation(M1, 900, 0.2, 640);
   await settle();
   let seen = events(ctx);
-  assert(seen.length === 1 && seen[0].type === 'drift.summary' && seen[0].quiet_ticks === 60, \`the 60th quiet evaluation must publish one drift.summary with quiet_ticks 60, the topic holds \${JSON.stringify(seen)}\`);
-  await m.publishEvaluation(M1, 900, 0.31, 640);
+  assert(seen.length === 1 && seen[0].type === 'drift.crossed', \`a distance of 0.2 against the threshold 0.2 is a crossing (distance >= threshold) and must publish a drift.crossed event at once, the topic holds \${JSON.stringify(seen)}\`);
+  await m.publishEvaluation(M1, 900, 0.05, 640);
   await settle();
   seen = events(ctx);
-  assert(seen.length === 2 && seen[1].type === 'drift.crossed', \`a crossing must publish a drift.crossed event at once, the topic holds \${JSON.stringify(seen)}\`);
+  assert(seen.length === 2 && seen[1].type === 'drift.summary' && seen[1].quiet_ticks === 60, \`the 60th quiet evaluation (a crossing in between is not quiet) must publish one drift.summary with quiet_ticks 60, the topic holds \${JSON.stringify(seen)}\`);
+  for (let i = 0; i < 59; i += 1) await m.publishEvaluation(M1, 900, 0.05, 640);
+  await settle();
+  assert.equal(events(ctx).length, 2, \`59 more quiet evaluations put \${events(ctx).length - 2} more events on \${TOPIC}, expected none before the 120th\`);
+  await m.publishEvaluation(M1, 900, 0.05, 640);
+  await settle();
+  seen = events(ctx);
+  assert(seen.length === 3 && seen[2].type === 'drift.summary' && seen[2].quiet_ticks === 60, \`the 120th quiet evaluation must publish a second drift.summary with quiet_ticks 60 (one every SUMMARY_EVERY), the topic holds \${JSON.stringify(seen.slice(2))}\`);
 }
 
 export async function check_payload_evidence(ctx) {
@@ -708,8 +734,11 @@ export async function check_payload_evidence(ctx) {
   await settle();
   const seen = events(ctx);
   assert.equal(seen.length, 1, \`one crossing produced \${seen.length} events\`);
-  const picked = Object.fromEntries(Object.keys(CROSSED).map(name => [name, seen[0][name]]));
-  assert.deepStrictEqual(picked, CROSSED, \`the event carries \${JSON.stringify(seen[0])}, expected \${JSON.stringify(CROSSED)}: without the window and the sample count a consumer cannot join it to a report or judge it\`);
+  assert.deepStrictEqual(pick(seen[0], CROSSED), CROSSED, \`the event carries \${JSON.stringify(seen[0])}, expected \${JSON.stringify(CROSSED)}: without the window and the sample count a consumer cannot join it to a report or judge it\`);
+  await m.publishEvaluation(M3, 3600, 0.31, 900);
+  await settle();
+  const all = events(ctx);
+  assert(all.length === 2 && JSON.stringify(pick(all[1], CROSSED_M3)) === JSON.stringify(CROSSED_M3), \`a crossing of m-3 (window_s 3600, threshold 0.25) published \${JSON.stringify(all.slice(1))}, expected \${JSON.stringify(CROSSED_M3)}: the window end and the threshold come from the monitor\`);
 }
 
 export async function check_idempotent_acks(ctx) {
@@ -731,13 +760,14 @@ export async function check_outbox_fallback(ctx) {
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the crossing is gone from the history\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'm-1' && rows[0].payload?.window_start === 900, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key m-1 and the event\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'm-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic \${TOPIC} and the key m-1\`);
+  assert.deepStrictEqual(pick(rows[0].payload, CROSSED), CROSSED, \`the outbox row carries the event \${JSON.stringify(rows[0].payload)}, expected the whole event \${JSON.stringify(CROSSED)}: the relay publishes it as it is\`);
   assert.equal(ok, false, \`publishEvaluation resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishEvaluation(M1, 1200, 0.33, 650);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishEvaluation waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishEvaluation waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.window_start === 1200, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishEvaluation resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -755,18 +785,21 @@ import (
 )
 
 var (
-	m1      = store.Monitor{MonitorID: "m-1", Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: "baseline:v3:2026-10-01", Threshold: 0.2}
-	m2      = store.Monitor{MonitorID: "m-2", Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: "baseline:v3:2026-10-01", Threshold: 0.2}
-	crossed = map[string]any{"type": "drift.crossed", "monitor_id": "m-1", "metric": "input_distribution", "distance": 0.31, "threshold": 0.2, "window_start": 900, "window_end": 1200, "sample_count": 640}
+	hM1      = store.Monitor{MonitorID: "m-1", Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: "baseline:v3:2026-10-01", Threshold: 0.2}
+	hM2      = store.Monitor{MonitorID: "m-2", Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: "baseline:v3:2026-10-01", Threshold: 0.2}
+	hCrossed = map[string]any{"type": "drift.crossed", "monitor_id": "m-1", "metric": "input_distribution", "distance": 0.31, "threshold": 0.2, "window_start": 900, "window_end": 1200, "sample_count": 640}
+	// A monitor with its own window and threshold: the event takes both from the monitor.
+	hM3        = store.Monitor{MonitorID: "m-3", Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: 3600, Baseline: "baseline:v3:2026-10-01", Threshold: 0.25}
+	hCrossedM3 = map[string]any{"type": "drift.crossed", "monitor_id": "m-3", "metric": "input_distribution", "distance": 0.31, "threshold": 0.25, "window_start": 3600, "window_end": 7200, "sample_count": 900}
 )
 
-func evaluate(ctx *harness.Ctx, m store.Monitor, window int64, distance float64, samples int64) bool {
+func hEvaluate(ctx *harness.Ctx, m store.Monitor, window int64, distance float64, samples int64) bool {
 	ok, err := publishEvaluation(context.Background(), m, window, distance, samples)
 	ctx.NoError(err, "publishEvaluation(%s, %d, %v) failed", m.MonitorID, window, distance)
 	return ok
 }
 
-func driftEvents(ctx *harness.Ctx) []map[string]any {
+func hEvents(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, value := range ctx.Kafka.Values(topic) {
 		var e map[string]any
@@ -776,16 +809,24 @@ func driftEvents(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-type outboxRow struct {
+func hPick(event map[string]any, want map[string]any) map[string]any {
+	picked := map[string]any{}
+	for name := range want {
+		picked[name] = event[name]
+	}
+	return picked
+}
+
+type hOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outbox(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutbox(ctx *harness.Ctx) []hOutboxRow {
+	var rows []hOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row hOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -793,9 +834,9 @@ func outbox(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckMonitorKey(ctx *harness.Ctx) {
-	evaluate(ctx, m1, 900, 0.31, 640)
-	evaluate(ctx, m2, 900, 0.35, 700)
-	evaluate(ctx, m1, 1200, 0.33, 650)
+	hEvaluate(ctx, hM1, 900, 0.31, 640)
+	hEvaluate(ctx, hM2, 900, 0.35, 700)
+	hEvaluate(ctx, hM1, 1200, 0.33, 650)
 	ctx.Settle()
 	records := ctx.Kafka.Records(topic)
 	ctx.Equal(len(records), 3, "three crossings must produce three records on %s; the records", topic)
@@ -805,38 +846,48 @@ func CheckMonitorKey(ctx *harness.Ctx) {
 
 func CheckCrossingsOnly(ctx *harness.Ctx) {
 	for i := 0; i < 59; i++ {
-		evaluate(ctx, m1, 900, 0.05, 640)
+		hEvaluate(ctx, hM1, 900, 0.05, 640)
 	}
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "59 quiet evaluations must publish nothing (quiet ticks are counted with store.CountQuiet and summarized every 60th); the events on %s", topic)
-	evaluate(ctx, m1, 900, 0.05, 640)
+	hEvaluate(ctx, hM1, 900, 0.2, 640)
 	ctx.Settle()
-	seen := driftEvents(ctx)
-	ctx.Assert(len(seen) == 1 && seen[0]["type"] == "drift.summary" && seen[0]["quiet_ticks"] == float64(60), "the 60th quiet evaluation must publish one drift.summary with quiet_ticks 60, the topic holds %v", seen)
-	evaluate(ctx, m1, 900, 0.31, 640)
+	seen := hEvents(ctx)
+	ctx.Assert(len(seen) == 1 && seen[0]["type"] == "drift.crossed", "a distance of 0.2 against the threshold 0.2 is a crossing (distance >= threshold) and must publish a drift.crossed event at once, the topic holds %v", seen)
+	hEvaluate(ctx, hM1, 900, 0.05, 640)
 	ctx.Settle()
-	seen = driftEvents(ctx)
-	ctx.Assert(len(seen) == 2 && seen[1]["type"] == "drift.crossed", "a crossing must publish a drift.crossed event at once, the topic holds %v", seen)
+	seen = hEvents(ctx)
+	ctx.Assert(len(seen) == 2 && seen[1]["type"] == "drift.summary" && seen[1]["quiet_ticks"] == float64(60), "the 60th quiet evaluation (a crossing in between is not quiet) must publish one drift.summary with quiet_ticks 60, the topic holds %v", seen)
+	for i := 0; i < 59; i++ {
+		hEvaluate(ctx, hM1, 900, 0.05, 640)
+	}
+	ctx.Settle()
+	ctx.Equal(len(hEvents(ctx)), 2, "59 more quiet evaluations must publish nothing before the 120th; the events on %s", topic)
+	hEvaluate(ctx, hM1, 900, 0.05, 640)
+	ctx.Settle()
+	seen = hEvents(ctx)
+	ctx.Assert(len(seen) == 3 && seen[2]["type"] == "drift.summary" && seen[2]["quiet_ticks"] == float64(60), "the 120th quiet evaluation must publish a second drift.summary with quiet_ticks 60 (one every summaryEvery), the topic holds %v", seen)
 }
 
 func CheckPayloadEvidence(ctx *harness.Ctx) {
-	evaluate(ctx, m1, 900, 0.31, 640)
+	hEvaluate(ctx, hM1, 900, 0.31, 640)
 	ctx.Settle()
-	seen := driftEvents(ctx)
+	seen := hEvents(ctx)
 	ctx.Equal(len(seen), 1, "one crossing must produce one event; the events")
-	picked := map[string]any{}
-	for name := range crossed {
-		picked[name] = seen[0][name]
-	}
-	ctx.Equal(picked, crossed, "the event must carry the window and the sample count, or a consumer cannot join it to a report or judge it")
+	ctx.Equal(hPick(seen[0], hCrossed), hCrossed, "the event must carry the window and the sample count, or a consumer cannot join it to a report or judge it")
+	hEvaluate(ctx, hM3, 3600, 0.31, 900)
+	ctx.Settle()
+	seen = hEvents(ctx)
+	ctx.Equal(len(seen), 2, "a crossing of m-3 must produce one more event; the events")
+	ctx.Equal(hPick(seen[1], hCrossedM3), hCrossedM3, "a crossing of m-3 (window_s 3600, threshold 0.25): the window end and the threshold come from the monitor")
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(topic, 1) // the broker wrote it, the acknowledgement never arrived
-	evaluate(ctx, m1, 900, 0.31, 640)
+	hEvaluate(ctx, hM1, 900, 0.31, 640)
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	evaluate(ctx, m1, 1200, 0.33, 650)
+	hEvaluate(ctx, hM1, 1200, 0.33, 650)
 	ctx.Settle()
 	ctx.Kafka.Failover(topic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
@@ -844,18 +895,19 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 
 func CheckOutboxFallback(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext(topic, 1)
-	ok := evaluate(ctx, m1, 900, 0.31, 640)
+	ok := hEvaluate(ctx, hM1, 900, 0.31, 640)
 	ctx.Settle()
-	rows := outbox(ctx)
+	rows := hOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the crossing is gone from the history; the rows")
-	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "m-1" && rows[0].Payload["window_start"] == float64(900), "the outbox row is %v, expected the topic, the key m-1 and the event", rows[0])
+	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "m-1", "the outbox row is %v, expected the topic %s and the key m-1", rows[0], topic)
+	ctx.Equal(hPick(rows[0].Payload, hCrossed), hCrossed, "the outbox row must carry the whole event: the relay publishes it as it is")
 	ctx.Equal(ok, false, "publishEvaluation's result after a failed delivery")
 	ctx.Kafka.Stall(topic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = evaluate(ctx, m1, 1200, 0.33, 650)
+	ok = hEvaluate(ctx, hM1, 1200, 0.33, 650)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishEvaluation waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = outbox(ctx)
+	ctx.Assert(waited <= 2.5, "publishEvaluation waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout = 2 s, then write the outbox row", waited)
+	rows = hOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["window_start"] == float64(1200), "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishEvaluation's result without a delivery report")
 }
@@ -873,18 +925,28 @@ using json = nlohmann::json;
 
 namespace {
 
-const store::Monitor kM1{"m-1", "t1", "v3", "input_distribution", 300, "baseline:v3:2026-10-01", 0.2};
-const store::Monitor kM2{"m-2", "t1", "v3", "input_distribution", 300, "baseline:v3:2026-10-01", 0.2};
-const json kCrossed = {{"type", "drift.crossed"}, {"monitor_id", "m-1"}, {"metric", "input_distribution"}, {"distance", 0.31},
+const store::Monitor hM1{"m-1", "t1", "v3", "input_distribution", 300, "baseline:v3:2026-10-01", 0.2};
+const store::Monitor hM2{"m-2", "t1", "v3", "input_distribution", 300, "baseline:v3:2026-10-01", 0.2};
+const json hCrossed = {{"type", "drift.crossed"}, {"monitor_id", "m-1"}, {"metric", "input_distribution"}, {"distance", 0.31},
                        {"threshold", 0.2},       {"window_start", 900}, {"window_end", 1200},                {"sample_count", 640}};
+// A monitor with its own window and threshold: the event takes both from the monitor.
+const store::Monitor hM3{"m-3", "t1", "v3", "input_distribution", 3600, "baseline:v3:2026-10-01", 0.25};
+const json hCrossedM3 = {{"type", "drift.crossed"}, {"monitor_id", "m-3"}, {"metric", "input_distribution"}, {"distance", 0.31},
+                         {"threshold", 0.25},      {"window_start", 3600}, {"window_end", 7200},               {"sample_count", 900}};
 
-std::vector<json> driftEvents(harness::Ctx& ctx) {
+std::vector<json> hEvents(harness::Ctx& ctx) {
   std::vector<json> out;
   for (const auto& value : ctx.Kafka.Values(kTopic)) out.push_back(json::parse(value, nullptr, false));
   return out;
 }
 
-std::vector<json> outbox(harness::Ctx& ctx) {
+json hPick(const json& event, const json& want) {
+  json picked = json::object();
+  for (const auto& [name, value] : want.items()) picked[name] = event.is_object() && event.contains(name) ? event[name] : json();
+  return picked;
+}
+
+std::vector<json> hOutbox(harness::Ctx& ctx) {
   std::vector<json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = json::parse(text, nullptr, false);
@@ -894,16 +956,16 @@ std::vector<json> outbox(harness::Ctx& ctx) {
   return rows;
 }
 
-long windowOf(const json& row) {
+long hWindowOf(const json& row) {
   return row.contains("payload") && row["payload"].is_object() ? row["payload"].value("window_start", 0L) : 0L;
 }
 
 }  // namespace
 
 void CheckMonitorKey(harness::Ctx& ctx) {
-  publishEvaluation(kM1, 900, 0.31, 640);
-  publishEvaluation(kM2, 900, 0.35, 700);
-  publishEvaluation(kM1, 1200, 0.33, 650);
+  publishEvaluation(hM1, 900, 0.31, 640);
+  publishEvaluation(hM2, 900, 0.35, 700);
+  publishEvaluation(hM1, 1200, 0.33, 650);
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kTopic);
   ctx.Equal(records.size(), 3, "three crossings must produce three records on %s; the records", kTopic);
@@ -912,35 +974,45 @@ void CheckMonitorKey(harness::Ctx& ctx) {
 }
 
 void CheckCrossingsOnly(harness::Ctx& ctx) {
-  for (int i = 0; i < 59; i++) publishEvaluation(kM1, 900, 0.05, 640);
+  for (int i = 0; i < 59; i++) publishEvaluation(hM1, 900, 0.05, 640);
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "59 quiet evaluations must publish nothing (quiet ticks are counted with store::countQuiet and summarized every 60th); the events on %s", kTopic);
-  publishEvaluation(kM1, 900, 0.05, 640);
+  publishEvaluation(hM1, 900, 0.2, 640);
   ctx.Settle();
-  auto seen = driftEvents(ctx);
-  ctx.Assert(seen.size() == 1 && seen[0].value("type", "") == "drift.summary" && seen[0].value("quiet_ticks", 0L) == 60, "the 60th quiet evaluation must publish one drift.summary with quiet_ticks 60, the topic holds %d events", seen.size());
-  publishEvaluation(kM1, 900, 0.31, 640);
+  auto seen = hEvents(ctx);
+  ctx.Assert(seen.size() == 1 && seen[0].value("type", "") == "drift.crossed", "a distance of 0.2 against the threshold 0.2 is a crossing (distance >= threshold) and must publish a drift.crossed event at once, the topic holds %s", json(seen).dump());
+  publishEvaluation(hM1, 900, 0.05, 640);
   ctx.Settle();
-  seen = driftEvents(ctx);
-  ctx.Assert(seen.size() == 2 && seen[1].value("type", "") == "drift.crossed", "a crossing must publish a drift.crossed event at once, the topic holds %d events", seen.size());
+  seen = hEvents(ctx);
+  ctx.Assert(seen.size() == 2 && seen[1].value("type", "") == "drift.summary" && seen[1].value("quiet_ticks", 0L) == 60, "the 60th quiet evaluation (a crossing in between is not quiet) must publish one drift.summary with quiet_ticks 60, the topic holds %s", json(seen).dump());
+  for (int i = 0; i < 59; i++) publishEvaluation(hM1, 900, 0.05, 640);
+  ctx.Settle();
+  ctx.Equal(hEvents(ctx).size(), 2, "59 more quiet evaluations must publish nothing before the 120th; the events on %s", kTopic);
+  publishEvaluation(hM1, 900, 0.05, 640);
+  ctx.Settle();
+  seen = hEvents(ctx);
+  ctx.Assert(seen.size() == 3 && seen[2].value("type", "") == "drift.summary" && seen[2].value("quiet_ticks", 0L) == 60, "the 120th quiet evaluation must publish a second drift.summary with quiet_ticks 60 (one every kSummaryEvery), the topic holds %s", json(seen).dump());
 }
 
 void CheckPayloadEvidence(harness::Ctx& ctx) {
-  publishEvaluation(kM1, 900, 0.31, 640);
+  publishEvaluation(hM1, 900, 0.31, 640);
   ctx.Settle();
-  const auto seen = driftEvents(ctx);
+  auto seen = hEvents(ctx);
   ctx.Equal(seen.size(), 1, "one crossing must produce one event; the events");
-  json picked = json::object();
-  for (const auto& [name, value] : kCrossed.items()) picked[name] = seen[0].is_object() && seen[0].contains(name) ? seen[0][name] : json();
-  ctx.Equal(picked, kCrossed, "the event must carry the window and the sample count, or a consumer cannot join it to a report or judge it");
+  ctx.Equal(hPick(seen[0], hCrossed), hCrossed, "the event must carry the window and the sample count, or a consumer cannot join it to a report or judge it");
+  publishEvaluation(hM3, 3600, 0.31, 900);
+  ctx.Settle();
+  seen = hEvents(ctx);
+  ctx.Equal(seen.size(), 2, "a crossing of m-3 must produce one more event; the events");
+  ctx.Equal(hPick(seen[1], hCrossedM3), hCrossedM3, "a crossing of m-3 (window_s 3600, threshold 0.25): the window end and the threshold come from the monitor");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishEvaluation(kM1, 900, 0.31, 640);
+  publishEvaluation(hM1, 900, 0.31, 640);
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  publishEvaluation(kM1, 1200, 0.33, 650);
+  publishEvaluation(hM1, 1200, 0.33, 650);
   ctx.Settle();
   ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
@@ -948,19 +1020,20 @@ void CheckIdempotentAcks(harness::Ctx& ctx) {
 
 void CheckOutboxFallback(harness::Ctx& ctx) {
   ctx.Kafka.FailNext(kTopic, 1);
-  bool ok = publishEvaluation(kM1, 900, 0.31, 640);
+  bool ok = publishEvaluation(hM1, 900, 0.31, 640);
   ctx.Settle();
-  auto rows = outbox(ctx);
+  auto rows = hOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the crossing is gone from the history; the rows");
-  ctx.Assert(rows[0].value("topic", "") == kTopic && rows[0].value("key", "") == "m-1" && windowOf(rows[0]) == 900, "the outbox row is %s, expected the topic, the key m-1 and the event", rows[0].dump());
+  ctx.Assert(rows[0].value("topic", "") == kTopic && rows[0].value("key", "") == "m-1", "the outbox row is %s, expected the topic %s and the key m-1", rows[0].dump(), kTopic);
+  ctx.Equal(hPick(rows[0].contains("payload") ? rows[0]["payload"] : json(), hCrossed), hCrossed, "the outbox row must carry the whole event: the relay publishes it as it is");
   ctx.Equal(ok, false, "publishEvaluation's result after a failed delivery");
   ctx.Kafka.Stall(kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishEvaluation(kM1, 1200, 0.33, 650);
+  ok = publishEvaluation(hM1, 1200, 0.33, 650);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishEvaluation waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = outbox(ctx);
-  ctx.Assert(rows.size() == 2 && windowOf(rows[1]) == 1200, "no delivery report within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(waited <= 2.5, "publishEvaluation waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs = 2000, then write the outbox row", waited);
+  rows = hOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && hWindowOf(rows[1]) == 1200, "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishEvaluation's result without a delivery report");
 }
 `,

@@ -21,8 +21,9 @@ serves nowhere.
 
 - \`eval_record\` is always attached: \`{eval_id, score, threshold, passed}\`, with
   \`passed = score >= threshold\`.
-- The model's \`owner\` and \`visibility\` come from \`store.model\`: a private model of another tenant
-  answers **404**, the same as a missing one, before any cache is read.
+- The model's \`owner\` and \`visibility\` come from \`store.model\`: another tenant reads only a
+  \`public\` model; any other model of another tenant answers **404**, the same as a missing one,
+  before any cache is read.
 - The cache key carries the pools, \`mread:{name}:{version}:{pools joined by ","}\`, and the entry lives
   \`READ_TTL_S\` = 5 s.`,
   sequence: {
@@ -65,7 +66,7 @@ serves nowhere.
       id: 'eval-always',
       title: 'Attaches the eval record with its threshold, failed or not',
       detail:
-        '`eval_record` is `{eval_id, score, threshold, passed}` with `passed` computed from the score and the threshold, attached whether the eval passed or not; the starter drops a failed one.',
+        '`eval_record` is `{eval_id, score, threshold, passed}` with `passed` computed from the score and the threshold (a score equal to the threshold passes), attached whether the eval passed or not; the starter drops a failed one.',
       match: {
         python: {all: [/["']threshold["']\s*:/, /["']passed["']\s*:[^\n]*>=/]},
         typescript: {all: [/threshold:/, /passed:[^\n]*>=/]},
@@ -78,7 +79,7 @@ serves nowhere.
       id: 'tenant-404',
       title: "Another tenant's private model is a 404",
       detail:
-        "The model's `owner` and `visibility` are checked against the tenant before the cache: a private model of another tenant answers **404**, indistinguishable from a missing one; a public one is readable by all.",
+        "The model's `owner` and `visibility` are checked against the tenant before the cache: another tenant's model answers **404**, indistinguishable from a missing one, unless its visibility is `public`.",
       match: {
         python: {all: [/store\.model\(/, /owner/, /visibility/]},
         typescript: {all: [/\bmodel\(/, /owner/, /visibility/]},
@@ -91,7 +92,7 @@ serves nowhere.
       id: 'fresh-promotion',
       title: 'The cache sees a promotion within seconds',
       detail:
-        'The cache key carries the pools the version serves in and the entry lives `READ_TTL_S` (5 s), so a promotion changes the key at once; the starter keys by version alone for an hour.',
+        'The cache key carries the pools the version serves in and the entry is written with `READ_TTL_S` (5 s) in the same command, so a promotion changes the key at once; the starter keys by version alone for an hour.',
       match: {
         python: {all: [/READ_TTL_S\s*=\s*5\b/, /ex\s*=\s*READ_TTL_S/, /join\(\s*pools\s*\)/], none: [/3600/]},
         typescript: {all: [/READ_TTL_S\s*=\s*5\b/, /['"]EX['"],\s*READ_TTL_S/, /pools\.join\(/], none: [/3600/]},
@@ -713,10 +714,14 @@ async def check_route_read(ctx):
 
 async def check_eval_always(ctx):
     async with _api(ctx) as c:
+        store.add_eval("e-3", "fraud", "sha256:a3", 0.85, 0.85, "precision 0.85 on holdout-2026-10")
+        store.register_version("t1", "fraud", "sha256:a3", "r-3", "e-3")
         failed = (await _get(c, "fraud", 2)).json().get("eval_record")
         passed = (await _get(c, "fraud", 1)).json().get("eval_record")
+        level = (await _get(c, "fraud", 3)).json().get("eval_record")
     assert failed == {"eval_id": "e-2", "score": 0.71, "threshold": 0.8, "passed": False}, f"fraud version 2 failed its eval (0.71 against 0.8) and the read carries eval_record {failed}: a failed gate must read as failed, with its threshold"
     assert passed == {"eval_id": "e-1", "score": 0.91, "threshold": 0.85, "passed": True}, f"fraud version 1 passed its eval and the read carries eval_record {passed}, expected score, threshold and passed"
+    assert level == {"eval_id": "e-3", "score": 0.85, "threshold": 0.85, "passed": True}, f"fraud version 3 scored exactly its threshold (0.85 against 0.85) and the read carries eval_record {level}: a score that meets the bar passes"
 
 
 async def check_tenant_404(ctx):
@@ -729,7 +734,12 @@ async def check_tenant_404(ctx):
         nothing = await _get(c, "nosuch", 1, tenant="t2")
         assert nothing.status_code == 404, f"a model that does not exist answered {nothing.status_code}"
         public = await _get(c, "embed", 1, tenant="t2")
-    assert public.status_code == 200 and public.json().get("name") == "embed", f"a public model must be readable by every tenant, t2 got {public.status_code} {public.text}"
+        assert public.status_code == 200 and public.json().get("name") == "embed", f"a public model must be readable by every tenant, t2 got {public.status_code} {public.text}"
+        store.create_model("ranker", "t1", "internal")
+        store.add_eval("e-rank", "ranker", "sha256:r1", 0.9, 0.8, "ndcg 0.9")
+        store.register_version("t1", "ranker", "sha256:r1", "r-rank", "e-rank")
+        internal = await _get(c, "ranker", 1, tenant="t2")
+    assert internal.status_code == 404, f"tenant t2 read t1's model ranker, visibility internal, and got {internal.status_code}: only a public model is readable by another tenant"
 
 
 async def check_fresh_promotion(ctx):
@@ -737,8 +747,21 @@ async def check_fresh_promotion(ctx):
         before = (await _get(c, "fraud", 1)).json()
         assert before.get("pools") == [], f"before the promotion the read says pools {before.get('pools')}"
         assert pointer.promote("fraud", 1, "prod", "e-1") is True, "the promotion of fraud version 1 must move active:prod"
+        # The TTL right after the cache entry is written: an entry set without one lives forever if the process dies before a second command.
+        key, ttls = "mread:fraud:1:prod", []
+
+        def watch():
+            ttl = ctx.redis.ttl(key)
+            if ttl == -2:
+                ctx.redis_after(key, watch)  # only read so far: wait for the write
+            else:
+                ttls.append(ttl)
+
+        ctx.redis_after(key, watch)
         after = (await _get(c, "fraud", 1)).json()
     assert after.get("pools") == ["prod"] and after.get("stage") == "promoted", f"right after the promotion the read answers pools {after.get('pools')} and stage {after.get('stage')}: the cache hides the promotion. Key it on the pools"
+    assert ttls, f"the read after the promotion never cached its body under {key}"
+    assert 0 < ttls[0] <= 5, f"{key} was written with TTL {ttls[0]}: the entry must carry READ_TTL_S = 5 from the command that writes it"
     for key in ctx.redis.keys("mread:*"):
         ttl = ctx.redis.ttl(key)
         assert 0 < ttl <= 5, f"{key} lives {ttl} s: a cached read must expire within READ_TTL_S = 5"
@@ -755,7 +778,7 @@ async def check_fresh_promotion(ctx):
   await store.registerVersion('t1', 'fraud', 'sha256:a1', 'r-1', 'e-1');
   await store.registerVersion('t1', 'fraud', 'sha256:a2', 'r-2', 'e-2');
   await store.registerVersion('t1', 'embed', 'sha256:e1', 'r-e', 'e-embed');
-  return {c: ctx.client(m.app), pointer};
+  return {c: ctx.client(m.app), pointer, store};
 }
 
 const get = (c, name: string, version: number, tenant = 't1') =>
@@ -776,15 +799,19 @@ export async function check_route_read(ctx) {
 }
 
 export async function check_eval_always(ctx) {
-  const {c} = await api(ctx);
+  const {c, store} = await api(ctx);
+  await store.addEval('e-3', 'fraud', 'sha256:a3', 0.85, 0.85, 'precision 0.85 on holdout-2026-10');
+  await store.registerVersion('t1', 'fraud', 'sha256:a3', 'r-3', 'e-3');
   const failed = (await get(c, 'fraud', 2)).json().eval_record;
   const passed = (await get(c, 'fraud', 1)).json().eval_record;
+  const level = (await get(c, 'fraud', 3)).json().eval_record;
   assert.deepStrictEqual(failed, {eval_id: 'e-2', score: 0.71, threshold: 0.8, passed: false}, \`fraud version 2 failed its eval (0.71 against 0.8) and the read carries eval_record \${JSON.stringify(failed)}: a failed gate must read as failed, with its threshold\`);
   assert.deepStrictEqual(passed, {eval_id: 'e-1', score: 0.91, threshold: 0.85, passed: true}, \`fraud version 1 passed its eval and the read carries eval_record \${JSON.stringify(passed)}, expected score, threshold and passed\`);
+  assert.deepStrictEqual(level, {eval_id: 'e-3', score: 0.85, threshold: 0.85, passed: true}, \`fraud version 3 scored exactly its threshold (0.85 against 0.85) and the read carries eval_record \${JSON.stringify(level)}: a score that meets the bar passes\`);
 }
 
 export async function check_tenant_404(ctx) {
-  const {c} = await api(ctx);
+  const {c, store} = await api(ctx);
   const own = await get(c, 'fraud', 1);
   assert.equal(own.status, 200, \`the owner's read answered \${own.status}: \${own.text}\`);
   const foreign = await get(c, 'fraud', 1, 't2');
@@ -794,6 +821,11 @@ export async function check_tenant_404(ctx) {
   assert.equal(nothing.status, 404, \`a model that does not exist answered \${nothing.status}\`);
   const pub = await get(c, 'embed', 1, 't2');
   assert(pub.status === 200 && pub.json().name === 'embed', \`a public model must be readable by every tenant, t2 got \${pub.status} \${pub.text}\`);
+  await store.createModel('ranker', 't1', 'internal');
+  await store.addEval('e-rank', 'ranker', 'sha256:r1', 0.9, 0.8, 'ndcg 0.9');
+  await store.registerVersion('t1', 'ranker', 'sha256:r1', 'r-rank', 'e-rank');
+  const internal = await get(c, 'ranker', 1, 't2');
+  assert.equal(internal.status, 404, \`tenant t2 read t1's model ranker, visibility internal, and got \${internal.status}: only a public model is readable by another tenant\`);
 }
 
 export async function check_fresh_promotion(ctx) {
@@ -801,8 +833,19 @@ export async function check_fresh_promotion(ctx) {
   const before = (await get(c, 'fraud', 1)).json();
   assert.deepEqual(before.pools, [], \`before the promotion the read says pools \${JSON.stringify(before.pools)}\`);
   assert.equal(await pointer.promote('fraud', 1, 'prod', 'e-1'), true, 'the promotion of fraud version 1 must move active:prod');
+  // The TTL right after the cache entry is written: an entry set without one lives forever if the process dies before a second command.
+  const entry = 'mread:fraud:1:prod';
+  const ttls: number[] = [];
+  const watch = () => {
+    const ttl = ctx.redis.ttl(entry);
+    if (ttl === -2) ctx.redisAfter(entry, watch); // only read so far: wait for the write
+    else ttls.push(ttl);
+  };
+  ctx.redisAfter(entry, watch);
   const after = (await get(c, 'fraud', 1)).json();
   assert(JSON.stringify(after.pools) === '["prod"]' && after.stage === 'promoted', \`right after the promotion the read answers pools \${JSON.stringify(after.pools)} and stage \${after.stage}: the cache hides the promotion. Key it on the pools\`);
+  assert(ttls.length > 0, \`the read after the promotion never cached its body under \${entry}\`);
+  assert(0 < ttls[0] && ttls[0] <= 5, \`\${entry} was written with TTL \${ttls[0]}: the entry must carry READ_TTL_S = 5 from the command that writes it\`);
   for (const key of ctx.redis.keys('mread:*')) {
     const ttl = ctx.redis.ttl(key);
     assert(0 < ttl && ttl <= 5, \`\${key} lives \${ttl} s: a cached read must expire within READ_TTL_S = 5\`);
@@ -821,23 +864,23 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hBg = context.Background()
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
-	store.CreateModel(readBg, "fraud", "t1", "private")
-	store.CreateModel(readBg, "embed", "t1", "public")
-	store.AddEval(readBg, "e-1", "fraud", "sha256:a1", 0.91, 0.85, "precision 0.91 on holdout-2026-10")
-	store.AddEval(readBg, "e-2", "fraud", "sha256:a2", 0.71, 0.8, "precision 0.71 on holdout-2026-10")
-	store.AddEval(readBg, "e-embed", "embed", "sha256:e1", 0.95, 0.9, "recall@10 0.95")
-	store.RegisterVersion(readBg, "t1", "fraud", "sha256:a1", "r-1", "e-1")
-	store.RegisterVersion(readBg, "t1", "fraud", "sha256:a2", "r-2", "e-2")
-	store.RegisterVersion(readBg, "t1", "embed", "sha256:e1", "r-e", "e-embed")
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
+	store.CreateModel(hBg, "fraud", "t1", "private")
+	store.CreateModel(hBg, "embed", "t1", "public")
+	store.AddEval(hBg, "e-1", "fraud", "sha256:a1", 0.91, 0.85, "precision 0.91 on holdout-2026-10")
+	store.AddEval(hBg, "e-2", "fraud", "sha256:a2", 0.71, 0.8, "precision 0.71 on holdout-2026-10")
+	store.AddEval(hBg, "e-embed", "embed", "sha256:e1", 0.95, 0.9, "recall@10 0.95")
+	store.RegisterVersion(hBg, "t1", "fraud", "sha256:a1", "r-1", "e-1")
+	store.RegisterVersion(hBg, "t1", "fraud", "sha256:a2", "r-2", "e-2")
+	store.RegisterVersion(hBg, "t1", "embed", "sha256:e1", "r-e", "e-embed")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-type versionView struct {
+type hVersionView struct {
 	Name           string         \`json:"name"\`
 	Version        int            \`json:"version"\`
 	ArtifactDigest string         \`json:"artifact_digest"\`
@@ -846,14 +889,14 @@ type versionView struct {
 	EvalRecord     map[string]any \`json:"eval_record"\`
 }
 
-func read(c *harness.HTTP, name, version, tenant string) (*harness.Response, versionView) {
+func hRead(c *harness.HTTP, name, version, tenant string) (*harness.Response, hVersionView) {
 	var r *harness.Response
 	if tenant == "" {
 		r = c.Get("/v1/models/" + name + "/versions/" + version)
 	} else {
 		r = c.Get("/v1/models/"+name+"/versions/"+version, "X-Tenant-Id", tenant)
 	}
-	var v versionView
+	var v hVersionView
 	if r.Status == 200 {
 		r.Decode(&v)
 	}
@@ -861,46 +904,70 @@ func read(c *harness.HTTP, name, version, tenant string) (*harness.Response, ver
 }
 
 func CheckRouteRead(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	r, v := read(c, "fraud", "1", "t1")
+	c := hReadAPI(ctx)
+	r, v := hRead(c, "fraud", "1", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/models/fraud/versions/1 (%s)", r.Text())
 	ctx.Assert(v.Name == "fraud" && v.Version == 1 && v.ArtifactDigest == "sha256:a1" && v.Stage == "staged", "the read answered %s", r.Text())
 	ctx.Equal(len(v.Pools), 0, "fraud version 1 serves no pool yet; the pools in %s", r.Text())
 	ctx.Equal(v.EvalRecord["eval_id"], "e-1", "the read must carry the eval record e-1 (%s)", r.Text())
-	missing, _ := read(c, "fraud", "9", "t1")
+	missing, _ := hRead(c, "fraud", "9", "t1")
 	ctx.Equal(missing.Status, 404, "a version that does not exist")
-	anonymous, _ := read(c, "fraud", "1", "")
+	anonymous, _ := hRead(c, "fraud", "1", "")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckEvalAlways(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	_, failed := read(c, "fraud", "2", "t1")
-	_, passed := read(c, "fraud", "1", "t1")
+	c := hReadAPI(ctx)
+	store.AddEval(hBg, "e-3", "fraud", "sha256:a3", 0.85, 0.85, "precision 0.85 on holdout-2026-10")
+	store.RegisterVersion(hBg, "t1", "fraud", "sha256:a3", "r-3", "e-3")
+	_, failed := hRead(c, "fraud", "2", "t1")
+	_, passed := hRead(c, "fraud", "1", "t1")
+	_, level := hRead(c, "fraud", "3", "t1")
 	ctx.Equal(failed.EvalRecord, map[string]any{"eval_id": "e-2", "score": 0.71, "threshold": 0.8, "passed": false}, "fraud version 2 failed its eval (0.71 against 0.8): a failed gate must read as failed, with its threshold; eval_record")
 	ctx.Equal(passed.EvalRecord, map[string]any{"eval_id": "e-1", "score": 0.91, "threshold": 0.85, "passed": true}, "fraud version 1 passed its eval; eval_record")
+	ctx.Equal(level.EvalRecord, map[string]any{"eval_id": "e-3", "score": 0.85, "threshold": 0.85, "passed": true}, "fraud version 3 scored exactly its threshold (0.85 against 0.85): a score that meets the bar passes; eval_record")
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	own, _ := read(c, "fraud", "1", "t1")
+	c := hReadAPI(ctx)
+	own, _ := hRead(c, "fraud", "1", "t1")
 	ctx.Equal(own.Status, 200, "the owner's read (%s)", own.Text())
-	foreign, _ := read(c, "fraud", "1", "t2")
+	foreign, _ := hRead(c, "fraud", "1", "t2")
 	ctx.Equal(foreign.Status, 404, "tenant t2 read t1's private model (%s): it must be a 404, like a missing model", foreign.Text())
-	nothing, _ := read(c, "nosuch", "1", "t2")
+	nothing, _ := hRead(c, "nosuch", "1", "t2")
 	ctx.Equal(nothing.Status, 404, "a model that does not exist")
-	public, v := read(c, "embed", "1", "t2")
+	public, v := hRead(c, "embed", "1", "t2")
 	ctx.Assert(public.Status == 200 && v.Name == "embed", "a public model must be readable by every tenant, t2 got %d %s", public.Status, public.Text())
+	store.CreateModel(hBg, "ranker", "t1", "internal")
+	store.AddEval(hBg, "e-rank", "ranker", "sha256:r1", 0.9, 0.8, "ndcg 0.9")
+	store.RegisterVersion(hBg, "t1", "ranker", "sha256:r1", "r-rank", "e-rank")
+	internal, _ := hRead(c, "ranker", "1", "t2")
+	ctx.Equal(internal.Status, 404, "tenant t2 read t1's model ranker, visibility internal (%s): only a public model is readable by another tenant", internal.Text())
 }
 
 func CheckFreshPromotion(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	_, before := read(c, "fraud", "1", "t1")
+	c := hReadAPI(ctx)
+	_, before := hRead(c, "fraud", "1", "t1")
 	ctx.Equal(len(before.Pools), 0, "before the promotion; the pools")
-	moved, err := pointer.Promote(readBg, "fraud", 1, "prod", "e-1")
+	moved, err := pointer.Promote(hBg, "fraud", 1, "prod", "e-1")
 	ctx.Assert(err == nil && moved, "the promotion of fraud version 1 must move active:prod (%v)", err)
-	r, after := read(c, "fraud", "1", "t1")
+	// The TTL right after the cache entry is written: an entry set without one lives forever if the process dies before a second command.
+	const entry = "mread:fraud:1:prod"
+	var ttls []int64
+	var watch func() any
+	watch = func() any {
+		if ttl := ctx.Redis.TTL(entry); ttl == -2 {
+			ctx.Redis.After(entry, watch) // only read so far: wait for the write
+		} else {
+			ttls = append(ttls, ttl)
+		}
+		return nil
+	}
+	ctx.Redis.After(entry, watch)
+	r, after := hRead(c, "fraud", "1", "t1")
 	ctx.Assert(len(after.Pools) == 1 && after.Pools[0] == "prod" && after.Stage == "promoted", "right after the promotion the read answers %s: the cache hides the promotion. Key it on the pools", r.Text())
+	ctx.Assert(len(ttls) > 0, "the read after the promotion never cached its body under %s", entry)
+	ctx.Assert(len(ttls) > 0 && 0 < ttls[0] && ttls[0] <= 5, "%s was written with TTL %v: the entry must carry a 5 s TTL from the command that writes it", entry, ttls)
 	for _, key := range ctx.Redis.Keys("mread:*") {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(0 < ttl && ttl <= 5, "%s lives %d s: a cached read must expire within 5 s", key, ttl)
@@ -909,11 +976,13 @@ func CheckFreshPromotion(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace {
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   store::createModel("fraud", "t1");
   store::createModel("embed", "t1", "public");
   store::addEval("e-1", "fraud", "sha256:a1", 0.91, 0.85, "precision 0.91 on holdout-2026-10");
@@ -929,12 +998,12 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response get(harness::HTTP& c, const std::string& name, long version, const std::string& tenant = "t1") {
+harness::Response hGet(harness::HTTP& c, const std::string& name, long version, const std::string& tenant = "t1") {
   const std::string path = "/v1/models/" + name + "/versions/" + std::to_string(version);
   return tenant.empty() ? c.Get(path) : c.Get(path, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json body(const harness::Response& r) {
+nlohmann::json hBody(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
@@ -942,47 +1011,72 @@ nlohmann::json body(const harness::Response& r) {
 }  // namespace
 
 void CheckRouteRead(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto r = get(c, "fraud", 1);
+  auto c = hReadApi(ctx);
+  const auto r = hGet(c, "fraud", 1);
   ctx.Equal(r.Status, 200, "GET /v1/models/fraud/versions/1 (%s)", r.Text());
-  const auto b = body(r);
+  const auto b = hBody(r);
   ctx.Assert(b.value("name", "") == "fraud" && b.value("version", 0L) == 1 && b.value("artifact_digest", "") == "sha256:a1" && b.value("stage", "") == "staged",
              "the read answered %s", r.Text());
   ctx.Equal(b.value("pools", nlohmann::json::array()), nlohmann::json::array(), "fraud version 1 serves no pool yet; the pools");
   ctx.Assert(b.contains("eval_record") && b["eval_record"].is_object() && b["eval_record"].value("eval_id", "") == "e-1", "the read must carry the eval record e-1, got %s", r.Text());
-  ctx.Equal(get(c, "fraud", 9).Status, 404, "a version that does not exist");
-  ctx.Equal(get(c, "fraud", 1, "").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(hGet(c, "fraud", 9).Status, 404, "a version that does not exist");
+  ctx.Equal(hGet(c, "fraud", 1, "").Status, 401, "a read without X-Tenant-Id");
 }
 
 void CheckEvalAlways(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto failed = body(get(c, "fraud", 2)).value("eval_record", nlohmann::json());
-  const auto passed = body(get(c, "fraud", 1)).value("eval_record", nlohmann::json());
+  auto c = hReadApi(ctx);
+  store::addEval("e-3", "fraud", "sha256:a3", 0.85, 0.85, "precision 0.85 on holdout-2026-10");
+  store::registerVersion("t1", "fraud", "sha256:a3", "r-3", "e-3");
+  const auto failed = hBody(hGet(c, "fraud", 2)).value("eval_record", nlohmann::json());
+  const auto passed = hBody(hGet(c, "fraud", 1)).value("eval_record", nlohmann::json());
+  const auto level = hBody(hGet(c, "fraud", 3)).value("eval_record", nlohmann::json());
   ctx.Equal(failed, nlohmann::json{{"eval_id", "e-2"}, {"score", 0.71}, {"threshold", 0.8}, {"passed", false}},
             "fraud version 2 failed its eval (0.71 against 0.8): a failed gate must read as failed, with its threshold; eval_record");
   ctx.Equal(passed, nlohmann::json{{"eval_id", "e-1"}, {"score", 0.91}, {"threshold", 0.85}, {"passed", true}}, "fraud version 1 passed its eval; eval_record");
+  ctx.Equal(level, nlohmann::json{{"eval_id", "e-3"}, {"score", 0.85}, {"threshold", 0.85}, {"passed", true}},
+            "fraud version 3 scored exactly its threshold (0.85 against 0.85): a score that meets the bar passes; eval_record");
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto own = get(c, "fraud", 1);
+  auto c = hReadApi(ctx);
+  const auto own = hGet(c, "fraud", 1);
   ctx.Equal(own.Status, 200, "the owner's read (%s)", own.Text());
-  const auto foreign = get(c, "fraud", 1, "t2");
+  const auto foreign = hGet(c, "fraud", 1, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 read t1's private model (%s): it must be a 404, like a missing model", foreign.Text());
   ctx.Assert(foreign.Text().find("sha256:a1") == std::string::npos, "the refusal leaks the version: %s", foreign.Text());
-  ctx.Equal(get(c, "nosuch", 1, "t2").Status, 404, "a model that does not exist");
-  const auto pub = get(c, "embed", 1, "t2");
-  ctx.Assert(pub.Status == 200 && body(pub).value("name", "") == "embed", "a public model must be readable by every tenant, t2 got %d %s", pub.Status, pub.Text());
+  ctx.Equal(hGet(c, "nosuch", 1, "t2").Status, 404, "a model that does not exist");
+  const auto pub = hGet(c, "embed", 1, "t2");
+  ctx.Assert(pub.Status == 200 && hBody(pub).value("name", "") == "embed", "a public model must be readable by every tenant, t2 got %d %s", pub.Status, pub.Text());
+  store::createModel("ranker", "t1", "internal");
+  store::addEval("e-rank", "ranker", "sha256:r1", 0.9, 0.8, "ndcg 0.9");
+  store::registerVersion("t1", "ranker", "sha256:r1", "r-rank", "e-rank");
+  const auto internal = hGet(c, "ranker", 1, "t2");
+  ctx.Equal(internal.Status, 404, "tenant t2 read t1's model ranker, visibility internal (%s): only a public model is readable by another tenant", internal.Text());
 }
 
 void CheckFreshPromotion(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  ctx.Equal(body(get(c, "fraud", 1)).value("pools", nlohmann::json::array()), nlohmann::json::array(), "before the promotion; the pools");
+  auto c = hReadApi(ctx);
+  ctx.Equal(hBody(hGet(c, "fraud", 1)).value("pools", nlohmann::json::array()), nlohmann::json::array(), "before the promotion; the pools");
   ctx.Equal(pointer::promote("fraud", 1, "prod", "e-1"), true, "the promotion of fraud version 1 must move active:prod; moved");
-  const auto r = get(c, "fraud", 1);
-  const auto after = body(r);
+  // The TTL right after the cache entry is written: an entry set without one lives forever if the process dies before a second command.
+  const std::string entry = "mread:fraud:1:prod";
+  std::vector<long long> ttls;
+  std::function<void()> watch = [&] {
+    const long long ttl = ctx.Redis.TTL(entry);
+    if (ttl == -2) {
+      ctx.Redis.After(entry, watch);  // only read so far: wait for the write
+    } else {
+      ttls.push_back(ttl);
+    }
+  };
+  ctx.Redis.After(entry, watch);
+  const auto r = hGet(c, "fraud", 1);
+  const auto after = hBody(r);
   ctx.Assert(after.value("pools", nlohmann::json::array()) == nlohmann::json::array({"prod"}) && after.value("stage", "") == "promoted",
              "right after the promotion the read answers %s: the cache hides the promotion. Key it on the pools", r.Text());
+  ctx.Assert(!ttls.empty(), "the read after the promotion never cached its body under %s", entry);
+  const long long written = ttls.empty() ? -2 : ttls.front();
+  ctx.Assert(0 < written && written <= 5, "%s was written with TTL %d: the entry must carry kReadTtl = 5 s from the command that writes it", entry, written);
   for (const auto& key : ctx.Redis.Keys("mread:*")) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(0 < ttl && ttl <= 5, "%s lives %d s: a cached read must expire within kReadTtl = 5 s", key, ttl);

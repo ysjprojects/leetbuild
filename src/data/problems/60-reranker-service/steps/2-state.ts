@@ -68,7 +68,7 @@ new model build serves the old build's numbers for as long as Redis keeps them, 
       id: 'score-ttl',
       title: 'Writes every score with a 30-minute TTL',
       detail:
-        'Each entry expires 1800 seconds after it is written (`SCORE_TTL_S`), so a cached number cannot outlive the build that produced it by more than half an hour. The starter writes with no expiry.',
+        'Each entry expires 1800 seconds after it is written (`SCORE_TTL_S`), and carries that TTL from the moment it exists, so a cached number cannot outlive the build that produced it by more than half an hour. The starter writes with no expiry.',
       match: {
         python: {all: [/SCORE_TTL_S/, /\bex\s*=\s*\w+|setex\(/]},
         typescript: {all: [/SCORE_TTL_S/, /['"]EX['"]|setex\(/]},
@@ -94,7 +94,7 @@ new model build serves the old build's numbers for as long as Redis keeps them, 
       id: 'misses-only',
       title: 'Scores exactly the passages that missed, in one call',
       detail:
-        'With one of three passages already cached, `compute` runs once with the other two in request order, and the cached score comes back untouched in its place. The starter calls the model once per miss.',
+        'With two of four passages already cached, one of them at a score of 0, `compute` runs once with the other two in request order, and the cached scores come back untouched in their places, their expiry untouched too. The starter calls the model once per miss.',
       match: {
         python: {all: [/\bmissing\b/], none: [/compute\(\s*\[\s*passage\s*\]\s*\)/]},
         typescript: {all: [/\bmissing\b/], none: [/compute\(\s*\[\s*passage\s*\]\s*\)/]},
@@ -490,6 +490,7 @@ V = "xenc-v7"
 P1 = "solar panel guide"
 P2 = "efficiency of panels"
 P3 = "solar efficiency panel tips"
+P4 = "wind farm permits"
 
 
 class Model:
@@ -540,12 +541,21 @@ def check_version_in_key(ctx):
 
 def check_score_ttl(ctx):
     m = ctx.load("state")
+    first = _key(Q1, P1)
+    written = {}
+
+    def arm():
+        # The lookup touches the key first; the next command touching it is the write.
+        ctx.redis_after(first, lambda: written.setdefault("ttl", ctx.redis.ttl(first)))
+
+    ctx.redis_after(first, arm)
     m.cached_scores(Q1, [P1, P2], V, Model(Q1))
     keys = sorted(ctx.redis.keys("rerank:score:*"))
     assert len(keys) == 2, f"two scored passages must leave two entries, Redis holds {keys}"
     for key in keys:
         ttl = ctx.redis.ttl(key)
         assert 1790 <= ttl <= 1800, f"{key} has TTL {ttl}: every score expires 30 minutes (1800 s) after it is written, so an old build's number cannot outlive it"
+    assert 1790 <= written.get("ttl", -2) <= 1800, f"right after the command that wrote {first}, its TTL was {written.get('ttl')}: the entry must be written with its TTL in the same command, or a crash before the EXPIRE leaves it forever"
 
 
 def check_one_mget(ctx):
@@ -570,11 +580,15 @@ def check_one_mget(ctx):
 
 def check_misses_only(ctx):
     m = ctx.load("state")
-    ctx.redis.set(_key(Q1, P2), "0.42", ex=1800)  # another replica scored P2 a minute ago
+    ctx.redis.set(_key(Q1, P2), "0.42", ex=600)  # another replica scored P2 twenty minutes ago
+    ctx.redis.set(_key(Q1, P4), "0", ex=600)  # and found P4 unrelated: a cached 0 is a hit
     asked = Model(Q1)
-    got = m.cached_scores(Q1, [P1, P2, P3], V, asked)
-    assert asked.calls == [[P1, P3]], f"with P2 cached the model must be asked once for [P1, P3] in order, it was asked {asked.calls}"
-    assert _close(got, [model.score(Q1, P1), 0.42, model.score(Q1, P3)]), f"the scores must be P1's, the cached 0.42, P3's, in passage order, got {got}"
+    got = m.cached_scores(Q1, [P1, P2, P3, P4], V, asked)
+    assert asked.calls == [[P1, P3]], f"with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order, it was asked {asked.calls}"
+    assert _close(got, [model.score(Q1, P1), 0.42, model.score(Q1, P3), 0.0]), f"the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got {got}"
+    for p in (P2, P4):
+        ttl = ctx.redis.ttl(_key(Q1, p))
+        assert 0 < ttl <= 600, f"a cached entry with 600 s left has TTL {ttl} after the lookup: only fresh scores are written, a hit keeps the expiry it was written with"
 `,
     typescript: `const Q1 = 'solar panel efficiency';
 const Q2 = 'wind turbine noise';
@@ -582,6 +596,7 @@ const V = 'xenc-v7';
 const P1 = 'solar panel guide';
 const P2 = 'efficiency of panels';
 const P3 = 'solar efficiency panel tips';
+const P4 = 'wind farm permits';
 
 function world(ctx) {
   return {m: ctx.load('state'), model: ctx.load('/support/rerank/model.ts'), config: ctx.load('/support/rerank/config.ts')};
@@ -625,7 +640,11 @@ export async function check_version_in_key(ctx) {
 }
 
 export async function check_score_ttl(ctx) {
-  const {m, model} = world(ctx);
+  const {m, model, config} = world(ctx);
+  const first = key(config, Q1, P1);
+  let written: number | undefined;
+  // The lookup touches the key first; the next command touching it is the write.
+  ctx.redisAfter(first, () => ctx.redisAfter(first, () => (written = ctx.redis.ttl(first))));
   await m.cachedScores(Q1, [P1, P2], V, counting(model, Q1).compute);
   const keys = ctx.redis.keys('rerank:score:*');
   assert.equal(keys.length, 2, \`two scored passages must leave two entries, Redis holds \${JSON.stringify(keys)}\`);
@@ -633,6 +652,7 @@ export async function check_score_ttl(ctx) {
     const ttl = ctx.redis.ttl(k);
     assert(ttl >= 1790 && ttl <= 1800, \`\${k} has TTL \${ttl}: every score expires 30 minutes (1800 s) after it is written, so an old build's number cannot outlive it\`);
   }
+  assert(written !== undefined && written >= 1790 && written <= 1800, \`right after the command that wrote \${first}, its TTL was \${written}: the entry must be written with its TTL in the same command, or a crash before the EXPIRE leaves it forever\`);
 }
 
 export async function check_one_mget(ctx) {
@@ -649,11 +669,16 @@ export async function check_one_mget(ctx) {
 
 export async function check_misses_only(ctx) {
   const {m, model, config} = world(ctx);
-  ctx.redis.set(key(config, Q1, P2), '0.42', 'EX', 1800); // another replica scored P2 a minute ago
+  ctx.redis.set(key(config, Q1, P2), '0.42', 'EX', 600); // another replica scored P2 twenty minutes ago
+  ctx.redis.set(key(config, Q1, P4), '0', 'EX', 600); // and found P4 unrelated: a cached 0 is a hit
   const asked = counting(model, Q1);
-  const got = await m.cachedScores(Q1, [P1, P2, P3], V, asked.compute);
-  assert.deepEqual(asked.calls, [[P1, P3]], \`with P2 cached the model must be asked once for [P1, P3] in order, it was asked \${JSON.stringify(asked.calls)}\`);
-  assert(close(got, [model.score(Q1, P1), 0.42, model.score(Q1, P3)]), \`the scores must be P1's, the cached 0.42, P3's, in passage order, got \${JSON.stringify(got)}\`);
+  const got = await m.cachedScores(Q1, [P1, P2, P3, P4], V, asked.compute);
+  assert.deepEqual(asked.calls, [[P1, P3]], \`with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order, it was asked \${JSON.stringify(asked.calls)}\`);
+  assert(close(got, [model.score(Q1, P1), 0.42, model.score(Q1, P3), 0]), \`the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got \${JSON.stringify(got)}\`);
+  for (const p of [P2, P4]) {
+    const ttl = ctx.redis.ttl(key(config, Q1, p));
+    assert(ttl > 0 && ttl <= 600, \`a cached entry with 600 s left has TTL \${ttl} after the lookup: only fresh scores are written, a hit keeps the expiry it was written with\`);
+  }
 }
 `,
     go: `package main
@@ -675,6 +700,7 @@ const (
 	stateP1 = "solar panel guide"
 	stateP2 = "efficiency of panels"
 	stateP3 = "solar efficiency panel tips"
+	stateP4 = "wind farm permits"
 )
 
 // stateModel is the compute the service hands in: the stand-in model for one query, counting what it was asked.
@@ -740,6 +766,15 @@ func CheckVersionInKey(ctx *harness.Ctx) {
 }
 
 func CheckScoreTtl(ctx *harness.Ctx) {
+	first := stateKey(stateQ1, stateP1, stateV)
+	written := int64(-3)
+	// The lookup touches the key first; the next command touching it is the write.
+	ctx.Redis.After(first, func() any {
+		return ctx.Redis.After(first, func() any {
+			written = int64(ctx.Redis.TTL(first))
+			return nil
+		})
+	})
 	stateLookup(ctx, stateQ1, []string{stateP1, stateP2}, stateV, &stateModel{query: stateQ1, scale: 1})
 	keys := ctx.Redis.Keys("rerank:score:*")
 	ctx.Equal(len(keys), 2, "two scored passages must leave two entries (%v); the entries", keys)
@@ -747,6 +782,7 @@ func CheckScoreTtl(ctx *harness.Ctx) {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 1790 && ttl <= 1800, "%s has TTL %d: every score expires 30 minutes (1800 s) after it is written, so an old build's number cannot outlive it", key, ttl)
 	}
+	ctx.Assert(written >= 1790 && written <= 1800, "right after the command that wrote %s, its TTL was %d: the entry must be written with its TTL in the same command, or a crash before the EXPIRE leaves it forever", first, written)
 }
 
 func CheckOneMget(ctx *harness.Ctx) {
@@ -762,11 +798,16 @@ func CheckOneMget(ctx *harness.Ctx) {
 }
 
 func CheckMissesOnly(ctx *harness.Ctx) {
-	ctx.Redis.Set(stateKey(stateQ1, stateP2, stateV), "0.42", "EX", 1800) // another replica scored P2 a minute ago
+	ctx.Redis.Set(stateKey(stateQ1, stateP2, stateV), "0.42", "EX", 600) // another replica scored P2 twenty minutes ago
+	ctx.Redis.Set(stateKey(stateQ1, stateP4, stateV), "0", "EX", 600)    // and found P4 unrelated: a cached 0 is a hit
 	asked := &stateModel{query: stateQ1, scale: 1}
-	got := stateLookup(ctx, stateQ1, []string{stateP1, stateP2, stateP3}, stateV, asked)
-	ctx.Equal(asked.calls, [][]string{{stateP1, stateP3}}, "with P2 cached the model must be asked once for [P1, P3] in order; the model calls")
-	ctx.Assert(stateClose(got, []float64{model.Score(stateQ1, stateP1), 0.42, model.Score(stateQ1, stateP3)}), "the scores must be P1's, the cached 0.42, P3's, in passage order, got %v", got)
+	got := stateLookup(ctx, stateQ1, []string{stateP1, stateP2, stateP3, stateP4}, stateV, asked)
+	ctx.Equal(asked.calls, [][]string{{stateP1, stateP3}}, "with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order; the model calls")
+	ctx.Assert(stateClose(got, []float64{model.Score(stateQ1, stateP1), 0.42, model.Score(stateQ1, stateP3), 0}), "the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got %v", got)
+	for _, p := range []string{stateP2, stateP4} {
+		ttl := ctx.Redis.TTL(stateKey(stateQ1, p, stateV))
+		ctx.Assert(ttl > 0 && ttl <= 600, "a cached entry with 600 s left has TTL %d after the lookup: only fresh scores are written, a hit keeps the expiry it was written with", ttl)
+	}
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -786,6 +827,7 @@ const std::string kV = "xenc-v7";
 const std::string kP1 = "solar panel guide";
 const std::string kP2 = "efficiency of panels";
 const std::string kP3 = "solar efficiency panel tips";
+const std::string kP4 = "wind farm permits";
 
 // The compute the service hands in: the stand-in model for one query, counting what it was asked.
 struct Counting {
@@ -803,11 +845,11 @@ struct Counting {
   }
 };
 
-std::string key(const std::string& query, const std::string& passage, const std::string& version) {
+std::string hKey(const std::string& query, const std::string& passage, const std::string& version) {
   return "rerank:score:" + config::fingerprint(query) + ":" + config::fingerprint(passage) + ":" + version;
 }
 
-bool close(const std::vector<double>& got, const std::vector<double>& want) {
+bool hClose(const std::vector<double>& got, const std::vector<double>& want) {
   if (got.size() != want.size()) return false;
   for (size_t i = 0; i < got.size(); i++) {
     if (std::fabs(got[i] - want[i]) > 1e-5) return false;
@@ -820,13 +862,13 @@ bool close(const std::vector<double>& got, const std::vector<double>& want) {
 void CheckPairKey(harness::Ctx& ctx) {
   Counting first{kQ1};
   const auto a = cachedScores(kQ1, {kP1}, kV, first.fn());
-  ctx.Assert(close(a, {model::score(kQ1, kP1)}), "the first lookup must answer the model's score, got %v", a);
+  ctx.Assert(hClose(a, {model::score(kQ1, kP1)}), "the first lookup must answer the model's score, got %v", a);
   Counting other{kQ2};
   const auto b = cachedScores(kQ2, {kP1}, kV, other.fn());
   ctx.Equal(other.calls, std::vector<std::vector<std::string>>{{kP1}}, "a second query over the same passage must be scored for itself (the key must name the query too); the model calls");
-  ctx.Assert(close(b, {model::score(kQ2, kP1)}), "the second query must get its own score, got %v", b);
+  ctx.Assert(hClose(b, {model::score(kQ2, kP1)}), "the second query must get its own score, got %v", b);
   for (const auto& q : {kQ1, kQ2}) {
-    ctx.Equal(ctx.Redis.Exists(key(q, kP1, kV)), 1, "an entry at %s (rerank:score:{fingerprint(query)}:{fingerprint(passage)}:{model_version}); Redis holds %v", key(q, kP1, kV), ctx.Redis.Keys("rerank:score:*"));
+    ctx.Equal(ctx.Redis.Exists(hKey(q, kP1, kV)), 1, "an entry at %s (rerank:score:{fingerprint(query)}:{fingerprint(passage)}:{model_version}); Redis holds %v", hKey(q, kP1, kV), ctx.Redis.Keys("rerank:score:*"));
   }
 }
 
@@ -836,14 +878,18 @@ void CheckVersionInKey(harness::Ctx& ctx) {
   Counting rebuilt{kQ1, 0.5};
   const auto got = cachedScores(kQ1, {kP1}, "xenc-v8", rebuilt.fn());
   ctx.Equal(rebuilt.calls, std::vector<std::vector<std::string>>{{kP1}}, "the next model build must be asked (a new model_version is a new key); the model calls");
-  ctx.Assert(close(got, {model::score(kQ1, kP1) * 0.5}), "under xenc-v8 the pair must get the new build's score, got %v", got);
-  ctx.Equal(ctx.Redis.Exists(key(kQ1, kP1, "xenc-v8")), 1, "an entry at %s", key(kQ1, kP1, "xenc-v8"));
+  ctx.Assert(hClose(got, {model::score(kQ1, kP1) * 0.5}), "under xenc-v8 the pair must get the new build's score, got %v", got);
+  ctx.Equal(ctx.Redis.Exists(hKey(kQ1, kP1, "xenc-v8")), 1, "an entry at %s", hKey(kQ1, kP1, "xenc-v8"));
   Counting old{kQ1};
   const auto again = cachedScores(kQ1, {kP1}, "xenc-v7", old.fn());
-  ctx.Assert(old.calls.empty() && close(again, {model::score(kQ1, kP1)}), "xenc-v7's entry must still answer for xenc-v7, got %v after %d model calls", again, old.calls.size());
+  ctx.Assert(old.calls.empty() && hClose(again, {model::score(kQ1, kP1)}), "xenc-v7's entry must still answer for xenc-v7, got %v after %d model calls", again, old.calls.size());
 }
 
 void CheckScoreTtl(harness::Ctx& ctx) {
+  const std::string first = hKey(kQ1, kP1, kV);
+  long long written = -3;
+  // The lookup touches the key first; the next command touching it is the write.
+  ctx.Redis.After(first, [&ctx, &written, first] { ctx.Redis.After(first, [&ctx, &written, first] { written = ctx.Redis.TTL(first); }); });
   Counting seed{kQ1};
   cachedScores(kQ1, {kP1, kP2}, kV, seed.fn());
   const auto keys = ctx.Redis.Keys("rerank:score:*");
@@ -852,6 +898,7 @@ void CheckScoreTtl(harness::Ctx& ctx) {
     const long long ttl = ctx.Redis.TTL(k);
     ctx.Assert(ttl >= 1790 && ttl <= 1800, "%s has TTL %d: every score expires 30 minutes (1800 s) after it is written, so an old build's number cannot outlive it", k, ttl);
   }
+  ctx.Assert(written >= 1790 && written <= 1800, "right after the command that wrote %s, its TTL was %d: the entry must be written with its TTL in the same command, or a crash before the EXPIRE leaves it forever", first, written);
 }
 
 void CheckOneMget(harness::Ctx& ctx) {
@@ -864,16 +911,21 @@ void CheckOneMget(harness::Ctx& ctx) {
   const auto all = ctx.Redis.RoundTrips();
   const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
   ctx.Equal(warm.calls.size(), 0, "three cached passages must not ask the model again; the model calls");
-  ctx.Assert(close(got, {model::score(kQ1, kP1), model::score(kQ1, kP2), model::score(kQ1, kP3)}), "the cached scores came back as %v", got);
+  ctx.Assert(hClose(got, {model::score(kQ1, kP1), model::score(kQ1, kP2), model::score(kQ1, kP3)}), "the cached scores came back as %v", got);
   ctx.Equal(trips, std::vector<std::vector<std::string>>{{"MGET"}}, "a lookup of three cached passages: one MGET round trip, not a GET each; the round trips");
 }
 
 void CheckMissesOnly(harness::Ctx& ctx) {
-  ctx.Redis.Set(key(kQ1, kP2, kV), "0.42", "EX", 1800);  // another replica scored P2 a minute ago
+  ctx.Redis.Set(hKey(kQ1, kP2, kV), "0.42", "EX", 600);  // another replica scored P2 twenty minutes ago
+  ctx.Redis.Set(hKey(kQ1, kP4, kV), "0", "EX", 600);     // and found P4 unrelated: a cached 0 is a hit
   Counting asked{kQ1};
-  const auto got = cachedScores(kQ1, {kP1, kP2, kP3}, kV, asked.fn());
-  ctx.Equal(asked.calls, std::vector<std::vector<std::string>>{{kP1, kP3}}, "with P2 cached the model must be asked once for [P1, P3] in order; the model calls");
-  ctx.Assert(close(got, {model::score(kQ1, kP1), 0.42, model::score(kQ1, kP3)}), "the scores must be P1's, the cached 0.42, P3's, in passage order, got %v", got);
+  const auto got = cachedScores(kQ1, {kP1, kP2, kP3, kP4}, kV, asked.fn());
+  ctx.Equal(asked.calls, std::vector<std::vector<std::string>>{{kP1, kP3}}, "with P2 and P4 cached (P4 at 0) the model must be asked once for [P1, P3] in order; the model calls");
+  ctx.Assert(hClose(got, {model::score(kQ1, kP1), 0.42, model::score(kQ1, kP3), 0.0}), "the scores must be P1's, the cached 0.42, P3's, the cached 0, in passage order, got %v", got);
+  for (const auto& p : {kP2, kP4}) {
+    const long long ttl = ctx.Redis.TTL(hKey(kQ1, p, kV));
+    ctx.Assert(ttl > 0 && ttl <= 600, "a cached entry with 600 s left has TTL %d after the lookup: only fresh scores are written, a hit keeps the expiry it was written with", ttl);
+  }
 }
 `,
   },

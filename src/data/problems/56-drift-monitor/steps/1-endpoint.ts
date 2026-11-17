@@ -57,7 +57,7 @@ its registration gets two monitors and two pages.
       id: 'metric-window',
       title: 'Requires a tenant, a known metric and a bounded window',
       detail:
-        'A missing `X-Tenant-Id` is **401**; a metric outside `METRICS` or a `window_s` outside `MIN_WINDOW_S`..`MAX_WINDOW_S` is **400**, and none of them stores a monitor.',
+        'A missing `X-Tenant-Id` is **401**; a metric outside `METRICS` or a `window_s` outside `MIN_WINDOW_S`..`MAX_WINDOW_S` (both bounds allowed) is **400**, and none of them stores a monitor.',
       match: {
         python: {all: [/METRICS/, /MIN_WINDOW_S/, /MAX_WINDOW_S/, /\b401\b/]},
         typescript: {all: [/METRICS/, /MIN_WINDOW_S/, /MAX_WINDOW_S/, /\b401\b/]},
@@ -83,7 +83,7 @@ its registration gets two monitors and two pages.
       id: 'baseline',
       title: 'Accepts only a frozen, dated baseline reference',
       detail:
-        'The baseline is matched against `BASELINE_RE` (`baseline:{model_version}:{yyyy-mm-dd}`) and anything else, a live segment included, is **400**.',
+        'The whole baseline is matched against `BASELINE_RE` (`baseline:{model_version}:{yyyy-mm-dd}`) and anything else, a live prefix or suffix included, is **400**.',
       match: {
         python: {all: [/BASELINE_RE\s*=/, /BASELINE_RE\.(fullmatch|match)\(/]},
         typescript: {all: [/BASELINE_RE\s*=/, /BASELINE_RE\.test\(/]},
@@ -638,6 +638,11 @@ async def check_metric_window(ctx):
         await _refused(c, ctx, {**GOOD, "metric": "accuracy"}, _headers(key="k-2"), 400, "the metric accuracy (not in METRICS)")
         await _refused(c, ctx, {**GOOD, "window_s": 60}, _headers(key="k-3"), 400, "a 60 s window (below MIN_WINDOW_S = 300)")
         await _refused(c, ctx, {**GOOD, "window_s": 172_800}, _headers(key="k-4"), 400, "a two-day window (above MAX_WINDOW_S = 86400)")
+        await _refused(c, ctx, {**GOOD, "window_s": 299}, _headers(key="k-6"), 400, "a 299 s window (one below MIN_WINDOW_S = 300)")
+        await _refused(c, ctx, {**GOOD, "window_s": 86_401}, _headers(key="k-7"), 400, "an 86401 s window (one above MAX_WINDOW_S = 86400)")
+        for key, window_s in (("k-8", 300), ("k-9", 86_400)):
+            r = await c.post("/v1/monitors", json={**GOOD, "window_s": window_s}, headers=_headers(key=key))
+            assert r.status_code == 201 and r.json().get("window_s") == window_s, f"a {window_s} s window answered {r.status_code} {r.text}, expected 201: the bounds 300 and 86400 are allowed"
         bare = {name: value for name, value in GOOD.items() if name != "window_s"}
         r = await c.post("/v1/monitors", json=bare, headers=_headers(key="k-5"))
     assert r.status_code == 201 and r.json().get("window_s") == 3600, f"a registration without window_s answered {r.status_code} {r.text}, expected 201 with the default window 3600"
@@ -654,6 +659,9 @@ async def check_baseline(ctx):
     async with _api(ctx) as c:
         await _refused(c, ctx, {**GOOD, "baseline": "live:v3"}, _headers(), 400, "the baseline live:v3 (the traffic the monitor watches)")
         await _refused(c, ctx, {**GOOD, "baseline": "baseline:v3:latest"}, _headers(key="k-2"), 400, "the baseline baseline:v3:latest (a moving reference)")
+        await _refused(c, ctx, {**GOOD, "baseline": "baseline:v3"}, _headers(key="k-4"), 400, "the baseline baseline:v3 (no date)")
+        await _refused(c, ctx, {**GOOD, "baseline": "baseline:v3:2026-10-01:live"}, _headers(key="k-5"), 400, "the baseline baseline:v3:2026-10-01:live (a frozen reference with a live suffix; the whole value must match)")
+        await _refused(c, ctx, {**GOOD, "baseline": "live:baseline:v3:2026-10-01"}, _headers(key="k-6"), 400, "the baseline live:baseline:v3:2026-10-01 (a live prefix; the whole value must match)")
         r = await c.post("/v1/monitors", json=GOOD, headers=_headers(key="k-3"))
     assert r.status_code == 201, f"the frozen baseline baseline:v3:2026-10-01 answered {r.status_code}: {r.text}"
 
@@ -703,6 +711,12 @@ export async function check_metric_window(ctx) {
   await refused(c, ctx, {...GOOD, metric: 'accuracy'}, headers('t1', 'k-2'), 400, 'the metric accuracy (not in METRICS)');
   await refused(c, ctx, {...GOOD, window_s: 60}, headers('t1', 'k-3'), 400, 'a 60 s window (below MIN_WINDOW_S = 300)');
   await refused(c, ctx, {...GOOD, window_s: 172_800}, headers('t1', 'k-4'), 400, 'a two-day window (above MAX_WINDOW_S = 86400)');
+  await refused(c, ctx, {...GOOD, window_s: 299}, headers('t1', 'k-6'), 400, 'a 299 s window (one below MIN_WINDOW_S = 300)');
+  await refused(c, ctx, {...GOOD, window_s: 86_401}, headers('t1', 'k-7'), 400, 'an 86401 s window (one above MAX_WINDOW_S = 86400)');
+  for (const [key, windowS] of [['k-8', 300], ['k-9', 86_400]] as const) {
+    const ok = await c.post('/v1/monitors', {json: {...GOOD, window_s: windowS}, headers: headers('t1', key)});
+    assert(ok.status === 201 && ok.json().window_s === windowS, \`a \${windowS} s window answered \${ok.status} \${ok.text}, expected 201: the bounds 300 and 86400 are allowed\`);
+  }
   const {window_s: _omitted, ...bare} = GOOD;
   const r = await c.post('/v1/monitors', {json: bare, headers: headers('t1', 'k-5')});
   assert(r.status === 201 && r.json().window_s === 3600, \`a registration without window_s answered \${r.status} \${r.text}, expected 201 with the default window 3600\`);
@@ -719,6 +733,9 @@ export async function check_baseline(ctx) {
   const {c} = api(ctx);
   await refused(c, ctx, {...GOOD, baseline: 'live:v3'}, headers(), 400, 'the baseline live:v3 (the traffic the monitor watches)');
   await refused(c, ctx, {...GOOD, baseline: 'baseline:v3:latest'}, headers('t1', 'k-2'), 400, 'the baseline baseline:v3:latest (a moving reference)');
+  await refused(c, ctx, {...GOOD, baseline: 'baseline:v3'}, headers('t1', 'k-4'), 400, 'the baseline baseline:v3 (no date)');
+  await refused(c, ctx, {...GOOD, baseline: 'baseline:v3:2026-10-01:live'}, headers('t1', 'k-5'), 400, 'the baseline baseline:v3:2026-10-01:live (a frozen reference with a live suffix; the whole value must match)');
+  await refused(c, ctx, {...GOOD, baseline: 'live:baseline:v3:2026-10-01'}, headers('t1', 'k-6'), 400, 'the baseline live:baseline:v3:2026-10-01 (a live prefix; the whole value must match)');
   const r = await c.post('/v1/monitors', {json: GOOD, headers: headers('t1', 'k-3')});
   assert.equal(r.status, 201, \`the frozen baseline baseline:v3:2026-10-01 answered \${r.status}: \${r.text}\`);
 }
@@ -746,18 +763,18 @@ import (
 	"leetbuild/harness"
 )
 
-var good = map[string]any{"model_version": "v3", "metric": "input_distribution", "window_s": 3600, "baseline": "baseline:v3:2026-10-01", "threshold": 0.2}
+var hGood = map[string]any{"model_version": "v3", "metric": "input_distribution", "window_s": 3600, "baseline": "baseline:v3:2026-10-01", "threshold": 0.2}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	ctx.Redis.Do("SADD", "registry:promoted", "v3")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func with(changes map[string]any, drop string) map[string]any {
+func hWith(changes map[string]any, drop string) map[string]any {
 	out := map[string]any{}
-	for k, v := range good {
+	for k, v := range hGood {
 		if k != drop {
 			out[k] = v
 		}
@@ -768,7 +785,7 @@ func with(changes map[string]any, drop string) map[string]any {
 	return out
 }
 
-func headers(tenant, key string) []string {
+func hHeaders(tenant, key string) []string {
 	var h []string
 	if tenant != "" {
 		h = append(h, "X-Tenant-Id", tenant)
@@ -779,68 +796,77 @@ func headers(tenant, key string) []string {
 	return h
 }
 
-func post(c *harness.HTTP, body map[string]any, h []string) *harness.Response {
+func hPost(c *harness.HTTP, body map[string]any, h []string) *harness.Response {
 	return c.Post("/v1/monitors", body, h...)
 }
 
-func field(r *harness.Response, name string) any {
+func hField(r *harness.Response, name string) any {
 	body, _ := r.JSON().(map[string]any)
 	return body[name]
 }
 
-func refused(ctx *harness.Ctx, c *harness.HTTP, body map[string]any, h []string, status int, why string) {
-	r := post(c, body, h)
+func hRefused(ctx *harness.Ctx, c *harness.HTTP, body map[string]any, h []string, status int, why string) {
+	r := hPost(c, body, h)
 	ctx.Equal(r.Status, status, "%s answered %s", why, r.Text())
 	ctx.Equal(len(ctx.Redis.Keys("monitor:m-*")), 0, "%s was refused, so it must not create a monitor; monitors in the store", why)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, good, headers("t1", "k-1"))
+	c := hAPI(ctx)
+	r := hPost(c, hGood, hHeaders("t1", "k-1"))
 	ctx.Equal(r.Status, 201, "POST /v1/monitors (%s)", r.Text())
-	for name, value := range good {
-		ctx.Equal(field(r, name), value, "the response's %s (%s)", name, r.Text())
+	for name, value := range hGood {
+		ctx.Equal(hField(r, name), value, "the response's %s (%s)", name, r.Text())
 	}
-	id, _ := field(r, "monitor_id").(string)
+	id, _ := hField(r, "monitor_id").(string)
 	stored := store.GetMonitor(context.Background(), id)
 	ctx.Assert(stored != nil && stored.Tenant == "t1", "monitor %q is not in the store for tenant t1: %+v", id, stored)
 }
 
 func CheckMetricWindow(ctx *harness.Ctx) {
-	c := api(ctx)
-	refused(ctx, c, good, headers("", "k-1"), 401, "a registration without X-Tenant-Id")
-	refused(ctx, c, with(map[string]any{"metric": "accuracy"}, ""), headers("t1", "k-2"), 400, "the metric accuracy (not in metrics)")
-	refused(ctx, c, with(map[string]any{"window_s": 60}, ""), headers("t1", "k-3"), 400, "a 60 s window (below minWindowS = 300)")
-	refused(ctx, c, with(map[string]any{"window_s": 172800}, ""), headers("t1", "k-4"), 400, "a two-day window (above maxWindowS = 86400)")
-	r := post(c, with(nil, "window_s"), headers("t1", "k-5"))
-	ctx.Assert(r.Status == 201 && field(r, "window_s") == float64(3600), "a registration without window_s answered %d %s, expected 201 with the default window 3600", r.Status, r.Text())
+	c := hAPI(ctx)
+	hRefused(ctx, c, hGood, hHeaders("", "k-1"), 401, "a registration without X-Tenant-Id")
+	hRefused(ctx, c, hWith(map[string]any{"metric": "accuracy"}, ""), hHeaders("t1", "k-2"), 400, "the metric accuracy (not in metrics)")
+	hRefused(ctx, c, hWith(map[string]any{"window_s": 60}, ""), hHeaders("t1", "k-3"), 400, "a 60 s window (below minWindowS = 300)")
+	hRefused(ctx, c, hWith(map[string]any{"window_s": 172800}, ""), hHeaders("t1", "k-4"), 400, "a two-day window (above maxWindowS = 86400)")
+	hRefused(ctx, c, hWith(map[string]any{"window_s": 299}, ""), hHeaders("t1", "k-6"), 400, "a 299 s window (one below minWindowS = 300)")
+	hRefused(ctx, c, hWith(map[string]any{"window_s": 86401}, ""), hHeaders("t1", "k-7"), 400, "an 86401 s window (one above maxWindowS = 86400)")
+	for key, windowS := range map[string]int{"k-8": 300, "k-9": 86400} {
+		ok := hPost(c, hWith(map[string]any{"window_s": windowS}, ""), hHeaders("t1", key))
+		ctx.Assert(ok.Status == 201 && hField(ok, "window_s") == float64(windowS), "a %d s window answered %d %s, expected 201: the bounds 300 and 86400 are allowed", windowS, ok.Status, ok.Text())
+	}
+	r := hPost(c, hWith(nil, "window_s"), hHeaders("t1", "k-5"))
+	ctx.Assert(r.Status == 201 && hField(r, "window_s") == float64(3600), "a registration without window_s answered %d %s, expected 201 with the default window 3600", r.Status, r.Text())
 }
 
 func CheckPromoted(ctx *harness.Ctx) {
-	c := api(ctx)
-	refused(ctx, c, with(map[string]any{"model_version": "v9", "baseline": "baseline:v9:2026-10-01"}, ""), headers("t1", "k-1"), 400, "a monitor on v9, which the registry never promoted,")
-	r := post(c, good, headers("t1", "k-2"))
+	c := hAPI(ctx)
+	hRefused(ctx, c, hWith(map[string]any{"model_version": "v9", "baseline": "baseline:v9:2026-10-01"}, ""), hHeaders("t1", "k-1"), 400, "a monitor on v9, which the registry never promoted,")
+	r := hPost(c, hGood, hHeaders("t1", "k-2"))
 	ctx.Equal(r.Status, 201, "a monitor on the promoted v3 (%s)", r.Text())
 }
 
 func CheckBaseline(ctx *harness.Ctx) {
-	c := api(ctx)
-	refused(ctx, c, with(map[string]any{"baseline": "live:v3"}, ""), headers("t1", "k-1"), 400, "the baseline live:v3 (the traffic the monitor watches)")
-	refused(ctx, c, with(map[string]any{"baseline": "baseline:v3:latest"}, ""), headers("t1", "k-2"), 400, "the baseline baseline:v3:latest (a moving reference)")
-	r := post(c, good, headers("t1", "k-3"))
+	c := hAPI(ctx)
+	hRefused(ctx, c, hWith(map[string]any{"baseline": "live:v3"}, ""), hHeaders("t1", "k-1"), 400, "the baseline live:v3 (the traffic the monitor watches)")
+	hRefused(ctx, c, hWith(map[string]any{"baseline": "baseline:v3:latest"}, ""), hHeaders("t1", "k-2"), 400, "the baseline baseline:v3:latest (a moving reference)")
+	hRefused(ctx, c, hWith(map[string]any{"baseline": "baseline:v3"}, ""), hHeaders("t1", "k-4"), 400, "the baseline baseline:v3 (no date)")
+	hRefused(ctx, c, hWith(map[string]any{"baseline": "baseline:v3:2026-10-01:live"}, ""), hHeaders("t1", "k-5"), 400, "the baseline baseline:v3:2026-10-01:live (a frozen reference with a live suffix; the whole value must match)")
+	hRefused(ctx, c, hWith(map[string]any{"baseline": "live:baseline:v3:2026-10-01"}, ""), hHeaders("t1", "k-6"), 400, "the baseline live:baseline:v3:2026-10-01 (a live prefix; the whole value must match)")
+	r := hPost(c, hGood, hHeaders("t1", "k-3"))
 	ctx.Equal(r.Status, 201, "the frozen baseline baseline:v3:2026-10-01 (%s)", r.Text())
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := api(ctx)
-	refused(ctx, c, good, headers("t1", ""), 400, "a registration without Idempotency-Key")
-	first := post(c, good, headers("t1", "k-1"))
+	c := hAPI(ctx)
+	hRefused(ctx, c, hGood, hHeaders("t1", ""), 400, "a registration without Idempotency-Key")
+	first := hPost(c, hGood, hHeaders("t1", "k-1"))
 	ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text())
-	replay := post(c, good, headers("t1", "k-1"))
-	ctx.Assert((replay.Status == 200 || replay.Status == 201) && field(replay, "monitor_id") == field(first, "monitor_id"), "a retry with the same Idempotency-Key answered %d %s, expected the first monitor %v", replay.Status, replay.Text(), field(first, "monitor_id"))
+	replay := hPost(c, hGood, hHeaders("t1", "k-1"))
+	ctx.Assert((replay.Status == 200 || replay.Status == 201) && hField(replay, "monitor_id") == hField(first, "monitor_id"), "a retry with the same Idempotency-Key answered %d %s, expected the first monitor %v", replay.Status, replay.Text(), hField(first, "monitor_id"))
 	ctx.Equal(len(ctx.Redis.Keys("monitor:m-*")), 1, "one registration and its retry must leave one monitor (a second one pages a second time); monitors in the store")
-	other := post(c, good, headers("t2", "k-1"))
-	ctx.Assert(other.Status == 201 && field(other, "monitor_id") != field(first, "monitor_id"), "tenant t2 using the key k-1 got %d %s: keys are scoped by tenant, so it is a new monitor", other.Status, other.Text())
+	other := hPost(c, hGood, hHeaders("t2", "k-1"))
+	ctx.Assert(other.Status == 201 && hField(other, "monitor_id") != hField(first, "monitor_id"), "tenant t2 using the key k-1 got %d %s: keys are scoped by tenant, so it is a new monitor", other.Status, other.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -856,9 +882,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kGood = {{"model_version", "v3"}, {"metric", "input_distribution"}, {"window_s", 3600}, {"baseline", "baseline:v3:2026-10-01"}, {"threshold", 0.2}};
+const json hGood = {{"model_version", "v3"}, {"metric", "input_distribution"}, {"window_s", 3600}, {"baseline", "baseline:v3:2026-10-01"}, {"threshold", 0.2}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   ctx.Redis.Do("SADD", "registry:promoted", "v3");
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -867,26 +893,26 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json with(const json& changes, const std::string& drop = "") {
-  json out = kGood;
+json hWith(const json& changes, const std::string& drop = "") {
+  json out = hGood;
   if (!drop.empty()) out.erase(drop);
   for (const auto& [k, v] : changes.items()) out[k] = v;
   return out;
 }
 
-harness::Response post(harness::HTTP& c, const json& body, const std::string& tenant, const std::string& key) {
+harness::Response hPost(harness::HTTP& c, const json& body, const std::string& tenant, const std::string& key) {
   if (tenant.empty()) return c.Post("/v1/monitors", body.dump(), "Content-Type", "application/json", "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/monitors", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/monitors", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-json bodyOf(const harness::Response& r) {
+json hBodyOf(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : json::object();
 }
 
-void refused(harness::Ctx& ctx, harness::HTTP& c, const json& body, const std::string& tenant, const std::string& key, int status, const std::string& why) {
-  const auto r = post(c, body, tenant, key);
+void hRefused(harness::Ctx& ctx, harness::HTTP& c, const json& body, const std::string& tenant, const std::string& key, int status, const std::string& why) {
+  const auto r = hPost(c, body, tenant, key);
   ctx.Equal(r.Status, status, "%s answered %s", why, r.Text());
   ctx.Equal(ctx.Redis.Keys("monitor:m-*").size(), 0, "%s was refused, so it must not create a monitor; monitors in the store", why);
 }
@@ -894,11 +920,11 @@ void refused(harness::Ctx& ctx, harness::HTTP& c, const json& body, const std::s
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kGood, "t1", "k-1");
+  auto c = hApi(ctx);
+  const auto r = hPost(c, hGood, "t1", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/monitors (%s)", r.Text());
-  const json body = bodyOf(r);
-  for (const auto& [name, value] : kGood.items()) {
+  const json body = hBodyOf(r);
+  for (const auto& [name, value] : hGood.items()) {
     ctx.Assert(body.contains(name) && body[name] == value, "the response's %s is %s, expected %s", name, body.value(name, json()).dump(), value.dump());
   }
   const auto stored = store::getMonitor(body.value("monitor_id", ""));
@@ -906,41 +932,50 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckMetricWindow(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  refused(ctx, c, kGood, "", "k-1", 401, "a registration without X-Tenant-Id");
-  refused(ctx, c, with({{"metric", "accuracy"}}), "t1", "k-2", 400, "the metric accuracy (not in kMetrics)");
-  refused(ctx, c, with({{"window_s", 60}}), "t1", "k-3", 400, "a 60 s window (below kMinWindowS = 300)");
-  refused(ctx, c, with({{"window_s", 172800}}), "t1", "k-4", 400, "a two-day window (above kMaxWindowS = 86400)");
-  const auto r = post(c, with(json::object(), "window_s"), "t1", "k-5");
-  ctx.Assert(r.Status == 201 && bodyOf(r).value("window_s", 0L) == 3600, "a registration without window_s answered %d %s, expected 201 with the default window 3600", r.Status, r.Text());
+  auto c = hApi(ctx);
+  hRefused(ctx, c, hGood, "", "k-1", 401, "a registration without X-Tenant-Id");
+  hRefused(ctx, c, hWith({{"metric", "accuracy"}}), "t1", "k-2", 400, "the metric accuracy (not in kMetrics)");
+  hRefused(ctx, c, hWith({{"window_s", 60}}), "t1", "k-3", 400, "a 60 s window (below kMinWindowS = 300)");
+  hRefused(ctx, c, hWith({{"window_s", 172800}}), "t1", "k-4", 400, "a two-day window (above kMaxWindowS = 86400)");
+  hRefused(ctx, c, hWith({{"window_s", 299}}), "t1", "k-6", 400, "a 299 s window (one below kMinWindowS = 300)");
+  hRefused(ctx, c, hWith({{"window_s", 86401}}), "t1", "k-7", 400, "an 86401 s window (one above kMaxWindowS = 86400)");
+  for (const auto& [key, window_s] : std::vector<std::pair<std::string, long>>{{"k-8", 300}, {"k-9", 86400}}) {
+    const auto ok = hPost(c, hWith({{"window_s", window_s}}), "t1", key);
+    ctx.Assert(ok.Status == 201 && hBodyOf(ok).value("window_s", 0L) == window_s, "a %d s window answered %d %s, expected 201: the bounds 300 and 86400 are allowed", window_s, ok.Status, ok.Text());
+  }
+  const auto r = hPost(c, hWith(json::object(), "window_s"), "t1", "k-5");
+  ctx.Assert(r.Status == 201 && hBodyOf(r).value("window_s", 0L) == 3600, "a registration without window_s answered %d %s, expected 201 with the default window 3600", r.Status, r.Text());
 }
 
 void CheckPromoted(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  refused(ctx, c, with({{"model_version", "v9"}, {"baseline", "baseline:v9:2026-10-01"}}), "t1", "k-1", 400, "a monitor on v9, which the registry never promoted,");
-  const auto r = post(c, kGood, "t1", "k-2");
+  auto c = hApi(ctx);
+  hRefused(ctx, c, hWith({{"model_version", "v9"}, {"baseline", "baseline:v9:2026-10-01"}}), "t1", "k-1", 400, "a monitor on v9, which the registry never promoted,");
+  const auto r = hPost(c, hGood, "t1", "k-2");
   ctx.Equal(r.Status, 201, "a monitor on the promoted v3 (%s)", r.Text());
 }
 
 void CheckBaseline(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  refused(ctx, c, with({{"baseline", "live:v3"}}), "t1", "k-1", 400, "the baseline live:v3 (the traffic the monitor watches)");
-  refused(ctx, c, with({{"baseline", "baseline:v3:latest"}}), "t1", "k-2", 400, "the baseline baseline:v3:latest (a moving reference)");
-  const auto r = post(c, kGood, "t1", "k-3");
+  auto c = hApi(ctx);
+  hRefused(ctx, c, hWith({{"baseline", "live:v3"}}), "t1", "k-1", 400, "the baseline live:v3 (the traffic the monitor watches)");
+  hRefused(ctx, c, hWith({{"baseline", "baseline:v3:latest"}}), "t1", "k-2", 400, "the baseline baseline:v3:latest (a moving reference)");
+  hRefused(ctx, c, hWith({{"baseline", "baseline:v3"}}), "t1", "k-4", 400, "the baseline baseline:v3 (no date)");
+  hRefused(ctx, c, hWith({{"baseline", "baseline:v3:2026-10-01:live"}}), "t1", "k-5", 400, "the baseline baseline:v3:2026-10-01:live (a frozen reference with a live suffix; the whole value must match)");
+  hRefused(ctx, c, hWith({{"baseline", "live:baseline:v3:2026-10-01"}}), "t1", "k-6", 400, "the baseline live:baseline:v3:2026-10-01 (a live prefix; the whole value must match)");
+  const auto r = hPost(c, hGood, "t1", "k-3");
   ctx.Equal(r.Status, 201, "the frozen baseline baseline:v3:2026-10-01 (%s)", r.Text());
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  refused(ctx, c, kGood, "t1", "", 400, "a registration without Idempotency-Key");
-  const auto first = post(c, kGood, "t1", "k-1");
+  auto c = hApi(ctx);
+  hRefused(ctx, c, hGood, "t1", "", 400, "a registration without Idempotency-Key");
+  const auto first = hPost(c, hGood, "t1", "k-1");
   ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text());
-  const std::string id = bodyOf(first).value("monitor_id", "");
-  const auto replay = post(c, kGood, "t1", "k-1");
-  ctx.Assert((replay.Status == 200 || replay.Status == 201) && bodyOf(replay).value("monitor_id", "") == id, "a retry with the same Idempotency-Key answered %d %s, expected the first monitor %s", replay.Status, replay.Text(), id);
+  const std::string id = hBodyOf(first).value("monitor_id", "");
+  const auto replay = hPost(c, hGood, "t1", "k-1");
+  ctx.Assert((replay.Status == 200 || replay.Status == 201) && hBodyOf(replay).value("monitor_id", "") == id, "a retry with the same Idempotency-Key answered %d %s, expected the first monitor %s", replay.Status, replay.Text(), id);
   ctx.Equal(ctx.Redis.Keys("monitor:m-*").size(), 1, "one registration and its retry must leave one monitor (a second one pages a second time); monitors in the store");
-  const auto other = post(c, kGood, "t2", "k-1");
-  ctx.Assert(other.Status == 201 && bodyOf(other).value("monitor_id", "") != id, "tenant t2 using the key k-1 got %d %s: keys are scoped by tenant, so it is a new monitor", other.Status, other.Text());
+  const auto other = hPost(c, hGood, "t2", "k-1");
+  ctx.Assert(other.Status == 201 && hBodyOf(other).value("monitor_id", "") != id, "tenant t2 using the key k-1 got %d %s: keys are scoped by tenant, so it is a new monitor", other.Status, other.Text());
 }
 `,
   },

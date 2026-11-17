@@ -53,7 +53,7 @@ and nothing says so; equal scores follow the client's order, so one request yiel
       id: 'query-cap',
       title: 'Answers 413 for a query over 2 KiB of UTF-8',
       detail:
-        'A query longer than `MAX_QUERY_BYTES` (2048 bytes of UTF-8, so 1100 accented letters are over it) answers **413**; exactly 2048 bytes is served. The starter passes any query to the model.',
+        'A query longer than `MAX_QUERY_BYTES` (2048 bytes of UTF-8, so 1100 accented letters are over it) answers **413**, 2049 bytes included; exactly 2048 bytes is served. The starter passes any query to the model.',
       match: {
         python: {all: [/MAX_QUERY_BYTES/, /\b413\b/, /\.encode\(/]},
         typescript: {all: [/MAX_QUERY_BYTES/, /\b413\b/, /TextEncoder|Buffer\.byteLength/]},
@@ -79,7 +79,7 @@ and nothing says so; equal scores follow the client's order, so one request yiel
       id: 'truncation-reported',
       title: 'Cuts a passage at 4 KiB of UTF-8 and reports it',
       detail:
-        'A text over `MAX_PASSAGE_BYTES` (4096 bytes, counted in UTF-8: 2500 accented letters are over it) is scored cut and its result says `truncated: true`; every other result says `false`. The starter cuts 4096 characters and says nothing.',
+        'A text over `MAX_PASSAGE_BYTES` (4096 bytes, counted in UTF-8: 2500 accented letters are over it, and so is 4097 bytes) is scored cut, on a character boundary so a letter split by the 4 KiB mark is dropped whole, and its result says `truncated: true`; every other result says `false`. The starter cuts 4096 characters and says nothing.',
       match: {
         python: {all: [/MAX_PASSAGE_BYTES/, /["']truncated["']/]},
         typescript: {all: [/MAX_PASSAGE_BYTES/, /truncated/]},
@@ -612,7 +612,9 @@ async def check_query_cap(ctx):
         wide = await _rerank(c, "\\u00e9" * 1100, [_cand("p-1", "solar")])
         assert wide.status_code == 413, f"a query of 1100 accented letters (2200 bytes of UTF-8) answered {wide.status_code}, expected 413: the cap counts bytes, not characters"
         edge = await _rerank(c, "a" * 2048, [_cand("p-1", "solar")])
+        over = await _rerank(c, "a" * 2049, [_cand("p-1", "solar")])
     assert edge.status_code == 200, f"a query of exactly 2048 bytes answered {edge.status_code}, expected 200"
+    assert over.status_code == 413, f"a query of 2049 bytes answered {over.status_code}, expected 413: the cap is 2048 bytes"
 
 
 async def check_candidate_cap(ctx):
@@ -639,6 +641,11 @@ async def check_truncation_reported(ctx):
     assert flags.get("wide") is True, f"2500 accented letters are 5000 bytes of UTF-8 and must come back truncated: true, got {flags}: the cap counts bytes, not characters"
     assert flags.get("exact") is False and flags.get("short") is False, f"passages within 4096 bytes must say truncated: false, got {flags}"
     assert abs(results["long"].get("score", -1)) < 1e-6, f"the long passage's only 'solar' sits past 4 KiB: scored cut, its score is 0.0, got {results['long']}"
+    async with _api(ctx) as c:
+        mid = await _rerank(c, "ab", [_cand("mid", "z" * 4092 + " ab" + "\\u00e9")])
+    item = _by_id(mid).get("mid", {})
+    assert item.get("truncated") is True, f"a 4097-byte passage must come back truncated: true, got {item}"
+    assert abs(item.get("score", -1) - 1.0) < 1e-6, f"a 4097-byte passage whose 4 KiB cut falls inside its last 2-byte letter is scored on the text before that letter (it ends in the word 'ab', score 1.0), got {item}: the cut keeps whole characters only"
 
 
 async def check_tie_break(ctx):
@@ -689,6 +696,8 @@ export async function check_query_cap(ctx) {
   assert.equal(wide.status, 413, \`a query of 1100 accented letters (2200 bytes of UTF-8) answered \${wide.status}, expected 413: the cap counts bytes, not characters\`);
   const edge = await rerank(c, 'a'.repeat(2048), [cand('p-1', 'solar')]);
   assert.equal(edge.status, 200, \`a query of exactly 2048 bytes answered \${edge.status}, expected 200\`);
+  const over = await rerank(c, 'a'.repeat(2049), [cand('p-1', 'solar')]);
+  assert.equal(over.status, 413, \`a query of 2049 bytes answered \${over.status}, expected 413: the cap is 2048 bytes\`);
 }
 
 export async function check_candidate_cap(ctx) {
@@ -716,6 +725,9 @@ export async function check_truncation_reported(ctx) {
   assert.equal(flags.wide, true, \`2500 accented letters are 5000 bytes of UTF-8 and must come back truncated: true, got \${JSON.stringify(flags)}: the cap counts bytes, not characters\`);
   assert(flags.exact === false && flags.short === false, \`passages within 4096 bytes must say truncated: false, got \${JSON.stringify(flags)}\`);
   assert(Math.abs(results.long.score) < 1e-6, \`the long passage's only 'solar' sits past 4 KiB: scored cut, its score is 0, got \${JSON.stringify(results.long)}\`);
+  const mid = byId(await rerank(c, 'ab', [cand('mid', 'z'.repeat(4092) + ' ab' + '\\u00e9')])).mid ?? {};
+  assert.equal(mid.truncated, true, \`a 4097-byte passage must come back truncated: true, got \${JSON.stringify(mid)}\`);
+  assert(Math.abs((mid.score ?? -1) - 1) < 1e-6, \`a 4097-byte passage whose 4 KiB cut falls inside its last 2-byte letter is scored on the text before that letter (it ends in the word 'ab', score 1.0), got \${JSON.stringify(mid)}: the cut keeps whole characters only\`);
 }
 
 export async function check_tie_break(ctx) {
@@ -806,6 +818,8 @@ func CheckQueryCap(ctx *harness.Ctx) {
 	ctx.Equal(wide.Status, 413, "a query of 1100 accented letters (2200 bytes of UTF-8): the cap counts bytes; the status")
 	edge := apiRerank(c, strings.Repeat("a", 2048), one)
 	ctx.Equal(edge.Status, 200, "a query of exactly 2048 bytes (%s)", edge.Text())
+	over := apiRerank(c, strings.Repeat("a", 2049), one)
+	ctx.Equal(over.Status, 413, "a query of 2049 bytes (the cap is 2048 bytes); the status")
 }
 
 func CheckCandidateCap(ctx *harness.Ctx) {
@@ -838,6 +852,9 @@ func CheckTruncationReported(ctx *harness.Ctx) {
 	ctx.Equal(apiFlag(results["wide"]), "true", "2500 accented letters are 5000 bytes of UTF-8 and must come back truncated: true; truncated")
 	ctx.Assert(apiFlag(results["exact"]) == "false" && apiFlag(results["short"]) == "false", "passages within 4096 bytes must say truncated: false, got exact %s, short %s", apiFlag(results["exact"]), apiFlag(results["short"]))
 	ctx.Assert(math.Abs(results["long"].Score) < 1e-6, "the long passage's only 'solar' sits past 4 KiB: scored cut, its score is 0, got %v", results["long"].Score)
+	mid := apiByID(apiRerank(c, "ab", []map[string]string{apiCand("mid", strings.Repeat("z", 4092)+" ab"+"\\u00e9")}))["mid"]
+	ctx.Equal(apiFlag(mid), "true", "a 4097-byte passage must come back truncated: true; truncated")
+	ctx.Assert(math.Abs(mid.Score-1) < 1e-6, "a 4097-byte passage whose 4 KiB cut falls inside its last 2-byte letter is scored on the text before that letter (it ends in the word 'ab', score 1.0), got %v: the cut keeps whole characters only", mid.Score)
 }
 
 func CheckTieBreak(ctx *harness.Ctx) {
@@ -870,7 +887,7 @@ namespace {
 
 const std::string kQuery = "solar panel efficiency";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -878,9 +895,9 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json cand(const std::string& id, const std::string& text) { return {{"passage_id", id}, {"text", text}}; }
+nlohmann::json hCand(const std::string& id, const std::string& text) { return {{"passage_id", id}, {"text", text}}; }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += s;
   return out;
@@ -897,18 +914,18 @@ nlohmann::json resultsOf(const harness::Response& r) {
   return body.is_object() && body.contains("results") && body["results"].is_array() ? body["results"] : nlohmann::json::array();
 }
 
-std::map<std::string, nlohmann::json> byId(const harness::Response& r) {
+std::map<std::string, nlohmann::json> hById(const harness::Response& r) {
   std::map<std::string, nlohmann::json> out;
   for (const auto& item : resultsOf(r)) out[item.value("passage_id", "")] = item;
   return out;
 }
 
-std::string flag(const nlohmann::json& item) {
+std::string hFlag(const nlohmann::json& item) {
   if (!item.is_object() || !item.contains("truncated") || !item["truncated"].is_boolean()) return "missing";
   return item["truncated"].get<bool>() ? "true" : "false";
 }
 
-std::vector<std::string> ids(const harness::Response& r) {
+std::vector<std::string> hIds(const harness::Response& r) {
   std::vector<std::string> out;
   for (const auto& item : resultsOf(r)) out.push_back(item.value("passage_id", ""));
   return out;
@@ -917,34 +934,35 @@ std::vector<std::string> ids(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = rerankWith(c, kQuery, nlohmann::json::array({cand("p-1", "solar panel efficiency in winter"), cand("p-2", "wind turbines")}));
+  auto c = hApi(ctx);
+  const auto r = rerankWith(c, kQuery, nlohmann::json::array({hCand("p-1", "solar panel efficiency in winter"), hCand("p-2", "wind turbines")}));
   ctx.Equal(r.Status, 200, "POST /v1/rerank (%s)", r.Text());
-  auto results = byId(r);
+  auto results = hById(r);
   ctx.Equal(results.size(), 2, "two candidates must answer two results (%s)", r.Text());
   ctx.Assert(std::fabs(results["p-1"].value("score", -1.0) - 1) < 1e-6 && std::fabs(results["p-2"].value("score", -1.0)) < 1e-6,
              "the scores must be the model's (p-1 1.0, p-2 0.0), got %s", r.Text());
-  const auto none = rerankWith(c, kQuery, nlohmann::json::array({cand("p-1", "solar")}), false);
+  const auto none = rerankWith(c, kQuery, nlohmann::json::array({hCand("p-1", "solar")}), false);
   ctx.Equal(none.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckQueryCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto one = nlohmann::json::array({cand("p-1", "solar")});
-  ctx.Equal(rerankWith(c, repeat("solar ", 400), one).Status, 413, "a 2400-byte query must be refused before the model sees it; the status");
-  ctx.Equal(rerankWith(c, repeat("\\xc3\\xa9", 1100), one).Status, 413, "a query of 1100 accented letters (2200 bytes of UTF-8): the cap counts bytes; the status");
-  const auto edge = rerankWith(c, repeat("a", 2048), one);
+  auto c = hApi(ctx);
+  const auto one = nlohmann::json::array({hCand("p-1", "solar")});
+  ctx.Equal(rerankWith(c, hRepeat("solar ", 400), one).Status, 413, "a 2400-byte query must be refused before the model sees it; the status");
+  ctx.Equal(rerankWith(c, hRepeat("\\xc3\\xa9", 1100), one).Status, 413, "a query of 1100 accented letters (2200 bytes of UTF-8): the cap counts bytes; the status");
+  const auto edge = rerankWith(c, hRepeat("a", 2048), one);
   ctx.Equal(edge.Status, 200, "a query of exactly 2048 bytes (%s)", edge.Text());
+  ctx.Equal(rerankWith(c, hRepeat("a", 2049), one).Status, 413, "a query of 2049 bytes (the cap is 2048 bytes); the status");
 }
 
 void CheckCandidateCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const auto many = [](int n) {
     nlohmann::json out = nlohmann::json::array();
     char id[16];
     for (int i = 0; i < n; i++) {
       std::snprintf(id, sizeof id, "p-%03d", i);
-      out.push_back(cand(id, "solar panel"));
+      out.push_back(hCand(id, "solar panel"));
     }
     return out;
   };
@@ -955,26 +973,31 @@ void CheckCandidateCap(harness::Ctx& ctx) {
 }
 
 void CheckTruncationReported(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = rerankWith(c, "solar", nlohmann::json::array({cand("long", repeat("panel ", 1000) + "solar"), cand("exact", repeat("y", 4096)),
-                                                               cand("wide", repeat("\\xc3\\xa9", 2500)), cand("short", "solar power")}));
+  auto c = hApi(ctx);
+  const auto r = rerankWith(c, "solar", nlohmann::json::array({hCand("long", hRepeat("panel ", 1000) + "solar"), hCand("exact", hRepeat("y", 4096)),
+                                                               hCand("wide", hRepeat("\\xc3\\xa9", 2500)), hCand("short", "solar power")}));
   ctx.Equal(r.Status, 200, "POST /v1/rerank");
-  auto results = byId(r);
-  ctx.Equal(flag(results["long"]), "true", "a 6005-byte passage must come back truncated: true; truncated");
-  ctx.Equal(flag(results["wide"]), "true", "2500 accented letters are 5000 bytes of UTF-8 and must come back truncated: true; truncated");
-  ctx.Assert(flag(results["exact"]) == "false" && flag(results["short"]) == "false", "passages within 4096 bytes must say truncated: false, got exact %s, short %s",
-             flag(results["exact"]), flag(results["short"]));
+  auto results = hById(r);
+  ctx.Equal(hFlag(results["long"]), "true", "a 6005-byte passage must come back truncated: true; truncated");
+  ctx.Equal(hFlag(results["wide"]), "true", "2500 accented letters are 5000 bytes of UTF-8 and must come back truncated: true; truncated");
+  ctx.Assert(hFlag(results["exact"]) == "false" && hFlag(results["short"]) == "false", "passages within 4096 bytes must say truncated: false, got exact %s, short %s",
+             hFlag(results["exact"]), hFlag(results["short"]));
   ctx.Assert(std::fabs(results["long"].value("score", -1.0)) < 1e-6, "the long passage's only 'solar' sits past 4 KiB: scored cut, its score is 0, got %s",
              results["long"].dump());
+  auto mid = hById(rerankWith(c, "ab", nlohmann::json::array({hCand("mid", hRepeat("z", 4092) + " ab" + "\\xc3\\xa9")})))["mid"];
+  ctx.Equal(hFlag(mid), "true", "a 4097-byte passage must come back truncated: true; truncated");
+  ctx.Assert(std::fabs(mid.value("score", -1.0) - 1) < 1e-6,
+             "a 4097-byte passage whose 4 KiB cut falls inside its last 2-byte letter is scored on the text before that letter (it ends in the word 'ab', score 1.0), got %s: the cut keeps whole characters only",
+             mid.dump());
 }
 
 void CheckTieBreak(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto candidates = nlohmann::json::array({cand("p-4", "unrelated text"), cand("p-2", "solar output"), cand("p-1", "panel cost"), cand("p-3", "solar panel efficiency")});
+  auto c = hApi(ctx);
+  const auto candidates = nlohmann::json::array({hCand("p-4", "unrelated text"), hCand("p-2", "solar output"), hCand("p-1", "panel cost"), hCand("p-3", "solar panel efficiency")});
   const auto reversed = nlohmann::json::array({candidates[3], candidates[2], candidates[1], candidates[0]});
-  const auto order = ids(rerankWith(c, kQuery, candidates));
+  const auto order = hIds(rerankWith(c, kQuery, candidates));
   ctx.Equal(order, std::vector<std::string>{"p-3", "p-1", "p-2", "p-4"}, "score descending, ties by passage_id; the order");
-  ctx.Equal(ids(rerankWith(c, kQuery, reversed)), order, "the same candidates sent in another order (a tie must not follow the client's order); the order");
+  ctx.Equal(hIds(rerankWith(c, kQuery, reversed)), order, "the same candidates sent in another order (a tie must not follow the client's order); the order");
 }
 `,
   },

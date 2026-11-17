@@ -456,12 +456,15 @@ def check_atomic_commit(ctx):
 
 def check_ttl(ctx):
     m = ctx.load("state")
+    # A snapshot right after the first command that writes the record: the TTL is already there.
+    seen = ctx.redis_after(KEY_A, lambda: ctx.redis.ttl(KEY_A))
     _apply(m, HASH_A, 0, "Revenue rose.")
-    ttl = ctx.redis.ttl(KEY_A)
-    assert 0 < ttl <= 3600, f"{KEY_A} has TTL {ttl}: progress for a source nobody finishes must expire (TTL_S = 3600)"
+    assert seen.fired, f"apply_chunk never touched {KEY_A}: progress belongs under the source hash"
+    assert seen.result is not None and 0 < seen.result <= 3600, f"right after the command that wrote {KEY_A} its TTL was {seen.result}: the commit script sets EXPIRE itself (TTL_S = 3600), so no moment exists without one"
+    ctx.clock.advance(1800)
     _apply(m, HASH_A, 1, "Costs fell.")
     ttl = ctx.redis.ttl(KEY_A)
-    assert 3500 < ttl <= 3600, f"after the second chunk {KEY_A} has TTL {ttl}, expected about 3600"
+    assert 3500 < ttl <= 3600, f"a second chunk applied 30 minutes after the first left {KEY_A} with TTL {ttl}: every applied chunk refreshes it to about 3600"
 
 
 def check_idempotent_chunk(ctx):
@@ -470,8 +473,9 @@ def check_idempotent_chunk(ctx):
     _apply(m, HASH_A, 1, "Costs fell.")
     again = _apply(m, HASH_A, 1, "Costs fell.")
     assert again["applied"] is False and again["chunks_done"] == 2, f"a redelivered chunk 1 answered {again}: a chunk already applied must leave the record alone and answer applied False"
+    assert again["summary"] == "Revenue rose. Costs fell.", f"a redelivered chunk 1 answered summary {again['summary']!r}: a refused chunk answers the record unchanged"
     early = _apply(m, HASH_A, 3, "Margins widened.")
-    assert early["applied"] is False and early["chunks_done"] == 2, f"chunk 3 before chunk 2 answered {early}: only the next chunk may be applied"
+    assert early["applied"] is False and early["chunks_done"] == 2 and early["summary"] == "Revenue rose. Costs fell.", f"chunk 3 before chunk 2 answered {early}: only the next chunk may be applied, and a refused one answers the record unchanged"
     stored = ctx.redis.hgetall(KEY_A)
     assert stored.get("summary") == "Revenue rose. Costs fell." and stored.get("chunks_done") == "2", f"after a redelivery and an early chunk the record is {stored}, expected the two chunks once each"
 `,
@@ -505,12 +509,15 @@ export async function check_atomic_commit(ctx) {
 
 export async function check_ttl(ctx) {
   const m = ctx.load('state');
+  // A snapshot right after the first command that writes the record: the TTL is already there.
+  const seen = ctx.redisAfter(KEY_A, () => ctx.redis.ttl(KEY_A));
   await apply(m, HASH_A, 0, 'Revenue rose.');
-  let ttl = ctx.redis.ttl(KEY_A);
-  assert(ttl > 0 && ttl <= 3600, \`\${KEY_A} has TTL \${ttl}: progress for a source nobody finishes must expire (TTL_S = 3600)\`);
+  assert(seen.fired, \`applyChunk never touched \${KEY_A}: progress belongs under the source hash\`);
+  assert(typeof seen.result === 'number' && seen.result > 0 && seen.result <= 3600, \`right after the command that wrote \${KEY_A} its TTL was \${seen.result}: the commit script sets EXPIRE itself (TTL_S = 3600), so no moment exists without one\`);
+  ctx.clock.advance(1800);
   await apply(m, HASH_A, 1, 'Costs fell.');
-  ttl = ctx.redis.ttl(KEY_A);
-  assert(ttl > 3500 && ttl <= 3600, \`after the second chunk \${KEY_A} has TTL \${ttl}, expected about 3600\`);
+  const ttl = ctx.redis.ttl(KEY_A);
+  assert(ttl > 3500 && ttl <= 3600, \`a second chunk applied 30 minutes after the first left \${KEY_A} with TTL \${ttl}: every applied chunk refreshes it to about 3600\`);
 }
 
 export async function check_idempotent_chunk(ctx) {
@@ -519,8 +526,9 @@ export async function check_idempotent_chunk(ctx) {
   await apply(m, HASH_A, 1, 'Costs fell.');
   const again = await apply(m, HASH_A, 1, 'Costs fell.');
   assert(again.applied === false && again.chunks_done === 2, \`a redelivered chunk 1 answered \${JSON.stringify(again)}: a chunk already applied must leave the record alone and answer applied false\`);
+  assert.equal(again.summary, 'Revenue rose. Costs fell.', \`a redelivered chunk 1 answered summary \${JSON.stringify(again.summary)}: a refused chunk answers the record unchanged\`);
   const early = await apply(m, HASH_A, 3, 'Margins widened.');
-  assert(early.applied === false && early.chunks_done === 2, \`chunk 3 before chunk 2 answered \${JSON.stringify(early)}: only the next chunk may be applied\`);
+  assert(early.applied === false && early.chunks_done === 2 && early.summary === 'Revenue rose. Costs fell.', \`chunk 3 before chunk 2 answered \${JSON.stringify(early)}: only the next chunk may be applied, and a refused one answers the record unchanged\`);
   const stored = ctx.redis.hgetall(KEY_A);
   assert(stored.summary === 'Revenue rose. Costs fell.' && stored.chunks_done === '2', \`after a redelivery and an early chunk the record is \${JSON.stringify(stored)}, expected the two chunks once each\`);
 }
@@ -573,12 +581,19 @@ func CheckAtomicCommit(ctx *harness.Ctx) {
 }
 
 func CheckTtl(ctx *harness.Ctx) {
+	// A snapshot right after the first command that writes the record: the TTL is already there.
+	var seenTTL int64 = -3
+	seen := ctx.Redis.After(stateKeyA, func() any {
+		seenTTL = ctx.Redis.TTL(stateKeyA)
+		return seenTTL
+	})
 	stateApply(ctx, stateHashA, 0, "Revenue rose.")
-	ttl := ctx.Redis.TTL(stateKeyA)
-	ctx.Assert(ttl > 0 && ttl <= 3600, "%s has TTL %d: progress for a source nobody finishes must expire (TTL_S = 3600)", stateKeyA, ttl)
+	ctx.Assert(seen.Fired, "applyChunk never touched %s: progress belongs under the source hash", stateKeyA)
+	ctx.Assert(seenTTL > 0 && seenTTL <= 3600, "right after the command that wrote %s its TTL was %d: the commit script sets EXPIRE itself (TTL_S = 3600), so no moment exists without one", stateKeyA, seenTTL)
+	ctx.Clock.Advance(1800)
 	stateApply(ctx, stateHashA, 1, "Costs fell.")
-	ttl = ctx.Redis.TTL(stateKeyA)
-	ctx.Assert(ttl > 3500 && ttl <= 3600, "after the second chunk %s has TTL %d, expected about 3600", stateKeyA, ttl)
+	ttl := ctx.Redis.TTL(stateKeyA)
+	ctx.Assert(ttl > 3500 && ttl <= 3600, "a second chunk applied 30 minutes after the first left %s with TTL %d: every applied chunk refreshes it to about 3600", stateKeyA, ttl)
 }
 
 func CheckIdempotentChunk(ctx *harness.Ctx) {
@@ -586,8 +601,9 @@ func CheckIdempotentChunk(ctx *harness.Ctx) {
 	stateApply(ctx, stateHashA, 1, "Costs fell.")
 	again := stateApply(ctx, stateHashA, 1, "Costs fell.")
 	ctx.Assert(!again.Applied && again.ChunksDone == 2, "a redelivered chunk 1 answered %+v: a chunk already applied must leave the record alone and answer applied false", again)
+	ctx.Equal(again.Summary, "Revenue rose. Costs fell.", "a redelivered chunk 1 must answer the record unchanged; its summary")
 	early := stateApply(ctx, stateHashA, 3, "Margins widened.")
-	ctx.Assert(!early.Applied && early.ChunksDone == 2, "chunk 3 before chunk 2 answered %+v: only the next chunk may be applied", early)
+	ctx.Assert(!early.Applied && early.ChunksDone == 2 && early.Summary == "Revenue rose. Costs fell.", "chunk 3 before chunk 2 answered %+v: only the next chunk may be applied, and a refused one answers the record unchanged", early)
 	stored := ctx.Redis.HGetAll(stateKeyA)
 	ctx.Assert(stored["summary"] == "Revenue rose. Costs fell." && stored["chunks_done"] == "2", "after a redelivery and an early chunk the record is %v, expected the two chunks once each", stored)
 }
@@ -598,60 +614,70 @@ func CheckIdempotentChunk(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kHashA(64, 'a');
-const std::string kHashB(64, 'b');
-const std::string kKeyA = "summary:progress:t1:" + kHashA;
+const std::string hHashA(64, 'a');
+const std::string hHashB(64, 'b');
+const std::string hKeyA = "summary:progress:t1:" + hHashA;
 
 Progress stateApply(const std::string& source_hash, long index, const std::string& summary) {
   return applyChunk("t1", "doc-1", source_hash, index, summary);
 }
 
-std::string field(harness::Ctx& ctx, const std::string& key, const std::string& name) { return ctx.Redis.HGet(key, name).value_or(""); }
+std::string hField(harness::Ctx& ctx, const std::string& key, const std::string& name) { return ctx.Redis.HGet(key, name).value_or(""); }
 
 }  // namespace
 
 void CheckHashKey(harness::Ctx& ctx) {
-  stateApply(kHashA, 0, "Revenue rose.");
-  stateApply(kHashA, 1, "Costs fell.");
-  const Progress edited = stateApply(kHashB, 0, "Revenue fell.");
+  stateApply(hHashA, 0, "Revenue rose.");
+  stateApply(hHashA, 1, "Costs fell.");
+  const Progress edited = stateApply(hHashB, 0, "Revenue fell.");
   ctx.Assert(edited.summary == "Revenue fell." && edited.chunks_done == 1,
              "the first chunk of the edited source (hash bbbb...) answered %d chunks, %q: it extended the previous version's summary. Key progress by the source hash", edited.chunks_done, edited.summary);
-  ctx.Equal(field(ctx, "summary:progress:t1:" + kHashB, "summary"), "Revenue fell.", "summary:progress:t1:<source_hash> must hold the edited source's summary (Redis holds %q)", ctx.Redis.Keys("summary:progress:*"));
-  ctx.Assert(field(ctx, kKeyA, "chunks_done") == "2" && field(ctx, kKeyA, "source_ref") == "doc-1", "the previous version must keep its own record with source_ref, got %v", ctx.Redis.HGetAll(kKeyA));
+  ctx.Equal(hField(ctx, "summary:progress:t1:" + hHashB, "summary"), "Revenue fell.", "summary:progress:t1:<source_hash> must hold the edited source's summary (Redis holds %q)", ctx.Redis.Keys("summary:progress:*"));
+  ctx.Assert(hField(ctx, hKeyA, "chunks_done") == "2" && hField(ctx, hKeyA, "source_ref") == "doc-1", "the previous version must keep its own record with source_ref, got %v", ctx.Redis.HGetAll(hKeyA));
 }
 
 void CheckAtomicCommit(harness::Ctx& ctx) {
   // A second worker delivers chunk 0 right after the first command on the record.
   bool fired = false;
-  ctx.Redis.After(kKeyA, [&fired] {
+  ctx.Redis.After(hKeyA, [&fired] {
     fired = true;
-    stateApply(kHashA, 0, "Revenue rose.");
+    stateApply(hHashA, 0, "Revenue rose.");
   });
-  stateApply(kHashA, 0, "Revenue rose.");
-  ctx.Assert(fired, "applyChunk never touched %s: progress belongs under the source hash", kKeyA);
-  const auto stored = ctx.Redis.HGetAll(kKeyA);
-  ctx.Assert(field(ctx, kKeyA, "summary") == "Revenue rose." && field(ctx, kKeyA, "chunks_done") == "1",
+  stateApply(hHashA, 0, "Revenue rose.");
+  ctx.Assert(fired, "applyChunk never touched %s: progress belongs under the source hash", hKeyA);
+  const auto stored = ctx.Redis.HGetAll(hKeyA);
+  ctx.Assert(hField(ctx, hKeyA, "summary") == "Revenue rose." && hField(ctx, hKeyA, "chunks_done") == "1",
              "two deliveries of chunk 0 racing each other left %v: the read, the append and the count must run in one script, so the second sees the first", stored);
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  stateApply(kHashA, 0, "Revenue rose.");
-  long long ttl = ctx.Redis.TTL(kKeyA);
-  ctx.Assert(ttl > 0 && ttl <= 3600, "%s has TTL %d: progress for a source nobody finishes must expire (TTL_S = 3600)", kKeyA, ttl);
-  stateApply(kHashA, 1, "Costs fell.");
-  ttl = ctx.Redis.TTL(kKeyA);
-  ctx.Assert(ttl > 3500 && ttl <= 3600, "after the second chunk %s has TTL %d, expected about 3600", kKeyA, ttl);
+  // A snapshot right after the first command that writes the record: the TTL is already there.
+  bool fired = false;
+  long long seen = -3;
+  ctx.Redis.After(hKeyA, [&ctx, &fired, &seen] {
+    fired = true;
+    seen = ctx.Redis.TTL(hKeyA);
+  });
+  stateApply(hHashA, 0, "Revenue rose.");
+  ctx.Assert(fired, "applyChunk never touched %s: progress belongs under the source hash", hKeyA);
+  ctx.Assert(seen > 0 && seen <= 3600, "right after the command that wrote %s its TTL was %d: the commit script sets EXPIRE itself (TTL_S = 3600), so no moment exists without one", hKeyA, seen);
+  ctx.Clock.Advance(1800);
+  stateApply(hHashA, 1, "Costs fell.");
+  const long long ttl = ctx.Redis.TTL(hKeyA);
+  ctx.Assert(ttl > 3500 && ttl <= 3600, "a second chunk applied 30 minutes after the first left %s with TTL %d: every applied chunk refreshes it to about 3600", hKeyA, ttl);
 }
 
 void CheckIdempotentChunk(harness::Ctx& ctx) {
-  stateApply(kHashA, 0, "Revenue rose.");
-  stateApply(kHashA, 1, "Costs fell.");
-  const Progress again = stateApply(kHashA, 1, "Costs fell.");
+  stateApply(hHashA, 0, "Revenue rose.");
+  stateApply(hHashA, 1, "Costs fell.");
+  const Progress again = stateApply(hHashA, 1, "Costs fell.");
   ctx.Assert(!again.applied && again.chunks_done == 2, "a redelivered chunk 1 answered applied %t with %d chunks: a chunk already applied must leave the record alone and answer applied false", again.applied, again.chunks_done);
-  const Progress early = stateApply(kHashA, 3, "Margins widened.");
-  ctx.Assert(!early.applied && early.chunks_done == 2, "chunk 3 before chunk 2 answered applied %t with %d chunks: only the next chunk may be applied", early.applied, early.chunks_done);
-  ctx.Assert(field(ctx, kKeyA, "summary") == "Revenue rose. Costs fell." && field(ctx, kKeyA, "chunks_done") == "2",
-             "after a redelivery and an early chunk the record is %v, expected the two chunks once each", ctx.Redis.HGetAll(kKeyA));
+  ctx.Equal(again.summary, "Revenue rose. Costs fell.", "a redelivered chunk 1 must answer the record unchanged; its summary");
+  const Progress early = stateApply(hHashA, 3, "Margins widened.");
+  ctx.Assert(!early.applied && early.chunks_done == 2 && early.summary == "Revenue rose. Costs fell.",
+             "chunk 3 before chunk 2 answered applied %t with %d chunks and %q: only the next chunk may be applied, and a refused one answers the record unchanged", early.applied, early.chunks_done, early.summary);
+  ctx.Assert(hField(ctx, hKeyA, "summary") == "Revenue rose. Costs fell." && hField(ctx, hKeyA, "chunks_done") == "2",
+             "after a redelivery and an early chunk the record is %v, expected the two chunks once each", ctx.Redis.HGetAll(hKeyA));
 }
 `,
   },

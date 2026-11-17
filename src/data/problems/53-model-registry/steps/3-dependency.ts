@@ -60,7 +60,7 @@ service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply
       id: 'digest-match',
       title: 'Promotes only when the loaded digest matches',
       detail:
-        "The reply's `loaded_digest` is compared with the registered digest and a difference answers `digest_mismatch` without touching the pointer; the starter never reads the reply.",
+        "The reply's `loaded_digest` must equal the registered digest exactly (an empty one or a longer one is a mismatch), else `digest_mismatch` without touching the pointer; the starter never reads the reply.",
       match: {
         python: {all: [/\.loaded_digest/, /["']digest_mismatch["']/]},
         typescript: {all: [/\.loaded_digest/, /['"]digest_mismatch['"]/]},
@@ -73,7 +73,7 @@ service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply
       id: 'failure-blocks',
       title: 'A failed or timed-out probe leaves the pointer',
       detail:
-        'A probe that ends in `DEADLINE_EXCEEDED` answers `probe_timeout`, any other failure `probe_failed`, and neither reaches `promote`; the starter swallows the error and promotes.',
+        'A probe that ends in `DEADLINE_EXCEEDED` answers `probe_timeout`, any other failure `probe_failed`, and neither reaches `promote`. Several non-retryable statuses are each tried once; the starter swallows the error and promotes.',
       match: {
         python: {
           all: [/["']probe_timeout["']/, /["']probe_failed["']/, /DEADLINE_EXCEEDED/],
@@ -89,7 +89,7 @@ service Serving { rpc Probe(ProbeRequest) returns (ProbeReply); }  // ProbeReply
       id: 'unavailable-retry',
       title: 'One retry when the pool is UNAVAILABLE',
       detail:
-        '`UNAVAILABLE` (a restarting pool) is retried once, `MAX_ATTEMPTS` = 2 in all; every other status is final. The starter makes one attempt and promotes whatever it says.',
+        '`UNAVAILABLE` (a restarting pool) is retried once, `MAX_ATTEMPTS` = 2 in all; every other status is final. A first attempt that fails late leaves the retry its own full 10 s. The starter makes one attempt and promotes whatever it says.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /StatusCode\.UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*2\b/, /status\.UNAVAILABLE/]},
@@ -537,8 +537,13 @@ class Pool(modelregistry_pb2_grpc.ServingServicer):
 
     def __init__(self):
         self.loaded = {}
+        # The next calls that find the pool restarting: they answer UNAVAILABLE after their latency.
+        self.restarting = 0
 
     def Probe(self, request, context):
+        if self.restarting:
+            self.restarting -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "pool restarting")
         digest = self.loaded.get(f"{request.model}:{request.version}", request.expected_digest)
         return modelregistry_pb2.ProbeReply(loaded_digest=digest)
 
@@ -593,6 +598,10 @@ def check_digest_match(ctx):
     m, pool = _client(ctx)
     pool.loaded["fraud:3"] = "sha256:stale"
     _held(ctx, _promote(m), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3")
+    pool.loaded["fraud:3"] = ""
+    _held(ctx, _promote(m), "digest_mismatch", "with the pool answering an empty loaded_digest (nothing loaded yet)")
+    pool.loaded["fraud:3"] = "sha256:a3.partial"
+    _held(ctx, _promote(m), "digest_mismatch", "with the pool holding sha256:a3.partial instead of the registered sha256:a3")
     pool.loaded.clear()
     _promoted(ctx, _promote(m), "once the pool loaded the registered digest")
 
@@ -603,19 +612,38 @@ def check_failure_blocks(ctx):
     _held(ctx, _promote(m), "probe_failed", "with the probe refused PERMISSION_DENIED")
     made = len(ctx.grpc.calls_to("Probe"))
     assert made == 1, f"a PERMISSION_DENIED probe was attempted {made} times: only UNAVAILABLE is worth a retry"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.ABORTED, grpc.StatusCode.NOT_FOUND):
+        ctx.grpc.fail("Probe", code, "probe refused")
+        before = len(ctx.grpc.calls_to("Probe"))
+        _held(ctx, _promote(m), "probe_failed", f"with the probe refused {code.name}")
+        made = len(ctx.grpc.calls_to("Probe")) - before
+        assert made == 1, f"a {code.name} probe was attempted {made} times: only UNAVAILABLE is worth a retry"
+    before = len(ctx.grpc.calls_to("Probe"))
     ctx.grpc.fail("Probe", grpc.StatusCode.UNAVAILABLE, "pool restarting", times=5)
     _held(ctx, _promote(m), "probe_failed", "with the pool UNAVAILABLE on every attempt")
-    made = len(ctx.grpc.calls_to("Probe")) - 1
+    made = len(ctx.grpc.calls_to("Probe")) - before
     assert made == 2, f"a pool that stays UNAVAILABLE was probed {made} times, expected MAX_ATTEMPTS = 2"
 
 
 def check_unavailable_retry(ctx):
-    m, _ = _client(ctx)
+    m, pool = _client(ctx)
     ctx.grpc.fail("Probe", grpc.StatusCode.UNAVAILABLE, "pool restarting", times=1)
     result = _promote(m)
     made = len(ctx.grpc.calls_to("Probe"))
     assert made == 2, f"the pool answered UNAVAILABLE once and the promotion made {made} probe call(s): it must probe again and see the digest before the pointer moves"
     _promoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt")
+    # The pool restarts slowly: the first attempt answers UNAVAILABLE after 8 s. The retry gets its own 10 s.
+    ctx.redis.set("active:prod", "fraud:2")
+    ctx.redis.hset("model:fraud:v3", "stage", "staged")
+    ctx.grpc.set_latency("Probe", 8.0)
+    pool.restarting = 1
+    before = len(ctx.grpc.calls_to("Probe"))
+    result = _promote(m)
+    calls = ctx.grpc.calls_to("Probe")[before:]
+    assert len(calls) == 2, f"the pool answered UNAVAILABLE after 8 s and the promotion made {len(calls)} probe call(s), expected a retry"
+    for call in calls:
+        assert call.timeout is not None and 9.5 <= call.timeout <= 10.5, f"a Probe attempt carried a {call.timeout} s deadline after the first one took 8 s: every attempt gets the full PROBE_DEADLINE_S = 10"
+    _promoted(ctx, result, "after an UNAVAILABLE that took 8 s and a second attempt that answers in 8 s")
 `,
     typescript: `const DIGEST = 'sha256:a3';
 
@@ -623,8 +651,14 @@ def check_unavailable_retry(ctx):
 function client(ctx) {
   const pkg = ctx.proto('modelregistry.proto');
   const loaded = new Map<string, string>();
+  // The next calls that find the pool restarting: they answer UNAVAILABLE after their latency.
+  const pool = {restarting: 0};
   ctx.grpc.serve(pkg.modelregistry.Serving.service, {
     Probe(call, callback) {
+      if (pool.restarting > 0) {
+        pool.restarting -= 1;
+        return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'pool restarting'});
+      }
       const {model, version, expected_digest} = call.request;
       callback(null, {loaded_digest: loaded.get(\`\${model}:\${version}\`) ?? expected_digest});
     },
@@ -633,7 +667,7 @@ function client(ctx) {
     ctx.redis.hset(\`model:fraud:v\${n}\`, 'name', 'fraud', 'version', String(n), 'artifact_digest', \`sha256:a\${n}\`, 'training_run_id', \`r-\${n}\`, 'eval_id', \`e-\${n}\`, 'stage', stage);
   }
   ctx.redis.set('active:prod', 'fraud:2');
-  return {m: ctx.load('client'), loaded};
+  return {m: ctx.load('client'), loaded, pool};
 }
 
 const promote = m => m.promoteWithProbe('prod', 'fraud', 3, DIGEST, 'e-3');
@@ -673,6 +707,10 @@ export async function check_digest_match(ctx) {
   const {m, loaded} = client(ctx);
   loaded.set('fraud:3', 'sha256:stale');
   held(ctx, await promote(m), 'digest_mismatch', 'with the pool holding sha256:stale instead of the registered sha256:a3');
+  loaded.set('fraud:3', '');
+  held(ctx, await promote(m), 'digest_mismatch', 'with the pool answering an empty loaded_digest (nothing loaded yet)');
+  loaded.set('fraud:3', 'sha256:a3.partial');
+  held(ctx, await promote(m), 'digest_mismatch', 'with the pool holding sha256:a3.partial instead of the registered sha256:a3');
   loaded.clear();
   promoted(ctx, await promote(m), 'once the pool loaded the registered digest');
 }
@@ -683,19 +721,40 @@ export async function check_failure_blocks(ctx) {
   held(ctx, await promote(m), 'probe_failed', 'with the probe refused PERMISSION_DENIED');
   let made = ctx.grpc.callsTo('Probe').length;
   assert.equal(made, 1, \`a PERMISSION_DENIED probe was attempted \${made} times: only UNAVAILABLE is worth a retry\`);
+  for (const code of ['INTERNAL', 'RESOURCE_EXHAUSTED', 'ABORTED', 'NOT_FOUND']) {
+    ctx.grpc.fail('Probe', ctx.grpc.status[code], 'probe refused');
+    const before = ctx.grpc.callsTo('Probe').length;
+    held(ctx, await promote(m), 'probe_failed', \`with the probe refused \${code}\`);
+    made = ctx.grpc.callsTo('Probe').length - before;
+    assert.equal(made, 1, \`a \${code} probe was attempted \${made} times: only UNAVAILABLE is worth a retry\`);
+  }
+  const before = ctx.grpc.callsTo('Probe').length;
   ctx.grpc.fail('Probe', ctx.grpc.status.UNAVAILABLE, 'pool restarting', 5);
   held(ctx, await promote(m), 'probe_failed', 'with the pool UNAVAILABLE on every attempt');
-  made = ctx.grpc.callsTo('Probe').length - 1;
+  made = ctx.grpc.callsTo('Probe').length - before;
   assert.equal(made, 2, \`a pool that stays UNAVAILABLE was probed \${made} times, expected MAX_ATTEMPTS = 2\`);
 }
 
 export async function check_unavailable_retry(ctx) {
-  const {m} = client(ctx);
+  const {m, pool} = client(ctx);
   ctx.grpc.fail('Probe', ctx.grpc.status.UNAVAILABLE, 'pool restarting', 1);
   const result = await promote(m);
   const made = ctx.grpc.callsTo('Probe').length;
   assert.equal(made, 2, \`the pool answered UNAVAILABLE once and the promotion made \${made} probe call(s): it must probe again and see the digest before the pointer moves\`);
   promoted(ctx, result, 'after one UNAVAILABLE and a healthy second attempt');
+  // The pool restarts slowly: the first attempt answers UNAVAILABLE after 8 s. The retry gets its own 10 s.
+  ctx.redis.set('active:prod', 'fraud:2');
+  ctx.redis.hset('model:fraud:v3', 'stage', 'staged');
+  ctx.grpc.setLatency('Probe', 8.0);
+  pool.restarting = 1;
+  const before = ctx.grpc.callsTo('Probe').length;
+  const slow = await promote(m);
+  const calls = ctx.grpc.callsTo('Probe').slice(before);
+  assert.equal(calls.length, 2, \`the pool answered UNAVAILABLE after 8 s and the promotion made \${calls.length} probe call(s), expected a retry\`);
+  for (const call of calls) {
+    assert(call.timeout !== null && 9.5 <= call.timeout && call.timeout <= 10.5, \`a Probe attempt carried a \${call.timeout} s deadline after the first one took 8 s: every attempt gets the full PROBE_DEADLINE_MS = 10000\`);
+  }
+  promoted(ctx, slow, 'after an UNAVAILABLE that took 8 s and a second attempt that answers in 8 s');
 }
 `,
     go: `package main
@@ -706,23 +765,30 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	pb "registry/gen/modelregistry"
 
 	"leetbuild/harness"
 )
 
-const registered = "sha256:a3"
+const hRegistered = "sha256:a3"
 
-var clientBg = context.Background()
+var hBg = context.Background()
 
-// poolPeer has loaded the bytes it is asked about, except the versions in loaded ("model:version" → digest).
-type poolPeer struct {
+// hPoolPeer has loaded the bytes it is asked about, except the versions in loaded ("model:version" → digest).
+type hPoolPeer struct {
 	pb.UnimplementedServingServer
 	loaded map[string]string
+	// The next calls that find the pool restarting: they answer UNAVAILABLE after their latency.
+	restarting int
 }
 
-func (p *poolPeer) Probe(_ context.Context, req *pb.ProbeRequest) (*pb.ProbeReply, error) {
+func (p *hPoolPeer) Probe(_ context.Context, req *pb.ProbeRequest) (*pb.ProbeReply, error) {
+	if p.restarting > 0 {
+		p.restarting--
+		return nil, status.Error(codes.Unavailable, "pool restarting")
+	}
 	digest, ok := p.loaded[fmt.Sprintf("%s:%d", req.GetModel(), req.GetVersion())]
 	if !ok {
 		digest = req.GetExpectedDigest()
@@ -730,8 +796,8 @@ func (p *poolPeer) Probe(_ context.Context, req *pb.ProbeRequest) (*pb.ProbeRepl
 	return &pb.ProbeReply{LoadedDigest: digest}, nil
 }
 
-func setup(ctx *harness.Ctx) *poolPeer {
-	peer := &poolPeer{loaded: map[string]string{}}
+func hSetup(ctx *harness.Ctx) *hPoolPeer {
+	peer := &hPoolPeer{loaded: map[string]string{}}
 	pb.RegisterServingServer(ctx.GRPC.Server(""), peer)
 	ctx.Redis.Do("HSET", "model:fraud:v2", "name", "fraud", "version", "2", "artifact_digest", "sha256:a2", "training_run_id", "r-2", "eval_id", "e-2", "stage", "promoted")
 	ctx.Redis.Do("HSET", "model:fraud:v3", "name", "fraud", "version", "3", "artifact_digest", "sha256:a3", "training_run_id", "r-3", "eval_id", "e-3", "stage", "staged")
@@ -739,13 +805,13 @@ func setup(ctx *harness.Ctx) *poolPeer {
 	return peer
 }
 
-func tryPromote(ctx *harness.Ctx) probeResult {
-	result, err := promoteWithProbe(clientBg, "prod", "fraud", 3, registered, "e-3")
+func hTryPromote(ctx *harness.Ctx) probeResult {
+	result, err := promoteWithProbe(hBg, "prod", "fraud", 3, hRegistered, "e-3")
 	ctx.NoError(err, "promoteWithProbe failed")
 	return result
 }
 
-func held(ctx *harness.Ctx, result probeResult, reason, why string) {
+func hHeld(ctx *harness.Ctx, result probeResult, reason, why string) {
 	ctx.Assert(!result.Promoted && result.Reason == reason, "%s: promoteWithProbe answered %+v, expected promoted false with reason %q", why, result, reason)
 	pointer, _ := ctx.Redis.Get("active:prod")
 	ctx.Equal(pointer, "fraud:2", "%s: prod must keep serving fraud:2; active:prod", why)
@@ -753,15 +819,15 @@ func held(ctx *harness.Ctx, result probeResult, reason, why string) {
 	ctx.Equal(stage, "staged", "%s: fraud version 3 must stay staged; its stage", why)
 }
 
-func promoted(ctx *harness.Ctx, result probeResult, why string) {
+func hPromoted(ctx *harness.Ctx, result probeResult, why string) {
 	ctx.Assert(result.Promoted && result.Reason == "", "%s: promoteWithProbe answered %+v, expected promoted true", why, result)
 	pointer, _ := ctx.Redis.Get("active:prod")
 	ctx.Equal(pointer, "fraud:3", "%s: active:prod", why)
 }
 
 func CheckProbeDeadline(ctx *harness.Ctx) {
-	setup(ctx)
-	promoted(ctx, tryPromote(ctx), "with a healthy pool holding the registered digest")
+	hSetup(ctx)
+	hPromoted(ctx, hTryPromote(ctx), "with a healthy pool holding the registered digest")
 	calls := ctx.GRPC.CallsTo("Probe", "")
 	ctx.Assert(len(calls) > 0, "no Probe call was made before the pointer moved")
 	for _, call := range calls {
@@ -772,34 +838,58 @@ func CheckProbeDeadline(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", "model:fraud:v3", "stage", "staged")
 	ctx.GRPC.SetLatency("Probe", 30.0, "")
 	before := len(ctx.GRPC.CallsTo("Probe", ""))
-	held(ctx, tryPromote(ctx), "probe_timeout", "with a pool that takes 30 s to answer")
+	hHeld(ctx, hTryPromote(ctx), "probe_timeout", "with a pool that takes 30 s to answer")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", ""))-before, 1, "DEADLINE_EXCEEDED is final, reported as probe_timeout; the attempts")
 }
 
 func CheckDigestMatch(ctx *harness.Ctx) {
-	peer := setup(ctx)
+	peer := hSetup(ctx)
 	peer.loaded["fraud:3"] = "sha256:stale"
-	held(ctx, tryPromote(ctx), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3")
+	hHeld(ctx, hTryPromote(ctx), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3")
+	peer.loaded["fraud:3"] = ""
+	hHeld(ctx, hTryPromote(ctx), "digest_mismatch", "with the pool answering an empty loaded_digest (nothing loaded yet)")
+	peer.loaded["fraud:3"] = "sha256:a3.partial"
+	hHeld(ctx, hTryPromote(ctx), "digest_mismatch", "with the pool holding sha256:a3.partial instead of the registered sha256:a3")
 	delete(peer.loaded, "fraud:3")
-	promoted(ctx, tryPromote(ctx), "once the pool loaded the registered digest")
+	hPromoted(ctx, hTryPromote(ctx), "once the pool loaded the registered digest")
 }
 
 func CheckFailureBlocks(ctx *harness.Ctx) {
-	setup(ctx)
+	hSetup(ctx)
 	ctx.GRPC.Fail("Probe", codes.PermissionDenied, "registryd may not probe prod", 1, "")
-	held(ctx, tryPromote(ctx), "probe_failed", "with the probe refused PERMISSION_DENIED")
+	hHeld(ctx, hTryPromote(ctx), "probe_failed", "with the probe refused PERMISSION_DENIED")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", "")), 1, "only UNAVAILABLE is worth a retry; the attempts of a PERMISSION_DENIED probe")
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.Aborted, codes.NotFound} {
+		ctx.GRPC.Fail("Probe", code, "probe refused", 1, "")
+		before := len(ctx.GRPC.CallsTo("Probe", ""))
+		hHeld(ctx, hTryPromote(ctx), "probe_failed", fmt.Sprintf("with the probe refused %v", code))
+		ctx.Equal(len(ctx.GRPC.CallsTo("Probe", ""))-before, 1, "only UNAVAILABLE is worth a retry; the attempts of a %v probe", code)
+	}
+	before := len(ctx.GRPC.CallsTo("Probe", ""))
 	ctx.GRPC.Fail("Probe", codes.Unavailable, "pool restarting", 5, "")
-	held(ctx, tryPromote(ctx), "probe_failed", "with the pool UNAVAILABLE on every attempt")
-	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", ""))-1, 2, "a pool that stays UNAVAILABLE gets maxAttempts = 2 probes; the attempts")
+	hHeld(ctx, hTryPromote(ctx), "probe_failed", "with the pool UNAVAILABLE on every attempt")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", ""))-before, 2, "a pool that stays UNAVAILABLE gets maxAttempts = 2 probes; the attempts")
 }
 
 func CheckUnavailableRetry(ctx *harness.Ctx) {
-	setup(ctx)
+	peer := hSetup(ctx)
 	ctx.GRPC.Fail("Probe", codes.Unavailable, "pool restarting", 1, "")
-	result := tryPromote(ctx)
+	result := hTryPromote(ctx)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Probe", "")), 2, "the pool answered UNAVAILABLE once: the promotion must probe again and see the digest before the pointer moves; the probe calls")
-	promoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt")
+	hPromoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt")
+	// The pool restarts slowly: the first attempt answers UNAVAILABLE after 8 s. The retry gets its own 10 s.
+	ctx.Redis.Set("active:prod", "fraud:2")
+	ctx.Redis.Do("HSET", "model:fraud:v3", "stage", "staged")
+	ctx.GRPC.SetLatency("Probe", 8.0, "")
+	peer.restarting = 1
+	before := len(ctx.GRPC.CallsTo("Probe", ""))
+	slow := hTryPromote(ctx)
+	calls := ctx.GRPC.CallsTo("Probe", "")[before:]
+	ctx.Equal(len(calls), 2, "the pool answered UNAVAILABLE after 8 s: the promotion must retry; the probe calls")
+	for _, call := range calls {
+		ctx.Assert(call.HasDeadline() && 9500*time.Millisecond <= call.Timeout && call.Timeout <= 10500*time.Millisecond, "a Probe attempt carried a %v deadline after the first one took 8 s: every attempt gets the full probeDeadline = 10 s", call.Timeout)
+	}
+	hPromoted(ctx, slow, "after an UNAVAILABLE that took 8 s and a second attempt that answers in 8 s")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -815,14 +905,20 @@ const std::string kRegistered = "sha256:a3";
 class PoolPeer final : public modelregistry::Serving::Service {
  public:
   std::map<std::string, std::string> loaded;
+  // The next calls that find the pool restarting: they answer UNAVAILABLE after their latency.
+  int restarting = 0;
   grpc::Status Probe(grpc::ServerContext*, const modelregistry::ProbeRequest* req, modelregistry::ProbeReply* out) override {
+    if (restarting > 0) {
+      --restarting;
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "pool restarting");
+    }
     const auto it = loaded.find(req->model() + ":" + std::to_string(req->version()));
     out->set_loaded_digest(it == loaded.end() ? req->expected_digest() : it->second);
     return grpc::Status::OK;
   }
 };
 
-PoolPeer& setup(harness::Ctx& ctx) {
+PoolPeer& hSetup(harness::Ctx& ctx) {
   static PoolPeer* peer = nullptr;
   delete peer;
   peer = new PoolPeer;
@@ -833,16 +929,16 @@ PoolPeer& setup(harness::Ctx& ctx) {
   return *peer;
 }
 
-ProbeResult tryPromote() { return promoteWithProbe("prod", "fraud", 3, kRegistered, "e-3"); }
+ProbeResult hTryPromote() { return promoteWithProbe("prod", "fraud", 3, kRegistered, "e-3"); }
 
-void held(harness::Ctx& ctx, const ProbeResult& result, const std::string& reason, const std::string& why) {
+void hHeld(harness::Ctx& ctx, const ProbeResult& result, const std::string& reason, const std::string& why) {
   ctx.Assert(!result.promoted && result.reason == reason, "%s: promoteWithProbe answered promoted %t reason %q, expected promoted false with reason %q", why,
              result.promoted, result.reason, reason);
   ctx.Equal(ctx.Redis.Get("active:prod").value_or(""), "fraud:2", "%s: prod must keep serving fraud:2; active:prod", why);
   ctx.Equal(ctx.Redis.HGet("model:fraud:v3", "stage").value_or(""), "staged", "%s: fraud version 3 must stay staged; its stage", why);
 }
 
-void promoted(harness::Ctx& ctx, const ProbeResult& result, const std::string& why) {
+void hPromoted(harness::Ctx& ctx, const ProbeResult& result, const std::string& why) {
   ctx.Assert(result.promoted && result.reason.empty(), "%s: promoteWithProbe answered promoted %t reason %q, expected promoted true", why, result.promoted, result.reason);
   ctx.Equal(ctx.Redis.Get("active:prod").value_or(""), "fraud:3", "%s: active:prod", why);
 }
@@ -850,8 +946,8 @@ void promoted(harness::Ctx& ctx, const ProbeResult& result, const std::string& w
 }  // namespace
 
 void CheckProbeDeadline(harness::Ctx& ctx) {
-  setup(ctx);
-  promoted(ctx, tryPromote(), "with a healthy pool holding the registered digest");
+  hSetup(ctx);
+  hPromoted(ctx, hTryPromote(), "with a healthy pool holding the registered digest");
   const auto calls = ctx.GRPC.CallsTo("Probe");
   ctx.Assert(!calls.empty(), "no Probe call was made before the pointer moved");
   for (const auto& call : calls) {
@@ -862,35 +958,64 @@ void CheckProbeDeadline(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "model:fraud:v3", "stage", "staged");
   ctx.GRPC.SetLatency("Probe", 30.0);
   const size_t before = ctx.GRPC.CallsTo("Probe").size();
-  held(ctx, tryPromote(), "probe_timeout", "with a pool that takes 30 s to answer");
+  hHeld(ctx, hTryPromote(), "probe_timeout", "with a pool that takes 30 s to answer");
   ctx.Equal(ctx.GRPC.CallsTo("Probe").size() - before, 1, "DEADLINE_EXCEEDED is final, reported as probe_timeout; the attempts");
 }
 
 void CheckDigestMatch(harness::Ctx& ctx) {
-  PoolPeer& peer = setup(ctx);
+  PoolPeer& peer = hSetup(ctx);
   peer.loaded["fraud:3"] = "sha256:stale";
-  held(ctx, tryPromote(), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3");
+  hHeld(ctx, hTryPromote(), "digest_mismatch", "with the pool holding sha256:stale instead of the registered sha256:a3");
+  peer.loaded["fraud:3"] = "";
+  hHeld(ctx, hTryPromote(), "digest_mismatch", "with the pool answering an empty loaded_digest (nothing loaded yet)");
+  peer.loaded["fraud:3"] = "sha256:a3.partial";
+  hHeld(ctx, hTryPromote(), "digest_mismatch", "with the pool holding sha256:a3.partial instead of the registered sha256:a3");
   peer.loaded.clear();
-  promoted(ctx, tryPromote(), "once the pool loaded the registered digest");
+  hPromoted(ctx, hTryPromote(), "once the pool loaded the registered digest");
 }
 
 void CheckFailureBlocks(harness::Ctx& ctx) {
-  setup(ctx);
+  hSetup(ctx);
   ctx.GRPC.Fail("Probe", grpc::StatusCode::PERMISSION_DENIED, "registryd may not probe prod", 1);
-  held(ctx, tryPromote(), "probe_failed", "with the probe refused PERMISSION_DENIED");
+  hHeld(ctx, hTryPromote(), "probe_failed", "with the probe refused PERMISSION_DENIED");
   ctx.Equal(ctx.GRPC.CallsTo("Probe").size(), 1, "only UNAVAILABLE is worth a retry; the attempts of a PERMISSION_DENIED probe");
+  const std::pair<grpc::StatusCode, std::string> terminal[] = {{grpc::StatusCode::INTERNAL, "INTERNAL"},
+                                                               {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+                                                               {grpc::StatusCode::ABORTED, "ABORTED"},
+                                                               {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"}};
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.Fail("Probe", code, "probe refused", 1);
+    const size_t made = ctx.GRPC.CallsTo("Probe").size();
+    hHeld(ctx, hTryPromote(), "probe_failed", "with the probe refused " + name);
+    ctx.Equal(ctx.GRPC.CallsTo("Probe").size() - made, 1, "only UNAVAILABLE is worth a retry; the attempts of a %s probe", name);
+  }
+  const size_t before = ctx.GRPC.CallsTo("Probe").size();
   ctx.GRPC.Fail("Probe", grpc::StatusCode::UNAVAILABLE, "pool restarting", 5);
-  held(ctx, tryPromote(), "probe_failed", "with the pool UNAVAILABLE on every attempt");
-  ctx.Equal(ctx.GRPC.CallsTo("Probe").size() - 1, 2, "a pool that stays UNAVAILABLE gets kMaxAttempts = 2 probes; the attempts");
+  hHeld(ctx, hTryPromote(), "probe_failed", "with the pool UNAVAILABLE on every attempt");
+  ctx.Equal(ctx.GRPC.CallsTo("Probe").size() - before, 2, "a pool that stays UNAVAILABLE gets kMaxAttempts = 2 probes; the attempts");
 }
 
 void CheckUnavailableRetry(harness::Ctx& ctx) {
-  setup(ctx);
+  PoolPeer& peer = hSetup(ctx);
   ctx.GRPC.Fail("Probe", grpc::StatusCode::UNAVAILABLE, "pool restarting", 1);
-  const ProbeResult result = tryPromote();
+  const ProbeResult result = hTryPromote();
   ctx.Equal(ctx.GRPC.CallsTo("Probe").size(), 2,
             "the pool answered UNAVAILABLE once: the promotion must probe again and see the digest before the pointer moves; the probe calls");
-  promoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt");
+  hPromoted(ctx, result, "after one UNAVAILABLE and a healthy second attempt");
+  // The pool restarts slowly: the first attempt answers UNAVAILABLE after 8 s. The retry gets its own 10 s.
+  ctx.Redis.Set("active:prod", "fraud:2");
+  ctx.Redis.Do("HSET", "model:fraud:v3", "stage", "staged");
+  ctx.GRPC.SetLatency("Probe", 8.0);
+  peer.restarting = 1;
+  const size_t before = ctx.GRPC.CallsTo("Probe").size();
+  const ProbeResult slow = hTryPromote();
+  const auto calls = ctx.GRPC.CallsTo("Probe");
+  ctx.Equal(calls.size() - before, 2, "the pool answered UNAVAILABLE after 8 s: the promotion must retry; the probe calls");
+  for (size_t i = before; i < calls.size(); ++i) {
+    ctx.Assert(calls[i].HasDeadline() && 9.5 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 10.5,
+               "a Probe attempt carried a %v s deadline after the first one took 8 s: every attempt gets the full kProbeDeadline = 10 s", calls[i].TimeoutSeconds());
+  }
+  hPromoted(ctx, slow, "after an UNAVAILABLE that took 8 s and a second attempt that answers in 8 s");
 }
 `,
   },

@@ -56,7 +56,7 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
       id: 'deadline',
       title: 'Every attempt carries a one-second deadline',
       detail:
-        'Each `Raise` is made with `DEADLINE_S` = 1 s (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`); without one a stalled alerting service holds the evaluator open.',
+        'Each `Raise` attempt is made with its own `DEADLINE_S` = 1 s (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`), not what is left of one shared deadline, and an attempt that runs out of time is retried like any failure; without a deadline a stalled alerting service holds the evaluator open.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1(\.0)?\b/, /Raise\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -69,7 +69,7 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
       id: 'dedupe-cooldown',
       title: 'Pages once per (monitor, window) and cooldown',
       detail:
-        'The page is claimed under `alert:{monitor_id}:{window}` with a set-if-absent that expires after `COOLDOWN_S` = 300 s; a second evaluation of the same window finds the claim and does not call.',
+        'The page is claimed under `alert:{monitor_id}:{window}` with one set-if-absent command that also sets the `COOLDOWN_S` = 300 s expiry; of two evaluators that see the same window at once only one pages, and a later evaluation finds the claim and does not call.',
       match: {
         python: {all: [/COOLDOWN_S\s*=\s*300\b/, /nx\s*=\s*True/, /ex\s*=\s*COOLDOWN_S/]},
         typescript: {all: [/COOLDOWN_S\s*=\s*300\b/, /['"]NX['"]/, /['"]EX['"],\s*COOLDOWN_S/]},
@@ -108,7 +108,7 @@ service Alerting { rpc Raise(AlertRequest) returns (AlertReply); }  // UNAVAILAB
       id: 'retry-backoff',
       title: 'Retries with backoff, then releases the claim',
       detail:
-        'A failed `Raise` is retried up to `MAX_ATTEMPTS` with a doubling backoff; when every attempt failed the claim is deleted and `AlertUnavailable` raised, so the next evaluation pages instead of finding a claim nobody acted on.',
+        'A failed `Raise` is retried up to `MAX_ATTEMPTS`, sleeping `BACKOFF_S` (0.2 s) and then 0.4 s; when every attempt failed the claim is deleted and `AlertUnavailable` raised, so the next evaluation pages instead of finding a claim nobody acted on.',
       match: {
         python: {all: [/MAX_ATTEMPTS/, /BACKOFF_S/, /time\.sleep\(/, /raise AlertUnavailable/]},
         typescript: {all: [/MAX_ATTEMPTS/, /BACKOFF_MS/, /setTimeout\(/, /throw new AlertUnavailable/]},
@@ -638,12 +638,34 @@ def check_deadline(ctx):
     before = ctx.clock.time()
     _unavailable(m, 1200, "with alerting stalled for 30 s")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"raise_alert spent {waited:.1f} s on a stalled alerting service, expected about 3 attempts of 1 s"
+    stalled = [call for call in ctx.grpc.calls_to("Raise") if call.request.window_start == 1200]
+    assert len(stalled) == 3, f"with alerting stalled raise_alert made {len(stalled)} Raise calls, expected MAX_ATTEMPTS = 3: a call that ran out its deadline failed and is retried"
+    for call in stalled:
+        assert call.timeout is not None and 0.5 <= call.timeout <= 1.5, f"with alerting stalled the attempts carried deadlines of {[c.timeout for c in stalled]} s, expected DEADLINE_S = 1 on every attempt"
+    assert waited <= 4.0, f"raise_alert spent {waited:.1f} s on a stalled alerting service, expected about 3.6 s: 3 attempts of 1 s and backoffs of 0.2 s and 0.4 s"
+    # The first attempt fails, and every later one takes 0.9 s: each attempt needs a full deadline of its own.
+    ctx.grpc.set_latency("Raise", 0.9)
+    ctx.grpc.fail("Raise", grpc.StatusCode.UNAVAILABLE, "alerting is restarting", times=1)
+    try:
+        paged = _page(m, 1500)
+    except m.AlertUnavailable:
+        paged = "AlertUnavailable"
+    deadlines = [call.timeout for call in ctx.grpc.calls_to("Raise") if call.request.window_start == 1500]
+    assert paged is True, f"with the first attempt UNAVAILABLE and alerting answering in 0.9 s, raise_alert gave {paged!r} after attempts with deadlines {deadlines} s, expected True on the second attempt: every attempt carries its own DEADLINE_S, not what is left of one shared deadline"
 
 
 def check_dedupe_cooldown(ctx):
     m, _ = _client(ctx)
-    assert _page(m, 900) is True, "the first evaluation of window 900 must page"
+    # A second evaluator sees window 900 right after this one's first command on the claim.
+    rival = ctx.redis_after("alert:m-1:900", lambda: (ctx.redis.ttl("alert:m-1:900"), _page(m, 900)))
+    first = _page(m, 900)
+    assert rival.fired, "the evaluation of window 900 never touched alert:m-1:900"
+    if rival.error is not None:
+        raise rival.error
+    claim_ttl, second = rival.result
+    calls = len(ctx.grpc.calls_to("Raise"))
+    assert [first, second].count(True) == 1 and calls == 1, f"two evaluators of window 900 returned {first!r} and {second!r} after {calls} Raise calls, expected one True and 1 call: the claim is checked and taken in one command (SET NX), not a read then a write"
+    assert 290 <= claim_ttl <= 300, f"right after the command that claimed alert:m-1:900 it expired in {claim_ttl} s, expected the 300 s cooldown set in the same command"
     again = _page(m, 900)
     calls = len(ctx.grpc.calls_to("Raise"))
     assert again is False and calls == 1, f"a second evaluation of window 900 returned {again!r} after {calls} Raise calls, expected False and 1 call: one drifting window pages on every evaluator tick"
@@ -675,8 +697,8 @@ def check_retry_backoff(ctx):
     paged = _page(m, 900)
     calls = ctx.grpc.calls_to("Raise")
     assert paged is True and len(calls) == 3, f"with two UNAVAILABLE answers raise_alert returned {paged!r} after {len(calls)} calls, expected True after 3: the page that mattered was dropped"
-    gaps = [b.started - a.started for a, b in zip(calls, calls[1:])]
-    assert gaps[0] > 0 and gaps[1] > gaps[0], f"the retries came {gaps} s apart, expected a growing backoff (0.2 s, then 0.4 s)"
+    gaps = [round(b.started - a.started, 3) for a, b in zip(calls, calls[1:])]
+    assert 0.15 <= gaps[0] <= 0.3 and 0.3 < gaps[1] <= 0.6, f"the retries came {gaps} s apart, expected BACKOFF_S doubled: 0.2 s, then 0.4 s"
     ctx.grpc.fail("Raise", grpc.StatusCode.UNAVAILABLE, "alerting is down", times=3)
     _unavailable(m, 1200, "with alerting down for every attempt")
     assert ctx.redis.exists("alert:m-1:1200") == 0, "every attempt failed but alert:m-1:1200 is still claimed: the next evaluation will not page for 300 s. Delete the claim"
@@ -720,14 +742,39 @@ export async function check_deadline(ctx) {
   const before = ctx.clock.now();
   await unavailable(m, 1200, 'with alerting stalled for 30 s');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`raiseAlert spent \${waited.toFixed(1)} s on a stalled alerting service, expected about 3 attempts of 1 s\`);
+  const stalled = ctx.grpc.callsTo('Raise').filter(call => Number(call.request.window_start) === 1200);
+  assert.equal(stalled.length, 3, \`with alerting stalled raiseAlert made \${stalled.length} Raise calls, expected MAX_ATTEMPTS = 3: a call that ran out its deadline failed and is retried\`);
+  for (const call of stalled) {
+    assert(call.timeout !== null && call.timeout >= 0.5 && call.timeout <= 1.5, \`with alerting stalled the attempts carried deadlines of \${JSON.stringify(stalled.map(c => c.timeout))} s, expected DEADLINE_MS = 1000 on every attempt\`);
+  }
+  assert(waited <= 4.0, \`raiseAlert spent \${waited.toFixed(1)} s on a stalled alerting service, expected about 3.6 s: 3 attempts of 1 s and backoffs of 200 ms and 400 ms\`);
+  // The first attempt fails, and every later one takes 0.9 s: each attempt needs a full deadline of its own.
+  ctx.grpc.setLatency('Raise', 0.9);
+  ctx.grpc.fail('Raise', ctx.grpc.status.UNAVAILABLE, 'alerting is restarting', 1);
+  let paged;
+  try {
+    paged = await page(m, 1500);
+  } catch (e) {
+    if (!(e instanceof m.AlertUnavailable)) throw e;
+    paged = 'AlertUnavailable';
+  }
+  const deadlines = ctx.grpc.callsTo('Raise').filter(call => Number(call.request.window_start) === 1500).map(call => call.timeout);
+  assert.equal(paged, true, \`with the first attempt UNAVAILABLE and alerting answering in 0.9 s, raiseAlert gave \${paged} after attempts with deadlines \${JSON.stringify(deadlines)} s, expected true on the second attempt: every attempt carries its own DEADLINE_MS, not what is left of one shared deadline\`);
 }
 
 export async function check_dedupe_cooldown(ctx) {
   const {m} = client(ctx);
-  assert.equal(await page(m, 900), true, 'the first evaluation of window 900 must page');
+  // A second evaluator sees window 900 right after this one's first command on the claim.
+  const rival = ctx.redisAfter('alert:m-1:900', () => [ctx.redis.ttl('alert:m-1:900'), page(m, 900)]);
+  const first = await page(m, 900);
+  assert(rival.fired, 'the evaluation of window 900 never touched alert:m-1:900');
+  const [claimTtl, pending] = rival.result;
+  const second = await pending;
+  let calls = ctx.grpc.callsTo('Raise').length;
+  assert([first, second].filter(v => v === true).length === 1 && calls === 1, \`two evaluators of window 900 returned \${first} and \${second} after \${calls} Raise calls, expected one true and 1 call: the claim is checked and taken in one command (SET NX), not a read then a write\`);
+  assert(claimTtl >= 290 && claimTtl <= 300, \`right after the command that claimed alert:m-1:900 it expired in \${claimTtl} s, expected the 300 s cooldown set in the same command\`);
   const again = await page(m, 900);
-  const calls = ctx.grpc.callsTo('Raise').length;
+  calls = ctx.grpc.callsTo('Raise').length;
   assert(again === false && calls === 1, \`a second evaluation of window 900 returned \${again} after \${calls} Raise calls, expected false and 1 call: one drifting window pages on every evaluator tick\`);
   const ttl = ctx.redis.ttl('alert:m-1:900');
   assert(ttl >= 290 && ttl <= 300, \`alert:m-1:900 expires in \${ttl} s, expected the 300 s cooldown\`);
@@ -767,7 +814,7 @@ export async function check_retry_backoff(ctx) {
   const calls = ctx.grpc.callsTo('Raise');
   assert(paged === true && calls.length === 3, \`with two UNAVAILABLE answers raiseAlert returned \${paged} after \${calls.length} calls, expected true after 3: the page that mattered was dropped\`);
   const gaps = [calls[1].started - calls[0].started, calls[2].started - calls[1].started];
-  assert(gaps[0] > 0 && gaps[1] > gaps[0], \`the retries came \${JSON.stringify(gaps)} ms apart, expected a growing backoff (200 ms, then 400 ms)\`);
+  assert(gaps[0] >= 150 && gaps[0] <= 300 && gaps[1] > 300 && gaps[1] <= 600, \`the retries came \${JSON.stringify(gaps)} ms apart, expected BACKOFF_MS doubled: 200 ms, then 400 ms\`);
   ctx.grpc.fail('Raise', ctx.grpc.status.UNAVAILABLE, 'alerting is down', 3);
   await unavailable(m, 1200, 'with alerting down for every attempt');
   assert.equal(ctx.redis.exists('alert:m-1:1200'), 0, 'every attempt failed but alert:m-1:1200 is still claimed: the next evaluation will not page for 300 s. Delete the claim');
@@ -788,76 +835,110 @@ import (
 	"leetbuild/harness"
 )
 
-var monitor = store.Monitor{MonitorID: "m-1", Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: "baseline:v3:2026-10-01", Threshold: 0.2}
+var hMonitor = store.Monitor{MonitorID: "m-1", Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: "baseline:v3:2026-10-01", Threshold: 0.2}
 
-// alertingPeer takes every page and notes whether alert:m-1:900 was claimed when the page arrived.
-type alertingPeer struct {
+// hAlertingPeer takes every page and notes whether alert:m-1:900 was claimed when the page arrived.
+type hAlertingPeer struct {
 	pb.UnimplementedAlertingServer
 	ctx     *harness.Ctx
 	claimed []int64
 }
 
-func (p *alertingPeer) Raise(_ context.Context, _ *pb.AlertRequest) (*pb.AlertReply, error) {
+func (p *hAlertingPeer) Raise(_ context.Context, _ *pb.AlertRequest) (*pb.AlertReply, error) {
 	p.claimed = append(p.claimed, p.ctx.Redis.Exists("alert:m-1:900"))
 	return &pb.AlertReply{AlertId: fmt.Sprintf("a-%d", len(p.claimed))}, nil
 }
 
-func client(ctx *harness.Ctx) *alertingPeer {
-	peer := &alertingPeer{ctx: ctx}
+func hClient(ctx *harness.Ctx) *hAlertingPeer {
+	peer := &hAlertingPeer{ctx: ctx}
 	pb.RegisterAlertingServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func page(window int64) (bool, error) {
-	return raiseAlert(context.Background(), monitor, window, 0.31, 640, 5000)
+func hPage(window int64) (bool, error) {
+	return raiseAlert(context.Background(), hMonitor, window, 0.31, 640, 5000)
 }
 
-func paged(ctx *harness.Ctx, window int64, why string) bool {
-	ok, err := page(window)
+func hPaged(ctx *harness.Ctx, window int64, why string) bool {
+	ok, err := hPage(window)
 	ctx.NoError(err, "%s: raiseAlert failed", why)
 	return ok
 }
 
-func unavailable(ctx *harness.Ctx, window int64, why string) {
-	ok, err := page(window)
+func hUnavailable(ctx *harness.Ctx, window int64, why string) {
+	ok, err := hPage(window)
 	ctx.Assert(err != nil, "%s: raiseAlert returned %v and no error, expected one wrapping ErrAlertUnavailable", why, ok)
 	ctx.ErrorIs(err, ErrAlertUnavailable, "%s: raiseAlert returned %v", why, err)
 }
 
+func hDeadlinesFor(ctx *harness.Ctx, window int64) []time.Duration {
+	var deadlines []time.Duration
+	for _, call := range ctx.GRPC.CallsTo("Raise", "") {
+		if call.Request.(*pb.AlertRequest).GetWindowStart() == window {
+			deadlines = append(deadlines, call.Timeout)
+		}
+	}
+	return deadlines
+}
+
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Equal(paged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged")
+	hClient(ctx)
+	ctx.Equal(hPaged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged")
 	for _, call := range ctx.GRPC.CallsTo("Raise", "") {
 		ctx.Assert(call.HasDeadline(), "a Raise call carries no deadline: a stalled alerting service would hold the evaluator open")
 		ctx.Assert(call.Timeout >= 500*time.Millisecond && call.Timeout <= 1500*time.Millisecond, "a Raise call carries a %v deadline, expected 1 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Raise", 30.0, "")
 	before := ctx.Clock.Now()
-	unavailable(ctx, 1200, "with alerting stalled for 30 s")
+	hUnavailable(ctx, 1200, "with alerting stalled for 30 s")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "raiseAlert spent %.1f s on a stalled alerting service, expected about 3 attempts of 1 s", waited)
+	stalled := hDeadlinesFor(ctx, 1200)
+	ctx.Assert(len(stalled) == 3, "with alerting stalled raiseAlert made %d Raise calls, expected maxAttempts = 3: a call that ran out its deadline failed and is retried", len(stalled))
+	for _, timeout := range stalled {
+		ctx.Assert(timeout >= 500*time.Millisecond && timeout <= 1500*time.Millisecond, "with alerting stalled the attempts carried deadlines of %v, expected 1 s on every attempt", stalled)
+	}
+	ctx.Assert(waited <= 4.0, "raiseAlert spent %.1f s on a stalled alerting service, expected about 3.6 s: 3 attempts of 1 s and backoffs of 200 ms and 400 ms", waited)
+	// The first attempt fails, and every later one takes 0.9 s: each attempt needs a full deadline of its own.
+	ctx.GRPC.SetLatency("Raise", 0.9, "")
+	ctx.GRPC.Fail("Raise", codes.Unavailable, "alerting is restarting", 1, "")
+	ok, err := hPage(1500)
+	ctx.Assert(ok && err == nil, "with the first attempt UNAVAILABLE and alerting answering in 0.9 s, raiseAlert returned %v, %v after attempts with deadlines %v, expected true on the second attempt: every attempt carries its own deadline, not what is left of one shared deadline", ok, err, hDeadlinesFor(ctx, 1500))
 }
 
 func CheckDedupeCooldown(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Equal(paged(ctx, 900, "the first evaluation"), true, "the first evaluation of window 900 must page; paged")
-	again := paged(ctx, 900, "the second evaluation")
+	hClient(ctx)
+	// A second evaluator sees window 900 right after this one's first command on the claim.
+	var claimTTL int64
+	var second bool
+	rival := ctx.Redis.After("alert:m-1:900", func() any {
+		claimTTL = ctx.Redis.TTL("alert:m-1:900")
+		ok, err := hPage(900)
+		second = ok
+		return err
+	})
+	first := hPaged(ctx, 900, "the first evaluation")
+	ctx.Assert(rival.Fired, "the evaluation of window 900 never touched alert:m-1:900")
+	ctx.Assert(rival.Result == nil, "the second evaluator failed: %v", rival.Result)
 	calls := len(ctx.GRPC.CallsTo("Raise", ""))
+	ctx.Assert(first != second && calls == 1, "two evaluators of window 900 returned %v and %v after %d Raise calls, expected one true and 1 call: the claim is checked and taken in one command (SET NX), not a read then a write", first, second, calls)
+	ctx.Assert(claimTTL >= 290 && claimTTL <= 300, "right after the command that claimed alert:m-1:900 it expired in %d s, expected the 300 s cooldown set in the same command", claimTTL)
+	again := hPaged(ctx, 900, "the second evaluation")
+	calls = len(ctx.GRPC.CallsTo("Raise", ""))
 	ctx.Assert(!again && calls == 1, "a second evaluation of window 900 returned %v after %d Raise calls, expected false and 1 call: one drifting window pages on every evaluator tick", again, calls)
 	ttl := ctx.Redis.TTL("alert:m-1:900")
 	ctx.Assert(ttl >= 290 && ttl <= 300, "alert:m-1:900 expires in %d s, expected the 300 s cooldown", ttl)
-	ctx.Assert(paged(ctx, 1200, "window 1200") && len(ctx.GRPC.CallsTo("Raise", "")) == 2, "window 1200 is a new window and must page")
+	ctx.Assert(hPaged(ctx, 1200, "window 1200") && len(ctx.GRPC.CallsTo("Raise", "")) == 2, "window 1200 is a new window and must page")
 }
 
 func CheckClaimBeforeCall(ctx *harness.Ctx) {
-	peer := client(ctx)
-	ctx.Equal(paged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged")
+	peer := hClient(ctx)
+	ctx.Equal(hPaged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged")
 	ctx.Equal(peer.claimed, []int64{1}, "when the page reached alerting, alert:m-1:900 must exist (a second evaluator seeing window 900 during the call would page too; claim before calling); claimed at each call")
 }
 
 func CheckPayloadEvidence(ctx *harness.Ctx) {
-	client(ctx)
-	page(900)
+	hClient(ctx)
+	hPage(900)
 	calls := ctx.GRPC.CallsTo("Raise", "")
 	ctx.Assert(len(calls) > 0, "no Raise call was made")
 	r := calls[0].Request.(*pb.AlertRequest)
@@ -867,21 +948,23 @@ func CheckPayloadEvidence(ctx *harness.Ctx) {
 }
 
 func CheckRetryBackoff(ctx *harness.Ctx) {
-	client(ctx)
+	hClient(ctx)
 	ctx.GRPC.Fail("Raise", codes.Unavailable, "alerting is restarting", 2, "")
-	ok := paged(ctx, 900, "with two UNAVAILABLE answers")
+	ok := hPaged(ctx, 900, "with two UNAVAILABLE answers")
 	calls := ctx.GRPC.CallsTo("Raise", "")
 	ctx.Assert(ok && len(calls) == 3, "with two UNAVAILABLE answers raiseAlert returned %v after %d calls, expected true after 3: the page that mattered was dropped", ok, len(calls))
 	first, second := calls[1].Started.Sub(calls[0].Started), calls[2].Started.Sub(calls[1].Started)
-	ctx.Assert(first > 0 && second > first, "the retries came %v and %v apart, expected a growing backoff (200 ms, then 400 ms)", first, second)
+	ctx.Assert(first >= 150*time.Millisecond && first <= 300*time.Millisecond && second > 300*time.Millisecond && second <= 600*time.Millisecond, "the retries came %v and %v apart, expected backoff doubled: 200 ms, then 400 ms", first, second)
 	ctx.GRPC.Fail("Raise", codes.Unavailable, "alerting is down", 3, "")
-	unavailable(ctx, 1200, "with alerting down for every attempt")
+	hUnavailable(ctx, 1200, "with alerting down for every attempt")
 	ctx.Equal(ctx.Redis.Exists("alert:m-1:1200"), 0, "every attempt failed, so alert:m-1:1200 must be released (or the next evaluation will not page for 300 s); exists")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <chrono>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -890,10 +973,10 @@ func CheckRetryBackoff(ctx *harness.Ctx) {
 
 namespace {
 
-const store::Monitor kMonitor{"m-1", "t1", "v3", "input_distribution", 300, "baseline:v3:2026-10-01", 0.2};
+const store::Monitor hMonitor{"m-1", "t1", "v3", "input_distribution", 300, "baseline:v3:2026-10-01", 0.2};
 
 // Takes every page and notes whether alert:m-1:900 was claimed when the page arrived.
-class AlertingPeer final : public driftmon::Alerting::Service {
+class HAlertingPeer final : public driftmon::Alerting::Service {
  public:
   harness::Ctx* ctx = nullptr;
   std::vector<long long> claimed;
@@ -904,27 +987,27 @@ class AlertingPeer final : public driftmon::Alerting::Service {
   }
 };
 
-AlertingPeer& client(harness::Ctx& ctx) {
-  static AlertingPeer* peer = nullptr;
+HAlertingPeer& hClient(harness::Ctx& ctx) {
+  static HAlertingPeer* peer = nullptr;
   delete peer;
-  peer = new AlertingPeer;
+  peer = new HAlertingPeer;
   peer->ctx = &ctx;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-bool paged(harness::Ctx& ctx, long window, const std::string& why) {
+bool hPaged(harness::Ctx& ctx, long window, const std::string& why) {
   try {
-    return raiseAlert(kMonitor, window, 0.31, 640, 5000);
+    return raiseAlert(hMonitor, window, 0.31, 640, 5000);
   } catch (const std::exception& e) {
     ctx.Fatalf("%s: raiseAlert threw %s: %s", why, harness::CurrentExceptionType(), e.what());
   }
 }
 
-void unavailable(harness::Ctx& ctx, long window, const std::string& why) {
+void hUnavailable(harness::Ctx& ctx, long window, const std::string& why) {
   bool outcome = false;
   try {
-    outcome = raiseAlert(kMonitor, window, 0.31, 640, 5000);
+    outcome = raiseAlert(hMonitor, window, 0.31, 640, 5000);
   } catch (const AlertUnavailable&) {
     return;
   } catch (const std::exception& e) {
@@ -933,43 +1016,82 @@ void unavailable(harness::Ctx& ctx, long window, const std::string& why) {
   ctx.Fatalf("%s: raiseAlert returned %t instead of throwing AlertUnavailable", why, outcome);
 }
 
+std::vector<double> hDeadlinesFor(harness::Ctx& ctx, long window) {
+  std::vector<double> deadlines;
+  for (const auto& call : ctx.GRPC.CallsTo("Raise")) {
+    if (call.Request<driftmon::AlertRequest>().window_start() == window) deadlines.push_back(call.HasDeadline() ? call.TimeoutSeconds() : -1);
+  }
+  return deadlines;
+}
+
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Equal(paged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged");
+  hClient(ctx);
+  ctx.Equal(hPaged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged");
   for (const auto& call : ctx.GRPC.CallsTo("Raise")) {
     ctx.Assert(call.HasDeadline(), "a Raise call carries no deadline: a stalled alerting service would hold the evaluator open");
     ctx.Assert(call.TimeoutSeconds() >= 0.5 && call.TimeoutSeconds() <= 1.5, "a Raise call carries a %v s deadline, expected kDeadlineMs = 1000", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Raise", 30.0);
   const int64_t before = ctx.Clock.Now();
-  unavailable(ctx, 1200, "with alerting stalled for 30 s");
+  hUnavailable(ctx, 1200, "with alerting stalled for 30 s");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "raiseAlert spent %.1f s on a stalled alerting service, expected about 3 attempts of 1 s", waited);
+  const auto stalled = hDeadlinesFor(ctx, 1200);
+  ctx.Assert(stalled.size() == 3, "with alerting stalled raiseAlert made %d Raise calls, expected kMaxAttempts = 3: a call that ran out its deadline failed and is retried", stalled.size());
+  for (const double timeout : stalled) {
+    ctx.Assert(timeout >= 0.5 && timeout <= 1.5, "with alerting stalled the attempts carried deadlines of %v s, expected kDeadlineMs = 1000 on every attempt", stalled);
+  }
+  ctx.Assert(waited <= 4.0, "raiseAlert spent %.1f s on a stalled alerting service, expected about 3.6 s: 3 attempts of 1 s and backoffs of 200 ms and 400 ms", waited);
+  // The first attempt fails, and every later one takes 0.9 s: each attempt needs a full deadline of its own.
+  ctx.GRPC.SetLatency("Raise", 0.9);
+  ctx.GRPC.Fail("Raise", grpc::StatusCode::UNAVAILABLE, "alerting is restarting", 1);
+  std::string outcome;
+  try {
+    outcome = raiseAlert(hMonitor, 1500, 0.31, 640, 5000) ? "true" : "false";
+  } catch (const std::exception& e) {
+    outcome = std::string(harness::CurrentExceptionType()) + ": " + e.what();
+  }
+  ctx.Assert(outcome == "true", "with the first attempt UNAVAILABLE and alerting answering in 0.9 s, raiseAlert gave %s after attempts with deadlines %v s, expected true on the second attempt: every attempt carries its own kDeadlineMs, not what is left of one shared deadline", outcome, hDeadlinesFor(ctx, 1500));
 }
 
 void CheckDedupeCooldown(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Equal(paged(ctx, 900, "the first evaluation"), true, "the first evaluation of window 900 must page; paged");
-  const bool again = paged(ctx, 900, "the second evaluation");
-  const size_t calls = ctx.GRPC.CallsTo("Raise").size();
+  hClient(ctx);
+  // A second evaluator sees window 900 right after this one's first command on the claim.
+  auto claimTtl = std::make_shared<std::optional<long long>>();
+  auto second = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After("alert:m-1:900", [&ctx, claimTtl, second] {
+    *claimTtl = ctx.Redis.TTL("alert:m-1:900");
+    try {
+      *second = raiseAlert(hMonitor, 900, 0.31, 640, 5000) ? "true" : "false";
+    } catch (const std::exception& e) {
+      *second = std::string(harness::CurrentExceptionType()) + ": " + e.what();
+    }
+  });
+  const bool first = hPaged(ctx, 900, "the first evaluation");
+  ctx.Assert(second->has_value(), "the evaluation of window 900 never touched alert:m-1:900");
+  size_t calls = ctx.GRPC.CallsTo("Raise").size();
+  const int pages = (first ? 1 : 0) + (**second == "true" ? 1 : 0);
+  ctx.Assert(pages == 1 && (**second == "true" || **second == "false") && calls == 1, "two evaluators of window 900 returned %t and %s after %d Raise calls, expected one true and 1 call: the claim is checked and taken in one command (SET NX), not a read then a write", first, **second, calls);
+  ctx.Assert(**claimTtl >= 290 && **claimTtl <= 300, "right after the command that claimed alert:m-1:900 it expired in %d s, expected the 300 s cooldown set in the same command", **claimTtl);
+  const bool again = hPaged(ctx, 900, "the second evaluation");
+  calls = ctx.GRPC.CallsTo("Raise").size();
   ctx.Assert(!again && calls == 1, "a second evaluation of window 900 returned %t after %d Raise calls, expected false and 1 call: one drifting window pages on every evaluator tick", again, calls);
   const long long ttl = ctx.Redis.TTL("alert:m-1:900");
   ctx.Assert(ttl >= 290 && ttl <= 300, "alert:m-1:900 expires in %d s, expected the 300 s cooldown", ttl);
-  ctx.Assert(paged(ctx, 1200, "window 1200") && ctx.GRPC.CallsTo("Raise").size() == 2, "window 1200 is a new window and must page");
+  ctx.Assert(hPaged(ctx, 1200, "window 1200") && ctx.GRPC.CallsTo("Raise").size() == 2, "window 1200 is a new window and must page");
 }
 
 void CheckClaimBeforeCall(harness::Ctx& ctx) {
-  AlertingPeer& peer = client(ctx);
-  ctx.Equal(paged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged");
+  HAlertingPeer& peer = hClient(ctx);
+  ctx.Equal(hPaged(ctx, 900, "with alerting healthy"), true, "with alerting healthy the page must go out; paged");
   ctx.Equal(peer.claimed, std::vector<long long>{1}, "when the page reached alerting, alert:m-1:900 must exist (a second evaluator seeing window 900 during the call would page too; claim before calling); claimed at each call");
 }
 
 void CheckPayloadEvidence(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   try {
-    raiseAlert(kMonitor, 900, 0.31, 640, 5000);
+    raiseAlert(hMonitor, 900, 0.31, 640, 5000);
   } catch (const std::exception&) {
   }
   const auto calls = ctx.GRPC.CallsTo("Raise");
@@ -984,16 +1106,16 @@ void CheckPayloadEvidence(harness::Ctx& ctx) {
 }
 
 void CheckRetryBackoff(harness::Ctx& ctx) {
-  client(ctx);
+  hClient(ctx);
   ctx.GRPC.Fail("Raise", grpc::StatusCode::UNAVAILABLE, "alerting is restarting", 2);
-  const bool ok = paged(ctx, 900, "with two UNAVAILABLE answers");
+  const bool ok = hPaged(ctx, 900, "with two UNAVAILABLE answers");
   const auto calls = ctx.GRPC.CallsTo("Raise");
   ctx.Assert(ok && calls.size() == 3, "with two UNAVAILABLE answers raiseAlert returned %t after %d calls, expected true after 3: the page that mattered was dropped", ok, calls.size());
   const double first = std::chrono::duration<double>(calls[1].Started - calls[0].Started).count();
   const double second = std::chrono::duration<double>(calls[2].Started - calls[1].Started).count();
-  ctx.Assert(first > 0 && second > first, "the retries came %v s and %v s apart, expected a growing backoff (0.2 s, then 0.4 s)", first, second);
+  ctx.Assert(first >= 0.15 && first <= 0.3 && second > 0.3 && second <= 0.6, "the retries came %v s and %v s apart, expected kBackoffMs doubled: 0.2 s, then 0.4 s", first, second);
   ctx.GRPC.Fail("Raise", grpc::StatusCode::UNAVAILABLE, "alerting is down", 3);
-  unavailable(ctx, 1200, "with alerting down for every attempt");
+  hUnavailable(ctx, 1200, "with alerting down for every attempt");
   ctx.Equal(ctx.Redis.Exists("alert:m-1:1200"), 0, "every attempt failed, so alert:m-1:1200 must be released (or the next evaluation will not page for 300 s); exists");
 }
 `,

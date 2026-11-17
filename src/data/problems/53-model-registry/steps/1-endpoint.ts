@@ -566,6 +566,7 @@ async def check_lineage(ctx):
         await _refused(ctx, c, {**FRAUD, "artifact_digest": "sha256:dead"}, "k-1", "with an artifact digest that does not resolve")
         await _refused(ctx, c, {**FRAUD, "training_run_id": "r-churn"}, "k-2", "with a training run of the churn model")
         await _refused(ctx, c, {**FRAUD, "training_run_id": "r-404"}, "k-3", "with a training run that does not exist")
+        await _refused(ctx, c, {**FRAUD, "name": "churn"}, "k-5", "as churn with a run and an eval record that both belong to fraud")
         r = await _post(c, FRAUD, "k-4")
     assert r.status_code == 201 and r.json().get("version") == 1, f"with its lineage in place the registration must answer version 1, got {r.status_code} {r.text}"
 
@@ -585,9 +586,15 @@ async def check_idempotent_version(ctx):
     async with _api(ctx) as c:
         first = await _post(c, FRAUD, "k-1")
         assert first.status_code == 201, f"the first registration answered {first.status_code}: {first.text}"
+        assert ctx.redis.exists("idem:t1:k-1") == 1, "the registration was not recorded with record_registration for (t1, k-1)"
+        ctx.redis.hset("model:fraud:v1", "stage", "promoted")
         replay = await _post(c, FRAUD, "k-1")
-        assert replay.status_code == 201 and replay.json() == first.json(), f"a retry with the same Idempotency-Key must answer the recorded version: first {first.json()}, retry {replay.json()}"
+        assert replay.status_code == 201 and replay.json() == first.json(), f"a retry with the same Idempotency-Key must answer the recorded row, even after the version moved on: first {first.json()}, retry {replay.json()}"
         assert ctx.redis.exists("model:fraud:v2") == 0, "the retry minted fraud version 2: one registration, two versions"
+        store.record_registration("t1", "k-9", first.json())
+        elsewhere = await _post(c, FRAUD, "k-9")
+        assert elsewhere.status_code == 201 and elsewhere.json() == first.json(), f"(t1, k-9) was recorded by another replica: the registration must answer that row, got {elsewhere.status_code} {elsewhere.text}"
+        assert ctx.redis.exists("model:fraud:v2") == 0, "a registration recorded by another replica minted fraud version 2"
         fresh = await _post(c, FRAUD, "k-2")
         assert fresh.json().get("version") == 2, f"a new Idempotency-Key is a new registration (version 2), got {fresh.text}"
         other = await _post(c, CHURN, "k-1", tenant="t2")
@@ -643,6 +650,7 @@ export async function check_lineage(ctx) {
   await refused(ctx, c, {...FRAUD, artifact_digest: 'sha256:dead'}, 'k-1', 'with an artifact digest that does not resolve');
   await refused(ctx, c, {...FRAUD, training_run_id: 'r-churn'}, 'k-2', 'with a training run of the churn model');
   await refused(ctx, c, {...FRAUD, training_run_id: 'r-404'}, 'k-3', 'with a training run that does not exist');
+  await refused(ctx, c, {...FRAUD, name: 'churn'}, 'k-5', 'as churn with a run and an eval record that both belong to fraud');
   const r = await post(c, FRAUD, 'k-4');
   assert(r.status === 201 && r.json().version === 1, \`with its lineage in place the registration must answer version 1, got \${r.status} \${r.text}\`);
 }
@@ -659,12 +667,18 @@ export async function check_eval_bound(ctx) {
 }
 
 export async function check_idempotent_version(ctx) {
-  const {c} = await api(ctx);
+  const {c, store} = await api(ctx);
   const first = await post(c, FRAUD, 'k-1');
   assert.equal(first.status, 201, \`the first registration answered \${first.status}: \${first.text}\`);
+  assert.equal(ctx.redis.exists('idem:t1:k-1'), 1, 'the registration was not recorded with recordRegistration for (t1, k-1)');
+  ctx.redis.hset('model:fraud:v1', 'stage', 'promoted');
   const replay = await post(c, FRAUD, 'k-1');
-  assert(replay.status === 201 && replay.json().version === first.json().version, \`a retry with the same Idempotency-Key must answer the recorded version: first \${first.text}, retry \${replay.text}\`);
+  assert(replay.status === 201 && replay.json().version === first.json().version && replay.json().stage === first.json().stage, \`a retry with the same Idempotency-Key must answer the recorded row, even after the version moved on: first \${first.text}, retry \${replay.text}\`);
   assert.equal(ctx.redis.exists('model:fraud:v2'), 0, 'the retry minted fraud version 2: one registration, two versions');
+  await store.recordRegistration('t1', 'k-9', first.json());
+  const elsewhere = await post(c, FRAUD, 'k-9');
+  assert(elsewhere.status === 201 && elsewhere.json().version === 1 && elsewhere.json().stage === 'staged', \`(t1, k-9) was recorded by another replica: the registration must answer that row, got \${elsewhere.status} \${elsewhere.text}\`);
+  assert.equal(ctx.redis.exists('model:fraud:v2'), 0, 'a registration recorded by another replica minted fraud version 2');
   const fresh = await post(c, FRAUD, 'k-2');
   assert.equal(fresh.json().version, 2, \`a new Idempotency-Key is a new registration (version 2), got \${fresh.text}\`);
   const other = await post(c, CHURN, 'k-1', 't2');
@@ -685,17 +699,17 @@ import (
 )
 
 const (
-	digest = "sha256:a1"
-	other  = "sha256:b2"
+	hDigest = "sha256:a1"
+	hOther  = "sha256:b2"
 )
 
 var (
-	apiBg = context.Background()
-	fraud = map[string]string{"name": "fraud", "artifact_digest": digest, "training_run_id": "r-1", "eval_id": "e-1"}
-	churn = map[string]string{"name": "churn", "artifact_digest": digest, "training_run_id": "r-churn", "eval_id": "e-churn"}
+	hBg    = context.Background()
+	hFraud = map[string]string{"name": "fraud", "artifact_digest": hDigest, "training_run_id": "r-1", "eval_id": "e-1"}
+	hChurn = map[string]string{"name": "churn", "artifact_digest": hDigest, "training_run_id": "r-churn", "eval_id": "e-churn"}
 )
 
-func with(body map[string]string, field, value string) map[string]string {
+func hWith(body map[string]string, field, value string) map[string]string {
 	out := map[string]string{}
 	for k, v := range body {
 		out[k] = v
@@ -704,88 +718,95 @@ func with(body map[string]string, field, value string) map[string]string {
 	return out
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	store.AddArtifact(apiBg, digest, "s3://models/a1")
-	store.AddArtifact(apiBg, other, "s3://models/b2")
-	store.AddTrainingRun(apiBg, "r-1", "fraud")
-	store.AddTrainingRun(apiBg, "r-churn", "churn")
-	store.AddEval(apiBg, "e-1", "fraud", digest, 0.91, 0.85, "precision 0.91 on holdout-2026-10")
-	store.AddEval(apiBg, "e-other", "fraud", other, 0.93, 0.85, "precision 0.93 on holdout-2026-10")
-	store.AddEval(apiBg, "e-churn", "churn", digest, 0.88, 0.85, "recall 0.88 on churn-holdout")
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
+	store.AddArtifact(hBg, hDigest, "s3://models/a1")
+	store.AddArtifact(hBg, hOther, "s3://models/b2")
+	store.AddTrainingRun(hBg, "r-1", "fraud")
+	store.AddTrainingRun(hBg, "r-churn", "churn")
+	store.AddEval(hBg, "e-1", "fraud", hDigest, 0.91, 0.85, "precision 0.91 on holdout-2026-10")
+	store.AddEval(hBg, "e-other", "fraud", hOther, 0.93, 0.85, "precision 0.93 on holdout-2026-10")
+	store.AddEval(hBg, "e-churn", "churn", hDigest, 0.88, 0.85, "recall 0.88 on churn-holdout")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func post(c *harness.HTTP, body map[string]string, key, tenant string) *harness.Response {
+func hPost(c *harness.HTTP, body map[string]string, key, tenant string) *harness.Response {
 	if key == "" {
 		return c.Post("/v1/models", body, "X-Tenant-Id", tenant)
 	}
 	return c.Post("/v1/models", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-type answer struct {
+type hAnswer struct {
 	Name    string \`json:"name"\`
 	Version int    \`json:"version"\`
 	Stage   string \`json:"stage"\`
 }
 
-func decode(r *harness.Response) answer {
-	var a answer
+func hDecode(r *harness.Response) hAnswer {
+	var a hAnswer
 	r.Decode(&a)
 	return a
 }
 
-func refused(ctx *harness.Ctx, c *harness.HTTP, body map[string]string, key, why string) {
-	r := post(c, body, key, "t1")
+func hRefused(ctx *harness.Ctx, c *harness.HTTP, body map[string]string, key, why string) {
+	r := hPost(c, body, key, "t1")
 	ctx.Equal(r.Status, 422, "%s: the registration answered %s; the status", why, r.Text())
 	ctx.Equal(len(ctx.Redis.Keys("model:*:v*")), 0, "%s: a version was written anyway; the versions", why)
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := post(c, fraud, "k-1", "t1")
+	c := hAPI(ctx)
+	r := hPost(c, hFraud, "k-1", "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/models (%s)", r.Text())
-	a := decode(r)
+	a := hDecode(r)
 	ctx.Assert(a.Name == "fraud" && a.Version == 1 && a.Stage == "staged", "the first registration must answer fraud version 1, staged; got %s", r.Text())
-	row := store.Version(apiBg, "fraud", 1)
-	ctx.Assert(row != nil && row.ArtifactDigest == digest, "the store holds %+v for fraud version 1", row)
-	none := c.Post("/v1/models", fraud, "Idempotency-Key", "k-2")
+	row := store.Version(hBg, "fraud", 1)
+	ctx.Assert(row != nil && row.ArtifactDigest == hDigest, "the store holds %+v for fraud version 1", row)
+	none := c.Post("/v1/models", hFraud, "Idempotency-Key", "k-2")
 	ctx.Equal(none.Status, 401, "a registration without X-Tenant-Id")
 }
 
 func CheckLineage(ctx *harness.Ctx) {
-	c := api(ctx)
-	refused(ctx, c, with(fraud, "artifact_digest", "sha256:dead"), "k-1", "with an artifact digest that does not resolve")
-	refused(ctx, c, with(fraud, "training_run_id", "r-churn"), "k-2", "with a training run of the churn model")
-	refused(ctx, c, with(fraud, "training_run_id", "r-404"), "k-3", "with a training run that does not exist")
-	r := post(c, fraud, "k-4", "t1")
-	ctx.Assert(r.Status == 201 && decode(r).Version == 1, "with its lineage in place the registration must answer version 1, got %d %s", r.Status, r.Text())
+	c := hAPI(ctx)
+	hRefused(ctx, c, hWith(hFraud, "artifact_digest", "sha256:dead"), "k-1", "with an artifact digest that does not resolve")
+	hRefused(ctx, c, hWith(hFraud, "training_run_id", "r-churn"), "k-2", "with a training run of the churn model")
+	hRefused(ctx, c, hWith(hFraud, "training_run_id", "r-404"), "k-3", "with a training run that does not exist")
+	hRefused(ctx, c, hWith(hFraud, "name", "churn"), "k-5", "as churn with a run and an eval record that both belong to fraud")
+	r := hPost(c, hFraud, "k-4", "t1")
+	ctx.Assert(r.Status == 201 && hDecode(r).Version == 1, "with its lineage in place the registration must answer version 1, got %d %s", r.Status, r.Text())
 }
 
 func CheckEvalBound(ctx *harness.Ctx) {
-	c := api(ctx)
-	refused(ctx, c, with(fraud, "eval_id", "e-churn"), "k-1", "with an eval record of the churn model")
-	refused(ctx, c, with(fraud, "eval_id", "e-other"), "k-2", "with an eval record measured on another digest of fraud")
-	refused(ctx, c, with(fraud, "eval_id", "e-404"), "k-3", "with an eval record that does not exist")
-	r := post(c, fraud, "k-4", "t1")
+	c := hAPI(ctx)
+	hRefused(ctx, c, hWith(hFraud, "eval_id", "e-churn"), "k-1", "with an eval record of the churn model")
+	hRefused(ctx, c, hWith(hFraud, "eval_id", "e-other"), "k-2", "with an eval record measured on another digest of fraud")
+	hRefused(ctx, c, hWith(hFraud, "eval_id", "e-404"), "k-3", "with an eval record that does not exist")
+	r := hPost(c, hFraud, "k-4", "t1")
 	ctx.Equal(r.Status, 201, "with its own eval record the registration (%s)", r.Text())
-	r = post(c, with(with(fraud, "artifact_digest", other), "eval_id", "e-other"), "k-5", "t1")
-	ctx.Assert(r.Status == 201 && decode(r).Version == 2, "the other digest with the eval measured on it must register as version 2, got %d %s", r.Status, r.Text())
+	r = hPost(c, hWith(hWith(hFraud, "artifact_digest", hOther), "eval_id", "e-other"), "k-5", "t1")
+	ctx.Assert(r.Status == 201 && hDecode(r).Version == 2, "the other digest with the eval measured on it must register as version 2, got %d %s", r.Status, r.Text())
 }
 
 func CheckIdempotentVersion(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := post(c, fraud, "k-1", "t1")
+	c := hAPI(ctx)
+	first := hPost(c, hFraud, "k-1", "t1")
 	ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text())
-	replay := post(c, fraud, "k-1", "t1")
-	ctx.Assert(replay.Status == 201 && decode(replay).Version == decode(first).Version, "a retry with the same Idempotency-Key must answer the recorded version: first %s, retry %s", first.Text(), replay.Text())
+	ctx.Equal(ctx.Redis.Exists("idem:t1:k-1"), 1, "the registration was not recorded with RecordRegistration for (t1, k-1); idem:t1:k-1 exists")
+	ctx.Redis.Do("HSET", "model:fraud:v1", "stage", "promoted")
+	replay := hPost(c, hFraud, "k-1", "t1")
+	ctx.Assert(replay.Status == 201 && hDecode(replay) == hDecode(first), "a retry with the same Idempotency-Key must answer the recorded row, even after the version moved on: first %s, retry %s", first.Text(), replay.Text())
 	ctx.Equal(ctx.Redis.Exists("model:fraud:v2"), 0, "the retry minted fraud version 2 (one registration, two versions); model:fraud:v2 exists")
-	fresh := post(c, fraud, "k-2", "t1")
-	ctx.Equal(decode(fresh).Version, 2, "a new Idempotency-Key is a new registration (%s); the version", fresh.Text())
-	theirs := post(c, churn, "k-1", "t2")
-	ctx.Assert(theirs.Status == 201 && decode(theirs).Name == "churn", "another tenant's k-1 is its own registration: it answered %s", theirs.Text())
-	none := post(c, fraud, "", "t1")
+	ctx.Redis.Set("idem:t1:k-9", first.Text())
+	elsewhere := hPost(c, hFraud, "k-9", "t1")
+	ctx.Assert(elsewhere.Status == 201 && hDecode(elsewhere) == hDecode(first), "(t1, k-9) was recorded by another replica: the registration must answer that row, got %d %s", elsewhere.Status, elsewhere.Text())
+	ctx.Equal(ctx.Redis.Exists("model:fraud:v2"), 0, "a registration recorded by another replica minted fraud version 2; model:fraud:v2 exists")
+	fresh := hPost(c, hFraud, "k-2", "t1")
+	ctx.Equal(hDecode(fresh).Version, 2, "a new Idempotency-Key is a new registration (%s); the version", fresh.Text())
+	theirs := hPost(c, hChurn, "k-1", "t2")
+	ctx.Assert(theirs.Status == 201 && hDecode(theirs).Name == "churn", "another tenant's k-1 is its own registration: it answered %s", theirs.Text())
+	none := hPost(c, hFraud, "", "t1")
 	ctx.Equal(none.Status, 400, "a registration without Idempotency-Key")
 }
 `,
@@ -798,19 +819,19 @@ namespace {
 const std::string kDigest = "sha256:a1";
 const std::string kOther = "sha256:b2";
 
-nlohmann::json body(const std::string& name, const std::string& digest, const std::string& run_id, const std::string& eval_id) {
+nlohmann::json hBody(const std::string& name, const std::string& digest, const std::string& run_id, const std::string& eval_id) {
   return {{"name", name}, {"artifact_digest", digest}, {"training_run_id", run_id}, {"eval_id", eval_id}};
 }
 
-const nlohmann::json kFraud = body("fraud", kDigest, "r-1", "e-1");
-const nlohmann::json kChurn = body("churn", kDigest, "r-churn", "e-churn");
+const nlohmann::json kFraud = hBody("fraud", kDigest, "r-1", "e-1");
+const nlohmann::json kChurn = hBody("churn", kDigest, "r-churn", "e-churn");
 
-nlohmann::json with(nlohmann::json b, const std::string& field, const std::string& value) {
+nlohmann::json hWith(nlohmann::json b, const std::string& field, const std::string& value) {
   b[field] = value;
   return b;
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   store::addArtifact(kDigest, "s3://models/a1");
   store::addArtifact(kOther, "s3://models/b2");
   store::addTrainingRun("r-1", "fraud");
@@ -825,18 +846,18 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response post(harness::HTTP& c, const nlohmann::json& b, const std::string& key, const std::string& tenant = "t1") {
+harness::Response hPost(harness::HTTP& c, const nlohmann::json& b, const std::string& key, const std::string& tenant = "t1") {
   if (key.empty()) return c.Post("/v1/models", b.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/models", b.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json decode(const harness::Response& r) {
+nlohmann::json hDecode(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
 
-void refused(harness::Ctx& ctx, harness::HTTP& c, const nlohmann::json& b, const std::string& key, const std::string& why) {
-  const auto r = post(c, b, key);
+void hRefused(harness::Ctx& ctx, harness::HTTP& c, const nlohmann::json& b, const std::string& key, const std::string& why) {
+  const auto r = hPost(c, b, key);
   ctx.Equal(r.Status, 422, "%s: the registration answered %s; the status", why, r.Text());
   ctx.Equal(ctx.Redis.Keys("model:*:v*").size(), 0, "%s: a version was written anyway; the versions", why);
 }
@@ -844,10 +865,10 @@ void refused(harness::Ctx& ctx, harness::HTTP& c, const nlohmann::json& b, const
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kFraud, "k-1");
+  auto c = hApi(ctx);
+  const auto r = hPost(c, kFraud, "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/models (%s)", r.Text());
-  const auto a = decode(r);
+  const auto a = hDecode(r);
   ctx.Assert(a.value("name", "") == "fraud" && a.value("version", 0L) == 1 && a.value("stage", "") == "staged",
              "the first registration must answer fraud version 1, staged; got %s", r.Text());
   const auto row = store::version("fraud", 1);
@@ -857,38 +878,46 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckLineage(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  refused(ctx, c, with(kFraud, "artifact_digest", "sha256:dead"), "k-1", "with an artifact digest that does not resolve");
-  refused(ctx, c, with(kFraud, "training_run_id", "r-churn"), "k-2", "with a training run of the churn model");
-  refused(ctx, c, with(kFraud, "training_run_id", "r-404"), "k-3", "with a training run that does not exist");
-  const auto r = post(c, kFraud, "k-4");
-  ctx.Assert(r.Status == 201 && decode(r).value("version", 0L) == 1, "with its lineage in place the registration must answer version 1, got %d %s", r.Status, r.Text());
+  auto c = hApi(ctx);
+  hRefused(ctx, c, hWith(kFraud, "artifact_digest", "sha256:dead"), "k-1", "with an artifact digest that does not resolve");
+  hRefused(ctx, c, hWith(kFraud, "training_run_id", "r-churn"), "k-2", "with a training run of the churn model");
+  hRefused(ctx, c, hWith(kFraud, "training_run_id", "r-404"), "k-3", "with a training run that does not exist");
+  hRefused(ctx, c, hWith(kFraud, "name", "churn"), "k-5", "as churn with a run and an eval record that both belong to fraud");
+  const auto r = hPost(c, kFraud, "k-4");
+  ctx.Assert(r.Status == 201 && hDecode(r).value("version", 0L) == 1, "with its lineage in place the registration must answer version 1, got %d %s", r.Status, r.Text());
 }
 
 void CheckEvalBound(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  refused(ctx, c, with(kFraud, "eval_id", "e-churn"), "k-1", "with an eval record of the churn model");
-  refused(ctx, c, with(kFraud, "eval_id", "e-other"), "k-2", "with an eval record measured on another digest of fraud");
-  refused(ctx, c, with(kFraud, "eval_id", "e-404"), "k-3", "with an eval record that does not exist");
-  auto r = post(c, kFraud, "k-4");
+  auto c = hApi(ctx);
+  hRefused(ctx, c, hWith(kFraud, "eval_id", "e-churn"), "k-1", "with an eval record of the churn model");
+  hRefused(ctx, c, hWith(kFraud, "eval_id", "e-other"), "k-2", "with an eval record measured on another digest of fraud");
+  hRefused(ctx, c, hWith(kFraud, "eval_id", "e-404"), "k-3", "with an eval record that does not exist");
+  auto r = hPost(c, kFraud, "k-4");
   ctx.Equal(r.Status, 201, "with its own eval record the registration (%s)", r.Text());
-  r = post(c, with(with(kFraud, "artifact_digest", kOther), "eval_id", "e-other"), "k-5");
-  ctx.Assert(r.Status == 201 && decode(r).value("version", 0L) == 2, "the other digest with the eval measured on it must register as version 2, got %d %s", r.Status, r.Text());
+  r = hPost(c, hWith(hWith(kFraud, "artifact_digest", kOther), "eval_id", "e-other"), "k-5");
+  ctx.Assert(r.Status == 201 && hDecode(r).value("version", 0L) == 2, "the other digest with the eval measured on it must register as version 2, got %d %s", r.Status, r.Text());
 }
 
 void CheckIdempotentVersion(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, kFraud, "k-1");
+  auto c = hApi(ctx);
+  const auto first = hPost(c, kFraud, "k-1");
   ctx.Equal(first.Status, 201, "the first registration (%s)", first.Text());
-  const auto replay = post(c, kFraud, "k-1");
-  ctx.Assert(replay.Status == 201 && decode(replay).value("version", 0L) == decode(first).value("version", -1L),
-             "a retry with the same Idempotency-Key must answer the recorded version: first %s, retry %s", first.Text(), replay.Text());
+  ctx.Equal(ctx.Redis.Exists("idem:t1:k-1"), 1, "the registration was not recorded with recordRegistration for (t1, k-1); idem:t1:k-1 exists");
+  ctx.Redis.Do("HSET", "model:fraud:v1", "stage", "promoted");
+  const auto replay = hPost(c, kFraud, "k-1");
+  ctx.Assert(replay.Status == 201 && hDecode(replay) == hDecode(first),
+             "a retry with the same Idempotency-Key must answer the recorded row, even after the version moved on: first %s, retry %s", first.Text(), replay.Text());
   ctx.Equal(ctx.Redis.Exists("model:fraud:v2"), 0, "the retry minted fraud version 2 (one registration, two versions); model:fraud:v2 exists");
-  const auto fresh = post(c, kFraud, "k-2");
-  ctx.Equal(decode(fresh).value("version", 0L), 2, "a new Idempotency-Key is a new registration (%s); the version", fresh.Text());
-  const auto theirs = post(c, kChurn, "k-1", "t2");
-  ctx.Assert(theirs.Status == 201 && decode(theirs).value("name", "") == "churn", "another tenant's k-1 is its own registration: it answered %s", theirs.Text());
-  const auto none = post(c, kFraud, "");
+  ctx.Redis.Set("idem:t1:k-9", first.Text());
+  const auto elsewhere = hPost(c, kFraud, "k-9");
+  ctx.Assert(elsewhere.Status == 201 && hDecode(elsewhere) == hDecode(first),
+             "(t1, k-9) was recorded by another replica: the registration must answer that row, got %d %s", elsewhere.Status, elsewhere.Text());
+  ctx.Equal(ctx.Redis.Exists("model:fraud:v2"), 0, "a registration recorded by another replica minted fraud version 2; model:fraud:v2 exists");
+  const auto fresh = hPost(c, kFraud, "k-2");
+  ctx.Equal(hDecode(fresh).value("version", 0L), 2, "a new Idempotency-Key is a new registration (%s); the version", fresh.Text());
+  const auto theirs = hPost(c, kChurn, "k-1", "t2");
+  ctx.Assert(theirs.Status == 201 && hDecode(theirs).value("name", "") == "churn", "another tenant's k-1 is its own registration: it answered %s", theirs.Text());
+  const auto none = hPost(c, kFraud, "");
   ctx.Equal(none.Status, 400, "a registration without Idempotency-Key");
 }
 `,

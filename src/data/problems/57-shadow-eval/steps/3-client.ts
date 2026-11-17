@@ -81,7 +81,7 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
       id: 'isolate',
       title: 'A candidate failure never fails the production request',
       detail:
-        "With the candidate down, `complete` still returns production's text. The starter raises the candidate's last error, so a broken experiment takes production down with it.",
+        "With the candidate down or failing with any status (`UNAVAILABLE`, `INTERNAL`, `RESOURCE_EXHAUSTED` and others), `complete` still returns production's text. The starter raises the candidate's last error, so a broken experiment takes production down with it.",
       match: {
         python: {all: [/except grpc\.RpcError/], none: [/^\s*raise\b/m]},
         typescript: {all: [/catch/], none: [/^\s*throw\b/m]},
@@ -107,7 +107,7 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
       id: 'dropped',
       title: 'Counts every dropped shadow',
       detail:
-        'A shadow that failed, timed out or was skipped is counted `dropped` in `shadow:{config_id}:stats`, so the report can say how much of the share was lost. The starter counts only completions.',
+        'A shadow that failed with any status, timed out or was skipped is counted `dropped` in `shadow:{config_id}:stats`, so the report can say how much of the share was lost. The starter counts only completions.',
       match: {
         python: {all: [/store\.count\([^\n]*["']dropped["']/]},
         typescript: {all: [/count\([^\n]*['"]dropped['"]/]},
@@ -120,7 +120,7 @@ service Model { rpc Complete(CompleteRequest) returns (CompleteReply); }
       id: 'breaker',
       title: 'Stops calling a failing candidate for 30 seconds',
       detail:
-        'Five failures in a row set `shadow:{config_id}:breaker` for 30 s, and while it exists the candidate is not called. The starter keeps sending every shadowed request to a candidate that is down.',
+        'Five failures in a row set `shadow:{config_id}:breaker`, with its 30 s expiry in the same command, and while it exists the candidate is not called. The count is `shadow:{config_id}:failures`, shared by every instance, and a success resets it. The starter keeps sending every shadowed request to a candidate that is down.',
       match: {
         python: {all: [/:breaker/, /BREAKER_FAILURES\s*=\s*5\b/, /BREAKER_OPEN_S\s*=\s*30\b/]},
         typescript: {all: [/:breaker/, /BREAKER_FAILURES\s*=\s*5\b/, /BREAKER_OPEN_S\s*=\s*30\b/]},
@@ -677,6 +677,10 @@ def check_isolate(ctx):
     m, cfg = _world(ctx)
     ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, times=10, target=CAND)
     _complete(m, cfg)
+    ctx.grpc.failures.clear()
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.UNKNOWN, grpc.StatusCode.INVALID_ARGUMENT):
+        ctx.grpc.fail("Complete", code, times=1, target=CAND)
+        _complete(m, cfg)
 
 
 def check_no_retry(ctx):
@@ -694,24 +698,48 @@ def check_dropped(ctx):
     assert _stats(ctx, cfg) == {"dropped": 1}, f"after one failed shadow shadow:{cfg}:stats is {_stats(ctx, cfg)}, expected dropped 1"
     _complete(m, cfg)
     assert _stats(ctx, cfg) == {"dropped": 1, "completed": 1}, f"after a failed and a completed shadow the stats are {_stats(ctx, cfg)}"
+    ctx.grpc.fail("Complete", grpc.StatusCode.INTERNAL, times=1, target=CAND)
+    _complete(m, cfg)
+    assert _stats(ctx, cfg) == {"dropped": 2, "completed": 1}, f"a shadow the candidate failed with INTERNAL is dropped too; the stats are {_stats(ctx, cfg)}"
     ctx.grpc.set_latency("Complete", 5.0, target=CAND)
     _complete(m, cfg)
-    assert _stats(ctx, cfg).get("dropped") == 2, f"a shadow past its deadline is dropped too; the stats are {_stats(ctx, cfg)}"
+    assert _stats(ctx, cfg).get("dropped") == 3, f"a shadow past its deadline is dropped too; the stats are {_stats(ctx, cfg)}"
 
 
 def check_breaker(ctx):
     m, cfg = _world(ctx)
-    ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, times=100, target=CAND)
-    for _ in range(8):
+    breaker = f"shadow:{cfg}:breaker"
+    ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, times=4, target=CAND)
+    for _ in range(5):  # four failures, then the candidate answers
+        _complete(m, cfg)
+    ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, times=4, target=CAND)
+    for _ in range(4):
         _complete(m, cfg)
     n = _candidate_calls(ctx)
-    assert n == 5, f"the candidate is down and received {n} of 8 shadows: after BREAKER_FAILURES (5) failures in a row it gets none until the breaker expires"
-    assert _stats(ctx, cfg).get("dropped") == 8, f"all 8 shadows were lost, the stats say {_stats(ctx, cfg)}"
-    ttl = ctx.redis.ttl(f"shadow:{cfg}:breaker")
-    assert 0 < ttl <= 30, f"shadow:{cfg}:breaker has TTL {ttl}, expected an open breaker for BREAKER_OPEN_S (30 s)"
+    assert n == 9 and not ctx.redis.exists(breaker), f"four failures, a success, then four failures: the candidate received {n} of 9 shadows and the breaker is {'open' if ctx.redis.exists(breaker) else 'closed'}. A success resets the count, so these are not five in a row"
+    _complete(m, cfg)  # a success clears the count again
+    failures = f"shadow:{cfg}:failures"
+    ctx.redis.set(failures, 4)  # four failures in a row seen by other instances
+    opened = {}
+
+    def watch_breaker():  # the breaker's TTL right after the command that creates it
+        if ctx.redis.exists(breaker):
+            opened.setdefault("ttl", ctx.redis.ttl(breaker))
+        else:
+            ctx.redis_after(breaker, watch_breaker)
+
+    ctx.redis_after(failures, watch_breaker)
+    ctx.grpc.fail("Complete", grpc.StatusCode.INTERNAL, times=100, target=CAND)
+    for _ in range(4):
+        _complete(m, cfg)
+    n = _candidate_calls(ctx)
+    assert n == 11, f"after four failures counted in shadow:{cfg}:failures by other instances and one here, the candidate received {n - 10} of the next 4 shadows, expected 1: the count lives in Redis and the fifth failure in a row opens the breaker for the whole fleet"
+    assert opened.get("ttl") == 30, f"right after the command that opened {breaker} its TTL was {opened.get('ttl')}, expected BREAKER_OPEN_S (30): the breaker is set with its expiry in one command"
+    stats = _stats(ctx, cfg)
+    assert stats.get("dropped") == 12 and stats.get("completed") == 2, f"12 shadows were lost and 2 completed, the stats say {stats}"
     ctx.clock.advance(31)
     _complete(m, cfg)
-    assert _candidate_calls(ctx) == 6, "30 s after the breaker opened the candidate must get the next shadow again"
+    assert _candidate_calls(ctx) == 12, "30 s after the breaker opened the candidate must get the next shadow again"
 `,
     typescript: `const PROD = 'production-model:9000';
 const CAND = 'candidate-model:9000';
@@ -773,6 +801,11 @@ export async function check_isolate(ctx) {
   const {m, cfg} = await setup(ctx);
   ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, '', 10, CAND);
   await complete(m, cfg);
+  ctx.grpc.clearFailures();
+  for (const code of [ctx.grpc.status.INTERNAL, ctx.grpc.status.RESOURCE_EXHAUSTED, ctx.grpc.status.UNKNOWN, ctx.grpc.status.INVALID_ARGUMENT]) {
+    ctx.grpc.fail('Complete', code, '', 1, CAND);
+    await complete(m, cfg);
+  }
 }
 
 export async function check_no_retry(ctx) {
@@ -789,22 +822,43 @@ export async function check_dropped(ctx) {
   assert.deepStrictEqual(stats(ctx, cfg), {dropped: 1}, \`after one failed shadow shadow:\${cfg}:stats is \${JSON.stringify(stats(ctx, cfg))}, expected dropped 1\`);
   await complete(m, cfg);
   assert.deepStrictEqual(stats(ctx, cfg), {dropped: 1, completed: 1}, \`after a failed and a completed shadow the stats are \${JSON.stringify(stats(ctx, cfg))}\`);
+  ctx.grpc.fail('Complete', ctx.grpc.status.INTERNAL, '', 1, CAND);
+  await complete(m, cfg);
+  assert.deepStrictEqual(stats(ctx, cfg), {dropped: 2, completed: 1}, \`a shadow the candidate failed with INTERNAL is dropped too; the stats are \${JSON.stringify(stats(ctx, cfg))}\`);
   ctx.grpc.setLatency('Complete', 5.0, CAND);
   await complete(m, cfg);
-  assert.equal(stats(ctx, cfg).dropped, 2, \`a shadow past its deadline is dropped too; the stats are \${JSON.stringify(stats(ctx, cfg))}\`);
+  assert.equal(stats(ctx, cfg).dropped, 3, \`a shadow past its deadline is dropped too; the stats are \${JSON.stringify(stats(ctx, cfg))}\`);
 }
 
 export async function check_breaker(ctx) {
   const {m, cfg} = await setup(ctx);
-  ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, '', 100, CAND);
-  for (let i = 0; i < 8; i += 1) await complete(m, cfg);
-  assert.equal(candidateCalls(ctx), 5, \`the candidate is down and received \${candidateCalls(ctx)} of 8 shadows: after BREAKER_FAILURES (5) failures in a row it gets none until the breaker expires\`);
-  assert.equal(stats(ctx, cfg).dropped, 8, \`all 8 shadows were lost, the stats say \${JSON.stringify(stats(ctx, cfg))}\`);
-  const ttl = ctx.redis.ttl(\`shadow:\${cfg}:breaker\`);
-  assert(ttl > 0 && ttl <= 30, \`shadow:\${cfg}:breaker has TTL \${ttl}, expected an open breaker for BREAKER_OPEN_S (30 s)\`);
+  const breaker = \`shadow:\${cfg}:breaker\`;
+  ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, '', 4, CAND);
+  for (let i = 0; i < 5; i += 1) await complete(m, cfg); // four failures, then the candidate answers
+  ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, '', 4, CAND);
+  for (let i = 0; i < 4; i += 1) await complete(m, cfg);
+  const open = ctx.redis.exists(breaker) === 1;
+  assert(candidateCalls(ctx) === 9 && !open, \`four failures, a success, then four failures: the candidate received \${candidateCalls(ctx)} of 9 shadows and the breaker is \${open ? 'open' : 'closed'}. A success resets the count, so these are not five in a row\`);
+  await complete(m, cfg); // a success clears the count again
+  const failures = \`shadow:\${cfg}:failures\`;
+  ctx.redis.set(failures, '4'); // four failures in a row seen by other instances
+  let openedTtl: number | undefined;
+  // The breaker's TTL right after the command that creates it.
+  const watchBreaker = () => {
+    if (ctx.redis.exists(breaker) === 1) openedTtl ??= ctx.redis.ttl(breaker);
+    else ctx.redisAfter(breaker, watchBreaker);
+  };
+  ctx.redisAfter(failures, watchBreaker);
+  ctx.grpc.fail('Complete', ctx.grpc.status.INTERNAL, '', 100, CAND);
+  for (let i = 0; i < 4; i += 1) await complete(m, cfg);
+  const n = candidateCalls(ctx);
+  assert.equal(n, 11, \`after four failures counted in \${failures} by other instances and one here, the candidate received \${n - 10} of the next 4 shadows, expected 1: the count lives in Redis and the fifth failure in a row opens the breaker for the whole fleet\`);
+  assert.equal(openedTtl, 30, \`right after the command that opened \${breaker} its TTL was \${openedTtl}, expected BREAKER_OPEN_S (30): the breaker is set with its expiry in one command\`);
+  const s = stats(ctx, cfg);
+  assert(s.dropped === 12 && s.completed === 2, \`12 shadows were lost and 2 completed, the stats say \${JSON.stringify(s)}\`);
   ctx.clock.advance(31);
   await complete(m, cfg);
-  assert.equal(candidateCalls(ctx), 6, '30 s after the breaker opened the candidate must get the next shadow again');
+  assert.equal(candidateCalls(ctx), 12, '30 s after the breaker opened the candidate must get the next shadow again');
 }
 `,
     go: `package main
@@ -823,35 +877,35 @@ import (
 )
 
 const (
-	prodTarget = "production-model:9000"
-	candTarget = "candidate-model:9000"
-	prodAnswer = "production answer to hello"
+	hProdTarget = "production-model:9000"
+	hCandTarget = "candidate-model:9000"
+	hProdAnswer = "production answer to hello"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-type modelPeer struct {
+type hModelPeer struct {
 	pb.UnimplementedModelServer
 	name string
 }
 
-func (p *modelPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
+func (p *hModelPeer) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteReply, error) {
 	return &pb.CompleteReply{Text: p.name + " answer to " + req.GetPrompt(), ModelVersion: req.GetModelVersion()}, nil
 }
 
-func clientWorld(ctx *harness.Ctx) string {
-	pb.RegisterModelServer(ctx.GRPC.Server("production-model:9000"), &modelPeer{name: "production"})
-	pb.RegisterModelServer(ctx.GRPC.Server("candidate-model:9000"), &modelPeer{name: "candidate"})
-	return store.CreateConfig(clientBg, "t1", "cand-2026-04", 5, []string{"latency"}).ConfigID
+func hClientWorld(ctx *harness.Ctx) string {
+	pb.RegisterModelServer(ctx.GRPC.Server(hProdTarget), &hModelPeer{name: "production"})
+	pb.RegisterModelServer(ctx.GRPC.Server(hCandTarget), &hModelPeer{name: "candidate"})
+	return store.CreateConfig(hClientBg, "t1", "cand-2026-04", 5, []string{"latency"}).ConfigID
 }
 
-func mustComplete(ctx *harness.Ctx, cfg string) {
-	text, err := complete(clientBg, cfg, "hello")
+func hComplete(ctx *harness.Ctx, cfg string) {
+	text, err := complete(hClientBg, cfg, "hello")
 	ctx.Assert(err == nil, "complete failed: %v. A shadow failure must never fail the production request", err)
-	ctx.Equal(text, prodAnswer, "complete must return production's answer")
+	ctx.Equal(text, hProdAnswer, "complete must return production's answer")
 }
 
-func shadowStats(ctx *harness.Ctx, cfg string) map[string]int {
+func hShadowStats(ctx *harness.Ctx, cfg string) map[string]int {
 	out := map[string]int{}
 	for k, v := range ctx.Redis.HGetAll("shadow:" + cfg + ":stats") {
 		n, _ := strconv.Atoi(v)
@@ -860,15 +914,15 @@ func shadowStats(ctx *harness.Ctx, cfg string) map[string]int {
 	return out
 }
 
-func candidateCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Complete", candTarget)) }
+func hCandidateCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Complete", hCandTarget)) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	cfg := clientWorld(ctx)
-	ctx.GRPC.SetLatency("Complete", 5.0, candTarget)
+	cfg := hClientWorld(ctx)
+	ctx.GRPC.SetLatency("Complete", 5.0, hCandTarget)
 	before := ctx.Clock.Now()
-	mustComplete(ctx, cfg)
+	hComplete(ctx, cfg)
 	took := float64(ctx.Clock.Now()-before) / 1000
-	calls := ctx.GRPC.CallsTo("Complete", candTarget)
+	calls := ctx.GRPC.CallsTo("Complete", hCandTarget)
 	ctx.Assert(len(calls) > 0, "the candidate was never called")
 	ctx.Assert(calls[0].HasDeadline(), "the candidate call carries no deadline: a candidate that hangs holds the production request")
 	ctx.Assert(250*time.Millisecond <= calls[0].Timeout && calls[0].Timeout <= 350*time.Millisecond, "the candidate call carries a %v deadline, expected 300 ms", calls[0].Timeout)
@@ -876,47 +930,85 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckIsolate(ctx *harness.Ctx) {
-	cfg := clientWorld(ctx)
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 10, candTarget)
-	mustComplete(ctx, cfg)
+	cfg := hClientWorld(ctx)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 10, hCandTarget)
+	hComplete(ctx, cfg)
+	ctx.GRPC.ClearFailures()
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.Unknown, codes.InvalidArgument} {
+		ctx.GRPC.Fail("Complete", code, "", 1, hCandTarget)
+		hComplete(ctx, cfg)
+	}
 }
 
 func CheckNoRetry(ctx *harness.Ctx) {
-	cfg := clientWorld(ctx)
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 1, candTarget)
-	mustComplete(ctx, cfg)
-	ctx.Equal(candidateCalls(ctx), 1, "a shadow is attempted once; the candidate calls for one failed shadow")
+	cfg := hClientWorld(ctx)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 1, hCandTarget)
+	hComplete(ctx, cfg)
+	ctx.Equal(hCandidateCalls(ctx), 1, "a shadow is attempted once; the candidate calls for one failed shadow")
 }
 
 func CheckDropped(ctx *harness.Ctx) {
-	cfg := clientWorld(ctx)
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 1, candTarget)
-	mustComplete(ctx, cfg)
-	ctx.Equal(shadowStats(ctx, cfg), map[string]int{"dropped": 1}, "after one failed shadow, shadow:%s:stats", cfg)
-	mustComplete(ctx, cfg)
-	ctx.Equal(shadowStats(ctx, cfg), map[string]int{"dropped": 1, "completed": 1}, "after a failed and a completed shadow, the stats")
-	ctx.GRPC.SetLatency("Complete", 5.0, candTarget)
-	mustComplete(ctx, cfg)
-	ctx.Equal(shadowStats(ctx, cfg)["dropped"], 2, "a shadow past its deadline is dropped too; dropped")
+	cfg := hClientWorld(ctx)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 1, hCandTarget)
+	hComplete(ctx, cfg)
+	ctx.Equal(hShadowStats(ctx, cfg), map[string]int{"dropped": 1}, "after one failed shadow, shadow:%s:stats", cfg)
+	hComplete(ctx, cfg)
+	ctx.Equal(hShadowStats(ctx, cfg), map[string]int{"dropped": 1, "completed": 1}, "after a failed and a completed shadow, the stats")
+	ctx.GRPC.Fail("Complete", codes.Internal, "", 1, hCandTarget)
+	hComplete(ctx, cfg)
+	ctx.Equal(hShadowStats(ctx, cfg), map[string]int{"dropped": 2, "completed": 1}, "a shadow the candidate failed with INTERNAL is dropped too; the stats")
+	ctx.GRPC.SetLatency("Complete", 5.0, hCandTarget)
+	hComplete(ctx, cfg)
+	ctx.Equal(hShadowStats(ctx, cfg)["dropped"], 3, "a shadow past its deadline is dropped too; dropped")
 }
 
 func CheckBreaker(ctx *harness.Ctx) {
-	cfg := clientWorld(ctx)
-	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 100, candTarget)
-	for i := 0; i < 8; i++ {
-		mustComplete(ctx, cfg)
+	cfg := hClientWorld(ctx)
+	breaker := "shadow:" + cfg + ":breaker"
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 4, hCandTarget)
+	for i := 0; i < 5; i++ { // four failures, then the candidate answers
+		hComplete(ctx, cfg)
 	}
-	ctx.Equal(candidateCalls(ctx), 5, "the candidate is down: after BREAKER_FAILURES (5) failures in a row it gets no shadow until the breaker expires; the calls it received out of 8")
-	ctx.Equal(shadowStats(ctx, cfg)["dropped"], 8, "all 8 shadows were lost; dropped")
-	ttl := ctx.Redis.TTL("shadow:" + cfg + ":breaker")
-	ctx.Assert(ttl > 0 && ttl <= 30, "shadow:%s:breaker has TTL %d, expected an open breaker for BREAKER_OPEN_S (30 s)", cfg, ttl)
+	ctx.GRPC.Fail("Complete", codes.Unavailable, "", 4, hCandTarget)
+	for i := 0; i < 4; i++ {
+		hComplete(ctx, cfg)
+	}
+	open := ctx.Redis.Exists(breaker) == 1
+	ctx.Assert(hCandidateCalls(ctx) == 9 && !open, "four failures, a success, then four failures: the candidate received %d of 9 shadows and the breaker is open=%v. A success resets the count, so these are not five in a row", hCandidateCalls(ctx), open)
+	hComplete(ctx, cfg) // a success clears the count again
+	failures := "shadow:" + cfg + ":failures"
+	ctx.Redis.Set(failures, "4") // four failures in a row seen by other instances
+	openedTTL := int64(-3)
+	// The breaker's TTL right after the command that creates it.
+	var watchBreaker func() any
+	watchBreaker = func() any {
+		if ctx.Redis.Exists(breaker) == 1 {
+			if openedTTL == -3 {
+				openedTTL = ctx.Redis.TTL(breaker)
+			}
+		} else {
+			ctx.Redis.After(breaker, watchBreaker)
+		}
+		return nil
+	}
+	ctx.Redis.After(failures, watchBreaker)
+	ctx.GRPC.Fail("Complete", codes.Internal, "", 100, hCandTarget)
+	for i := 0; i < 4; i++ {
+		hComplete(ctx, cfg)
+	}
+	n := hCandidateCalls(ctx)
+	ctx.Assert(n == 11, "after four failures counted in %s by other instances and one here, the candidate received %d of the next 4 shadows, expected 1: the count lives in Redis and the fifth failure in a row opens the breaker for the whole fleet", failures, n-10)
+	ctx.Equal(openedTTL, int64(30), "the breaker is set with its expiry in one command; the TTL of %s right after the command that opened it", breaker)
+	stats := hShadowStats(ctx, cfg)
+	ctx.Assert(stats["dropped"] == 12 && stats["completed"] == 2, "12 shadows were lost and 2 completed, the stats say %v", stats)
 	ctx.Clock.Advance(31)
-	mustComplete(ctx, cfg)
-	ctx.Equal(candidateCalls(ctx), 6, "30 s after the breaker opened the candidate must get the next shadow again; the calls")
+	hComplete(ctx, cfg)
+	ctx.Equal(hCandidateCalls(ctx), 12, "30 s after the breaker opened the candidate must get the next shadow again; the calls")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <functional>
 #include <map>
 #include <string>
 
@@ -925,13 +1017,13 @@ func CheckBreaker(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kProdTarget = "production-model:9000";
-const std::string kCandTarget = "candidate-model:9000";
-const std::string kProdAnswer = "production answer to hello";
+const std::string kHProdTarget = "production-model:9000";
+const std::string kHCandTarget = "candidate-model:9000";
+const std::string kHProdAnswer = "production answer to hello";
 
-class ModelPeer final : public shadoweval::Model::Service {
+class HModelPeer final : public shadoweval::Model::Service {
  public:
-  explicit ModelPeer(std::string name) : name_(std::move(name)) {}
+  explicit HModelPeer(std::string name) : name_(std::move(name)) {}
   grpc::Status Complete(grpc::ServerContext*, const shadoweval::CompleteRequest* req, shadoweval::CompleteReply* out) override {
     out->set_text(name_ + " answer to " + req->prompt());
     out->set_model_version(req->model_version());
@@ -942,47 +1034,47 @@ class ModelPeer final : public shadoweval::Model::Service {
   std::string name_;
 };
 
-struct Peers {
-  ModelPeer production{"production"};
-  ModelPeer candidate{"candidate"};
+struct HPeers {
+  HModelPeer production{"production"};
+  HModelPeer candidate{"candidate"};
 };
 
-std::string clientWorld(harness::Ctx& ctx) {
-  static Peers* peers = nullptr;
+std::string hClientWorld(harness::Ctx& ctx) {
+  static HPeers* peers = nullptr;
   delete peers;
-  peers = new Peers;
-  ctx.GRPC.Server(kProdTarget)->RegisterService(&peers->production);
-  ctx.GRPC.Server(kCandTarget)->RegisterService(&peers->candidate);
+  peers = new HPeers;
+  ctx.GRPC.Server(kHProdTarget)->RegisterService(&peers->production);
+  ctx.GRPC.Server(kHCandTarget)->RegisterService(&peers->candidate);
   return store::createConfig("t1", "cand-2026-04", 5, {"latency"}).config_id;
 }
 
-void mustComplete(harness::Ctx& ctx, const std::string& cfg) {
+void hComplete(harness::Ctx& ctx, const std::string& cfg) {
   std::string text;
   try {
     text = complete(cfg, "hello");
   } catch (const std::exception& e) {
     ctx.Fatalf("complete threw %s: %s. A shadow failure must never fail the production request", harness::CurrentExceptionType(), e.what());
   }
-  ctx.Equal(text, kProdAnswer, "complete must return production's answer");
+  ctx.Equal(text, kHProdAnswer, "complete must return production's answer");
 }
 
-std::map<std::string, long long> shadowStats(harness::Ctx& ctx, const std::string& cfg) {
+std::map<std::string, long long> hShadowStats(harness::Ctx& ctx, const std::string& cfg) {
   std::map<std::string, long long> out;
   for (const auto& [k, v] : ctx.Redis.HGetAll("shadow:" + cfg + ":stats")) out[k] = std::stoll(v);
   return out;
 }
 
-size_t candidateCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Complete", kCandTarget).size(); }
+size_t hCandidateCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Complete", kHCandTarget).size(); }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  const std::string cfg = clientWorld(ctx);
-  ctx.GRPC.SetLatency("Complete", 5.0, kCandTarget);
+  const std::string cfg = hClientWorld(ctx);
+  ctx.GRPC.SetLatency("Complete", 5.0, kHCandTarget);
   const int64_t before = ctx.Clock.Now();
-  mustComplete(ctx, cfg);
+  hComplete(ctx, cfg);
   const double took = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  const auto calls = ctx.GRPC.CallsTo("Complete", kCandTarget);
+  const auto calls = ctx.GRPC.CallsTo("Complete", kHCandTarget);
   ctx.Assert(!calls.empty(), "the candidate was never called");
   ctx.Assert(calls[0].HasDeadline(), "the candidate call carries no deadline: a candidate that hangs holds the production request");
   ctx.Assert(0.25 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 0.35, "the candidate call carries a %v s deadline, expected 0.3 s", calls[0].TimeoutSeconds());
@@ -990,41 +1082,71 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckIsolate(harness::Ctx& ctx) {
-  const std::string cfg = clientWorld(ctx);
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 10, kCandTarget);
-  mustComplete(ctx, cfg);
+  const std::string cfg = hClientWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 10, kHCandTarget);
+  hComplete(ctx, cfg);
+  ctx.GRPC.ClearFailures();
+  for (const auto code : {grpc::StatusCode::INTERNAL, grpc::StatusCode::RESOURCE_EXHAUSTED, grpc::StatusCode::UNKNOWN, grpc::StatusCode::INVALID_ARGUMENT}) {
+    ctx.GRPC.Fail("Complete", code, "", 1, kHCandTarget);
+    hComplete(ctx, cfg);
+  }
 }
 
 void CheckNoRetry(harness::Ctx& ctx) {
-  const std::string cfg = clientWorld(ctx);
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 1, kCandTarget);
-  mustComplete(ctx, cfg);
-  ctx.Equal(candidateCalls(ctx), 1, "a shadow is attempted once; the candidate calls for one failed shadow");
+  const std::string cfg = hClientWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 1, kHCandTarget);
+  hComplete(ctx, cfg);
+  ctx.Equal(hCandidateCalls(ctx), 1, "a shadow is attempted once; the candidate calls for one failed shadow");
 }
 
 void CheckDropped(harness::Ctx& ctx) {
-  const std::string cfg = clientWorld(ctx);
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 1, kCandTarget);
-  mustComplete(ctx, cfg);
-  ctx.Equal(shadowStats(ctx, cfg), std::map<std::string, long long>{{"dropped", 1}}, "after one failed shadow, shadow:%s:stats", cfg);
-  mustComplete(ctx, cfg);
-  ctx.Equal(shadowStats(ctx, cfg), std::map<std::string, long long>{{"completed", 1}, {"dropped", 1}}, "after a failed and a completed shadow, the stats");
-  ctx.GRPC.SetLatency("Complete", 5.0, kCandTarget);
-  mustComplete(ctx, cfg);
-  ctx.Equal(shadowStats(ctx, cfg)["dropped"], 2, "a shadow past its deadline is dropped too; dropped");
+  const std::string cfg = hClientWorld(ctx);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 1, kHCandTarget);
+  hComplete(ctx, cfg);
+  ctx.Equal(hShadowStats(ctx, cfg), std::map<std::string, long long>{{"dropped", 1}}, "after one failed shadow, shadow:%s:stats", cfg);
+  hComplete(ctx, cfg);
+  ctx.Equal(hShadowStats(ctx, cfg), std::map<std::string, long long>{{"completed", 1}, {"dropped", 1}}, "after a failed and a completed shadow, the stats");
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::INTERNAL, "", 1, kHCandTarget);
+  hComplete(ctx, cfg);
+  ctx.Equal(hShadowStats(ctx, cfg), std::map<std::string, long long>{{"completed", 1}, {"dropped", 2}}, "a shadow the candidate failed with INTERNAL is dropped too; the stats");
+  ctx.GRPC.SetLatency("Complete", 5.0, kHCandTarget);
+  hComplete(ctx, cfg);
+  ctx.Equal(hShadowStats(ctx, cfg)["dropped"], 3, "a shadow past its deadline is dropped too; dropped");
 }
 
 void CheckBreaker(harness::Ctx& ctx) {
-  const std::string cfg = clientWorld(ctx);
-  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 100, kCandTarget);
-  for (int i = 0; i < 8; i++) mustComplete(ctx, cfg);
-  ctx.Equal(candidateCalls(ctx), 5, "the candidate is down: after BREAKER_FAILURES (5) failures in a row it gets no shadow until the breaker expires; the calls it received out of 8");
-  ctx.Equal(shadowStats(ctx, cfg)["dropped"], 8, "all 8 shadows were lost; dropped");
-  const long long ttl = ctx.Redis.TTL("shadow:" + cfg + ":breaker");
-  ctx.Assert(ttl > 0 && ttl <= 30, "shadow:%s:breaker has TTL %d, expected an open breaker for BREAKER_OPEN_S (30 s)", cfg, ttl);
+  const std::string cfg = hClientWorld(ctx);
+  const std::string breaker = "shadow:" + cfg + ":breaker";
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 4, kHCandTarget);
+  for (int i = 0; i < 5; i++) hComplete(ctx, cfg);  // four failures, then the candidate answers
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "", 4, kHCandTarget);
+  for (int i = 0; i < 4; i++) hComplete(ctx, cfg);
+  const bool open = ctx.Redis.Exists(breaker) == 1;
+  ctx.Assert(hCandidateCalls(ctx) == 9 && !open, "four failures, a success, then four failures: the candidate received %d of 9 shadows and the breaker is %s. A success resets the count, so these are not five in a row",
+             hCandidateCalls(ctx), open ? "open" : "closed");
+  hComplete(ctx, cfg);  // a success clears the count again
+  const std::string failures = "shadow:" + cfg + ":failures";
+  ctx.Redis.Set(failures, "4");  // four failures in a row seen by other instances
+  long long opened_ttl = -3;
+  // The breaker's TTL right after the command that creates it.
+  std::function<void()> watch_breaker = [&] {
+    if (ctx.Redis.Exists(breaker) == 1) {
+      if (opened_ttl == -3) opened_ttl = ctx.Redis.TTL(breaker);
+    } else {
+      ctx.Redis.After(breaker, watch_breaker);
+    }
+  };
+  ctx.Redis.After(failures, watch_breaker);
+  ctx.GRPC.Fail("Complete", grpc::StatusCode::INTERNAL, "", 100, kHCandTarget);
+  for (int i = 0; i < 4; i++) hComplete(ctx, cfg);
+  const size_t n = hCandidateCalls(ctx);
+  ctx.Assert(n == 11, "after four failures counted in %s by other instances and one here, the candidate received %d of the next 4 shadows, expected 1: the count lives in Redis and the fifth failure in a row opens the breaker for the whole fleet", failures, static_cast<long long>(n) - 10);
+  ctx.Equal(opened_ttl, 30, "the breaker is set with its expiry in one command; the TTL of %s right after the command that opened it", breaker);
+  auto stats = hShadowStats(ctx, cfg);
+  ctx.Assert(stats["dropped"] == 12 && stats["completed"] == 2, "12 shadows were lost and 2 completed, the stats say dropped %d, completed %d", stats["dropped"], stats["completed"]);
   ctx.Clock.Advance(31);
-  mustComplete(ctx, cfg);
-  ctx.Equal(candidateCalls(ctx), 6, "30 s after the breaker opened the candidate must get the next shadow again; the calls");
+  hComplete(ctx, cfg);
+  ctx.Equal(hCandidateCalls(ctx), 12, "30 s after the breaker opened the candidate must get the next shadow again; the calls");
 }
 `,
   },

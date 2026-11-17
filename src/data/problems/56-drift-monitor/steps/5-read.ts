@@ -59,7 +59,7 @@ the distance.
       id: 'tenant-scope',
       title: 'Resolves the monitor inside the tenant',
       detail:
-        'A missing `X-Tenant-Id` is **401** and the monitor is looked up with `monitor_for`/`monitorFor(tenant, id)`, so another tenant’s monitor is **404**; a lookup by id alone (`get_monitor`) serves anyone’s drift.',
+        'A missing `X-Tenant-Id` is **401** and the monitor is looked up with `monitor_for`/`monitorFor(tenant, id)`, so another tenant’s monitor is **404**, the same answer as an unknown id; a lookup by id alone (`get_monitor`) serves anyone’s drift.',
       match: {
         python: {all: [/store\.monitor_for\(\s*tenant/, /\b401\b/], none: [/store\.get_monitor\(/]},
         typescript: {all: [/monitorFor\(\s*tenant/, /\b401\b/], none: [/getMonitor\(/]},
@@ -72,7 +72,7 @@ the distance.
       id: 'sample-counts',
       title: 'Reports the sample counts, the window and the baseline',
       detail:
-        'The report carries `sample_count`, `baseline_sample_count`, `window_start`, `window_end` and `baseline` next to the distance.',
+        'The report carries `sample_count`, `baseline_sample_count`, `window_start`, `window_end` and `baseline` next to the distance, the window being the monitor’s own `window_s`.',
       match: {
         python: {all: [/["']sample_count["']/, /["']baseline_sample_count["']/, /["']window_end["']/]},
         typescript: {all: [/sample_count:/, /baseline_sample_count:/, /window_end:/]},
@@ -85,7 +85,7 @@ the distance.
       id: 'insufficient-data',
       title: 'Calls out insufficient data below the sample floor',
       detail:
-        'Fewer than `MIN_SAMPLES` = 200 samples on either side is `state: "insufficient_data"`, never a crossing.',
+        'Fewer than `MIN_SAMPLES` = 200 samples on either side, the live window or the baseline, is `state: "insufficient_data"`, never a crossing; exactly 200 is enough.',
       match: {
         python: {all: [/MIN_SAMPLES\s*=\s*200\b/, /insufficient_data/]},
         typescript: {all: [/MIN_SAMPLES\s*=\s*200\b/, /insufficient_data/]},
@@ -98,7 +98,7 @@ the distance.
       id: 'threshold-crossed',
       title: 'Reports a crossing only for a sufficient, over-threshold window',
       detail:
-        '`threshold_crossed` is computed from the sample floor and `distance >= threshold`, and `state` says `drifting` or `ok`; the starter answers `significant: true` for any distance.',
+        '`threshold_crossed` is computed from the sample floor and `distance >= threshold`, a distance equal to the threshold included, and `state` says `drifting` or `ok`; the starter answers `significant: true` for any distance.',
       match: {
         python: {
           all: [/["']threshold_crossed["']/, /distance\s*>=\s*monitor\[["']threshold["']\]/],
@@ -511,11 +511,11 @@ STEADY = {1: 330, 2: 310}
 THIN = {1: 10, 2: 40}
 
 
-def _seed(live, tenant="t1"):
-    """A monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window."""
-    monitor = store.create_monitor({"tenant": tenant, "model_version": "v3", "metric": "input_distribution", "window_s": 300, "baseline": REF, "threshold": 0.2})
-    sketch.freeze_baseline(tenant, REF, BASELINE)
-    sketch.merge_batch(tenant, monitor["monitor_id"], 300, live)
+def _seed(live, tenant="t1", window_s=300, threshold=0.2, ref=REF, baseline=BASELINE):
+    """A monitor of tenant with its baseline frozen and live merged into the current window."""
+    monitor = store.create_monitor({"tenant": tenant, "model_version": "v3", "metric": "input_distribution", "window_s": window_s, "baseline": ref, "threshold": threshold})
+    sketch.freeze_baseline(tenant, ref, baseline)
+    sketch.merge_batch(tenant, monitor["monitor_id"], window_s, live)
     return monitor["monitor_id"]
 
 
@@ -543,6 +543,8 @@ async def check_tenant_scope(ctx):
     assert anonymous.status_code == 401, f"a report without X-Tenant-Id answered {anonymous.status_code}, expected 401"
     own = await _report(ctx, monitor_id)
     assert own.status_code == 200, f"t1 asking for its own monitor got {own.status_code}: {own.text}"
+    missing = await _report(ctx, "m-404")
+    assert missing.status_code == 404, f"t1 asking for the unknown monitor m-404 got {missing.status_code} {missing.text}, expected 404, the same answer as another tenant's monitor"
 
 
 async def check_sample_counts(ctx):
@@ -552,6 +554,12 @@ async def check_sample_counts(ctx):
     want = {"sample_count": 640, "baseline_sample_count": 5000, "window_start": window, "window_end": window + 300, "baseline": REF}
     seen = {name: body.get(name) for name in want}
     assert seen == want, f"the report carries {seen}, expected {want}: a distance without its counts, window and baseline cannot be judged"
+    hourly = _seed(STEADY, window_s=3600)
+    hour = sketch.window_start(int(ctx.clock.time()), 3600)
+    body = (await _report(ctx, hourly)).json()
+    want = {"sample_count": 640, "baseline_sample_count": 5000, "window_start": hour, "window_end": hour + 3600, "baseline": REF}
+    seen = {name: body.get(name) for name in want}
+    assert seen == want, f"a monitor with window_s 3600 reported {seen}, expected {want}: the window is the monitor's own"
 
 
 async def check_insufficient_data(ctx):
@@ -559,6 +567,13 @@ async def check_insufficient_data(ctx):
     body = (await _report(ctx, monitor_id)).json()
     assert body.get("state") == "insufficient_data", f"a window of 50 samples (MIN_SAMPLES is 200) reported state {body.get('state')!r}: {body}"
     assert body.get("threshold_crossed") is False, f"a window of 50 samples reported threshold_crossed {body.get('threshold_crossed')!r}, expected False whatever its distance"
+    body = (await _report(ctx, _seed({1: 50, 2: 149}))).json()
+    assert body.get("state") == "insufficient_data" and body.get("threshold_crossed") is False, f"a window of 199 samples (one below MIN_SAMPLES) reported {body}, expected state insufficient_data"
+    body = (await _report(ctx, _seed({1: 50, 2: 150}))).json()
+    assert body.get("state") == "drifting" and body.get("threshold_crossed") is True, f"a window of exactly 200 samples (MIN_SAMPLES) at distance {body.get('distance')} over a 0.2 threshold reported {body}, expected state drifting: the floor itself is enough"
+    thin = {1: 99, 2: 100}
+    body = (await _report(ctx, _seed(DRIFTING, ref="baseline:v3:2026-09-01", baseline=thin))).json()
+    assert body.get("state") == "insufficient_data" and body.get("threshold_crossed") is False, f"640 live samples against a baseline of 199 reported {body}, expected state insufficient_data: the floor applies to both sides"
 
 
 async def check_threshold_crossed(ctx):
@@ -566,6 +581,9 @@ async def check_threshold_crossed(ctx):
     assert drifting.get("threshold_crossed") is True and drifting.get("state") == "drifting", f"640 samples at distance {sketch.psi(DRIFTING, BASELINE):.3f} over a 0.2 threshold reported {drifting}, expected threshold_crossed True and state drifting"
     steady = (await _report(ctx, _seed(STEADY))).json()
     assert steady.get("threshold_crossed") is False and steady.get("state") == "ok", f"640 samples at distance {sketch.psi(STEADY, BASELINE):.4f} under the 0.2 threshold reported {steady}, expected threshold_crossed False and state ok"
+    exact = sketch.psi(DRIFTING, BASELINE)
+    at = (await _report(ctx, _seed(DRIFTING, threshold=exact))).json()
+    assert at.get("threshold_crossed") is True and at.get("state") == "drifting", f"a distance equal to the threshold ({exact}) reported {at}, expected threshold_crossed True and state drifting: the threshold itself is a crossing (distance >= threshold)"
 `,
     typescript: `const REF = 'baseline:v3:2026-10-01';
 const BASELINE = {1: 2500, 2: 2500};
@@ -573,13 +591,13 @@ const DRIFTING = {1: 160, 2: 480};
 const STEADY = {1: 330, 2: 310};
 const THIN = {1: 10, 2: 40};
 
-/** A monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window. */
-async function seed(ctx, live, tenant = 't1'): Promise<string> {
+/** A monitor of tenant with its baseline frozen and live merged into the current window. */
+async function seed(ctx, live, {tenant = 't1', windowS = 300, threshold = 0.2, ref = REF, baseline = BASELINE} = {}): Promise<string> {
   const store = ctx.load('/support/drift/store.ts');
   const sketch = ctx.load('/support/drift/sketch.ts');
-  const monitor = await store.createMonitor({tenant, model_version: 'v3', metric: 'input_distribution', window_s: 300, baseline: REF, threshold: 0.2});
-  await sketch.freezeBaseline(tenant, REF, BASELINE);
-  await sketch.mergeBatch(tenant, monitor.monitor_id, 300, live);
+  const monitor = await store.createMonitor({tenant, model_version: 'v3', metric: 'input_distribution', window_s: windowS, baseline: ref, threshold});
+  await sketch.freezeBaseline(tenant, ref, baseline);
+  await sketch.mergeBatch(tenant, monitor.monitor_id, windowS, live);
   return monitor.monitor_id;
 }
 
@@ -605,6 +623,8 @@ export async function check_tenant_scope(ctx) {
   assert.equal(anonymous.status, 401, \`a report without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
   const own = await report(ctx, monitorId);
   assert.equal(own.status, 200, \`t1 asking for its own monitor got \${own.status}: \${own.text}\`);
+  const missing = await report(ctx, 'm-404');
+  assert.equal(missing.status, 404, \`t1 asking for the unknown monitor m-404 got \${missing.status} \${missing.text}, expected 404, the same answer as another tenant's monitor\`);
 }
 
 export async function check_sample_counts(ctx) {
@@ -615,6 +635,12 @@ export async function check_sample_counts(ctx) {
   const want = {sample_count: 640, baseline_sample_count: 5000, window_start: window, window_end: window + 300, baseline: REF};
   const seen = Object.fromEntries(Object.keys(want).map(name => [name, body[name]]));
   assert.deepStrictEqual(seen, want, \`the report carries \${JSON.stringify(seen)}, expected \${JSON.stringify(want)}: a distance without its counts, window and baseline cannot be judged\`);
+  const hourly = await seed(ctx, STEADY, {windowS: 3600});
+  const hour = now - (now % 3600);
+  const hourBody = (await report(ctx, hourly)).json();
+  const wantHour = {sample_count: 640, baseline_sample_count: 5000, window_start: hour, window_end: hour + 3600, baseline: REF};
+  const seenHour = Object.fromEntries(Object.keys(wantHour).map(name => [name, hourBody[name]]));
+  assert.deepStrictEqual(seenHour, wantHour, \`a monitor with window_s 3600 reported \${JSON.stringify(seenHour)}, expected \${JSON.stringify(wantHour)}: the window is the monitor's own\`);
 }
 
 export async function check_insufficient_data(ctx) {
@@ -622,6 +648,12 @@ export async function check_insufficient_data(ctx) {
   const body = (await report(ctx, monitorId)).json();
   assert.equal(body.state, 'insufficient_data', \`a window of 50 samples (MIN_SAMPLES is 200) reported state \${JSON.stringify(body.state)}: \${JSON.stringify(body)}\`);
   assert.equal(body.threshold_crossed, false, \`a window of 50 samples reported threshold_crossed \${JSON.stringify(body.threshold_crossed)}, expected false whatever its distance\`);
+  const below = (await report(ctx, await seed(ctx, {1: 50, 2: 149}))).json();
+  assert(below.state === 'insufficient_data' && below.threshold_crossed === false, \`a window of 199 samples (one below MIN_SAMPLES) reported \${JSON.stringify(below)}, expected state insufficient_data\`);
+  const floor = (await report(ctx, await seed(ctx, {1: 50, 2: 150}))).json();
+  assert(floor.state === 'drifting' && floor.threshold_crossed === true, \`a window of exactly 200 samples (MIN_SAMPLES) over a 0.2 threshold reported \${JSON.stringify(floor)}, expected state drifting: the floor itself is enough\`);
+  const thinBaseline = (await report(ctx, await seed(ctx, DRIFTING, {ref: 'baseline:v3:2026-09-01', baseline: {1: 99, 2: 100}}))).json();
+  assert(thinBaseline.state === 'insufficient_data' && thinBaseline.threshold_crossed === false, \`640 live samples against a baseline of 199 reported \${JSON.stringify(thinBaseline)}, expected state insufficient_data: the floor applies to both sides\`);
 }
 
 export async function check_threshold_crossed(ctx) {
@@ -629,6 +661,9 @@ export async function check_threshold_crossed(ctx) {
   assert(drifting.threshold_crossed === true && drifting.state === 'drifting', \`640 samples over a 0.2 threshold reported \${JSON.stringify(drifting)}, expected threshold_crossed true and state drifting\`);
   const steady = (await report(ctx, await seed(ctx, STEADY))).json();
   assert(steady.threshold_crossed === false && steady.state === 'ok', \`640 samples under the 0.2 threshold reported \${JSON.stringify(steady)}, expected threshold_crossed false and state ok\`);
+  const exact = ctx.load('/support/drift/sketch.ts').psi(DRIFTING, BASELINE);
+  const at = (await report(ctx, await seed(ctx, DRIFTING, {threshold: exact}))).json();
+  assert(at.threshold_crossed === true && at.state === 'drifting', \`a distance equal to the threshold (\${exact}) reported \${JSON.stringify(at)}, expected threshold_crossed true and state drifting: the threshold itself is a crossing (distance >= threshold)\`);
 }
 `,
     go: `package main
@@ -644,26 +679,31 @@ import (
 	"leetbuild/harness"
 )
 
-const ref = "baseline:v3:2026-10-01"
+const hRef = "baseline:v3:2026-10-01"
 
 var (
-	readBg   = context.Background()
-	baseline = map[int]int64{1: 2500, 2: 2500}
-	drifting = map[int]int64{1: 160, 2: 480}
-	steady   = map[int]int64{1: 330, 2: 310}
-	thin     = map[int]int64{1: 10, 2: 40}
+	hBg       = context.Background()
+	hBaseline = map[int]int64{1: 2500, 2: 2500}
+	hDrifting = map[int]int64{1: 160, 2: 480}
+	hSteady   = map[int]int64{1: 330, 2: 310}
+	hThin     = map[int]int64{1: 10, 2: 40}
 )
 
-// seed is a monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window.
-func seed(ctx *harness.Ctx, live map[int]int64, tenant string) string {
-	m := store.CreateMonitor(readBg, store.Monitor{Tenant: tenant, ModelVersion: "v3", Metric: "input_distribution", WindowS: 300, Baseline: ref, Threshold: 0.2})
-	sketch.FreezeBaseline(readBg, tenant, ref, baseline)
-	_, err := sketch.MergeBatch(readBg, tenant, m.MonitorID, 300, live)
+// hSeedWith is a monitor of t1 with its baseline frozen and live merged into the current window.
+func hSeedWith(ctx *harness.Ctx, live map[int]int64, windowS int64, threshold float64, ref string, baseline map[int]int64) string {
+	m := store.CreateMonitor(hBg, store.Monitor{Tenant: "t1", ModelVersion: "v3", Metric: "input_distribution", WindowS: windowS, Baseline: ref, Threshold: threshold})
+	sketch.FreezeBaseline(hBg, "t1", ref, baseline)
+	_, err := sketch.MergeBatch(hBg, "t1", m.MonitorID, windowS, live)
 	ctx.NoError(err, "seeding the live sketch failed")
 	return m.MonitorID
 }
 
-func report(ctx *harness.Ctx, monitorID, tenant string) *harness.Response {
+// hSeed is a monitor of t1 (window_s 300, threshold 0.2) on the default baseline.
+func hSeed(ctx *harness.Ctx, live map[int]int64) string {
+	return hSeedWith(ctx, live, 300, 0.2, hRef, hBaseline)
+}
+
+func hReport(ctx *harness.Ctx, monitorID, tenant string) *harness.Response {
 	mux := http.NewServeMux()
 	register(mux)
 	c := ctx.HTTP(mux)
@@ -673,53 +713,71 @@ func report(ctx *harness.Ctx, monitorID, tenant string) *harness.Response {
 	return c.Get("/v1/monitors/"+monitorID+"/report", "X-Tenant-Id", tenant)
 }
 
-func body(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func hBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	m, _ := r.JSON().(map[string]any)
 	ctx.Assert(m != nil, "the report is not a JSON object: %d %s", r.Status, r.Text())
 	return m
 }
 
-func CheckRoute(ctx *harness.Ctx) {
-	monitorID := seed(ctx, drifting, "t1")
-	r := report(ctx, monitorID, "t1")
-	ctx.Equal(r.Status, 200, "GET /v1/monitors/%s/report (%s)", monitorID, r.Text())
-	want := sketch.PSI(drifting, baseline)
-	distance, ok := body(ctx, r)["distance"].(float64)
-	ctx.Assert(ok && math.Abs(distance-want) < 1e-6, "the report's distance is %v, expected the PSI of the window against the baseline, %.6f", body(ctx, r)["distance"], want)
-}
-
-func CheckTenantScope(ctx *harness.Ctx) {
-	monitorID := seed(ctx, drifting, "t1")
-	foreign := report(ctx, monitorID, "t2")
-	ctx.Equal(foreign.Status, 404, "tenant t2 asking for t1's monitor %s must get 404, not another tenant's drift (%s)", monitorID, foreign.Text())
-	ctx.Equal(report(ctx, monitorID, "").Status, 401, "a report without X-Tenant-Id")
-	own := report(ctx, monitorID, "t1")
-	ctx.Equal(own.Status, 200, "t1 asking for its own monitor (%s)", own.Text())
-}
-
-func CheckSampleCounts(ctx *harness.Ctx) {
-	monitorID := seed(ctx, drifting, "t1")
-	window := sketch.WindowStart(ctx.Clock.Now()/1000, 300)
-	b := body(ctx, report(ctx, monitorID, "t1"))
-	want := map[string]any{"sample_count": 640, "baseline_sample_count": 5000, "window_start": window, "window_end": window + 300, "baseline": ref}
+func hPicked(b map[string]any, want map[string]any) map[string]any {
 	seen := map[string]any{}
 	for name := range want {
 		seen[name] = b[name]
 	}
-	ctx.Equal(seen, want, "the report must carry the counts, the window and the baseline, or its distance cannot be judged")
+	return seen
+}
+
+func CheckRoute(ctx *harness.Ctx) {
+	monitorID := hSeed(ctx, hDrifting)
+	r := hReport(ctx, monitorID, "t1")
+	ctx.Equal(r.Status, 200, "GET /v1/monitors/%s/report (%s)", monitorID, r.Text())
+	want := sketch.PSI(hDrifting, hBaseline)
+	distance, ok := hBody(ctx, r)["distance"].(float64)
+	ctx.Assert(ok && math.Abs(distance-want) < 1e-6, "the report's distance is %v, expected the PSI of the window against the baseline, %.6f", hBody(ctx, r)["distance"], want)
+}
+
+func CheckTenantScope(ctx *harness.Ctx) {
+	monitorID := hSeed(ctx, hDrifting)
+	foreign := hReport(ctx, monitorID, "t2")
+	ctx.Equal(foreign.Status, 404, "tenant t2 asking for t1's monitor %s must get 404, not another tenant's drift (%s)", monitorID, foreign.Text())
+	ctx.Equal(hReport(ctx, monitorID, "").Status, 401, "a report without X-Tenant-Id")
+	own := hReport(ctx, monitorID, "t1")
+	ctx.Equal(own.Status, 200, "t1 asking for its own monitor (%s)", own.Text())
+	missing := hReport(ctx, "m-404", "t1")
+	ctx.Equal(missing.Status, 404, "t1 asking for the unknown monitor m-404 must get 404, the same answer as another tenant's monitor (%s)", missing.Text())
+}
+
+func CheckSampleCounts(ctx *harness.Ctx) {
+	monitorID := hSeed(ctx, hDrifting)
+	window := sketch.WindowStart(ctx.Clock.Now()/1000, 300)
+	want := map[string]any{"sample_count": 640, "baseline_sample_count": 5000, "window_start": window, "window_end": window + 300, "baseline": hRef}
+	ctx.Equal(hPicked(hBody(ctx, hReport(ctx, monitorID, "t1")), want), want, "the report must carry the counts, the window and the baseline, or its distance cannot be judged")
+	hourly := hSeedWith(ctx, hSteady, 3600, 0.2, hRef, hBaseline)
+	hour := sketch.WindowStart(ctx.Clock.Now()/1000, 3600)
+	want = map[string]any{"sample_count": 640, "baseline_sample_count": 5000, "window_start": hour, "window_end": hour + 3600, "baseline": hRef}
+	ctx.Equal(hPicked(hBody(ctx, hReport(ctx, hourly, "t1")), want), want, "a monitor with window_s 3600: the window is the monitor's own")
 }
 
 func CheckInsufficientData(ctx *harness.Ctx) {
-	b := body(ctx, report(ctx, seed(ctx, thin, "t1"), "t1"))
+	b := hBody(ctx, hReport(ctx, hSeed(ctx, hThin), "t1"))
 	ctx.Equal(b["state"], "insufficient_data", "a window of 50 samples (minSamples is 200), its state (%v)", b)
 	ctx.Equal(b["threshold_crossed"], false, "a window of 50 samples must not report a crossing whatever its distance; threshold_crossed")
+	below := hBody(ctx, hReport(ctx, hSeed(ctx, map[int]int64{1: 50, 2: 149}), "t1"))
+	ctx.Assert(below["state"] == "insufficient_data" && below["threshold_crossed"] == false, "a window of 199 samples (one below minSamples) reported %v, expected state insufficient_data", below)
+	floor := hBody(ctx, hReport(ctx, hSeed(ctx, map[int]int64{1: 50, 2: 150}), "t1"))
+	ctx.Assert(floor["state"] == "drifting" && floor["threshold_crossed"] == true, "a window of exactly 200 samples (minSamples) over a 0.2 threshold reported %v, expected state drifting: the floor itself is enough", floor)
+	thinBaseline := hBody(ctx, hReport(ctx, hSeedWith(ctx, hDrifting, 300, 0.2, "baseline:v3:2026-09-01", map[int]int64{1: 99, 2: 100}), "t1"))
+	ctx.Assert(thinBaseline["state"] == "insufficient_data" && thinBaseline["threshold_crossed"] == false, "640 live samples against a baseline of 199 reported %v, expected state insufficient_data: the floor applies to both sides", thinBaseline)
 }
 
 func CheckThresholdCrossed(ctx *harness.Ctx) {
-	d := body(ctx, report(ctx, seed(ctx, drifting, "t1"), "t1"))
+	d := hBody(ctx, hReport(ctx, hSeed(ctx, hDrifting), "t1"))
 	ctx.Assert(d["threshold_crossed"] == true && d["state"] == "drifting", "640 samples over a 0.2 threshold reported %v, expected threshold_crossed true and state drifting", d)
-	s := body(ctx, report(ctx, seed(ctx, steady, "t1"), "t1"))
+	s := hBody(ctx, hReport(ctx, hSeed(ctx, hSteady), "t1"))
 	ctx.Assert(s["threshold_crossed"] == false && s["state"] == "ok", "640 samples under the 0.2 threshold reported %v, expected threshold_crossed false and state ok", s)
+	exact := sketch.PSI(hDrifting, hBaseline)
+	at := hBody(ctx, hReport(ctx, hSeedWith(ctx, hDrifting, 300, exact, hRef, hBaseline), "t1"))
+	ctx.Assert(at["threshold_crossed"] == true && at["state"] == "drifting", "a distance equal to the threshold (%v) reported %v, expected threshold_crossed true and state drifting: the threshold itself is a crossing (distance >= threshold)", exact, at)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -736,21 +794,21 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kRef = "baseline:v3:2026-10-01";
-const sketch::Sketch kBaseline = {{1, 2500}, {2, 2500}};
-const sketch::Sketch kDrifting = {{1, 160}, {2, 480}};
-const sketch::Sketch kSteady = {{1, 330}, {2, 310}};
-const sketch::Sketch kThin = {{1, 10}, {2, 40}};
+const std::string hRef = "baseline:v3:2026-10-01";
+const sketch::Sketch hBaseline = {{1, 2500}, {2, 2500}};
+const sketch::Sketch hDrifting = {{1, 160}, {2, 480}};
+const sketch::Sketch hSteady = {{1, 330}, {2, 310}};
+const sketch::Sketch hThin = {{1, 10}, {2, 40}};
 
-// A monitor of tenant (window_s 300, threshold 0.2) with its baseline frozen and live merged into the current window.
-std::string seed(const sketch::Sketch& live, const std::string& tenant = "t1") {
-  const store::Monitor m = store::createMonitor(store::Monitor{"", tenant, "v3", "input_distribution", 300, kRef, 0.2});
-  sketch::freezeBaseline(tenant, kRef, kBaseline);
-  sketch::mergeBatch(tenant, m.monitor_id, 300, live);
+// A monitor of t1 with its baseline frozen and live merged into the current window.
+std::string hSeed(const sketch::Sketch& live, long window_s = 300, double threshold = 0.2, const std::string& ref = hRef, const sketch::Sketch& baseline = hBaseline) {
+  const store::Monitor m = store::createMonitor(store::Monitor{"", "t1", "v3", "input_distribution", window_s, ref, threshold});
+  sketch::freezeBaseline("t1", ref, baseline);
+  sketch::mergeBatch("t1", m.monitor_id, window_s, live);
   return m.monitor_id;
 }
 
-harness::Response report(harness::Ctx& ctx, const std::string& monitor_id, const std::string& tenant = "t1") {
+harness::Response hReport(harness::Ctx& ctx, const std::string& monitor_id, const std::string& tenant = "t1") {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -760,54 +818,72 @@ harness::Response report(harness::Ctx& ctx, const std::string& monitor_id, const
   return c.Get("/v1/monitors/" + monitor_id + "/report", "X-Tenant-Id", tenant);
 }
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the report is not a JSON object: %d %s", r.Status, r.Text());
   return body;
 }
 
+json hPicked(const json& body, const json& want) {
+  json seen = json::object();
+  for (const auto& [name, value] : want.items()) seen[name] = body.contains(name) ? body[name] : json();
+  return seen;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const std::string monitor_id = seed(kDrifting);
-  const auto r = report(ctx, monitor_id);
+  const std::string monitor_id = hSeed(hDrifting);
+  const auto r = hReport(ctx, monitor_id);
   ctx.Equal(r.Status, 200, "GET /v1/monitors/%s/report (%s)", monitor_id, r.Text());
-  const double want = sketch::psi(kDrifting, kBaseline);
-  const json body = bodyOf(ctx, r);
+  const double want = sketch::psi(hDrifting, hBaseline);
+  const json body = hBodyOf(ctx, r);
   ctx.Assert(body.contains("distance") && body["distance"].is_number() && std::abs(body["distance"].get<double>() - want) < 1e-6,
              "the report's distance is %s, expected the PSI of the window against the baseline, %.6f", body.value("distance", json()).dump(), want);
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  const std::string monitor_id = seed(kDrifting);
-  const auto foreign = report(ctx, monitor_id, "t2");
+  const std::string monitor_id = hSeed(hDrifting);
+  const auto foreign = hReport(ctx, monitor_id, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 asking for t1's monitor %s must get 404, not another tenant's drift (%s)", monitor_id, foreign.Text());
-  ctx.Equal(report(ctx, monitor_id, "").Status, 401, "a report without X-Tenant-Id");
-  const auto own = report(ctx, monitor_id);
+  ctx.Equal(hReport(ctx, monitor_id, "").Status, 401, "a report without X-Tenant-Id");
+  const auto own = hReport(ctx, monitor_id);
   ctx.Equal(own.Status, 200, "t1 asking for its own monitor (%s)", own.Text());
+  const auto missing = hReport(ctx, "m-404");
+  ctx.Equal(missing.Status, 404, "t1 asking for the unknown monitor m-404 must get 404, the same answer as another tenant's monitor (%s)", missing.Text());
 }
 
 void CheckSampleCounts(harness::Ctx& ctx) {
-  const std::string monitor_id = seed(kDrifting);
+  const std::string monitor_id = hSeed(hDrifting);
   const long window = sketch::windowStart(static_cast<long>(ctx.Clock.Now() / 1000), 300);
-  const json body = bodyOf(ctx, report(ctx, monitor_id));
-  const json want = {{"sample_count", 640}, {"baseline_sample_count", 5000}, {"window_start", window}, {"window_end", window + 300}, {"baseline", kRef}};
-  json seen = json::object();
-  for (const auto& [name, value] : want.items()) seen[name] = body.contains(name) ? body[name] : json();
-  ctx.Equal(seen, want, "the report must carry the counts, the window and the baseline, or its distance cannot be judged");
+  json want = {{"sample_count", 640}, {"baseline_sample_count", 5000}, {"window_start", window}, {"window_end", window + 300}, {"baseline", hRef}};
+  ctx.Equal(hPicked(hBodyOf(ctx, hReport(ctx, monitor_id)), want), want, "the report must carry the counts, the window and the baseline, or its distance cannot be judged");
+  const std::string hourly = hSeed(hSteady, 3600);
+  const long hour = sketch::windowStart(static_cast<long>(ctx.Clock.Now() / 1000), 3600);
+  want = {{"sample_count", 640}, {"baseline_sample_count", 5000}, {"window_start", hour}, {"window_end", hour + 3600}, {"baseline", hRef}};
+  ctx.Equal(hPicked(hBodyOf(ctx, hReport(ctx, hourly)), want), want, "a monitor with window_s 3600: the window is the monitor's own");
 }
 
 void CheckInsufficientData(harness::Ctx& ctx) {
-  const json body = bodyOf(ctx, report(ctx, seed(kThin)));
+  const json body = hBodyOf(ctx, hReport(ctx, hSeed(hThin)));
   ctx.Equal(body.value("state", ""), "insufficient_data", "a window of 50 samples (kMinSamples is 200), its state (%s)", body.dump());
   ctx.Assert(body.contains("threshold_crossed") && body["threshold_crossed"] == false, "a window of 50 samples must not report a crossing whatever its distance, got %s", body.dump());
+  const json below = hBodyOf(ctx, hReport(ctx, hSeed({{1, 50}, {2, 149}})));
+  ctx.Assert(below.value("state", "") == "insufficient_data" && below.contains("threshold_crossed") && below["threshold_crossed"] == false, "a window of 199 samples (one below kMinSamples) reported %s, expected state insufficient_data", below.dump());
+  const json onFloor = hBodyOf(ctx, hReport(ctx, hSeed({{1, 50}, {2, 150}})));
+  ctx.Assert(onFloor.value("state", "") == "drifting" && onFloor.value("threshold_crossed", false), "a window of exactly 200 samples (kMinSamples) over a 0.2 threshold reported %s, expected state drifting: the floor itself is enough", onFloor.dump());
+  const json thinBaseline = hBodyOf(ctx, hReport(ctx, hSeed(hDrifting, 300, 0.2, "baseline:v3:2026-09-01", {{1, 99}, {2, 100}})));
+  ctx.Assert(thinBaseline.value("state", "") == "insufficient_data" && thinBaseline.contains("threshold_crossed") && thinBaseline["threshold_crossed"] == false, "640 live samples against a baseline of 199 reported %s, expected state insufficient_data: the floor applies to both sides", thinBaseline.dump());
 }
 
 void CheckThresholdCrossed(harness::Ctx& ctx) {
-  const json drifting = bodyOf(ctx, report(ctx, seed(kDrifting)));
+  const json drifting = hBodyOf(ctx, hReport(ctx, hSeed(hDrifting)));
   ctx.Assert(drifting.value("threshold_crossed", false) && drifting.value("state", "") == "drifting", "640 samples over a 0.2 threshold reported %s, expected threshold_crossed true and state drifting", drifting.dump());
-  const json steady = bodyOf(ctx, report(ctx, seed(kSteady)));
+  const json steady = hBodyOf(ctx, hReport(ctx, hSeed(hSteady)));
   ctx.Assert(steady.contains("threshold_crossed") && steady["threshold_crossed"] == false && steady.value("state", "") == "ok", "640 samples under the 0.2 threshold reported %s, expected threshold_crossed false and state ok", steady.dump());
+  const double exact = sketch::psi(hDrifting, hBaseline);
+  const json at = hBodyOf(ctx, hReport(ctx, hSeed(hDrifting, 300, exact)));
+  ctx.Assert(at.value("threshold_crossed", false) && at.value("state", "") == "drifting", "a distance equal to the threshold (%v) reported %s, expected threshold_crossed true and state drifting: the threshold itself is a crossing (distance >= threshold)", exact, at.dump());
 }
 `,
   },

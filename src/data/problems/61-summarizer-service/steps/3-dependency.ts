@@ -58,7 +58,7 @@ service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply);
       id: 'deadline',
       title: 'Every attempt carries a 5-second deadline',
       detail:
-        'Each `Summarize` call is made with `DEADLINE_S` (5 s), so a hung model costs at most three deadlines before the extract is served; the starter sets none.',
+        'Each `Summarize` call, retries included, is made with its own full `DEADLINE_S` (5 s) and a timed-out attempt is retried, so a hung model costs at most three deadlines before the extract is served; the starter sets none.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*5\b/, /Summarize\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -71,7 +71,7 @@ service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply);
       id: 'terminal-refusal',
       title: 'Retries only on UNAVAILABLE and DEADLINE_EXCEEDED',
       detail:
-        'The status of a failed call decides: `RETRYABLE_CODES` are retried, a refusal (`FAILED_PRECONDITION`) or `INVALID_ARGUMENT` ends the call at once. The starter retries whatever failed.',
+        'The status of a failed call decides: `RETRYABLE_CODES` are retried, and any other code, a refusal (`FAILED_PRECONDITION`) or `INVALID_ARGUMENT` among them, ends the call at once. The starter retries whatever failed.',
       match: {
         python: {all: [/RETRYABLE_CODES\s*=/, /\.code\(\)\s+(not\s+)?in\s+RETRYABLE_CODES/]},
         typescript: {all: [/RETRYABLE_CODES\s*=/, /RETRYABLE_CODES\.includes\(/]},
@@ -83,7 +83,8 @@ service SummaryModel { rpc Summarize(SummarizeRequest) returns (SummarizeReply);
     {
       id: 'retry-budget',
       title: 'Makes at most three attempts',
-      detail: 'An outage costs `MAX_ATTEMPTS` = 3 calls in all, then the extract is served; the starter makes five.',
+      detail:
+        "An outage costs `MAX_ATTEMPTS` = 3 calls in all, then the extract is served; one `UNAVAILABLE` or `DEADLINE_EXCEEDED` followed by a healthy model is retried into the model's summary. The starter makes five.",
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /range\(\s*MAX_ATTEMPTS\s*\)/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /<\s*MAX_ATTEMPTS/], none: [/<\s*5\b/]},
@@ -528,6 +529,10 @@ def check_deadline(ctx):
     waited = ctx.clock.time() - before
     assert waited <= 16, f"with the model hung summarize took {waited:.0f} s: each attempt must give up after 5 s"
     assert slow.get("kind") == "extractive", f"with the model hung summarize answered {slow}, expected the extractive lead"
+    hung = ctx.grpc.calls_to("Summarize")[1:]
+    assert len(hung) == 3, f"with the model hung summarize made {len(hung)} calls: DEADLINE_EXCEEDED is retried, up to MAX_ATTEMPTS = 3"
+    timeouts = [call.timeout for call in hung]
+    assert all(t is not None and 4.5 <= t <= 5.5 for t in timeouts), f"with the model hung the attempts carried deadlines of {timeouts} s: every attempt gets its own full DEADLINE_S = 5, not what is left of the first one's"
 
 
 def check_terminal_refusal(ctx):
@@ -540,6 +545,12 @@ def check_terminal_refusal(ctx):
     ctx.grpc.fail("Summarize", grpc.StatusCode.INVALID_ARGUMENT, "target_words out of range", times=1)
     m.summarize(HASH, SOURCE, 20)
     assert _calls(ctx) == 2, f"INVALID_ARGUMENT was retried ({_calls(ctx) - 1} calls for one request): only UNAVAILABLE and DEADLINE_EXCEEDED may be"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INTERNAL):
+        before = _calls(ctx)
+        ctx.grpc.fail("Summarize", code, "the model failed", times=1)
+        answer = m.summarize(HASH, SOURCE, 20)
+        assert _calls(ctx) - before == 1, f"{code.name} was sent {_calls(ctx) - before} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert answer.get("kind") == "extractive", f"after {code.name} summarize answered {answer}, expected the extractive lead"
 
 
 def check_retry_budget(ctx):
@@ -551,6 +562,9 @@ def check_retry_budget(ctx):
     ctx.grpc.fail("Summarize", grpc.StatusCode.UNAVAILABLE, "model restarting", times=1)
     back = m.summarize(HASH, SOURCE, 20)
     assert _calls(ctx) == 5 and back.get("kind") == "abstractive", f"one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got {back} after {_calls(ctx) - 3} calls"
+    ctx.grpc.fail("Summarize", grpc.StatusCode.DEADLINE_EXCEEDED, "model timed out", times=1)
+    late = m.summarize(HASH, SOURCE, 20)
+    assert _calls(ctx) == 7 and late.get("kind") == "abstractive", f"one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got {late} after {_calls(ctx) - 5} calls"
 
 
 def check_labelled_fallback(ctx):
@@ -594,6 +608,10 @@ export async function check_deadline(ctx) {
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited <= 16, \`with the model hung summarize took \${waited.toFixed(0)} s: each attempt must give up after 5 s\`);
   assert.equal(slow.kind, 'extractive', \`with the model hung summarize answered \${JSON.stringify(slow)}, expected the extractive lead\`);
+  const hung = ctx.grpc.callsTo('Summarize').slice(1);
+  assert.equal(hung.length, 3, \`with the model hung summarize made \${hung.length} calls: DEADLINE_EXCEEDED is retried, up to MAX_ATTEMPTS = 3\`);
+  const timeouts = hung.map(call => call.timeout);
+  assert(timeouts.every(t => t !== null && 4.5 <= t && t <= 5.5), \`with the model hung the attempts carried deadlines of \${JSON.stringify(timeouts)} s: every attempt gets its own full 5 s deadline, not what is left of the first one's\`);
 }
 
 export async function check_terminal_refusal(ctx) {
@@ -606,6 +624,13 @@ export async function check_terminal_refusal(ctx) {
   ctx.grpc.fail('Summarize', ctx.grpc.status.INVALID_ARGUMENT, 'target_words out of range', 1);
   await m.summarize(HASH, SOURCE, 20);
   assert.equal(calls(ctx), 2, \`INVALID_ARGUMENT was retried (\${calls(ctx) - 1} calls for one request): only UNAVAILABLE and DEADLINE_EXCEEDED may be\`);
+  for (const code of ['PERMISSION_DENIED', 'INTERNAL']) {
+    const before = calls(ctx);
+    ctx.grpc.fail('Summarize', ctx.grpc.status[code], 'the model failed', 1);
+    const answer = await m.summarize(HASH, SOURCE, 20);
+    assert.equal(calls(ctx) - before, 1, \`\${code} was sent \${calls(ctx) - before} times: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert.equal(answer.kind, 'extractive', \`after \${code} summarize answered \${JSON.stringify(answer)}, expected the extractive lead\`);
+  }
 }
 
 export async function check_retry_budget(ctx) {
@@ -617,6 +642,9 @@ export async function check_retry_budget(ctx) {
   ctx.grpc.fail('Summarize', ctx.grpc.status.UNAVAILABLE, 'model restarting', 1);
   const back = await m.summarize(HASH, SOURCE, 20);
   assert(calls(ctx) === 5 && back.kind === 'abstractive', \`one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got \${JSON.stringify(back)} after \${calls(ctx) - 3} calls\`);
+  ctx.grpc.fail('Summarize', ctx.grpc.status.DEADLINE_EXCEEDED, 'model timed out', 1);
+  const late = await m.summarize(HASH, SOURCE, 20);
+  assert(calls(ctx) === 7 && late.kind === 'abstractive', \`one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got \${JSON.stringify(late)} after \${calls(ctx) - 5} calls\`);
 }
 
 export async function check_labelled_fallback(ctx) {
@@ -683,6 +711,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 16, "with the model hung summarize took %.0f s: each attempt must give up after 5 s", waited)
 	ctx.Equal(slow.Kind, "extractive", "with the model hung, the kind of the answer")
+	hung := ctx.GRPC.CallsTo("Summarize", "")[1:]
+	ctx.Equal(len(hung), 3, "with the model hung, the Summarize calls (DEADLINE_EXCEEDED is retried, up to MAX_ATTEMPTS = 3)")
+	for _, call := range hung {
+		ctx.Assert(call.HasDeadline() && 4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "with the model hung an attempt carried a %v deadline: every attempt gets its own full 5 s, not what is left of the first one's", call.Timeout)
+	}
 }
 
 func CheckTerminalRefusal(ctx *harness.Ctx) {
@@ -695,6 +728,13 @@ func CheckTerminalRefusal(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("Summarize", codes.InvalidArgument, "target_words out of range", 1, "")
 	clientCall()
 	ctx.Equal(clientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.Internal} {
+		before := clientCalls(ctx)
+		ctx.GRPC.Fail("Summarize", code, "the model failed", 1, "")
+		answer := clientCall()
+		ctx.Equal(clientCalls(ctx)-before, 1, "%v must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Summarize calls", code)
+		ctx.Equal(answer.Kind, "extractive", "after %v, the kind of the answer", code)
+	}
 }
 
 func CheckRetryBudget(ctx *harness.Ctx) {
@@ -706,6 +746,9 @@ func CheckRetryBudget(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("Summarize", codes.Unavailable, "model restarting", 1, "")
 	back := clientCall()
 	ctx.Assert(clientCalls(ctx) == 5 && back.Kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got %+v after %d calls", back, clientCalls(ctx)-3)
+	ctx.GRPC.Fail("Summarize", codes.DeadlineExceeded, "model timed out", 1, "")
+	late := clientCall()
+	ctx.Assert(clientCalls(ctx) == 7 && late.Kind == "abstractive", "one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got %+v after %d calls", late, clientCalls(ctx)-5)
 }
 
 func CheckLabelledFallback(ctx *harness.Ctx) {
@@ -722,17 +765,18 @@ func CheckLabelledFallback(ctx *harness.Ctx) {
     cpp: `#include <leetbuild/harness.h>
 
 #include <string>
+#include <utility>
 
 #include "summarizer/text.h"
 #include "summarizer_service.grpc.pb.h"
 
 namespace {
 
-const std::string kSource =
+const std::string hSource =
     "The board met on 3 March. Revenue rose four percent in the quarter. The audit committee approved the accounts.\\n\\nTwo directors stepped down. A new chair takes over in May.";
-const std::string kHash(64, 'c');
+const std::string hHash(64, 'c');
 
-class ModelPeer final : public summarizerd::SummaryModel::Service {
+class HarnessModelPeer final : public summarizerd::SummaryModel::Service {
  public:
   grpc::Status Summarize(grpc::ServerContext*, const summarizerd::SummarizeRequest* req, summarizerd::SummarizeReply* out) override {
     out->set_summary("A " + std::to_string(summarizer::text::words(req->text()).size()) + "-word source in " + std::to_string(req->target_words()) + " words.");
@@ -742,13 +786,13 @@ class ModelPeer final : public summarizerd::SummaryModel::Service {
 };
 
 void clientPeer(harness::Ctx& ctx) {
-  static ModelPeer* peer = nullptr;
+  static HarnessModelPeer* peer = nullptr;
   delete peer;
-  peer = new ModelPeer;
+  peer = new HarnessModelPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-Summarized clientCall() { return summarize(kHash, kSource, 20); }
+Summarized clientCall() { return summarize(hHash, hSource, 20); }
 
 size_t clientCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Summarize").size(); }
 
@@ -768,6 +812,12 @@ void CheckDeadline(harness::Ctx& ctx) {
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 16, "with the model hung summarize took %.0f s: each attempt must give up after 5 s", waited);
   ctx.Equal(slow.kind, "extractive", "with the model hung, the kind of the answer");
+  const auto calls = ctx.GRPC.CallsTo("Summarize");
+  ctx.Equal(calls.size(), 4, "with the model hung, the Summarize calls after the healthy one (DEADLINE_EXCEEDED is retried, up to kMaxAttempts = 3)");
+  for (size_t i = 1; i < calls.size(); i++) {
+    ctx.Assert(calls[i].HasDeadline() && 4.5 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 5.5,
+               "with the model hung an attempt carried a %v s deadline: every attempt gets its own full 5 s, not what is left of the first one's", calls[i].TimeoutSeconds());
+  }
 }
 
 void CheckTerminalRefusal(harness::Ctx& ctx) {
@@ -780,6 +830,14 @@ void CheckTerminalRefusal(harness::Ctx& ctx) {
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::INVALID_ARGUMENT, "target_words out of range", 1);
   clientCall();
   ctx.Equal(clientCalls(ctx), 2, "INVALID_ARGUMENT must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED may be); the Summarize calls");
+  const std::pair<grpc::StatusCode, std::string> terminal[] = {{grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}};
+  for (const auto& [code, name] : terminal) {
+    const size_t before = clientCalls(ctx);
+    ctx.GRPC.Fail("Summarize", code, "the model failed", 1);
+    const Summarized answer = clientCall();
+    ctx.Equal(clientCalls(ctx) - before, 1, "%s must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the Summarize calls", name);
+    ctx.Equal(answer.kind, "extractive", "after %s, the kind of the answer", name);
+  }
 }
 
 void CheckRetryBudget(harness::Ctx& ctx) {
@@ -791,6 +849,9 @@ void CheckRetryBudget(harness::Ctx& ctx) {
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::UNAVAILABLE, "model restarting", 1);
   const Summarized back = clientCall();
   ctx.Assert(clientCalls(ctx) == 5 && back.kind == "abstractive", "one UNAVAILABLE then a healthy model: expected a retry and the model's summary, got kind %q after %d calls", back.kind, clientCalls(ctx) - 3);
+  ctx.GRPC.Fail("Summarize", grpc::StatusCode::DEADLINE_EXCEEDED, "model timed out", 1);
+  const Summarized late = clientCall();
+  ctx.Assert(clientCalls(ctx) == 7 && late.kind == "abstractive", "one DEADLINE_EXCEEDED then a healthy model: expected a retry and the model's summary, got kind %q after %d calls", late.kind, clientCalls(ctx) - 5);
 }
 
 void CheckLabelledFallback(harness::Ctx& ctx) {
@@ -800,7 +861,7 @@ void CheckLabelledFallback(harness::Ctx& ctx) {
   ctx.GRPC.Fail("Summarize", grpc::StatusCode::FAILED_PRECONDITION, "refused", 5);
   const Summarized fallback = clientCall();
   ctx.Equal(fallback.kind, "extractive", "when the model gave no summary a reader takes an unlabelled answer for the model's; the kind");
-  ctx.Equal(fallback.summary, summarizer::text::lead(kSource, 20), "the fallback must be the source's own lead cut to 20 words");
+  ctx.Equal(fallback.summary, summarizer::text::lead(hSource, 20), "the fallback must be the source's own lead cut to 20 words");
   ctx.Equal(fallback.model_version, "", "an extract has no model version");
 }
 `,

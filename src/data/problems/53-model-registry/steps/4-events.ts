@@ -106,7 +106,7 @@ twice; and a delivery the broker refuses is dropped.
       id: 'outbox-from-delivery',
       title: 'An outbox row from the delivery report',
       detail:
-        "The broker's answer arrives in the delivery report (`on_delivery`, the awaited send, the delivery channel, `dr_cb`, the send future): an error or no report within 2 s writes the outbox row and returns false. A `try` around the enqueue sees neither.",
+        "The broker's answer arrives in the delivery report (`on_delivery`, the awaited send, the delivery channel, `dr_cb`, the send future): an error or no report within 2 s writes the outbox row (the same ids-only payload, with its `event_id`) and returns false; an acknowledged event writes no row and returns true. A `try` around the enqueue sees neither.",
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/]},
@@ -627,9 +627,9 @@ def _outbox(ctx):
 
 def check_model_key(ctx):
     m = _events(ctx)
-    m.announce(_change("fraud", 3))
-    m.announce(_change("churn", 1))
-    m.announce(_change("fraud", 3, stage="rolled_back"))
+    acked = [m.announce(_change("fraud", 3)), m.announce(_change("churn", 1)), m.announce(_change("fraud", 3, stage="rolled_back"))]
+    assert acked == [True, True, True], f"three acknowledged deliveries returned {acked}, expected True each"
+    assert ctx.redis.llen("outbox") == 0, f"the broker acknowledged every event and the outbox holds {ctx.redis.llen('outbox')} rows: the relay would publish them twice"
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 3, f"three announce calls produced {len(records)} records on model.event"
     keys = [r.key for r in records]
@@ -678,13 +678,16 @@ def check_outbox_from_delivery(ctx):
     assert len(rows) == 1, f"the broker refused the delivery and the outbox holds {len(rows)} rows: the promotion never reaches the serving consumers"
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == "fraud" and row.get("payload", {}).get("model") == "fraud", f"the outbox row is {row}, expected the topic, the key fraud and the payload"
+    history = [json.loads(h) for h in ctx.redis.lrange("model:fraud:history", 0, -1)]
+    payload = row["payload"]
+    assert set(payload) == IDS and history and payload.get("event_id") == history[-1].get("event_id"), f"the outbox payload is {payload}, expected the event the broker refused: ids only {sorted(IDS)}, with the event_id record_change committed"
     assert ok is False, f"announce returned {ok!r} after a refused delivery, expected False"
     assert ctx.redis.llen("model:fraud:history") == 1, "the change must stay committed when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.announce(_change("fraud", 4))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"announce waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"announce waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S = 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("version") == 4, f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"announce returned {ok!r} without a delivery report, expected False"
@@ -722,10 +725,10 @@ const settle = (): Promise<void> => {
 
 export async function check_model_key(ctx) {
   const m = await events(ctx);
-  await m.announce(change('fraud', 3));
-  await m.announce(change('churn', 1));
-  await m.announce(change('fraud', 3, 'rolled_back'));
+  const acked = [await m.announce(change('fraud', 3)), await m.announce(change('churn', 1)), await m.announce(change('fraud', 3, 'rolled_back'))];
   await settle();
+  assert.deepEqual(acked, [true, true, true], \`three acknowledged deliveries resolved \${JSON.stringify(acked)}, expected true each\`);
+  assert.equal(ctx.redis.llen('outbox'), 0, \`the broker acknowledged every event and the outbox holds \${ctx.redis.llen('outbox')} rows: the relay would publish them twice\`);
   const records = ctx.kafka.records(TOPIC);
   assert.equal(records.length, 3, \`three announce calls produced \${records.length} records on model.event\`);
   const keys = ctx.kafka.keys(TOPIC);
@@ -777,13 +780,19 @@ export async function check_outbox_from_delivery(ctx) {
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the broker refused the delivery and the outbox holds \${rows.length} rows: the promotion never reaches the serving consumers\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'fraud' && rows[0].payload?.model === 'fraud', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key fraud and the payload\`);
+  const history = (ctx.redis.lrange('model:fraud:history', 0, -1) as string[]).map(row => JSON.parse(row));
+  const payload = rows[0].payload;
+  assert(
+    JSON.stringify(Object.keys(payload).sort()) === JSON.stringify(IDS) && history.length > 0 && payload.event_id === history[history.length - 1].event_id,
+    \`the outbox payload is \${JSON.stringify(payload)}, expected the event the broker refused: ids only \${JSON.stringify(IDS)}, with the event_id recordChange committed\`,
+  );
   assert.equal(ok, false, \`announce resolved \${JSON.stringify(ok)} after a refused delivery, expected false\`);
   assert.equal(ctx.redis.llen('model:fraud:history'), 1, 'the change must stay committed when only the produce failed');
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.announce(change('fraud', 4));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`announce waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`announce waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.version === 4, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`announce resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -805,37 +814,37 @@ import (
 
 const (
 	eventsTopic = "model.event"
-	report      = "precision 0.91 on holdout-2026-10; samples: txn 88231 flagged, txn 90412 cleared"
+	hReport     = "precision 0.91 on holdout-2026-10; samples: txn 88231 flagged, txn 90412 cleared"
 )
 
 var eventsBg = context.Background()
 
-func change(name string, version int, stage string) store.Change {
+func hChange(name string, version int, stage string) store.Change {
 	return store.Change{Name: name, Version: version, ArtifactDigest: fmt.Sprintf("sha256:%s%d", name, version), EvalID: fmt.Sprintf("e-%s-%d", name, version), Pool: "prod", Stage: stage}
 }
 
-func seedEvals() {
-	for _, c := range []store.Change{change("fraud", 3, ""), change("fraud", 4, ""), change("churn", 1, "")} {
-		store.AddEval(eventsBg, c.EvalID, c.Name, c.ArtifactDigest, 0.91, 0.85, report)
+func hSeedEvals() {
+	for _, c := range []store.Change{hChange("fraud", 3, ""), hChange("fraud", 4, ""), hChange("churn", 1, "")} {
+		store.AddEval(eventsBg, c.EvalID, c.Name, c.ArtifactDigest, 0.91, 0.85, hReport)
 	}
 }
 
-func mustAnnounce(ctx *harness.Ctx, c store.Change) bool {
+func hAnnounce(ctx *harness.Ctx, c store.Change) bool {
 	ok, err := announce(eventsBg, c)
 	ctx.NoError(err, "announce(%s %d) failed", c.Name, c.Version)
 	return ok
 }
 
-type outboxRow struct {
+type hOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outboxRows(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutboxRows(ctx *harness.Ctx) []hOutboxRow {
+	var rows []hOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row hOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -843,11 +852,11 @@ func outboxRows(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckModelKey(ctx *harness.Ctx) {
-	seedEvals()
-	mustAnnounce(ctx, change("fraud", 3, "promoted"))
-	mustAnnounce(ctx, change("churn", 1, "promoted"))
-	mustAnnounce(ctx, change("fraud", 3, "rolled_back"))
+	hSeedEvals()
+	acked := []bool{hAnnounce(ctx, hChange("fraud", 3, "promoted")), hAnnounce(ctx, hChange("churn", 1, "promoted")), hAnnounce(ctx, hChange("fraud", 3, "rolled_back"))}
 	ctx.Settle()
+	ctx.Equal(acked, []bool{true, true, true}, "three acknowledged deliveries must each return true; announce's results")
+	ctx.Equal(ctx.Redis.LLen("outbox"), 0, "the broker acknowledged every event: an outbox row would make the relay publish it twice; the outbox rows")
 	records := ctx.Kafka.Records(eventsTopic)
 	ctx.Equal(len(records), 3, "three announce calls must produce three records on model.event; the records")
 	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"fraud", "churn", "fraud"}, "the records must be keyed by the model names")
@@ -855,8 +864,8 @@ func CheckModelKey(ctx *harness.Ctx) {
 }
 
 func CheckIdsOnly(ctx *harness.Ctx) {
-	seedEvals()
-	mustAnnounce(ctx, change("fraud", 3, "promoted"))
+	hSeedEvals()
+	hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
 	values := ctx.Kafka.Values(eventsTopic)
 	ctx.Equal(len(values), 1, "one announce must produce one record; the records")
@@ -879,9 +888,9 @@ func CheckIdsOnly(ctx *harness.Ctx) {
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
-	seedEvals()
+	hSeedEvals()
 	probe := ctx.Redis.After("model:fraud:history", func() any { return len(ctx.Kafka.Records(eventsTopic)) })
-	mustAnnounce(ctx, change("fraud", 3, "promoted"))
+	hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
 	ctx.Assert(probe.Fired, "announce never committed the change (no write to model:fraud:history)")
 	ctx.Equal(probe.Result, 0, "when the change was committed the topic already held records: a consumer could act on a change the registry had not committed. Commit, then produce; the records at commit time")
@@ -889,33 +898,44 @@ func CheckCommitBeforeProduce(ctx *harness.Ctx) {
 }
 
 func CheckIdempotentAcks(ctx *harness.Ctx) {
-	seedEvals()
+	hSeedEvals()
 	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	mustAnnounce(ctx, change("fraud", 3, "promoted"))
+	hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	mustAnnounce(ctx, change("fraud", 4, "promoted"))
+	hAnnounce(ctx, hChange("fraud", 4, "promoted"))
 	ctx.Settle()
 	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxFromDelivery(ctx *harness.Ctx) {
-	seedEvals()
+	hSeedEvals()
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := mustAnnounce(ctx, change("fraud", 3, "promoted"))
+	ok := hAnnounce(ctx, hChange("fraud", 3, "promoted"))
 	ctx.Settle()
-	rows := outboxRows(ctx)
+	rows := hOutboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused the delivery: without an outbox row the promotion never reaches the serving consumers; the rows")
 	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "fraud" && rows[0].Payload["model"] == "fraud", "the outbox row is %+v, expected the topic, the key fraud and the payload", rows[0])
+	fields := make([]string, 0, len(rows[0].Payload))
+	for k := range rows[0].Payload {
+		fields = append(fields, k)
+	}
+	sort.Strings(fields)
+	var last map[string]any
+	if history := ctx.Redis.LRange("model:fraud:history", 0, -1); len(history) > 0 {
+		json.Unmarshal([]byte(history[len(history)-1]), &last)
+	}
+	ctx.Assert(strings.Join(fields, ",") == "artifact_digest,eval_id,event_id,model,pool,stage,version" && last != nil && rows[0].Payload["event_id"] == last["event_id"],
+		"the outbox payload is %v, expected the event the broker refused: ids only, with the event_id RecordChange committed", rows[0].Payload)
 	ctx.Equal(ok, false, "announce's result after a refused delivery")
 	ctx.Equal(ctx.Redis.LLen("model:fraud:history"), 1, "the change must stay committed when only the produce failed; the history")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = mustAnnounce(ctx, change("fraud", 4, "promoted"))
+	ok = hAnnounce(ctx, hChange("fraud", 4, "promoted"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "announce waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = outboxRows(ctx)
+	ctx.Assert(waited <= 2.5, "announce waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout = 2 s, then write the outbox row", waited)
+	rows = hOutboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["version"] == float64(4), "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "announce's result without a delivery report")
 }
@@ -933,16 +953,16 @@ namespace {
 const std::string kEventsTopic = "model.event";
 const std::string kReport = "precision 0.91 on holdout-2026-10; samples: txn 88231 flagged, txn 90412 cleared";
 
-store::Change change(const std::string& name, long version, const std::string& stage = "promoted") {
+store::Change hChange(const std::string& name, long version, const std::string& stage = "promoted") {
   const std::string v = std::to_string(version);
   return store::Change{name, version, "sha256:" + name + v, "e-" + name + "-" + v, "prod", stage};
 }
 
-void seedEvals() {
-  for (const auto& c : {change("fraud", 3), change("fraud", 4), change("churn", 1)}) store::addEval(c.eval_id, c.name, c.artifact_digest, 0.91, 0.85, kReport);
+void hSeedEvals() {
+  for (const auto& c : {hChange("fraud", 3), hChange("fraud", 4), hChange("churn", 1)}) store::addEval(c.eval_id, c.name, c.artifact_digest, 0.91, 0.85, kReport);
 }
 
-std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutboxRows(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -952,18 +972,19 @@ std::vector<nlohmann::json> outboxRows(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string text(const nlohmann::json& j, const std::string& field) {
+std::string hText(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckModelKey(harness::Ctx& ctx) {
-  seedEvals();
-  announce(change("fraud", 3));
-  announce(change("churn", 1));
-  announce(change("fraud", 3, "rolled_back"));
+  hSeedEvals();
+  const std::vector<bool> acked = {announce(hChange("fraud", 3)), announce(hChange("churn", 1)), announce(hChange("fraud", 3, "rolled_back"))};
   ctx.Settle();
+  ctx.Assert(acked == std::vector<bool>{true, true, true}, "three acknowledged deliveries must each return true; announce returned %t, %t, %t", static_cast<bool>(acked[0]),
+             static_cast<bool>(acked[1]), static_cast<bool>(acked[2]));
+  ctx.Equal(ctx.Redis.LRange("outbox", 0, -1).size(), 0, "the broker acknowledged every event: an outbox row would make the relay publish it twice; the outbox rows");
   const auto records = ctx.Kafka.Records(kEventsTopic);
   ctx.Equal(records.size(), 3, "three announce calls must produce three records on model.event; the records");
   ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"fraud", "churn", "fraud"}, "the records must be keyed by the model names");
@@ -971,8 +992,8 @@ void CheckModelKey(harness::Ctx& ctx) {
 }
 
 void CheckIdsOnly(harness::Ctx& ctx) {
-  seedEvals();
-  announce(change("fraud", 3));
+  hSeedEvals();
+  announce(hChange("fraud", 3));
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 1, "one announce must produce one record; the records");
@@ -983,22 +1004,22 @@ void CheckIdsOnly(harness::Ctx& ctx) {
   for (const auto& [k, v] : value.items()) fields.push_back(k);
   std::sort(fields.begin(), fields.end());
   ctx.Equal(fields, {"artifact_digest", "eval_id", "event_id", "model", "pool", "stage", "version"}, "the payload must carry ids only; its fields");
-  ctx.Assert(text(value, "model") == "fraud" && value.value("version", 0L) == 3 && text(value, "eval_id") == "e-fraud-3" && text(value, "stage") == "promoted",
+  ctx.Assert(hText(value, "model") == "fraud" && value.value("version", 0L) == 3 && hText(value, "eval_id") == "e-fraud-3" && hText(value, "stage") == "promoted",
              "the payload is %s", values[0]);
   const auto history = ctx.Redis.LRange("model:fraud:history", 0, -1);
   ctx.Assert(!history.empty(), "the change was never committed to model:fraud:history");
-  ctx.Equal(text(nlohmann::json::parse(history.back()), "event_id"), text(value, "event_id"), "the event's event_id must be the one recordChange committed");
+  ctx.Equal(hText(nlohmann::json::parse(history.back()), "event_id"), hText(value, "event_id"), "the event's event_id must be the one recordChange committed");
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
-  seedEvals();
+  hSeedEvals();
   size_t atCommit = 999;
   bool fired = false;
   ctx.Redis.After("model:fraud:history", [&] {
     fired = true;
     atCommit = ctx.Kafka.Records(kEventsTopic).size();
   });
-  announce(change("fraud", 3));
+  announce(hChange("fraud", 3));
   ctx.Settle();
   ctx.Assert(fired, "announce never committed the change (no write to model:fraud:history)");
   ctx.Equal(atCommit, 0,
@@ -1008,34 +1029,44 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
-  seedEvals();
+  hSeedEvals();
   ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  announce(change("fraud", 3));
+  announce(hChange("fraud", 3));
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  announce(change("fraud", 4));
+  announce(hChange("fraud", 4));
   ctx.Settle();
   ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxFromDelivery(harness::Ctx& ctx) {
-  seedEvals();
+  hSeedEvals();
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = announce(change("fraud", 3));
+  bool ok = announce(hChange("fraud", 3));
   ctx.Settle();
-  auto rows = outboxRows(ctx);
+  auto rows = hOutboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused the delivery: without an outbox row the promotion never reaches the serving consumers; the rows");
-  ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "fraud" && rows[0].contains("payload") && text(rows[0]["payload"], "model") == "fraud",
+  ctx.Assert(hText(rows[0], "topic") == kEventsTopic && hText(rows[0], "key") == "fraud" && rows[0].contains("payload") && hText(rows[0]["payload"], "model") == "fraud",
              "the outbox row is %s, expected the topic, the key fraud and the payload", rows[0].dump());
+  std::vector<std::string> fields;
+  if (rows[0].contains("payload") && rows[0]["payload"].is_object()) {
+    for (const auto& [k, v] : rows[0]["payload"].items()) fields.push_back(k);
+  }
+  std::sort(fields.begin(), fields.end());
+  const auto history = ctx.Redis.LRange("model:fraud:history", 0, -1);
+  const auto last = history.empty() ? nlohmann::json::object() : nlohmann::json::parse(history.back(), nullptr, false);
+  ctx.Assert(fields == std::vector<std::string>{"artifact_digest", "eval_id", "event_id", "model", "pool", "stage", "version"} && !hText(last, "event_id").empty() &&
+                 hText(rows[0].value("payload", nlohmann::json::object()), "event_id") == hText(last, "event_id"),
+             "the outbox payload is %s, expected the event the broker refused: ids only, with the event_id recordChange committed", rows[0].value("payload", nlohmann::json()).dump());
   ctx.Equal(ok, false, "announce's result after a refused delivery");
   ctx.Equal(ctx.Redis.LRange("model:fraud:history", 0, -1).size(), 1, "the change must stay committed when only the produce failed; the history");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = announce(change("fraud", 4));
+  ok = announce(hChange("fraud", 4));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "announce waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = outboxRows(ctx);
+  ctx.Assert(waited <= 2.5, "announce waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs = 2000, then write the outbox row", waited);
+  rows = hOutboxRows(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && rows[1]["payload"].value("version", 0L) == 4, "no delivery report within the window and the outbox holds %d rows",
              rows.size());
   ctx.Equal(ok, false, "announce's result without a delivery report");

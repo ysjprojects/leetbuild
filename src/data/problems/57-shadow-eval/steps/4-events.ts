@@ -57,7 +57,7 @@ a broker that refuses or stalls loses the sample with the call reporting success
       id: 'config-key',
       title: 'Keys every sample by the config id',
       detail:
-        "Samples of cfg-1, cfg-2, cfg-1 carry those keys and both cfg-1 samples share a partition, so one consumer owns each config's aggregate. The starter keys by user, which spreads a config over every partition.",
+        "Samples of cfg-1, cfg-2, cfg-1 carry those keys and both cfg-1 samples share a partition, so one consumer owns each config's aggregate; each acknowledged sample returns true and writes no outbox row. The starter keys by user, which spreads a config over every partition.",
       match: {
         python: {all: [/key\s*=\s*config_id/], none: [/key\s*=\s*pair\[["']user_id["']\]/]},
         typescript: {all: [/key:\s*configId/], none: [/key:\s*pair\.user_id/]},
@@ -70,7 +70,7 @@ a broker that refuses or stalls loses the sample with the call reporting success
       id: 'no-content',
       title: 'Carries scores and a fingerprint, never user content',
       detail:
-        'The payload has both versions, both scores, the delta and `fingerprint(prompt)`, and none of the prompt, the answers or the user id. The starter copies all of them into a topic that is retained and replicated.',
+        "The payload has both versions, both scores, the delta (the candidate's score minus production's, negative when the candidate is worse) and `fingerprint(prompt)`, and none of the prompt, the answers or the user id. The starter copies all of them into a topic that is retained and replicated.",
       match: {
         python: {
           all: [/store\.fingerprint\(/, /["']delta["']/],
@@ -105,7 +105,7 @@ a broker that refuses or stalls loses the sample with the call reporting success
       id: 'outbox',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A refused delivery, or no report within 2 s, leaves an outbox row with the topic, the config id and the payload, and the call returns false. The starter fires and forgets.',
+        "A broker that acknowledges within 2 s, even 1 s late, gets true and no outbox row. A refused delivery, or no report within 2 s, leaves an outbox row with the topic, the config id and the sample's payload (with no user content), and the call returns false after at most about 2 s. The starter fires and forgets.",
       match: {
         python: {all: [/store\.insert_outbox\(/, /on_delivery\s*=/, /producer\.flush\(/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
@@ -625,14 +625,17 @@ def _outbox(ctx):
 
 def check_config_key(ctx):
     m = ctx.load("events")
-    m.publish_sample("cfg-1", _pair(1, "user-1"))
-    m.publish_sample("cfg-2", _pair(2, "user-2"))
-    m.publish_sample("cfg-1", _pair(3, "user-3"))
+    sent = [
+        m.publish_sample("cfg-1", _pair(1, "user-1")),
+        m.publish_sample("cfg-2", _pair(2, "user-2")),
+        m.publish_sample("cfg-1", _pair(3, "user-3")),
+    ]
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 3, f"three publish_sample calls produced {len(records)} records on shadow.sample (topics: {sorted(ctx.kafka.topics)})"
     keys = [r.key for r in records]
     assert keys == [b"cfg-1", b"cfg-2", b"cfg-1"], f"the records are keyed {keys}, expected the config ids cfg-1, cfg-2, cfg-1"
     assert records[0].partition == records[2].partition, "both cfg-1 samples must land on one partition, or no single consumer owns cfg-1's aggregate"
+    assert sent == [True, True, True] and not _outbox(ctx), f"three acknowledged samples returned {sent} and left {len(_outbox(ctx))} outbox rows: a sample the broker acknowledged returns True and writes no outbox row"
 
 
 def check_no_content(ctx):
@@ -657,6 +660,9 @@ def check_no_content(ctx):
     for name, want in expected.items():
         assert value.get(name) == want, f"the sample's {name} is {value.get(name)!r}, expected {want!r} (payload {value})"
     assert abs(value.get("delta", 0) - 0.05) < 1e-9, f"the sample's delta is {value.get('delta')!r}, expected the candidate's score minus production's (0.05)"
+    m.publish_sample("cfg-1", {**_pair(2), "candidate_score": 0.60})
+    worse = json.loads(ctx.kafka.records(TOPIC)[-1].value.decode())
+    assert abs(worse.get("delta", 0) - (0.60 - 0.70)) < 1e-9, f"a candidate scoring 0.60 against production's 0.70 gave the delta {worse.get('delta')!r}, expected -0.1: the delta keeps its sign"
 
 
 def check_idempotent(ctx):
@@ -671,18 +677,25 @@ def check_idempotent(ctx):
 
 def check_outbox(ctx):
     m = ctx.load("events")
+    ctx.kafka.stall(TOPIC, seconds=1)  # a slow broker: it acknowledges 1 s later, inside the 2 s window
+    ok = m.publish_sample("cfg-1", _pair(3))
+    assert ok is True and not _outbox(ctx), f"a broker that acknowledged after 1 s got publish_sample {ok!r} and {len(_outbox(ctx))} outbox rows: wait up to ACK_TIMEOUT_S (2 s) for the report before falling back"
+    ctx.kafka.resume(TOPIC)
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_sample("cfg-1", _pair(1))
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and shadow:outbox holds {len(rows)} rows: without a row the pair is lost from the comparison"
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == "cfg-1" and row.get("payload", {}).get("config_id") == "cfg-1", f"the outbox row is {row}, expected the topic, the key cfg-1 and the payload"
+    payload = row["payload"]
+    leaked = [name for name in ("prompt", "production_text", "candidate_text", "user_id") if _pair(1)[name] in json.dumps(payload)]
+    assert not leaked and payload.get("fingerprint") == store.fingerprint(_pair(1)["prompt"]) and abs(payload.get("delta", 0) - 0.05) < 1e-9, f"the outbox row's payload is {payload}: it is the sample's payload (fingerprint, scores, delta), and carries none of {leaked or 'the user content'}"
     assert ok is False, f"publish_sample returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_sample("cfg-1", _pair(2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_sample waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_sample waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S (2 s), then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("at") == _pair(2)["at"], f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_sample returned {ok!r} without a delivery report, expected False"
@@ -712,15 +725,19 @@ const settle = (): Promise<void> => {
 
 export async function check_config_key(ctx) {
   const m = ctx.load('events');
-  await m.publishSample('cfg-1', pairOf(1, 'user-1'));
-  await m.publishSample('cfg-2', pairOf(2, 'user-2'));
-  await m.publishSample('cfg-1', pairOf(3, 'user-3'));
+  const sent = [
+    await m.publishSample('cfg-1', pairOf(1, 'user-1')),
+    await m.publishSample('cfg-2', pairOf(2, 'user-2')),
+    await m.publishSample('cfg-1', pairOf(3, 'user-3')),
+  ];
   await settle();
   const records = ctx.kafka.records(TOPIC);
   assert.equal(records.length, 3, \`three publishSample calls produced \${records.length} records on shadow.sample\`);
   const keys = ctx.kafka.keys(TOPIC);
   assert.deepEqual(keys, ['cfg-1', 'cfg-2', 'cfg-1'], \`the records are keyed \${JSON.stringify(keys)}, expected the config ids cfg-1, cfg-2, cfg-1\`);
   assert.equal(records[0].partition, records[2].partition, "both cfg-1 samples must land on one partition, or no single consumer owns cfg-1's aggregate");
+  const rows = outboxRows(ctx);
+  assert(sent.every(ok => ok === true) && rows.length === 0, \`three acknowledged samples resolved \${JSON.stringify(sent)} and left \${rows.length} outbox rows: a sample the broker acknowledged resolves true and writes no outbox row\`);
 }
 
 export async function check_no_content(ctx) {
@@ -749,6 +766,10 @@ export async function check_no_content(ctx) {
     assert.equal(value[name], want, \`the sample's \${name} is \${JSON.stringify(value[name])}, expected \${JSON.stringify(want)} (payload \${raw})\`);
   }
   assert(Math.abs((value.delta ?? 0) - 0.05) < 1e-9, \`the sample's delta is \${JSON.stringify(value.delta)}, expected the candidate's score minus production's (0.05)\`);
+  await m.publishSample('cfg-1', {...pairOf(2), candidate_score: 0.6});
+  await settle();
+  const worse = JSON.parse(ctx.kafka.values(TOPIC).at(-1));
+  assert(Math.abs((worse.delta ?? 0) - (0.6 - 0.7)) < 1e-9, \`a candidate scoring 0.6 against production's 0.7 gave the delta \${JSON.stringify(worse.delta)}, expected -0.1: the delta keeps its sign\`);
 }
 
 export async function check_idempotent(ctx) {
@@ -765,18 +786,28 @@ export async function check_idempotent(ctx) {
 
 export async function check_outbox(ctx) {
   const m = ctx.load('events');
-  ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishSample('cfg-1', pairOf(1));
+  const store = ctx.load('/support/shadow/store.ts');
+  ctx.kafka.stall(TOPIC, 1); // a slow broker: it acknowledges 1 s later, inside the 2 s window
+  let ok = await m.publishSample('cfg-1', pairOf(3));
   await settle();
   let rows = outboxRows(ctx);
+  assert(ok === true && rows.length === 0, \`a broker that acknowledged after 1 s got publishSample \${JSON.stringify(ok)} and \${rows.length} outbox rows: wait up to ACK_TIMEOUT_MS (2 s) for the report before falling back\`);
+  ctx.kafka.resume(TOPIC);
+  ctx.kafka.failNext(TOPIC, 1);
+  ok = await m.publishSample('cfg-1', pairOf(1));
+  await settle();
+  rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and shadow:outbox holds \${rows.length} rows: without a row the pair is lost from the comparison\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'cfg-1' && rows[0].payload?.config_id === 'cfg-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key cfg-1 and the payload\`);
+  const payload = rows[0].payload;
+  const leaked = ['prompt', 'production_text', 'candidate_text', 'user_id'].filter(name => JSON.stringify(payload).includes(pairOf(1)[name]));
+  assert(leaked.length === 0 && payload.fingerprint === store.fingerprint(pairOf(1).prompt) && Math.abs((payload.delta ?? 0) - 0.05) < 1e-9, \`the outbox row's payload is \${JSON.stringify(payload)}: it is the sample's payload (fingerprint, scores, delta), and carries none of \${leaked.join(', ') || 'the user content'}\`);
   assert.equal(ok, false, \`publishSample resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishSample('cfg-1', pairOf(2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishSample waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishSample waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS (2 s), then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.at === pairOf(2).at, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishSample resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -795,9 +826,9 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "shadow.sample"
+const hEventsTopic = "shadow.sample"
 
-func eventsPair(n int, user string) store.Pair {
+func hEventsPair(n int, user string) store.Pair {
 	return store.Pair{
 		UserID: user, Prompt: fmt.Sprintf("Summarise ticket %d for alice@example.com", n),
 		ProductionVersion: "prod-2026-03", ProductionText: fmt.Sprintf("Production summary of ticket %d", n), ProductionScore: 0.70,
@@ -806,22 +837,22 @@ func eventsPair(n int, user string) store.Pair {
 	}
 }
 
-func eventsPublish(ctx *harness.Ctx, configID string, pair store.Pair) bool {
+func hPublish(ctx *harness.Ctx, configID string, pair store.Pair) bool {
 	ok, err := publishSample(configID, pair)
 	ctx.NoError(err, "publishSample")
 	return ok
 }
 
-type eventsRow struct {
+type hOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func eventsOutbox(ctx *harness.Ctx) []eventsRow {
-	var rows []eventsRow
+func hEventsOutbox(ctx *harness.Ctx) []hOutboxRow {
+	var rows []hOutboxRow
 	for _, text := range ctx.Redis.LRange("shadow:outbox", 0, -1) {
-		var row eventsRow
+		var row hOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -829,21 +860,25 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 }
 
 func CheckConfigKey(ctx *harness.Ctx) {
-	eventsPublish(ctx, "cfg-1", eventsPair(1, "user-1"))
-	eventsPublish(ctx, "cfg-2", eventsPair(2, "user-2"))
-	eventsPublish(ctx, "cfg-1", eventsPair(3, "user-3"))
+	sent := []bool{
+		hPublish(ctx, "cfg-1", hEventsPair(1, "user-1")),
+		hPublish(ctx, "cfg-2", hEventsPair(2, "user-2")),
+		hPublish(ctx, "cfg-1", hEventsPair(3, "user-3")),
+	}
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(hEventsTopic)
 	ctx.Equal(len(records), 3, "three publishSample calls must produce three records on shadow.sample; the records")
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"cfg-1", "cfg-2", "cfg-1"}, "the records must be keyed by the config ids")
+	ctx.Equal(ctx.Kafka.Keys(hEventsTopic), []string{"cfg-1", "cfg-2", "cfg-1"}, "the records must be keyed by the config ids")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both cfg-1 samples must land on one partition, or no single consumer owns cfg-1's aggregate; the partitions")
+	ctx.Equal(sent, []bool{true, true, true}, "a sample the broker acknowledged returns true; the results")
+	ctx.Equal(len(hEventsOutbox(ctx)), 0, "a sample the broker acknowledged writes no outbox row; the rows")
 }
 
 func CheckNoContent(ctx *harness.Ctx) {
-	pair := eventsPair(1, "user-4711")
-	eventsPublish(ctx, "cfg-1", pair)
+	pair := hEventsPair(1, "user-4711")
+	hPublish(ctx, "cfg-1", pair)
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(hEventsTopic)
 	ctx.Equal(len(values), 1, "one publishSample must produce one record; the records")
 	raw := values[0]
 	for name, secret := range map[string]string{"prompt": pair.Prompt, "production_text": pair.ProductionText, "candidate_text": pair.CandidateText, "user_id": pair.UserID} {
@@ -860,34 +895,56 @@ func CheckNoContent(ctx *harness.Ctx) {
 	}
 	delta, _ := value["delta"].(float64)
 	ctx.Assert(math.Abs(delta-0.05) < 1e-9, "the sample's delta is %v, expected the candidate's score minus production's (0.05)", value["delta"])
+	worsePair := hEventsPair(2, "user-4711")
+	worsePair.CandidateScore = 0.60
+	hPublish(ctx, "cfg-1", worsePair)
+	ctx.Settle()
+	values = ctx.Kafka.Values(hEventsTopic)
+	var worse map[string]any
+	ctx.NoError(json.Unmarshal([]byte(values[len(values)-1]), &worse), "the payload must be JSON")
+	worseDelta, _ := worse["delta"].(float64)
+	ctx.Assert(math.Abs(worseDelta-(0.60-0.70)) < 1e-9, "a candidate scoring 0.60 against production's 0.70 gave the delta %v, expected -0.1: the delta keeps its sign", worse["delta"])
 }
 
 func CheckIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsPublish(ctx, "cfg-1", eventsPair(1, "user-4711"))
+	ctx.Kafka.LoseAcks(hEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hPublish(ctx, "cfg-1", hEventsPair(1, "user-4711"))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "after one lost acknowledgement the retry must not write the sample twice, or the consumer counts the pair twice (enable.idempotence); the records")
-	eventsPublish(ctx, "cfg-1", eventsPair(2, "user-4711"))
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 1, "after one lost acknowledgement the retry must not write the sample twice, or the consumer counts the pair twice (enable.idempotence); the records")
+	hPublish(ctx, "cfg-1", hEventsPair(2, "user-4711"))
 	ctx.Settle()
-	ctx.Kafka.Failover(eventsTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 2, "a leader failover must not lose a sample (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hEventsTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hEventsTopic)), 2, "a leader failover must not lose a sample (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, "cfg-1", eventsPair(1, "user-4711"))
+	ctx.Kafka.StallFor(hEventsTopic, 1) // a slow broker: it acknowledges 1 s later, inside the 2 s window
+	ok := hPublish(ctx, "cfg-1", hEventsPair(3, "user-4711"))
 	ctx.Settle()
-	rows := eventsOutbox(ctx)
+	rows := hEventsOutbox(ctx)
+	ctx.Assert(ok && len(rows) == 0, "a broker that acknowledged after 1 s got publishSample %v and %d outbox rows: wait up to ackTimeout (2 s) for the report before falling back", ok, len(rows))
+	ctx.Kafka.Resume(hEventsTopic)
+	ctx.Kafka.FailNext(hEventsTopic, 1)
+	ok = hPublish(ctx, "cfg-1", hEventsPair(1, "user-4711"))
+	ctx.Settle()
+	rows = hEventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the pair is lost from the comparison; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "cfg-1" && rows[0].Payload["config_id"] == "cfg-1", "the outbox row is %v, expected the topic, the key cfg-1 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == hEventsTopic && rows[0].Key == "cfg-1" && rows[0].Payload["config_id"] == "cfg-1", "the outbox row is %v, expected the topic, the key cfg-1 and the payload", rows[0])
+	first := hEventsPair(1, "user-4711")
+	payload, _ := json.Marshal(rows[0].Payload)
+	for name, secret := range map[string]string{"prompt": first.Prompt, "production_text": first.ProductionText, "candidate_text": first.CandidateText, "user_id": first.UserID} {
+		ctx.Assert(!strings.Contains(string(payload), secret), "the outbox row's payload carries the %s %q: it is the sample's payload, with none of the user content", name, secret)
+	}
+	rowDelta, _ := rows[0].Payload["delta"].(float64)
+	ctx.Assert(rows[0].Payload["fingerprint"] == store.Fingerprint(first.Prompt) && math.Abs(rowDelta-0.05) < 1e-9, "the outbox row's payload is %s: it is the sample's payload (fingerprint, scores, delta)", payload)
 	ctx.Equal(ok, false, "publishSample's result after a failed delivery")
-	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
+	ctx.Kafka.Stall(hEventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = eventsPublish(ctx, "cfg-1", eventsPair(2, "user-4711"))
+	ok = hPublish(ctx, "cfg-1", hEventsPair(2, "user-4711"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishSample waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
-	rows = eventsOutbox(ctx)
-	ctx.Assert(len(rows) == 2 && rows[1].Payload["at"] == float64(eventsPair(2, "").At), "no delivery report within the window and the outbox holds %v", rows)
+	ctx.Assert(waited <= 2.5, "publishSample waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
+	rows = hEventsOutbox(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["at"] == float64(hEventsPair(2, "").At), "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishSample's result without a delivery report")
 }
 `,
@@ -904,9 +961,9 @@ func CheckOutbox(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventsTopic = "shadow.sample";
+const std::string kHEventsTopic = "shadow.sample";
 
-store::Pair eventsPair(int n, const std::string& user = "user-4711") {
+store::Pair hEventsPair(int n, const std::string& user = "user-4711") {
   store::Pair p;
   p.user_id = user;
   p.prompt = "Summarise ticket " + std::to_string(n) + " for alice@example.com";
@@ -920,7 +977,7 @@ store::Pair eventsPair(int n, const std::string& user = "user-4711") {
   return p;
 }
 
-std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hEventsOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("shadow:outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -930,28 +987,31 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string eventsField(const nlohmann::json& j, const std::string& field) {
+std::string hEventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
+
+double hEventsDelta(const nlohmann::json& j) { return j.is_object() && j.contains("delta") && j["delta"].is_number() ? j["delta"].get<double>() : 0; }
 
 }  // namespace
 
 void CheckConfigKey(harness::Ctx& ctx) {
-  publishSample("cfg-1", eventsPair(1, "user-1"));
-  publishSample("cfg-2", eventsPair(2, "user-2"));
-  publishSample("cfg-1", eventsPair(3, "user-3"));
+  const std::vector<bool> sent = {publishSample("cfg-1", hEventsPair(1, "user-1")), publishSample("cfg-2", hEventsPair(2, "user-2")),
+                                  publishSample("cfg-1", hEventsPair(3, "user-3"))};
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kEventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   ctx.Equal(records.size(), 3, "three publishSample calls must produce three records on shadow.sample; the records");
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"cfg-1", "cfg-2", "cfg-1"}, "the records must be keyed by the config ids");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"cfg-1", "cfg-2", "cfg-1"}, "the records must be keyed by the config ids");
   ctx.Equal(records[0].Partition, records[2].Partition, "both cfg-1 samples must land on one partition, or no single consumer owns cfg-1's aggregate; the partitions");
+  ctx.Assert(sent[0] && sent[1] && sent[2], "a sample the broker acknowledged returns true; the results were %d, %d, %d", sent[0], sent[1], sent[2]);
+  ctx.Equal(hEventsOutbox(ctx).size(), 0, "a sample the broker acknowledged writes no outbox row; the rows");
 }
 
 void CheckNoContent(harness::Ctx& ctx) {
-  const store::Pair pair = eventsPair(1);
+  const store::Pair pair = hEventsPair(1);
   publishSample("cfg-1", pair);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kEventsTopic);
+  const auto values = ctx.Kafka.Values(kHEventsTopic);
   ctx.Equal(values.size(), 1, "one publishSample must produce one record; the records");
   const std::string raw = values[0];
   const std::map<std::string, std::string> secrets = {
@@ -966,38 +1026,58 @@ void CheckNoContent(harness::Ctx& ctx) {
   for (const auto& [name, want] : expected.items()) {
     ctx.Equal(value.contains(name) ? value[name] : nlohmann::json(), want, "the sample's %s (payload %s)", name, raw);
   }
-  const double delta = value.contains("delta") && value["delta"].is_number() ? value["delta"].get<double>() : 0;
-  ctx.Assert(std::fabs(delta - 0.05) < 1e-9, "the sample's delta is %v, expected the candidate's score minus production's (0.05)", delta);
+  ctx.Assert(std::fabs(hEventsDelta(value) - 0.05) < 1e-9, "the sample's delta is %v, expected the candidate's score minus production's (0.05)", hEventsDelta(value));
+  store::Pair worse_pair = hEventsPair(2);
+  worse_pair.candidate_score = 0.60;
+  publishSample("cfg-1", worse_pair);
+  ctx.Settle();
+  const auto worse = nlohmann::json::parse(ctx.Kafka.Values(kHEventsTopic).back(), nullptr, false);
+  ctx.Assert(std::fabs(hEventsDelta(worse) - (0.60 - 0.70)) < 1e-9, "a candidate scoring 0.60 against production's 0.70 gave the delta %v, expected -0.1: the delta keeps its sign", hEventsDelta(worse));
 }
 
 void CheckIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishSample("cfg-1", eventsPair(1));
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishSample("cfg-1", hEventsPair(1));
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "after one lost acknowledgement the retry must not write the sample twice, or the consumer counts the pair twice (enable.idempotence); the records");
-  publishSample("cfg-1", eventsPair(2));
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 1, "after one lost acknowledgement the retry must not write the sample twice, or the consumer counts the pair twice (enable.idempotence); the records");
+  publishSample("cfg-1", hEventsPair(2));
   ctx.Settle();
-  ctx.Kafka.Failover(kEventsTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 2, "a leader failover must not lose a sample (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(kHEventsTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(kHEventsTopic).size(), 2, "a leader failover must not lose a sample (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishSample("cfg-1", eventsPair(1));
+  ctx.Kafka.StallFor(kHEventsTopic, 1);  // a slow broker: it acknowledges 1 s later, inside the 2 s window
+  bool ok = publishSample("cfg-1", hEventsPair(3));
   ctx.Settle();
-  auto rows = eventsOutbox(ctx);
+  auto rows = hEventsOutbox(ctx);
+  ctx.Assert(ok && rows.empty(), "a broker that acknowledged after 1 s got publishSample %d and %d outbox rows: wait up to kAckTimeoutMs (2 s) for the report before falling back", ok, rows.size());
+  ctx.Kafka.Resume(kHEventsTopic);
+  ctx.Kafka.FailNext(kHEventsTopic, 1);
+  ok = publishSample("cfg-1", hEventsPair(1));
+  ctx.Settle();
+  rows = hEventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the pair is lost from the comparison; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "cfg-1" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "config_id") == "cfg-1",
+  ctx.Assert(hEventsField(rows[0], "topic") == kHEventsTopic && hEventsField(rows[0], "key") == "cfg-1" && rows[0].contains("payload") &&
+                 hEventsField(rows[0]["payload"], "config_id") == "cfg-1",
              "the outbox row is %s, expected the topic, the key cfg-1 and the payload", rows[0].dump());
+  const store::Pair first = hEventsPair(1);
+  const std::string payload = rows[0]["payload"].dump();
+  const std::map<std::string, std::string> secrets = {
+      {"prompt", first.prompt}, {"production_text", first.production_text}, {"candidate_text", first.candidate_text}, {"user_id", first.user_id}};
+  for (const auto& [name, secret] : secrets) {
+    ctx.Assert(payload.find(secret) == std::string::npos, "the outbox row's payload carries the %s %q: it is the sample's payload, with none of the user content", name, secret);
+  }
+  ctx.Assert(hEventsField(rows[0]["payload"], "fingerprint") == store::fingerprint(first.prompt) && std::fabs(hEventsDelta(rows[0]["payload"]) - 0.05) < 1e-9,
+             "the outbox row's payload is %s: it is the sample's payload (fingerprint, scores, delta)", payload);
   ctx.Equal(ok, false, "publishSample's result after a failed delivery");
-  ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
+  ctx.Kafka.Stall(kHEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
-  ok = publishSample("cfg-1", eventsPair(2));
+  ok = publishSample("cfg-1", hEventsPair(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishSample waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
-  rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && rows[1]["payload"].value("at", 0LL) == eventsPair(2).at,
+  ctx.Assert(waited <= 2.5, "publishSample waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
+  rows = hEventsOutbox(ctx);
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && rows[1]["payload"].value("at", 0LL) == hEventsPair(2).at,
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishSample's result without a delivery report");
 }

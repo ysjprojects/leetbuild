@@ -54,7 +54,7 @@ timeout gets a second summary and a second bill.
       id: 'source-cap',
       title: 'Caps the source at 1 MiB of UTF-8 with a pointer to the chunked path',
       detail:
-        'A source over `MAX_SOURCE_BYTES` (1 MiB, counted in UTF-8 bytes) is **413** naming `chunking` and `chunk_bytes`, and nothing is summarized; the starter takes any size.',
+        'A source over `MAX_SOURCE_BYTES` (1 MiB, counted in UTF-8 bytes) is **413** with `chunking` and `chunk_bytes`, and nothing is summarized; a source of exactly 1 MiB is summarized. The starter takes any size.',
       match: {
         python: {
           all: [
@@ -94,7 +94,7 @@ timeout gets a second summary and a second bill.
       id: 'band-authority',
       title: 'Takes the band from the request and the platform table, never from the text',
       detail:
-        'The band is the request\'s, looked up in `BAND_TARGETS`; an unknown one is **400**. The starter\'s `detect_band` lets a document that says "TL;DR" or "in detail" choose its own length.',
+        'The band is the request\'s, looked up in `BAND_TARGETS`; an unknown one is **400** whatever the text says. The starter\'s `detect_band` lets a document that says "TL;DR" or "in detail" choose its own length.',
       match: {
         python: {all: [/BAND_TARGETS/, /status_code\s*=\s*400/], none: [/detect_band\(/, /BAND_TARGETS\.get\(/]},
         typescript: {all: [/BAND_TARGETS/, /code\(\s*400\s*\)/], none: [/detectBand\(/, /\?\?\s*250/]},
@@ -652,6 +652,7 @@ void register_routes(httplib::Server& svr) { svr.Post("/v1/summaries", submit); 
 DOC = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
 BIG = "Line of the filing. " * 52429  # 1,048,580 bytes: four over the cap
 WIDE = "R\\u00e9sum\\u00e9. " * 110000  # 880,000 characters, 1,100,000 UTF-8 bytes
+EXACT = "R\\u00e9sum\\u00e9. " * 104857 + "Done. "  # exactly 1,048,576 UTF-8 bytes: at the cap, not over it
 
 
 def _headers(key="k-1", tenant="t1"):
@@ -682,12 +683,14 @@ async def check_source_cap(ctx):
     async with _api(ctx) as c:
         r = await _submit(c, content=BIG)
         assert r.status_code == 413, f"a {len(BIG)}-byte source answered {r.status_code}: past 1 MiB a source belongs on the chunked path, expected 413"
-        assert "/v1/sources/doc-1/chunks" in r.text and "65536" in r.text, f"the 413 must name the chunked path /v1/sources/doc-1/chunks and chunk_bytes 65536, got {r.text[:300]}"
+        cap = r.json()
+        assert cap.get("chunking") == "/v1/sources/doc-1/chunks" and cap.get("chunk_bytes") == 65536, f"the 413 must carry chunking /v1/sources/doc-1/chunks and chunk_bytes 65536, got {r.text[:300]}"
         r = await _submit(c, content=WIDE, headers=_headers("k-2"))
         assert r.status_code == 413, f"a source of {len(WIDE)} characters but {len(WIDE.encode())} UTF-8 bytes answered {r.status_code}: the cap counts bytes, not characters"
         assert ctx.redis.get("summary:seq") is None, "a source over the cap was summarized anyway"
-        ok = await _submit(c, headers=_headers("k-3"))
-    assert ok.status_code in (200, 201), f"a small source answered {ok.status_code}: {ok.text}"
+        ok = await _submit(c, content=EXACT, headers=_headers("k-3"))
+    assert ok.status_code in (200, 201), f"a source of exactly 1 MiB ({len(EXACT.encode())} UTF-8 bytes) answered {ok.status_code}: the cap refuses only what is over it. {ok.text[:300]}"
+    assert ctx.redis.get("summary:seq") == "1", "a source of exactly 1 MiB was not summarized"
 
 
 async def check_band_authority(ctx):
@@ -698,8 +701,8 @@ async def check_band_authority(ctx):
         r = await _submit(c, content="Explain in detail. " + DOC, band="short", headers=_headers("k-2"))
         body = r.json()
         assert body.get("band") == "short" and body.get("target_words") == 100, f"a short request whose text says 'in detail' answered {body.get('band')} / {body.get('target_words')} words, expected short, 100"
-        r = await _submit(c, band="huge", headers=_headers("k-3"))
-        assert r.status_code == 400, f"an unknown band answered {r.status_code}, expected 400"
+        r = await _submit(c, content="TL;DR: keep this to one line. " + DOC, band="huge", headers=_headers("k-3"))
+        assert r.status_code == 400, f"an unknown band whose text says TL;DR answered {r.status_code}, expected 400: the text never stands in for the band"
     assert ctx.redis.get("summary:seq") == "2", f"{ctx.redis.get('summary:seq')} summaries were written, expected 2: an unknown band writes none"
 
 
@@ -719,6 +722,7 @@ async def check_idempotent_replay(ctx):
     typescript: `const DOC = 'The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down.';
 const BIG = 'Line of the filing. '.repeat(52429); // 1,048,580 bytes: four over the cap
 const WIDE = 'R\\u00e9sum\\u00e9. '.repeat(110000); // 880,000 characters, 1,100,000 UTF-8 bytes
+const EXACT = 'R\\u00e9sum\\u00e9. '.repeat(104857) + 'Done. '; // exactly 1,048,576 UTF-8 bytes: at the cap, not over it
 
 const keyed = (key: string, tenant = 't1') => ({'X-Tenant-Id': tenant, 'Idempotency-Key': key});
 
@@ -746,12 +750,14 @@ export async function check_source_cap(ctx) {
   const {c} = api(ctx);
   let r = await submit(c, BIG, 'medium', keyed('k-1'));
   assert.equal(r.status, 413, \`a \${BIG.length}-byte source answered \${r.status}: past 1 MiB a source belongs on the chunked path, expected 413\`);
-  assert(r.text.includes('/v1/sources/doc-1/chunks') && r.text.includes('65536'), \`the 413 must name the chunked path /v1/sources/doc-1/chunks and chunk_bytes 65536, got \${r.text.slice(0, 300)}\`);
+  const cap = r.json();
+  assert(cap.chunking === '/v1/sources/doc-1/chunks' && cap.chunk_bytes === 65536, \`the 413 must carry chunking /v1/sources/doc-1/chunks and chunk_bytes 65536, got \${r.text.slice(0, 300)}\`);
   r = await submit(c, WIDE, 'medium', keyed('k-2'));
   assert.equal(r.status, 413, \`a source of \${WIDE.length} characters but 1,100,000 UTF-8 bytes answered \${r.status}: the cap counts bytes, not characters\`);
   assert.equal(ctx.redis.get('summary:seq'), null, 'a source over the cap was summarized anyway');
-  const ok = await submit(c, DOC, 'medium', keyed('k-3'));
-  assert(ok.status === 200 || ok.status === 201, \`a small source answered \${ok.status}: \${ok.text}\`);
+  const ok = await submit(c, EXACT, 'medium', keyed('k-3'));
+  assert(ok.status === 200 || ok.status === 201, \`a source of exactly 1 MiB (1,048,576 UTF-8 bytes) answered \${ok.status}: the cap refuses only what is over it. \${ok.text.slice(0, 300)}\`);
+  assert.equal(ctx.redis.get('summary:seq'), '1', 'a source of exactly 1 MiB was not summarized');
 }
 
 export async function check_band_authority(ctx) {
@@ -760,8 +766,8 @@ export async function check_band_authority(ctx) {
   assert(body.band === 'long' && body.target_words === 600, \`a long request whose text says TL;DR answered \${body.band} / \${body.target_words} words: the text chose its own length. Expected long, 600\`);
   body = (await submit(c, 'Explain in detail. ' + DOC, 'short', keyed('k-2'))).json();
   assert(body.band === 'short' && body.target_words === 100, \`a short request whose text says 'in detail' answered \${body.band} / \${body.target_words} words, expected short, 100\`);
-  const r = await submit(c, DOC, 'huge', keyed('k-3'));
-  assert.equal(r.status, 400, \`an unknown band answered \${r.status}, expected 400\`);
+  const r = await submit(c, 'TL;DR: keep this to one line. ' + DOC, 'huge', keyed('k-3'));
+  assert.equal(r.status, 400, \`an unknown band whose text says TL;DR answered \${r.status}, expected 400: the text never stands in for the band\`);
   assert.equal(ctx.redis.get('summary:seq'), '2', \`\${ctx.redis.get('summary:seq')} summaries were written, expected 2: an unknown band writes none\`);
 }
 
@@ -791,9 +797,9 @@ import (
 	"leetbuild/harness"
 )
 
-const apiDoc = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
+const hAPIDoc = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
 
-type submitted struct {
+type hSubmitted struct {
 	SummaryID   string \`json:"summary_id"\`
 	Band        string \`json:"band"\`
 	TargetWords int    \`json:"target_words"\`
@@ -801,77 +807,84 @@ type submitted struct {
 	Replayed    bool   \`json:"replayed"\`
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hAPIClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func postSummary(c *harness.HTTP, content, band string, header ...string) *harness.Response {
+func hPostSummary(c *harness.HTTP, content, band string, header ...string) *harness.Response {
 	return c.Post("/v1/summaries", map[string]string{"source_ref": "doc-1", "content": content, "band": band}, header...)
 }
 
-func keyed(key, tenant string) []string { return []string{"X-Tenant-Id", tenant, "Idempotency-Key", key} }
+func hKeyed(key, tenant string) []string { return []string{"X-Tenant-Id", tenant, "Idempotency-Key", key} }
 
-func decoded(r *harness.Response) submitted {
-	var s submitted
+func hDecoded(r *harness.Response) hSubmitted {
+	var s hSubmitted
 	r.Decode(&s)
 	return s
 }
 
-func seq(ctx *harness.Ctx) string {
+func hSeq(ctx *harness.Ctx) string {
 	n, _ := ctx.Redis.Get("summary:seq")
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := postSummary(c, apiDoc, "medium", keyed("k-1", "t1")...)
+	c := hAPIClient(ctx)
+	r := hPostSummary(c, hAPIDoc, "medium", hKeyed("k-1", "t1")...)
 	ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/summaries answered %d: %s", r.Status, r.Text())
-	body := decoded(r)
+	body := hDecoded(r)
 	ctx.Assert(body.Band == "medium" && body.TargetWords == 250, "a medium request must answer band medium with 250 target words, got %s", r.Text())
 	ctx.Assert(strings.HasPrefix(body.Summary, "The board met on 3 March."), "the summary must be the source's lead, got %q", body.Summary)
 	ctx.Assert(store.LoadSummary(context.Background(), "t1", body.SummaryID) != nil, "no summary %q is stored for t1", body.SummaryID)
-	anon := postSummary(c, apiDoc, "medium", "Idempotency-Key", "k-2")
+	anon := hPostSummary(c, hAPIDoc, "medium", "Idempotency-Key", "k-2")
 	ctx.Equal(anon.Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckSourceCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := hAPIClient(ctx)
 	big := strings.Repeat("Line of the filing. ", 52429)
-	r := postSummary(c, big, "medium", keyed("k-1", "t1")...)
+	r := hPostSummary(c, big, "medium", hKeyed("k-1", "t1")...)
 	ctx.Equal(r.Status, 413, "a %d-byte source (past 1 MiB a source belongs on the chunked path)", len(big))
-	ctx.Assert(strings.Contains(r.Text(), "/v1/sources/doc-1/chunks") && strings.Contains(r.Text(), "65536"), "the 413 must name the chunked path /v1/sources/doc-1/chunks and chunk_bytes 65536, got %.300s", r.Text())
+	var capped struct {
+		Chunking   string  \`json:"chunking"\`
+		ChunkBytes float64 \`json:"chunk_bytes"\`
+	}
+	r.Decode(&capped)
+	ctx.Assert(capped.Chunking == "/v1/sources/doc-1/chunks" && capped.ChunkBytes == 65536, "the 413 must carry chunking /v1/sources/doc-1/chunks and chunk_bytes 65536, got %.300s", r.Text())
 	wide := strings.Repeat("R\\u00e9sum\\u00e9. ", 110000)
-	r = postSummary(c, wide, "medium", keyed("k-2", "t1")...)
+	r = hPostSummary(c, wide, "medium", hKeyed("k-2", "t1")...)
 	ctx.Equal(r.Status, 413, "a source of 880,000 characters but %d UTF-8 bytes (the cap counts bytes, not characters)", len(wide))
-	ctx.Equal(seq(ctx), "", "a source over the cap was summarized anyway; summary:seq")
-	ok := postSummary(c, apiDoc, "medium", keyed("k-3", "t1")...)
-	ctx.Assert(ok.Status == 200 || ok.Status == 201, "a small source answered %d: %s", ok.Status, ok.Text())
+	ctx.Equal(hSeq(ctx), "", "a source over the cap was summarized anyway; summary:seq")
+	exact := strings.Repeat("R\\u00e9sum\\u00e9. ", 104857) + "Done. " // exactly 1,048,576 UTF-8 bytes: at the cap, not over it
+	ok := hPostSummary(c, exact, "medium", hKeyed("k-3", "t1")...)
+	ctx.Assert(ok.Status == 200 || ok.Status == 201, "a source of exactly 1 MiB (%d UTF-8 bytes) answered %d: the cap refuses only what is over it. %.300s", len(exact), ok.Status, ok.Text())
+	ctx.Equal(hSeq(ctx), "1", "a source of exactly 1 MiB must be summarized; summary:seq")
 }
 
 func CheckBandAuthority(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	body := decoded(postSummary(c, "TL;DR: keep this to one line. "+apiDoc, "long", keyed("k-1", "t1")...))
+	c := hAPIClient(ctx)
+	body := hDecoded(hPostSummary(c, "TL;DR: keep this to one line. "+hAPIDoc, "long", hKeyed("k-1", "t1")...))
 	ctx.Assert(body.Band == "long" && body.TargetWords == 600, "a long request whose text says TL;DR answered %s / %d words: the text chose its own length. Expected long, 600", body.Band, body.TargetWords)
-	body = decoded(postSummary(c, "Explain in detail. "+apiDoc, "short", keyed("k-2", "t1")...))
+	body = hDecoded(hPostSummary(c, "Explain in detail. "+hAPIDoc, "short", hKeyed("k-2", "t1")...))
 	ctx.Assert(body.Band == "short" && body.TargetWords == 100, "a short request whose text says 'in detail' answered %s / %d words, expected short, 100", body.Band, body.TargetWords)
-	r := postSummary(c, apiDoc, "huge", keyed("k-3", "t1")...)
-	ctx.Equal(r.Status, 400, "an unknown band")
-	ctx.Equal(seq(ctx), "2", "an unknown band must write no summary; summary:seq")
+	r := hPostSummary(c, "TL;DR: keep this to one line. "+hAPIDoc, "huge", hKeyed("k-3", "t1")...)
+	ctx.Equal(r.Status, 400, "an unknown band whose text says TL;DR (the text never stands in for the band)")
+	ctx.Equal(hSeq(ctx), "2", "an unknown band must write no summary; summary:seq")
 }
 
 func CheckIdempotentReplay(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := postSummary(c, apiDoc, "medium", keyed("k-1", "t1")...)
+	c := hAPIClient(ctx)
+	first := hPostSummary(c, hAPIDoc, "medium", hKeyed("k-1", "t1")...)
 	ctx.Assert(first.Status == 200 || first.Status == 201, "the first request answered %d: %s", first.Status, first.Text())
-	retry := postSummary(c, apiDoc, "medium", keyed("k-1", "t1")...)
-	ctx.Assert(retry.Status == 200 && decoded(retry).Replayed, "a retry with the same Idempotency-Key answered %d %s, expected 200 with replayed true", retry.Status, retry.Text())
-	ctx.Equal(decoded(retry).SummaryID, decoded(first).SummaryID, "the retry must answer the first summary id")
-	ctx.Equal(seq(ctx), "1", "two requests with one key must write one summary (each retry is billed again); summary:seq")
-	other := postSummary(c, apiDoc, "medium", keyed("k-1", "t2")...)
-	ctx.Assert((other.Status == 200 || other.Status == 201) && decoded(other).SummaryID != decoded(first).SummaryID, "another tenant's request with the same key must get its own summary, got %d %s", other.Status, other.Text())
-	missing := postSummary(c, apiDoc, "medium", "X-Tenant-Id", "t1")
+	retry := hPostSummary(c, hAPIDoc, "medium", hKeyed("k-1", "t1")...)
+	ctx.Assert(retry.Status == 200 && hDecoded(retry).Replayed, "a retry with the same Idempotency-Key answered %d %s, expected 200 with replayed true", retry.Status, retry.Text())
+	ctx.Equal(hDecoded(retry).SummaryID, hDecoded(first).SummaryID, "the retry must answer the first summary id")
+	ctx.Equal(hSeq(ctx), "1", "two requests with one key must write one summary (each retry is billed again); summary:seq")
+	other := hPostSummary(c, hAPIDoc, "medium", hKeyed("k-1", "t2")...)
+	ctx.Assert((other.Status == 200 || other.Status == 201) && hDecoded(other).SummaryID != hDecoded(first).SummaryID, "another tenant's request with the same key must get its own summary, got %d %s", other.Status, other.Text())
+	missing := hPostSummary(c, hAPIDoc, "medium", "X-Tenant-Id", "t1")
 	ctx.Equal(missing.Status, 400, "a request without Idempotency-Key")
 }
 `,
@@ -885,10 +898,10 @@ func CheckIdempotentReplay(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kDoc =
+const std::string hDoc =
     "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down.";
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -896,82 +909,85 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response postSummary(harness::HTTP& c, const std::string& content, const std::string& band, const std::string& tenant, const std::string& key) {
+harness::Response hPostSummary(harness::HTTP& c, const std::string& content, const std::string& band, const std::string& tenant, const std::string& key) {
   const std::string body = nlohmann::json{{"source_ref", "doc-1"}, {"content", content}, {"band", band}}.dump();
   if (tenant.empty()) return c.Post("/v1/summaries", body, "Content-Type", "application/json", "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/summaries", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/summaries", body, "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the response is not a JSON object: %d %.200s", r.Status, r.Text());
   return body;
 }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   out.reserve(s.size() * n);
   for (int i = 0; i < n; i++) out += s;
   return out;
 }
 
-std::string seq(harness::Ctx& ctx) { return ctx.Redis.Get("summary:seq").value_or(""); }
+std::string hSeq(harness::Ctx& ctx) { return ctx.Redis.Get("summary:seq").value_or(""); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto r = postSummary(c, kDoc, "medium", "t1", "k-1");
+  auto c = hApiClient(ctx);
+  const auto r = hPostSummary(c, hDoc, "medium", "t1", "k-1");
   ctx.Assert(r.Status == 200 || r.Status == 201, "POST /v1/summaries answered %d: %s", r.Status, r.Text());
-  const auto body = bodyOf(ctx, r);
+  const auto body = hBodyOf(ctx, r);
   ctx.Assert(body.value("band", "") == "medium" && body.value("target_words", 0L) == 250, "a medium request must answer band medium with 250 target words, got %s", r.Text());
   ctx.Assert(body.value("summary", "").rfind("The board met on 3 March.", 0) == 0, "the summary must be the source's lead, got %q", body.value("summary", ""));
   ctx.Assert(summarizer::store::loadSummary("t1", body.value("summary_id", "")).has_value(), "no summary %q is stored for t1", body.value("summary_id", ""));
-  const auto anon = postSummary(c, kDoc, "medium", "", "k-2");
+  const auto anon = hPostSummary(c, hDoc, "medium", "", "k-2");
   ctx.Equal(anon.Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckSourceCap(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const std::string big = repeat("Line of the filing. ", 52429);
-  auto r = postSummary(c, big, "medium", "t1", "k-1");
+  auto c = hApiClient(ctx);
+  const std::string big = hRepeat("Line of the filing. ", 52429);
+  auto r = hPostSummary(c, big, "medium", "t1", "k-1");
   ctx.Equal(r.Status, 413, "a %d-byte source (past 1 MiB a source belongs on the chunked path)", big.size());
-  ctx.Assert(r.Text().find("/v1/sources/doc-1/chunks") != std::string::npos && r.Text().find("65536") != std::string::npos,
-             "the 413 must name the chunked path /v1/sources/doc-1/chunks and chunk_bytes 65536, got %.300s", r.Text());
-  const std::string wide = repeat("R\\u00e9sum\\u00e9. ", 110000);
-  r = postSummary(c, wide, "medium", "t1", "k-2");
+  const auto capped = nlohmann::json::parse(r.Text(), nullptr, false);
+  ctx.Assert(capped.is_object() && capped.value("chunking", "") == "/v1/sources/doc-1/chunks" && capped.value("chunk_bytes", 0L) == 65536,
+             "the 413 must carry chunking /v1/sources/doc-1/chunks and chunk_bytes 65536, got %.300s", r.Text());
+  const std::string wide = hRepeat("R\\u00e9sum\\u00e9. ", 110000);
+  r = hPostSummary(c, wide, "medium", "t1", "k-2");
   ctx.Equal(r.Status, 413, "a source of 880,000 characters but %d UTF-8 bytes (the cap counts bytes, not characters)", wide.size());
-  ctx.Equal(seq(ctx), "", "a source over the cap was summarized anyway; summary:seq");
-  const auto ok = postSummary(c, kDoc, "medium", "t1", "k-3");
-  ctx.Assert(ok.Status == 200 || ok.Status == 201, "a small source answered %d: %s", ok.Status, ok.Text());
+  ctx.Equal(hSeq(ctx), "", "a source over the cap was summarized anyway; summary:seq");
+  const std::string exact = hRepeat("R\\u00e9sum\\u00e9. ", 104857) + "Done. ";  // exactly 1,048,576 UTF-8 bytes: at the cap, not over it
+  const auto ok = hPostSummary(c, exact, "medium", "t1", "k-3");
+  ctx.Assert(ok.Status == 200 || ok.Status == 201, "a source of exactly 1 MiB (%d UTF-8 bytes) answered %d: the cap refuses only what is over it. %.300s", exact.size(), ok.Status, ok.Text());
+  ctx.Equal(hSeq(ctx), "1", "a source of exactly 1 MiB must be summarized; summary:seq");
 }
 
 void CheckBandAuthority(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  auto body = bodyOf(ctx, postSummary(c, "TL;DR: keep this to one line. " + kDoc, "long", "t1", "k-1"));
+  auto c = hApiClient(ctx);
+  auto body = hBodyOf(ctx, hPostSummary(c, "TL;DR: keep this to one line. " + hDoc, "long", "t1", "k-1"));
   ctx.Assert(body.value("band", "") == "long" && body.value("target_words", 0L) == 600,
              "a long request whose text says TL;DR answered %s / %d words: the text chose its own length. Expected long, 600", body.value("band", ""), body.value("target_words", 0L));
-  body = bodyOf(ctx, postSummary(c, "Explain in detail. " + kDoc, "short", "t1", "k-2"));
+  body = hBodyOf(ctx, hPostSummary(c, "Explain in detail. " + hDoc, "short", "t1", "k-2"));
   ctx.Assert(body.value("band", "") == "short" && body.value("target_words", 0L) == 100,
              "a short request whose text says 'in detail' answered %s / %d words, expected short, 100", body.value("band", ""), body.value("target_words", 0L));
-  const auto r = postSummary(c, kDoc, "huge", "t1", "k-3");
-  ctx.Equal(r.Status, 400, "an unknown band");
-  ctx.Equal(seq(ctx), "2", "an unknown band must write no summary; summary:seq");
+  const auto r = hPostSummary(c, "TL;DR: keep this to one line. " + hDoc, "huge", "t1", "k-3");
+  ctx.Equal(r.Status, 400, "an unknown band whose text says TL;DR (the text never stands in for the band)");
+  ctx.Equal(hSeq(ctx), "2", "an unknown band must write no summary; summary:seq");
 }
 
 void CheckIdempotentReplay(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto first = postSummary(c, kDoc, "medium", "t1", "k-1");
+  auto c = hApiClient(ctx);
+  const auto first = hPostSummary(c, hDoc, "medium", "t1", "k-1");
   ctx.Assert(first.Status == 200 || first.Status == 201, "the first request answered %d: %s", first.Status, first.Text());
-  const auto retry = postSummary(c, kDoc, "medium", "t1", "k-1");
-  ctx.Assert(retry.Status == 200 && bodyOf(ctx, retry).value("replayed", false), "a retry with the same Idempotency-Key answered %d %s, expected 200 with replayed true", retry.Status, retry.Text());
-  ctx.Equal(bodyOf(ctx, retry).value("summary_id", ""), bodyOf(ctx, first).value("summary_id", ""), "the retry must answer the first summary id");
-  ctx.Equal(seq(ctx), "1", "two requests with one key must write one summary (each retry is billed again); summary:seq");
-  const auto other = postSummary(c, kDoc, "medium", "t2", "k-1");
-  ctx.Assert((other.Status == 200 || other.Status == 201) && bodyOf(ctx, other).value("summary_id", "") != bodyOf(ctx, first).value("summary_id", ""),
+  const auto retry = hPostSummary(c, hDoc, "medium", "t1", "k-1");
+  ctx.Assert(retry.Status == 200 && hBodyOf(ctx, retry).value("replayed", false), "a retry with the same Idempotency-Key answered %d %s, expected 200 with replayed true", retry.Status, retry.Text());
+  ctx.Equal(hBodyOf(ctx, retry).value("summary_id", ""), hBodyOf(ctx, first).value("summary_id", ""), "the retry must answer the first summary id");
+  ctx.Equal(hSeq(ctx), "1", "two requests with one key must write one summary (each retry is billed again); summary:seq");
+  const auto other = hPostSummary(c, hDoc, "medium", "t2", "k-1");
+  ctx.Assert((other.Status == 200 || other.Status == 201) && hBodyOf(ctx, other).value("summary_id", "") != hBodyOf(ctx, first).value("summary_id", ""),
              "another tenant's request with the same key must get its own summary, got %d %s", other.Status, other.Text());
-  const auto missing = postSummary(c, kDoc, "medium", "t1", "");
+  const auto missing = hPostSummary(c, hDoc, "medium", "t1", "");
   ctx.Equal(missing.Status, 400, "a request without Idempotency-Key");
 }
 `,

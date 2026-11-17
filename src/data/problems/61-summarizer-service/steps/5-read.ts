@@ -53,7 +53,7 @@ an edited chunk quotes text the summary never saw.
       id: 'tenant-scope',
       title: "Another tenant's id is 404",
       detail:
-        "`X-Tenant-Id` is required and the record is loaded with `load_summary(tenant, id)`, so a foreign id answers **404** like a missing one; the starter's `find_summary` finds it whoever owns it.",
+        "`X-Tenant-Id` is required and the record is loaded with `load_summary(tenant, id)`, so a foreign id answers the same **404** as a missing one, body included; the starter's `find_summary` finds it whoever owns it.",
       match: {
         python: {all: [/x-tenant-id/i, /store\.load_summary\(\s*tenant/], none: [/find_summary\(/]},
         typescript: {all: [/x-tenant-id/i, /loadSummary\(\s*tenant/], none: [/findSummary\(/]},
@@ -66,7 +66,7 @@ an edited chunk quotes text the summary never saw.
       id: 'stale-flag',
       title: 'Marks a summary of an edited source stale',
       detail:
-        "The response compares the current `source_hash` with the summary's (`stale`) and lists the cited chunks that changed (`stale_chunks`); the starter compares nothing.",
+        "The response compares the current `source_hash` with the summary's (`stale`, true even when only an uncited chunk changed) and lists, sorted, the cited chunks that changed (`stale_chunks`); the starter compares nothing.",
       match: {
         python: {all: [/stale_chunks/, /source_hash["']\]\s*!=/]},
         typescript: {all: [/stale_chunks/, /source_hash\s*!==/]},
@@ -487,11 +487,16 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/summaries/([\\w-]+))
     },
   },
   harness: {
-    python: `from summarizer import store
+    python: `from summarizer import store, text
 
 DOC = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
 EDITED = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned."
 SENTENCES = ["The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.", "Two directors stepped down."]
+# A three-chunk source whose summary cites chunk 1 before chunk 0 and never cites chunk 2.
+DOC3 = DOC + "\\n\\nA new chair takes over in May."
+REORDERED = "Two directors stepped down. The board met on 3 March."
+TAIL_EDITED = DOC + "\\n\\nA new chair takes over in June."
+ALL_EDITED = EDITED.replace("3 March", "4 March") + "\\n\\nA new chair takes over in June."
 
 
 def _seed():
@@ -525,6 +530,8 @@ async def check_tenant_scope(ctx):
         foreign = await _get(c, summary_id, tenant="t2")
         assert foreign.status_code == 404, f"tenant t2 reading t1's summary {summary_id} answered {foreign.status_code}: the lookup must be scoped to the caller's tenant, expected 404"
         assert "board" not in foreign.text, f"the answer to t2 carries t1's text: {foreign.text[:200]}"
+        missing = await _get(c, "s-99", tenant="t2")
+        assert foreign.text.replace(summary_id, "<id>") == missing.text.replace("s-99", "<id>"), f"t1's summary answered t2 {foreign.text[:200]} and an unknown id answered {missing.text[:200]}: a foreign id must look exactly like a missing one, or the answer confirms it exists"
         anon = await _get(c, summary_id, tenant=None)
     assert anon.status_code == 401, f"a read without X-Tenant-Id answered {anon.status_code}, expected 401"
 
@@ -538,6 +545,16 @@ async def check_stale_flag(ctx):
         edited = (await _get(c, summary_id)).json()
     assert edited.get("stale") is True, f"after the source was edited the summary answered stale={edited.get('stale')!r}: a reader takes a summary of text that no longer exists for the current one"
     assert edited.get("stale_chunks") == [1], f"only chunk 1 changed, stale_chunks is {edited.get('stale_chunks')!r}"
+    record = store.create_summary("t1", "doc-2", DOC3, "medium", 250)
+    record.update(summary=REORDERED, citations=text.cite(DOC3, REORDERED))
+    store.save_summary(record)
+    async with _api(ctx) as c:
+        store.put_source("t1", "doc-2", TAIL_EDITED)
+        tail = (await _get(c, record["summary_id"])).json()
+        assert tail.get("stale") is True and tail.get("stale_chunks") == [], f"after an edit to chunk 2, which no citation points at, the summary answered stale={tail.get('stale')!r} stale_chunks={tail.get('stale_chunks')!r}: the source changed, so the summary is stale, and no cited chunk did. Expected stale true, stale_chunks []"
+        store.put_source("t1", "doc-2", ALL_EDITED)
+        both = (await _get(c, record["summary_id"])).json()
+    assert both.get("stale_chunks") == [0, 1], f"a summary citing chunk 1 then chunk 0, both edited, answered stale_chunks {both.get('stale_chunks')!r}, expected them sorted: [0, 1]"
 
 
 async def check_citation_quotes(ctx):
@@ -556,6 +573,11 @@ async def check_citation_quotes(ctx):
     typescript: `const DOC = 'The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down.';
 const EDITED = 'The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.';
 const SENTENCES = ['The board met on 3 March.', 'Revenue rose four percent in the quarter.', 'The audit committee approved the accounts.', 'Two directors stepped down.'];
+// A three-chunk source whose summary cites chunk 1 before chunk 0 and never cites chunk 2.
+const DOC3 = DOC + '\\n\\nA new chair takes over in May.';
+const REORDERED = 'Two directors stepped down. The board met on 3 March.';
+const TAIL_EDITED = DOC + '\\n\\nA new chair takes over in June.';
+const ALL_EDITED = EDITED.replace('3 March', '4 March') + '\\n\\nA new chair takes over in June.';
 
 async function read(ctx) {
   const store = ctx.load('/support/summarizer/store.ts');
@@ -582,6 +604,8 @@ export async function check_tenant_scope(ctx) {
   const foreign = await get(summaryId, 't2');
   assert.equal(foreign.status, 404, \`tenant t2 reading t1's summary \${summaryId} answered \${foreign.status}: the lookup must be scoped to the caller's tenant, expected 404\`);
   assert(!foreign.text.includes('board'), \`the answer to t2 carries t1's text: \${foreign.text.slice(0, 200)}\`);
+  const missing = await get('s-99', 't2');
+  assert.equal(foreign.text.split(summaryId).join('<id>'), missing.text.split('s-99').join('<id>'), \`t1's summary answered t2 \${foreign.text.slice(0, 200)} and an unknown id answered \${missing.text.slice(0, 200)}: a foreign id must look exactly like a missing one, or the answer confirms it exists\`);
   const anon = await get(summaryId, null);
   assert.equal(anon.status, 401, \`a read without X-Tenant-Id answered \${anon.status}, expected 401\`);
 }
@@ -594,6 +618,15 @@ export async function check_stale_flag(ctx) {
   const edited = (await get(summaryId)).json();
   assert.equal(edited.stale, true, \`after the source was edited the summary answered stale=\${JSON.stringify(edited.stale)}: a reader takes a summary of text that no longer exists for the current one\`);
   assert.deepStrictEqual(edited.stale_chunks, [1], \`only chunk 1 changed, stale_chunks is \${JSON.stringify(edited.stale_chunks)}\`);
+  const text = ctx.load('/support/summarizer/text.ts');
+  const record = await store.createSummary('t1', 'doc-2', DOC3, 'medium', 250);
+  await store.saveSummary({...record, summary: REORDERED, citations: text.cite(DOC3, REORDERED)});
+  await store.putSource('t1', 'doc-2', TAIL_EDITED);
+  const tail = (await get(record.summary_id)).json();
+  assert(tail.stale === true && JSON.stringify(tail.stale_chunks) === '[]', \`after an edit to chunk 2, which no citation points at, the summary answered stale=\${JSON.stringify(tail.stale)} stale_chunks=\${JSON.stringify(tail.stale_chunks)}: the source changed, so the summary is stale, and no cited chunk did. Expected stale true, stale_chunks []\`);
+  await store.putSource('t1', 'doc-2', ALL_EDITED);
+  const both = (await get(record.summary_id)).json();
+  assert.deepStrictEqual(both.stale_chunks, [0, 1], \`a summary citing chunk 1 then chunk 0, both edited, answered stale_chunks \${JSON.stringify(both.stale_chunks)}, expected them sorted: [0, 1]\`);
 }
 
 export async function check_citation_quotes(ctx) {
@@ -618,6 +651,7 @@ import (
 	"strings"
 
 	"summarizer/store"
+	"summarizer/text"
 
 	"leetbuild/harness"
 )
@@ -625,6 +659,11 @@ import (
 const (
 	readDoc    = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down."
 	readEdited = "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned."
+	// A three-chunk source whose summary cites chunk 1 before chunk 0 and never cites chunk 2.
+	readDoc3       = readDoc + "\\n\\nA new chair takes over in May."
+	readReordered  = "Two directors stepped down. The board met on 3 March."
+	readTailEdited = readDoc + "\\n\\nA new chair takes over in June."
+	readAllEdited  = "The board met on 4 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.\\n\\nA new chair takes over in June."
 )
 
 var readSentences = []string{"The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.", "Two directors stepped down."}
@@ -662,7 +701,7 @@ func readDecode(r *harness.Response) readBody {
 	return b
 }
 
-func show(p any) string {
+func hShow(p any) string {
 	switch v := p.(type) {
 	case *bool:
 		if v != nil {
@@ -700,17 +739,31 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	foreign := readGet(c, summaryID, "t2")
 	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's summary %s (the lookup must be scoped to the caller's tenant)", summaryID)
 	ctx.Assert(!strings.Contains(foreign.Text(), "board"), "the answer to t2 carries t1's text: %.200s", foreign.Text())
+	missing := readGet(c, "s-99", "t2")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), summaryID, "<id>"), strings.ReplaceAll(missing.Text(), "s-99", "<id>"),
+		"a foreign id must look exactly like a missing one, or the answer confirms it exists; t1's summary as t2 sees it, against an unknown id")
 	ctx.Equal(readGet(c, summaryID, "").Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckStaleFlag(ctx *harness.Ctx) {
 	c, summaryID := readSetup(ctx)
 	fresh := readDecode(readGet(c, summaryID, "t1"))
-	ctx.Assert(fresh.Stale != nil && !*fresh.Stale && fresh.StaleChunks != nil && len(fresh.StaleChunks) == 0, "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%v", show(fresh.Stale), fresh.StaleChunks)
+	ctx.Assert(fresh.Stale != nil && !*fresh.Stale && fresh.StaleChunks != nil && len(fresh.StaleChunks) == 0, "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%v", hShow(fresh.Stale), fresh.StaleChunks)
 	store.PutSource(context.Background(), "t1", "doc-1", readEdited)
 	edited := readDecode(readGet(c, summaryID, "t1"))
-	ctx.Assert(edited.Stale != nil && *edited.Stale, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", show(edited.Stale))
+	ctx.Assert(edited.Stale != nil && *edited.Stale, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", hShow(edited.Stale))
 	ctx.Equal(edited.StaleChunks, []int{1}, "only chunk 1 changed; stale_chunks")
+	record := store.CreateSummary(context.Background(), "t1", "doc-2", readDoc3, "medium", 250)
+	record.Summary = readReordered
+	record.Citations = text.Cite(readDoc3, readReordered)
+	ctx.NoError(store.SaveSummary(context.Background(), record), "saving the reordered summary")
+	store.PutSource(context.Background(), "t1", "doc-2", readTailEdited)
+	tail := readDecode(readGet(c, record.SummaryID, "t1"))
+	ctx.Assert(tail.Stale != nil && *tail.Stale && tail.StaleChunks != nil && len(tail.StaleChunks) == 0,
+		"after an edit to chunk 2, which no citation points at, the summary answered stale=%s stale_chunks=%v: the source changed, so the summary is stale, and no cited chunk did. Expected stale true, stale_chunks []", hShow(tail.Stale), tail.StaleChunks)
+	store.PutSource(context.Background(), "t1", "doc-2", readAllEdited)
+	both := readDecode(readGet(c, record.SummaryID, "t1"))
+	ctx.Equal(both.StaleChunks, []int{0, 1}, "a summary citing chunk 1 then chunk 0, both edited, lists them sorted; stale_chunks")
 }
 
 func CheckCitationQuotes(ctx *harness.Ctx) {
@@ -720,9 +773,9 @@ func CheckCitationQuotes(ctx *harness.Ctx) {
 	ctx.Equal(len(citations), 4, "the summary has four cited sentences; the citations")
 	for i, cite := range citations {
 		if cite.ChunkIndex == 0 {
-			ctx.Assert(cite.Quote != nil && *cite.Quote == readSentences[i] && cite.Stale != nil && !*cite.Stale, "a citation into the unchanged chunk 0 must quote %q and be stale false, got quote %s stale %s", readSentences[i], show(cite.Quote), show(cite.Stale))
+			ctx.Assert(cite.Quote != nil && *cite.Quote == readSentences[i] && cite.Stale != nil && !*cite.Stale, "a citation into the unchanged chunk 0 must quote %q and be stale false, got quote %s stale %s", readSentences[i], hShow(cite.Quote), hShow(cite.Stale))
 		} else {
-			ctx.Assert(cite.Quote == nil && cite.Stale != nil && *cite.Stale, "a citation into the edited chunk 1 answered quote %s, stale %s: the old offsets now slice text the summary never saw. Expected quote null, stale true", show(cite.Quote), show(cite.Stale))
+			ctx.Assert(cite.Quote == nil && cite.Stale != nil && *cite.Stale, "a citation into the edited chunk 1 answered quote %s, stale %s: the old offsets now slice text the summary never saw. Expected quote null, stale true", hShow(cite.Quote), hShow(cite.Stale))
 		}
 	}
 }
@@ -735,15 +788,22 @@ func CheckCitationQuotes(ctx *harness.Ctx) {
 #include <vector>
 
 #include "summarizer/store.h"
+#include "summarizer/text.h"
 
 namespace {
 
-const std::string kReadDoc =
+const std::string hReadDoc =
     "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee approved the accounts. Two directors stepped down.";
-const std::string kReadEdited =
+const std::string hReadEdited =
     "The board met on 3 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.";
-const std::vector<std::string> kSentences = {"The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.",
+const std::vector<std::string> hSentences = {"The board met on 3 March.", "Revenue rose four percent in the quarter.", "The audit committee approved the accounts.",
                                              "Two directors stepped down."};
+// A three-chunk source whose summary cites chunk 1 before chunk 0 and never cites chunk 2.
+const std::string hReadDoc3 = hReadDoc + "\\n\\nA new chair takes over in May.";
+const std::string hReordered = "Two directors stepped down. The board met on 3 March.";
+const std::string hTailEdited = hReadDoc + "\\n\\nA new chair takes over in June.";
+const std::string hAllEdited =
+    "The board met on 4 March. Revenue rose four percent in the quarter.\\n\\nThe audit committee rejected the accounts. Three directors resigned.\\n\\nA new chair takes over in June.";
 
 struct ReadSetup {
   harness::HTTP c;
@@ -751,7 +811,7 @@ struct ReadSetup {
 };
 
 ReadSetup readSetup(harness::Ctx& ctx) {
-  const auto record = summarizer::store::createSummary("t1", "doc-1", kReadDoc, "medium", 250);
+  const auto record = summarizer::store::createSummary("t1", "doc-1", hReadDoc, "medium", 250);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -770,7 +830,12 @@ nlohmann::json readBody(harness::Ctx& ctx, const harness::Response& r) {
   return body;
 }
 
-std::string show(const nlohmann::json& body, const char* name) { return body.contains(name) ? body[name].dump() : "absent"; }
+std::string hShow(const nlohmann::json& body, const char* name) { return body.contains(name) ? body[name].dump() : "absent"; }
+
+std::string hMasked(std::string text, const std::string& id) {
+  for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "<id>");
+  return text;
+}
 
 }  // namespace
 
@@ -779,12 +844,12 @@ void CheckRoute(harness::Ctx& ctx) {
   const auto r = readGet(c, summary_id, "t1");
   ctx.Equal(r.Status, 200, "GET /v1/summaries/%s (%s)", summary_id, r.Text());
   const auto body = readBody(ctx, r);
-  ctx.Equal(body.value("summary", ""), kSentences[0] + " " + kSentences[1] + " " + kSentences[2] + " " + kSentences[3], "the response must carry the stored summary");
+  ctx.Equal(body.value("summary", ""), hSentences[0] + " " + hSentences[1] + " " + hSentences[2] + " " + hSentences[3], "the response must carry the stored summary");
   std::vector<std::string> quotes;
   for (const auto& cite : body.value("citations", nlohmann::json::array())) {
     if (cite.contains("quote") && cite["quote"].is_string()) quotes.push_back(cite["quote"].get<std::string>());
   }
-  ctx.Equal(quotes, kSentences, "each citation must quote the sentence it points at");
+  ctx.Equal(quotes, hSentences, "each citation must quote the sentence it points at");
   ctx.Equal(readGet(c, "s-99", "t1").Status, 404, "an unknown id");
 }
 
@@ -793,6 +858,9 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const auto foreign = readGet(c, summary_id, "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's summary %s (the lookup must be scoped to the caller's tenant)", summary_id);
   ctx.Assert(foreign.Text().find("board") == std::string::npos, "the answer to t2 carries t1's text: %.200s", foreign.Text());
+  const auto missing = readGet(c, "s-99", "t2");
+  ctx.Equal(hMasked(foreign.Text(), summary_id), hMasked(missing.Text(), "s-99"),
+            "a foreign id must look exactly like a missing one, or the answer confirms it exists; t1's summary as t2 sees it, against an unknown id");
   ctx.Equal(readGet(c, summary_id, "").Status, 401, "a read without X-Tenant-Id");
 }
 
@@ -800,26 +868,39 @@ void CheckStaleFlag(harness::Ctx& ctx) {
   auto [c, summary_id] = readSetup(ctx);
   const auto fresh = readBody(ctx, readGet(c, summary_id, "t1"));
   ctx.Assert(fresh.value("stale", nlohmann::json()) == false && fresh.value("stale_chunks", nlohmann::json()) == nlohmann::json::array(),
-             "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%s", show(fresh, "stale"), show(fresh, "stale_chunks"));
-  summarizer::store::putSource("t1", "doc-1", kReadEdited);
+             "before any edit the summary must be stale false with no stale_chunks, got stale=%s stale_chunks=%s", hShow(fresh, "stale"), hShow(fresh, "stale_chunks"));
+  summarizer::store::putSource("t1", "doc-1", hReadEdited);
   const auto edited = readBody(ctx, readGet(c, summary_id, "t1"));
-  ctx.Assert(edited.value("stale", nlohmann::json()) == true, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", show(edited, "stale"));
+  ctx.Assert(edited.value("stale", nlohmann::json()) == true, "after the source was edited the summary answered stale=%s: a reader takes a summary of text that no longer exists for the current one", hShow(edited, "stale"));
   ctx.Equal(edited.value("stale_chunks", nlohmann::json()), nlohmann::json::array({1}), "only chunk 1 changed; stale_chunks");
+  auto record = summarizer::store::createSummary("t1", "doc-2", hReadDoc3, "medium", 250);
+  record["summary"] = hReordered;
+  record["citations"] = summarizer::text::cite(hReadDoc3, hReordered);
+  summarizer::store::saveSummary(record);
+  const std::string reordered_id = record.at("summary_id").get<std::string>();
+  summarizer::store::putSource("t1", "doc-2", hTailEdited);
+  const auto tail = readBody(ctx, readGet(c, reordered_id, "t1"));
+  ctx.Assert(tail.value("stale", nlohmann::json()) == true && tail.value("stale_chunks", nlohmann::json()) == nlohmann::json::array(),
+             "after an edit to chunk 2, which no citation points at, the summary answered stale=%s stale_chunks=%s: the source changed, so the summary is stale, and no cited chunk did. Expected stale true, stale_chunks []",
+             hShow(tail, "stale"), hShow(tail, "stale_chunks"));
+  summarizer::store::putSource("t1", "doc-2", hAllEdited);
+  const auto both = readBody(ctx, readGet(c, reordered_id, "t1"));
+  ctx.Equal(both.value("stale_chunks", nlohmann::json()), nlohmann::json::array({0, 1}), "a summary citing chunk 1 then chunk 0, both edited, lists them sorted; stale_chunks");
 }
 
 void CheckCitationQuotes(harness::Ctx& ctx) {
   auto [c, summary_id] = readSetup(ctx);
-  summarizer::store::putSource("t1", "doc-1", kReadEdited);
+  summarizer::store::putSource("t1", "doc-1", hReadEdited);
   const auto citations = readBody(ctx, readGet(c, summary_id, "t1")).value("citations", nlohmann::json::array());
   ctx.Equal(citations.size(), 4, "the summary has four cited sentences; the citations");
   for (size_t i = 0; i < citations.size(); i++) {
     const auto& cite = citations[i];
     if (cite.value("chunk_index", -1L) == 0) {
-      ctx.Assert(cite.value("quote", nlohmann::json()) == kSentences[i] && cite.value("stale", nlohmann::json()) == false,
-                 "a citation into the unchanged chunk 0 must quote %q and be stale false, got %s", kSentences[i], cite.dump());
+      ctx.Assert(cite.value("quote", nlohmann::json()) == hSentences[i] && cite.value("stale", nlohmann::json()) == false,
+                 "a citation into the unchanged chunk 0 must quote %q and be stale false, got %s", hSentences[i], cite.dump());
     } else {
       ctx.Assert(cite.value("quote", nlohmann::json(0)).is_null() && cite.value("stale", nlohmann::json()) == true,
-                 "a citation into the edited chunk 1 answered quote %s, stale %s: the old offsets now slice text the summary never saw. Expected quote null, stale true", show(cite, "quote"), show(cite, "stale"));
+                 "a citation into the edited chunk 1 answered quote %s, stale %s: the old offsets now slice text the summary never saw. Expected quote null, stale true", hShow(cite, "quote"), hShow(cite, "stale"));
     }
   }
 }

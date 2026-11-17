@@ -694,6 +694,12 @@ def check_score_histogram(ctx):
     }
     for field, value in want.items():
         assert event.get(field) == value, f"the event's {field} is {event.get(field)!r}, expected {value!r} (scores 0.05, 0.15, unscored, 1.0); event: {event}"
+    m.publish_outcome(_outcome(Q2, scores=(0.0, 0.3, None, 0.1)))
+    events = _events(ctx)
+    assert len(events) == 2, f"two outcomes produced {len(events)} records"
+    edge = events[1]
+    assert edge.get("unscored_count") == 1, f"scores 0.0, 0.3, unscored, 0.1 have one unscored passage (a score of 0.0 is a score), the event says unscored_count {edge.get('unscored_count')!r}"
+    assert edge.get("score_histogram") == [1, 1, 0, 1, 0, 0, 0, 0, 0, 0], f"scores 0.0, 0.3, unscored, 0.1 land in buckets 0, 3 and 1 (min(floor(score * 10), 9)), the event's score_histogram is {edge.get('score_histogram')!r}"
 
 
 def check_acks_idempotent(ctx):
@@ -719,7 +725,7 @@ def check_outbox_on_failure(ctx):
     before = ctx.clock.time()
     ok = m.publish_outcome(_outcome(Q2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_outcome waited {waited:.0f} s for a broker that does not answer: wait for the delivery report at most 2 s"
+    assert waited <= 2.5, f"publish_outcome waited {waited:.1f} s for a broker that does not answer: wait for the delivery report at most 2 s"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("key") == fingerprint(Q2), f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish_outcome returned {ok!r} without an acknowledgement, expected False"
@@ -729,7 +735,7 @@ const Q1 = 'how do I reset my router password';
 const Q2 = 'router firmware update steps';
 const PASSAGES = ['Hold the reset button for ten seconds.', 'Router firmware release notes', 'Billing questions', 'Admin page password rules'];
 
-const outcome = (query = Q1, tenant = 't-acme') => ({tenant, query, passages: [...PASSAGES], scores: [0.05, 0.15, null, 1.0], model_version: 'xenc-v7', latency_ms: 84});
+const outcome = (query = Q1, tenant = 't-acme', scores: (number | null)[] = [0.05, 0.15, null, 1.0]) => ({tenant, query, passages: [...PASSAGES], scores: [...scores], model_version: 'xenc-v7', latency_ms: 84});
 
 /** A real macrotask: every pending promise continuation has run. */
 const settle = (): Promise<void> => {
@@ -791,6 +797,13 @@ export async function check_score_histogram(ctx) {
     latency_ms: 84,
   };
   for (const [field, value] of Object.entries(want)) assert.deepEqual(event[field], value, \`the event's \${field} is \${JSON.stringify(event[field])}, expected \${JSON.stringify(value)} (scores 0.05, 0.15, unscored, 1.0); event: \${values[0]}\`);
+  await m.publishOutcome(outcome(Q2, 't-acme', [0.0, 0.3, null, 0.1]));
+  await settle();
+  const both = ctx.kafka.values(TOPIC);
+  assert.equal(both.length, 2, \`two outcomes produced \${both.length} records\`);
+  const edge = JSON.parse(both[1]);
+  assert.equal(edge.unscored_count, 1, \`scores 0.0, 0.3, unscored, 0.1 have one unscored passage (a score of 0.0 is a score), the event says unscored_count \${JSON.stringify(edge.unscored_count)}\`);
+  assert.deepEqual(edge.score_histogram, [1, 1, 0, 1, 0, 0, 0, 0, 0, 0], \`scores 0.0, 0.3, unscored, 0.1 land in buckets 0, 3 and 1 (min(floor(score * 10), 9)), the event's score_histogram is \${JSON.stringify(edge.score_histogram)}\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -818,7 +831,7 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.publishOutcome(outcome(Q2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishOutcome waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the delivery report at most 2 s\`);
+  assert(waited <= 2.5, \`publishOutcome waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the delivery report at most 2 s\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].key === config.fingerprint(Q2), \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishOutcome resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -846,9 +859,17 @@ const (
 
 var eventsPassages = []string{"Hold the reset button for ten seconds.", "Router firmware release notes", "Billing questions", "Admin page password rules"}
 
-func eventsOutcome(query, tenant string) outcome.RerankOutcome {
-	a, b, c := 0.05, 0.15, 1.0
-	return outcome.RerankOutcome{Tenant: tenant, Query: query, Passages: append([]string{}, eventsPassages...), Scores: []*float64{&a, &b, nil, &c}, ModelVersion: "xenc-v7", LatencyMs: 84}
+func eventsOutcome(query, tenant string, scores ...float64) outcome.RerankOutcome {
+	if scores == nil {
+		scores = []float64{0.05, 0.15, -1, 1.0}
+	}
+	ptrs := make([]*float64, len(scores))
+	for i := range scores {
+		if scores[i] >= 0 { // -1 stands for an unscored passage
+			ptrs[i] = &scores[i]
+		}
+	}
+	return outcome.RerankOutcome{Tenant: tenant, Query: query, Passages: append([]string{}, eventsPassages...), Scores: ptrs, ModelVersion: "xenc-v7", LatencyMs: 84}
 }
 
 func eventsPublish(ctx *harness.Ctx, o outcome.RerankOutcome) bool {
@@ -920,6 +941,17 @@ func CheckScoreHistogram(ctx *harness.Ctx) {
 	ctx.Assert(event.QueryFingerprint == config.Fingerprint(eventsQ1) && event.Tenant == "t-acme" && event.ModelVersion == "xenc-v7" && event.CandidateCount == 4 && event.LatencyMs == 84, "the event must carry query_fingerprint, tenant, model_version, candidate_count 4 and latency_ms 84, got %s", values[0])
 	ctx.Assert(event.UnscoredCount != nil && *event.UnscoredCount == 1, "the event's unscored_count must be 1 (one passage unscored), got %s", values[0])
 	ctx.Equal(event.ScoreHistogram, []int{1, 1, 0, 0, 0, 0, 0, 0, 0, 1}, "the event's score_histogram for scores 0.05, 0.15, unscored, 1.0")
+	eventsPublish(ctx, eventsOutcome(eventsQ2, "t-acme", 0.0, 0.3, -1, 0.1))
+	ctx.Settle()
+	values = ctx.Kafka.Values(eventsTopic)
+	ctx.Equal(len(values), 2, "two outcomes must produce two records; the records")
+	var edge struct {
+		UnscoredCount  *int  \`json:"unscored_count"\`
+		ScoreHistogram []int \`json:"score_histogram"\`
+	}
+	ctx.NoError(json.Unmarshal([]byte(values[1]), &edge), "the event must be JSON")
+	ctx.Assert(edge.UnscoredCount != nil && *edge.UnscoredCount == 1, "scores 0.0, 0.3, unscored, 0.1 have one unscored passage (a score of 0.0 is a score), got %s", values[1])
+	ctx.Equal(edge.ScoreHistogram, []int{1, 1, 0, 1, 0, 0, 0, 0, 0, 0}, "scores 0.0, 0.3, unscored, 0.1 land in buckets 0, 3 and 1 (min(floor(score * 10), 9)); the event's score_histogram")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -945,7 +977,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsOutcome(eventsQ2, "t-acme"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishOutcome waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s", waited)
+	ctx.Assert(waited <= 2.5, "publishOutcome waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Key == config.Fingerprint(eventsQ2), "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishOutcome's result without an acknowledgement")
@@ -955,7 +987,9 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -965,8 +999,9 @@ const std::string kQ1 = "how do I reset my router password";
 const std::string kQ2 = "router firmware update steps";
 const std::vector<std::string> kPassages = {"Hold the reset button for ten seconds.", "Router firmware release notes", "Billing questions", "Admin page password rules"};
 
-outcome::RerankOutcome eventsOutcome(const std::string& query, const std::string& tenant = "t-acme") {
-  return outcome::RerankOutcome{tenant, query, kPassages, {0.05, 0.15, std::nullopt, 1.0}, "xenc-v7", 84};
+outcome::RerankOutcome eventsOutcome(const std::string& query, const std::string& tenant = "t-acme",
+                                     std::vector<std::optional<double>> scores = {0.05, 0.15, std::nullopt, 1.0}) {
+  return outcome::RerankOutcome{tenant, query, kPassages, std::move(scores), "xenc-v7", 84};
 }
 
 std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
@@ -979,7 +1014,7 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
@@ -1022,12 +1057,20 @@ void CheckScoreHistogram(harness::Ctx& ctx) {
   ctx.Equal(values.size(), 1, "one outcome must produce one record; the records");
   const auto event = nlohmann::json::parse(values[0], nullptr, false);
   ctx.Assert(event.is_object(), "the event must be JSON, got %s", values[0]);
-  ctx.Assert(field(event, "query_fingerprint") == config::fingerprint(kQ1) && field(event, "tenant") == "t-acme" && field(event, "model_version") == "xenc-v7" &&
+  ctx.Assert(hField(event, "query_fingerprint") == config::fingerprint(kQ1) && hField(event, "tenant") == "t-acme" && hField(event, "model_version") == "xenc-v7" &&
                  event.value("candidate_count", -1) == 4 && event.value("latency_ms", -1) == 84,
              "the event must carry query_fingerprint, tenant, model_version, candidate_count 4 and latency_ms 84, got %s", values[0]);
   ctx.Equal(event.value("unscored_count", -1), 1, "the event's unscored_count (one passage unscored)");
   ctx.Equal(event.contains("score_histogram") ? event["score_histogram"] : nlohmann::json(), nlohmann::json({1, 1, 0, 0, 0, 0, 0, 0, 0, 1}),
             "the event's score_histogram for scores 0.05, 0.15, unscored, 1.0");
+  publishOutcome(eventsOutcome(kQ2, "t-acme", {0.0, 0.3, std::nullopt, 0.1}));
+  ctx.Settle();
+  const auto both = ctx.Kafka.Values(kEventsTopic);
+  ctx.Equal(both.size(), 2, "two outcomes must produce two records; the records");
+  const auto edge = both.size() == 2 ? nlohmann::json::parse(both[1], nullptr, false) : nlohmann::json();
+  ctx.Equal(edge.is_object() ? edge.value("unscored_count", -1) : -1, 1, "scores 0.0, 0.3, unscored, 0.1 have one unscored passage (a score of 0.0 is a score); the event's unscored_count");
+  ctx.Equal(edge.is_object() && edge.contains("score_histogram") ? edge["score_histogram"] : nlohmann::json(), nlohmann::json({1, 1, 0, 1, 0, 0, 0, 0, 0, 0}),
+            "scores 0.0, 0.3, unscored, 0.1 land in buckets 0, 3 and 1 (min(floor(score * 10), 9)); the event's score_histogram");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -1047,17 +1090,17 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused the produce: without an outbox row the outcome is gone; the rows");
-  ctx.Assert(!rows.empty() && field(rows[0], "topic") == kEventsTopic && field(rows[0], "key") == config::fingerprint(kQ1) && rows[0].contains("payload") &&
-                 field(rows[0]["payload"], "query_fingerprint") == config::fingerprint(kQ1),
+  ctx.Assert(!rows.empty() && hField(rows[0], "topic") == kEventsTopic && hField(rows[0], "key") == config::fingerprint(kQ1) && rows[0].contains("payload") &&
+                 hField(rows[0]["payload"], "query_fingerprint") == config::fingerprint(kQ1),
              "the outbox row is %s, expected the topic, the query fingerprint as key and the payload", rows.empty() ? "none" : rows[0].dump());
   ctx.Equal(ok, false, "publishOutcome's result after a refused produce");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishOutcome(eventsOutcome(kQ2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishOutcome waited %.0f s for a broker that does not answer: wait for the delivery report at most 2 s", waited);
+  ctx.Assert(waited <= 2.5, "publishOutcome waited %.1f s for a broker that does not answer: wait for the delivery report at most 2 s", waited);
   rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && field(rows[1], "key") == config::fingerprint(kQ2), "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(rows.size() == 2 && hField(rows[1], "key") == config::fingerprint(kQ2), "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishOutcome's result without an acknowledgement");
 }
 `,

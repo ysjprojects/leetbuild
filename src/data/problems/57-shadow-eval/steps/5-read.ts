@@ -65,7 +65,7 @@ from; and any caller reads any tenant's experiment.
       id: 'samples',
       title: 'Reports the pair count and decides nothing below 500 pairs',
       detail:
-        'The report carries `sample_count`, and below `MIN_PAIRED_SAMPLES` (500) the verdict is `inconclusive`. The starter declares a winner from 12 pairs and hides the count.',
+        'The report carries `sample_count` (0 before the first pair), and below `MIN_PAIRED_SAMPLES` (500) the verdict is `inconclusive`: 499 pairs decide nothing, 500 may. The starter declares a winner from 12 pairs and hides the count.',
       match: {
         python: {all: [/MIN_PAIRED_SAMPLES\s*=\s*500\b/, /["']sample_count["']/, /[<>]=?\s*MIN_PAIRED_SAMPLES/]},
         typescript: {all: [/MIN_PAIRED_SAMPLES\s*=\s*500\b/, /sample_count/, /[<>]=?\s*MIN_PAIRED_SAMPLES/]},
@@ -104,7 +104,7 @@ from; and any caller reads any tenant's experiment.
       id: 'tenant-scope',
       title: "Scopes the report to the caller's tenant",
       detail:
-        "A missing `X-Tenant-Id` is **401**, and a config of another tenant is **404** like one that does not exist, so a report never confirms someone else's experiment. The starter serves any config to any caller.",
+        "A missing `X-Tenant-Id` is **401**, and a config of another tenant is **404** with the same answer as one that does not exist, so a report never confirms someone else's experiment. The starter serves any config to any caller.",
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/, /!=\s*tenant\b|\btenant\s*!=/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/, /!==\s*tenant\b|\btenant\s*!==/]},
@@ -545,13 +545,21 @@ async def check_route(ctx):
 
 
 async def check_samples(ctx):
-    cfg = _config()
+    cfg, fresh, just_under, at_floor = _config(), _config(), _config(), _config()
     for i, delta in enumerate([0.2, 0.1, 0.3] * 4):
         store.record_pair(cfg, delta, START + 60 * i)
+    _seed(ctx, just_under, 499, 0.1, 0.5)
+    _seed(ctx, at_floor, 500, 0.1, 0.5)
     async with _api(ctx) as c:
         body = await _report(c, cfg)
-    assert body.get("sample_count") == 12, f"the report's sample_count is {body.get('sample_count')!r}, expected 12: a delta without its count cannot be judged"
-    assert body.get("verdict") == "inconclusive", f"12 pairs gave the verdict {body.get('verdict')!r}: below MIN_PAIRED_SAMPLES (500) it is inconclusive, however good the mean looks"
+        assert body.get("sample_count") == 12, f"the report's sample_count is {body.get('sample_count')!r}, expected 12: a delta without its count cannot be judged"
+        assert body.get("verdict") == "inconclusive", f"12 pairs gave the verdict {body.get('verdict')!r}: below MIN_PAIRED_SAMPLES (500) it is inconclusive, however good the mean looks"
+        body = await _report(c, fresh)
+        assert body.get("sample_count") == 0 and body.get("verdict") == "inconclusive", f"a config with no pairs yet reported sample_count {body.get('sample_count')!r} and verdict {body.get('verdict')!r}, expected 0 and inconclusive"
+        body = await _report(c, just_under)
+        assert body.get("sample_count") == 499 and body.get("verdict") == "inconclusive", f"499 pairs with mean +0.1 reported sample_count {body.get('sample_count')!r} and verdict {body.get('verdict')!r}, expected 499 and inconclusive: one pair short of MIN_PAIRED_SAMPLES (500)"
+        body = await _report(c, at_floor)
+        assert body.get("verdict") == "candidate_better", f"500 pairs with mean +0.1 gave the verdict {body.get('verdict')!r}, expected candidate_better: 500 pairs reach MIN_PAIRED_SAMPLES, and the interval is above 0"
 
 
 async def check_interval(ctx):
@@ -590,8 +598,11 @@ async def check_tenant_scope(ctx):
         r = await c.get(f"/v1/shadow/configs/{cfg}/report", headers={"X-Tenant-Id": "t2"})
         assert r.status_code == 404, f"tenant t2 asked for t1's report and got {r.status_code}, expected 404"
         assert "cand-2026-04" not in r.text, f"the answer to t2 names t1's candidate version: {r.text}"
+        foreign = r.text.replace(cfg, "{id}")
         r = await c.get("/v1/shadow/configs/cfg-404/report", headers=T1)
         assert r.status_code == 404, f"a config that does not exist answered {r.status_code}, expected 404"
+        missing = r.text.replace("cfg-404", "{id}")
+        assert foreign == missing, f"another tenant's config answered {foreign!r} and a missing one {missing!r}: the two must be the same answer, or the report confirms the config exists"
         await _report(c, cfg)
 `,
     typescript: `const T1 = {'X-Tenant-Id': 't1'};
@@ -627,11 +638,22 @@ export async function check_route(ctx) {
 export async function check_samples(ctx) {
   const {c, store} = world(ctx);
   const cfg = await newConfig(store);
+  const fresh = await newConfig(store);
+  const justUnder = await newConfig(store);
+  const atFloor = await newConfig(store);
   const deltas = [0.2, 0.1, 0.3, 0.2, 0.1, 0.3, 0.2, 0.1, 0.3, 0.2, 0.1, 0.3];
   for (const [i, delta] of deltas.entries()) await store.recordPair(cfg, delta, START + 60 * i);
-  const body = await report(c, cfg);
+  seed(ctx, justUnder, 499, 0.1, 0.5);
+  seed(ctx, atFloor, 500, 0.1, 0.5);
+  let body = await report(c, cfg);
   assert.equal(body.sample_count, 12, \`the report's sample_count is \${JSON.stringify(body.sample_count)}, expected 12: a delta without its count cannot be judged\`);
   assert.equal(body.verdict, 'inconclusive', \`12 pairs gave the verdict \${JSON.stringify(body.verdict)}: below MIN_PAIRED_SAMPLES (500) it is inconclusive, however good the mean looks\`);
+  body = await report(c, fresh);
+  assert(body.sample_count === 0 && body.verdict === 'inconclusive', \`a config with no pairs yet reported sample_count \${JSON.stringify(body.sample_count)} and verdict \${JSON.stringify(body.verdict)}, expected 0 and inconclusive\`);
+  body = await report(c, justUnder);
+  assert(body.sample_count === 499 && body.verdict === 'inconclusive', \`499 pairs with mean +0.1 reported sample_count \${JSON.stringify(body.sample_count)} and verdict \${JSON.stringify(body.verdict)}, expected 499 and inconclusive: one pair short of MIN_PAIRED_SAMPLES (500)\`);
+  body = await report(c, atFloor);
+  assert.equal(body.verdict, 'candidate_better', \`500 pairs with mean +0.1 gave the verdict \${JSON.stringify(body.verdict)}, expected candidate_better: 500 pairs reach MIN_PAIRED_SAMPLES, and the interval is above 0\`);
 }
 
 export async function check_interval(ctx) {
@@ -673,8 +695,11 @@ export async function check_tenant_scope(ctx) {
   r = await c.get(\`/v1/shadow/configs/\${cfg}/report\`, {headers: {'X-Tenant-Id': 't2'}});
   assert.equal(r.status, 404, \`tenant t2 asked for t1's report and got \${r.status}, expected 404\`);
   assert(!r.text.includes('cand-2026-04'), \`the answer to t2 names t1's candidate version: \${r.text}\`);
+  const foreign = r.text.replaceAll(cfg, '{id}');
   r = await c.get('/v1/shadow/configs/cfg-404/report', {headers: T1});
   assert.equal(r.status, 404, \`a config that does not exist answered \${r.status}, expected 404\`);
+  const missing = r.text.replaceAll('cfg-404', '{id}');
+  assert.equal(foreign, missing, \`another tenant's config answered \${JSON.stringify(foreign)} and a missing one \${JSON.stringify(missing)}: the two must be the same answer, or the report confirms the config exists\`);
   await report(c, cfg);
 }
 `,
@@ -693,30 +718,30 @@ import (
 )
 
 const (
-	windowStart = 1767225600
-	windowEnd   = 1767312000
+	hWindowStart = 1767225600
+	hWindowEnd   = 1767312000
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readConfig(tenant string) string {
-	return store.CreateConfig(readBg, tenant, "cand-2026-04", 5, []string{"quality"}).ConfigID
+func hReadConfig(tenant string) string {
+	return store.CreateConfig(hReadBg, tenant, "cand-2026-04", 5, []string{"quality"}).ConfigID
 }
 
-// seedPairs writes the comparison consumer's aggregate for n pairs with this mean and sample standard deviation.
-func seedPairs(ctx *harness.Ctx, cfg string, n int, mean, sd float64) {
+// hSeedPairs writes the comparison consumer's aggregate for n pairs with this mean and sample standard deviation.
+func hSeedPairs(ctx *harness.Ctx, cfg string, n int, mean, sd float64) {
 	sumsq := float64(n-1)*sd*sd + float64(n)*mean*mean
 	ctx.Redis.Do("HSET", "shadow:"+cfg+":pairs", "n", fmt.Sprint(n), "sum", fmt.Sprint(float64(n)*mean), "sumsq", fmt.Sprint(sumsq),
-		"first_at", fmt.Sprint(windowStart), "last_at", fmt.Sprint(windowEnd))
+		"first_at", fmt.Sprint(hWindowStart), "last_at", fmt.Sprint(hWindowEnd))
 }
 
-func readReport(ctx *harness.Ctx, c *harness.HTTP, cfg string) map[string]any {
+func hReadReport(ctx *harness.Ctx, c *harness.HTTP, cfg string) map[string]any {
 	r := c.Get("/v1/shadow/configs/"+cfg+"/report", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/shadow/configs/%s/report (%s)", cfg, r.Text())
 	var body map[string]any
@@ -725,31 +750,38 @@ func readReport(ctx *harness.Ctx, c *harness.HTTP, cfg string) map[string]any {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	cfg := readConfig("t1")
-	body := readReport(ctx, c, cfg)
+	c := hReadAPI(ctx)
+	cfg := hReadConfig("t1")
+	body := hReadReport(ctx, c, cfg)
 	ctx.Assert(body["config_id"] == cfg && body["candidate_version"] == "cand-2026-04", "the report is %v, expected config_id %s and its candidate version", body, cfg)
 }
 
 func CheckSamples(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	cfg := readConfig("t1")
+	c := hReadAPI(ctx)
+	cfg, fresh, justUnder, atFloor := hReadConfig("t1"), hReadConfig("t1"), hReadConfig("t1"), hReadConfig("t1")
 	for i := 0; i < 12; i++ {
-		store.RecordPair(readBg, cfg, []float64{0.2, 0.1, 0.3}[i%3], int64(windowStart+60*i))
+		store.RecordPair(hReadBg, cfg, []float64{0.2, 0.1, 0.3}[i%3], int64(hWindowStart+60*i))
 	}
-	body := readReport(ctx, c, cfg)
+	hSeedPairs(ctx, justUnder, 499, 0.1, 0.5)
+	hSeedPairs(ctx, atFloor, 500, 0.1, 0.5)
+	body := hReadReport(ctx, c, cfg)
 	ctx.Equal(body["sample_count"], 12.0, "a delta without its count cannot be judged; the report's sample_count")
 	ctx.Equal(body["verdict"], "inconclusive", "12 pairs: below MIN_PAIRED_SAMPLES (500) the verdict is inconclusive, however good the mean looks; the verdict")
+	body = hReadReport(ctx, c, fresh)
+	ctx.Assert(body["sample_count"] == 0.0 && body["verdict"] == "inconclusive", "a config with no pairs yet reported sample_count %v and verdict %v, expected 0 and inconclusive", body["sample_count"], body["verdict"])
+	body = hReadReport(ctx, c, justUnder)
+	ctx.Assert(body["sample_count"] == 499.0 && body["verdict"] == "inconclusive", "499 pairs with mean +0.1 reported sample_count %v and verdict %v, expected 499 and inconclusive: one pair short of MIN_PAIRED_SAMPLES (500)", body["sample_count"], body["verdict"])
+	ctx.Equal(hReadReport(ctx, c, atFloor)["verdict"], "candidate_better", "500 pairs with mean +0.1 reach MIN_PAIRED_SAMPLES, and the interval is above 0; the verdict")
 }
 
 func CheckInterval(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	noisy, better, worse := readConfig("t1"), readConfig("t1"), readConfig("t1")
-	seedPairs(ctx, noisy, 600, 0.01, 0.5)
-	seedPairs(ctx, better, 600, 0.1, 0.5)
-	seedPairs(ctx, worse, 600, -0.1, 0.5)
+	c := hReadAPI(ctx)
+	noisy, better, worse := hReadConfig("t1"), hReadConfig("t1"), hReadConfig("t1")
+	hSeedPairs(ctx, noisy, 600, 0.01, 0.5)
+	hSeedPairs(ctx, better, 600, 0.1, 0.5)
+	hSeedPairs(ctx, worse, 600, -0.1, 0.5)
 	half := 1.96 * math.Sqrt(0.25/600)
-	body := readReport(ctx, c, noisy)
+	body := hReadReport(ctx, c, noisy)
 	ctx.Equal(body["sample_count"], 600.0, "the report's sample_count")
 	for _, f := range []struct {
 		name string
@@ -759,30 +791,33 @@ func CheckInterval(ctx *harness.Ctx) {
 		ctx.Assert(ok && math.Abs(got-f.want) < 1e-6, "the report's %s is %v, expected %.6f (mean ± 1.96 × √(s²/n)) for 600 pairs with mean 0.01 and s = 0.5", f.name, body[f.name], f.want)
 	}
 	ctx.Equal(body["verdict"], "inconclusive", "600 pairs with an interval from %.3f to %.3f: an interval that contains 0 is inconclusive; the verdict", 0.01-half, 0.01+half)
-	ctx.Equal(readReport(ctx, c, better)["verdict"], "candidate_better", "600 pairs with mean +0.1; the verdict")
-	ctx.Equal(readReport(ctx, c, worse)["verdict"], "candidate_worse", "600 pairs with mean -0.1; the verdict")
+	ctx.Equal(hReadReport(ctx, c, better)["verdict"], "candidate_better", "600 pairs with mean +0.1; the verdict")
+	ctx.Equal(hReadReport(ctx, c, worse)["verdict"], "candidate_worse", "600 pairs with mean -0.1; the verdict")
 }
 
 func CheckWindow(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	cfg := readConfig("t1")
-	seedPairs(ctx, cfg, 600, 0.1, 0.5)
-	body := readReport(ctx, c, cfg)
-	ctx.Assert(body["window_start"] == float64(windowStart) && body["window_end"] == float64(windowEnd), "the report's window is %v to %v, expected %d to %d (first_at, last_at of the pairs)", body["window_start"], body["window_end"], windowStart, windowEnd)
+	c := hReadAPI(ctx)
+	cfg := hReadConfig("t1")
+	hSeedPairs(ctx, cfg, 600, 0.1, 0.5)
+	body := hReadReport(ctx, c, cfg)
+	ctx.Assert(body["window_start"] == float64(hWindowStart) && body["window_end"] == float64(hWindowEnd), "the report's window is %v to %v, expected %d to %d (first_at, last_at of the pairs)", body["window_start"], body["window_end"], hWindowStart, hWindowEnd)
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	cfg := readConfig("t1")
-	seedPairs(ctx, cfg, 600, 0.1, 0.5)
+	c := hReadAPI(ctx)
+	cfg := hReadConfig("t1")
+	hSeedPairs(ctx, cfg, 600, 0.1, 0.5)
 	r := c.Get("/v1/shadow/configs/" + cfg + "/report")
 	ctx.Equal(r.Status, 401, "a report without X-Tenant-Id")
 	r = c.Get("/v1/shadow/configs/"+cfg+"/report", "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 asked for t1's report")
 	ctx.Assert(!strings.Contains(r.Text(), "cand-2026-04"), "the answer to t2 names t1's candidate version: %s", r.Text())
+	foreign := strings.ReplaceAll(r.Text(), cfg, "{id}")
 	r = c.Get("/v1/shadow/configs/cfg-404/report", "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 404, "a config that does not exist")
-	readReport(ctx, c, cfg)
+	missing := strings.ReplaceAll(r.Text(), "cfg-404", "{id}")
+	ctx.Assert(foreign == missing, "another tenant's config answered %q and a missing one %q: the two must be the same answer, or the report confirms the config exists", foreign, missing)
+	hReadReport(ctx, c, cfg)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -796,10 +831,10 @@ func CheckTenantScope(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kWindowStart = 1767225600;
-constexpr long long kWindowEnd = 1767312000;
+constexpr long long kHWindowStart = 1767225600;
+constexpr long long kHWindowEnd = 1767312000;
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -807,22 +842,22 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string readConfig(const std::string& tenant) { return store::createConfig(tenant, "cand-2026-04", 5, {"quality"}).config_id; }
+std::string hReadConfig(const std::string& tenant) { return store::createConfig(tenant, "cand-2026-04", 5, {"quality"}).config_id; }
 
-std::string number(double v) {
+std::string hNumber(double v) {
   char out[64];
   std::snprintf(out, sizeof out, "%.17g", v);
   return out;
 }
 
 // The comparison consumer's aggregate for n pairs with this mean and sample standard deviation.
-void seedPairs(harness::Ctx& ctx, const std::string& cfg, int n, double mean, double sd) {
+void hSeedPairs(harness::Ctx& ctx, const std::string& cfg, int n, double mean, double sd) {
   const double sumsq = (n - 1) * sd * sd + n * mean * mean;
-  ctx.Redis.Do("HSET", "shadow:" + cfg + ":pairs", "n", std::to_string(n), "sum", number(n * mean), "sumsq", number(sumsq), "first_at",
-               std::to_string(kWindowStart), "last_at", std::to_string(kWindowEnd));
+  ctx.Redis.Do("HSET", "shadow:" + cfg + ":pairs", "n", std::to_string(n), "sum", hNumber(n * mean), "sumsq", hNumber(sumsq), "first_at",
+               std::to_string(kHWindowStart), "last_at", std::to_string(kHWindowEnd));
 }
 
-nlohmann::json readReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& cfg) {
+nlohmann::json hReadReport(harness::Ctx& ctx, harness::HTTP& c, const std::string& cfg) {
   const auto r = c.Get("/v1/shadow/configs/" + cfg + "/report", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/shadow/configs/%s/report (%s)", cfg, r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -830,68 +865,89 @@ nlohmann::json readReport(harness::Ctx& ctx, harness::HTTP& c, const std::string
   return body;
 }
 
-nlohmann::json field(const nlohmann::json& body, const std::string& name) { return body.contains(name) ? body[name] : nlohmann::json(); }
+nlohmann::json hField(const nlohmann::json& body, const std::string& name) { return body.contains(name) ? body[name] : nlohmann::json(); }
+
+// The answer with every occurrence of the config id replaced, so two 404s compare whatever id they echo.
+std::string hWithoutId(std::string text, const std::string& id) {
+  for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
+  return text;
+}
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string cfg = readConfig("t1");
-  const auto body = readReport(ctx, c, cfg);
-  ctx.Assert(field(body, "config_id") == cfg && field(body, "candidate_version") == "cand-2026-04", "the report is %s, expected config_id %s and its candidate version", body.dump(), cfg);
+  auto c = hReadApi(ctx);
+  const std::string cfg = hReadConfig("t1");
+  const auto body = hReadReport(ctx, c, cfg);
+  ctx.Assert(hField(body, "config_id") == cfg && hField(body, "candidate_version") == "cand-2026-04", "the report is %s, expected config_id %s and its candidate version", body.dump(), cfg);
 }
 
 void CheckSamples(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string cfg = readConfig("t1");
+  auto c = hReadApi(ctx);
+  const std::string cfg = hReadConfig("t1");
+  const std::string fresh = hReadConfig("t1");
+  const std::string just_under = hReadConfig("t1");
+  const std::string at_floor = hReadConfig("t1");
   const double deltas[] = {0.2, 0.1, 0.3};
-  for (int i = 0; i < 12; i++) store::recordPair(cfg, deltas[i % 3], kWindowStart + 60 * i);
-  const auto body = readReport(ctx, c, cfg);
-  ctx.Equal(field(body, "sample_count"), nlohmann::json(12), "a delta without its count cannot be judged; the report's sample_count");
-  ctx.Equal(field(body, "verdict"), nlohmann::json("inconclusive"), "12 pairs: below MIN_PAIRED_SAMPLES (500) the verdict is inconclusive, however good the mean looks; the verdict");
+  for (int i = 0; i < 12; i++) store::recordPair(cfg, deltas[i % 3], kHWindowStart + 60 * i);
+  hSeedPairs(ctx, just_under, 499, 0.1, 0.5);
+  hSeedPairs(ctx, at_floor, 500, 0.1, 0.5);
+  auto body = hReadReport(ctx, c, cfg);
+  ctx.Equal(hField(body, "sample_count"), nlohmann::json(12), "a delta without its count cannot be judged; the report's sample_count");
+  ctx.Equal(hField(body, "verdict"), nlohmann::json("inconclusive"), "12 pairs: below MIN_PAIRED_SAMPLES (500) the verdict is inconclusive, however good the mean looks; the verdict");
+  body = hReadReport(ctx, c, fresh);
+  ctx.Assert(hField(body, "sample_count") == 0 && hField(body, "verdict") == "inconclusive", "a config with no pairs yet reported sample_count %s and verdict %s, expected 0 and inconclusive",
+             hField(body, "sample_count").dump(), hField(body, "verdict").dump());
+  body = hReadReport(ctx, c, just_under);
+  ctx.Assert(hField(body, "sample_count") == 499 && hField(body, "verdict") == "inconclusive", "499 pairs with mean +0.1 reported sample_count %s and verdict %s, expected 499 and inconclusive: one pair short of MIN_PAIRED_SAMPLES (500)",
+             hField(body, "sample_count").dump(), hField(body, "verdict").dump());
+  ctx.Equal(hField(hReadReport(ctx, c, at_floor), "verdict"), nlohmann::json("candidate_better"), "500 pairs with mean +0.1 reach MIN_PAIRED_SAMPLES, and the interval is above 0; the verdict");
 }
 
 void CheckInterval(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string noisy = readConfig("t1");
-  const std::string better = readConfig("t1");
-  const std::string worse = readConfig("t1");
-  seedPairs(ctx, noisy, 600, 0.01, 0.5);
-  seedPairs(ctx, better, 600, 0.1, 0.5);
-  seedPairs(ctx, worse, 600, -0.1, 0.5);
+  auto c = hReadApi(ctx);
+  const std::string noisy = hReadConfig("t1");
+  const std::string better = hReadConfig("t1");
+  const std::string worse = hReadConfig("t1");
+  hSeedPairs(ctx, noisy, 600, 0.01, 0.5);
+  hSeedPairs(ctx, better, 600, 0.1, 0.5);
+  hSeedPairs(ctx, worse, 600, -0.1, 0.5);
   const double half = 1.96 * std::sqrt(0.25 / 600);
-  const auto body = readReport(ctx, c, noisy);
-  ctx.Equal(field(body, "sample_count"), nlohmann::json(600), "the report's sample_count");
+  const auto body = hReadReport(ctx, c, noisy);
+  ctx.Equal(hField(body, "sample_count"), nlohmann::json(600), "the report's sample_count");
   for (const auto& [name, want] : {std::pair<std::string, double>{"delta", 0.01}, {"ci_low", 0.01 - half}, {"ci_high", 0.01 + half}}) {
-    const auto got = field(body, name);
+    const auto got = hField(body, name);
     ctx.Assert(got.is_number() && std::fabs(got.get<double>() - want) < 1e-6, "the report's %s is %s, expected %.6f (mean ± 1.96 × √(s²/n)) for 600 pairs with mean 0.01 and s = 0.5", name, got.dump(), want);
   }
-  ctx.Equal(field(body, "verdict"), nlohmann::json("inconclusive"), "600 pairs with an interval from %.3f to %.3f: an interval that contains 0 is inconclusive; the verdict", 0.01 - half, 0.01 + half);
-  ctx.Equal(field(readReport(ctx, c, better), "verdict"), nlohmann::json("candidate_better"), "600 pairs with mean +0.1; the verdict");
-  ctx.Equal(field(readReport(ctx, c, worse), "verdict"), nlohmann::json("candidate_worse"), "600 pairs with mean -0.1; the verdict");
+  ctx.Equal(hField(body, "verdict"), nlohmann::json("inconclusive"), "600 pairs with an interval from %.3f to %.3f: an interval that contains 0 is inconclusive; the verdict", 0.01 - half, 0.01 + half);
+  ctx.Equal(hField(hReadReport(ctx, c, better), "verdict"), nlohmann::json("candidate_better"), "600 pairs with mean +0.1; the verdict");
+  ctx.Equal(hField(hReadReport(ctx, c, worse), "verdict"), nlohmann::json("candidate_worse"), "600 pairs with mean -0.1; the verdict");
 }
 
 void CheckWindow(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string cfg = readConfig("t1");
-  seedPairs(ctx, cfg, 600, 0.1, 0.5);
-  const auto body = readReport(ctx, c, cfg);
-  ctx.Assert(field(body, "window_start") == kWindowStart && field(body, "window_end") == kWindowEnd, "the report's window is %s to %s, expected %d to %d (first_at, last_at of the pairs)",
-             field(body, "window_start").dump(), field(body, "window_end").dump(), kWindowStart, kWindowEnd);
+  auto c = hReadApi(ctx);
+  const std::string cfg = hReadConfig("t1");
+  hSeedPairs(ctx, cfg, 600, 0.1, 0.5);
+  const auto body = hReadReport(ctx, c, cfg);
+  ctx.Assert(hField(body, "window_start") == kHWindowStart && hField(body, "window_end") == kHWindowEnd, "the report's window is %s to %s, expected %d to %d (first_at, last_at of the pairs)",
+             hField(body, "window_start").dump(), hField(body, "window_end").dump(), kHWindowStart, kHWindowEnd);
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string cfg = readConfig("t1");
-  seedPairs(ctx, cfg, 600, 0.1, 0.5);
+  auto c = hReadApi(ctx);
+  const std::string cfg = hReadConfig("t1");
+  hSeedPairs(ctx, cfg, 600, 0.1, 0.5);
   auto r = c.Get("/v1/shadow/configs/" + cfg + "/report");
   ctx.Equal(r.Status, 401, "a report without X-Tenant-Id");
   r = c.Get("/v1/shadow/configs/" + cfg + "/report", "X-Tenant-Id", "t2");
   ctx.Equal(r.Status, 404, "tenant t2 asked for t1's report");
   ctx.Assert(r.Text().find("cand-2026-04") == std::string::npos, "the answer to t2 names t1's candidate version: %s", r.Text());
+  const std::string foreign = hWithoutId(r.Text(), cfg);
   r = c.Get("/v1/shadow/configs/cfg-404/report", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 404, "a config that does not exist");
-  readReport(ctx, c, cfg);
+  const std::string missing = hWithoutId(r.Text(), "cfg-404");
+  ctx.Assert(foreign == missing, "another tenant's config answered %q and a missing one %q: the two must be the same answer, or the report confirms the config exists", foreign, missing);
+  hReadReport(ctx, c, cfg);
 }
 `,
   },

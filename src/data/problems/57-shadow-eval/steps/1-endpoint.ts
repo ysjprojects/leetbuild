@@ -64,7 +64,7 @@ answers its next request with that key from a shadow config.
       id: 'share',
       title: 'Caps the traffic share at 1 to 20 percent',
       detail:
-        'A share below `MIN_SHARE` (1) or above `MAX_SHARE` (20) is **400** and stores nothing. The starter stores any share, so one config can send every request to the candidate.',
+        'A share below `MIN_SHARE` (1) or above `MAX_SHARE` (20), or one that is not a whole number such as 2.5, is **400** and stores nothing. The starter stores any share, so one config can send every request to the candidate.',
       match: {
         python: {
           all: [
@@ -614,6 +614,8 @@ async def check_share(ctx):
         for share in (0, 21, 100, -5):
             r = await _create(c, {**BODY, "share": share})
             assert r.status_code == 400, f"a share of {share} percent answered {r.status_code}, expected 400: a share above 20 percent puts that much of production's traffic on the candidate"
+        r = await _create(c, {**BODY, "share": 2.5})
+        assert r.status_code in (400, 422), f"a share of 2.5 percent answered {r.status_code}, expected 400: the share is a whole percentage"
         for share in (1, 20):
             r = await _create(c, {**BODY, "share": share})
             assert r.status_code == 201, f"a share of {share} percent answered {r.status_code}: {r.text}"
@@ -682,6 +684,8 @@ export async function check_share(ctx) {
     const r = await create(c, {...BODY, share});
     assert.equal(r.status, 400, \`a share of \${share} percent answered \${r.status}, expected 400: a share above 20 percent puts that much of production's traffic on the candidate\`);
   }
+  const fractional = await create(c, {...BODY, share: 2.5});
+  assert.equal(fractional.status, 400, \`a share of 2.5 percent answered \${fractional.status}, expected 400: the share is a whole percentage\`);
   for (const share of [1, 20]) {
     const r = await create(c, {...BODY, share});
     assert.equal(r.status, 201, \`a share of \${share} percent answered \${r.status}: \${r.text}\`);
@@ -738,30 +742,30 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBody = map[string]any{"candidate_version": "cand-2026-04", "share": 5, "metrics": []string{"latency", "cost"}}
+var hAPIBody = map[string]any{"candidate_version": "cand-2026-04", "share": 5, "metrics": []string{"latency", "cost"}}
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func withField(name string, value any) map[string]any {
+func hWithField(name string, value any) map[string]any {
 	out := map[string]any{}
-	for k, v := range apiBody {
+	for k, v := range hAPIBody {
 		out[k] = v
 	}
 	out[name] = value
 	return out
 }
 
-func storedConfigs(ctx *harness.Ctx) int {
+func hStoredConfigs(ctx *harness.Ctx) int {
 	seq, _ := ctx.Redis.Get("shadow:config:seq")
 	n, _ := strconv.Atoi(seq)
 	return n
 }
 
-func configIDOf(r *harness.Response) string {
+func hConfigIDOf(r *harness.Response) string {
 	var body struct {
 		ConfigID string \`json:"config_id"\`
 	}
@@ -770,8 +774,8 @@ func configIDOf(r *harness.Response) string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/shadow/configs", apiBody, "X-Tenant-Id", "t1")
+	c := hAPI(ctx)
+	r := c.Post("/v1/shadow/configs", hAPIBody, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/shadow/configs (%s)", r.Text())
 	var body store.Config
 	r.Decode(&body)
@@ -782,55 +786,57 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckShare(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	for _, share := range []int{0, 21, 100, -5} {
-		r := c.Post("/v1/shadow/configs", withField("share", share), "X-Tenant-Id", "t1")
+		r := c.Post("/v1/shadow/configs", hWithField("share", share), "X-Tenant-Id", "t1")
 		ctx.Equal(r.Status, 400, "a share of %d percent (a share above 20 percent puts that much of production's traffic on the candidate); the status", share)
 	}
+	r := c.Post("/v1/shadow/configs", hWithField("share", 2.5), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 400, "a share of 2.5 percent (the share is a whole percentage); the status")
 	for _, share := range []int{1, 20} {
-		r := c.Post("/v1/shadow/configs", withField("share", share), "X-Tenant-Id", "t1")
+		r := c.Post("/v1/shadow/configs", hWithField("share", share), "X-Tenant-Id", "t1")
 		ctx.Equal(r.Status, 201, "a share of %d percent (%s)", share, r.Text())
 	}
-	ctx.Equal(storedConfigs(ctx), 2, "only the two configs with a share from 1 to 20 may be stored; the configs stored")
+	ctx.Equal(hStoredConfigs(ctx), 2, "only the two configs with a share from 1 to 20 may be stored; the configs stored")
 }
 
 func CheckTenant(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/shadow/configs", apiBody)
+	c := hAPI(ctx)
+	r := c.Post("/v1/shadow/configs", hAPIBody)
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id")
-	r = c.Post("/v1/shadow/configs", apiBody, "X-Tenant-Id", "")
+	r = c.Post("/v1/shadow/configs", hAPIBody, "X-Tenant-Id", "")
 	ctx.Equal(r.Status, 401, "a request with an empty X-Tenant-Id")
-	ctx.Equal(storedConfigs(ctx), 0, "no config may be stored without a tenant; the configs stored")
+	ctx.Equal(hStoredConfigs(ctx), 0, "no config may be stored without a tenant; the configs stored")
 }
 
 func CheckIsolate(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	ctx.Redis.Set("idem:t1:k-2", "order-77") // production's own record of a request with key k-2
-	first := c.Post("/v1/shadow/configs", apiBody, "X-Tenant-Id", "t1", "Idempotency-Key", "k-1")
+	first := c.Post("/v1/shadow/configs", hAPIBody, "X-Tenant-Id", "t1", "Idempotency-Key", "k-1")
 	ctx.Equal(first.Status, 201, "the first request with key k-1 (%s)", first.Text())
-	configID := configIDOf(first)
+	configID := hConfigIDOf(first)
 	ctx.Equal(ctx.Redis.Exists("idem:t1:k-1"), int64(0), "the shadow config wrote production's idempotency record idem:t1:k-1: production's next request with that key would be answered with a shadow config; it exists")
 	recorded, _ := ctx.Redis.Get("shadow:idem:t1:k-1")
 	ctx.Equal(recorded, configID, "the shadow records its keys in its own namespace; shadow:idem:t1:k-1")
-	replay := c.Post("/v1/shadow/configs", apiBody, "X-Tenant-Id", "t1", "Idempotency-Key", "k-1")
-	ctx.Assert(replay.Status == 200 && configIDOf(replay) == configID, "a replay of k-1 answered %d %s, expected 200 with %s", replay.Status, replay.Text(), configID)
-	other := c.Post("/v1/shadow/configs", apiBody, "X-Tenant-Id", "t1", "Idempotency-Key", "k-2")
-	otherID := configIDOf(other)
+	replay := c.Post("/v1/shadow/configs", hAPIBody, "X-Tenant-Id", "t1", "Idempotency-Key", "k-1")
+	ctx.Assert(replay.Status == 200 && hConfigIDOf(replay) == configID, "a replay of k-1 answered %d %s, expected 200 with %s", replay.Status, replay.Text(), configID)
+	other := c.Post("/v1/shadow/configs", hAPIBody, "X-Tenant-Id", "t1", "Idempotency-Key", "k-2")
+	otherID := hConfigIDOf(other)
 	ctx.Assert(other.Status == 201 && otherID != "" && otherID != configID, "key k-2, which production already used, answered %d %s: the shadow read production's idempotency store", other.Status, other.Text())
 	production, _ := ctx.Redis.Get("idem:t1:k-2")
 	ctx.Equal(production, "order-77", "production's record idem:t1:k-2")
-	ctx.Equal(storedConfigs(ctx), 2, "k-1 once and k-2 once; the configs stored")
+	ctx.Equal(hStoredConfigs(ctx), 2, "k-1 once and k-2 once; the configs stored")
 }
 
 func CheckMetrics(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	for _, metrics := range [][]string{{"latency", "bleu"}, {}, {"accuracy"}} {
-		r := c.Post("/v1/shadow/configs", withField("metrics", metrics), "X-Tenant-Id", "t1")
+		r := c.Post("/v1/shadow/configs", hWithField("metrics", metrics), "X-Tenant-Id", "t1")
 		ctx.Equal(r.Status, 400, "metrics %q (only latency, cost and quality are measured for a pair); the status", metrics)
 	}
-	r := c.Post("/v1/shadow/configs", withField("metrics", []string{"quality"}), "X-Tenant-Id", "t1")
+	r := c.Post("/v1/shadow/configs", hWithField("metrics", []string{"quality"}), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "metrics [quality] (%s)", r.Text())
-	ctx.Equal(storedConfigs(ctx), 1, "only the config with known metrics may be stored; the configs stored")
+	ctx.Equal(hStoredConfigs(ctx), 1, "only the config with known metrics may be stored; the configs stored")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -842,9 +848,9 @@ func CheckMetrics(ctx *harness.Ctx) {
 
 namespace {
 
-nlohmann::json apiBody() { return {{"candidate_version", "cand-2026-04"}, {"share", 5}, {"metrics", {"latency", "cost"}}}; }
+nlohmann::json hApiBody() { return {{"candidate_version", "cand-2026-04"}, {"share", 5}, {"metrics", {"latency", "cost"}}}; }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -852,18 +858,18 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json withField(const std::string& name, const nlohmann::json& value) {
-  nlohmann::json body = apiBody();
+nlohmann::json hWithField(const std::string& name, const nlohmann::json& value) {
+  nlohmann::json body = hApiBody();
   body[name] = value;
   return body;
 }
 
-long storedConfigs(harness::Ctx& ctx) {
+long hStoredConfigs(harness::Ctx& ctx) {
   const auto seq = ctx.Redis.Get("shadow:config:seq");
   return seq ? std::stol(*seq) : 0;
 }
 
-std::string configIdOf(const harness::Response& r) {
+std::string hConfigIdOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("config_id", "") : "";
 }
@@ -871,63 +877,65 @@ std::string configIdOf(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = c.Post("/v1/shadow/configs", apiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  auto c = hApi(ctx);
+  const auto r = c.Post("/v1/shadow/configs", hApiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 201, "POST /v1/shadow/configs (%s)", r.Text());
-  const auto config = store::getConfig(configIdOf(r));
+  const auto config = store::getConfig(hConfigIdOf(r));
   ctx.Assert(config.has_value(), "the answer %s names no stored config", r.Text());
   ctx.Assert(config->tenant == "t1" && config->share == 5 && config->candidate_version == "cand-2026-04", "the stored config is %s", store::toJson(*config).dump());
   ctx.Equal(nlohmann::json::parse(r.Text()), store::toJson(*config), "the answer must be the stored config");
 }
 
 void CheckShare(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (int share : {0, 21, 100, -5}) {
-    const auto r = c.Post("/v1/shadow/configs", withField("share", share).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+    const auto r = c.Post("/v1/shadow/configs", hWithField("share", share).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
     ctx.Equal(r.Status, 400, "a share of %d percent (a share above 20 percent puts that much of production's traffic on the candidate); the status", share);
   }
+  const auto fractional = c.Post("/v1/shadow/configs", hWithField("share", 2.5).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  ctx.Equal(fractional.Status, 400, "a share of 2.5 percent (the share is a whole percentage); the status");
   for (int share : {1, 20}) {
-    const auto r = c.Post("/v1/shadow/configs", withField("share", share).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+    const auto r = c.Post("/v1/shadow/configs", hWithField("share", share).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
     ctx.Equal(r.Status, 201, "a share of %d percent (%s)", share, r.Text());
   }
-  ctx.Equal(storedConfigs(ctx), 2, "only the two configs with a share from 1 to 20 may be stored; the configs stored");
+  ctx.Equal(hStoredConfigs(ctx), 2, "only the two configs with a share from 1 to 20 may be stored; the configs stored");
 }
 
 void CheckTenant(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = c.Post("/v1/shadow/configs", apiBody().dump(), "Content-Type", "application/json");
+  auto c = hApi(ctx);
+  auto r = c.Post("/v1/shadow/configs", hApiBody().dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id");
-  r = c.Post("/v1/shadow/configs", apiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "");
+  r = c.Post("/v1/shadow/configs", hApiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "");
   ctx.Equal(r.Status, 401, "a request with an empty X-Tenant-Id");
-  ctx.Equal(storedConfigs(ctx), 0, "no config may be stored without a tenant; the configs stored");
+  ctx.Equal(hStoredConfigs(ctx), 0, "no config may be stored without a tenant; the configs stored");
 }
 
 void CheckIsolate(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   ctx.Redis.Set("idem:t1:k-2", "order-77");  // production's own record of a request with key k-2
-  const auto first = c.Post("/v1/shadow/configs", apiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", "k-1");
+  const auto first = c.Post("/v1/shadow/configs", hApiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", "k-1");
   ctx.Equal(first.Status, 201, "the first request with key k-1 (%s)", first.Text());
-  const std::string config_id = configIdOf(first);
+  const std::string config_id = hConfigIdOf(first);
   ctx.Equal(ctx.Redis.Exists("idem:t1:k-1"), 0, "the shadow config wrote production's idempotency record idem:t1:k-1: production's next request with that key would be answered with a shadow config; it exists");
   ctx.Equal(ctx.Redis.Get("shadow:idem:t1:k-1").value_or(""), config_id, "the shadow records its keys in its own namespace; shadow:idem:t1:k-1");
-  const auto replay = c.Post("/v1/shadow/configs", apiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", "k-1");
-  ctx.Assert(replay.Status == 200 && configIdOf(replay) == config_id, "a replay of k-1 answered %d %s, expected 200 with %s", replay.Status, replay.Text(), config_id);
-  const auto other = c.Post("/v1/shadow/configs", apiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", "k-2");
-  const std::string other_id = configIdOf(other);
+  const auto replay = c.Post("/v1/shadow/configs", hApiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", "k-1");
+  ctx.Assert(replay.Status == 200 && hConfigIdOf(replay) == config_id, "a replay of k-1 answered %d %s, expected 200 with %s", replay.Status, replay.Text(), config_id);
+  const auto other = c.Post("/v1/shadow/configs", hApiBody().dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1", "Idempotency-Key", "k-2");
+  const std::string other_id = hConfigIdOf(other);
   ctx.Assert(other.Status == 201 && !other_id.empty() && other_id != config_id, "key k-2, which production already used, answered %d %s: the shadow read production's idempotency store", other.Status, other.Text());
   ctx.Equal(ctx.Redis.Get("idem:t1:k-2").value_or(""), "order-77", "production's record idem:t1:k-2");
-  ctx.Equal(storedConfigs(ctx), 2, "k-1 once and k-2 once; the configs stored");
+  ctx.Equal(hStoredConfigs(ctx), 2, "k-1 once and k-2 once; the configs stored");
 }
 
 void CheckMetrics(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   for (const auto& metrics : {nlohmann::json::array({"latency", "bleu"}), nlohmann::json::array(), nlohmann::json::array({"accuracy"})}) {
-    const auto r = c.Post("/v1/shadow/configs", withField("metrics", metrics).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+    const auto r = c.Post("/v1/shadow/configs", hWithField("metrics", metrics).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
     ctx.Equal(r.Status, 400, "metrics %s (only latency, cost and quality are measured for a pair); the status", metrics.dump());
   }
-  const auto r = c.Post("/v1/shadow/configs", withField("metrics", nlohmann::json::array({"quality"})).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  const auto r = c.Post("/v1/shadow/configs", hWithField("metrics", nlohmann::json::array({"quality"})).dump(), "Content-Type", "application/json", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 201, "metrics [quality] (%s)", r.Text());
-  ctx.Equal(storedConfigs(ctx), 1, "only the config with known metrics may be stored; the configs stored");
+  ctx.Equal(hStoredConfigs(ctx), 1, "only the config with known metrics may be stored; the configs stored");
 }
 `,
   },

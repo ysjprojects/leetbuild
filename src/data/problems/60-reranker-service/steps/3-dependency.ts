@@ -59,7 +59,7 @@ message ScoreReply   { repeated double scores = 1; string model_version = 2; }
       id: 'batch-deadline',
       title: 'Puts a 700 ms deadline on every call',
       detail:
-        'Every Score call carries a deadline of about 700 ms, so a replica that takes a second per batch costs 0.7 s per batch and leaves those passages unscored. The starter waits up to 5 s.',
+        'Every Score call carries its own deadline of about 700 ms, not what is left of one shared by the request: two batches on a replica answering in 0.5 s are both scored, and a replica that takes a second per batch costs 0.7 s per batch and leaves those passages unscored. The starter waits up to 5 s.',
       match: {
         python: {all: [/BATCH_DEADLINE_S\s*=\s*0?\.7\b/, /timeout\s*=\s*BATCH_DEADLINE_S/]},
         typescript: {all: [/BATCH_DEADLINE_MS\s*=\s*700\b/, /deadline:\s*Date\.now\(\)\s*\+\s*BATCH_DEADLINE_MS/]},
@@ -72,7 +72,7 @@ message ScoreReply   { repeated double scores = 1; string model_version = 2; }
       id: 'unscored-not-neutral',
       title: 'Marks a failed batch unscored, once',
       detail:
-        'A batch the model keeps failing (`UNAVAILABLE`) is called once and its passages come back unscored; the batches around it keep their scores. The starter calls it three times and fills it with 0.5, so an outage reads as mid-tier relevance.',
+        'A batch the model keeps failing (`UNAVAILABLE`, and as much `INTERNAL`, `RESOURCE_EXHAUSTED` or `FAILED_PRECONDITION`) is called once and its passages come back unscored, without an error; the batches around it keep their scores. The starter calls it three times and fills it with 0.5, so an outage reads as mid-tier relevance.',
       match: {
         python: {all: [/\[None\]\s*\*/], none: [/NEUTRAL_SCORE/]},
         typescript: {all: [/\bnull\b/], none: [/NEUTRAL_SCORE/]},
@@ -580,6 +580,12 @@ import reranker_service_pb2_grpc
 from rerank import config, model
 
 QUERY = "solar panel efficiency"
+# A passage starting with one of these makes the stand-in fail its batch with that status.
+STATUS_FAULTS = {
+    "internal:": grpc.StatusCode.INTERNAL,
+    "exhausted:": grpc.StatusCode.RESOURCE_EXHAUSTED,
+    "precondition:": grpc.StatusCode.FAILED_PRECONDITION,
+}
 
 
 class RerankerServicer(reranker_service_pb2_grpc.RerankerServicer):
@@ -596,6 +602,9 @@ class RerankerServicer(reranker_service_pb2_grpc.RerankerServicer):
             context.abort(grpc.StatusCode.UNAVAILABLE, "replica draining")
         if fault == "invalid_argument":
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "empty passage in batch")
+        for prefix, code in STATUS_FAULTS.items():
+            if any(p.startswith(prefix) for p in passages):
+                context.abort(code, f"replica failed: {code.name}")
         return reranker_service_pb2.ScoreReply(scores=[model.score(request.query, p) for p in passages], model_version=model.MODEL_VERSION)
 
 
@@ -630,12 +639,19 @@ def check_batch_deadline(ctx):
     calls = _calls(ctx)
     assert calls and calls[0].timeout is not None, "the Score call carries no deadline: a slow replica holds the request as long as it likes"
     assert 0.6 <= calls[0].timeout <= 0.75, f"each call's deadline must be 700 ms, got {calls[0].timeout:.2f} s"
+    ctx.grpc.set_latency("Score", 0.5, config.MODEL)
+    before = len(_calls(ctx))
+    steady = m.rerank_passages(QUERY, _passages(100))
+    timeouts = [round(call.timeout, 2) if call.timeout is not None else None for call in _calls(ctx)[before:]]
+    assert len(timeouts) == 2 and all(t is not None and 0.6 <= t <= 0.75 for t in timeouts), f"two batches on a replica answering in 0.5 s must be two calls with 700 ms each, their deadlines were {timeouts}: every call gets its own full deadline, not what is left of one shared by the request"
+    assert None not in steady, f"two batches answering in 0.5 s each fit their own 700 ms deadlines and must both be scored, got {sum(s is None for s in steady)} unscored passages"
     ctx.grpc.set_latency("Score", 1.0, config.MODEL)
+    before = len(_calls(ctx))
     started = ctx.clock.offset
     scores = m.rerank_passages(QUERY, _passages(100))
     waited = ctx.clock.offset - started
     assert scores == [None] * 100, f"a replica that takes 1 s per batch must leave both batches unscored at 700 ms, got {[s for s in scores[:3]]}…"
-    assert len(_calls(ctx)) == 3, f"two batches must be two calls, saw {len(_calls(ctx)) - 1}"
+    assert len(_calls(ctx)) - before == 2, f"two batches must be two calls, saw {len(_calls(ctx)) - before}"
     assert waited <= 1.6, f"two slow batches held the request {waited:.1f} s: each must be cut at 700 ms"
 
 
@@ -650,6 +666,14 @@ def check_unscored_not_neutral(ctx):
     kept = [i for i in list(range(64)) + list(range(128, 150)) if scores[i] is None or abs(scores[i] - model.score(QUERY, passages[i])) > 1e-6]
     assert not kept, f"the healthy batches must keep their scores; passages {kept[:5]} lost theirs"
     assert len(servicer.batches) == 3, f"three batches must be three calls, the model was called {len(servicer.batches)} times: a failed batch is not retried inside the 700 ms budget"
+    for prefix, code in STATUS_FAULTS.items():
+        before = len(servicer.batches)
+        try:
+            got = m.rerank_passages(QUERY, ["solar panel", f"{prefix} solar"])
+        except Exception as exc:  # noqa: BLE001 - the assertion names it
+            raise AssertionError(f"a batch failing with {code.name} raised {exc!r}: only INVALID_ARGUMENT ends the call, any other failure leaves the batch unscored") from exc
+        assert got == [None, None], f"a batch failing with {code.name} must come back unscored, got {got}"
+        assert len(servicer.batches) - before == 1, f"a batch failing with {code.name} must be called once, it was called {len(servicer.batches) - before} times"
 
 
 def check_malformed_terminal(ctx):
@@ -664,6 +688,12 @@ def check_malformed_terminal(ctx):
     assert m.rerank_passages(QUERY, ["solar panel"]) is not None, "a well-formed request after the malformed one is served"
 `,
     typescript: `const QUERY = 'solar panel efficiency';
+// A passage starting with one of these makes the stand-in fail its batch with that status.
+const STATUS_FAULTS: [string, string][] = [
+  ['internal:', 'INTERNAL'],
+  ['exhausted:', 'RESOURCE_EXHAUSTED'],
+  ['precondition:', 'FAILED_PRECONDITION'],
+];
 
 function world(ctx) {
   const {rerankd} = ctx.proto('reranker_service.proto');
@@ -677,6 +707,9 @@ function world(ctx) {
       const fault = model.batchFault(passages);
       if (fault === 'unavailable') return callback({code: ctx.grpc.status.UNAVAILABLE, details: 'replica draining'});
       if (fault === 'invalid_argument') return callback({code: ctx.grpc.status.INVALID_ARGUMENT, details: 'empty passage in batch'});
+      for (const [prefix, name] of STATUS_FAULTS) {
+        if (passages.some(p => p.startsWith(prefix))) return callback({code: ctx.grpc.status[name], details: \`replica failed: \${name}\`});
+      }
       callback(null, {scores: passages.map(p => model.score(call.request.query, p)), model_version: model.MODEL_VERSION});
     },
   }, config.MODEL);
@@ -704,12 +737,19 @@ export async function check_batch_deadline(ctx) {
   const first = ctx.grpc.callsTo('Score')[0];
   assert(first && first.timeout !== null, 'the Score call carries no deadline: a slow replica holds the request as long as it likes');
   assert(first.timeout >= 0.6 && first.timeout <= 0.75, \`each call's deadline must be 700 ms, got \${first.timeout} s\`);
+  ctx.grpc.setLatency('Score', 0.5, config.MODEL);
+  let before = ctx.grpc.callsTo('Score').length;
+  const steady = await m.rerankPassages(QUERY, passagesOf(100));
+  const timeouts = ctx.grpc.callsTo('Score').slice(before).map(call => call.timeout);
+  assert(timeouts.length === 2 && timeouts.every(t => t !== null && t >= 0.6 && t <= 0.75), \`two batches on a replica answering in 0.5 s must be two calls with 700 ms each, their deadlines were \${JSON.stringify(timeouts)}: every call gets its own full deadline, not what is left of one shared by the request\`);
+  assert(steady.every(s => s !== null), \`two batches answering in 0.5 s each fit their own 700 ms deadlines and must both be scored, got \${steady.filter(s => s === null).length} unscored passages\`);
   ctx.grpc.setLatency('Score', 1.0, config.MODEL);
+  before = ctx.grpc.callsTo('Score').length;
   const started = ctx.clock.now();
   const scores = await m.rerankPassages(QUERY, passagesOf(100));
   const waited = (ctx.clock.now() - started) / 1000;
   assert(scores.length === 100 && scores.every(s => s === null), \`a replica that takes 1 s per batch must leave both batches unscored at 700 ms, got \${JSON.stringify(scores.slice(0, 3))}…\`);
-  assert.equal(ctx.grpc.callsTo('Score').length, 3, \`two batches must be two calls, saw \${ctx.grpc.callsTo('Score').length - 1}\`);
+  assert.equal(ctx.grpc.callsTo('Score').length - before, 2, \`two batches must be two calls, saw \${ctx.grpc.callsTo('Score').length - before}\`);
   assert(waited <= 1.6, \`two slow batches held the request \${waited.toFixed(1)} s: each must be cut at 700 ms\`);
 }
 
@@ -724,6 +764,17 @@ export async function check_unscored_not_neutral(ctx) {
   const kept = passages.flatMap((p, i) => ((i < 64 || i >= 128) && (scores[i] === null || Math.abs(scores[i] - model.score(QUERY, p)) > 1e-6) ? [i] : []));
   assert.equal(kept.length, 0, \`the healthy batches must keep their scores; passages \${JSON.stringify(kept.slice(0, 5))} lost theirs\`);
   assert.equal(batches.length, 3, \`three batches must be three calls, the model was called \${batches.length} times: a failed batch is not retried inside the 700 ms budget\`);
+  for (const [prefix, name] of STATUS_FAULTS) {
+    const before = batches.length;
+    let got;
+    try {
+      got = await m.rerankPassages(QUERY, ['solar panel', \`\${prefix} solar\`]);
+    } catch (err) {
+      assert.fail(\`a batch failing with \${name} threw \${err}: only INVALID_ARGUMENT ends the call, any other failure leaves the batch unscored\`);
+    }
+    assert.deepEqual(got, [null, null], \`a batch failing with \${name} must come back unscored, got \${JSON.stringify(got)}\`);
+    assert.equal(batches.length - before, 1, \`a batch failing with \${name} must be called once, it was called \${batches.length - before} times\`);
+  }
 }
 
 export async function check_malformed_terminal(ctx) {
@@ -746,6 +797,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -758,6 +810,12 @@ import (
 )
 
 const clientQuery = "solar panel efficiency"
+
+// clientStatusFaults: a passage starting with one of these prefixes makes the stand-in fail its batch with that status.
+var clientStatusFaults = []struct {
+	prefix string
+	code   codes.Code
+}{{"internal:", codes.Internal}, {"exhausted:", codes.ResourceExhausted}, {"precondition:", codes.FailedPrecondition}}
 
 // clientPeer is the stand-in cross-encoder: scores from rerank/model, faults from model.BatchFault; records batch sizes.
 type clientPeer struct {
@@ -774,6 +832,13 @@ func (p *clientPeer) Score(_ context.Context, req *pb.ScoreRequest) (*pb.ScoreRe
 	}
 	if fault == "invalid_argument" {
 		return nil, status.Error(codes.InvalidArgument, "empty passage in batch")
+	}
+	for _, f := range clientStatusFaults {
+		for _, p := range passages {
+			if strings.HasPrefix(p, f.prefix) {
+				return nil, status.Error(f.code, "replica failed: "+f.code.String())
+			}
+		}
 	}
 	scores := make([]float64, len(passages))
 	for i, passage := range passages {
@@ -837,7 +902,27 @@ func CheckBatchDeadline(ctx *harness.Ctx) {
 	calls := ctx.GRPC.CallsTo("Score", "")
 	ctx.Assert(len(calls) > 0 && calls[0].HasDeadline(), "the Score call carries no deadline: a slow replica holds the request as long as it likes")
 	ctx.Assert(calls[0].Timeout.Seconds() >= 0.6 && calls[0].Timeout.Seconds() <= 0.75, "each call's deadline must be 700 ms, got %v", calls[0].Timeout)
+	ctx.GRPC.SetLatency("Score", 0.5, config.Model)
+	before := len(ctx.GRPC.CallsTo("Score", ""))
+	steady := clientRerank(ctx, clientPassages(100))
+	timeouts := []float64{}
+	for _, call := range ctx.GRPC.CallsTo("Score", "")[before:] {
+		timeouts = append(timeouts, math.Round(call.Timeout.Seconds()*100)/100)
+	}
+	fresh := len(timeouts) == 2
+	for _, t := range timeouts {
+		fresh = fresh && t >= 0.6 && t <= 0.75
+	}
+	ctx.Assert(fresh, "two batches on a replica answering in 0.5 s must be two calls with 700 ms each, their deadlines were %v: every call gets its own full deadline, not what is left of one shared by the request", timeouts)
+	missed := 0
+	for _, s := range steady {
+		if s == nil {
+			missed++
+		}
+	}
+	ctx.Equal(missed, 0, "two batches answering in 0.5 s each fit their own 700 ms deadlines and must both be scored; unscored passages")
 	ctx.GRPC.SetLatency("Score", 1.0, config.Model)
+	before = len(ctx.GRPC.CallsTo("Score", ""))
 	started := ctx.Clock.Now()
 	scores := clientRerank(ctx, clientPassages(100))
 	waited := float64(ctx.Clock.Now()-started) / 1000
@@ -848,7 +933,7 @@ func CheckBatchDeadline(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(unscored, 100, "a replica that takes 1 s per batch must leave both batches unscored at 700 ms; unscored passages")
-	ctx.Equal(len(ctx.GRPC.CallsTo("Score", "")), 3, "two batches must be two calls; calls so far")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Score", ""))-before, 2, "two batches must be two calls; calls")
 	ctx.Assert(waited <= 1.6, "two slow batches held the request %.1f s: each must be cut at 700 ms", waited)
 }
 
@@ -868,6 +953,13 @@ func CheckUnscoredNotNeutral(ctx *harness.Ctx) {
 	kept := clientWrong(scores, passages, append(clientRange(0, 64), clientRange(128, 150)...))
 	ctx.Equal(len(kept), 0, "the healthy batches must keep their scores (passages %v lost theirs); lost scores", kept)
 	ctx.Equal(len(peer.batches), 3, "three batches must be three calls: a failed batch is not retried inside the 700 ms budget; the calls")
+	for _, f := range clientStatusFaults {
+		before := len(peer.batches)
+		got, err := rerankPassages(context.Background(), clientQuery, []string{"solar panel", f.prefix + " solar"})
+		ctx.Assert(err == nil, "a batch failing with %s returned the error %v: only INVALID_ARGUMENT ends the call, any other failure leaves the batch unscored", f.code, err)
+		ctx.Assert(len(got) == 2 && got[0] == nil && got[1] == nil, "a batch failing with %s must come back unscored (two nil entries), got %d entries", f.code, len(got))
+		ctx.Equal(len(peer.batches)-before, 1, "a batch failing with %s must be called once; the calls", f.code)
+	}
 }
 
 func CheckMalformedTerminal(ctx *harness.Ctx) {
@@ -882,7 +974,9 @@ func CheckMalformedTerminal(ctx *harness.Ctx) {
 
 #include <cmath>
 #include <exception>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "rerank/config.h"
@@ -891,6 +985,10 @@ func CheckMalformedTerminal(ctx *harness.Ctx) {
 namespace {
 
 const std::string kQuery = "solar panel efficiency";
+
+// A passage starting with one of these prefixes makes the stand-in fail its batch with that status.
+const std::vector<std::pair<std::string, grpc::StatusCode>> kStatusFaults = {
+    {"internal:", grpc::StatusCode::INTERNAL}, {"exhausted:", grpc::StatusCode::RESOURCE_EXHAUSTED}, {"precondition:", grpc::StatusCode::FAILED_PRECONDITION}};
 
 // The stand-in cross-encoder: scores from rerank/model.h, faults from model::batch_fault; records batch sizes.
 class RerankerPeer final : public rerankd::Reranker::Service {
@@ -903,6 +1001,11 @@ class RerankerPeer final : public rerankd::Reranker::Service {
     const std::string fault = model::batch_fault(passages);
     if (fault == "unavailable") return grpc::Status(grpc::StatusCode::UNAVAILABLE, "replica draining");
     if (fault == "invalid_argument") return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "empty passage in batch");
+    for (const auto& [prefix, code] : kStatusFaults) {
+      for (const auto& p : passages) {
+        if (p.rfind(prefix, 0) == 0) return grpc::Status(code, "replica failed: " + prefix);
+      }
+    }
     for (const auto& p : passages) reply->add_scores(model::score(req->query(), p));
     reply->set_model_version(model::kVersion);
     return grpc::Status::OK;
@@ -949,14 +1052,27 @@ void CheckBatchDeadline(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("Score");
   ctx.Assert(!calls.empty() && calls[0].HasDeadline(), "the Score call carries no deadline: a slow replica holds the request as long as it likes");
   ctx.Assert(calls[0].TimeoutSeconds() >= 0.6 && calls[0].TimeoutSeconds() <= 0.75, "each call's deadline must be 700 ms, got %vs", calls[0].TimeoutSeconds());
+  ctx.GRPC.SetLatency("Score", 0.5, config::kModel);
+  size_t before = ctx.GRPC.CallsTo("Score").size();
+  const auto steady = rerankPassages(kQuery, passagesOf(100));
+  const auto afterSteady = ctx.GRPC.CallsTo("Score");
+  std::vector<double> timeouts;
+  for (size_t i = before; i < afterSteady.size(); i++) timeouts.push_back(std::round(afterSteady[i].TimeoutSeconds() * 100) / 100);
+  bool fresh = timeouts.size() == 2;
+  for (double t : timeouts) fresh = fresh && t >= 0.6 && t <= 0.75;
+  ctx.Assert(fresh, "two batches on a replica answering in 0.5 s must be two calls with 700 ms each, their deadlines were %v: every call gets its own full deadline, not what is left of one shared by the request", timeouts);
+  int missed = 0;
+  for (const auto& s : steady) missed += s ? 0 : 1;
+  ctx.Equal(missed, 0, "two batches answering in 0.5 s each fit their own 700 ms deadlines and must both be scored; unscored passages");
   ctx.GRPC.SetLatency("Score", 1.0, config::kModel);
+  before = ctx.GRPC.CallsTo("Score").size();
   const int64_t started = ctx.Clock.Now();
   const auto scores = rerankPassages(kQuery, passagesOf(100));
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   int unscored = 0;
   for (const auto& s : scores) unscored += s ? 0 : 1;
   ctx.Equal(unscored, 100, "a replica that takes 1 s per batch must leave both batches unscored at 700 ms; unscored passages");
-  ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 3, "two batches must be two calls; calls so far");
+  ctx.Equal(ctx.GRPC.CallsTo("Score").size() - before, 2, "two batches must be two calls; calls");
   ctx.Assert(waited <= 1.6, "two slow batches held the request %.1f s: each must be cut at 700 ms", waited);
 }
 
@@ -977,6 +1093,19 @@ void CheckUnscoredNotNeutral(harness::Ctx& ctx) {
   ctx.Equal(scored, 0, "the passages of the failed batch must come back unscored (nullopt), not %v: a neutral score makes an outage read as mid-tier relevance; scored entries", sample);
   ctx.Equal(wrongScores(scores, passages, 0, 64) + wrongScores(scores, passages, 128, 150), 0, "the healthy batches must keep their scores; lost scores");
   ctx.Equal(peer.batches.size(), 3, "three batches must be three calls: a failed batch is not retried inside the 700 ms budget; the calls");
+  for (const auto& [prefix, code] : kStatusFaults) {
+    const size_t before = peer.batches.size();
+    std::vector<std::optional<double>> got;
+    std::string raised;
+    try {
+      got = rerankPassages(kQuery, {"solar panel", prefix + " solar"});
+    } catch (const std::exception& e) {
+      raised = e.what();
+    }
+    ctx.Assert(raised.empty(), "a batch failing with status %d threw '%s': only INVALID_ARGUMENT ends the call, any other failure leaves the batch unscored", static_cast<int>(code), raised);
+    ctx.Assert(got.size() == 2 && !got[0] && !got[1], "a batch failing with status %d must come back unscored (two nullopt entries), got %d entries", static_cast<int>(code), got.size());
+    ctx.Equal(peer.batches.size() - before, 1, "a batch failing with status %d must be called once; the calls", static_cast<int>(code));
+  }
 }
 
 void CheckMalformedTerminal(harness::Ctx& ctx) {

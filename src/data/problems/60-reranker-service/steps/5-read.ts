@@ -56,7 +56,7 @@ A share with a zero denominator is 0.`,
       id: 'per-version',
       title: 'Reports each model version on its own',
       detail:
-        "With xenc-v7 at 90 hits / 10 misses and xenc-v8 at 20 / 80, the answer lists both versions in order with hit ratios 0.9 and 0.2, read from each version's counters. The starter reports the fleet's 0.55.",
+        "With xenc-v7 at 90 hits / 10 misses and xenc-v8 at 20 / 80, the answer lists both versions in order with hit ratios 0.9 and 0.2, read from each version's counters; a retired build whose hash is still there but which is not in `VERSIONS_KEY` is not listed, and a new build with no hits or misses reads 0. The starter reports the fleet's 0.55.",
       match: {
         python: {all: [/VERSIONS_KEY/, /stats_key\(/], none: [/FLEET_HITS_KEY/]},
         typescript: {all: [/VERSIONS_KEY/, /statsKey\(/], none: [/FLEET_HITS_KEY/]},
@@ -69,7 +69,7 @@ A share with a zero denominator is 0.`,
       id: 'unscored-share',
       title: 'Reports the unscored batch share',
       detail:
-        '`unscored_share` is unscored_batches / batches per version (0.05 for xenc-v7, 0.5 for xenc-v8), so a build whose batches fail cannot read as healthy. The starter has no such field.',
+        '`unscored_share` is unscored_batches / batches per version (0.05 for xenc-v7, 0.5 for xenc-v8, 0 for a build with no batches yet), so a build whose batches fail cannot read as healthy. The starter has no such field.',
       match: {
         python: {all: [/unscored_share/, /unscored_batches/]},
         typescript: {all: [/unscored_share/, /unscored_batches/]},
@@ -82,7 +82,7 @@ A share with a zero denominator is 0.`,
       id: 'fallback-share',
       title: 'Reports the share of requests served in retrieval order',
       detail:
-        "`fallback_share` is fallback_requests / requests per version (0 for xenc-v7, 0.4 for xenc-v8): how often users got the retriever's order instead of the model's. The starter has no such field.",
+        "`fallback_share` is fallback_requests / requests per version (0 for xenc-v7, 0.4 for xenc-v8, 0 for a build with no requests yet): how often users got the retriever's order instead of the model's. The starter has no such field.",
       match: {
         python: {all: [/fallback_share/, /fallback_requests/]},
         typescript: {all: [/fallback_share/, /fallback_requests/]},
@@ -95,7 +95,7 @@ A share with a zero denominator is 0.`,
       id: 'boundary-latency',
       title: 'Reports queue and model latency apart',
       detail:
-        'Each version carries `latency_ms.queue` and `latency_ms.model`, nearest-rank p50 and p95 of its two boundary lists (xenc-v8: queue 900 / 1200 ms, model 45 / 55 ms), so a deep queue is not charged to the model. The starter reports client-observed times.',
+        'Each version carries `latency_ms.queue` and `latency_ms.model`, nearest-rank p50 and p95 of its two boundary lists (xenc-v8: queue 900 / 1200 ms, model 45 / 55 ms; 0 for a build with no samples yet), so a deep queue is not charged to the model. The starter reports client-observed times.',
       match: {
         python: {all: [/latency_key\(/, /["']queue["']/, /["']model["']/], none: [/CLIENT_LATENCY_KEY/]},
         typescript: {all: [/latencyKey\(/, /queue/, /model/], none: [/CLIENT_LATENCY_KEY/]},
@@ -639,6 +639,19 @@ def _seed(ctx):
     ctx.redis.set("rerank:hits", 110)
     ctx.redis.set("rerank:misses", 90)
     ctx.redis.rpush("rerank:latency:client", 950, 1300, 120, 400)
+    ctx.redis.hset("rerank:stats:xenc-v6", mapping={"requests": 5, "hits": 1, "misses": 4})  # a retired build, no longer in rerank:versions
+
+
+async def _idle(ctx):
+    """A build just rolled out: in rerank:versions with every counter at 0 and no latency samples yet."""
+    ctx.redis.sadd("rerank:versions", "xenc-v9")
+    ctx.redis.hset("rerank:stats:xenc-v9", mapping={"requests": 0, "hits": 0, "misses": 0, "batches": 0, "unscored_batches": 0, "fallback_requests": 0})
+    async with ctx.client(ctx.load("read").app) as c:
+        r = await c.get(STATS)
+    assert r.status_code == 200, f"with xenc-v9 at zero counters GET {STATS} answered {r.status_code}: {r.text}"
+    entry = {v.get("model_version"): v for v in r.json().get("versions", [])}.get("xenc-v9")
+    assert entry is not None, f"xenc-v9 is in rerank:versions and must have an entry, got {r.text}"
+    return entry, r.text
 
 
 async def _versions(ctx):
@@ -664,21 +677,27 @@ async def check_route(ctx):
 
 async def check_per_version(ctx):
     by_version, order, text = await _versions(ctx)
-    assert order == ["xenc-v7", "xenc-v8"], f"expected one entry per version, sorted (xenc-v7, xenc-v8), got {order}"
+    assert order == ["xenc-v7", "xenc-v8"], f"expected one entry per version in rerank:versions, sorted (xenc-v7, xenc-v8), got {order}"
     v7, v8 = by_version["xenc-v7"].get("hit_ratio"), by_version["xenc-v8"].get("hit_ratio")
     assert _near(v7, 0.9) and _near(v8, 0.2), f"the hit ratios must be each version's own (0.9 and 0.2), got {v7} and {v8}: {text}"
+    idle, text = await _idle(ctx)
+    assert _near(idle.get("hit_ratio"), 0.0), f"a version with no hits and no misses has hit_ratio 0 (a share with a zero denominator is 0), got {idle.get('hit_ratio')!r}: {text}"
 
 
 async def check_unscored_share(ctx):
     by_version, _, text = await _versions(ctx)
     got = {v: by_version.get(v, {}).get("unscored_share") for v in ("xenc-v7", "xenc-v8")}
     assert _near(got["xenc-v7"], 0.05) and _near(got["xenc-v8"], 0.5), f"unscored_share must be unscored_batches / batches (0.05 and 0.5), got {got}: {text}"
+    idle, text = await _idle(ctx)
+    assert _near(idle.get("unscored_share"), 0.0), f"a version with no batches has unscored_share 0 (a share with a zero denominator is 0), got {idle.get('unscored_share')!r}: {text}"
 
 
 async def check_fallback_share(ctx):
     by_version, _, text = await _versions(ctx)
     got = {v: by_version.get(v, {}).get("fallback_share") for v in ("xenc-v7", "xenc-v8")}
     assert _near(got["xenc-v7"], 0.0) and _near(got["xenc-v8"], 0.4), f"fallback_share must be fallback_requests / requests (0 and 0.4), got {got}: {text}"
+    idle, text = await _idle(ctx)
+    assert _near(idle.get("fallback_share"), 0.0), f"a version with no requests has fallback_share 0 (a share with a zero denominator is 0), got {idle.get('fallback_share')!r}: {text}"
 
 
 async def check_boundary_latency(ctx):
@@ -690,6 +709,9 @@ async def check_boundary_latency(ctx):
     for version, latency in want.items():
         got = by_version.get(version, {}).get("latency_ms")
         assert got == latency, f"{version}'s latency_ms must be the queue and model boundaries apart, nearest-rank p50/p95 {latency}, got {got}: {text}"
+    idle, text = await _idle(ctx)
+    zero = {"queue": {"p50": 0, "p95": 0}, "model": {"p50": 0, "p95": 0}}
+    assert idle.get("latency_ms") == zero, f"a version with no latency samples reports 0 at both boundaries {zero}, got {idle.get('latency_ms')}: {text}"
 `,
     typescript: `const STATS = '/v1/rerank/cache/stats';
 
@@ -705,6 +727,18 @@ function seed(ctx) {
   ctx.redis.set('rerank:hits', 110);
   ctx.redis.set('rerank:misses', 90);
   ctx.redis.rpush('rerank:latency:client', 950, 1300, 120, 400);
+  ctx.redis.hset('rerank:stats:xenc-v6', 'requests', '5', 'hits', '1', 'misses', '4'); // a retired build, no longer in rerank:versions
+}
+
+/** A build just rolled out: in rerank:versions with every counter at 0 and no latency samples yet. */
+async function idle(ctx) {
+  ctx.redis.sadd('rerank:versions', 'xenc-v9');
+  ctx.redis.hset('rerank:stats:xenc-v9', 'requests', '0', 'hits', '0', 'misses', '0', 'batches', '0', 'unscored_batches', '0', 'fallback_requests', '0');
+  const r = await ctx.client(ctx.load('read').app).get(STATS);
+  assert.equal(r.status, 200, \`with xenc-v9 at zero counters GET \${STATS} answered \${r.status}: \${r.text}\`);
+  const entry = (r.json().versions ?? []).find(v => v.model_version === 'xenc-v9');
+  assert(entry !== undefined, \`xenc-v9 is in rerank:versions and must have an entry, got \${r.text}\`);
+  return {entry, text: r.text};
 }
 
 async function versions(ctx) {
@@ -727,10 +761,12 @@ export async function check_route(ctx) {
 
 export async function check_per_version(ctx) {
   const {byVersion, order, text} = await versions(ctx);
-  assert.deepEqual(order, ['xenc-v7', 'xenc-v8'], \`expected one entry per version, sorted (xenc-v7, xenc-v8), got \${JSON.stringify(order)}\`);
+  assert.deepEqual(order, ['xenc-v7', 'xenc-v8'], \`expected one entry per version in rerank:versions, sorted (xenc-v7, xenc-v8), got \${JSON.stringify(order)}\`);
   const v7 = byVersion['xenc-v7'].hit_ratio;
   const v8 = byVersion['xenc-v8'].hit_ratio;
   assert(near(v7, 0.9) && near(v8, 0.2), \`the hit ratios must be each version's own (0.9 and 0.2), got \${v7} and \${v8}: \${text}\`);
+  const v9 = await idle(ctx);
+  assert(near(v9.entry.hit_ratio, 0), \`a version with no hits and no misses has hit_ratio 0 (a share with a zero denominator is 0), got \${JSON.stringify(v9.entry.hit_ratio)}: \${v9.text}\`);
 }
 
 export async function check_unscored_share(ctx) {
@@ -738,6 +774,8 @@ export async function check_unscored_share(ctx) {
   const v7 = byVersion['xenc-v7']?.unscored_share;
   const v8 = byVersion['xenc-v8']?.unscored_share;
   assert(near(v7, 0.05) && near(v8, 0.5), \`unscored_share must be unscored_batches / batches (0.05 and 0.5), got \${v7} and \${v8}: \${text}\`);
+  const v9 = await idle(ctx);
+  assert(near(v9.entry.unscored_share, 0), \`a version with no batches has unscored_share 0 (a share with a zero denominator is 0), got \${JSON.stringify(v9.entry.unscored_share)}: \${v9.text}\`);
 }
 
 export async function check_fallback_share(ctx) {
@@ -745,6 +783,8 @@ export async function check_fallback_share(ctx) {
   const v7 = byVersion['xenc-v7']?.fallback_share;
   const v8 = byVersion['xenc-v8']?.fallback_share;
   assert(near(v7, 0) && near(v8, 0.4), \`fallback_share must be fallback_requests / requests (0 and 0.4), got \${v7} and \${v8}: \${text}\`);
+  const v9 = await idle(ctx);
+  assert(near(v9.entry.fallback_share, 0), \`a version with no requests has fallback_share 0 (a share with a zero denominator is 0), got \${JSON.stringify(v9.entry.fallback_share)}: \${v9.text}\`);
 }
 
 export async function check_boundary_latency(ctx) {
@@ -756,6 +796,9 @@ export async function check_boundary_latency(ctx) {
   for (const [version, latency] of Object.entries(want)) {
     assert.deepEqual(byVersion[version]?.latency_ms, latency, \`\${version}'s latency_ms must be the queue and model boundaries apart, nearest-rank p50/p95 \${JSON.stringify(latency)}, got \${JSON.stringify(byVersion[version]?.latency_ms)}: \${text}\`);
   }
+  const v9 = await idle(ctx);
+  const zero = {queue: {p50: 0, p95: 0}, model: {p50: 0, p95: 0}};
+  assert.deepEqual(v9.entry.latency_ms, zero, \`a version with no latency samples reports 0 at both boundaries, got \${JSON.stringify(v9.entry.latency_ms)}: \${v9.text}\`);
 }
 `,
     go: `package main
@@ -800,6 +843,26 @@ func readSeed(ctx *harness.Ctx) {
 	ctx.Redis.Set("rerank:hits", 110)
 	ctx.Redis.Set("rerank:misses", 90)
 	ctx.Redis.Do("RPUSH", "rerank:latency:client", 950, 1300, 120, 400)
+	ctx.Redis.Do("HSET", "rerank:stats:xenc-v6", "requests", 5, "hits", 1, "misses", 4) // a retired build, no longer in rerank:versions
+}
+
+// readIdle: a build just rolled out, in rerank:versions with every counter at 0 and no latency samples yet.
+func readIdle(ctx *harness.Ctx) (readEntry, string) {
+	ctx.Redis.Do("SADD", "rerank:versions", "xenc-v9")
+	ctx.Redis.Do("HSET", "rerank:stats:xenc-v9", "requests", 0, "hits", 0, "misses", 0, "batches", 0, "unscored_batches", 0, "fallback_requests", 0)
+	r := readClient(ctx).Get(readStats)
+	ctx.Equal(r.Status, 200, "GET %s with xenc-v9 at zero counters (%s)", readStats, r.Text())
+	var body struct {
+		Versions []readEntry \`json:"versions"\`
+	}
+	r.Decode(&body)
+	for _, v := range body.Versions {
+		if v.ModelVersion == "xenc-v9" {
+			return v, r.Text()
+		}
+	}
+	ctx.Assert(false, "xenc-v9 is in rerank:versions and must have an entry, got %s", r.Text())
+	return readEntry{}, r.Text()
 }
 
 func readVersions(ctx *harness.Ctx) (map[string]readEntry, []string, string) {
@@ -831,18 +894,24 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckPerVersion(ctx *harness.Ctx) {
 	byVersion, order, text := readVersions(ctx)
-	ctx.Equal(order, []string{"xenc-v7", "xenc-v8"}, "one entry per version, sorted; the versions")
+	ctx.Equal(order, []string{"xenc-v7", "xenc-v8"}, "one entry per version in rerank:versions, sorted; the versions")
 	ctx.Assert(readNear(byVersion["xenc-v7"].HitRatio, 0.9) && readNear(byVersion["xenc-v8"].HitRatio, 0.2), "the hit ratios must be each version's own (0.9 and 0.2): %s", text)
+	idle, text := readIdle(ctx)
+	ctx.Assert(readNear(idle.HitRatio, 0), "a version with no hits and no misses has hit_ratio 0 (a share with a zero denominator is 0): %s", text)
 }
 
 func CheckUnscoredShare(ctx *harness.Ctx) {
 	byVersion, _, text := readVersions(ctx)
 	ctx.Assert(readNear(byVersion["xenc-v7"].UnscoredShare, 0.05) && readNear(byVersion["xenc-v8"].UnscoredShare, 0.5), "unscored_share must be unscored_batches / batches (0.05 and 0.5): %s", text)
+	idle, text := readIdle(ctx)
+	ctx.Assert(readNear(idle.UnscoredShare, 0), "a version with no batches has unscored_share 0 (a share with a zero denominator is 0): %s", text)
 }
 
 func CheckFallbackShare(ctx *harness.Ctx) {
 	byVersion, _, text := readVersions(ctx)
 	ctx.Assert(readNear(byVersion["xenc-v7"].FallbackShare, 0) && readNear(byVersion["xenc-v8"].FallbackShare, 0.4), "fallback_share must be fallback_requests / requests (0 and 0.4): %s", text)
+	idle, text := readIdle(ctx)
+	ctx.Assert(readNear(idle.FallbackShare, 0), "a version with no requests has fallback_share 0 (a share with a zero denominator is 0): %s", text)
 }
 
 func CheckBoundaryLatency(ctx *harness.Ctx) {
@@ -854,6 +923,8 @@ func CheckBoundaryLatency(ctx *harness.Ctx) {
 	for _, version := range []string{"xenc-v7", "xenc-v8"} {
 		ctx.Equal(byVersion[version].LatencyMs, want[version], "%s's latency_ms must be the queue and model boundaries apart, nearest-rank p50/p95 (%s)", version, text)
 	}
+	idle, text := readIdle(ctx)
+	ctx.Equal(idle.LatencyMs, map[string]readPercentiles{"queue": {}, "model": {}}, "a version with no latency samples reports 0 at both boundaries (%s)", text)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -863,6 +934,7 @@ func CheckBoundaryLatency(ctx *harness.Ctx) {
 #include <cmath>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -889,6 +961,7 @@ void readSeed(harness::Ctx& ctx) {
   ctx.Redis.Set("rerank:hits", 110);
   ctx.Redis.Set("rerank:misses", 90);
   ctx.Redis.Do("RPUSH", "rerank:latency:client", 950, 1300, 120, 400);
+  ctx.Redis.Do("HSET", "rerank:stats:xenc-v6", "requests", 5, "hits", 1, "misses", 4);  // a retired build, no longer in rerank:versions
 }
 
 struct Versions {
@@ -914,8 +987,25 @@ Versions readVersions(harness::Ctx& ctx) {
   return out;
 }
 
-bool near(const nlohmann::json& entry, const std::string& field, double want) {
+bool hNear(const nlohmann::json& entry, const std::string& field, double want) {
   return entry.is_object() && entry.contains(field) && entry[field].is_number() && std::fabs(entry[field].get<double>() - want) < 1e-6;
+}
+
+// A build just rolled out: in rerank:versions with every counter at 0 and no latency samples yet.
+std::pair<nlohmann::json, std::string> readIdle(harness::Ctx& ctx) {
+  ctx.Redis.Do("SADD", "rerank:versions", "xenc-v9");
+  ctx.Redis.Do("HSET", "rerank:stats:xenc-v9", "requests", 0, "hits", 0, "misses", 0, "batches", 0, "unscored_batches", 0, "fallback_requests", 0);
+  auto c = readClient(ctx);
+  const auto r = c.Get(kStats);
+  ctx.Equal(r.Status, 200, "GET %s with xenc-v9 at zero counters (%s)", kStats, r.Text());
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  if (body.is_object() && body.contains("versions") && body["versions"].is_array()) {
+    for (const auto& v : body["versions"]) {
+      if (v.is_object() && v.value("model_version", "") == "xenc-v9") return {v, r.Text()};
+    }
+  }
+  ctx.Assert(false, "xenc-v9 is in rerank:versions and must have an entry, got %s", r.Text());
+  return {nlohmann::json(), r.Text()};
 }
 
 }  // namespace
@@ -929,18 +1019,24 @@ void CheckRoute(harness::Ctx& ctx) {
 
 void CheckPerVersion(harness::Ctx& ctx) {
   auto v = readVersions(ctx);
-  ctx.Equal(v.order, std::vector<std::string>{"xenc-v7", "xenc-v8"}, "one entry per version, sorted; the versions");
-  ctx.Assert(near(v.by_version["xenc-v7"], "hit_ratio", 0.9) && near(v.by_version["xenc-v8"], "hit_ratio", 0.2), "the hit ratios must be each version's own (0.9 and 0.2): %s", v.text);
+  ctx.Equal(v.order, std::vector<std::string>{"xenc-v7", "xenc-v8"}, "one entry per version in rerank:versions, sorted; the versions");
+  ctx.Assert(hNear(v.by_version["xenc-v7"], "hit_ratio", 0.9) && hNear(v.by_version["xenc-v8"], "hit_ratio", 0.2), "the hit ratios must be each version's own (0.9 and 0.2): %s", v.text);
+  const auto [idle, text] = readIdle(ctx);
+  ctx.Assert(hNear(idle, "hit_ratio", 0), "a version with no hits and no misses has hit_ratio 0 (a share with a zero denominator is 0): %s", text);
 }
 
 void CheckUnscoredShare(harness::Ctx& ctx) {
   auto v = readVersions(ctx);
-  ctx.Assert(near(v.by_version["xenc-v7"], "unscored_share", 0.05) && near(v.by_version["xenc-v8"], "unscored_share", 0.5), "unscored_share must be unscored_batches / batches (0.05 and 0.5): %s", v.text);
+  ctx.Assert(hNear(v.by_version["xenc-v7"], "unscored_share", 0.05) && hNear(v.by_version["xenc-v8"], "unscored_share", 0.5), "unscored_share must be unscored_batches / batches (0.05 and 0.5): %s", v.text);
+  const auto [idle, text] = readIdle(ctx);
+  ctx.Assert(hNear(idle, "unscored_share", 0), "a version with no batches has unscored_share 0 (a share with a zero denominator is 0): %s", text);
 }
 
 void CheckFallbackShare(harness::Ctx& ctx) {
   auto v = readVersions(ctx);
-  ctx.Assert(near(v.by_version["xenc-v7"], "fallback_share", 0) && near(v.by_version["xenc-v8"], "fallback_share", 0.4), "fallback_share must be fallback_requests / requests (0 and 0.4): %s", v.text);
+  ctx.Assert(hNear(v.by_version["xenc-v7"], "fallback_share", 0) && hNear(v.by_version["xenc-v8"], "fallback_share", 0.4), "fallback_share must be fallback_requests / requests (0 and 0.4): %s", v.text);
+  const auto [idle, text] = readIdle(ctx);
+  ctx.Assert(hNear(idle, "fallback_share", 0), "a version with no requests has fallback_share 0 (a share with a zero denominator is 0): %s", text);
 }
 
 void CheckBoundaryLatency(harness::Ctx& ctx) {
@@ -954,6 +1050,9 @@ void CheckBoundaryLatency(harness::Ctx& ctx) {
     ctx.Equal(entry.is_object() && entry.contains("latency_ms") ? entry["latency_ms"] : nlohmann::json(), latency,
               "%s's latency_ms must be the queue and model boundaries apart, nearest-rank p50/p95 (%s)", version, v.text);
   }
+  const auto [idle, text] = readIdle(ctx);
+  const nlohmann::json zero = {{"queue", {{"p50", 0}, {"p95", 0}}}, {"model", {{"p50", 0}, {"p95", 0}}}};
+  ctx.Equal(idle.is_object() && idle.contains("latency_ms") ? idle["latency_ms"] : nlohmann::json(), zero, "a version with no latency samples reports 0 at both boundaries (%s)", text);
 }
 `,
   },

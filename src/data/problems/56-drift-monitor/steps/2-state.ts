@@ -47,7 +47,7 @@ resets at all; and a re-run of the freeze job silently rebases the monitor on to
       id: 'atomic-merge',
       title: 'Merges a whole batch in one Lua script',
       detail:
-        'Every bucket of a batch is incremented with `HINCRBY` inside one script (`EVAL`/`register_script`/`defineCommand`/`NewScript`); a client-side `HGET` then `HSET` loses the increment another replica made in between.',
+        'Every bucket of a batch is incremented with `HINCRBY` inside one script (`EVAL`/`register_script`/`defineCommand`/`NewScript`), which returns the window total it produced; a client-side `HGET` then `HSET` loses the increment another replica made in between, and another replica never sees half a batch.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /HINCRBY/], none: [/\.hget\(/, /\.hset\(/]},
@@ -73,7 +73,7 @@ resets at all; and a re-run of the freeze job silently rebases the monitor on to
       id: 'window-ttl',
       title: 'Expires the sketch at the end of its window',
       detail:
-        'The expiry is the seconds left in the window (`window + window_s - now`), set on every merge, so the key dies with its window; a fixed hour slides forward on every write.',
+        'The expiry is the seconds left in the window (`window + window_s - now`), set by the merging script on every merge, so the key never exists without it and dies with its window; a fixed hour slides forward on every write.',
       match: {
         python: {all: [/window_s\s*-\s*now|window_end\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
         typescript: {all: [/windowS\s*-\s*now|windowEnd\s*-\s*now|EXPIREAT|expireat/], none: [/\b3600\b/]},
@@ -86,7 +86,7 @@ resets at all; and a re-run of the freeze job silently rebases the monitor on to
       id: 'baseline-frozen',
       title: 'Writes the baseline once',
       detail:
-        'The baseline is written with a set-if-absent (`nx=True`, `NX`, `SetNX`, `SetParams.nx()`, `UpdateType::NOT_EXIST`) and not deleted first, so a second freeze reports false and the reference stays as it was.',
+        'The baseline is written with a set-if-absent (`nx=True`, `NX`, `SetNX`, `SetParams.nx()`, `UpdateType::NOT_EXIST`) and not deleted first, so a second freeze reports false and the reference stays as it was; of two racing freezes, exactly one reports true and its batch is the one stored.',
       match: {
         python: {all: [/nx\s*=\s*True/], none: [/\.delete\(/]},
         typescript: {all: [/['"]NX['"]/], none: [/\.del\(/]},
@@ -539,13 +539,21 @@ def check_atomic_merge(ctx):
     assert len(keys) == 1, f"one merge left {keys} in Redis, expected one sketch"
     key = keys[0]
     # Another evaluator replica merges its batch between this merge's commands.
-    rival = ctx.redis_after(key, lambda: m.merge_batch("t1", "m-1", 300, {1: 7, 2: 1}))
-    m.merge_batch("t1", "m-1", 300, {1: 3, 2: 2})
+    seen = {}
+
+    def _rival():
+        seen.update(ctx.redis.hgetall(key))
+        return m.merge_batch("t1", "m-1", 300, {1: 7, 2: 1})
+
+    rival = ctx.redis_after(key, _rival)
+    own = m.merge_batch("t1", "m-1", 300, {1: 3, 2: 2})
     assert rival.fired, f"the second merge never touched {key}"
     if rival.error is not None:
         raise rival.error
+    assert seen == {"1": "8", "2": "2"}, f"right after the first command of the merge of {{1: 3, 2: 2}} touched {key}, it held {seen}, expected {{'1': '8', '2': '2'}}: the whole batch lands in one script, so another replica never sees half of it"
     counts = ctx.redis.hgetall(key)
     assert counts == {"1": "15", "2": "3"}, f"{key} holds {counts} after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2, expected 15 and 3: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script"
+    assert own == 10, f"the merge of {{1: 3, 2: 2}} into a window of 5 samples returned {own}, expected 10: the total is the one the merging script saw, not a later read that counts another replica's batch"
 
 
 def _into_window(ctx, offset):
@@ -573,7 +581,10 @@ def check_window_ttl(ctx):
     m = ctx.load("state")
     window = _into_window(ctx, 100)
     key = f"sketch:live:t1:m-1:{window}"
+    created = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
     m.merge_batch("t1", "m-1", 300, {1: 4})
+    assert created.fired, f"the merge never touched {key} (Redis holds {sorted(ctx.redis.keys('sketch:*'))})"
+    assert created.result is not None and 199 <= created.result <= 200, f"right after the command that created {key} it expired in {created.result} s, expected 200: the expiry is set by the merging script, so the sketch never exists without one"
     ttl = ctx.redis.ttl(key)
     assert 199 <= ttl <= 200, f"100 s into window {window} the window has 200 s left, but {key} expires in {ttl} s (Redis holds {sorted(ctx.redis.keys('sketch:*'))}): the expiry must be the seconds left in the window"
     ctx.clock.advance(50)
@@ -594,6 +605,17 @@ def check_baseline_frozen(ctx):
     raw = ctx.redis.get(BASELINE_KEY)
     assert raw is not None and json.loads(raw) == {"1": 10, "2": 20}, f"a second freeze rewrote the baseline to {raw!r}: the monitor is now compared against today's traffic. Write it once (SET NX)"
     assert ctx.redis.ttl(BASELINE_KEY) == -1, "the baseline must not expire"
+    # Two freeze jobs race on a new reference: exactly one writes it, and it keeps that one's batch.
+    ref = "baseline:v3:2026-10-02"
+    key = f"sketch:baseline:t1:{ref}"
+    rival = ctx.redis_after(key, lambda: m.freeze_baseline("t1", ref, {1: 7}))
+    own = m.freeze_baseline("t1", ref, {1: 40})
+    assert rival.fired, f"the freeze of {ref} never touched {key}"
+    if rival.error is not None:
+        raise rival.error
+    raw = ctx.redis.get(key)
+    winners = [batch for batch, written in (({"1": 40}, own), ({"1": 7}, rival.result)) if written is True]
+    assert len(winners) == 1 and raw is not None and json.loads(raw) == winners[0], f"two racing freezes of {ref} returned {own!r} and {rival.result!r} and left {raw!r}: the one that reports True must be the one stored. Check and write in one command (SET NX), not a read then a write"
 `,
     typescript: `const REF = 'baseline:v3:2026-10-01';
 const BASELINE_KEY = \`sketch:baseline:t1:\${REF}\`;
@@ -608,12 +630,18 @@ export async function check_atomic_merge(ctx) {
   assert.equal(keys.length, 1, \`one merge left \${JSON.stringify(keys)} in Redis, expected one sketch\`);
   const key = keys[0];
   // Another evaluator replica merges its batch between this merge's commands.
-  const rival = ctx.redisAfter(key, () => m.mergeBatch('t1', 'm-1', 300, {1: 7, 2: 1}));
-  await m.mergeBatch('t1', 'm-1', 300, {1: 3, 2: 2});
+  let seen = {};
+  const rival = ctx.redisAfter(key, () => {
+    seen = ctx.redis.hgetall(key);
+    return m.mergeBatch('t1', 'm-1', 300, {1: 7, 2: 1});
+  });
+  const own = await m.mergeBatch('t1', 'm-1', 300, {1: 3, 2: 2});
   assert(rival.fired, \`the second merge never touched \${key}\`);
   await rival.result;
+  assert.deepStrictEqual(seen, {1: '8', 2: '2'}, \`right after the first command of the merge of {1: 3, 2: 2} touched \${key}, it held \${JSON.stringify(seen)}, expected {"1": "8", "2": "2"}: the whole batch lands in one script, so another replica never sees half of it\`);
   const counts = ctx.redis.hgetall(key);
   assert.deepStrictEqual(counts, {1: '15', 2: '3'}, \`\${key} holds \${JSON.stringify(counts)} after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2, expected 15 and 3: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script\`);
+  assert.equal(own, 10, \`the merge of {1: 3, 2: 2} into a window of 5 samples returned \${own}, expected 10: the total is the one the merging script saw, not a later read that counts another replica's batch\`);
 }
 
 /** Move the clock to offset seconds into a 300 s window; returns that window's start. */
@@ -641,7 +669,10 @@ export async function check_window_ttl(ctx) {
   const m = ctx.load('state');
   const window = intoWindow(ctx, 100);
   const key = \`sketch:live:t1:m-1:\${window}\`;
+  const created = ctx.redisAfter(key, () => ctx.redis.ttl(key));
   await m.mergeBatch('t1', 'm-1', 300, {1: 4});
+  assert(created.fired, \`the merge never touched \${key} (Redis holds \${sketchKeys(ctx)})\`);
+  assert(typeof created.result === 'number' && created.result >= 199 && created.result <= 200, \`right after the command that created \${key} it expired in \${created.result} s, expected 200: the expiry is set by the merging script, so the sketch never exists without one\`);
   let ttl = ctx.redis.ttl(key);
   assert(ttl >= 199 && ttl <= 200, \`100 s into window \${window} the window has 200 s left, but \${key} expires in \${ttl} s (Redis holds \${sketchKeys(ctx)}): the expiry must be the seconds left in the window\`);
   ctx.clock.advance(50);
@@ -662,6 +693,16 @@ export async function check_baseline_frozen(ctx) {
   raw = ctx.redis.get(BASELINE_KEY);
   assert(raw !== null && JSON.stringify(JSON.parse(raw)) === '{"1":10,"2":20}', \`a second freeze rewrote the baseline to \${JSON.stringify(raw)}: the monitor is now compared against today's traffic. Write it once (SET NX)\`);
   assert.equal(ctx.redis.ttl(BASELINE_KEY), -1, 'the baseline must not expire');
+  // Two freeze jobs race on a new reference: exactly one writes it, and it keeps that one's batch.
+  const ref = 'baseline:v3:2026-10-02';
+  const key = \`sketch:baseline:t1:\${ref}\`;
+  const rival = ctx.redisAfter(key, () => m.freezeBaseline('t1', ref, {1: 7}));
+  const own = await m.freezeBaseline('t1', ref, {1: 40});
+  assert(rival.fired, \`the freeze of \${ref} never touched \${key}\`);
+  const rivalWrote = await rival.result;
+  raw = ctx.redis.get(key);
+  const winners = [[{1: 40}, own], [{1: 7}, rivalWrote]].filter(([, written]) => written === true).map(([batch]) => JSON.stringify(batch));
+  assert(winners.length === 1 && raw !== null && JSON.stringify(JSON.parse(raw)) === winners[0], \`two racing freezes of \${ref} returned \${own} and \${rivalWrote} and left \${JSON.stringify(raw)}: the one that reports true must be the one stored. Check and write in one command (SET NX), not a read then a write\`);
 }
 `,
     go: `package main
@@ -675,36 +716,40 @@ import (
 )
 
 const (
-	ref         = "baseline:v3:2026-10-01"
-	baselineKey = "sketch:baseline:t1:" + ref
+	hRef         = "baseline:v3:2026-10-01"
+	hBaselineKey = "sketch:baseline:t1:" + hRef
 )
 
-var stateBg = context.Background()
+var hBg = context.Background()
 
-func merged(ctx *harness.Ctx, batch map[int]int64) int64 {
-	total, err := mergeBatch(stateBg, "t1", "m-1", 300, batch)
+func hMerged(ctx *harness.Ctx, batch map[int]int64) int64 {
+	total, err := mergeBatch(hBg, "t1", "m-1", 300, batch)
 	ctx.NoError(err, "mergeBatch(t1, m-1, 300, %v) failed", batch)
 	return total
 }
 
 func CheckAtomicMerge(ctx *harness.Ctx) {
-	ctx.Equal(merged(ctx, map[int]int64{1: 5}), 5, "the first batch of 5 samples; the window's samples")
+	ctx.Equal(hMerged(ctx, map[int]int64{1: 5}), 5, "the first batch of 5 samples; the window's samples")
 	keys := ctx.Redis.Keys("sketch:*")
 	ctx.Equal(len(keys), 1, "one merge must leave one sketch in Redis (%q); the keys", keys)
 	key := keys[0]
 	// Another evaluator replica merges its batch between this merge's commands.
+	var seen map[string]string
 	rival := ctx.Redis.After(key, func() any {
-		_, err := mergeBatch(stateBg, "t1", "m-1", 300, map[int]int64{1: 7, 2: 1})
+		seen = ctx.Redis.HGetAll(key)
+		_, err := mergeBatch(hBg, "t1", "m-1", 300, map[int]int64{1: 7, 2: 1})
 		return err
 	})
-	merged(ctx, map[int]int64{1: 3, 2: 2})
+	own := hMerged(ctx, map[int]int64{1: 3, 2: 2})
 	ctx.Assert(rival.Fired, "the second merge never touched %s", key)
 	ctx.Assert(rival.Result == nil, "the other replica's merge failed: %v", rival.Result)
+	ctx.Equal(seen, map[string]string{"1": "8", "2": "2"}, "right after the first command of the merge of {1: 3, 2: 2} touched %s: the whole batch lands in one script, so another replica never sees half of it; the sketch", key)
 	ctx.Equal(ctx.Redis.HGetAll(key), map[string]string{"1": "15", "2": "3"}, "%s after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script", key)
+	ctx.Equal(own, 10, "the merge of {1: 3, 2: 2} into a window of 5 samples returns the total the merging script saw, not a later read that counts another replica's batch; the total")
 }
 
-// intoWindow moves the clock to offset seconds into a 300 s window and returns that window's start.
-func intoWindow(ctx *harness.Ctx, offset int64) int64 {
+// hIntoWindow moves the clock to offset seconds into a 300 s window and returns that window's start.
+func hIntoWindow(ctx *harness.Ctx, offset int64) int64 {
 	now := ctx.Clock.Now() / 1000
 	if step := ((offset-now)%300 + 300) % 300; step > 0 {
 		ctx.Clock.Advance(float64(step))
@@ -713,25 +758,29 @@ func intoWindow(ctx *harness.Ctx, offset int64) int64 {
 }
 
 func CheckWindowKey(ctx *harness.Ctx) {
-	window := intoWindow(ctx, 10)
-	merged(ctx, map[int]int64{1: 4})
+	window := hIntoWindow(ctx, 10)
+	hMerged(ctx, map[int]int64{1: 4})
 	first := fmt.Sprintf("sketch:live:t1:m-1:%d", window)
 	ctx.Equal(ctx.Redis.HGetAll(first), map[string]string{"1": "4"}, "a batch 10 s into window %d (window_s 300) must land in %s (Redis holds %q)", window, first, ctx.Redis.Keys("sketch:*"))
 	ctx.Clock.Advance(300)
-	total := merged(ctx, map[int]int64{2: 6})
+	total := hMerged(ctx, map[int]int64{2: 6})
 	second := fmt.Sprintf("sketch:live:t1:m-1:%d", window+300)
 	ctx.Equal(ctx.Redis.HGetAll(second), map[string]string{"2": "6"}, "the batch 300 s later must start the sketch of window %d, %s (Redis holds %q)", window+300, second, ctx.Redis.Keys("sketch:*"))
 	ctx.Equal(total, 6, "the first batch of window %d must not count the previous window's samples; the window's samples", window+300)
 }
 
 func CheckWindowTtl(ctx *harness.Ctx) {
-	window := intoWindow(ctx, 100)
+	window := hIntoWindow(ctx, 100)
 	key := fmt.Sprintf("sketch:live:t1:m-1:%d", window)
-	merged(ctx, map[int]int64{1: 4})
+	created := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
+	hMerged(ctx, map[int]int64{1: 4})
+	ctx.Assert(created.Fired, "the merge never touched %s (Redis holds %q)", key, ctx.Redis.Keys("sketch:*"))
+	createdTTL, _ := created.Result.(int64)
+	ctx.Assert(createdTTL >= 199 && createdTTL <= 200, "right after the command that created %s it expired in %v s, expected 200: the expiry is set by the merging script, so the sketch never exists without one", key, created.Result)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(ttl >= 199 && ttl <= 200, "100 s into window %d the window has 200 s left, but %s expires in %d s (Redis holds %q): the expiry must be the seconds left in the window", window, key, ttl, ctx.Redis.Keys("sketch:*"))
 	ctx.Clock.Advance(50)
-	merged(ctx, map[int]int64{1: 4})
+	hMerged(ctx, map[int]int64{1: 4})
 	ttl = ctx.Redis.TTL(key)
 	ctx.Assert(ttl >= 149 && ttl <= 150, "150 s into the window %s expires in %d s, expected 150: a later write must not push the expiry past the window's end", key, ttl)
 	ctx.Clock.Advance(150)
@@ -739,22 +788,44 @@ func CheckWindowTtl(ctx *harness.Ctx) {
 }
 
 func CheckBaselineFrozen(ctx *harness.Ctx) {
-	first, err := freezeBaseline(stateBg, "t1", ref, map[int]int64{1: 10, 2: 20})
+	first, err := freezeBaseline(hBg, "t1", hRef, map[int]int64{1: 10, 2: 20})
 	ctx.NoError(err, "the first freeze failed")
 	ctx.Equal(first, true, "the first freeze must write the baseline; written")
 	want := map[string]any{"1": 10, "2": 20}
-	stored := func() map[string]any {
-		raw, _ := ctx.Redis.Get(baselineKey)
+	stored := func(key string) map[string]any {
+		raw, _ := ctx.Redis.Get(key)
 		var out map[string]any
 		json.Unmarshal([]byte(raw), &out)
 		return out
 	}
-	ctx.Equal(stored(), want, "%s must hold the JSON object {\\"1\\": 10, \\"2\\": 20}", baselineKey)
-	again, err := freezeBaseline(stateBg, "t1", ref, map[int]int64{1: 99})
+	ctx.Equal(stored(hBaselineKey), want, "%s must hold the JSON object {\\"1\\": 10, \\"2\\": 20}", hBaselineKey)
+	again, err := freezeBaseline(hBg, "t1", hRef, map[int]int64{1: 99})
 	ctx.NoError(err, "the second freeze failed")
-	ctx.Equal(again, false, "a second freeze of %s must report that the reference already exists; written", ref)
-	ctx.Equal(stored(), want, "a second freeze rewrote the baseline: the monitor is now compared against today's traffic. Write it once (SET NX); the baseline")
-	ctx.Equal(ctx.Redis.TTL(baselineKey), -1, "the baseline must not expire; its TTL")
+	ctx.Equal(again, false, "a second freeze of %s must report that the reference already exists; written", hRef)
+	ctx.Equal(stored(hBaselineKey), want, "a second freeze rewrote the baseline: the monitor is now compared against today's traffic. Write it once (SET NX); the baseline")
+	ctx.Equal(ctx.Redis.TTL(hBaselineKey), -1, "the baseline must not expire; its TTL")
+	// Two freeze jobs race on a new reference: exactly one writes it, and it keeps that one's batch.
+	ref := "baseline:v3:2026-10-02"
+	key := "sketch:baseline:t1:" + ref
+	var rivalWrote bool
+	rival := ctx.Redis.After(key, func() any {
+		written, err := freezeBaseline(hBg, "t1", ref, map[int]int64{1: 7})
+		rivalWrote = written
+		return err
+	})
+	own, err := freezeBaseline(hBg, "t1", ref, map[int]int64{1: 40})
+	ctx.NoError(err, "the racing freeze of %s failed", ref)
+	ctx.Assert(rival.Fired, "the freeze of %s never touched %s", ref, key)
+	ctx.Assert(rival.Result == nil, "the other freeze failed: %v", rival.Result)
+	var winners []map[string]any
+	if own {
+		winners = append(winners, map[string]any{"1": 40})
+	}
+	if rivalWrote {
+		winners = append(winners, map[string]any{"1": 7})
+	}
+	ctx.Assert(len(winners) == 1, "two racing freezes of %s returned %t and %t: exactly one writes the reference. Check and write in one command (SET NX), not a read then a write", ref, own, rivalWrote)
+	ctx.Equal(stored(key), winners[0], "two racing freezes of %s: the one that reports true must be the one stored; %s", ref, key)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -768,10 +839,18 @@ func CheckBaselineFrozen(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kRef = "baseline:v3:2026-10-01";
-const std::string kBaselineKey = "sketch:baseline:t1:" + kRef;
+const std::string hRef = "baseline:v3:2026-10-01";
+const std::string hBaselineKey = "sketch:baseline:t1:" + hRef;
 
-std::map<std::string, std::string> hash(const std::map<std::string, std::string>& m) { return m; }
+std::map<std::string, std::string> hHash(const std::map<std::string, std::string>& m) { return m; }
+
+// Move the clock to offset seconds into a 300 s window; returns that window's start.
+long hIntoWindow(harness::Ctx& ctx, long offset) {
+  const long now = static_cast<long>(ctx.Clock.Now() / 1000);
+  const long step = ((offset - now) % 300 + 300) % 300;
+  if (step > 0) ctx.Clock.Advance(static_cast<double>(step));
+  return static_cast<long>(ctx.Clock.Now() / 1000) - offset;
+}
 
 }  // namespace
 
@@ -783,44 +862,44 @@ void CheckAtomicMerge(harness::Ctx& ctx) {
   // Another evaluator replica merges its batch between this merge's commands.
   auto fired = std::make_shared<bool>(false);
   auto error = std::make_shared<std::optional<std::string>>();
-  ctx.Redis.After(key, [fired, error] {
+  auto seen = std::make_shared<std::map<std::string, std::string>>();
+  ctx.Redis.After(key, [&ctx, key, fired, error, seen] {
     *fired = true;
+    *seen = ctx.Redis.HGetAll(key);
     try {
       mergeBatch("t1", "m-1", 300, {{1, 7}, {2, 1}});
     } catch (const std::exception& e) {
       *error = e.what();
     }
   });
-  mergeBatch("t1", "m-1", 300, {{1, 3}, {2, 2}});
+  const long long own = mergeBatch("t1", "m-1", 300, {{1, 3}, {2, 2}});
   ctx.Assert(*fired, "the second merge never touched %s", key);
   ctx.Assert(!*error, "the other replica's merge failed: %s", error->value_or(""));
-  ctx.Equal(ctx.Redis.HGetAll(key), hash({{"1", "15"}, {"2", "3"}}), "%s after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script", key);
-}
-
-// Move the clock to offset seconds into a 300 s window; returns that window's start.
-long intoWindow(harness::Ctx& ctx, long offset) {
-  const long now = static_cast<long>(ctx.Clock.Now() / 1000);
-  const long step = ((offset - now) % 300 + 300) % 300;
-  if (step > 0) ctx.Clock.Advance(static_cast<double>(step));
-  return static_cast<long>(ctx.Clock.Now() / 1000) - offset;
+  ctx.Equal(*seen, hHash({{"1", "8"}, {"2", "2"}}), "right after the first command of the merge of {1: 3, 2: 2} touched %s: the whole batch lands in one script, so another replica never sees half of it; the sketch", key);
+  ctx.Equal(ctx.Redis.HGetAll(key), hHash({{"1", "15"}, {"2", "3"}}), "%s after batches of 5, 7 and 3 in bucket 1 and 1 and 2 in bucket 2: the other replica's increment landed between your read and your write and was overwritten. Merge the batch with HINCRBY inside one script", key);
+  ctx.Equal(own, 10, "the merge of {1: 3, 2: 2} into a window of 5 samples returns the total the merging script saw, not a later read that counts another replica's batch; the total");
 }
 
 void CheckWindowKey(harness::Ctx& ctx) {
-  const long window = intoWindow(ctx, 10);
+  const long window = hIntoWindow(ctx, 10);
   mergeBatch("t1", "m-1", 300, {{1, 4}});
   const std::string first = "sketch:live:t1:m-1:" + std::to_string(window);
-  ctx.Equal(ctx.Redis.HGetAll(first), hash({{"1", "4"}}), "a batch 10 s into window %d (window_s 300) must land in %s (Redis holds %q)", window, first, ctx.Redis.Keys("sketch:*"));
+  ctx.Equal(ctx.Redis.HGetAll(first), hHash({{"1", "4"}}), "a batch 10 s into window %d (window_s 300) must land in %s (Redis holds %q)", window, first, ctx.Redis.Keys("sketch:*"));
   ctx.Clock.Advance(300);
   const long long total = mergeBatch("t1", "m-1", 300, {{2, 6}});
   const std::string second = "sketch:live:t1:m-1:" + std::to_string(window + 300);
-  ctx.Equal(ctx.Redis.HGetAll(second), hash({{"2", "6"}}), "the batch 300 s later must start the sketch of window %d, %s (Redis holds %q)", window + 300, second, ctx.Redis.Keys("sketch:*"));
+  ctx.Equal(ctx.Redis.HGetAll(second), hHash({{"2", "6"}}), "the batch 300 s later must start the sketch of window %d, %s (Redis holds %q)", window + 300, second, ctx.Redis.Keys("sketch:*"));
   ctx.Equal(total, 6, "the first batch of window %d must not count the previous window's samples; the window's samples", window + 300);
 }
 
 void CheckWindowTtl(harness::Ctx& ctx) {
-  const long window = intoWindow(ctx, 100);
+  const long window = hIntoWindow(ctx, 100);
   const std::string key = "sketch:live:t1:m-1:" + std::to_string(window);
+  auto created = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After(key, [&ctx, key, created] { *created = ctx.Redis.TTL(key); });
   mergeBatch("t1", "m-1", 300, {{1, 4}});
+  ctx.Assert(created->has_value(), "the merge never touched %s (Redis holds %q)", key, ctx.Redis.Keys("sketch:*"));
+  ctx.Assert(**created >= 199 && **created <= 200, "right after the command that created %s it expired in %d s, expected 200: the expiry is set by the merging script, so the sketch never exists without one", key, **created);
   long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(ttl >= 199 && ttl <= 200, "100 s into window %d the window has 200 s left, but %s expires in %d s (Redis holds %q): the expiry must be the seconds left in the window", window, key, ttl, ctx.Redis.Keys("sketch:*"));
   ctx.Clock.Advance(50);
@@ -832,13 +911,32 @@ void CheckWindowTtl(harness::Ctx& ctx) {
 }
 
 void CheckBaselineFrozen(harness::Ctx& ctx) {
-  ctx.Equal(freezeBaseline("t1", kRef, {{1, 10}, {2, 20}}), true, "the first freeze must write the baseline; written");
+  ctx.Equal(freezeBaseline("t1", hRef, {{1, 10}, {2, 20}}), true, "the first freeze must write the baseline; written");
   const nlohmann::json want = {{"1", 10}, {"2", 20}};
-  const auto stored = [&ctx] { return nlohmann::json::parse(ctx.Redis.Get(kBaselineKey).value_or("null")); };
-  ctx.Equal(stored(), want, "%s must hold the JSON object {\\"1\\": 10, \\"2\\": 20}", kBaselineKey);
-  ctx.Equal(freezeBaseline("t1", kRef, {{1, 99}}), false, "a second freeze of %s must report that the reference already exists; written", kRef);
-  ctx.Equal(stored(), want, "a second freeze rewrote the baseline: the monitor is now compared against today's traffic. Write it once (SET NX); the baseline");
-  ctx.Equal(ctx.Redis.TTL(kBaselineKey), -1, "the baseline must not expire; its TTL");
+  const auto stored = [&ctx](const std::string& key) { return nlohmann::json::parse(ctx.Redis.Get(key).value_or("null")); };
+  ctx.Equal(stored(hBaselineKey), want, "%s must hold the JSON object {\\"1\\": 10, \\"2\\": 20}", hBaselineKey);
+  ctx.Equal(freezeBaseline("t1", hRef, {{1, 99}}), false, "a second freeze of %s must report that the reference already exists; written", hRef);
+  ctx.Equal(stored(hBaselineKey), want, "a second freeze rewrote the baseline: the monitor is now compared against today's traffic. Write it once (SET NX); the baseline");
+  ctx.Equal(ctx.Redis.TTL(hBaselineKey), -1, "the baseline must not expire; its TTL");
+  // Two freeze jobs race on a new reference: exactly one writes it, and it keeps that one's batch.
+  const std::string ref = "baseline:v3:2026-10-02";
+  const std::string key = "sketch:baseline:t1:" + ref;
+  auto rival = std::make_shared<std::optional<bool>>();
+  auto error = std::make_shared<std::optional<std::string>>();
+  ctx.Redis.After(key, [ref, rival, error] {
+    try {
+      *rival = freezeBaseline("t1", ref, {{1, 7}});
+    } catch (const std::exception& e) {
+      *error = e.what();
+    }
+  });
+  const bool own = freezeBaseline("t1", ref, {{1, 40}});
+  ctx.Assert(rival->has_value() || error->has_value(), "the freeze of %s never touched %s", ref, key);
+  ctx.Assert(!*error, "the other freeze failed: %s", error->value_or(""));
+  const bool rivalWrote = **rival;
+  ctx.Assert(own != rivalWrote, "two racing freezes of %s returned %t and %t: exactly one writes the reference. Check and write in one command (SET NX), not a read then a write", ref, own, rivalWrote);
+  const nlohmann::json winner = own ? nlohmann::json{{"1", 40}} : nlohmann::json{{"1", 7}};
+  ctx.Equal(stored(key), winner, "two racing freezes of %s: the one that reports true must be the one stored; %s", ref, key);
 }
 `,
   },
