@@ -28,11 +28,13 @@ message EmbedReply   { repeated Vector vectors = 1; string model = 2; }  // one 
 
 Requirements:
 
-- \`CHUNK_SIZE\` = 800 characters; each chunk starts \`OVERLAP\` = 100 before the previous one ended.
+- \`CHUNK_SIZE\` = 800 characters; each chunk starts \`OVERLAP\` = 100 before the previous one ended, and
+  the chunk that reaches the end of the content is the last.
 - \`chunk_id\` is the hex SHA-256 of \`"{tenant}:{doc_id}:{version}:{start}"\`.
-- \`Embed\` takes up to \`BATCH\` = 32 texts per call, each call under a \`DEADLINE_S\` = 2 s deadline.
+- \`Embed\` takes up to \`BATCH\` = 32 texts per call, each call (a retry included) under its own
+  \`DEADLINE_S\` = 2 s deadline.
 - \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried after a backoff, \`MAX_ATTEMPTS\` = 3 calls in all;
-  any other status, or the last failure, raises, so the event is redelivered or dead-lettered.`,
+  any other status, or the last failure, raises at once, so the event is redelivered or dead-lettered.`,
   sequence: {
     participants: ['Worker', 'Redis', 'Embedder'],
     messages: [
@@ -50,7 +52,7 @@ Requirements:
       id: 'overlap',
       title: 'Chunks overlap by 100 characters',
       detail:
-        'A 2000-character document is indexed as (0, 800), (700, 1500), (1400, 2000), each chunk holding content[start:end], and index_document returns 3. The starter cuts at 0, 800, 1600.',
+        'A 2000-character document is indexed as (0, 800), (700, 1500), (1400, 2000), each chunk holding content[start:end], and index_document returns 3; the chunk that reaches the end is the last, so 1500 characters are two chunks and 800 one. The starter cuts at 0, 800, 1600.',
       match: {
         python: {all: [/\bOVERLAP\b/, /-\s*OVERLAP\b/]},
         typescript: {all: [/\bOVERLAP\b/, /-\s*OVERLAP\b/]},
@@ -76,7 +78,7 @@ Requirements:
       id: 'batch-size',
       title: 'Embeds up to 32 texts per call',
       detail:
-        'A 40-chunk document costs two Embed calls (32 + 8 texts), never more than 32 texts in one request. The starter makes one call per chunk.',
+        'A 40-chunk document costs two Embed calls (32 + 8 texts), never more than 32 texts in one request, and a 64-chunk document exactly two; every chunk is written with the vector returned for its own text. The starter makes one call per chunk.',
       match: {
         python: {all: [/\bBATCH\b/], none: [/texts\s*=\s*\[\s*text\s*\]/]},
         typescript: {all: [/\bBATCH\b/], none: [/texts:\s*\[\s*text\s*\]/]},
@@ -89,7 +91,7 @@ Requirements:
       id: 'call-deadline',
       title: 'Puts a two-second deadline on every Embed call',
       detail:
-        'Every Embed call carries a deadline of about 2 s; an embedder that hangs 5 s per call ends index_document with an error after three cut calls, in under 8 s. The starter sends no deadline and waits the hang out.',
+        'Every Embed call carries a deadline of about 2 s, each retry its own full 2 s; an embedder that hangs 5 s per call ends index_document with an error after three cut calls, in under 8 s. The starter sends no deadline and waits the hang out.',
       match: {
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -102,7 +104,7 @@ Requirements:
       id: 'bounded-retry',
       title: 'Retries only transient statuses, three calls at most',
       detail:
-        'One UNAVAILABLE is retried after a backoff and the document indexes; INVALID_ARGUMENT raises after one call; UNAVAILABLE five times raises after three calls. The starter retries every status up to ten times.',
+        'One UNAVAILABLE or one DEADLINE_EXCEEDED is retried after a backoff and the document indexes; INVALID_ARGUMENT, PERMISSION_DENIED, UNAUTHENTICATED or FAILED_PRECONDITION raises after one call, with no backoff; UNAVAILABLE five times raises after three calls and two backoffs. The starter retries every status up to ten times.',
       match: {
         python: {all: [/StatusCode\.UNAVAILABLE/, /\bMAX_ATTEMPTS\b/], none: [/MAX_TRIES/]},
         typescript: {all: [/status\.UNAVAILABLE/, /\bMAX_ATTEMPTS\b/], none: [/MAX_TRIES/]},
@@ -812,6 +814,12 @@ def check_overlap(ctx):
     for c in chunks:
         assert c["text"] == content[int(c["start"]) : int(c["end"])], f"the chunk at {c['start']} must hold content[start:end]"
     assert n == 3, f"index_document returns the number of chunks: expected 3, got {n}"
+    for size, expected in ((1500, [(0, 800), (700, 1500)]), (800, [(0, 800)])):
+        doc_id = f"len{size}"
+        ctx.redis.hset(f"rag:doc:t1:{doc_id}:1", mapping={"sha256": "-", "job_id": "j2", "content_type": "text/plain", "content": _text(size)})
+        n = m.index_document("t1", doc_id, 1)
+        spans = sorted((int(c["start"]), int(c["end"])) for c in _chunks(ctx) if c["doc_id"] == doc_id)
+        assert spans == expected and n == len(expected), f"a {size}-character document must be chunked {expected}: the chunk that reaches the end is the last; got {spans}, returned {n}"
 
 
 def check_stable_id(ctx):
@@ -832,6 +840,14 @@ def check_batch_size(ctx):
     assert max(sizes) <= 32, f"an Embed call carried {max(sizes)} texts; at most 32 per call"
     assert len(sizes) == math.ceil(n / 32), f"{n} chunks were embedded in {len(sizes)} calls of {sizes[:5]}... texts; batches of 32 need {math.ceil(n / 32)}"
     assert len(_chunks(ctx)) == n, f"every chunk is written: index_document returned {n}, the index holds {len(_chunks(ctx))}"
+    for c in _chunks(ctx):
+        stored = [float(x) for x in c["vec"].split(",")]
+        assert all(abs(a - b) < 1e-9 for a, b in zip(stored, embed.vector(c["text"]))) and len(stored) == embed.DIM, f"the chunk at {c['start']} was written with another text's vector: each chunk is upserted with the vector the embedder returned for its own text"
+    ctx.redis.hset("rag:doc:t1:wide:1", mapping={"sha256": "-", "job_id": "j2", "content_type": "text/plain", "content": _text(700 * 63 + 800)})
+    before = len(_calls(ctx))
+    n = m.index_document("t1", "wide", 1)
+    sizes = [len(c.request.texts) for c in _calls(ctx)[before:]]
+    assert n == 64 and sizes == [32, 32], f"a 64-chunk document is exactly two batches of 32: got {n} chunks in calls of {sizes} texts"
 
 
 def check_call_deadline(ctx):
@@ -846,6 +862,8 @@ def check_call_deadline(ctx):
     waited, hung = ctx.clock.offset - started, len(_calls(ctx)) - before
     assert raised, f"an embedder that hangs 5 s on every call must end index_document with an error once the attempts are spent; it returned after {waited:.1f} s and {hung} calls"
     assert hung == 3, f"a hung call is cut at the deadline and retried: expected 3 calls, saw {hung}"
+    retries = [c.timeout for c in _calls(ctx)[before:]]
+    assert all(t is not None and 1.5 <= t <= 2.5 for t in retries), f"every attempt carries its own 2 s deadline, a retry included; the three calls carried {retries}"
     assert waited <= 8.0, f"index_document waited {waited:.1f} s on a hung embedder: three 2-second deadlines and two backoffs fit in 8"
 
 
@@ -854,12 +872,19 @@ def check_bounded_retry(ctx):
     ctx.grpc.fail("Embed", grpc.StatusCode.UNAVAILABLE, "embedder restarting", times=1, target=config.EMBEDDER)
     assert _index(m) == 1
     assert len(_calls(ctx)) == 2 and ctx.clock.sleeps >= 1, f"one UNAVAILABLE earns one retry after a backoff: saw {len(_calls(ctx))} calls and {ctx.clock.sleeps} sleeps"
-    ctx.grpc.fail("Embed", grpc.StatusCode.INVALID_ARGUMENT, "text rejected", times=1, target=config.EMBEDDER)
-    raised = _raises(m)
-    assert raised and len(_calls(ctx)) == 3, f"INVALID_ARGUMENT is permanent: one call, then an error; saw {len(_calls(ctx)) - 2} calls and {'an error' if raised else 'a normal return'}"
+    ctx.grpc.fail("Embed", grpc.StatusCode.DEADLINE_EXCEEDED, "embedder slow", times=1, target=config.EMBEDDER)
+    assert _index(m) == 1 and len(_calls(ctx)) == 4, f"one DEADLINE_EXCEEDED earns one retry: saw {len(_calls(ctx)) - 2} calls"
+    for code in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.FAILED_PRECONDITION):
+        ctx.grpc.fail("Embed", code, "text rejected", times=1, target=config.EMBEDDER)
+        before, sleeps = len(_calls(ctx)), ctx.clock.sleeps
+        raised = _raises(m)
+        assert raised and len(_calls(ctx)) == before + 1, f"{code.name} is permanent: one call, then an error; saw {len(_calls(ctx)) - before} calls and {'an error' if raised else 'a normal return'}"
+        assert ctx.clock.sleeps == sleeps, f"{code.name} is permanent: it raises at once, without a backoff first"
     ctx.grpc.fail("Embed", grpc.StatusCode.UNAVAILABLE, "embedder down", times=5, target=config.EMBEDDER)
+    before, sleeps = len(_calls(ctx)), ctx.clock.sleeps
     raised = _raises(m)
-    assert raised and len(_calls(ctx)) == 6, f"an embedder that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then an error; saw {len(_calls(ctx)) - 3} calls and {'an error' if raised else 'a normal return'}"
+    assert raised and len(_calls(ctx)) == before + 3, f"an embedder that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then an error; saw {len(_calls(ctx)) - before} calls and {'an error' if raised else 'a normal return'}"
+    assert ctx.clock.sleeps - sleeps == 2, f"three attempts take two backoffs, none after the last failure: saw {ctx.clock.sleeps - sleeps}"
 `,
     typescript: `import {createHash} from 'node:crypto';
 
@@ -879,7 +904,7 @@ function world(ctx, n: number) {
   }, config.EMBEDDER);
   const content = text(n);
   ctx.redis.hset(DOC_KEY, 'sha256', '-', 'job_id', 'j1', 'content_type', 'text/plain', 'content', content);
-  return {m: ctx.load('chunk_embed'), content, config};
+  return {m: ctx.load('chunk_embed'), content, config, embed};
 }
 
 const index = m => m.indexDocument('t1', 'handbook', 3);
@@ -902,6 +927,13 @@ export async function check_overlap(ctx) {
   assert.deepEqual(spans, [[0, 800], [700, 1500], [1400, 2000]], \`a 2000-character document must be chunked (0, 800), (700, 1500), (1400, 2000): 800 characters, each starting 100 before the previous one ended; got \${JSON.stringify(spans)}\`);
   for (const c of all) assert.equal(c.text, content.slice(Number(c.start), Number(c.end)), \`the chunk at \${c.start} must hold content[start:end]\`);
   assert.equal(n, 3, \`indexDocument resolves to the number of chunks: expected 3, got \${n}\`);
+  for (const [size, expected] of [[1500, [[0, 800], [700, 1500]]], [800, [[0, 800]]]] as [number, number[][]][]) {
+    const docId = \`len\${size}\`;
+    ctx.redis.hset(\`rag:doc:t1:\${docId}:1\`, 'sha256', '-', 'job_id', 'j2', 'content_type', 'text/plain', 'content', text(size));
+    const count = await m.indexDocument('t1', docId, 1);
+    const got = chunks(ctx).filter(c => c.doc_id === docId).map(c => [Number(c.start), Number(c.end)]);
+    assert(JSON.stringify(got) === JSON.stringify(expected) && count === expected.length, \`a \${size}-character document must be chunked \${JSON.stringify(expected)}: the chunk that reaches the end is the last; got \${JSON.stringify(got)}, resolved to \${count}\`);
+  }
 }
 
 export async function check_stable_id(ctx) {
@@ -916,12 +948,22 @@ export async function check_stable_id(ctx) {
 }
 
 export async function check_batch_size(ctx) {
-  const {m} = world(ctx, 700 * 39 + 800);
+  const {m, embed} = world(ctx, 700 * 39 + 800);
   const n = await index(m);
   const sizes = calls(ctx).map(c => c.request.texts.length);
   assert(Math.max(...sizes) <= 32, \`an Embed call carried \${Math.max(...sizes)} texts; at most 32 per call\`);
   assert.equal(sizes.length, Math.ceil(n / 32), \`\${n} chunks were embedded in \${sizes.length} calls of \${JSON.stringify(sizes.slice(0, 5))}... texts; batches of 32 need \${Math.ceil(n / 32)}\`);
   assert.equal(chunks(ctx).length, n, \`every chunk is written: indexDocument resolved to \${n}, the index holds \${chunks(ctx).length}\`);
+  for (const c of chunks(ctx)) {
+    const stored = String(c.vec).split(',').map(Number);
+    const want = embed.vector(c.text);
+    assert(stored.length === want.length && stored.every((x, i) => Math.abs(x - want[i]) < 1e-9), \`the chunk at \${c.start} was written with another text's vector: each chunk is upserted with the vector the embedder returned for its own text\`);
+  }
+  ctx.redis.hset('rag:doc:t1:wide:1', 'sha256', '-', 'job_id', 'j2', 'content_type', 'text/plain', 'content', text(700 * 63 + 800));
+  const before = calls(ctx).length;
+  const wide = await m.indexDocument('t1', 'wide', 1);
+  const wideSizes = calls(ctx).slice(before).map(c => c.request.texts.length);
+  assert(wide === 64 && JSON.stringify(wideSizes) === '[32,32]', \`a 64-chunk document is exactly two batches of 32: got \${wide} chunks in calls of \${JSON.stringify(wideSizes)} texts\`);
 }
 
 export async function check_call_deadline(ctx) {
@@ -938,6 +980,8 @@ export async function check_call_deadline(ctx) {
   const hung = calls(ctx).length - before;
   assert(raised, \`an embedder that hangs 5 s on every call must end indexDocument with an error once the attempts are spent; it resolved after \${waited.toFixed(1)} s and \${hung} calls\`);
   assert.equal(hung, 3, \`a hung call is cut at the deadline and retried: expected 3 calls, saw \${hung}\`);
+  const retries = calls(ctx).slice(before).map(c => c.timeout);
+  assert(retries.every(t => t !== null && 1.5 <= t && t <= 2.5), \`every attempt carries its own 2 s deadline, a retry included; the three calls carried \${JSON.stringify(retries)} s\`);
   assert(waited <= 8.0, \`indexDocument waited \${waited.toFixed(1)} s on a hung embedder: three 2-second deadlines and two backoffs fit in 8\`);
 }
 
@@ -946,12 +990,22 @@ export async function check_bounded_retry(ctx) {
   ctx.grpc.fail('Embed', ctx.grpc.status.UNAVAILABLE, 'embedder restarting', 1, config.EMBEDDER);
   assert.equal(await index(m), 1);
   assert(calls(ctx).length === 2 && ctx.clock.sleeps >= 1, \`one UNAVAILABLE earns one retry after a backoff: saw \${calls(ctx).length} calls and \${ctx.clock.sleeps} sleeps\`);
-  ctx.grpc.fail('Embed', ctx.grpc.status.INVALID_ARGUMENT, 'text rejected', 1, config.EMBEDDER);
-  let raised = await raises(m);
-  assert(raised && calls(ctx).length === 3, \`INVALID_ARGUMENT is permanent: one call, then an error; saw \${calls(ctx).length - 2} calls and \${raised ? 'an error' : 'a normal return'}\`);
+  ctx.grpc.fail('Embed', ctx.grpc.status.DEADLINE_EXCEEDED, 'embedder slow', 1, config.EMBEDDER);
+  assert(await index(m) === 1 && calls(ctx).length === 4, \`one DEADLINE_EXCEEDED earns one retry: saw \${calls(ctx).length - 2} calls\`);
+  for (const code of ['INVALID_ARGUMENT', 'PERMISSION_DENIED', 'UNAUTHENTICATED', 'FAILED_PRECONDITION']) {
+    ctx.grpc.fail('Embed', ctx.grpc.status[code], 'text rejected', 1, config.EMBEDDER);
+    const before = calls(ctx).length;
+    const sleeps = ctx.clock.sleeps;
+    const raised = await raises(m);
+    assert(raised && calls(ctx).length === before + 1, \`\${code} is permanent: one call, then an error; saw \${calls(ctx).length - before} calls and \${raised ? 'an error' : 'a normal return'}\`);
+    assert.equal(ctx.clock.sleeps, sleeps, \`\${code} is permanent: it raises at once, without a backoff first\`);
+  }
   ctx.grpc.fail('Embed', ctx.grpc.status.UNAVAILABLE, 'embedder down', 5, config.EMBEDDER);
-  raised = await raises(m);
-  assert(raised && calls(ctx).length === 6, \`an embedder that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then an error; saw \${calls(ctx).length - 3} calls and \${raised ? 'an error' : 'a normal return'}\`);
+  const before = calls(ctx).length;
+  const sleeps = ctx.clock.sleeps;
+  const raised = await raises(m);
+  assert(raised && calls(ctx).length === before + 3, \`an embedder that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then an error; saw \${calls(ctx).length - before} calls and \${raised ? 'an error' : 'a normal return'}\`);
+  assert.equal(ctx.clock.sleeps - sleeps, 2, \`three attempts take two backoffs, none after the last failure: saw \${ctx.clock.sleeps - sleeps}\`);
 }
 `,
     go: `package main
@@ -961,6 +1015,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -1011,9 +1066,9 @@ func chunkWorld(ctx *harness.Ctx, n int) string {
 func chunkIndex() (int, error) { return indexDocument(context.Background(), "t1", "handbook", 3) }
 
 type storedChunk struct {
-	id         string
+	id, docID  string
 	start, end int
-	text       string
+	text, vec  string
 }
 
 func chunkRows(ctx *harness.Ctx) []storedChunk {
@@ -1022,10 +1077,15 @@ func chunkRows(ctx *harness.Ctx) []storedChunk {
 		h := ctx.Redis.HGetAll("rag:chunk:" + id)
 		start, _ := strconv.Atoi(h["start"])
 		end, _ := strconv.Atoi(h["end"])
-		out = append(out, storedChunk{id, start, end, h["text"]})
+		out = append(out, storedChunk{id, h["doc_id"], start, end, h["text"], h["vec"]})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].start < out[j].start })
 	return out
+}
+
+// chunkStore stores another document version for the worker to index.
+func chunkStore(ctx *harness.Ctx, docID string, n int) {
+	ctx.Redis.Do("HSET", "rag:doc:t1:"+docID+":1", "sha256", "-", "job_id", "j2", "content_type", "text/plain", "content", chunkText(n))
 }
 
 func chunkCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Embed", "") }
@@ -1044,6 +1104,22 @@ func CheckOverlap(ctx *harness.Ctx) {
 		ctx.Assert(c.text == content[c.start:c.end], "the chunk at %d must hold content[start:end]", c.start)
 	}
 	ctx.Equal(n, 3, "indexDocument returns the number of chunks")
+	for _, tc := range []struct {
+		size     int
+		expected [][2]int
+	}{{1500, [][2]int{{0, 800}, {700, 1500}}}, {800, [][2]int{{0, 800}}}} {
+		docID := fmt.Sprintf("len%d", tc.size)
+		chunkStore(ctx, docID, tc.size)
+		count, err := indexDocument(context.Background(), "t1", docID, 1)
+		ctx.NoError(err, "indexDocument of a %d-character document", tc.size)
+		var got [][2]int
+		for _, c := range chunkRows(ctx) {
+			if c.docID == docID {
+				got = append(got, [2]int{c.start, c.end})
+			}
+		}
+		ctx.Assert(fmt.Sprint(got) == fmt.Sprint(tc.expected) && count == len(tc.expected), "a %d-character document must be chunked %v: the chunk that reaches the end is the last; got %v, returned %d", tc.size, tc.expected, got, count)
+	}
 }
 
 func CheckStableId(ctx *harness.Ctx) {
@@ -1078,6 +1154,25 @@ func CheckBatchSize(ctx *harness.Ctx) {
 	ctx.Assert(most <= 32, "an Embed call carried %d texts; at most 32 per call", most)
 	ctx.Assert(len(sizes) == (n+31)/32, "%d chunks were embedded in %d calls of %v texts; batches of 32 need %d", n, len(sizes), sizes, (n+31)/32)
 	ctx.Equal(len(chunkRows(ctx)), n, "every chunk is written: indexDocument's count against the index")
+	for _, c := range chunkRows(ctx) {
+		want := embed.Vector(c.text)
+		parts := strings.Split(c.vec, ",")
+		same := len(parts) == len(want)
+		for i := 0; same && i < len(parts); i++ {
+			x, err := strconv.ParseFloat(parts[i], 64)
+			same = err == nil && math.Abs(x-want[i]) < 1e-9
+		}
+		ctx.Assert(same, "the chunk at %d was written with another text's vector: each chunk is upserted with the vector the embedder returned for its own text", c.start)
+	}
+	chunkStore(ctx, "wide", 700*63+800)
+	before := len(chunkCalls(ctx))
+	wide, err := indexDocument(context.Background(), "t1", "wide", 1)
+	ctx.NoError(err, "indexDocument of a 64-chunk document")
+	var wideSizes []int
+	for _, c := range chunkCalls(ctx)[before:] {
+		wideSizes = append(wideSizes, len(c.Request.(*pb.EmbedRequest).GetTexts()))
+	}
+	ctx.Assert(wide == 64 && fmt.Sprint(wideSizes) == "[32 32]", "a 64-chunk document is exactly two batches of 32: got %d chunks in calls of %v texts", wide, wideSizes)
 }
 
 func CheckCallDeadline(ctx *harness.Ctx) {
@@ -1096,6 +1191,9 @@ func CheckCallDeadline(ctx *harness.Ctx) {
 	waited, hung := float64(ctx.Clock.Now()-started)/1000, len(chunkCalls(ctx))-before
 	ctx.Assert(err != nil, "an embedder that hangs 5 s on every call must end indexDocument with an error once the attempts are spent; it returned after %.1f s and %d calls", waited, hung)
 	ctx.Equal(hung, 3, "a hung call is cut at the deadline and retried; calls")
+	for _, c := range chunkCalls(ctx)[before:] {
+		ctx.Assert(c.HasDeadline() && 1500*time.Millisecond <= c.Timeout && c.Timeout <= 2500*time.Millisecond, "every attempt carries its own 2 s deadline, a retry included; a call carried %v", c.Timeout)
+	}
 	ctx.Assert(waited <= 8.0, "indexDocument waited %.1f s on a hung embedder: three 2-second deadlines and two backoffs fit in 8", waited)
 }
 
@@ -1106,17 +1204,28 @@ func CheckBoundedRetry(ctx *harness.Ctx) {
 	ctx.NoError(err, "indexDocument after one UNAVAILABLE")
 	ctx.Equal(n, 1, "chunks")
 	ctx.Assert(len(chunkCalls(ctx)) == 2 && ctx.Clock.Sleeps() >= 1, "one UNAVAILABLE earns one retry after a backoff: saw %d calls and %d sleeps", len(chunkCalls(ctx)), ctx.Clock.Sleeps())
-	ctx.GRPC.Fail("Embed", codes.InvalidArgument, "text rejected", 1, config.Embedder)
-	_, err = chunkIndex()
-	ctx.Assert(err != nil && len(chunkCalls(ctx)) == 3, "INVALID_ARGUMENT is permanent: one call, then an error; saw %d calls and error %v", len(chunkCalls(ctx))-2, err)
+	ctx.GRPC.Fail("Embed", codes.DeadlineExceeded, "embedder slow", 1, config.Embedder)
+	n, err = chunkIndex()
+	ctx.Assert(err == nil && n == 1 && len(chunkCalls(ctx)) == 4, "one DEADLINE_EXCEEDED earns one retry: saw %d calls and error %v", len(chunkCalls(ctx))-2, err)
+	for _, code := range []codes.Code{codes.InvalidArgument, codes.PermissionDenied, codes.Unauthenticated, codes.FailedPrecondition} {
+		ctx.GRPC.Fail("Embed", code, "text rejected", 1, config.Embedder)
+		before, sleeps := len(chunkCalls(ctx)), ctx.Clock.Sleeps()
+		_, err = chunkIndex()
+		ctx.Assert(err != nil && len(chunkCalls(ctx)) == before+1, "%v is permanent: one call, then an error; saw %d calls and error %v", code, len(chunkCalls(ctx))-before, err)
+		ctx.Equal(ctx.Clock.Sleeps(), sleeps, "%v is permanent: it returns at once, without a backoff first; sleeps", code)
+	}
 	ctx.GRPC.Fail("Embed", codes.Unavailable, "embedder down", 5, config.Embedder)
+	before, sleeps := len(chunkCalls(ctx)), ctx.Clock.Sleeps()
 	_, err = chunkIndex()
-	ctx.Assert(err != nil && len(chunkCalls(ctx)) == 6, "an embedder that stays UNAVAILABLE gets maxAttempts = 3 calls, then an error; saw %d calls and error %v", len(chunkCalls(ctx))-3, err)
+	ctx.Assert(err != nil && len(chunkCalls(ctx)) == before+3, "an embedder that stays UNAVAILABLE gets maxAttempts = 3 calls, then an error; saw %d calls and error %v", len(chunkCalls(ctx))-before, err)
+	ctx.Equal(ctx.Clock.Sleeps()-sleeps, 2, "three attempts take two backoffs, none after the last failure; sleeps")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <algorithm>
+#include <cmath>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -1167,19 +1276,26 @@ bool chunkRaises() {
 
 struct Stored {
   std::string id;
+  std::string doc_id;
   int start = 0;
   int end = 0;
   std::string text;
+  std::string vec;
 };
 
 std::vector<Stored> chunkRows(harness::Ctx& ctx) {
   std::vector<Stored> out;
   for (const auto& id : ctx.Redis.SMembers("rag:chunks:t1")) {
     auto h = ctx.Redis.HGetAll("rag:chunk:" + id);
-    out.push_back({id, std::stoi(h["start"]), std::stoi(h["end"]), h["text"]});
+    out.push_back({id, h["doc_id"], std::stoi(h["start"]), std::stoi(h["end"]), h["text"], h["vec"]});
   }
   std::sort(out.begin(), out.end(), [](const Stored& a, const Stored& b) { return a.start < b.start; });
   return out;
+}
+
+// Another document version for the worker to index.
+void chunkStore(harness::Ctx& ctx, const std::string& doc_id, size_t n) {
+  ctx.Redis.Do("HSET", "rag:doc:t1:" + doc_id + ":1", "sha256", "-", "job_id", "j2", "content_type", "text/plain", "content", chunkText(n));
 }
 
 }  // namespace
@@ -1193,6 +1309,16 @@ void CheckOverlap(harness::Ctx& ctx) {
   ctx.Equal(spans, std::vector<std::vector<int>>{{0, 800}, {700, 1500}, {1400, 2000}}, "a 2000-character document's chunks (800 characters, each starting 100 before the previous one ended)");
   for (const auto& c : rows) ctx.Assert(c.text == content.substr(c.start, c.end - c.start), "the chunk at %d must hold content[start:end]", c.start);
   ctx.Equal(n, 3, "index_document returns the number of chunks");
+  const std::vector<std::pair<size_t, std::vector<std::vector<int>>>> shorter = {{1500, {{0, 800}, {700, 1500}}}, {800, {{0, 800}}}};
+  for (const auto& [size, expected] : shorter) {
+    const std::string doc_id = "len" + std::to_string(size);
+    chunkStore(ctx, doc_id, size);
+    const int count = index_document("t1", doc_id, 1);
+    std::vector<std::vector<int>> got;
+    for (const auto& c : chunkRows(ctx))
+      if (c.doc_id == doc_id) got.push_back({c.start, c.end});
+    ctx.Assert(got == expected && count == static_cast<int>(expected.size()), "a %d-character document must be chunked %v: the chunk that reaches the end is the last; got %v, returned %d", size, expected, got, count);
+  }
 }
 
 void CheckStableId(harness::Ctx& ctx) {
@@ -1220,6 +1346,22 @@ void CheckBatchSize(harness::Ctx& ctx) {
   ctx.Assert(most <= 32, "an Embed call carried %d texts; at most 32 per call", most);
   ctx.Assert(static_cast<int>(sizes.size()) == (n + 31) / 32, "%d chunks were embedded in %d calls of %v texts; batches of 32 need %d", n, sizes.size(), sizes, (n + 31) / 32);
   ctx.Equal(chunkRows(ctx).size(), n, "every chunk is written: index_document's count against the index");
+  for (const auto& c : chunkRows(ctx)) {
+    const auto want = embed::vector(c.text);
+    std::stringstream parts(c.vec);
+    std::string part;
+    size_t i = 0;
+    bool same = true;
+    for (; std::getline(parts, part, ','); i++) same = same && i < want.size() && std::fabs(std::stod(part) - want[i]) < 1e-9;
+    ctx.Assert(same && i == want.size(), "the chunk at %d was written with another text's vector: each chunk is upserted with the vector the embedder returned for its own text", c.start);
+  }
+  chunkStore(ctx, "wide", 700 * 63 + 800);
+  const size_t before = ctx.GRPC.CallsTo("Embed").size();
+  const int wide = index_document("t1", "wide", 1);
+  std::vector<int> wideSizes;
+  const auto all = ctx.GRPC.CallsTo("Embed");
+  for (size_t i = before; i < all.size(); i++) wideSizes.push_back(all[i].Request<rag::EmbedRequest>().texts_size());
+  ctx.Assert(wide == 64 && wideSizes == std::vector<int>{32, 32}, "a 64-chunk document is exactly two batches of 32: got %d chunks in calls of %v texts", wide, wideSizes);
 }
 
 void CheckCallDeadline(harness::Ctx& ctx) {
@@ -1239,6 +1381,9 @@ void CheckCallDeadline(harness::Ctx& ctx) {
   const size_t hung = ctx.GRPC.CallsTo("Embed").size() - before;
   ctx.Assert(raised, "an embedder that hangs 5 s on every call must end index_document with an error once the attempts are spent; it returned after %.1f s and %d calls", waited, hung);
   ctx.Equal(hung, 3, "a hung call is cut at the deadline and retried; calls");
+  const auto retried = ctx.GRPC.CallsTo("Embed");
+  for (size_t i = before; i < retried.size(); i++)
+    ctx.Assert(retried[i].HasDeadline() && 1.5 <= retried[i].TimeoutSeconds() && retried[i].TimeoutSeconds() <= 2.5, "every attempt carries its own 2 s deadline, a retry included; a call carried %vs", retried[i].TimeoutSeconds());
   ctx.Assert(waited <= 8.0, "index_document waited %.1f s on a hung embedder: three 2-second deadlines and two backoffs fit in 8", waited);
 }
 
@@ -1247,19 +1392,34 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
   ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "embedder restarting", 1, config::kEmbedder);
   ctx.Equal(index_document("t1", "handbook", 3), 1, "chunks after one UNAVAILABLE");
   ctx.Assert(ctx.GRPC.CallsTo("Embed").size() == 2 && ctx.Clock.Sleeps() >= 1, "one UNAVAILABLE earns one retry after a backoff: saw %d calls and %d sleeps", ctx.GRPC.CallsTo("Embed").size(), ctx.Clock.Sleeps());
-  ctx.GRPC.Fail("Embed", grpc::StatusCode::INVALID_ARGUMENT, "text rejected", 1, config::kEmbedder);
-  bool raised = chunkRaises();
-  ctx.Assert(raised && ctx.GRPC.CallsTo("Embed").size() == 3, "INVALID_ARGUMENT is permanent: one call, then an error; saw %d calls (raised: %t)", ctx.GRPC.CallsTo("Embed").size() - 2, raised);
+  ctx.GRPC.Fail("Embed", grpc::StatusCode::DEADLINE_EXCEEDED, "embedder slow", 1, config::kEmbedder);
+  ctx.Equal(index_document("t1", "handbook", 3), 1, "chunks after one DEADLINE_EXCEEDED");
+  ctx.Equal(ctx.GRPC.CallsTo("Embed").size(), 4, "one DEADLINE_EXCEEDED earns one retry; calls so far");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> permanent = {{grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+                                                                           {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+                                                                           {grpc::StatusCode::UNAUTHENTICATED, "UNAUTHENTICATED"},
+                                                                           {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"}};
+  for (const auto& [code, name] : permanent) {
+    ctx.GRPC.Fail("Embed", code, "text rejected", 1, config::kEmbedder);
+    const size_t before = ctx.GRPC.CallsTo("Embed").size();
+    const auto sleeps = ctx.Clock.Sleeps();
+    const bool raised = chunkRaises();
+    ctx.Assert(raised && ctx.GRPC.CallsTo("Embed").size() == before + 1, "%s is permanent: one call, then an error; saw %d calls (raised: %t)", name, ctx.GRPC.CallsTo("Embed").size() - before, raised);
+    ctx.Equal(ctx.Clock.Sleeps(), sleeps, "%s is permanent: it raises at once, without a backoff first; sleeps", name);
+  }
   ctx.GRPC.Fail("Embed", grpc::StatusCode::UNAVAILABLE, "embedder down", 5, config::kEmbedder);
-  raised = chunkRaises();
-  ctx.Assert(raised && ctx.GRPC.CallsTo("Embed").size() == 6, "an embedder that stays UNAVAILABLE gets kMaxAttempts = 3 calls, then an error; saw %d calls (raised: %t)", ctx.GRPC.CallsTo("Embed").size() - 3, raised);
+  const size_t before = ctx.GRPC.CallsTo("Embed").size();
+  const auto sleeps = ctx.Clock.Sleeps();
+  const bool raised = chunkRaises();
+  ctx.Assert(raised && ctx.GRPC.CallsTo("Embed").size() == before + 3, "an embedder that stays UNAVAILABLE gets kMaxAttempts = 3 calls, then an error; saw %d calls (raised: %t)", ctx.GRPC.CallsTo("Embed").size() - before, raised);
+  ctx.Equal(ctx.Clock.Sleeps() - sleeps, 2, "three attempts take two backoffs, none after the last failure; sleeps");
 }
 `,
   },
   hints: [
     'Symptom: an answer quotes half a sentence, a replayed ingest event doubles every chunk in the index, one slow embedder replica stalls ingestion for minutes, and a rejected text is retried ten times before the worker gives up.',
     'Mechanism: chunks start every 800 characters with no overlap, ids come from `uuid4()`, each chunk is its own `Embed` call without a `timeout`, and the retry loop treats every `RpcError` alike.',
-    'Change: step by `CHUNK_SIZE - OVERLAP`; `sha256(f"{tenant}:{doc_id}:{version}:{start}")`; embed `chunks[i:i + BATCH]` with `timeout=DEADLINE_S`; retry only `UNAVAILABLE` or `DEADLINE_EXCEEDED` while `attempt < MAX_ATTEMPTS`, then raise.',
+    'Change: start each chunk at the previous end minus `OVERLAP`, and stop at the chunk that reaches the end; `sha256(f"{tenant}:{doc_id}:{version}:{start}")`; embed `chunks[i:i + BATCH]` with `timeout=DEADLINE_S` on every attempt; retry only `UNAVAILABLE` or `DEADLINE_EXCEEDED` while `attempt < MAX_ATTEMPTS`, then raise.',
   ],
   debrief: `Overlap exists so a sentence that straddles a boundary is whole in at least one chunk; 100 characters is about a sentence, 800 a paragraph. The chunk id is a function of what the chunk is (tenant, document version, position), which lets an at-least-once consumer replay an event and land on the same keys. Batching cuts the round trips by up to thirty-two; the per-call deadline bounds what a hung replica costs; the retry set follows what a retry can change: a restarting server recovers, a rejected input does not. Production indexers also delete the chunks of a superseded version, store the embedding model beside each vector so a model change triggers a re-index, and cap batches in flight per tenant.`,
 };

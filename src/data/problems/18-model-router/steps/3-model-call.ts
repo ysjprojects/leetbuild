@@ -50,7 +50,7 @@ every call.
       id: 'deadline',
       title: 'Every attempt carries the 800 ms deadline',
       detail:
-        'Each `Complete` call is made with the 800 ms deadline (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`); a stalled deployment then ends in DEADLINE_EXCEEDED and the next attempt or the fallback gets its turn.',
+        'Each `Complete` call is made with the 800 ms deadline (`timeout=`, `deadline:`, a context with timeout, `withDeadlineAfter`, `set_deadline`), a full one per attempt, the retries and the fallback included; a stalled deployment then ends in DEADLINE_EXCEEDED and the next attempt or the fallback gets its turn.',
       match: {
         python: {all: [/\.Complete\([^)]*timeout\s*=/]},
         typescript: {all: [/\.Complete\([^)]*deadline\s*:/]},
@@ -76,7 +76,7 @@ every call.
       id: 'retryable',
       title: 'Retries only UNAVAILABLE and DEADLINE_EXCEEDED',
       detail:
-        'The status code decides: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt, anything else (`INVALID_ARGUMENT`, `PERMISSION_DENIED`) is raised at once and counts nowhere.',
+        'The status code decides: `UNAVAILABLE` and `DEADLINE_EXCEEDED` are worth another attempt, anything else (`INVALID_ARGUMENT`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `NOT_FOUND`, each checked on its own) is raised at once and counts nowhere.',
       match: {
         python: {all: [/\.code\(\)/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
         typescript: {all: [/\.code\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/]},
@@ -102,7 +102,7 @@ every call.
       id: 'breaker',
       title: 'Opens circuit:{model} after five failures for 30 s',
       detail:
-        '`circuit:{model}` counts retryable failures with INCR and a 30 s expiry; at five it is set to `open` for 30 s and the model is skipped until it expires, by every replica.',
+        '`circuit:{model}` counts retryable failures with INCR and a 30 s expiry, which the count carries before it reaches five; at five it is set to `open` for 30 s and the model is skipped until it expires, by every replica.',
       match: {
         python: {all: [/f["']circuit:\{/, /\.incr\(/, /["']open["']/, /\.expire\(|\bex\s*=/]},
         typescript: {all: [/`circuit:\$\{/, /\.incr\(/, /['"]open['"]/, /\.expire\(|['"]EX['"]/]},
@@ -723,7 +723,8 @@ async def check_deadline(ctx):
     assert out["ended"], f"with gpt-4o stalled the call never ended ({_calls(ctx, LARGE)} attempts on it): every attempt needs a deadline"
     large = ctx.grpc.calls_to("Complete", LARGE)
     assert large and large[0].timeout is not None, "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes"
-    assert 0.7 <= large[0].timeout <= 0.9, f"each attempt's deadline must be 800 ms, got {large[0].timeout} s"
+    timeouts = [c.timeout for c in large + ctx.grpc.calls_to("Complete", SMALL)]
+    assert all(t is not None and 0.7 <= t <= 0.9 for t in timeouts), f"each attempt's deadline must be 800 ms, a full one per attempt, the retries' and the fallback's included; the attempts on gpt-4o, then gpt-4o-mini, carried {timeouts} s"
     assert out["error"] is None and out["model"] == "gpt-4o-mini", f"after gpt-4o timed out on every attempt the fallback must answer; got model {out['model']!r} and {out['error']!r}"
     assert len(large) == 3, f"gpt-4o was tried {len(large)} times, expected 3 attempts of 800 ms"
 
@@ -747,10 +748,17 @@ async def check_retryable(ctx):
     assert _calls(ctx, LARGE) == 1, f"INVALID_ARGUMENT is not retryable: gpt-4o was called {_calls(ctx, LARGE)} times, expected once"
     assert _calls(ctx, SMALL) == 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong"
     assert ctx.redis.get("circuit:gpt-4o") is None, "a non-retryable failure must not count towards the breaker"
+    for code in (grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.NOT_FOUND):
+        before = _calls(ctx, LARGE)
+        ctx.grpc.fail("Complete", code, "refused", times=1, target=LARGE)
+        out = _run(ctx, m)
+        assert out["ended"] and out["error"] is not None, f"{code.name} from gpt-4o must be raised to the caller at once, the call returned {out['model']!r}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert _calls(ctx, LARGE) == before + 1 and _calls(ctx, SMALL) == 0, f"{code.name} is not retryable: gpt-4o was called {_calls(ctx, LARGE) - before} times and gpt-4o-mini {_calls(ctx, SMALL)} times, expected once and never"
+    assert ctx.redis.get("circuit:gpt-4o") is None, "a non-retryable failure must not count towards the breaker"
     ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, "gpt-4o restarting", times=1, target=LARGE)
     out = _run(ctx, m)
     assert out["error"] is None and out["model"] == "gpt-4o", f"one UNAVAILABLE must be retried on gpt-4o, got model {out['model']!r} and {out['error']!r}"
-    assert _calls(ctx, LARGE) == 3, f"gpt-4o was called {_calls(ctx, LARGE)} times in all, expected 1 + 2 (one refusal, then one retried failure)"
+    assert _calls(ctx, LARGE) == 6, f"gpt-4o was called {_calls(ctx, LARGE)} times in all, expected 4 + 2 (four refusals, then one retried failure)"
 
 
 async def check_fallback(ctx):
@@ -771,6 +779,8 @@ async def check_breaker(ctx):
     m = _world(ctx)
     ctx.grpc.fail("Complete", grpc.StatusCode.UNAVAILABLE, "gpt-4o overloaded", times=5, target=LARGE)
     first = _run(ctx, m)
+    counted, counted_ttl = ctx.redis.get("circuit:gpt-4o"), ctx.redis.ttl("circuit:gpt-4o")
+    assert counted == "3" and 0 < counted_ttl <= 30, f"after three retryable failures circuit:gpt-4o is {counted!r} with TTL {counted_ttl}, expected the count 3 expiring within 30 s: a count that never expires opens the circuit on failures spread over days"
     second = _run(ctx, m)
     state = ctx.redis.get("circuit:gpt-4o")
     assert state == "open", f"after five retryable failures circuit:gpt-4o is {state!r}, expected 'open'"
@@ -828,7 +838,8 @@ export async function check_deadline(ctx) {
   assert(out.ended, \`with gpt-4o stalled the call never ended (\${calls(ctx, LARGE)} attempts on it): every attempt needs a deadline\`);
   const large = ctx.grpc.callsTo('Complete', LARGE);
   assert(large.length > 0 && large[0].timeout !== null, 'the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes');
-  assert(0.7 <= large[0].timeout && large[0].timeout <= 0.9, \`each attempt's deadline must be 800 ms, got \${large[0].timeout} s\`);
+  const timeouts = [...large, ...ctx.grpc.callsTo('Complete', SMALL)].map(c => c.timeout);
+  assert(timeouts.every(t => t !== null && 0.7 <= t && t <= 0.9), \`each attempt's deadline must be 800 ms, a full one per attempt, the retries' and the fallback's included; the attempts on gpt-4o, then gpt-4o-mini, carried \${JSON.stringify(timeouts)} s\`);
   assert(out.error === null && out.model === 'gpt-4o-mini', \`after gpt-4o timed out on every attempt the fallback must answer; got model \${JSON.stringify(out.model)} and \${out.error}\`);
   assert.equal(large.length, 3, \`gpt-4o was tried \${large.length} times, expected 3 attempts of 800 ms\`);
 }
@@ -852,10 +863,18 @@ export async function check_retryable(ctx) {
   assert.equal(calls(ctx, LARGE), 1, \`INVALID_ARGUMENT is not retryable: gpt-4o was called \${calls(ctx, LARGE)} times, expected once\`);
   assert.equal(calls(ctx, SMALL), 0, 'INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong');
   assert.equal(ctx.redis.get('circuit:gpt-4o'), null, 'a non-retryable failure must not count towards the breaker');
+  for (const code of ['PERMISSION_DENIED', 'RESOURCE_EXHAUSTED', 'NOT_FOUND']) {
+    const before = calls(ctx, LARGE);
+    ctx.grpc.fail('Complete', ctx.grpc.status[code], 'refused', 1, LARGE);
+    out = await run(ctx, m);
+    assert(out.ended && out.error !== null, \`\${code} from gpt-4o must be thrown to the caller at once, the call returned \${JSON.stringify(out.model)}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert(calls(ctx, LARGE) === before + 1 && calls(ctx, SMALL) === 0, \`\${code} is not retryable: gpt-4o was called \${calls(ctx, LARGE) - before} times and gpt-4o-mini \${calls(ctx, SMALL)} times, expected once and never\`);
+  }
+  assert.equal(ctx.redis.get('circuit:gpt-4o'), null, 'a non-retryable failure must not count towards the breaker');
   ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, 'gpt-4o restarting', 1, LARGE);
   out = await run(ctx, m);
   assert(out.error === null && out.model === 'gpt-4o', \`one UNAVAILABLE must be retried on gpt-4o, got model \${JSON.stringify(out.model)} and \${out.error}\`);
-  assert.equal(calls(ctx, LARGE), 3, \`gpt-4o was called \${calls(ctx, LARGE)} times in all, expected 1 + 2 (one refusal, then one retried failure)\`);
+  assert.equal(calls(ctx, LARGE), 6, \`gpt-4o was called \${calls(ctx, LARGE)} times in all, expected 4 + 2 (four refusals, then one retried failure)\`);
 }
 
 export async function check_fallback(ctx) {
@@ -876,6 +895,9 @@ export async function check_breaker(ctx) {
   const m = world(ctx);
   ctx.grpc.fail('Complete', ctx.grpc.status.UNAVAILABLE, 'gpt-4o overloaded', 5, LARGE);
   const first = await run(ctx, m);
+  const counted = ctx.redis.get('circuit:gpt-4o');
+  const countedTtl = Number(ctx.redis.ttl('circuit:gpt-4o'));
+  assert(counted === '3' && 0 < countedTtl && countedTtl <= 30, \`after three retryable failures circuit:gpt-4o is \${JSON.stringify(counted)} with TTL \${countedTtl}, expected the count 3 expiring within 30 s: a count that never expires opens the circuit on failures spread over days\`);
   const second = await run(ctx, m);
   const state = ctx.redis.get('circuit:gpt-4o');
   assert.equal(state, 'open', \`after five retryable failures circuit:gpt-4o is \${JSON.stringify(state)}, expected 'open'\`);
@@ -954,7 +976,13 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", modelCalls(ctx, largeTarget))
 	large := ctx.GRPC.CallsTo("Complete", largeTarget)
 	ctx.Assert(len(large) > 0 && large[0].HasDeadline(), "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes")
-	ctx.Assert(700*time.Millisecond <= large[0].Timeout && large[0].Timeout <= 900*time.Millisecond, "each attempt's deadline must be 800 ms, got %v", large[0].Timeout)
+	timeouts := []time.Duration{}
+	full := true
+	for _, call := range append(large, ctx.GRPC.CallsTo("Complete", smallTarget)...) {
+		timeouts = append(timeouts, call.Timeout)
+		full = full && call.HasDeadline() && 700*time.Millisecond <= call.Timeout && call.Timeout <= 900*time.Millisecond
+	}
+	ctx.Assert(full, "each attempt's deadline must be 800 ms, a full one per attempt, the retries' and the fallback's included; the attempts on gpt-4o, then gpt-4o-mini, carried %v", timeouts)
 	ctx.Assert(out.err == nil && out.model == "gpt-4o-mini", "after gpt-4o timed out on every attempt the fallback must answer; got model %q and %v", out.model, out.err)
 	ctx.Equal(len(large), 3, "gpt-4o attempts (3 of 800 ms each)")
 }
@@ -979,10 +1007,19 @@ func CheckRetryable(ctx *harness.Ctx) {
 	ctx.Equal(modelCalls(ctx, smallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls")
 	_, counted := ctx.Redis.Get("circuit:gpt-4o")
 	ctx.Assert(!counted, "a non-retryable failure must not count towards the breaker")
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.ResourceExhausted, codes.NotFound} {
+		before := modelCalls(ctx, largeTarget)
+		ctx.GRPC.Fail("Complete", code, "refused", 1, largeTarget)
+		out = modelRun(ctx, "gpt-4o")
+		ctx.Assert(out.ended && out.err != nil, "%v from gpt-4o must be returned to the caller at once, the call returned model %q: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", code, out.model)
+		ctx.Assert(modelCalls(ctx, largeTarget) == before+1 && modelCalls(ctx, smallTarget) == 0, "%v is not retryable: gpt-4o was called %d times and gpt-4o-mini %d times, expected once and never", code, modelCalls(ctx, largeTarget)-before, modelCalls(ctx, smallTarget))
+	}
+	_, counted = ctx.Redis.Get("circuit:gpt-4o")
+	ctx.Assert(!counted, "a non-retryable failure must not count towards the breaker")
 	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o restarting", 1, largeTarget)
 	out = modelRun(ctx, "gpt-4o")
 	ctx.Assert(out.err == nil && out.model == "gpt-4o", "one UNAVAILABLE must be retried on gpt-4o, got model %q and %v", out.model, out.err)
-	ctx.Equal(modelCalls(ctx, largeTarget), 3, "gpt-4o calls in all (1 + 2: one refusal, then one retried failure)")
+	ctx.Equal(modelCalls(ctx, largeTarget), 6, "gpt-4o calls in all (4 + 2: four refusals, then one retried failure)")
 }
 
 func CheckFallback(ctx *harness.Ctx) {
@@ -1003,6 +1040,9 @@ func CheckBreaker(ctx *harness.Ctx) {
 	modelWorld(ctx)
 	ctx.GRPC.Fail("Complete", codes.Unavailable, "gpt-4o overloaded", 5, largeTarget)
 	first := modelRun(ctx, "gpt-4o")
+	count, _ := ctx.Redis.Get("circuit:gpt-4o")
+	countTTL := ctx.Redis.TTL("circuit:gpt-4o")
+	ctx.Assert(count == "3" && 0 < countTTL && countTTL <= 30, "after three retryable failures circuit:gpt-4o is %q with TTL %d, expected the count 3 expiring within 30 s: a count that never expires opens the circuit on failures spread over days", count, countTTL)
 	second := modelRun(ctx, "gpt-4o")
 	state, _ := ctx.Redis.Get("circuit:gpt-4o")
 	ctx.Equal(state, "open", "after five retryable failures circuit:gpt-4o")
@@ -1022,6 +1062,8 @@ func CheckBreaker(ctx *harness.Ctx) {
 
 #include <exception>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -1089,7 +1131,15 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(out.ended, "with gpt-4o stalled the call never ended (%d attempts on it): every attempt needs a deadline", modelCalls(ctx, kLargeTarget));
   const auto large = ctx.GRPC.CallsTo("Complete", kLargeTarget);
   ctx.Assert(!large.empty() && large[0].HasDeadline(), "the Complete call to gpt-4o carries no deadline: a stalled deployment holds the worker as long as it likes");
-  ctx.Assert(0.7 <= large[0].TimeoutSeconds() && large[0].TimeoutSeconds() <= 0.9, "each attempt's deadline must be 800 ms, got %vs", large[0].TimeoutSeconds());
+  std::string timeouts;
+  bool full = true;
+  for (const auto& target : {kLargeTarget, kSmallTarget}) {
+    for (const auto& call : ctx.GRPC.CallsTo("Complete", target)) {
+      timeouts += (timeouts.empty() ? "" : ", ") + (call.HasDeadline() ? std::to_string(call.TimeoutSeconds()) : std::string("none"));
+      full = full && call.HasDeadline() && 0.7 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.9;
+    }
+  }
+  ctx.Assert(full, "each attempt's deadline must be 800 ms, a full one per attempt, the retries' and the fallback's included; the attempts on gpt-4o, then gpt-4o-mini, carried [%s] s", timeouts);
   ctx.Assert(out.error.empty() && out.model == "gpt-4o-mini", "after gpt-4o timed out on every attempt the fallback must answer; got model %q and %s", out.model, out.error);
   ctx.Equal(large.size(), 3, "gpt-4o attempts (3 of 800 ms each)");
 }
@@ -1113,10 +1163,23 @@ void CheckRetryable(harness::Ctx& ctx) {
   ctx.Equal(modelCalls(ctx, kLargeTarget), 1, "INVALID_ARGUMENT is not retryable; gpt-4o calls");
   ctx.Equal(modelCalls(ctx, kSmallTarget), 0, "INVALID_ARGUMENT is not retryable: the fallback must not be tried, the request itself is wrong; gpt-4o-mini calls");
   ctx.Assert(!ctx.Redis.Get("circuit:gpt-4o"), "a non-retryable failure must not count towards the breaker");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+  };
+  for (const auto& [code, name] : terminal) {
+    const size_t before = modelCalls(ctx, kLargeTarget);
+    ctx.GRPC.Fail("Complete", code, "refused", 1, kLargeTarget);
+    out = modelRun(ctx);
+    ctx.Assert(out.ended && !out.error.empty(), "%s from gpt-4o must be thrown to the caller at once, the call returned model %q: only UNAVAILABLE and DEADLINE_EXCEEDED are retried", name, out.model);
+    ctx.Assert(modelCalls(ctx, kLargeTarget) == before + 1 && modelCalls(ctx, kSmallTarget) == 0, "%s is not retryable: gpt-4o was called %d times and gpt-4o-mini %d times, expected once and never", name, modelCalls(ctx, kLargeTarget) - before, modelCalls(ctx, kSmallTarget));
+  }
+  ctx.Assert(!ctx.Redis.Get("circuit:gpt-4o"), "a non-retryable failure must not count towards the breaker");
   ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o restarting", 1, kLargeTarget);
   out = modelRun(ctx);
   ctx.Assert(out.error.empty() && out.model == "gpt-4o", "one UNAVAILABLE must be retried on gpt-4o, got model %q and %s", out.model, out.error);
-  ctx.Equal(modelCalls(ctx, kLargeTarget), 3, "gpt-4o calls in all (1 + 2: one refusal, then one retried failure)");
+  ctx.Equal(modelCalls(ctx, kLargeTarget), 6, "gpt-4o calls in all (4 + 2: four refusals, then one retried failure)");
 }
 
 void CheckFallback(harness::Ctx& ctx) {
@@ -1137,6 +1200,9 @@ void CheckBreaker(harness::Ctx& ctx) {
   modelWorld(ctx);
   ctx.GRPC.Fail("Complete", grpc::StatusCode::UNAVAILABLE, "gpt-4o overloaded", 5, kLargeTarget);
   const auto first = modelRun(ctx);
+  const std::string count = ctx.Redis.Get("circuit:gpt-4o").value_or("");
+  const long long count_ttl = ctx.Redis.TTL("circuit:gpt-4o");
+  ctx.Assert(count == "3" && 0 < count_ttl && count_ttl <= 30, "after three retryable failures circuit:gpt-4o is %q with TTL %d, expected the count 3 expiring within 30 s: a count that never expires opens the circuit on failures spread over days", count, count_ttl);
   const auto second = modelRun(ctx);
   ctx.Equal(ctx.Redis.Get("circuit:gpt-4o"), "open", "after five retryable failures circuit:gpt-4o");
   const long long ttl = ctx.Redis.TTL("circuit:gpt-4o");

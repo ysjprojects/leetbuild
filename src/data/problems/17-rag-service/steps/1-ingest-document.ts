@@ -57,7 +57,7 @@ Requirements:
       id: 'validate-body',
       title: 'Rejects a bad id, type, version or size before storing',
       detail:
-        'An id outside ^[a-z0-9][a-z0-9_-]{2,63}$, a content_type outside ALLOWED_TYPES or a version below 1 is 400, content over 1 MiB is 413, and none of them leaves a key in Redis; exactly 1 MiB is accepted. The starter stores all of them.',
+        'An id outside ^[a-z0-9][a-z0-9_-]{2,63}$ (a valid prefix, a trailing newline or 65 characters included), a content_type outside ALLOWED_TYPES or a version below 1 is 400, content over 1 MiB of UTF-8 is 413 (counted in bytes, not characters), and none of them leaves a key in Redis; exactly 1 MiB and a 64-character id are accepted. The starter stores all of them.',
       match: {
         python: {all: [/ALLOWED_TYPES/, /MAX_BODY_BYTES/, /status_code\s*=\s*413/]},
         typescript: {all: [/ALLOWED_TYPES/, /MAX_BODY_BYTES/, /code\(\s*413\s*\)/]},
@@ -85,7 +85,7 @@ Requirements:
       id: 'outbox-tx',
       title: 'Writes the document and its outbox row together',
       detail:
-        'At the instant the document becomes visible in Redis its outbox row is already there: one MULTI/EXEC (or one script) writes both. The starter writes the hash, then pushes the row in a second round trip.',
+        'At the instant the document becomes visible in Redis its outbox row is already there, and the row never appears before the document: one MULTI/EXEC (or one script) writes both. The starter writes the hash, then pushes the row in a second round trip.',
       match: {
         python: {all: [/\.pipeline\(|\.transaction\(|register_script/], none: [/transaction\s*=\s*False/]},
         typescript: {all: [/\.multi\(|\.eval\(|defineCommand\(/]},
@@ -98,7 +98,7 @@ Requirements:
       id: 'event-ids-only',
       title: 'Puts ids and the hash in the event, not the document',
       detail:
-        'The outbox row is {tenant, doc_id, version, job_id, sha256} with the SHA-256 of the content and no content field: the worker reads the text from the store. The starter copies the whole document into the event.',
+        'The outbox row is exactly {tenant, doc_id, version, job_id, sha256}, with the SHA-256 of the content and no other field: the worker reads the text from the store. The starter copies the whole document into the event.',
       match: {
         python: {all: [/event\s*=\s*\{[^}]*["']sha256["']/], none: [/event\s*=\s*\{[^}]*["']content["']\s*:/]},
         typescript: {all: [/event\s*=\s*\{[^}]*\bsha256\b/], none: [/event\s*=\s*\{[^}]*\bcontent:/]},
@@ -859,9 +859,14 @@ async def check_validate_body(ctx):
     cases = [
         ({**GOOD, "doc_id": "Bad ID!"}, 400, "a doc_id with spaces and capitals"),
         ({**GOOD, "doc_id": "ab"}, 400, "a two-character doc_id"),
+        ({**GOOD, "doc_id": "abc def"}, 400, "a doc_id with a space after a valid prefix"),
+        ({**GOOD, "doc_id": "handbook-2026\\n"}, 400, "a doc_id ending in a newline"),
+        ({**GOOD, "doc_id": "a" * 65}, 400, "a 65-character doc_id"),
         ({**GOOD, "content_type": "image/png"}, 400, "content_type image/png"),
         ({**GOOD, "version": 0}, 400, "version 0"),
+        ({**GOOD, "version": -1}, 400, "version -1"),
         ({**GOOD, "content": "a" * ((1 << 20) + 1)}, 413, "content of 1 MiB + 1 byte"),
+        ({**GOOD, "content": "é" * ((1 << 19) + 1)}, 413, "524289 two-byte characters (1 MiB + 2 bytes of UTF-8)"),
     ]
     async with _api(ctx) as c:
         for body, status, what in cases:
@@ -870,6 +875,10 @@ async def check_validate_body(ctx):
         assert ctx.redis.keys("rag:*") == [], f"rejected uploads must store nothing, Redis holds {sorted(ctx.redis.keys('rag:*'))}"
         r = await _post(c, {**GOOD, "content": "a" * (1 << 20)})
         assert r.status_code == 202, f"exactly 1 MiB is within the limit, got {r.status_code}"
+        r = await _post(c, {**GOOD, "version": 2, "content": "é" * (1 << 19)})
+        assert r.status_code == 202, f"exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit, got {r.status_code}"
+        r = await _post(c, {**GOOD, "doc_id": "a" * 64})
+        assert r.status_code == 202, f"a 64-character doc_id is valid, got {r.status_code}"
 
 
 async def check_version_conflict(ctx):
@@ -902,10 +911,20 @@ async def check_outbox_tx(ctx):
         taken.append(ctx.redis_after(DOC, snapshot))  # the lookup came first: watch the write
         return None
 
+    rows_seen = []
+
+    def row_appears():
+        if ctx.redis.llen("rag:outbox") == 0:  # a read of the list, not the row: watch on
+            rows_seen.append(ctx.redis_after("rag:outbox", row_appears))
+            return None
+        return ctx.redis.exists(DOC) == 1
+
     probe = ctx.redis_after(DOC, first_touch)
+    rows_seen.append(ctx.redis_after("rag:outbox", row_appears))
     async with _api(ctx) as c:
         r = await _post(c, GOOD)
     assert r.status_code == 202, f"a valid upload answered {r.status_code}: {r.text}"
+    assert rows_seen[-1].result is not False, "the outbox row appeared before its document: a crash right there leaves an event naming a document that was never stored; write both in one MULTI/EXEC"
     seen = probe.result or (taken[0].result if taken and taken[0].fired else None)
     assert seen is not None and seen["doc"], "the document was never written"
     assert seen["outbox"] == 1, f"when the document became visible rag:outbox held {seen['outbox']} rows: a crash right there leaves a document no worker hears about; write both in one MULTI/EXEC"
@@ -921,6 +940,7 @@ async def check_event_ids_only(ctx):
     assert len(rows) == 1, f"one upload, one outbox row: found {len(rows)}"
     row = rows[0]
     assert "content" not in row, f"the event carries the document text: {sorted(row)}; ids and the hash only, the worker reads the content from the store"
+    assert sorted(row) == ["doc_id", "job_id", "sha256", "tenant", "version"], f"the event is {{tenant, doc_id, version, job_id, sha256}} and nothing else, got the fields {sorted(row)}"
     expected = {"tenant": "t1", "doc_id": "handbook-2026", "version": 1, "job_id": r.json()["job_id"], "sha256": _sha(GOOD["content"])}
     for key, value in expected.items():
         assert row.get(key) == value, f"the event must carry {key}={value!r}, got {row}"
@@ -953,9 +973,14 @@ export async function check_validate_body(ctx) {
   const cases: [Record<string, unknown>, number, string][] = [
     [{...GOOD, doc_id: 'Bad ID!'}, 400, 'a doc_id with spaces and capitals'],
     [{...GOOD, doc_id: 'ab'}, 400, 'a two-character doc_id'],
+    [{...GOOD, doc_id: 'abc def'}, 400, 'a doc_id with a space after a valid prefix'],
+    [{...GOOD, doc_id: 'handbook-2026\\n'}, 400, 'a doc_id ending in a newline'],
+    [{...GOOD, doc_id: 'a'.repeat(65)}, 400, 'a 65-character doc_id'],
     [{...GOOD, content_type: 'image/png'}, 400, 'content_type image/png'],
     [{...GOOD, version: 0}, 400, 'version 0'],
+    [{...GOOD, version: -1}, 400, 'version -1'],
     [{...GOOD, content: 'a'.repeat((1 << 20) + 1)}, 413, 'content of 1 MiB + 1 byte'],
+    [{...GOOD, content: 'é'.repeat((1 << 19) + 1)}, 413, '524289 two-byte characters (1 MiB + 2 bytes of UTF-8)'],
   ];
   for (const [body, status, what] of cases) {
     const r = await post(c, body);
@@ -964,6 +989,10 @@ export async function check_validate_body(ctx) {
   assert.deepEqual(ctx.redis.keys('rag:*'), [], \`rejected uploads must store nothing, Redis holds \${JSON.stringify(ctx.redis.keys('rag:*').sort())}\`);
   const max = await post(c, {...GOOD, content: 'a'.repeat(1 << 20)});
   assert.equal(max.status, 202, \`exactly 1 MiB is within the limit, got \${max.status}\`);
+  const wide = await post(c, {...GOOD, version: 2, content: 'é'.repeat(1 << 19)});
+  assert.equal(wide.status, 202, \`exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit, got \${wide.status}\`);
+  const longId = await post(c, {...GOOD, doc_id: 'a'.repeat(64)});
+  assert.equal(longId.status, 202, \`a 64-character doc_id is valid, got \${longId.status}\`);
 }
 
 export async function check_version_conflict(ctx) {
@@ -986,14 +1015,24 @@ export async function check_version_conflict(ctx) {
 export async function check_outbox_tx(ctx) {
   const snapshot = () => ({doc: ctx.redis.exists(DOC), outbox: ctx.redis.llen('rag:outbox')});
   const armed: {fired: boolean; result: unknown}[] = [];
+  const rowsSeen: {fired: boolean; result: unknown}[] = [];
+  const rowAppears = () => {
+    if (ctx.redis.llen('rag:outbox') === 0) {
+      rowsSeen.push(ctx.redisAfter('rag:outbox', rowAppears)); // a read of the list, not the row: watch on
+      return null;
+    }
+    return ctx.redis.exists(DOC) === 1;
+  };
   const probe = ctx.redisAfter(DOC, () => {
     const seen = snapshot();
     if (seen.doc) return seen;
     armed.push(ctx.redisAfter(DOC, snapshot)); // the lookup came first: watch the write
     return null;
   });
+  rowsSeen.push(ctx.redisAfter('rag:outbox', rowAppears));
   const r = await post(api(ctx), GOOD);
   assert.equal(r.status, 202, \`a valid upload answered \${r.status}: \${r.text}\`);
+  assert(rowsSeen[rowsSeen.length - 1].result !== false, 'the outbox row appeared before its document: a crash right there leaves an event naming a document that was never stored; write both in one MULTI/EXEC');
   const seen = (probe.result ?? (armed[0]?.fired ? armed[0].result : null)) as {doc: number; outbox: number} | null;
   assert(seen !== null && seen.doc, 'the document was never written');
   assert.equal(seen.outbox, 1, \`when the document became visible rag:outbox held \${seen.outbox} rows: a crash right there leaves a document no worker hears about; write both in one MULTI/EXEC\`);
@@ -1007,6 +1046,7 @@ export async function check_event_ids_only(ctx) {
   const rows = outbox(ctx);
   assert.equal(rows.length, 1, \`one upload, one outbox row: found \${rows.length}\`);
   assert(!('content' in rows[0]), \`the event carries the document text: \${JSON.stringify(Object.keys(rows[0]).sort())}; ids and the hash only, the worker reads the content from the store\`);
+  assert.deepEqual(Object.keys(rows[0]).sort(), ['doc_id', 'job_id', 'sha256', 'tenant', 'version'], \`the event is {tenant, doc_id, version, job_id, sha256} and nothing else, got the fields \${JSON.stringify(Object.keys(rows[0]).sort())}\`);
   const expected = {tenant: 't1', doc_id: 'handbook-2026', version: 1, job_id: r.json().job_id, sha256: sha(GOOD.content)};
   for (const [key, value] of Object.entries(expected))
     assert.deepEqual(rows[0][key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(rows[0])}\`);
@@ -1019,6 +1059,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"sort"
 	"strings"
 
 	"leetbuild/harness"
@@ -1091,9 +1132,14 @@ func CheckValidateBody(ctx *harness.Ctx) {
 	}{
 		{"doc_id", "Bad ID!", 400, "a doc_id with spaces and capitals"},
 		{"doc_id", "ab", 400, "a two-character doc_id"},
+		{"doc_id", "abc def", 400, "a doc_id with a space after a valid prefix"},
+		{"doc_id", "handbook-2026\\n", 400, "a doc_id ending in a newline"},
+		{"doc_id", strings.Repeat("a", 65), 400, "a 65-character doc_id"},
 		{"content_type", "image/png", 400, "content_type image/png"},
 		{"version", 0, 400, "version 0"},
+		{"version", -1, 400, "version -1"},
 		{"content", strings.Repeat("a", 1<<20+1), 413, "content of 1 MiB + 1 byte"},
+		{"content", strings.Repeat("é", 1<<19+1), 413, "524289 two-byte characters (1 MiB + 2 bytes of UTF-8)"},
 	}
 	for _, tc := range cases {
 		r := ingestPost(c, ingestWith(tc.field, tc.value))
@@ -1102,6 +1148,10 @@ func CheckValidateBody(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.Keys("rag:*")), 0, "rejected uploads must store nothing; keys in Redis")
 	r := ingestPost(c, ingestWith("content", strings.Repeat("a", 1<<20)))
 	ctx.Equal(r.Status, 202, "exactly 1 MiB is within the limit")
+	wide := ingestWith("content", strings.Repeat("é", 1<<19))
+	wide["version"] = 2
+	ctx.Equal(ingestPost(c, wide).Status, 202, "exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit")
+	ctx.Equal(ingestPost(c, ingestWith("doc_id", strings.Repeat("a", 64))).Status, 202, "a 64-character doc_id is valid")
 }
 
 func CheckVersionConflict(ctx *harness.Ctx) {
@@ -1135,8 +1185,25 @@ func CheckOutboxTx(ctx *harness.Ctx) {
 		}
 		return nil
 	})
+	rowFirst := 0 // 1: the document was there when the row appeared, -1: it was not
+	var rowAppears func() any
+	rowAppears = func() any {
+		if ctx.Redis.LLen("rag:outbox") == 0 {
+			ctx.Redis.After("rag:outbox", rowAppears) // a read of the list, not the row: watch on
+			return nil
+		}
+		if rowFirst == 0 {
+			rowFirst = -1
+			if ctx.Redis.Exists(ingestDoc) == 1 {
+				rowFirst = 1
+			}
+		}
+		return nil
+	}
+	ctx.Redis.After("rag:outbox", rowAppears)
 	r := ingestPost(ingestClient(ctx), ingestGood)
 	ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text())
+	ctx.Assert(rowFirst != -1, "the outbox row appeared before its document: a crash right there leaves an event naming a document that was never stored; write both in one MULTI/EXEC")
 	ctx.Assert(seen != nil && seen["doc"] == 1, "the document was never written")
 	ctx.Equal(seen["outbox"], int64(1), "when the document became visible, the rows in rag:outbox (a crash right there leaves a document no worker hears about; write both in one MULTI/EXEC)")
 	rows := ingestOutbox(ctx)
@@ -1155,12 +1222,19 @@ func CheckEventIdsOnly(ctx *harness.Ctx) {
 	for key, value := range expected {
 		ctx.Equal(rows[0][key], value, "the event's %s (event %v)", key, rows[0])
 	}
+	fields := make([]string, 0, len(rows[0]))
+	for key := range rows[0] {
+		fields = append(fields, key)
+	}
+	sort.Strings(fields)
+	ctx.Assert(len(fields) == len(expected), "the event is {tenant, doc_id, version, job_id, sha256} and nothing else, got the fields %v", fields)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -1181,6 +1255,13 @@ struct Api {
 json with(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
+}
+
+std::string repeat(const std::string& unit, size_t n) {
+  std::string out;
+  out.reserve(unit.size() * n);
+  for (size_t i = 0; i < n; ++i) out += unit;
+  return out;
 }
 
 std::string jobOf(const harness::Response& r) {
@@ -1220,13 +1301,20 @@ void CheckValidateBody(harness::Ctx& ctx) {
   const std::vector<Case> cases = {
       {"doc_id", "Bad ID!", 400, "a doc_id with spaces and capitals"},
       {"doc_id", "ab", 400, "a two-character doc_id"},
+      {"doc_id", "abc def", 400, "a doc_id with a space after a valid prefix"},
+      {"doc_id", "handbook-2026\\n", 400, "a doc_id ending in a newline"},
+      {"doc_id", std::string(65, 'a'), 400, "a 65-character doc_id"},
       {"content_type", "image/png", 400, "content_type image/png"},
       {"version", 0, 400, "version 0"},
+      {"version", -1, 400, "version -1"},
       {"content", std::string((1 << 20) + 1, 'a'), 413, "content of 1 MiB + 1 byte"},
+      {"content", repeat("é", (1 << 19) + 1), 413, "524289 two-byte characters (1 MiB + 2 bytes of UTF-8)"},
   };
   for (const auto& c : cases) ctx.Equal(api.post(with(kGood, c.field, c.value)).Status, c.status, "%s", c.what);
   ctx.Equal(ctx.Redis.Keys("rag:*").size(), 0, "rejected uploads must store nothing; keys in Redis");
   ctx.Equal(api.post(with(kGood, "content", std::string(1 << 20, 'a'))).Status, 202, "exactly 1 MiB is within the limit");
+  ctx.Equal(api.post(with(with(kGood, "version", 2), "content", repeat("é", 1 << 19))).Status, 202, "exactly 1 MiB of UTF-8 (524288 two-byte characters) is within the limit");
+  ctx.Equal(api.post(with(kGood, "doc_id", std::string(64, 'a'))).Status, 202, "a 64-character doc_id is valid");
 }
 
 void CheckVersionConflict(harness::Ctx& ctx) {
@@ -1262,8 +1350,18 @@ void CheckOutboxTx(harness::Ctx& ctx) {
       outbox = ctx.Redis.LLen("rag:outbox");
     });
   });
+  int rowFirst = 0;  // 1: the document was there when the row appeared, -1: it was not
+  std::function<void()> rowAppears = [&] {
+    if (ctx.Redis.LLen("rag:outbox") == 0) {
+      ctx.Redis.After("rag:outbox", rowAppears);  // a read of the list, not the row: watch on
+      return;
+    }
+    if (rowFirst == 0) rowFirst = ctx.Redis.Exists(kDoc) == 1 ? 1 : -1;
+  };
+  ctx.Redis.After("rag:outbox", rowAppears);
   const auto r = api.post(kGood);
   ctx.Equal(r.Status, 202, "a valid upload (%s)", r.Text());
+  ctx.Assert(rowFirst != -1, "the outbox row appeared before its document: a crash right there leaves an event naming a document that was never stored; write both in one MULTI/EXEC");
   ctx.Assert(written, "the document was never written");
   ctx.Equal(outbox, 1, "when the document became visible, the rows in rag:outbox (a crash right there leaves a document no worker hears about; write both in one MULTI/EXEC)");
   const auto rows = outboxRows(ctx);
@@ -1279,6 +1377,9 @@ void CheckEventIdsOnly(harness::Ctx& ctx) {
   ctx.Assert(!rows[0].contains("content"), "the event carries the document text; ids and the hash only, the worker reads the content from the store");
   const json expected = {{"tenant", "t1"}, {"doc_id", "handbook-2026"}, {"version", 1}, {"job_id", jobOf(r)}, {"sha256", sha256_hex(kGood["content"].get<std::string>())}};
   for (const auto& [key, value] : expected.items()) ctx.Equal(rows[0].value(key, json()), value, "the event's %s (event %v)", key, rows[0]);
+  std::vector<std::string> fields;
+  for (const auto& [key, value] : rows[0].items()) fields.push_back(key);
+  ctx.Assert(fields.size() == expected.size(), "the event is {tenant, doc_id, version, job_id, sha256} and nothing else, got the fields %v", fields);
 }
 `,
   },

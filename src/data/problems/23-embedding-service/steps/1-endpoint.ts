@@ -18,7 +18,7 @@ content_hashes, vectors}\`. It serves the demo and hides 4 flaws.
 that buys an unbounded amount of model work, an oversized input embedded as a different text, and
 a client retry that pays the model server twice.
 
-- A missing \`X-Tenant-Id\` is **401**, before any work.
+- A missing or empty \`X-Tenant-Id\` is **401**, before any work.
 - A batch holds **1..256** inputs (\`MAX_BATCH_INPUTS\`); anything else is **400**.
 - An input over **8192 UTF-8 bytes** (\`MAX_INPUT_BYTES\`) is **413** with its \`index\`; nothing in
   the batch is embedded. Count bytes, not characters.
@@ -57,7 +57,7 @@ a client retry that pays the model server twice.
     {
       id: 'tenant-required',
       title: 'A request without a tenant is 401',
-      detail: 'A missing `X-Tenant-Id` answers **401** before anything is embedded.',
+      detail: 'A missing or empty `X-Tenant-Id` answers **401** before anything is embedded.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/]},
@@ -69,7 +69,8 @@ a client retry that pays the model server twice.
     {
       id: 'batch-cap',
       title: 'Caps the batch at 256 inputs',
-      detail: '`MAX_BATCH_INPUTS = 256`: an empty batch or a 257th input is **400**, with no model call.',
+      detail:
+        '`MAX_BATCH_INPUTS = 256`: an empty batch or a 257th input is **400**, with no model call; a batch of exactly 256 is embedded.',
       match: {
         python: {all: [/MAX_BATCH_INPUTS\s*=\s*256\b/, /\b400\b/]},
         typescript: {all: [/MAX_BATCH_INPUTS\s*=\s*256\b/, /code\(\s*400\s*\)/]},
@@ -652,8 +653,11 @@ async def check_route(ctx):
 async def check_tenant_required(ctx):
     async with _api(ctx) as c:
         r = await _post(c, TEXTS, tenant=None)
-    assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}: {r.text[:120]}; it must be 401"
-    assert _calls(ctx) == 0, f"a request without a tenant cost {_calls(ctx)} Embed calls before it was refused"
+        assert r.status_code == 401, f"a request without X-Tenant-Id answered {r.status_code}: {r.text[:120]}; it must be 401"
+        assert _calls(ctx) == 0, f"a request without a tenant cost {_calls(ctx)} Embed calls before it was refused"
+        empty = await _post(c, TEXTS, tenant="", key="k-2")
+    assert empty.status_code == 401, f"a request with an empty X-Tenant-Id answered {empty.status_code}: {empty.text[:120]}; an empty tenant is no tenant, and it must be 401"
+    assert _calls(ctx) == 0, f"a request with an empty tenant cost {_calls(ctx)} Embed calls before it was refused"
 
 
 async def check_batch_cap(ctx):
@@ -663,8 +667,9 @@ async def check_batch_cap(ctx):
         assert _calls(ctx) == 0, f"a refused batch cost {_calls(ctx)} Embed calls"
         empty = await _post(c, [], key="k-2")
         assert empty.status_code == 400, f"an empty batch answered {empty.status_code}, expected 400"
-        ok = await _post(c, TEXTS, key="k-3")
-    assert ok.status_code == 200, f"a batch of two inputs answered {ok.status_code}: {ok.text}"
+        full = await _post(c, [f"input {i}" for i in range(256)], key="k-3")
+    assert full.status_code == 200, f"a batch of exactly 256 inputs (MAX_BATCH_INPUTS) answered {full.status_code}: {full.text[:120]}; the cap allows 256"
+    assert len(full.json().get("vectors", [])) == 256, f"a batch of 256 inputs must answer 256 vectors, got {len(full.json().get('vectors', []))}"
 
 
 async def check_input_bytes(ctx):
@@ -731,6 +736,9 @@ export async function check_tenant_required(ctx) {
   const r = await post(c, TEXTS, null);
   assert.equal(r.status, 401, \`a request without X-Tenant-Id answered \${r.status}: \${r.text.slice(0, 120)}; it must be 401\`);
   assert.equal(calls(ctx), 0, \`a request without a tenant cost \${calls(ctx)} Embed calls before it was refused\`);
+  const empty = await post(c, TEXTS, '', 'k-2');
+  assert.equal(empty.status, 401, \`a request with an empty X-Tenant-Id answered \${empty.status}: \${empty.text.slice(0, 120)}; an empty tenant is no tenant, and it must be 401\`);
+  assert.equal(calls(ctx), 0, \`a request with an empty tenant cost \${calls(ctx)} Embed calls before it was refused\`);
 }
 
 export async function check_batch_cap(ctx) {
@@ -740,8 +748,9 @@ export async function check_batch_cap(ctx) {
   assert.equal(calls(ctx), 0, \`a refused batch cost \${calls(ctx)} Embed calls\`);
   const empty = await post(c, [], 'acme', 'k-2');
   assert.equal(empty.status, 400, \`an empty batch answered \${empty.status}, expected 400\`);
-  const ok = await post(c, TEXTS, 'acme', 'k-3');
-  assert.equal(ok.status, 200, \`a batch of two inputs answered \${ok.status}: \${ok.text}\`);
+  const full = await post(c, Array.from({length: 256}, (_, i) => \`input \${i}\`), 'acme', 'k-3');
+  assert.equal(full.status, 200, \`a batch of exactly 256 inputs (MAX_BATCH_INPUTS) answered \${full.status}: \${full.text.slice(0, 120)}; the cap allows 256\`);
+  assert.equal(full.json().vectors?.length, 256, \`a batch of 256 inputs must answer 256 vectors, got \${full.json().vectors?.length}\`);
 }
 
 export async function check_input_bytes(ctx) {
@@ -837,6 +846,9 @@ func CheckTenantRequired(ctx *harness.Ctx) {
 	r := apiPost(c, apiTexts, "", "k-1")
 	ctx.Equal(r.Status, 401, "a request without X-Tenant-Id must be 401 (%s)", r.Text())
 	ctx.Equal(apiEmbeds, 0, "a request without a tenant must cost no model call; Embed calls")
+	empty := c.Post("/v1/embeddings", map[string]any{"inputs": apiTexts}, "X-Tenant-Id", "", "Idempotency-Key", "k-2")
+	ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text())
+	ctx.Equal(apiEmbeds, 0, "a request with an empty tenant must cost no model call; Embed calls")
 }
 
 func CheckBatchCap(ctx *harness.Ctx) {
@@ -850,8 +862,15 @@ func CheckBatchCap(ctx *harness.Ctx) {
 	ctx.Equal(apiEmbeds, 0, "a refused batch must cost no model call; Embed calls")
 	empty := apiPost(c, []string{}, "acme", "k-2")
 	ctx.Equal(empty.Status, 400, "an empty batch")
-	ok := apiPost(c, apiTexts, "acme", "k-3")
-	ctx.Equal(ok.Status, 200, "a batch of two inputs (%s)", ok.Text())
+	full := make([]string, 256)
+	for i := range full {
+		full[i] = fmt.Sprintf("input %d", i)
+	}
+	ok := apiPost(c, full, "acme", "k-3")
+	ctx.Equal(ok.Status, 200, "a batch of exactly 256 inputs (maxBatchInputs): the cap allows 256 (%.120s)", ok.Text())
+	var body apiBody
+	ok.Decode(&body)
+	ctx.Equal(len(body.Vectors), 256, "a batch of 256 inputs must answer 256 vectors; vectors")
 }
 
 func CheckInputBytes(ctx *harness.Ctx) {
@@ -946,6 +965,10 @@ void CheckTenantRequired(harness::Ctx& ctx) {
   const auto r = post(c, kTexts, "", "k-1");
   ctx.Equal(r.Status, 401, "a request without X-Tenant-Id must be 401 (%s)", r.Text());
   ctx.Equal(g_embeds, 0, "a request without a tenant must cost no model call; Embed calls");
+  const std::string body = nlohmann::json{{"inputs", kTexts}}.dump();
+  const auto empty = c.Post("/v1/embeddings", body, "Content-Type", "application/json", "X-Tenant-Id", "", "Idempotency-Key", "k-2");
+  ctx.Equal(empty.Status, 401, "a request with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text());
+  ctx.Equal(g_embeds, 0, "a request with an empty tenant must cost no model call; Embed calls");
 }
 
 void CheckBatchCap(harness::Ctx& ctx) {
@@ -957,8 +980,11 @@ void CheckBatchCap(harness::Ctx& ctx) {
   ctx.Equal(g_embeds, 0, "a refused batch must cost no model call; Embed calls");
   const auto empty = post(c, {}, "acme", "k-2");
   ctx.Equal(empty.Status, 400, "an empty batch");
-  const auto ok = post(c, kTexts, "acme", "k-3");
-  ctx.Equal(ok.Status, 200, "a batch of two inputs (%s)", ok.Text());
+  std::vector<std::string> full;
+  for (int i = 0; i < 256; i++) full.push_back("input " + std::to_string(i));
+  const auto ok = post(c, full, "acme", "k-3");
+  ctx.Equal(ok.Status, 200, "a batch of exactly 256 inputs (kMaxBatchInputs): the cap allows 256 (%s)", ok.Text().substr(0, 120));
+  ctx.Equal(parsed(ok).value("vectors", nlohmann::json::array()).size(), 256, "a batch of 256 inputs must answer 256 vectors; vectors");
 }
 
 void CheckInputBytes(harness::Ctx& ctx) {

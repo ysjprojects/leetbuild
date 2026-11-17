@@ -105,7 +105,7 @@ loses it; and a broker that is down drops the event while the caller hears \`Tru
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false; the starter returns true before any report arrives.',
+        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the same payload the event carries, and the call returns false; an acknowledged event returns true and writes no row. The starter returns true before any report arrives.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -649,17 +649,21 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish_turn_event("t1", "s-0", _turn(1))
+    assert ok is True and _outbox(ctx) == [], f"a delivered event returned {ok!r} and left the outbox {_outbox(ctx)}: once the broker acknowledges, return True and write no row"
     ctx.kafka.fail_next(TOPIC, 1)
-    ok = m.publish_turn_event("t1", "s-1", _turn(1))
+    ok = m.publish_turn_event("t1", "s-1", _turn(1, CARD))
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the worker never hears of the turn"
     assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "t1:s-1" and rows[0].get("payload", {}).get("turn_id") == "t-1", f"the outbox row is {rows[0]}, expected the topic, the key t1:s-1 and the payload"
+    want = {"type": "session.turn", "tenant": "t1", "session_id": "s-1", "turn_id": "t-1", "role": "user", "tokens": 9}
+    assert rows[0]["payload"] == want, f"the outbox row carries {rows[0]['payload']}, expected the event's payload {want}: the relay produces exactly what the topic would have held"
     assert ok is False, f"publish_turn_event returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_turn_event("t1", "s-1", _turn(2))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_turn_event waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_turn_event waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("turn_id") == "t-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_turn_event returned {ok!r} without a delivery report, expected False"
@@ -718,18 +722,23 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  let ok = await m.publishTurnEvent('t1', 's-0', turn(1));
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`a delivered event resolved \${JSON.stringify(ok)} and left the outbox \${JSON.stringify(outboxRows(ctx))}: once the broker acknowledges, resolve true and write no row\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishTurnEvent('t1', 's-1', turn(1));
+  ok = await m.publishTurnEvent('t1', 's-1', turn(1, CARD));
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the worker never hears of the turn\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 't1:s-1' && rows[0].payload?.turn_id === 't-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key t1:s-1 and the payload\`);
+  const want = {type: 'session.turn', tenant: 't1', session_id: 's-1', turn_id: 't-1', role: 'user', tokens: 9};
+  assert.deepStrictEqual(rows[0].payload, want, \`the outbox row carries \${JSON.stringify(rows[0].payload)}, expected the event's payload \${JSON.stringify(want)}: the relay produces exactly what the topic would have held\`);
   assert.equal(ok, false, \`publishTurnEvent resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishTurnEvent('t1', 's-1', turn(2));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishTurnEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishTurnEvent waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.turn_id === 't-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishTurnEvent resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -818,18 +827,22 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := mustPublish(ctx, "t1", "s-0", eventTurn(1, ""))
+	ctx.Settle()
+	ctx.Assert(ok && len(outboxRows(ctx)) == 0, "a delivered event returned %v and left the outbox %v: once the broker acknowledges, return true and write no row", ok, outboxRows(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := mustPublish(ctx, "t1", "s-1", eventTurn(1, ""))
+	ok = mustPublish(ctx, "t1", "s-1", eventTurn(1, card))
 	ctx.Settle()
 	rows := outboxRows(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the worker never hears of the turn; the rows")
 	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "t1:s-1" && rows[0].Payload["turn_id"] == "t-1", "the outbox row is %v, expected the topic, the key t1:s-1 and the payload", rows[0])
+	ctx.Equal(rows[0].Payload, map[string]any{"type": "session.turn", "tenant": "t1", "session_id": "s-1", "turn_id": "t-1", "role": "user", "tokens": 9}, "the outbox row must carry the event's payload, exactly what the topic would have held; its payload")
 	ctx.Equal(ok, false, "publishTurnEvent's result after a failed delivery")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = mustPublish(ctx, "t1", "s-1", eventTurn(2, ""))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishTurnEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishTurnEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = outboxRows(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["turn_id"] == "t-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishTurnEvent's result without a delivery report")
@@ -903,19 +916,24 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  bool ok = publishTurnEvent("t1", "s-0", eventTurn(1));
+  ctx.Settle();
+  ctx.Assert(ok && outboxRows(ctx).empty(), "a delivered event returned %v and left %d outbox rows: once the broker acknowledges, return true and write no row", ok, outboxRows(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishTurnEvent("t1", "s-1", eventTurn(1));
+  ok = publishTurnEvent("t1", "s-1", eventTurn(1, kCard));
   ctx.Settle();
   auto rows = outboxRows(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the worker never hears of the turn; the rows");
   ctx.Assert(text(rows[0], "topic") == kEventsTopic && text(rows[0], "key") == "t1:s-1" && rows[0].contains("payload") && text(rows[0]["payload"], "turn_id") == "t-1",
              "the outbox row is %s, expected the topic, the key t1:s-1 and the payload", rows[0].dump());
+  const nlohmann::json want = {{"type", "session.turn"}, {"tenant", "t1"}, {"session_id", "s-1"}, {"turn_id", "t-1"}, {"role", "user"}, {"tokens", 9}};
+  ctx.Assert(rows[0]["payload"] == want, "the outbox row carries %s, expected the event's payload %s: the relay produces exactly what the topic would have held", rows[0]["payload"].dump(), want.dump());
   ctx.Equal(ok, false, "publishTurnEvent's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishTurnEvent("t1", "s-1", eventTurn(2));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishTurnEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishTurnEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = outboxRows(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && text(rows[1]["payload"], "turn_id") == "t-2", "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishTurnEvent's result without a delivery report");

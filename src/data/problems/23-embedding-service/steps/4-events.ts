@@ -38,7 +38,7 @@ event lost when the partition leader fails, and a broker refusal nobody keeps.
       id: 'document-event',
       title: 'One event per document, keyed by document id',
       detail:
-        'The record key is the document id and the event lists every chunk’s content hash, so one document lands on one partition as one message.',
+        'The record key is the document id and the event lists every chunk’s content hash (never its text), so one document lands on one partition as one message.',
       match: {
         python: {all: [/key\s*=\s*document_id/, /content_hashes/]},
         typescript: {all: [/key:\s*documentId/, /content_hashes/]},
@@ -51,7 +51,7 @@ event lost when the partition leader fails, and a broker refusal nobody keeps.
       id: 'after-write',
       title: 'Produces after every vector is stored',
       detail:
-        'Every `store_vector` call comes before the produce, so the indexer never fetches a vector that is not there.',
+        'Every `store_vector` call comes before the produce, so the indexer never fetches a vector that is not there; a store that fails announces nothing.',
       match: {
         python: {order: [/store_vector\(/, /producer\.produce\(/]},
         typescript: {order: [/storeVector\(/, /producer\.send\(/]},
@@ -516,6 +516,8 @@ def check_document_event(ctx):
     expected = {"tenant": TENANT, "document_id": DOC, "model_version": MODEL_VERSION, "content_hashes": [content_hash(t) for t in TEXTS], "chunk_count": 3}
     for key, value in expected.items():
         assert event.get(key) == value, f"the event must carry {key}={value!r}, got {event}"
+    leaked = [t for t in TEXTS if t in records[0].value.decode()]
+    assert not leaked, f"the event carries chunk text ({leaked[0]!r}): it names the chunks by content hash, and the text stays with the tenant's data"
 
 
 def check_after_write(ctx):
@@ -529,6 +531,17 @@ def check_after_write(ctx):
     for t in TEXTS:
         assert ctx.redis.get(vector_key(TENANT, MODEL_VERSION, content_hash(t))) is not None, f"every chunk's vector is stored; {t!r} is missing"
     assert len(ctx.kafka.records(TOPIC)) >= 1, "the document is announced once its vectors are stored"
+    # A store that fails (the key holds another type) holds the event back: the indexer would fetch a vector that is not there.
+    broken = "Rotate the signing key."
+    ctx.redis.rpush(vector_key(TENANT, MODEL_VERSION, content_hash(broken)), "not a vector")
+    before = len(ctx.kafka.records(TOPIC))
+    try:
+        m.publish_ready(TENANT, "doc-44", _chunks([TEXTS[0], broken]))
+    except Exception:  # noqa: BLE001 - the failure may reach the caller; an event may not
+        pass
+    _settle(m)
+    announced = len(ctx.kafka.records(TOPIC)) - before + len([row for row in _outbox(ctx) if row.get("key") == "doc-44"])
+    assert announced == 0, "storing one chunk's vector failed, yet doc-44 was announced: an event for a document whose vectors are not all stored sends the indexer to a vector that is not there"
 
 
 def check_acks_all(ctx):
@@ -592,6 +605,8 @@ export async function check_document_event(ctx) {
   const event = JSON.parse(records[0].value.toString());
   const expected = {tenant: TENANT, document_id: DOC, model_version: config.MODEL_VERSION, content_hashes: TEXTS.map(config.contentHash), chunk_count: 3};
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(event[key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(event)}\`);
+  const leaked = TEXTS.filter(t => records[0].value.toString().includes(t));
+  assert.equal(leaked.length, 0, \`the event carries chunk text ("\${leaked[0]}"): it names the chunks by content hash, and the text stays with the tenant's data\`);
 }
 
 export async function check_after_write(ctx) {
@@ -604,6 +619,18 @@ export async function check_after_write(ctx) {
   assert.equal(probe.result, 0, \`when the last chunk's vector was being stored, \${probe.result} record(s) were already on \${config.TOPIC}: the indexer would fetch a vector that is not there yet\`);
   for (const t of TEXTS) assert(ctx.redis.get(config.vectorKey(TENANT, config.MODEL_VERSION, config.contentHash(t))) !== null, \`every chunk's vector is stored; "\${t}" is missing\`);
   assert(ctx.kafka.records(config.TOPIC).length >= 1, 'the document is announced once its vectors are stored');
+  // A store that fails (the key holds another type) holds the event back: the indexer would fetch a vector that is not there.
+  const broken = 'Rotate the signing key.';
+  ctx.redis.rpush(config.vectorKey(TENANT, config.MODEL_VERSION, config.contentHash(broken)), 'not a vector');
+  const before = ctx.kafka.records(config.TOPIC).length;
+  try {
+    await m.publishReady(TENANT, 'doc-44', chunks([TEXTS[0], broken]));
+  } catch {
+    // The failure may reach the caller; an event may not.
+  }
+  await settle();
+  const announced = ctx.kafka.records(config.TOPIC).length - before + outboxRows(ctx).filter(row => row.key === 'doc-44').length;
+  assert.equal(announced, 0, 'storing one chunk\\'s vector failed, yet doc-44 was announced: an event for a document whose vectors are not all stored sends the indexer to a vector that is not there');
 }
 
 export async function check_acks_all(ctx) {
@@ -641,6 +668,7 @@ export async function check_outbox(ctx) {
 import (
 	"context"
 	"encoding/json"
+	"strings"
 
 	"embedding/config"
 	"embedding/model"
@@ -709,6 +737,11 @@ func CheckDocumentEvent(ctx *harness.Ctx) {
 	}
 	ctx.Equal(event["content_hashes"], hashes, "the event must list every chunk's content hash in order")
 	ctx.Equal(event["chunk_count"], 3, "the event's chunk_count")
+	for _, r := range records {
+		for _, t := range eventsTexts {
+			ctx.Assert(!strings.Contains(string(r.Value), t), "the event carries chunk text (%q): it names the chunks by content hash, and the text stays with the tenant's data", t)
+		}
+	}
 }
 
 func CheckAfterWrite(ctx *harness.Ctx) {
@@ -723,6 +756,22 @@ func CheckAfterWrite(ctx *harness.Ctx) {
 		ctx.Assert(ok, "every chunk's vector is stored; %q is missing", t)
 	}
 	ctx.Assert(len(ctx.Kafka.Records(config.Topic)) >= 1, "the document is announced once its vectors are stored")
+	// A store that fails (the key holds another type) holds the event back: the indexer would fetch a vector that is not there.
+	broken := "Rotate the signing key."
+	ctx.Redis.Do("RPUSH", config.VectorKey(eventsTenant, config.ModelVersion, config.ContentHash(broken)), "not a vector")
+	before := len(ctx.Kafka.Records(config.Topic))
+	func() {
+		defer func() { recover() }() // the failure may reach the caller; an event may not
+		publishReady(context.Background(), eventsTenant, "doc-44", eventsChunks([]string{eventsTexts[0], broken}))
+	}()
+	ctx.Settle()
+	announced := len(ctx.Kafka.Records(config.Topic)) - before
+	for _, row := range eventsOutbox(ctx) {
+		if row["key"] == "doc-44" {
+			announced++
+		}
+	}
+	ctx.Equal(announced, 0, "storing one chunk's vector failed, yet doc-44 was announced: an event for a document whose vectors are not all stored sends the indexer to a vector that is not there; events and outbox rows for doc-44")
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
@@ -814,6 +863,7 @@ void CheckDocumentEvent(harness::Ctx& ctx) {
   ctx.Equal(event.value("model_version", ""), config::kModelVersion, "the event's model_version (%v)", event);
   ctx.Equal(event.value("content_hashes", nlohmann::json::array()), nlohmann::json(hashesOf(kTexts)), "the event must list every chunk's content hash in order");
   ctx.Equal(event.value("chunk_count", 0), 3, "the event's chunk_count");
+  for (const auto& t : kTexts) ctx.Assert(records[0].Value.value_or("").find(t) == std::string::npos, "the event carries chunk text (%q): it names the chunks by content hash, and the text stays with the tenant's data", t);
 }
 
 void CheckAfterWrite(harness::Ctx& ctx) {
@@ -830,6 +880,19 @@ void CheckAfterWrite(harness::Ctx& ctx) {
   ctx.Assert(seen == 0, "when the last chunk's vector was being stored, %d record(s) were already on %s: the indexer would fetch a vector that is not there yet", seen, config::kTopic);
   for (const auto& t : kTexts) ctx.Assert(ctx.Redis.Get(config::vectorKey(kTenant, config::kModelVersion, config::contentHash(t))).has_value(), "every chunk's vector is stored; %q is missing", t);
   ctx.Assert(!ctx.Kafka.Records(config::kTopic).empty(), "the document is announced once its vectors are stored");
+  // A store that fails (the key holds another type) holds the event back: the indexer would fetch a vector that is not there.
+  const std::string broken = "Rotate the signing key.";
+  ctx.Redis.Do("RPUSH", config::vectorKey(kTenant, config::kModelVersion, config::contentHash(broken)), "not a vector");
+  const size_t before = ctx.Kafka.Records(config::kTopic).size();
+  try {
+    publishReady(kTenant, "doc-44", chunksOf({kTexts[0], broken}));
+  } catch (const std::exception&) {
+    // The failure may reach the caller; an event may not.
+  }
+  settle(ctx);
+  size_t announced = ctx.Kafka.Records(config::kTopic).size() - before;
+  for (const auto& row : outboxRows(ctx)) announced += row.value("key", "") == "doc-44" ? 1 : 0;
+  ctx.Equal(announced, 0, "storing one chunk's vector failed, yet doc-44 was announced: an event for a document whose vectors are not all stored sends the indexer to a vector that is not there; events and outbox rows for doc-44");
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {

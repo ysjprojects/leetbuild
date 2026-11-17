@@ -65,7 +65,7 @@ Requirements:
       id: 'tenant-scope',
       title: "Answers 404 for another tenant's run",
       detail:
-        "Tenant t2 asking for t1's run gets 404, the answer an unknown run gets; t1 gets its report. The starter returns any run to any tenant.",
+        "Tenant t2 asking for t1's run gets 404 with the same body the id got before the run existed; t1 gets its report. The starter returns any run to any tenant.",
       match: {
         python: {
           all: [/run(\.get\(\s*["']tenant["']\s*\)|\[["']tenant["']\])\s*!=\s*tenant|tenant\s*!=\s*run(\.get\(|\[)/],
@@ -80,7 +80,7 @@ Requirements:
       id: 'min-samples',
       title: 'Reports pending below 200 scored samples',
       detail:
-        'Runs with 12 and 199 scored samples, all passing, report pending; at 200 the run is judged. The starter labels a run after any number of samples.',
+        'Runs with 0, 12 and 199 scored samples, all passing, report pending; at 200 the run is judged. The starter labels a run after any number of samples.',
       match: {
         python: {all: [/MIN_SCORED_SAMPLES/, /["']pending["']/]},
         typescript: {all: [/MIN_SCORED_SAMPLES/, /['"]pending['"]/]},
@@ -106,7 +106,7 @@ Requirements:
       id: 'fallback-share',
       title: 'Reports unreliable when fallbacks dominate',
       detail:
-        'A run where 120 of 300 samples were scored by the string metric reports unreliable whatever its pass rate; with 30 of 300 it is judged. The starter never reads fallback.',
+        'A run where 120, or 61, of 300 samples were scored by the string metric reports unreliable whatever its pass rate; with 30 of 300, or exactly 60 (20%), it is judged. The starter never reads fallback.',
       match: {
         python: {all: [/MAX_FALLBACK_SHARE/, /["']unreliable["']/]},
         typescript: {all: [/MAX_FALLBACK_SHARE/, /['"]unreliable['"]/]},
@@ -846,22 +846,25 @@ async def check_route(ctx):
 
 
 async def check_tenant_scope(ctx):
-    _seed(ctx, "r1", 250, 240, tenant="t1")
     async with _api(ctx) as c:
+        unknown = await _report(c, "r1", headers={"X-Tenant-Id": "t2"})
+        _seed(ctx, "r1", 250, 240, tenant="t1")
         r = await _report(c, "r1", headers={"X-Tenant-Id": "t2"})
         assert r.status_code == 404, f"tenant t2 asked for tenant t1's run and got {r.status_code}: {r.text}; another tenant's run answers 404, like one that does not exist"
+        assert r.text == unknown.text, f"tenant t2 asking for t1's run got {r.text}, and for the same id before the run existed {unknown.text}: a different answer tells t2 the run exists"
         r = await _report(c, "r1")
         assert r.status_code == 200, f"the owner t1 still gets its report, got {r.status_code}: {r.text}"
 
 
 async def check_min_samples(ctx):
+    _seed(ctx, "r0", 0, 0)
     _seed(ctx, "r12", 12, 12)
     _seed(ctx, "r199", 199, 199)
     _seed(ctx, "r200", 200, 190)
     async with _api(ctx) as c:
-        for run_id, n in (("r12", 12), ("r199", 199)):
+        for run_id, n in (("r12", 12), ("r199", 199), ("r0", 0)):
             body = await _body(c, run_id)
-            assert body.get("status") == "pending", f"a run with {n} scored samples, every one passing, reported status {body.get('status')!r}: below MIN_SCORED_SAMPLES = 200 it is pending, not judged"
+            assert body.get("status") == "pending", f"a run with {n} scored samples, all of them passing, reported status {body.get('status')!r}: below MIN_SCORED_SAMPLES = 200 it is pending, not judged"
         body = await _body(c, "r200")
         assert body.get("status") == "passed", f"200 scored samples at 0.95 are judged and pass, got {body}"
 
@@ -880,12 +883,18 @@ async def check_threshold_config(ctx):
 async def check_fallback_share(ctx):
     _seed(ctx, "r-fb", 300, 290, fallback=120)
     _seed(ctx, "r-ok", 300, 290, fallback=30)
+    _seed(ctx, "r-60", 300, 290, fallback=60)
+    _seed(ctx, "r-61", 300, 290, fallback=61)
     async with _api(ctx) as c:
         body = await _body(c, "r-fb")
         assert body.get("status") == "unreliable", f"120 of 300 samples were scored by the string metric and the run reported {body.get('status')!r}: above MAX_FALLBACK_SHARE = 0.2 the judge barely saw it, so it is unreliable"
         assert body.get("fallback") == 120, f"the report carries the fallback count, got {body.get('fallback')!r}"
         body = await _body(c, "r-ok")
         assert body.get("status") == "passed", f"30 of 300 fallbacks is within the share: the run is judged and passes at 0.97, got {body}"
+        body = await _body(c, "r-60")
+        assert body.get("status") == "passed", f"60 of 300 fallbacks is exactly 20%, not more than MAX_FALLBACK_SHARE: the run is judged and passes at 0.97, got {body}"
+        body = await _body(c, "r-61")
+        assert body.get("status") == "unreliable", f"61 of 300 fallbacks is more than 20%: the run is unreliable, got {body}"
 
 
 async def check_fresh_report(ctx):
@@ -934,22 +943,25 @@ export async function check_route(ctx) {
 }
 
 export async function check_tenant_scope(ctx) {
-  seed(ctx, 'r1', 250, 240, {tenant: 't1'});
   const c = api(ctx);
+  const unknown = await report(c, 'r1', {'X-Tenant-Id': 't2'});
+  seed(ctx, 'r1', 250, 240, {tenant: 't1'});
   let r = await report(c, 'r1', {'X-Tenant-Id': 't2'});
   assert.equal(r.status, 404, \`tenant t2 asked for tenant t1's run and got \${r.status}: \${r.text}; another tenant's run answers 404, like one that does not exist\`);
+  assert.equal(r.text, unknown.text, \`tenant t2 asking for t1's run got \${r.text}, and for the same id before the run existed \${unknown.text}: a different answer tells t2 the run exists\`);
   r = await report(c, 'r1');
   assert.equal(r.status, 200, \`the owner t1 still gets its report, got \${r.status}: \${r.text}\`);
 }
 
 export async function check_min_samples(ctx) {
+  seed(ctx, 'r0', 0, 0);
   seed(ctx, 'r12', 12, 12);
   seed(ctx, 'r199', 199, 199);
   seed(ctx, 'r200', 200, 190);
   const c = api(ctx);
-  for (const [runId, n] of [['r12', 12], ['r199', 199]] as const) {
+  for (const [runId, n] of [['r12', 12], ['r199', 199], ['r0', 0]] as const) {
     const b = await body(c, runId);
-    assert.equal(b.status, 'pending', \`a run with \${n} scored samples, every one passing, reported status \${JSON.stringify(b.status)}: below MIN_SCORED_SAMPLES = 200 it is pending, not judged\`);
+    assert.equal(b.status, 'pending', \`a run with \${n} scored samples, all of them passing, reported status \${JSON.stringify(b.status)}: below MIN_SCORED_SAMPLES = 200 it is pending, not judged\`);
   }
   const b = await body(c, 'r200');
   assert.equal(b.status, 'passed', \`200 scored samples at 0.95 are judged and pass, got \${JSON.stringify(b)}\`);
@@ -969,12 +981,18 @@ export async function check_threshold_config(ctx) {
 export async function check_fallback_share(ctx) {
   seed(ctx, 'r-fb', 300, 290, {fallback: 120});
   seed(ctx, 'r-ok', 300, 290, {fallback: 30});
+  seed(ctx, 'r-60', 300, 290, {fallback: 60});
+  seed(ctx, 'r-61', 300, 290, {fallback: 61});
   const c = api(ctx);
   let b = await body(c, 'r-fb');
   assert.equal(b.status, 'unreliable', \`120 of 300 samples were scored by the string metric and the run reported \${JSON.stringify(b.status)}: above MAX_FALLBACK_SHARE = 0.2 the judge barely saw it, so it is unreliable\`);
   assert.equal(b.fallback, 120, \`the report carries the fallback count, got \${JSON.stringify(b.fallback)}\`);
   b = await body(c, 'r-ok');
   assert.equal(b.status, 'passed', \`30 of 300 fallbacks is within the share: the run is judged and passes at 0.97, got \${JSON.stringify(b)}\`);
+  b = await body(c, 'r-60');
+  assert.equal(b.status, 'passed', \`60 of 300 fallbacks is exactly 20%, not more than MAX_FALLBACK_SHARE: the run is judged and passes at 0.97, got \${JSON.stringify(b)}\`);
+  b = await body(c, 'r-61');
+  assert.equal(b.status, 'unreliable', \`61 of 300 fallbacks is more than 20%: the run is unreliable, got \${JSON.stringify(b)}\`);
 }
 
 export async function check_fresh_report(ctx) {
@@ -1036,21 +1054,24 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	readSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
 	c := readClient(ctx)
+	unknown := c.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2")
+	readSeed(ctx, "r1", 250, 240, 0, "t1", 1_700_000_000)
 	r := c.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 asked for tenant t1's run (%s): another tenant's run answers 404, like one that does not exist", r.Text())
+	ctx.Equal(r.Text(), unknown.Text(), "tenant t2 asking for t1's run must get the answer the same id got before the run existed (a different answer tells t2 the run exists); the body")
 	ctx.Equal(c.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t1").Status, 200, "the owner t1 still gets its report")
 }
 
 func CheckMinSamples(ctx *harness.Ctx) {
+	readSeed(ctx, "r0", 0, 0, 0, "t1", 1_700_000_000)
 	readSeed(ctx, "r12", 12, 12, 0, "t1", 1_700_000_000)
 	readSeed(ctx, "r199", 199, 199, 0, "t1", 1_700_000_000)
 	readSeed(ctx, "r200", 200, 190, 0, "t1", 1_700_000_000)
 	c := readClient(ctx)
-	for _, runID := range []string{"r12", "r199"} {
+	for _, runID := range []string{"r12", "r199", "r0"} {
 		body := readBody(ctx, c, "/v1/evals/runs/"+runID)
-		ctx.Equal(body["status"], "pending", "a run with %v scored samples, every one passing: below minScoredSamples = 200 it is pending, not judged; the status", body["scored"])
+		ctx.Equal(body["status"], "pending", "a run with %v scored samples, all of them passing: below minScoredSamples = 200 it is pending, not judged; the status", body["scored"])
 	}
 	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r200")["status"], "passed", "200 scored samples at 0.95 are judged and pass; the status")
 }
@@ -1068,11 +1089,15 @@ func CheckThresholdConfig(ctx *harness.Ctx) {
 func CheckFallbackShare(ctx *harness.Ctx) {
 	readSeed(ctx, "r-fb", 300, 290, 120, "t1", 1_700_000_000)
 	readSeed(ctx, "r-ok", 300, 290, 30, "t1", 1_700_000_000)
+	readSeed(ctx, "r-60", 300, 290, 60, "t1", 1_700_000_000)
+	readSeed(ctx, "r-61", 300, 290, 61, "t1", 1_700_000_000)
 	c := readClient(ctx)
 	body := readBody(ctx, c, "/v1/evals/runs/r-fb")
 	ctx.Equal(body["status"], "unreliable", "120 of 300 samples were scored by the string metric: above maxFallbackShare = 0.2 the judge barely saw the run, so it is unreliable; the status")
 	ctx.Equal(body["fallback"], 120, "the report carries the fallback count")
 	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r-ok")["status"], "passed", "30 of 300 fallbacks is within the share: the run is judged and passes at 0.97; the status")
+	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r-60")["status"], "passed", "60 of 300 fallbacks is exactly 20%%, not more than maxFallbackShare: the run is judged and passes at 0.97; the status")
+	ctx.Equal(readBody(ctx, c, "/v1/evals/runs/r-61")["status"], "unreliable", "61 of 300 fallbacks is more than 20%%: the run is unreliable; the status")
 }
 
 func CheckFreshReport(ctx *harness.Ctx) {
@@ -1134,21 +1159,24 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  readSeed(ctx, "r1", 250, 240, 0, "t1");
   Api api(ctx);
+  const auto unknown = api.http.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2");
+  readSeed(ctx, "r1", 250, 240, 0, "t1");
   const auto r = api.http.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t2");
   ctx.Equal(r.Status, 404, "tenant t2 asked for tenant t1's run (%s): another tenant's run answers 404, like one that does not exist", r.Text());
+  ctx.Equal(r.Text(), unknown.Text(), "tenant t2 asking for t1's run must get the answer the same id got before the run existed (a different answer tells t2 the run exists); the body");
   ctx.Equal(api.http.Get("/v1/evals/runs/r1", "X-Tenant-Id", "t1").Status, 200, "the owner t1 still gets its report");
 }
 
 void CheckMinSamples(harness::Ctx& ctx) {
+  readSeed(ctx, "r0", 0, 0);
   readSeed(ctx, "r12", 12, 12);
   readSeed(ctx, "r199", 199, 199);
   readSeed(ctx, "r200", 200, 190);
   Api api(ctx);
-  for (const std::string run_id : {"r12", "r199"}) {
+  for (const std::string run_id : {"r12", "r199", "r0"}) {
     const json body = readBody(ctx, api, "/v1/evals/runs/" + run_id);
-    ctx.Equal(field(body, "status"), json("pending"), "a run with %s scored samples, every one passing: below kMinScoredSamples = 200 it is pending, not judged; the status", field(body, "scored").dump());
+    ctx.Equal(field(body, "status"), json("pending"), "a run with %s scored samples, all of them passing: below kMinScoredSamples = 200 it is pending, not judged; the status", field(body, "scored").dump());
   }
   ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r200"), "status"), json("passed"), "200 scored samples at 0.95 are judged and pass; the status");
 }
@@ -1166,11 +1194,15 @@ void CheckThresholdConfig(harness::Ctx& ctx) {
 void CheckFallbackShare(harness::Ctx& ctx) {
   readSeed(ctx, "r-fb", 300, 290, 120);
   readSeed(ctx, "r-ok", 300, 290, 30);
+  readSeed(ctx, "r-60", 300, 290, 60);
+  readSeed(ctx, "r-61", 300, 290, 61);
   Api api(ctx);
   const json body = readBody(ctx, api, "/v1/evals/runs/r-fb");
   ctx.Equal(field(body, "status"), json("unreliable"), "120 of 300 samples were scored by the string metric: above kMaxFallbackShare = 0.2 the judge barely saw the run, so it is unreliable; the status");
   ctx.Equal(field(body, "fallback"), json(120), "the report carries the fallback count");
   ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r-ok"), "status"), json("passed"), "30 of 300 fallbacks is within the share: the run is judged and passes at 0.97; the status");
+  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r-60"), "status"), json("passed"), "60 of 300 fallbacks is exactly 20%%, not more than kMaxFallbackShare: the run is judged and passes at 0.97; the status");
+  ctx.Equal(field(readBody(ctx, api, "/v1/evals/runs/r-61"), "status"), json("unreliable"), "61 of 300 fallbacks is more than 20%%: the run is unreliable; the status");
 }
 
 void CheckFreshReport(harness::Ctx& ctx) {

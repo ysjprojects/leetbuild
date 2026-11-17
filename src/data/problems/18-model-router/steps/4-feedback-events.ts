@@ -26,11 +26,12 @@ verdict.
 - The record key is the **tenant**; the event id stays the request id.
 - The producer is **idempotent** with \`acks=all\` (kafka-go has no idempotent mode: \`RequireAll\`
   is what it can promise).
-- The event is \`{id, tenant, policy, model, outcome, latency_ms}\`; the prompt is in neither the
-  event nor a log line.
+- The event is exactly \`{id, tenant, policy, model, outcome, latency_ms}\`: nothing else the rated
+  request carries gets in, and the prompt is in no log line.
 - A refusal arrives in the **delivery callback**, and that is where the outbox write belongs; the
   request path does not wait for the broker.
-- \`run_quality\` increments **before** it commits.`,
+- \`run_quality\` increments **before** it commits, and a record whose increment failed is not
+  committed.`,
   sequence: {
     participants: ['routerd', 'route.feedback', 'quality', 'Redis'],
     messages: [
@@ -78,7 +79,7 @@ verdict.
       id: 'no-prompt',
       title: 'No prompt in the event or the logs',
       detail:
-        'The event is ids, the model, the outcome and the latency; the prompt is neither serialised into the record nor logged. The topic is retained for days and read by every consumer group.',
+        'The event is exactly ids, the model, the outcome and the latency, whatever else the rated request carries (a model answer included); the prompt is neither serialised into the record nor logged. The topic is retained for days and read by every consumer group.',
       match: {
         python: {none: [/["']prompt["']\s*:/, /logg?(er|ing)\.[a-z]+\([^\n]*prompt/i, /print\([^\n]*prompt/i]},
         typescript: {none: [/\bprompt:\s*routed\.prompt/, /console\.(log|info|debug|warn)\([^\n]*prompt/i]},
@@ -104,7 +105,7 @@ verdict.
       id: 'commit-after-increment',
       title: 'HINCRBY before the offset commit',
       detail:
-        'The consumer increments `quality:{tenant}:{model}` and only then commits; a crash between a commit and the increment loses the verdict.',
+        'The consumer increments `quality:{tenant}:{model}` and only then commits; a crash between a commit and the increment loses the verdict, and so does committing a record whose increment failed (a key of the wrong type is checked).',
       match: {
         python: {order: [/\.hincrby\(/, /consumer\.commit\(/]},
         typescript: {order: [/\.hincrby\(/, /commitOffsets\(/]},
@@ -913,7 +914,8 @@ def check_no_prompt(ctx):
     root.setLevel(logging.DEBUG)
     try:
         with contextlib.redirect_stdout(captured), contextlib.redirect_stderr(captured):
-            m.emit_feedback(m.build_event(_routed("r-1", prompt=CANARY)))
+            # The rated request also carries the model's answer: content that has no place in the event either.
+            m.emit_feedback(m.build_event({**_routed("r-1", prompt=CANARY), "answer": "CANARY-7731 the card ends in 4111"}))
             m.producer.poll(0)
     finally:
         root.removeHandler(handler)
@@ -921,8 +923,10 @@ def check_no_prompt(ctx):
     records = ctx.kafka.records("route.feedback")
     assert len(records) == 1, f"one emit_feedback call produced {len(records)} records"
     value = records[0].value.decode()
-    assert "CANARY-7731" not in value, f"the feedback event carries the prompt: {value}"
+    assert "CANARY-7731" not in value, f"the feedback event carries the prompt or the answer: {value}"
     assert "prompt" not in json.loads(value), f"the feedback event has a prompt field: {value}"
+    fields = sorted(json.loads(value))
+    assert fields == sorted(["id", "tenant", "policy", "model", "outcome", "latency_ms"]), f"the feedback event has the fields {fields}, expected exactly id, tenant, policy, model, outcome and latency_ms"
     assert "CANARY-7731" not in captured.getvalue(), f"the prompt was printed or logged: {captured.getvalue().strip()!r}"
 
 
@@ -949,15 +953,24 @@ def check_commit_after_increment(ctx):
     for request_id, outcome in (("r-1", "good"), ("r-2", "good"), ("r-3", "bad")):
         event = {k: v for k, v in _routed(request_id, outcome=outcome).items() if k != "prompt"}
         ctx.kafka.seed("route.feedback", key="acme", value=json.dumps(event))
+    # The last record's increment fails: quality:acme:gpt-4o is not a hash.
+    failing = {k: v for k, v in _routed("r-4").items() if k != "prompt"}
+    ctx.kafka.seed("route.feedback", key="acme", value=json.dumps({**failing, "model": "gpt-4o"}))
+    ctx.redis.set("quality:acme:gpt-4o", "not-a-hash")
     at_commit = []
     ctx.kafka.on_commit(lambda group, offsets: at_commit.append(sum(int(v) for v in ctx.redis.hgetall(QUALITY).values())))
     m = ctx.load("feedback")
-    ctx.drain(m.run_quality)
+    try:
+        ctx.drain(m.run_quality)
+    except Exception:  # noqa: BLE001 - the failed increment may end the consumer; the offsets are the verdict
+        pass
     assert at_commit, "the consumer never committed an offset"
     assert at_commit[0] >= 1, f"at the first commit {QUALITY} counted {at_commit[0]} verdicts: the increment must come before the commit, or a crash in between loses the verdict"
     counts = ctx.redis.hgetall(QUALITY)
     assert counts == {"good": "2", "bad": "1"}, f"{QUALITY} is {counts}, expected good 2 and bad 1"
-    assert ctx.kafka.lag("quality", "route.feedback") == 0, "every processed record must be committed"
+    lag = ctx.kafka.lag("quality", "route.feedback")
+    assert lag <= 1, f"the lag is {lag}: every record whose increment succeeded must be committed"
+    assert lag == 1, "the increment of r-4 failed (WRONGTYPE) and its offset was committed anyway: the verdict is lost for good. Commit only after the increment succeeded"
 `,
     typescript: `const CANARY = 'CANARY-7731 my card number is 4111';
 const QUALITY = 'quality:acme:gpt-4o-mini';
@@ -1016,7 +1029,8 @@ export async function check_no_prompt(ctx) {
   const capture = (...args: unknown[]) => void logged.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
   console.log = console.info = console.debug = console.warn = console.error = capture;
   try {
-    m.emitFeedback(m.buildEvent(routed('r-1', 'acme', CANARY)));
+    // The rated request also carries the model's answer: content that has no place in the event either.
+    m.emitFeedback(m.buildEvent({...routed('r-1', 'acme', CANARY), answer: 'CANARY-7731 the card ends in 4111'}));
     await settle();
   } finally {
     Object.assign(console, prior);
@@ -1024,8 +1038,10 @@ export async function check_no_prompt(ctx) {
   const records = ctx.kafka.records('route.feedback');
   assert.equal(records.length, 1, \`one emitFeedback call produced \${records.length} records\`);
   const value = records[0].value.toString();
-  assert(!value.includes('CANARY-7731'), \`the feedback event carries the prompt: \${value}\`);
+  assert(!value.includes('CANARY-7731'), \`the feedback event carries the prompt or the answer: \${value}\`);
   assert(!('prompt' in JSON.parse(value)), \`the feedback event has a prompt field: \${value}\`);
+  const fields = Object.keys(JSON.parse(value)).sort();
+  assert.deepStrictEqual(fields, ['id', 'latency_ms', 'model', 'outcome', 'policy', 'tenant'], \`the feedback event has the fields \${JSON.stringify(fields)}, expected exactly id, tenant, policy, model, outcome and latency_ms\`);
   const leak = logged.find(l => l.includes('CANARY-7731'));
   assert(leak === undefined, \`the prompt was printed or logged: \${JSON.stringify(leak)}\`);
 }
@@ -1053,14 +1069,24 @@ export async function check_commit_after_increment(ctx) {
     const {prompt: _prompt, ...event} = routed(id, 'acme', '', outcome);
     ctx.kafka.seed('route.feedback', {key: 'acme', value: JSON.stringify(event)});
   }
+  // The last record's increment fails: quality:acme:gpt-4o is not a hash.
+  const {prompt: _failingPrompt, ...failing} = routed('r-4');
+  ctx.kafka.seed('route.feedback', {key: 'acme', value: JSON.stringify({...failing, model: 'gpt-4o'})});
+  ctx.redis.set('quality:acme:gpt-4o', 'not-a-hash');
   const atCommit: number[] = [];
   ctx.kafka.onCommit(() => atCommit.push(Object.values(ctx.redis.hgetall(QUALITY) as Record<string, string>).reduce((n, v) => n + Number(v), 0)));
   const m = ctx.load('feedback');
-  await ctx.drain(m.runQuality());
+  try {
+    await ctx.drain(m.runQuality());
+  } catch {
+    // The failed increment may end the consumer; the offsets are the verdict.
+  }
   assert(atCommit.length > 0, 'the consumer never committed an offset');
   assert(atCommit[0] >= 1, \`at the first commit \${QUALITY} counted \${atCommit[0]} verdicts: the increment must come before the commit, or a crash in between loses the verdict\`);
   assert.deepStrictEqual(ctx.redis.hgetall(QUALITY), {good: '2', bad: '1'}, \`\${QUALITY} is \${JSON.stringify(ctx.redis.hgetall(QUALITY))}, expected good 2 and bad 1\`);
-  assert.equal(ctx.kafka.lag('quality', 'route.feedback'), 0, 'every processed record must be committed');
+  const lag = ctx.kafka.lag('quality', 'route.feedback');
+  assert(lag <= 1, \`the lag is \${lag}: every record whose increment succeeded must be committed\`);
+  assert.equal(lag, 1, 'the increment of r-4 failed (WRONGTYPE) and its offset was committed anyway: the verdict is lost for good. Commit only after the increment succeeded');
 }
 `,
     go: `package main
@@ -1167,6 +1193,12 @@ func CheckNoPrompt(ctx *harness.Ctx) {
 	json.Unmarshal(records[0].Value, &event)
 	_, hasPrompt := event["prompt"]
 	ctx.Assert(!hasPrompt, "the feedback event has a prompt field: %s", value)
+	exact := len(event) == 6
+	for _, field := range []string{"id", "tenant", "policy", "model", "outcome", "latency_ms"} {
+		_, has := event[field]
+		exact = exact && has
+	}
+	ctx.Assert(exact, "the feedback event is %s, expected exactly id, tenant, policy, model, outcome and latency_ms", value)
 	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was printed or logged: %q", strings.TrimSpace(logged.String()))
 }
 
@@ -1196,13 +1228,19 @@ func CheckCommitAfterIncrement(ctx *harness.Ctx) {
 		value, _ := json.Marshal(map[string]any{"id": r.id, "tenant": "acme", "policy": "auto", "model": "gpt-4o-mini", "outcome": r.outcome, "latency_ms": 812.5})
 		ctx.Kafka.Seed("route.feedback", "acme", string(value))
 	}
+	// The last record's increment fails: quality:acme:gpt-4o is not a hash.
+	failing, _ := json.Marshal(map[string]any{"id": "r-4", "tenant": "acme", "policy": "auto", "model": "gpt-4o", "outcome": "good", "latency_ms": 812.5})
+	ctx.Kafka.Seed("route.feedback", "acme", string(failing))
+	ctx.Redis.Set("quality:acme:gpt-4o", "not-a-hash")
 	var atCommit []int
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, qualityTotal(ctx)) })
 	ctx.Drain(func() { runQuality(context.Background()) })
 	ctx.Assert(len(atCommit) > 0, "the consumer never committed an offset")
 	ctx.Assert(atCommit[0] >= 1, "at the first commit %s counted %d verdicts: the increment must come before the commit, or a crash in between loses the verdict", feedbackQuality, atCommit[0])
 	ctx.Equal(ctx.Redis.HGetAll(feedbackQuality), map[string]string{"good": "2", "bad": "1"}, "%s (good 2, bad 1)", feedbackQuality)
-	ctx.Equal(ctx.Kafka.Lag("quality", "route.feedback"), 0, "every processed record must be committed; the lag")
+	lag := ctx.Kafka.Lag("quality", "route.feedback")
+	ctx.Assert(lag <= 1, "the lag is %d: every record whose increment succeeded must be committed", lag)
+	ctx.Assert(lag == 1, "the increment of r-4 failed (WRONGTYPE) and its offset was committed anyway: the verdict is lost for good. Commit only after the increment succeeded")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1287,7 +1325,10 @@ void CheckNoPrompt(harness::Ctx& ctx) {
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
-  emit_feedback(build_event(feedbackRouted("r-1", "acme", kFeedbackCanary)));
+  // The rated request also carries the model's answer: content that has no place in the event either.
+  auto rated = feedbackRouted("r-1", "acme", kFeedbackCanary);
+  rated["answer"] = "CANARY-7731 the card ends in 4111";
+  emit_feedback(build_event(rated));
   producer->poll(0);
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
@@ -1295,9 +1336,12 @@ void CheckNoPrompt(harness::Ctx& ctx) {
   const auto records = ctx.Kafka.Records("route.feedback");
   ctx.Equal(records.size(), 1, "one emit_feedback call; the records");
   const std::string value = records[0].Value.value_or("");
-  ctx.Assert(value.find("CANARY-7731") == std::string::npos, "the feedback event carries the prompt: %s", value);
+  ctx.Assert(value.find("CANARY-7731") == std::string::npos, "the feedback event carries the prompt or the answer: %s", value);
   const auto event = nlohmann::json::parse(value, nullptr, false);
   ctx.Assert(event.is_object() && !event.contains("prompt"), "the feedback event has a prompt field: %s", value);
+  bool exact = event.is_object() && event.size() == 6;
+  for (const char* field : {"id", "tenant", "policy", "model", "outcome", "latency_ms"}) exact = exact && event.contains(field);
+  ctx.Assert(exact, "the feedback event is %s, expected exactly id, tenant, policy, model, outcome and latency_ms", value);
   ctx.Assert(logged.str().find("CANARY-7731") == std::string::npos, "the prompt was printed or logged: %q", logged.str());
 }
 
@@ -1327,13 +1371,25 @@ void CheckCommitAfterIncrement(harness::Ctx& ctx) {
     event.erase("prompt");
     ctx.Kafka.Seed("route.feedback", "acme", event.dump());
   }
+  // The last record's increment fails: quality:acme:gpt-4o is not a hash.
+  auto failing = feedbackRouted("r-4", "acme");
+  failing.erase("prompt");
+  failing["model"] = "gpt-4o";
+  ctx.Kafka.Seed("route.feedback", "acme", failing.dump());
+  ctx.Redis.Set("quality:acme:gpt-4o", "not-a-hash");
   std::vector<long long> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(qualityTotal(ctx)); });
-  ctx.Drain([] { run_quality(); });
+  try {
+    ctx.Drain([] { run_quality(); });
+  } catch (const std::exception&) {
+    // The failed increment may end the consumer; the offsets are the verdict.
+  }
   ctx.Assert(!atCommit.empty(), "the consumer never committed an offset");
   ctx.Assert(atCommit[0] >= 1, "at the first commit %s counted %d verdicts: the increment must come before the commit, or a crash in between loses the verdict", kFeedbackQuality, atCommit[0]);
   ctx.Assert(ctx.Redis.HGetAll(kFeedbackQuality) == std::map<std::string, std::string>{{"good", "2"}, {"bad", "1"}}, "%s is %v, expected good 2 and bad 1", kFeedbackQuality, ctx.Redis.HGetAll(kFeedbackQuality));
-  ctx.Equal(ctx.Kafka.Lag("quality", "route.feedback"), 0, "every processed record must be committed; the lag");
+  const auto lag = ctx.Kafka.Lag("quality", "route.feedback");
+  ctx.Assert(lag <= 1, "the lag is %d: every record whose increment succeeded must be committed", lag);
+  ctx.Assert(lag == 1, "the increment of r-4 failed (WRONGTYPE) and its offset was committed anyway: the verdict is lost for good. Commit only after the increment succeeded");
 }
 `,
   },

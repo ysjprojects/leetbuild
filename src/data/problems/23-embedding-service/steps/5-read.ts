@@ -61,7 +61,7 @@ cache as a real vector.
     {
       id: 'tenant-required',
       title: 'A read without a tenant is 401',
-      detail: 'A missing `X-Tenant-Id` answers **401** before Redis is read.',
+      detail: 'A missing or empty `X-Tenant-Id` answers **401**.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/]},
@@ -451,7 +451,7 @@ def _api(ctx):
 
 
 async def _get(c, text, tenant="acme", version=None):
-    headers = {"X-Tenant-Id": tenant} if tenant else {}
+    headers = {"X-Tenant-Id": tenant} if tenant is not None else {}
     params = {"model_version": version} if version else {}
     return await c.get(f"/v1/embeddings/{content_hash(text)}", headers=headers, params=params)
 
@@ -468,7 +468,9 @@ async def check_tenant_required(ctx):
     _seed(ctx, "acme", MODEL_VERSION, TEXT)
     async with _api(ctx) as c:
         r = await _get(c, TEXT, tenant=None)
-    assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}: {r.text[:160]}; it must be 401"
+        assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}: {r.text[:160]}; it must be 401"
+        empty = await _get(c, TEXT, tenant="")
+    assert empty.status_code == 401, f"a read with an empty X-Tenant-Id answered {empty.status_code}: {empty.text[:160]}; an empty tenant is no tenant, and it must be 401"
 
 
 async def check_exact_key(ctx):
@@ -512,7 +514,7 @@ function world(ctx) {
   };
   const c = ctx.client(ctx.load('read').app);
   const get = (text: string, tenant: string | null = 'acme', version: string | null = null) =>
-    c.get(\`/v1/embeddings/\${config.contentHash(text)}\`, {headers: tenant ? {'X-Tenant-Id': tenant} : {}, query: version ? {model_version: version} : {}});
+    c.get(\`/v1/embeddings/\${config.contentHash(text)}\`, {headers: tenant !== null ? {'X-Tenant-Id': tenant} : {}, query: version ? {model_version: version} : {}});
   return {config, seed, get};
 }
 
@@ -529,6 +531,8 @@ export async function check_tenant_required(ctx) {
   seed('acme', config.MODEL_VERSION, TEXT);
   const r = await get(TEXT, null);
   assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}: \${r.text.slice(0, 160)}; it must be 401\`);
+  const empty = await get(TEXT, '');
+  assert.equal(empty.status, 401, \`a read with an empty X-Tenant-Id answered \${empty.status}: \${empty.text.slice(0, 160)}; an empty tenant is no tenant, and it must be 401\`);
 }
 
 export async function check_exact_key(ctx) {
@@ -623,8 +627,11 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckTenantRequired(ctx *harness.Ctx) {
 	readSeed(ctx, "acme", config.ModelVersion, readText)
-	r := readGet(readAPI(ctx), readText, "", "")
+	c := readAPI(ctx)
+	r := readGet(c, readText, "", "")
 	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id must be 401 (%s)", r.Text())
+	empty := c.Get("/v1/embeddings/"+config.ContentHash(readText), "X-Tenant-Id", "")
+	ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text())
 }
 
 func CheckExactKey(ctx *harness.Ctx) {
@@ -709,6 +716,8 @@ void CheckTenantRequired(harness::Ctx& ctx) {
   auto c = api(ctx);
   const auto r = get(c, kText, "");
   ctx.Equal(r.Status, 401, "a read without X-Tenant-Id must be 401 (%s)", r.Text());
+  const auto empty = c.Get("/v1/embeddings/" + config::contentHash(kText), "X-Tenant-Id", "");
+  ctx.Equal(empty.Status, 401, "a read with an empty X-Tenant-Id: an empty tenant is no tenant (%s)", empty.Text());
 }
 
 void CheckExactKey(harness::Ctx& ctx) {

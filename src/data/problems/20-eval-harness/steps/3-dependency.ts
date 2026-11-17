@@ -69,7 +69,7 @@ Requirements:
       id: 'retry-unavailable',
       title: 'Retries UNAVAILABLE at most twice',
       detail:
-        "One UNAVAILABLE earns a retry after a backoff and the model's score; a judge that stays UNAVAILABLE gets exactly three calls for the sample. The starter calls until the judge answers.",
+        "One UNAVAILABLE, or one DEADLINE_EXCEEDED, earns a retry after a backoff and the model's score; INTERNAL, PERMISSION_DENIED and NOT_FOUND get one call each; a judge that stays UNAVAILABLE gets exactly three calls for the sample. The starter calls until the judge answers.",
       match: {
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s+True/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/while\s*\(\s*true\s*\)/]},
@@ -85,7 +85,7 @@ Requirements:
       id: 'fallback-metric',
       title: 'Scores with exact_match, marked fallback, when the judge cannot answer',
       detail:
-        'A judge that hangs past every deadline, or stays UNAVAILABLE, leaves the sample scored by exact_match(expected, output) with judge fallback, after about three deadlines of waiting. The starter waits the judge out.',
+        'A judge that hangs past every deadline, or stays UNAVAILABLE, leaves the sample scored by exact_match(expected, output) with judge fallback; a hanging judge gets three attempts, each with its own 800 ms deadline, so the worker waits about three deadlines. The starter waits the judge out.',
       match: {
         python: {all: [/exact_match\(/, /["']fallback["']/]},
         typescript: {all: [/exactMatch\(/, /['"]fallback['"]/]},
@@ -111,7 +111,7 @@ Requirements:
       id: 'breaker',
       title: 'Opens a breaker after five failed attempts, for 30 s',
       detail:
-        'With the judge down, the fifth failed attempt in a row opens the breaker: later samples go to the fallback without a call until 30 s have passed, then a trial call reaches the judge again. The starter has no breaker.',
+        'Four failed attempts and then an answer leave the breaker closed; with the judge down, the fifth failed attempt in a row opens it: later samples go to the fallback without a call, still at 29 s, until 30 s have passed, then a trial call reaches the judge again. The starter has no breaker.',
       match: {
         python: {all: [/BREAKER_FAILURES/, /BREAKER_COOLDOWN_S/, /\.allow\(\)/]},
         typescript: {all: [/BREAKER_FAILURES/, /BREAKER_COOLDOWN/, /\.allow\(\)/]},
@@ -816,14 +816,23 @@ def check_deadline(ctx):
 
 def check_retry_unavailable(ctx):
     m = _world(ctx)
+    for n, code in enumerate((grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.NOT_FOUND)):
+        ctx.grpc.fail("Score", code, "judge refused", times=1, target=config.JUDGE)
+        result = _shape(m.score_sample(_sample(10 + n)))
+        assert len(_calls(ctx)) == n + 1, f"{code.name} is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw {len(_calls(ctx)) - n}"
+        assert result.get("judge") != "model", f"{code.name} on the only call leaves no model score, got {result}"
+    base = len(_calls(ctx))
     ctx.grpc.fail("Score", grpc.StatusCode.UNAVAILABLE, "judge restarting", times=1, target=config.JUDGE)
     result = _shape(m.score_sample(_sample(1)))
     assert _judged(result), f"one UNAVAILABLE then a healthy judge: the retry must get the model's score, got {result}"
-    assert result.get("attempts") == 2 and len(_calls(ctx)) == 2, f"one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw {len(_calls(ctx))} calls and {result}"
+    assert result.get("attempts") == 2 and len(_calls(ctx)) == base + 2, f"one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw {len(_calls(ctx)) - base} calls and {result}"
     assert ctx.clock.sleeps >= 1, "a retry waits a backoff before the next attempt"
-    ctx.grpc.fail("Score", grpc.StatusCode.UNAVAILABLE, "judge down", times=3, target=config.JUDGE)
+    ctx.grpc.fail("Score", grpc.StatusCode.DEADLINE_EXCEEDED, "judge slow", times=1, target=config.JUDGE)
     result = _shape(m.score_sample(_sample(2)))
-    assert len(_calls(ctx)) == 5, f"a judge that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the sample, saw {len(_calls(ctx)) - 2}"
+    assert _judged(result) and len(_calls(ctx)) == base + 4, f"one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw {len(_calls(ctx)) - base - 2} calls and {result}"
+    ctx.grpc.fail("Score", grpc.StatusCode.UNAVAILABLE, "judge down", times=3, target=config.JUDGE)
+    result = _shape(m.score_sample(_sample(3)))
+    assert len(_calls(ctx)) == base + 7, f"a judge that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the sample, saw {len(_calls(ctx)) - base - 4}"
     assert result.get("attempts") == 3 and result.get("judge") != "model", f"three failed attempts: attempts 3 and no model score, got {result}"
 
 
@@ -836,6 +845,10 @@ def check_fallback_metric(ctx):
     assert result.get("judge") == "fallback" and result.get("status") == "scored", f"the judge hung on every attempt and the sample came back {result}: score it with exact_match and mark it judge 'fallback'"
     assert result.get("score") == 1.0, f"exact_match(' paris ', 'Paris') is 1.0 (trimmed, case-insensitive), got {result}"
     assert waited <= 3.5, f"the worker waited {waited:.1f} s on a judge that hangs: three 800 ms attempts and their backoffs, then the fallback"
+    calls = _calls(ctx)
+    assert len(calls) == 3, f"a judge that hangs past the deadline answers DEADLINE_EXCEEDED, which is retried: expected MAX_ATTEMPTS = 3 calls, saw {len(calls)}"
+    timeouts = [c.timeout for c in calls]
+    assert all(t is not None and 0.6 <= t <= 1.0 for t in timeouts), f"the attempts carried deadlines of {timeouts} s: every attempt gets its own 800 ms, not what is left of the first one's"
     ctx.grpc.set_latency("Score", 0.0, config.JUDGE)
     ctx.grpc.fail("Score", grpc.StatusCode.UNAVAILABLE, "judge down", times=3, target=config.JUDGE)
     result = _shape(m.score_sample(_sample(2)))
@@ -858,19 +871,23 @@ def check_invalid_argument(ctx):
 
 def check_breaker(ctx):
     m = _world(ctx)
-    ctx.grpc.fail("Score", grpc.StatusCode.UNAVAILABLE, "judge down", times=5, target=config.JUDGE)
+    ctx.grpc.fail("Score", grpc.StatusCode.UNAVAILABLE, "judge restarting", times=4, target=config.JUDGE)
     first = _shape(m.score_sample(_sample(1)))
-    assert first.get("judge") == "fallback" and len(_calls(ctx)) == 3, f"the judge is down: the first sample makes 3 calls and falls back, saw {len(_calls(ctx))} calls and {first}"
     second = _shape(m.score_sample(_sample(2)))
-    assert second.get("judge") == "fallback" and len(_calls(ctx)) == 5, f"the fifth failed attempt in a row opens the breaker (BREAKER_FAILURES = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw {len(_calls(ctx)) - 3} calls and {second}"
-    for n in range(3, 7):
+    assert first.get("judge") == "fallback" and _judged(second) and len(_calls(ctx)) == 5, f"four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw {len(_calls(ctx))} calls, {first} and {second}"
+    ctx.grpc.fail("Score", grpc.StatusCode.UNAVAILABLE, "judge down", times=5, target=config.JUDGE)
+    first = _shape(m.score_sample(_sample(3)))
+    assert first.get("judge") == "fallback" and len(_calls(ctx)) == 8, f"the judge is down after a success: the next sample makes 3 calls and falls back, saw {len(_calls(ctx)) - 5} calls and {first}"
+    second = _shape(m.score_sample(_sample(4)))
+    assert second.get("judge") == "fallback" and len(_calls(ctx)) == 10, f"the fifth failed attempt in a row opens the breaker (BREAKER_FAILURES = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw {len(_calls(ctx)) - 8} calls and {second}"
+    for n in range(5, 9):
         assert _shape(m.score_sample(_sample(n))).get("judge") == "fallback"
-    assert len(_calls(ctx)) == 5, f"while the breaker is open samples skip the judge, yet {len(_calls(ctx)) - 5} calls went out"
-    ctx.clock.advance(10)
-    assert _shape(m.score_sample(_sample(7))).get("judge") == "fallback" and len(_calls(ctx)) == 5, "ten seconds into a 30 s cooldown the breaker is still open"
-    ctx.clock.advance(21)
-    result = _shape(m.score_sample(_sample(8)))
-    assert _judged(result) and len(_calls(ctx)) == 6, f"after the 30 s cooldown a trial call reaches the judge, which is back: got {result} after {len(_calls(ctx))} calls"
+    assert len(_calls(ctx)) == 10, f"while the breaker is open samples skip the judge, yet {len(_calls(ctx)) - 10} calls went out"
+    ctx.clock.advance(29)
+    assert _shape(m.score_sample(_sample(9))).get("judge") == "fallback" and len(_calls(ctx)) == 10, "29 seconds into a 30 s cooldown the breaker is still open"
+    ctx.clock.advance(2)
+    result = _shape(m.score_sample(_sample(10)))
+    assert _judged(result) and len(_calls(ctx)) == 11, f"after the 30 s cooldown a trial call reaches the judge, which is back: got {result} after {len(_calls(ctx))} calls"
 `,
     typescript: `const sample = (n: number, expected = 'Paris', output = 'The capital of France is Paris.') => ({run_id: 'r1', sample_id: \`s-\${n}\`, expected, output});
 
@@ -906,14 +923,24 @@ export async function check_deadline(ctx) {
 
 export async function check_retry_unavailable(ctx) {
   const {m, config} = world(ctx);
+  for (const [n, code] of ['INTERNAL', 'PERMISSION_DENIED', 'NOT_FOUND'].entries()) {
+    ctx.grpc.fail('Score', ctx.grpc.status[code], 'judge refused', 1, config.JUDGE);
+    const refused = await m.scoreSample(sample(10 + n));
+    assert.equal(calls(ctx).length, n + 1, \`\${code} is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw \${calls(ctx).length - n}\`);
+    assert.notEqual(refused?.judge, 'model', \`\${code} on the only call leaves no model score, got \${JSON.stringify(refused)}\`);
+  }
+  const base = calls(ctx).length;
   ctx.grpc.fail('Score', ctx.grpc.status.UNAVAILABLE, 'judge restarting', 1, config.JUDGE);
   let result = await m.scoreSample(sample(1));
   assert(judged(result), \`one UNAVAILABLE then a healthy judge: the retry must get the model's score, got \${JSON.stringify(result)}\`);
-  assert(result.attempts === 2 && calls(ctx).length === 2, \`one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw \${calls(ctx).length} calls and \${JSON.stringify(result)}\`);
+  assert(result.attempts === 2 && calls(ctx).length === base + 2, \`one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw \${calls(ctx).length - base} calls and \${JSON.stringify(result)}\`);
   assert(ctx.clock.sleeps >= 1, 'a retry waits a backoff before the next attempt');
-  ctx.grpc.fail('Score', ctx.grpc.status.UNAVAILABLE, 'judge down', 3, config.JUDGE);
+  ctx.grpc.fail('Score', ctx.grpc.status.DEADLINE_EXCEEDED, 'judge slow', 1, config.JUDGE);
   result = await m.scoreSample(sample(2));
-  assert.equal(calls(ctx).length, 5, \`a judge that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the sample, saw \${calls(ctx).length - 2}\`);
+  assert(judged(result) && calls(ctx).length === base + 4, \`one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw \${calls(ctx).length - base - 2} calls and \${JSON.stringify(result)}\`);
+  ctx.grpc.fail('Score', ctx.grpc.status.UNAVAILABLE, 'judge down', 3, config.JUDGE);
+  result = await m.scoreSample(sample(3));
+  assert.equal(calls(ctx).length, base + 7, \`a judge that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the sample, saw \${calls(ctx).length - base - 4}\`);
   assert(result?.attempts === 3 && result?.judge !== 'model', \`three failed attempts: attempts 3 and no model score, got \${JSON.stringify(result)}\`);
 }
 
@@ -926,6 +953,9 @@ export async function check_fallback_metric(ctx) {
   assert(result?.judge === 'fallback' && result?.status === 'scored', \`the judge hung on every attempt and the sample came back \${JSON.stringify(result)}: score it with exactMatch and mark it judge 'fallback'\`);
   assert.equal(result.score, 1, \`exactMatch(' paris ', 'Paris') is 1 (trimmed, case-insensitive), got \${JSON.stringify(result)}\`);
   assert(waited <= 3.5, \`the worker waited \${waited.toFixed(1)} s on a judge that hangs: three 800 ms attempts and their backoffs, then the fallback\`);
+  assert.equal(calls(ctx).length, 3, \`a judge that hangs past the deadline answers DEADLINE_EXCEEDED, which is retried: expected MAX_ATTEMPTS = 3 calls, saw \${calls(ctx).length}\`);
+  const timeouts = calls(ctx).map(c => c.timeout);
+  assert(timeouts.every(t => typeof t === 'number' && 0.6 <= t && t <= 1.0), \`the attempts carried deadlines of \${JSON.stringify(timeouts)} s: every attempt gets its own 800 ms, not what is left of the first one's\`);
   ctx.grpc.setLatency('Score', 0, config.JUDGE);
   ctx.grpc.fail('Score', ctx.grpc.status.UNAVAILABLE, 'judge down', 3, config.JUDGE);
   result = await m.scoreSample(sample(2));
@@ -947,18 +977,22 @@ export async function check_invalid_argument(ctx) {
 
 export async function check_breaker(ctx) {
   const {m, config} = world(ctx);
+  ctx.grpc.fail('Score', ctx.grpc.status.UNAVAILABLE, 'judge restarting', 4, config.JUDGE);
+  let first = await m.scoreSample(sample(1));
+  let second = await m.scoreSample(sample(2));
+  assert(first?.judge === 'fallback' && judged(second) && calls(ctx).length === 5, \`four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw \${calls(ctx).length} calls, \${JSON.stringify(first)} and \${JSON.stringify(second)}\`);
   ctx.grpc.fail('Score', ctx.grpc.status.UNAVAILABLE, 'judge down', 5, config.JUDGE);
-  const first = await m.scoreSample(sample(1));
-  assert(first?.judge === 'fallback' && calls(ctx).length === 3, \`the judge is down: the first sample makes 3 calls and falls back, saw \${calls(ctx).length} calls and \${JSON.stringify(first)}\`);
-  const second = await m.scoreSample(sample(2));
-  assert(second?.judge === 'fallback' && calls(ctx).length === 5, \`the fifth failed attempt in a row opens the breaker (BREAKER_FAILURES = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw \${calls(ctx).length - 3} calls and \${JSON.stringify(second)}\`);
-  for (let n = 3; n <= 6; n += 1) assert.equal((await m.scoreSample(sample(n)))?.judge, 'fallback');
-  assert.equal(calls(ctx).length, 5, \`while the breaker is open samples skip the judge, yet \${calls(ctx).length - 5} calls went out\`);
-  ctx.clock.advance(10);
-  assert((await m.scoreSample(sample(7)))?.judge === 'fallback' && calls(ctx).length === 5, 'ten seconds into a 30 s cooldown the breaker is still open');
-  ctx.clock.advance(21);
-  const result = await m.scoreSample(sample(8));
-  assert(judged(result) && calls(ctx).length === 6, \`after the 30 s cooldown a trial call reaches the judge, which is back: got \${JSON.stringify(result)} after \${calls(ctx).length} calls\`);
+  first = await m.scoreSample(sample(3));
+  assert(first?.judge === 'fallback' && calls(ctx).length === 8, \`the judge is down after a success: the next sample makes 3 calls and falls back, saw \${calls(ctx).length - 5} calls and \${JSON.stringify(first)}\`);
+  second = await m.scoreSample(sample(4));
+  assert(second?.judge === 'fallback' && calls(ctx).length === 10, \`the fifth failed attempt in a row opens the breaker (BREAKER_FAILURES = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw \${calls(ctx).length - 8} calls and \${JSON.stringify(second)}\`);
+  for (let n = 5; n <= 8; n += 1) assert.equal((await m.scoreSample(sample(n)))?.judge, 'fallback');
+  assert.equal(calls(ctx).length, 10, \`while the breaker is open samples skip the judge, yet \${calls(ctx).length - 10} calls went out\`);
+  ctx.clock.advance(29);
+  assert((await m.scoreSample(sample(9)))?.judge === 'fallback' && calls(ctx).length === 10, '29 seconds into a 30 s cooldown the breaker is still open');
+  ctx.clock.advance(2);
+  const result = await m.scoreSample(sample(10));
+  assert(judged(result) && calls(ctx).length === 11, \`after the 30 s cooldown a trial call reaches the judge, which is back: got \${JSON.stringify(result)} after \${calls(ctx).length} calls\`);
 }
 `,
     go: `package main
@@ -1022,14 +1056,24 @@ func CheckDeadline(ctx *harness.Ctx) {
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
 	clientWorld(ctx)
+	for n, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.NotFound} {
+		ctx.GRPC.Fail("Score", code, "judge refused", 1, config.Judge)
+		refused := clientScore(10 + n)
+		ctx.Assert(clientCalls(ctx) == n+1, "%v is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw %d", code, clientCalls(ctx)-n)
+		ctx.Assert(refused.Judge != "model", "%v on the only call leaves no model score, got %+v", code, refused)
+	}
+	base := clientCalls(ctx)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge restarting", 1, config.Judge)
 	result := clientScore(1)
 	ctx.Assert(clientJudged(result), "one UNAVAILABLE then a healthy judge: the retry must get the model's score, got %+v", result)
-	ctx.Assert(result.Attempts == 2 && clientCalls(ctx) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", clientCalls(ctx), result)
+	ctx.Assert(result.Attempts == 2 && clientCalls(ctx) == base+2, "one UNAVAILABLE earns one retry: expected 2 calls and Attempts 2, saw %d calls and %+v", clientCalls(ctx)-base, result)
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt")
-	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 3, config.Judge)
+	ctx.GRPC.Fail("Score", codes.DeadlineExceeded, "judge slow", 1, config.Judge)
 	result = clientScore(2)
-	ctx.Equal(clientCalls(ctx), 5, "a judge that stays UNAVAILABLE gets maxAttempts = 3 calls for the sample; calls so far")
+	ctx.Assert(clientJudged(result) && clientCalls(ctx) == base+4, "one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw %d calls and %+v", clientCalls(ctx)-base-2, result)
+	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 3, config.Judge)
+	result = clientScore(3)
+	ctx.Equal(clientCalls(ctx)-base-4, 3, "a judge that stays UNAVAILABLE gets maxAttempts = 3 calls for the sample; calls")
 	ctx.Assert(result.Attempts == 3 && result.Judge != "model", "three failed attempts: Attempts 3 and no model score, got %+v", result)
 }
 
@@ -1042,6 +1086,11 @@ func CheckFallbackMetric(ctx *harness.Ctx) {
 	ctx.Assert(result.Judge == "fallback" && result.Status == "scored", "the judge hung on every attempt and the sample came back %+v: score it with metrics.ExactMatch and mark it Judge \\"fallback\\"", result)
 	ctx.Equal(result.Score, 1.0, "metrics.ExactMatch(\\"Paris\\", \\" paris \\") is 1 (trimmed, case-insensitive); the score")
 	ctx.Assert(waited <= 3.5, "the worker waited %.1f s on a judge that hangs: three 800 ms attempts and their backoffs, then the fallback", waited)
+	calls := ctx.GRPC.CallsTo("Score", "")
+	ctx.Equal(len(calls), 3, "a judge that hangs past the deadline answers DEADLINE_EXCEEDED, which is retried: maxAttempts = 3; calls")
+	for i, call := range calls {
+		ctx.Assert(call.HasDeadline() && 600*time.Millisecond <= call.Timeout && call.Timeout <= time.Second, "attempt %d carried a deadline of %v: every attempt gets its own 800 ms, not what is left of the first one's", i+1, call.Timeout)
+	}
 	ctx.GRPC.SetLatency("Score", 0, config.Judge)
 	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 3, config.Judge)
 	result = clientScore(2)
@@ -1065,20 +1114,24 @@ func CheckInvalidArgument(ctx *harness.Ctx) {
 
 func CheckBreaker(ctx *harness.Ctx) {
 	clientWorld(ctx)
-	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 5, config.Judge)
+	ctx.GRPC.Fail("Score", codes.Unavailable, "judge restarting", 4, config.Judge)
 	first := clientScore(1)
-	ctx.Assert(first.Judge == "fallback" && clientCalls(ctx) == 3, "the judge is down: the first sample makes 3 calls and falls back, saw %d calls and %+v", clientCalls(ctx), first)
 	second := clientScore(2)
-	ctx.Assert(second.Judge == "fallback" && clientCalls(ctx) == 5, "the fifth failed attempt in a row opens the breaker (breakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %+v", clientCalls(ctx)-3, second)
-	for n := 3; n <= 6; n++ {
+	ctx.Assert(first.Judge == "fallback" && clientJudged(second) && clientCalls(ctx) == 5, "four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw %d calls, %+v and %+v", clientCalls(ctx), first, second)
+	ctx.GRPC.Fail("Score", codes.Unavailable, "judge down", 5, config.Judge)
+	first = clientScore(3)
+	ctx.Assert(first.Judge == "fallback" && clientCalls(ctx) == 8, "the judge is down after a success: the next sample makes 3 calls and falls back, saw %d calls and %+v", clientCalls(ctx)-5, first)
+	second = clientScore(4)
+	ctx.Assert(second.Judge == "fallback" && clientCalls(ctx) == 10, "the fifth failed attempt in a row opens the breaker (breakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %+v", clientCalls(ctx)-8, second)
+	for n := 5; n <= 8; n++ {
 		ctx.Equal(clientScore(n).Judge, "fallback", "sample %d's judge with the breaker open", n)
 	}
-	ctx.Equal(clientCalls(ctx), 5, "while the breaker is open samples skip the judge; calls")
-	ctx.Clock.Advance(10)
-	ctx.Assert(clientScore(7).Judge == "fallback" && clientCalls(ctx) == 5, "ten seconds into a 30 s cooldown the breaker is still open")
-	ctx.Clock.Advance(21)
-	result := clientScore(8)
-	ctx.Assert(clientJudged(result) && clientCalls(ctx) == 6, "after the 30 s cooldown a trial call reaches the judge, which is back: got %+v after %d calls", result, clientCalls(ctx))
+	ctx.Equal(clientCalls(ctx), 10, "while the breaker is open samples skip the judge; calls")
+	ctx.Clock.Advance(29)
+	ctx.Assert(clientScore(9).Judge == "fallback" && clientCalls(ctx) == 10, "29 seconds into a 30 s cooldown the breaker is still open")
+	ctx.Clock.Advance(2)
+	result := clientScore(10)
+	ctx.Assert(clientJudged(result) && clientCalls(ctx) == 11, "after the 30 s cooldown a trial call reaches the judge, which is back: got %+v after %d calls", result, clientCalls(ctx))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1135,14 +1188,26 @@ void CheckDeadline(harness::Ctx& ctx) {
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
   clientWorld(ctx);
+  const grpc::StatusCode terminal[] = {grpc::StatusCode::INTERNAL, grpc::StatusCode::PERMISSION_DENIED, grpc::StatusCode::NOT_FOUND};
+  const char* terminalNames[] = {"INTERNAL", "PERMISSION_DENIED", "NOT_FOUND"};
+  for (size_t n = 0; n < 3; n++) {
+    ctx.GRPC.Fail("Score", terminal[n], "judge refused", 1, config::kJudge);
+    const SampleScore refused = score_sample(clientSample(10 + static_cast<int>(n)));
+    ctx.Assert(clientCalls(ctx) == n + 1, "%s is not UNAVAILABLE or DEADLINE_EXCEEDED, so no retry: expected 1 call for the sample, saw %d", terminalNames[n], clientCalls(ctx) - n);
+    ctx.Assert(refused.judge != "model", "%s on the only call leaves no model score, got %s", terminalNames[n], show(refused));
+  }
+  const size_t base = clientCalls(ctx);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge restarting", 1, config::kJudge);
   SampleScore result = score_sample(clientSample(1));
   ctx.Assert(clientJudged(result), "one UNAVAILABLE then a healthy judge: the retry must get the model's score, got %s", show(result));
-  ctx.Assert(result.attempts == 2 && clientCalls(ctx) == 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and %s", clientCalls(ctx), show(result));
+  ctx.Assert(result.attempts == 2 && clientCalls(ctx) == base + 2, "one UNAVAILABLE earns one retry: expected 2 calls and attempts 2, saw %d calls and %s", clientCalls(ctx) - base, show(result));
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "a retry waits a backoff before the next attempt");
-  ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 3, config::kJudge);
+  ctx.GRPC.Fail("Score", grpc::StatusCode::DEADLINE_EXCEEDED, "judge slow", 1, config::kJudge);
   result = score_sample(clientSample(2));
-  ctx.Equal(clientCalls(ctx), 5, "a judge that stays UNAVAILABLE gets kMaxAttempts = 3 calls for the sample; calls so far");
+  ctx.Assert(clientJudged(result) && clientCalls(ctx) == base + 4, "one DEADLINE_EXCEEDED then a healthy judge: it is retried like UNAVAILABLE, expected 2 calls and the model's score, saw %d calls and %s", clientCalls(ctx) - base - 2, show(result));
+  ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 3, config::kJudge);
+  result = score_sample(clientSample(3));
+  ctx.Equal(clientCalls(ctx) - base - 4, 3, "a judge that stays UNAVAILABLE gets kMaxAttempts = 3 calls for the sample; calls");
   ctx.Assert(result.attempts == 3 && result.judge != "model", "three failed attempts: attempts 3 and no model score, got %s", show(result));
 }
 
@@ -1155,6 +1220,11 @@ void CheckFallbackMetric(harness::Ctx& ctx) {
   ctx.Assert(result.judge == "fallback" && result.status == "scored", "the judge hung on every attempt and the sample came back %s: score it with metrics::exact_match and mark it judge \\"fallback\\"", show(result));
   ctx.Equal(result.score, 1.0, "metrics::exact_match(\\"Paris\\", \\" paris \\") is 1 (trimmed, case-insensitive); the score");
   ctx.Assert(waited <= 3.5, "the worker waited %.1f s on a judge that hangs: three 800 ms attempts and their backoffs, then the fallback", waited);
+  const auto calls = ctx.GRPC.CallsTo("Score");
+  ctx.Equal(calls.size(), 3, "a judge that hangs past the deadline answers DEADLINE_EXCEEDED, which is retried: kMaxAttempts = 3; calls");
+  for (size_t i = 0; i < calls.size(); i++) {
+    ctx.Assert(calls[i].HasDeadline() && 0.6 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 1.0, "attempt %d carried a deadline of %vs: every attempt gets its own 800 ms, not what is left of the first one's", i + 1, calls[i].TimeoutSeconds());
+  }
   ctx.GRPC.SetLatency("Score", 0, config::kJudge);
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 3, config::kJudge);
   result = score_sample(clientSample(2));
@@ -1176,18 +1246,22 @@ void CheckInvalidArgument(harness::Ctx& ctx) {
 
 void CheckBreaker(harness::Ctx& ctx) {
   clientWorld(ctx);
+  ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge restarting", 4, config::kJudge);
+  SampleScore first = score_sample(clientSample(1));
+  SampleScore second = score_sample(clientSample(2));
+  ctx.Assert(first.judge == "fallback" && clientJudged(second) && clientCalls(ctx) == 5, "four failed attempts, then the judge answers: the breaker counts failures in a row, so it stays closed and the second sample gets the model's score on its second call; saw %d calls, %s and %s", clientCalls(ctx), show(first), show(second));
   ctx.GRPC.Fail("Score", grpc::StatusCode::UNAVAILABLE, "judge down", 5, config::kJudge);
-  const SampleScore first = score_sample(clientSample(1));
-  ctx.Assert(first.judge == "fallback" && clientCalls(ctx) == 3, "the judge is down: the first sample makes 3 calls and falls back, saw %d calls and %s", clientCalls(ctx), show(first));
-  const SampleScore second = score_sample(clientSample(2));
-  ctx.Assert(second.judge == "fallback" && clientCalls(ctx) == 5, "the fifth failed attempt in a row opens the breaker (kBreakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %s", clientCalls(ctx) - 3, show(second));
-  for (int n = 3; n <= 6; n++) ctx.Equal(score_sample(clientSample(n)).judge, "fallback", "sample %d's judge with the breaker open", n);
-  ctx.Equal(clientCalls(ctx), 5, "while the breaker is open samples skip the judge; calls");
-  ctx.Clock.Advance(10);
-  ctx.Assert(score_sample(clientSample(7)).judge == "fallback" && clientCalls(ctx) == 5, "ten seconds into a 30 s cooldown the breaker is still open");
-  ctx.Clock.Advance(21);
-  const SampleScore result = score_sample(clientSample(8));
-  ctx.Assert(clientJudged(result) && clientCalls(ctx) == 6, "after the 30 s cooldown a trial call reaches the judge, which is back: got %s after %d calls", show(result), clientCalls(ctx));
+  first = score_sample(clientSample(3));
+  ctx.Assert(first.judge == "fallback" && clientCalls(ctx) == 8, "the judge is down after a success: the next sample makes 3 calls and falls back, saw %d calls and %s", clientCalls(ctx) - 5, show(first));
+  second = score_sample(clientSample(4));
+  ctx.Assert(second.judge == "fallback" && clientCalls(ctx) == 10, "the fifth failed attempt in a row opens the breaker (kBreakerFailures = 5, asked before each attempt): the second sample makes 2 calls and falls back, saw %d calls and %s", clientCalls(ctx) - 8, show(second));
+  for (int n = 5; n <= 8; n++) ctx.Equal(score_sample(clientSample(n)).judge, "fallback", "sample %d's judge with the breaker open", n);
+  ctx.Equal(clientCalls(ctx), 10, "while the breaker is open samples skip the judge; calls");
+  ctx.Clock.Advance(29);
+  ctx.Assert(score_sample(clientSample(9)).judge == "fallback" && clientCalls(ctx) == 10, "29 seconds into a 30 s cooldown the breaker is still open");
+  ctx.Clock.Advance(2);
+  const SampleScore result = score_sample(clientSample(10));
+  ctx.Assert(clientJudged(result) && clientCalls(ctx) == 11, "after the 30 s cooldown a trial call reaches the judge, which is back: got %s after %d calls", show(result), clientCalls(ctx));
 }
 `,
   },

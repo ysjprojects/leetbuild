@@ -72,7 +72,7 @@ Requirements:
       id: 'event-payload',
       title: 'Carries the judge beside the score',
       detail:
-        'The event is {run_id, sample_id, model_version, score, passed, judge}, so the warehouse can tell a judged score from a fallback one. The starter sends no judge.',
+        'The event is exactly {run_id, sample_id, model_version, score, passed, judge}, no other field, so the warehouse can tell a judged score from a fallback one. The starter sends no judge.',
       match: {
         python: {all: [/["']judge["']\s*:\s*sample\.judge/]},
         typescript: {all: [/\bjudge:\s*sample\.judge/]},
@@ -111,7 +111,7 @@ Requirements:
       id: 'outbox-on-failure',
       title: 'Waits for the ack and falls back to the outbox',
       detail:
-        'A failed delivery, or no acknowledgement within 2 s, leaves the event as an outbox row and publish returns false. The starter catches only a local produce error and returns true.',
+        'An acknowledged event returns true and leaves no outbox row. A failed delivery, or no acknowledgement within 2 s, leaves the event itself (judge included) as an outbox row and publish returns false; a broker that never answers holds the call for 2 s, not longer. The starter catches only a local produce error and returns true.',
       match: {
         python: {
           all: [/outbox\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -647,6 +647,8 @@ def check_event_payload(ctx):
     for key, value in expected.items():
         assert events[0].get(key) == value, f"the event must carry {key}={value!r}, got {events[0]}"
     assert events[1].get("passed") is False and events[1].get("judge") == "model", f"a 0.25 judged by the model is passed false, judge model: {events[1]}"
+    for event in events:
+        assert sorted(event) == sorted(expected), f"the event is exactly {{run_id, sample_id, model_version, score, passed, judge}}, got the fields {sorted(event)}: anything else on a retained topic is a field the warehouse never asked for"
 
 
 def check_no_output_text(ctx):
@@ -659,14 +661,18 @@ def check_no_output_text(ctx):
             self.lines.append(record.getMessage())
 
     capture = Capture()
-    logging.getLogger().addHandler(capture)
+    root = logging.getLogger()
+    level = root.level
+    root.addHandler(capture)
+    root.setLevel(logging.DEBUG)
     try:
         m = ctx.load("events")
         ctx.kafka.fail_next(TOPIC, 1)
         m.publish_result(_sample("s-1"))
         m.publish_result(_sample("s-2"))
     finally:
-        logging.getLogger().removeHandler(capture)
+        root.removeHandler(capture)
+        root.setLevel(level)
     for value in ctx.kafka.values(TOPIC):
         assert SECRET.encode() not in value, f"the event carries the model's output: {value!r}; the topic is retained and replicated, ids and scores only"
         assert "output" not in json.loads(value), f"the event has an output field: {value!r}"
@@ -688,17 +694,20 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish_result(_sample("s-0"))
+    assert ok is True and _outbox(ctx) == [], f"the broker acknowledged s-0 and publish_result returned {ok!r} with outbox rows {_outbox(ctx)}: an acknowledged event returns True and leaves no row"
     ctx.kafka.fail_next(TOPIC, 1)
-    ok = m.publish_result(_sample("s-1"))
+    ok = m.publish_result(_sample("s-1", judge="fallback"))
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the sample is missing from the warehouse for good"
-    assert rows[0].get("run_id") == "r1" and rows[0].get("sample_id") == "s-1", f"the outbox row must be the event itself, got {rows[0]}"
+    expected = {"run_id": "r1", "sample_id": "s-1", "model_version": "support-bot-2026-10", "score": 0.75, "passed": True, "judge": "fallback"}
+    assert rows[0] == expected, f"the outbox row must be the event itself, {expected}, got {rows[0]}"
     assert ok is False, f"publish_result returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_result(_sample("s-2"))
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_result waited {waited:.0f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_result waited {waited:.1f} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("sample_id") == "s-2", f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish_result returned {ok!r} without an acknowledgement, expected False"
@@ -749,19 +758,28 @@ export async function check_event_payload(ctx) {
   const expected = {run_id: 'r1', sample_id: 's-1', model_version: 'support-bot-2026-10', score: 1, passed: true, judge: 'fallback'};
   for (const [key, value] of Object.entries(expected)) assert.deepEqual(all[0][key], value, \`the event must carry \${key}=\${JSON.stringify(value)}, got \${JSON.stringify(all[0])}\`);
   assert(all[1].passed === false && all[1].judge === 'model', \`a 0.25 judged by the model is passed false, judge model: \${JSON.stringify(all[1])}\`);
+  for (const event of all) assert.deepEqual(Object.keys(event).sort(), Object.keys(expected).sort(), \`the event is exactly {run_id, sample_id, model_version, score, passed, judge}, got the fields \${JSON.stringify(Object.keys(event).sort())}: anything else on a retained topic is a field the warehouse never asked for\`);
 }
 
 export async function check_no_output_text(ctx) {
   const m = ctx.load('events');
-  ctx.kafka.failNext(TOPIC, 1);
-  await m.publishResult(sample('s-1'));
-  await m.publishResult(sample('s-2'));
-  await settle();
+  const logged: string[] = [];
+  const real = {log: console.log, info: console.info, debug: console.debug, warn: console.warn, error: console.error};
+  console.log = console.info = console.debug = console.warn = console.error = (...args: unknown[]) => void logged.push(args.map(a => (typeof a === 'string' ? a : JSON.stringify(a))).join(' '));
+  try {
+    ctx.kafka.failNext(TOPIC, 1);
+    await m.publishResult(sample('s-1'));
+    await m.publishResult(sample('s-2'));
+    await settle();
+  } finally {
+    Object.assign(console, real);
+  }
   for (const value of ctx.kafka.values(TOPIC) as string[]) {
     assert(!value.includes(SECRET), \`the event carries the model's output: \${value}; the topic is retained and replicated, ids and scores only\`);
     assert(!('output' in JSON.parse(value)), \`the event has an output field: \${value}\`);
   }
   for (const row of ctx.redis.lrange('evals:outbox', 0, -1) as string[]) assert(!row.includes(SECRET), \`the outbox row carries the model's output: \${row}\`);
+  for (const line of logged) assert(!line.includes(SECRET), \`a log line carries the model's output: \${line}\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -778,18 +796,22 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  let ok = await m.publishResult(sample('s-0'));
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`the broker acknowledged s-0 and publishResult resolved \${JSON.stringify(ok)} with outbox rows \${JSON.stringify(outboxRows(ctx))}: an acknowledged event resolves true and leaves no row\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishResult(sample('s-1'));
+  ok = await m.publishResult(sample('s-1', 'r1', 0.75, 'fallback'));
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the sample is missing from the warehouse for good\`);
-  assert(rows[0].run_id === 'r1' && rows[0].sample_id === 's-1', \`the outbox row must be the event itself, got \${JSON.stringify(rows[0])}\`);
+  const expected = {run_id: 'r1', sample_id: 's-1', model_version: 'support-bot-2026-10', score: 0.75, passed: true, judge: 'fallback'};
+  assert.deepEqual(rows[0], expected, \`the outbox row must be the event itself, \${JSON.stringify(expected)}, got \${JSON.stringify(rows[0])}\`);
   assert.equal(ok, false, \`publishResult resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishResult(sample('s-2'));
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishResult waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishResult waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].sample_id === 's-2', \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishResult resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
@@ -798,8 +820,11 @@ export async function check_outbox_on_failure(ctx) {
     go: `package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log"
+	"sort"
 	"strings"
 
 	"evals/samples"
@@ -863,9 +888,21 @@ func CheckEventPayload(ctx *harness.Ctx) {
 		ctx.Equal(all[0][key], value, "the event's %s (%v)", key, all[0])
 	}
 	ctx.Assert(all[1]["passed"] == false && all[1]["judge"] == "model", "a 0.25 judged by the model is passed false, judge model: %v", all[1])
+	for _, e := range all {
+		fields := make([]string, 0, len(e))
+		for k := range e {
+			fields = append(fields, k)
+		}
+		sort.Strings(fields)
+		ctx.Equal(fields, []string{"judge", "model_version", "passed", "run_id", "sample_id", "score"}, "the event is exactly {run_id, sample_id, model_version, score, passed, judge}: anything else on a retained topic is a field the warehouse never asked for; the fields")
+	}
 }
 
 func CheckNoOutputText(ctx *harness.Ctx) {
+	var logged bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logged)
+	defer log.SetOutput(previous)
 	ctx.Kafka.FailNext(eventsTopic, 1)
 	eventsPublish(ctx, eventsSample("s-1", "r1", 0.75, "model"))
 	eventsPublish(ctx, eventsSample("s-2", "r1", 0.75, "model"))
@@ -880,6 +917,7 @@ func CheckNoOutputText(ctx *harness.Ctx) {
 	for _, row := range ctx.Redis.LRange("evals:outbox", 0, -1) {
 		ctx.Assert(!strings.Contains(row, eventsSecret), "the outbox row carries the model's output: %s", row)
 	}
+	ctx.Assert(!strings.Contains(logged.String(), eventsSecret), "a log line carries the model's output: %q", strings.TrimSpace(logged.String()))
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -894,18 +932,25 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := eventsPublish(ctx, eventsSample("s-0", "r1", 0.75, "model"))
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "the broker acknowledged s-0 and publishResult returned %v with outbox rows %v: an acknowledged event returns true and leaves no row", ok, eventsOutbox(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsSample("s-1", "r1", 0.75, "model"))
+	ok = eventsPublish(ctx, eventsSample("s-1", "r1", 0.75, "fallback"))
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the sample is missing from the warehouse for good; the rows")
-	ctx.Assert(rows[0]["run_id"] == "r1" && rows[0]["sample_id"] == "s-1", "the outbox row must be the event itself, got %v", rows[0])
+	want := map[string]any{"run_id": "r1", "sample_id": "s-1", "model_version": "support-bot-2026-10", "score": 0.75, "passed": true, "judge": "fallback"}
+	ctx.Equal(len(rows[0]), len(want), "the outbox row must be the event itself, %v, got %v; its fields", want, rows[0])
+	for key, value := range want {
+		ctx.Equal(rows[0][key], value, "the outbox row must be the event itself (%v); its %s", rows[0], key)
+	}
 	ctx.Equal(ok, false, "publishResult's result after a failed delivery")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsSample("s-2", "r1", 0.75, "model"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishResult waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishResult waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1]["sample_id"] == "s-2", "no acknowledgement within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishResult's result without an acknowledgement")
@@ -915,6 +960,8 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -967,13 +1014,26 @@ void CheckEventPayload(harness::Ctx& ctx) {
     ctx.Equal(all[0].is_object() && all[0].contains(key) ? all[0][key] : nlohmann::json(), value, "the event's %s (%s)", key, all[0].dump());
   }
   ctx.Assert(all[1].value("passed", true) == false && eventsField(all[1], "judge") == "model", "a 0.25 judged by the model is passed false, judge model: %s", all[1].dump());
+  for (const auto& e : all) {
+    std::vector<std::string> fields;
+    if (e.is_object())
+      for (const auto& [key, value] : e.items()) fields.push_back(key);
+    ctx.Equal(fields, {"judge", "model_version", "passed", "run_id", "sample_id", "score"}, "the event is exactly {run_id, sample_id, model_version, score, passed, judge}: anything else on a retained topic is a field the warehouse never asked for (%s); the fields", e.dump());
+  }
 }
 
 void CheckNoOutputText(harness::Ctx& ctx) {
+  std::ostringstream logged;
+  auto* err = std::cerr.rdbuf(logged.rdbuf());
+  auto* clg = std::clog.rdbuf(logged.rdbuf());
+  auto* out = std::cout.rdbuf(logged.rdbuf());
   ctx.Kafka.FailNext(kEventsTopic, 1);
   publish_result(eventsSample("s-1"));
   publish_result(eventsSample("s-2"));
   ctx.Settle();
+  std::cerr.rdbuf(err);
+  std::clog.rdbuf(clg);
+  std::cout.rdbuf(out);
   for (const auto& value : ctx.Kafka.Values(kEventsTopic)) {
     ctx.Assert(value.find(kSecret) == std::string::npos, "the event carries the model's output: %s; the topic is retained and replicated, ids and scores only", value);
     const auto e = nlohmann::json::parse(value, nullptr, false);
@@ -982,6 +1042,7 @@ void CheckNoOutputText(harness::Ctx& ctx) {
   for (const auto& row : ctx.Redis.LRange("evals:outbox", 0, -1)) {
     ctx.Assert(row.find(kSecret) == std::string::npos, "the outbox row carries the model's output: %s", row);
   }
+  ctx.Assert(logged.str().find(kSecret) == std::string::npos, "a log line carries the model's output: %q", logged.str());
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -996,18 +1057,22 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  bool ok = publish_result(eventsSample("s-0"));
+  ctx.Settle();
+  ctx.Assert(ok && eventsOutbox(ctx).empty(), "the broker acknowledged s-0 and publish_result returned %t with %d outbox rows: an acknowledged event returns true and leaves no row", ok, eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publish_result(eventsSample("s-1"));
+  ok = publish_result(eventsSample("s-1", "r1", 0.75, "fallback"));
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the sample is missing from the warehouse for good; the rows");
-  ctx.Assert(!rows.empty() && eventsField(rows[0], "run_id") == "r1" && eventsField(rows[0], "sample_id") == "s-1", "the outbox row must be the event itself, got %s", rows.empty() ? std::string("none") : rows[0].dump());
+  const nlohmann::json want = {{"run_id", "r1"}, {"sample_id", "s-1"}, {"model_version", "support-bot-2026-10"}, {"score", 0.75}, {"passed", true}, {"judge", "fallback"}};
+  ctx.Assert(!rows.empty() && rows[0] == want, "the outbox row must be the event itself, %s, got %s", want.dump(), rows.empty() ? std::string("none") : rows[0].dump());
   ctx.Equal(ok, false, "publish_result's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publish_result(eventsSample("s-2"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publish_result waited %.0f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publish_result waited %.1f s for a broker that does not answer: wait for the ack at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && eventsField(rows[1], "sample_id") == "s-2", "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish_result's result without an acknowledgement");

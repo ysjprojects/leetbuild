@@ -67,7 +67,7 @@ and another operator's rollback overwritten by a raise that read the record befo
       id: 'validate',
       title: 'Rejects a bad policy name, version or percentage with 400',
       detail:
-        'The policy name matches `^[a-z0-9][a-z0-9_-]{1,31}$`, the version is at least 1 and the percentage is 0…100; anything else answers 400 and writes nothing.',
+        'The policy name matches `^[a-z0-9][a-z0-9_-]{1,31}$`, the version is at least 1 and the percentage is 0…100; anything else answers 400 and writes nothing. Both ends count: a 32-character name and 100 % are allowed, a 33-character name or one starting with `-` is not.',
       match: {
         python: {all: [/re\.compile\(|re\.(full)?match\(/, /[<>]=?\s*100\b/]},
         typescript: {all: [/\.test\(/, /[<>]=?\s*100\b/]},
@@ -93,7 +93,7 @@ and another operator's rollback overwritten by a raise that read the record befo
       id: 'rollback',
       title: 'Lowering the current canary is never gated',
       detail:
-        "Lowering the current canary's share, to 0 or to anything below what it has now, applies even when its eval has since failed; a rollback that waits for a passing eval keeps a regressed version in front of users.",
+        "Lowering the current canary's share, to 0 or to anything below what it has now, applies even when its eval has since failed; a rollback that waits for a passing eval keeps a regressed version in front of users. A lower share for another version is a new canary, and it is gated.",
       match: {
         python: {all: [/<=\s*current\b/]},
         typescript: {all: [/<=\s*current\b/]},
@@ -834,12 +834,19 @@ async def check_validate(ctx):
         ("version 0", "auto", 0, 10),
         ("the policy name AUTO", "AUTO", 4, 20),
         ("the policy name x", "x", 4, 20),
+        ("the policy name -auto", "-auto", 4, 20),
+        ("a policy name of 33 characters", "auto-" + "x" * 28, 4, 20),
     ]
     for what, policy, version, percentage in bad:
         r = await _rollout(ctx, m, version, percentage, policy=policy)
         assert r.status_code == 400, f"{what} answered {r.status_code}, expected 400"
     assert _record(ctx) == {"stable": "3", "canary": "4", "percentage": "10"}, f"rejected requests changed {KEY}: {_record(ctx)}"
     assert sorted(ctx.redis.keys("rollout:*")) == [KEY], f"rejected requests wrote rollout records: {sorted(ctx.redis.keys('rollout:*'))}"
+    longest = "auto-" + "x" * 27
+    r = await _rollout(ctx, m, 1, 0, policy=longest)
+    assert r.status_code == 200, f"a policy name of 32 characters ({longest}) answered {r.status_code}: {r.text}"
+    r = await _rollout(ctx, m, 4, 100)
+    assert r.status_code == 200 and _record(ctx).get("percentage") == "100", f"v4 to 100 % with a passing eval answered {r.status_code} and left {_record(ctx)}: 0 and 100 are both allowed"
 
 
 async def check_eval_gate(ctx):
@@ -867,6 +874,9 @@ async def check_rollback(ctx):
     r = await _rollout(ctx, m, 4, 5)
     assert r.status_code == 200, f"lowering canary v4 from 25 % to 5 % (its eval now fails) answered {r.status_code}: a rollback must not wait for a passing eval"
     assert _record(ctx).get("percentage") == "5", f"{KEY} is {_record(ctx)} after the rollback to 5 %"
+    r = await _rollout(ctx, m, 7, 3)
+    assert r.status_code == 409, f"sending 3 % to v7, which has no eval, while v4 holds 5 % answered {r.status_code}: a lower share for another version is a new canary, not a rollback"
+    assert _record(ctx) == {"stable": "3", "canary": "4", "percentage": "5"}, f"the refused switch to v7 changed {KEY}: {_record(ctx)}"
     r = await _rollout(ctx, m, 4, 0)
     assert r.status_code == 200 and _record(ctx).get("percentage") == "0", f"rolling v4 back to 0 % answered {r.status_code} and left {_record(ctx)}"
     r = await _rollout(ctx, m, 7, 3)
@@ -923,6 +933,8 @@ export async function check_validate(ctx) {
     ['version 0', 'auto', 0, 10],
     ['the policy name AUTO', 'AUTO', 4, 20],
     ['the policy name x', 'x', 4, 20],
+    ['the policy name -auto', '-auto', 4, 20],
+    ['a policy name of 33 characters', \`auto-\${'x'.repeat(28)}\`, 4, 20],
   ];
   for (const [what, policy, version, percentage] of bad) {
     const r = await rollout(version, percentage, policy);
@@ -930,6 +942,11 @@ export async function check_validate(ctx) {
   }
   assert.deepStrictEqual(record(ctx), {stable: '3', canary: '4', percentage: '10'}, \`rejected requests changed \${KEY}: \${JSON.stringify(record(ctx))}\`);
   assert.deepStrictEqual(ctx.redis.keys('rollout:*').sort(), [KEY], \`rejected requests wrote rollout records: \${JSON.stringify(ctx.redis.keys('rollout:*').sort())}\`);
+  const longest = \`auto-\${'x'.repeat(27)}\`;
+  let r = await rollout(1, 0, longest);
+  assert.equal(r.status, 200, \`a policy name of 32 characters (\${longest}) answered \${r.status}: \${r.text}\`);
+  r = await rollout(4, 100);
+  assert(r.status === 200 && record(ctx).percentage === '100', \`v4 to 100 % with a passing eval answered \${r.status} and left \${JSON.stringify(record(ctx))}: 0 and 100 are both allowed\`);
 }
 
 export async function check_eval_gate(ctx) {
@@ -957,6 +974,9 @@ export async function check_rollback(ctx) {
   let r = await rollout(4, 5);
   assert.equal(r.status, 200, \`lowering canary v4 from 25 % to 5 % (its eval now fails) answered \${r.status}: a rollback must not wait for a passing eval\`);
   assert.equal(record(ctx).percentage, '5', \`\${KEY} is \${JSON.stringify(record(ctx))} after the rollback to 5 %\`);
+  r = await rollout(7, 3);
+  assert.equal(r.status, 409, \`sending 3 % to v7, which has no eval, while v4 holds 5 % answered \${r.status}: a lower share for another version is a new canary, not a rollback\`);
+  assert.deepStrictEqual(record(ctx), {stable: '3', canary: '4', percentage: '5'}, \`the refused switch to v7 changed \${KEY}: \${JSON.stringify(record(ctx))}\`);
   r = await rollout(4, 0);
   assert(r.status === 200 && record(ctx).percentage === '0', \`rolling v4 back to 0 % answered \${r.status} and left \${JSON.stringify(record(ctx))}\`);
   r = await rollout(7, 3);
@@ -982,6 +1002,7 @@ export async function check_no_lost_update(ctx) {
 import (
 	"fmt"
 	"net/http"
+	"strings"
 
 	"leetbuild/harness"
 )
@@ -1032,6 +1053,8 @@ func CheckValidate(ctx *harness.Ctx) {
 		{"version 0", "auto", 0, 10},
 		{"the policy name AUTO", "AUTO", 4, 20},
 		{"the policy name x", "x", 4, 20},
+		{"the policy name -auto", "-auto", 4, 20},
+		{"a policy name of 33 characters", "auto-" + strings.Repeat("x", 28), 4, 20},
 	}
 	for _, b := range bad {
 		r := rolloutPost(c, b.policy, b.version, b.percentage)
@@ -1039,6 +1062,11 @@ func CheckValidate(ctx *harness.Ctx) {
 	}
 	ctx.Equal(ctx.Redis.HGetAll(rolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "10"}, "rejected requests must not change %s", rolloutKey)
 	ctx.Equal(ctx.Redis.Keys("rollout:*"), []string{rolloutKey}, "rejected requests must write no rollout record; the records")
+	longest := "auto-" + strings.Repeat("x", 27)
+	r := rolloutPost(c, longest, 1, 0)
+	ctx.Equal(r.Status, 200, "a policy name of 32 characters (%s): %s", longest, r.Text())
+	r = rolloutPost(c, "auto", 4, 100)
+	ctx.Assert(r.Status == 200 && ctx.Redis.HGetAll(rolloutKey)["percentage"] == "100", "v4 to 100 %% with a passing eval answered %d and left %v: 0 and 100 are both allowed", r.Status, ctx.Redis.HGetAll(rolloutKey))
 }
 
 func CheckEvalGate(ctx *harness.Ctx) {
@@ -1067,6 +1095,9 @@ func CheckRollback(ctx *harness.Ctx) {
 	r := rolloutPost(c, "auto", 4, 5)
 	ctx.Equal(r.Status, 200, "lowering canary v4 from 25 %% to 5 %% (its eval now fails; a rollback must not wait for a passing eval)")
 	ctx.Equal(ctx.Redis.HGetAll(rolloutKey)["percentage"], "5", "%s percentage after the rollback to 5 %%", rolloutKey)
+	r = rolloutPost(c, "auto", 7, 3)
+	ctx.Equal(r.Status, 409, "sending 3 %% to v7, which has no eval, while v4 holds 5 %% (a lower share for another version is a new canary, not a rollback)")
+	ctx.Equal(ctx.Redis.HGetAll(rolloutKey), map[string]string{"stable": "3", "canary": "4", "percentage": "5"}, "the refused switch to v7 must not change %s", rolloutKey)
 	r = rolloutPost(c, "auto", 4, 0)
 	ctx.Assert(r.Status == 200 && ctx.Redis.HGetAll(rolloutKey)["percentage"] == "0", "rolling v4 back to 0 %% answered %d and left %v", r.Status, ctx.Redis.HGetAll(rolloutKey))
 	r = rolloutPost(c, "auto", 7, 3)
@@ -1157,6 +1188,8 @@ void CheckValidate(harness::Ctx& ctx) {
       {"version 0", "auto", 0, 10},
       {"the policy name AUTO", "AUTO", 4, 20},
       {"the policy name x", "x", 4, 20},
+      {"the policy name -auto", "-auto", 4, 20},
+      {"a policy name of 33 characters", "auto-" + std::string(28, 'x'), 4, 20},
   };
   for (const auto& b : bad) {
     const auto r = rolloutPost(c, b.version, b.percentage, b.policy);
@@ -1164,6 +1197,11 @@ void CheckValidate(harness::Ctx& ctx) {
   }
   ctx.Assert(rolloutRecord(ctx) == kSeeded, "rejected requests changed %s: %v", kRolloutKey, rolloutRecord(ctx));
   ctx.Equal(ctx.Redis.Keys("rollout:*"), {kRolloutKey}, "rejected requests must write no rollout record; the records");
+  const std::string longest = "auto-" + std::string(27, 'x');
+  auto r = rolloutPost(c, 1, 0, longest);
+  ctx.Equal(r.Status, 200, "a policy name of 32 characters (%s): %s", longest, r.Text());
+  r = rolloutPost(c, 4, 100);
+  ctx.Assert(r.Status == 200 && rolloutRecord(ctx)["percentage"] == "100", "v4 to 100 %% with a passing eval answered %d and left %v: 0 and 100 are both allowed", r.Status, rolloutRecord(ctx));
 }
 
 void CheckEvalGate(harness::Ctx& ctx) {
@@ -1192,6 +1230,9 @@ void CheckRollback(harness::Ctx& ctx) {
   auto r = rolloutPost(c, 4, 5);
   ctx.Equal(r.Status, 200, "lowering canary v4 from 25 %% to 5 %% (its eval now fails; a rollback must not wait for a passing eval)");
   ctx.Equal(rolloutRecord(ctx)["percentage"], "5", "%s percentage after the rollback to 5 %%", kRolloutKey);
+  r = rolloutPost(c, 7, 3);
+  ctx.Equal(r.Status, 409, "sending 3 %% to v7, which has no eval, while v4 holds 5 %% (a lower share for another version is a new canary, not a rollback)");
+  ctx.Assert(rolloutRecord(ctx) == std::map<std::string, std::string>{{"stable", "3"}, {"canary", "4"}, {"percentage", "5"}}, "the refused switch to v7 changed %s: %v", kRolloutKey, rolloutRecord(ctx));
   r = rolloutPost(c, 4, 0);
   ctx.Assert(r.Status == 200 && rolloutRecord(ctx)["percentage"] == "0", "rolling v4 back to 0 %% answered %d and left %v", r.Status, rolloutRecord(ctx));
   r = rolloutPost(c, 7, 3);

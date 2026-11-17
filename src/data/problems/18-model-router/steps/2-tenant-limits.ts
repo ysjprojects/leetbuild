@@ -78,7 +78,7 @@ thousands of tiny requests a minute.
       id: 'ttl',
       title: 'The window key expires when its minute ends',
       detail:
-        'The script sets `EXPIRE` on the key (the seconds left in the minute) and reports its `TTL`; a key with no expiry stays in Redis after its minute has passed, one per tenant per minute.',
+        'The script sets `EXPIRE` on the key (the seconds left in the minute) and reports its `TTL`; the key has its expiry from the command that creates it, checked midway through a minute. A key with no expiry stays in Redis after its minute has passed, one per tenant per minute.',
       match: {
         python: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/, /redis\.call\(\s*['"]TTL['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]P?EXPIRE(AT)?['"]/, /redis\.call\(\s*['"]TTL['"]/]},
@@ -91,7 +91,7 @@ thousands of tiny requests a minute.
       id: 'reject-headers',
       title: 'Answers 429 with Retry-After and X-RateLimit-Remaining',
       detail:
-        "A request that does not fit answers `429 Too Many Requests` with `Retry-After` (the key's TTL) and `X-RateLimit-Remaining`, spends nothing, and the route behind the guard does not run.",
+        "A request that does not fit answers `429 Too Many Requests` with `Retry-After` (the key's TTL) and `X-RateLimit-Remaining`, spends nothing, and the route behind the guard does not run. A request that brings the window to exactly 100 000 tokens fits.",
       match: {
         python: {all: [/Retry-After/, /X-RateLimit-Remaining/]},
         typescript: {all: [/Retry-After/, /X-RateLimit-Remaining/]},
@@ -848,7 +848,11 @@ async def check_atomic(ctx):
 
 async def check_ttl(ctx):
     m = _router(ctx)
+    # 25 s into the minute, so 35 s are left in the window.
+    ctx.clock.advance((25 - int(ctx.clock.time()) % 60) % 60)
     key = _window_key(ctx)
+    # Right after the first command that touches the window: a crash before a later round trip must not leave the key without expiry.
+    at_create = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
     r = await _route(ctx, m, _body(164))
     assert r.status_code == 200, f"the first request of the minute answered {r.status_code}: {r.text}"
     assert ctx.redis.exists(key), f"after a request {key} does not exist (keys: {sorted(ctx.redis.keys('limits:*'))})"
@@ -856,6 +860,8 @@ async def check_ttl(ctx):
     left = 60 - int(ctx.clock.time()) % 60
     assert ttl > 0, f"{key} has no expiry (TTL {ttl}): every minute leaves one hash per tenant in Redis for good"
     assert abs(ttl - left) <= 2, f"{key} expires in {ttl} s, expected the {left} s left in its minute"
+    assert at_create.fired and at_create.error is None, f"the request never touched {key}"
+    assert at_create.result != -1, f"right after the request's first command on {key} the key existed without expiry: a crash before the expiry is set leaves the window in Redis for good. Set the expiry in the same script"
     ctx.clock.advance(61)
     assert not ctx.redis.exists(key), f"{key} still exists a minute after its window ended"
     r = await _route(ctx, m, _body(164))
@@ -876,6 +882,9 @@ async def check_reject_headers(ctx):
     small = await _route(ctx, m, _body(2, prompt_bytes=4))
     assert small.status_code == 200 and len(m.served) == 1, f"a request that fits (2 tokens of 50) answered {small.status_code}"
     assert _hash(ctx, key) == {"requests": 4, "tokens": 99952}, f"after a 2-token reservation {key} holds {_hash(ctx, key)}, expected 4 requests and 99952 tokens"
+    exact = await _route(ctx, m, _body(48, prompt_bytes=4))
+    assert exact.status_code == 200 and len(m.served) == 2, f"a request worth exactly the 48 tokens left answered {exact.status_code}: a request that brings the window to 100 000 tokens fits"
+    assert _hash(ctx, key) == {"requests": 5, "tokens": 100000}, f"after a 48-token reservation {key} holds {_hash(ctx, key)}, expected 5 requests and 100000 tokens"
 
 
 async def check_request_limit(ctx):
@@ -939,7 +948,11 @@ export async function check_atomic(ctx) {
 
 export async function check_ttl(ctx) {
   const {c} = router(ctx);
+  // 25 s into the minute, so 35 s are left in the window.
+  ctx.clock.advance((85 - (Math.floor(ctx.clock.now() / 1000) % 60)) % 60);
   const key = windowKey(ctx);
+  // Right after the first command that touches the window: a crash before a later round trip must not leave the key without expiry.
+  const atCreate = ctx.redisAfter(key, () => Number(ctx.redis.ttl(key)));
   const r = await c.post('/v1/route', {body: body(164), headers: AUTH});
   assert.equal(r.status, 200, \`the first request of the minute answered \${r.status}: \${r.text}\`);
   assert(ctx.redis.exists(key), \`after a request \${key} does not exist (keys: \${JSON.stringify(ctx.redis.keys('limits:*').sort())})\`);
@@ -947,6 +960,8 @@ export async function check_ttl(ctx) {
   const left = 60 - (Math.floor(ctx.clock.now() / 1000) % 60);
   assert(ttl > 0, \`\${key} has no expiry (TTL \${ttl}): every minute leaves one hash per tenant in Redis for good\`);
   assert(Math.abs(ttl - left) <= 2, \`\${key} expires in \${ttl} s, expected the \${left} s left in its minute\`);
+  assert(atCreate.fired && atCreate.error === undefined, \`the request never touched \${key}\`);
+  assert(atCreate.result !== -1, \`right after the request's first command on \${key} the key existed without expiry: a crash before the expiry is set leaves the window in Redis for good. Set the expiry in the same script\`);
   ctx.clock.advance(61);
   assert(!ctx.redis.exists(key), \`\${key} still exists a minute after its window ended\`);
   const next = await c.post('/v1/route', {body: body(164), headers: AUTH});
@@ -967,6 +982,9 @@ export async function check_reject_headers(ctx) {
   const small = await c.post('/v1/route', {body: body(2, 4), headers: AUTH});
   assert(small.status === 200 && served.length === 1, \`a request that fits (2 tokens of 50) answered \${small.status}\`);
   assert.deepStrictEqual(hash(ctx, key), {requests: 4, tokens: 99952}, \`after a 2-token reservation \${key} holds \${JSON.stringify(hash(ctx, key))}, expected 4 requests and 99952 tokens\`);
+  const exact = await c.post('/v1/route', {body: body(48, 4), headers: AUTH});
+  assert(exact.status === 200 && served.length === 2, \`a request worth exactly the 48 tokens left answered \${exact.status}: a request that brings the window to 100 000 tokens fits\`);
+  assert.deepStrictEqual(hash(ctx, key), {requests: 5, tokens: 100000}, \`after a 48-token reservation \${key} holds \${JSON.stringify(hash(ctx, key))}, expected 5 requests and 100000 tokens\`);
 }
 
 export async function check_request_limit(ctx) {
@@ -1057,7 +1075,11 @@ func CheckAtomic(ctx *harness.Ctx) {
 
 func CheckTtl(ctx *harness.Ctx) {
 	g := newLimitsRouter(ctx)
+	// 25 s into the minute, so 35 s are left in the window.
+	ctx.Clock.Advance(float64((85 - (ctx.Clock.Now()/1000)%60) % 60))
 	key := windowKey(ctx, "acme")
+	// Right after the first command that touches the window: a crash before a later round trip must not leave the key without expiry.
+	atCreate := ctx.Redis.After(key, func() any { return ctx.Redis.TTL(key) })
 	r := g.route(limitsBody(164, 400), "acme")
 	ctx.Equal(r.Status, 200, "the first request of the minute (%s)", r.Text())
 	ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("limits:*"))
@@ -1065,6 +1087,8 @@ func CheckTtl(ctx *harness.Ctx) {
 	left := 60 - (ctx.Clock.Now()/1000)%60
 	ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): every minute leaves one hash per tenant in Redis for good", key, ttl)
 	ctx.Assert(ttl-left <= 2 && left-ttl <= 2, "%s expires in %d s, expected the %d s left in its minute", key, ttl, left)
+	ctx.Assert(atCreate.Fired && atCreate.Err == nil, "the request never touched %s", key)
+	ctx.Assert(atCreate.Result != int64(-1), "right after the request's first command on %s the key existed without expiry: a crash before the expiry is set leaves the window in Redis for good. Set the expiry in the same script", key)
 	ctx.Clock.Advance(61)
 	ctx.Assert(ctx.Redis.Exists(key) == 0, "%s still exists a minute after its window ended", key)
 	next := g.route(limitsBody(164, 400), "acme")
@@ -1086,6 +1110,9 @@ func CheckRejectHeaders(ctx *harness.Ctx) {
 	small := g.route(limitsBody(2, 4), "acme")
 	ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status)
 	ctx.Equal(windowHash(ctx, key), map[string]int{"requests": 4, "tokens": 99952}, "after a 2-token reservation %s", key)
+	exact := g.route(limitsBody(48, 4), "acme")
+	ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d: a request that brings the window to 100 000 tokens fits", exact.Status)
+	ctx.Equal(windowHash(ctx, key), map[string]int{"requests": 5, "tokens": 100000}, "after a 48-token reservation %s", key)
 }
 
 func CheckRequestLimit(ctx *harness.Ctx) {
@@ -1171,7 +1198,16 @@ void CheckAtomic(harness::Ctx& ctx) {
 
 void CheckTtl(harness::Ctx& ctx) {
   LimitsRouter g(ctx);
+  // 25 s into the minute, so 35 s are left in the window.
+  ctx.Clock.Advance(static_cast<double>((85 - (ctx.Clock.Now() / 1000) % 60) % 60));
   const std::string key = windowKey(ctx);
+  // Right after the first command that touches the window: a crash before a later round trip must not leave the key without expiry.
+  bool fired = false;
+  long long ttl_then = 0;
+  ctx.Redis.After(key, [&] {
+    fired = true;
+    ttl_then = ctx.Redis.TTL(key);
+  });
   const auto r = g.route(limitsBody(164));
   ctx.Equal(r.Status, 200, "the first request of the minute (%s)", r.Text());
   ctx.Assert(ctx.Redis.Exists(key) == 1, "after a request %s does not exist (keys: %v)", key, ctx.Redis.Keys("limits:*"));
@@ -1179,6 +1215,8 @@ void CheckTtl(harness::Ctx& ctx) {
   const long long left = 60 - (ctx.Clock.Now() / 1000) % 60;
   ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): every minute leaves one hash per tenant in Redis for good", key, ttl);
   ctx.Assert(std::llabs(ttl - left) <= 2, "%s expires in %d s, expected the %d s left in its minute", key, ttl, left);
+  ctx.Assert(fired, "the request never touched %s", key);
+  ctx.Assert(ttl_then != -1, "right after the request's first command on %s the key existed without expiry: a crash before the expiry is set leaves the window in Redis for good. Set the expiry in the same script", key);
   ctx.Clock.Advance(61);
   ctx.Assert(ctx.Redis.Exists(key) == 0, "%s still exists a minute after its window ended", key);
   const auto next = g.route(limitsBody(164));
@@ -1200,6 +1238,9 @@ void CheckRejectHeaders(harness::Ctx& ctx) {
   const auto small = g.route(limitsBody(2, 4));
   ctx.Assert(small.Status == 200 && g.served == 1, "a request that fits (2 tokens of 50) answered %d", small.Status);
   ctx.Assert(windowHash(ctx, key) == std::map<std::string, long long>{{"requests", 4}, {"tokens", 99952}}, "after a 2-token reservation %s holds %v, expected 4 requests and 99952 tokens", key, windowHash(ctx, key));
+  const auto exact = g.route(limitsBody(48, 4));
+  ctx.Assert(exact.Status == 200 && g.served == 2, "a request worth exactly the 48 tokens left answered %d: a request that brings the window to 100 000 tokens fits", exact.Status);
+  ctx.Assert(windowHash(ctx, key) == std::map<std::string, long long>{{"requests", 5}, {"tokens", 100000}}, "after a 48-token reservation %s holds %v, expected 5 requests and 100000 tokens", key, windowHash(ctx, key));
 }
 
 void CheckRequestLimit(harness::Ctx& ctx) {

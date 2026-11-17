@@ -45,7 +45,7 @@ Requirements:
       id: 'tenant-scope',
       title: 'Prefilters the vector search by tenant',
       detail:
-        "Tenant t1's hits are exactly t1's chunks; t2's chunk, the nearest vector in the index, is not among them. The starter's knn searches every tenant with the \"*\" prefilter.",
+        "Tenant t1's hits are exactly t1's chunks, all five of them, while 61 of t2's chunks sit nearer the query in the index. The starter's knn searches every tenant with the \"*\" prefilter.",
       match: {
         python: {all: [/tenant_filter\(\s*tenant\s*\)/], none: [/knn\(\s*["']\*["']/]},
         typescript: {all: [/tenantFilter\(\s*tenant\s*\)/], none: [/knn\(\s*['"]\*['"]/]},
@@ -71,7 +71,7 @@ Requirements:
       id: 'rrf-merge',
       title: 'Fuses the two rankings with RRF',
       detail:
-        'A chunk second in both lists outranks one first in the lexical list and last in the vector list, and its score is 2/62. The starter appends the vector list to the lexical one.',
+        'A chunk second in both lists outranks one first in the lexical list and last in the vector list, and its score is 2/62; k = 1 returns that chunk too, since each retriever ranks its 50 candidates whatever k is; two chunks with the same fused score come in chunk id order. The starter appends the vector list to the lexical one.',
       match: {
         python: {all: [/RRF_K\s*\+\s*rank|rank\s*\+\s*RRF_K/]},
         typescript: {all: [/RRF_K\s*\+\s*rank|rank\s*\+\s*RRF_K/]},
@@ -97,7 +97,7 @@ Requirements:
       id: 'cache-key',
       title: 'Caches per tenant and k for 60 seconds',
       detail:
-        'After a retrieval rag:q:{tenant}:{k}:{sha256(query)} holds the hits with a TTL of at most 60 s, another tenant asking the same query gets a key of its own, and 61 s later the entry is gone. The starter keys by the query alone and never expires it.',
+        'After a retrieval rag:q:{tenant}:{k}:{sha256(query)} holds the hits with a TTL of at most 60 s from the moment it is written, another tenant asking the same query gets a key of its own, and 61 s later the entry is gone. The starter keys by the query alone and never expires it.',
       match: {
         python: {all: [/ex\s*=\s*CACHE_TTL_S/, /rag:q:\{tenant\}/]},
         typescript: {all: [/['"]EX['"],\s*CACHE_TTL_S/, /rag:q:\$\{tenant\}/]},
@@ -631,10 +631,12 @@ def _ids(hits):
 
 def check_tenant_scope(ctx):
     _corpus()
+    for i in range(60):  # another tenant's chunks, all nearer the query than any of t1's
+        _seed("t2", f"p{i:02d}", f"Partner note {i}.", 3.0)
     m = ctx.load("retrieve")
     ids = _ids(m.retrieve("t1", Q, 10))
-    assert "t2-x" not in ids, f"tenant t1's retrieval returned t2's chunk t2-x ({ids}): the vector search must be prefiltered by tenant, not run over the whole index"
-    assert sorted(ids) == ["t1-a", "t1-b", "t1-c", "t1-d", "t1-e"], f"t1 has five chunks and k = 10: expected all five, got {ids}"
+    assert not [i for i in ids if not i.startswith("t1-")], f"tenant t1's retrieval returned t2's chunks ({ids}): the vector search must be prefiltered by tenant, not run over the whole index"
+    assert sorted(ids) == ["t1-a", "t1-b", "t1-c", "t1-d", "t1-e"], f"t1 has five chunks and k = 10: expected all five, got {ids}; with 61 of t2's chunks nearer the query, filtering a search over the whole index afterwards loses t1's"
 
 
 def check_k_cap(ctx):
@@ -654,6 +656,12 @@ def check_rrf_merge(ctx):
     ids = _ids(hits)
     assert ids[:2] == ["t1-b", "t1-a"], f"t1-b is second in both rankings, t1-a first in one and last in the other: fused by 1/(60 + rank), b leads, then a; got {ids}"
     assert abs(hits[0]["score"] - 2 / 62) < 1e-9, f"the top hit's score must be its fused score 1/62 + 1/62, got {hits[0]['score']}"
+    top = m.retrieve("t1", Q, 1)
+    assert _ids(top) == ["t1-b"] and abs(top[0]["score"] - 2 / 62) < 1e-9, f"k = 1 must return the best fused chunk, t1-b with 2/62: each retriever ranks CANDIDATES = 50 ids before the fusion, whatever k is; got {[(h['chunk_id'], h['score']) for h in top]}"
+    _seed("t3", "z", "Refund window policy.", 0.5)  # lexical first, vector second
+    _seed("t3", "m", "Refund.", 1.0)  # lexical second, vector first
+    tied = _ids(m.retrieve("t3", Q, 2))
+    assert tied == ["t3-m", "t3-z"], f"t3-m and t3-z both score 1/61 + 1/62; a tie is ordered by chunk id, got {tied}"
 
 
 def check_citation_offsets(ctx):
@@ -671,9 +679,20 @@ def check_cache_key(ctx):
     _corpus()
     m = ctx.load("retrieve")
     digest = hashlib.sha256(Q.encode()).hexdigest()
-    m.retrieve("t1", Q, 5)
     key = f"rag:q:t1:5:{digest}"
+    created = []
+
+    def ttl_at_creation():
+        if not ctx.redis.exists(key):  # the lookup came first: watch the write
+            created.append(ctx.redis_after(key, ttl_at_creation))
+            return None
+        return ctx.redis.ttl(key)
+
+    created.append(ctx.redis_after(key, ttl_at_creation))
+    m.retrieve("t1", Q, 5)
     assert ctx.redis.exists(key), f"the hits must be cached at rag:q:{{tenant}}:{{k}}:{{sha256(query)}}, found {sorted(ctx.redis.keys('rag:q:*'))}"
+    born = created[-1].result
+    assert born is not None and 0 < born <= 60, f"{key} had TTL {born} the moment it was written: the entry and its 60 s expiry go in one command (SET … EX), so no crash leaves it immortal"
     ttl = ctx.redis.ttl(key)
     assert 0 < ttl <= 60, f"{key} has TTL {ttl}: the cache keeps hits CACHE_TTL_S = 60 s"
     m.retrieve("t2", Q, 5)
@@ -707,10 +726,11 @@ const ids = hits => hits.map(h => h.chunk_id);
 
 export async function check_tenant_scope(ctx) {
   await corpus(ctx);
+  for (let i = 0; i < 60; i++) await seed(ctx, 't2', \`p\${String(i).padStart(2, '0')}\`, \`Partner note \${i}.\`, 3.0); // all nearer the query than any of t1's
   const m = ctx.load('retrieve');
   const got = ids(await m.retrieve('t1', Q, 10));
-  assert(!got.includes('t2-x'), \`tenant t1's retrieval returned t2's chunk t2-x (\${JSON.stringify(got)}): the vector search must be prefiltered by tenant, not run over the whole index\`);
-  assert.deepEqual([...got].sort(), ['t1-a', 't1-b', 't1-c', 't1-d', 't1-e'], \`t1 has five chunks and k = 10: expected all five, got \${JSON.stringify(got)}\`);
+  assert(got.every(id => id.startsWith('t1-')), \`tenant t1's retrieval returned t2's chunks (\${JSON.stringify(got)}): the vector search must be prefiltered by tenant, not run over the whole index\`);
+  assert.deepEqual([...got].sort(), ['t1-a', 't1-b', 't1-c', 't1-d', 't1-e'], \`t1 has five chunks and k = 10: expected all five, got \${JSON.stringify(got)}; with 61 of t2's chunks nearer the query, filtering a search over the whole index afterwards loses t1's\`);
 }
 
 export async function check_k_cap(ctx) {
@@ -729,6 +749,12 @@ export async function check_rrf_merge(ctx) {
   const got = ids(hits);
   assert.deepEqual(got.slice(0, 2), ['t1-b', 't1-a'], \`t1-b is second in both rankings, t1-a first in one and last in the other: fused by 1/(60 + rank), b leads, then a; got \${JSON.stringify(got)}\`);
   assert(Math.abs(hits[0].score - 2 / 62) < 1e-9, \`the top hit's score must be its fused score 1/62 + 1/62, got \${hits[0].score}\`);
+  const top = await m.retrieve('t1', Q, 1);
+  assert(top.length === 1 && top[0].chunk_id === 't1-b' && Math.abs(top[0].score - 2 / 62) < 1e-9, \`k = 1 must return the best fused chunk, t1-b with 2/62: each retriever ranks CANDIDATES = 50 ids before the fusion, whatever k is; got \${JSON.stringify(top.map(h => [h.chunk_id, h.score]))}\`);
+  await seed(ctx, 't3', 'z', 'Refund window policy.', 0.5); // lexical first, vector second
+  await seed(ctx, 't3', 'm', 'Refund.', 1.0); // lexical second, vector first
+  const tied = ids(await m.retrieve('t3', Q, 2));
+  assert.deepEqual(tied, ['t3-m', 't3-z'], \`t3-m and t3-z both score 1/61 + 1/62; a tie is ordered by chunk id, got \${JSON.stringify(tied)}\`);
 }
 
 export async function check_citation_offsets(ctx) {
@@ -745,9 +771,20 @@ export async function check_cache_key(ctx) {
   await corpus(ctx);
   const m = ctx.load('retrieve');
   const digest = createHash('sha256').update(Q).digest('hex');
-  await m.retrieve('t1', Q, 5);
   const key = \`rag:q:t1:5:\${digest}\`;
+  const created: {result: unknown}[] = [];
+  const ttlAtCreation = () => {
+    if (ctx.redis.exists(key) === 0) {
+      created.push(ctx.redisAfter(key, ttlAtCreation)); // the lookup came first: watch the write
+      return null;
+    }
+    return ctx.redis.ttl(key);
+  };
+  created.push(ctx.redisAfter(key, ttlAtCreation));
+  await m.retrieve('t1', Q, 5);
   assert(ctx.redis.exists(key) === 1, \`the hits must be cached at rag:q:{tenant}:{k}:{sha256(query)}, found \${JSON.stringify(ctx.redis.keys('rag:q:*').sort())}\`);
+  const born = created[created.length - 1].result as number | null;
+  assert(born !== null && 0 < born && born <= 60, \`\${key} had TTL \${born} the moment it was written: the entry and its 60 s expiry go in one command (SET … EX), so no crash leaves it immortal\`);
   const ttl = ctx.redis.ttl(key);
   assert(0 < ttl && ttl <= 60, \`\${key} has TTL \${ttl}: the cache keeps hits CACHE_TTL_S = 60 s\`);
   await m.retrieve('t2', Q, 5);
@@ -765,6 +802,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 
 	"rag/embed"
 	"rag/search"
@@ -811,13 +849,16 @@ func retrieveIDs(hits []search.Hit) []string {
 
 func CheckTenantScope(ctx *harness.Ctx) {
 	retrieveCorpus(ctx)
+	for i := 0; i < 60; i++ { // another tenant's chunks, all nearer the query than any of t1's
+		retrieveSeed(ctx, "t2", fmt.Sprintf("p%02d", i), fmt.Sprintf("Partner note %d.", i), 3.0, 0)
+	}
 	ids := retrieveIDs(retrieveRun(ctx, "t1", retrieveQ, 10))
 	for _, id := range ids {
-		ctx.Assert(id != "t2-x", "tenant t1's retrieval returned t2's chunk t2-x (%v): the vector search must be prefiltered by tenant, not run over the whole index", ids)
+		ctx.Assert(strings.HasPrefix(id, "t1-"), "tenant t1's retrieval returned t2's chunks (%v): the vector search must be prefiltered by tenant, not run over the whole index", ids)
 	}
 	sorted := append([]string(nil), ids...)
 	sort.Strings(sorted)
-	ctx.Equal(sorted, []string{"t1-a", "t1-b", "t1-c", "t1-d", "t1-e"}, "t1 has five chunks and k = 10: the hits")
+	ctx.Equal(sorted, []string{"t1-a", "t1-b", "t1-c", "t1-d", "t1-e"}, "t1 has five chunks and k = 10 (with 61 of t2's chunks nearer the query, filtering a search over the whole index afterwards loses t1's): the hits")
 }
 
 func CheckKCap(ctx *harness.Ctx) {
@@ -836,6 +877,12 @@ func CheckRrfMerge(ctx *harness.Ctx) {
 	ids := retrieveIDs(hits)
 	ctx.Assert(len(ids) >= 2 && ids[0] == "t1-b" && ids[1] == "t1-a", "t1-b is second in both rankings, t1-a first in one and last in the other: fused by 1/(60 + rank), b leads, then a; got %v", ids)
 	ctx.Assert(math.Abs(hits[0].Score-2.0/62) < 1e-9, "the top hit's score must be its fused score 1/62 + 1/62, got %v", hits[0].Score)
+	top := retrieveRun(ctx, "t1", retrieveQ, 1)
+	ctx.Assert(len(top) == 1 && top[0].ChunkID == "t1-b" && math.Abs(top[0].Score-2.0/62) < 1e-9, "k = 1 must return the best fused chunk, t1-b with 2/62: each retriever ranks candidates = 50 ids before the fusion, whatever k is; got %+v", top)
+	retrieveSeed(ctx, "t3", "z", "Refund window policy.", 0.5, 0) // lexical first, vector second
+	retrieveSeed(ctx, "t3", "m", "Refund.", 1.0, 0)                // lexical second, vector first
+	tied := retrieveIDs(retrieveRun(ctx, "t3", retrieveQ, 2))
+	ctx.Equal(tied, []string{"t3-m", "t3-z"}, "t3-m and t3-z both score 1/61 + 1/62; a tie is ordered by chunk id")
 }
 
 func CheckCitationOffsets(ctx *harness.Ctx) {
@@ -856,9 +903,21 @@ func CheckCacheKey(ctx *harness.Ctx) {
 	retrieveCorpus(ctx)
 	sum := sha256.Sum256([]byte(retrieveQ))
 	digest := hex.EncodeToString(sum[:])
-	retrieveRun(ctx, "t1", retrieveQ, 5)
 	key := "rag:q:t1:5:" + digest
+	born, bornSeen := int64(0), false
+	var ttlAtCreation func() any
+	ttlAtCreation = func() any {
+		if ctx.Redis.Exists(key) == 0 {
+			ctx.Redis.After(key, ttlAtCreation) // the lookup came first: watch the write
+			return nil
+		}
+		born, bornSeen = int64(ctx.Redis.TTL(key)), true
+		return nil
+	}
+	ctx.Redis.After(key, ttlAtCreation)
+	retrieveRun(ctx, "t1", retrieveQ, 5)
 	ctx.Assert(ctx.Redis.Exists(key) == 1, "the hits must be cached at rag:q:{tenant}:{k}:{sha256(query)}, found %v", ctx.Redis.Keys("rag:q:*"))
+	ctx.Assert(bornSeen && 0 < born && born <= 60, "%s had TTL %d the moment it was written: the entry and its 60 s expiry go in one command (SET … EX), so no crash leaves it immortal", key, born)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= 60, "%s has TTL %d: the cache keeps hits cacheTTL = 60 s", key, ttl)
 	retrieveRun(ctx, "t2", retrieveQ, 5)
@@ -872,6 +931,7 @@ func CheckCacheKey(ctx *harness.Ctx) {
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -906,11 +966,16 @@ std::vector<std::string> idsOf(const std::vector<search::Hit>& hits) {
 
 void CheckTenantScope(harness::Ctx& ctx) {
   retrieveCorpus();
+  for (int i = 0; i < 60; i++) {  // another tenant's chunks, all nearer the query than any of t1's
+    char name[8];
+    std::snprintf(name, sizeof name, "p%02d", i);
+    retrieveSeed("t2", name, "Partner note " + std::to_string(i) + ".", 3.0);
+  }
   const auto ids = idsOf(retrieve("t1", kQ, 10));
-  ctx.Assert(std::find(ids.begin(), ids.end(), "t2-x") == ids.end(), "tenant t1's retrieval returned t2's chunk t2-x (%v): the vector search must be prefiltered by tenant, not run over the whole index", ids);
+  for (const auto& id : ids) ctx.Assert(id.rfind("t1-", 0) == 0, "tenant t1's retrieval returned t2's chunks (%v): the vector search must be prefiltered by tenant, not run over the whole index", ids);
   auto sorted = ids;
   std::sort(sorted.begin(), sorted.end());
-  ctx.Equal(sorted, {"t1-a", "t1-b", "t1-c", "t1-d", "t1-e"}, "t1 has five chunks and k = 10: the hits");
+  ctx.Equal(sorted, {"t1-a", "t1-b", "t1-c", "t1-d", "t1-e"}, "t1 has five chunks and k = 10 (with 61 of t2's chunks nearer the query, filtering a search over the whole index afterwards loses t1's): the hits");
 }
 
 void CheckKCap(harness::Ctx& ctx) {
@@ -929,6 +994,11 @@ void CheckRrfMerge(harness::Ctx& ctx) {
   const auto ids = idsOf(hits);
   ctx.Assert(ids.size() >= 2 && ids[0] == "t1-b" && ids[1] == "t1-a", "t1-b is second in both rankings, t1-a first in one and last in the other: fused by 1/(60 + rank), b leads, then a; got %v", ids);
   ctx.Assert(std::abs(hits[0].score - 2.0 / 62) < 1e-9, "the top hit's score must be its fused score 1/62 + 1/62, got %v", hits[0].score);
+  const auto top = retrieve("t1", kQ, 1);
+  ctx.Assert(top.size() == 1 && top[0].chunk_id == "t1-b" && std::abs(top[0].score - 2.0 / 62) < 1e-9, "k = 1 must return the best fused chunk, t1-b with 2/62: each retriever ranks kCandidates = 50 ids before the fusion, whatever k is; got %v", idsOf(top));
+  retrieveSeed("t3", "z", "Refund window policy.", 0.5);  // lexical first, vector second
+  retrieveSeed("t3", "m", "Refund.", 1.0);                // lexical second, vector first
+  ctx.Equal(idsOf(retrieve("t3", kQ, 2)), {"t3-m", "t3-z"}, "t3-m and t3-z both score 1/61 + 1/62; a tie is ordered by chunk id");
 }
 
 void CheckCitationOffsets(harness::Ctx& ctx) {
@@ -946,9 +1016,21 @@ void CheckCitationOffsets(harness::Ctx& ctx) {
 void CheckCacheKey(harness::Ctx& ctx) {
   retrieveCorpus();
   const std::string digest = sha256_hex(kQ);
-  retrieve("t1", kQ, 5);
   const std::string key = "rag:q:t1:5:" + digest;
+  bool bornSeen = false;
+  long long born = 0;
+  std::function<void()> ttlAtCreation = [&] {
+    if (ctx.Redis.Exists(key) == 0) {
+      ctx.Redis.After(key, ttlAtCreation);  // the lookup came first: watch the write
+      return;
+    }
+    bornSeen = true;
+    born = ctx.Redis.TTL(key);
+  };
+  ctx.Redis.After(key, ttlAtCreation);
+  retrieve("t1", kQ, 5);
   ctx.Assert(ctx.Redis.Exists(key) == 1, "the hits must be cached at rag:q:{tenant}:{k}:{sha256(query)}, found %v", ctx.Redis.Keys("rag:q:*"));
+  ctx.Assert(bornSeen && 0 < born && born <= 60, "%s had TTL %d the moment it was written: the entry and its 60 s expiry go in one command (SET … EX), so no crash leaves it immortal", key, born);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= 60, "%s has TTL %d: the cache keeps hits kCacheTtl = 60 s", key, ttl);
   retrieve("t2", kQ, 5);

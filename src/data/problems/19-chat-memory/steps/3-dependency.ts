@@ -24,12 +24,12 @@ the stored summary with its own.
 service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // INVALID_ARGUMENT: bad span · UNAVAILABLE: overloaded
 \`\`\`
 
-- Every attempt carries a \`DEADLINE_S\` = **1.5 s** deadline.
+- Every attempt, the retry included, carries its own \`DEADLINE_S\` = **1.5 s** deadline.
 - At most \`MAX_ATTEMPTS\` = **2** attempts, the second only after \`UNAVAILABLE\` or
   \`DEADLINE_EXCEEDED\`; any other status, or a failed last attempt, raises \`SummarizerError\`.
 - A summary is stored in the hash \`summaries_key(tenant, session_id)\` =
   \`summaries:{tenant}:{session_id}\` under \`span_id(turns)\` = \`{first_turn_id}:{last_turn_id}\`,
-  where \`memory.summaries.latest_summary\` reads it.
+  where \`memory.summaries.latest_summary\` reads it; the hash keeps the starter's one-day expiry.
 - The write is \`HSETNX\`: the first summary of a span wins, and \`summarize_span\` returns the stored
   text.`,
   sequence: {
@@ -58,7 +58,7 @@ service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // IN
       id: 'deadline',
       title: 'Every attempt carries a 1.5-second deadline',
       detail:
-        'Each `Summarize` call is made with `DEADLINE_S` (1.5 s), so a summarizer that hangs costs at most two deadlines; the starter passes no deadline at all.',
+        'Each `Summarize` call, the retry included, is made with its own `DEADLINE_S` (1.5 s), so a summarizer that hangs costs at most two deadlines; the starter passes no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1\.5\b/, /Summarize\([^)]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1500\b/, /Summarize\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -73,7 +73,7 @@ service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // IN
       id: 'bounded-retry',
       title: 'Retries once, and only a retryable status',
       detail:
-        'At most `MAX_ATTEMPTS` (2) calls per span, the second only after `UNAVAILABLE` or `DEADLINE_EXCEEDED`; `INVALID_ARGUMENT` raises at once. The starter retries every error five times with a sleep in between.',
+        'At most `MAX_ATTEMPTS` (2) calls per span, the second only after `UNAVAILABLE` or `DEADLINE_EXCEEDED`; any other status (`INVALID_ARGUMENT`, `INTERNAL`, `PERMISSION_DENIED`, `NOT_FOUND`) raises at once. The starter retries every error five times with a sleep in between.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*2\b/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/],
@@ -101,7 +101,7 @@ service Summarizer { rpc Summarize(SummarizeRequest) returns (Summary); }  // IN
       id: 'span-identity',
       title: 'Stores each span under its own id',
       detail:
-        'A summary goes into `summaries:{tenant}:{session_id}` under `span_id(turns)` (`{first_turn_id}:{last_turn_id}`), so a later span adds a field instead of replacing the earlier summary; the starter writes every span of a session to `summary:{session_id}`.',
+        'A summary goes into `summaries:{tenant}:{session_id}` under `span_id(turns)` (`{first_turn_id}:{last_turn_id}`), so a later span adds a field instead of replacing the earlier summary, and the hash still expires after a day; the starter writes every span of a session to `summary:{session_id}`.',
       match: {
         python: {all: [/def span_id\(/, /summaries:\{tenant\}:\{session_id\}/], none: [/summary:\{session_id\}/]},
         typescript: {
@@ -703,11 +703,15 @@ def check_deadline(ctx):
         assert call.timeout is not None, "a Summarize call carries no deadline: a summarizer that hangs holds the worker indefinitely"
         assert 1.4 <= call.timeout <= 1.6, f"a Summarize call carries a {call.timeout} s deadline, expected DEADLINE_S = 1.5"
     ctx.grpc.set_latency("Summarize", 30.0)
+    start = len(ctx.grpc.calls_to("Summarize"))
     before = ctx.clock.time()
     outcome = _outcome(m, "t1", "s-1", _turns(11, 20))
     waited = ctx.clock.time() - before
     assert waited <= 3.5, f"summarize_span waited {waited:.1f} s on a summarizer that takes 30 s: two attempts of 1.5 s at most"
     _assert_summarizer_error(m, outcome, "with a summarizer that takes 30 s")
+    stalled = [c.timeout for c in ctx.grpc.calls_to("Summarize")[start:]]
+    assert len(stalled) == 2, f"summarize_span made {len(stalled)} calls to a summarizer that takes 30 s: a DEADLINE_EXCEEDED attempt gets a second attempt"
+    assert all(t is not None and 1.4 <= t <= 1.6 for t in stalled), f"the two attempts at a summarizer that takes 30 s carried deadlines of {stalled} s: each attempt gets its own 1.5 s, not what the first one left"
 
 
 def check_bounded_retry(ctx):
@@ -727,6 +731,18 @@ def check_bounded_retry(ctx):
     made = len(ctx.grpc.calls_to("Summarize")) - before
     assert made == 1, f"summarize_span sent a request the summarizer called INVALID_ARGUMENT {made} times: a bad request is not retried"
     _assert_summarizer_error(m, outcome, "after INVALID_ARGUMENT")
+    for n, code in enumerate((grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.NOT_FOUND)):
+        ctx.grpc.fail("Summarize", code, "not retryable", times=1)
+        before = len(ctx.grpc.calls_to("Summarize"))
+        outcome = _outcome(m, "t1", "s-1", _turns(31 + 10 * n, 40 + 10 * n))
+        made = len(ctx.grpc.calls_to("Summarize")) - before
+        assert made == 1, f"summarize_span made {made} calls after {code.name}: only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt"
+        _assert_summarizer_error(m, outcome, f"after {code.name}")
+    ctx.grpc.fail("Summarize", grpc.StatusCode.DEADLINE_EXCEEDED, "deadline exceeded", times=1)
+    before = len(ctx.grpc.calls_to("Summarize"))
+    outcome = _outcome(m, "t1", "s-1", _turns(61, 70))
+    made = len(ctx.grpc.calls_to("Summarize")) - before
+    assert outcome[0] == "text" and made == 2, f"one DEADLINE_EXCEEDED then an answer must take two calls and return the summary, got {made} calls and {outcome[1]!r}"
 
 
 def check_span_identity(ctx):
@@ -740,6 +756,8 @@ def check_span_identity(ctx):
     assert stored == {"t-1:t-10": other}, f"summaries:t2:s-1 holds {stored}: tenant t2's span belongs in its own hash"
     latest = latest_summary("t1", "s-1")
     assert latest == {"span": "t-11:t-20", "text": second}, f"memory.summaries.latest_summary reads {latest}, expected the t-11:t-20 summary"
+    ttl = ctx.redis.ttl("summaries:t1:s-1")
+    assert 0 < ttl <= 86400, f"summaries:t1:s-1 has TTL {ttl}: the hash keeps the starter's one-day expiry (SUMMARY_TTL_S)"
 
 
 def check_first_writer_wins(ctx):
@@ -795,11 +813,15 @@ export async function check_deadline(ctx) {
     assert(1.4 <= call.timeout && call.timeout <= 1.6, \`a Summarize call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 1500\`);
   }
   ctx.grpc.setLatency('Summarize', 30.0);
+  const start = ctx.grpc.callsTo('Summarize').length;
   const before = ctx.clock.now();
   const result = await outcome(m, 't1', 's-1', turns(11, 20));
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited <= 3.5, \`summarizeSpan waited \${waited.toFixed(1)} s on a summarizer that takes 30 s: two attempts of 1.5 s at most\`);
   assertSummarizerError(m, result, 'with a summarizer that takes 30 s');
+  const stalled = ctx.grpc.callsTo('Summarize').slice(start).map(c => c.timeout);
+  assert.equal(stalled.length, 2, \`summarizeSpan made \${stalled.length} calls to a summarizer that takes 30 s: a DEADLINE_EXCEEDED attempt gets a second attempt\`);
+  assert(stalled.every(t => t !== null && 1.4 <= t && t <= 1.6), \`the two attempts at a summarizer that takes 30 s carried deadlines of \${JSON.stringify(stalled)} s: each attempt gets its own 1.5 s, not what the first one left\`);
 }
 
 export async function check_bounded_retry(ctx) {
@@ -820,6 +842,19 @@ export async function check_bounded_retry(ctx) {
   made = ctx.grpc.callsTo('Summarize').length - before;
   assert.equal(made, 1, \`summarizeSpan sent a request the summarizer called INVALID_ARGUMENT \${made} times: a bad request is not retried\`);
   assertSummarizerError(m, result, 'after INVALID_ARGUMENT');
+  for (const [n, name] of ['INTERNAL', 'PERMISSION_DENIED', 'NOT_FOUND'].entries()) {
+    ctx.grpc.fail('Summarize', ctx.grpc.status[name], 'not retryable', 1);
+    before = ctx.grpc.callsTo('Summarize').length;
+    result = await outcome(m, 't1', 's-1', turns(31 + 10 * n, 40 + 10 * n));
+    made = ctx.grpc.callsTo('Summarize').length - before;
+    assert.equal(made, 1, \`summarizeSpan made \${made} calls after \${name}: only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt\`);
+    assertSummarizerError(m, result, \`after \${name}\`);
+  }
+  ctx.grpc.fail('Summarize', ctx.grpc.status.DEADLINE_EXCEEDED, 'deadline exceeded', 1);
+  before = ctx.grpc.callsTo('Summarize').length;
+  result = await outcome(m, 't1', 's-1', turns(61, 70));
+  made = ctx.grpc.callsTo('Summarize').length - before;
+  assert(result.error === undefined && made === 2, \`one DEADLINE_EXCEEDED then an answer must take two calls and return the summary, got \${made} calls and \${result.error === undefined ? JSON.stringify(result.text) : String(result.error)}\`);
 }
 
 export async function check_span_identity(ctx) {
@@ -833,6 +868,8 @@ export async function check_span_identity(ctx) {
   assert.deepStrictEqual(stored, {'t-1:t-10': other}, \`summaries:t2:s-1 holds \${JSON.stringify(stored)}: tenant t2's span belongs in its own hash\`);
   const latest = await summaries.latestSummary('t1', 's-1');
   assert.deepStrictEqual(latest, {span: 't-11:t-20', text: second}, \`memory/summaries latestSummary reads \${JSON.stringify(latest)}, expected the t-11:t-20 summary\`);
+  const ttl = ctx.redis.ttl('summaries:t1:s-1');
+  assert(0 < ttl && ttl <= 86400, \`summaries:t1:s-1 has TTL \${ttl}: the hash keeps the starter's one-day expiry (SUMMARY_TTL_S)\`);
 }
 
 export async function check_first_writer_wins(ctx) {
@@ -925,11 +962,20 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(call.Timeout.Seconds() >= 1.4 && call.Timeout.Seconds() <= 1.6, "a Summarize call carries a %v deadline, expected 1.5 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Summarize", 30.0, "")
+	start := len(ctx.GRPC.CallsTo("Summarize", ""))
 	before := ctx.Clock.Now()
 	text, err := summarizeSpan(clientBg, "t1", "s-1", spanTurns(11, 20, "t1"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 3.5, "summarizeSpan waited %.1f s on a summarizer that takes 30 s: two attempts of 1.5 s at most", waited)
 	mustFailSummarizer(ctx, text, err, "with a summarizer that takes 30 s")
+	stalled := []string{}
+	ownDeadlines := true
+	for _, call := range ctx.GRPC.CallsTo("Summarize", "")[start:] {
+		stalled = append(stalled, call.Timeout.String())
+		ownDeadlines = ownDeadlines && call.HasDeadline() && call.Timeout.Seconds() >= 1.4 && call.Timeout.Seconds() <= 1.6
+	}
+	ctx.Assert(len(stalled) == 2, "summarizeSpan made %d calls to a summarizer that takes 30 s: a DEADLINE_EXCEEDED attempt gets a second attempt", len(stalled))
+	ctx.Assert(ownDeadlines, "the two attempts at a summarizer that takes 30 s carried deadlines of %v: each attempt gets its own 1.5 s, not what the first one left", stalled)
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
@@ -950,6 +996,19 @@ func CheckBoundedRetry(ctx *harness.Ctx) {
 	made = len(ctx.GRPC.CallsTo("Summarize", "")) - before
 	ctx.Assert(made == 1, "summarizeSpan sent a request the summarizer called INVALID_ARGUMENT %d times: a bad request is not retried", made)
 	mustFailSummarizer(ctx, text, err, "after INVALID_ARGUMENT")
+	for n, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.NotFound} {
+		ctx.GRPC.Fail("Summarize", code, "not retryable", 1, "")
+		before = len(ctx.GRPC.CallsTo("Summarize", ""))
+		text, err = summarizeSpan(clientBg, "t1", "s-1", spanTurns(31+10*n, 40+10*n, "t1"))
+		made = len(ctx.GRPC.CallsTo("Summarize", "")) - before
+		ctx.Assert(made == 1, "summarizeSpan made %d calls after %v: only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt", made, code)
+		mustFailSummarizer(ctx, text, err, "after "+code.String())
+	}
+	ctx.GRPC.Fail("Summarize", codes.DeadlineExceeded, "deadline exceeded", 1, "")
+	before = len(ctx.GRPC.CallsTo("Summarize", ""))
+	text, err = summarizeSpan(clientBg, "t1", "s-1", spanTurns(61, 70, "t1"))
+	made = len(ctx.GRPC.CallsTo("Summarize", "")) - before
+	ctx.Assert(err == nil && made == 2, "one DEADLINE_EXCEEDED then an answer must take two calls and return the summary, got %d calls, %q and error %v", made, text, err)
 }
 
 func CheckSpanIdentity(ctx *harness.Ctx) {
@@ -962,6 +1021,8 @@ func CheckSpanIdentity(ctx *harness.Ctx) {
 	latest, err := summaries.LatestSummary(clientBg, "t1", "s-1")
 	ctx.NoError(err, "summaries.LatestSummary failed")
 	ctx.Assert(latest != nil && latest.Span == "t-11:t-20" && latest.Text == second, "summaries.LatestSummary reads %+v, expected the t-11:t-20 summary", latest)
+	ttl := ctx.Redis.TTL("summaries:t1:s-1")
+	ctx.Assert(ttl > 0 && ttl <= 86400, "summaries:t1:s-1 has TTL %d: the hash keeps the starter's one-day expiry (summaryTTL)", ttl)
 }
 
 func CheckFirstWriterWins(ctx *harness.Ctx) {
@@ -1061,11 +1122,21 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(1.4 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.6, "a Summarize call carries a %v s deadline, expected kDeadline = 1.5 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Summarize", 30.0);
+  const size_t start = ctx.GRPC.CallsTo("Summarize").size();
   const int64_t before = ctx.Clock.Now();
   const Outcome o = outcome("t1", spanTurns(11, 20));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 3.5, "summarizeSpan waited %.1f s on a summarizer that takes 30 s: two attempts of 1.5 s at most", waited);
   mustFailSummarizer(ctx, o, "with a summarizer that takes 30 s");
+  const auto calls = ctx.GRPC.CallsTo("Summarize");
+  std::string stalled;
+  bool own_deadlines = true;
+  for (size_t i = start; i < calls.size(); i++) {
+    stalled += (stalled.empty() ? "" : ", ") + (calls[i].HasDeadline() ? std::to_string(calls[i].TimeoutSeconds()) : std::string("none"));
+    own_deadlines = own_deadlines && calls[i].HasDeadline() && 1.4 <= calls[i].TimeoutSeconds() && calls[i].TimeoutSeconds() <= 1.6;
+  }
+  ctx.Assert(calls.size() - start == 2, "summarizeSpan made %d calls to a summarizer that takes 30 s: a DEADLINE_EXCEEDED attempt gets a second attempt", calls.size() - start);
+  ctx.Assert(own_deadlines, "the two attempts at a summarizer that takes 30 s carried deadlines of [%s] s: each attempt gets its own 1.5 s, not what the first one left", stalled);
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
@@ -1086,6 +1157,21 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
   made = ctx.GRPC.CallsTo("Summarize").size() - before;
   ctx.Assert(made == 1, "summarizeSpan sent a request the summarizer called INVALID_ARGUMENT %d times: a bad request is not retried", made);
   mustFailSummarizer(ctx, o, "after INVALID_ARGUMENT");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}, {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"}};
+  for (size_t n = 0; n < terminal.size(); n++) {
+    ctx.GRPC.Fail("Summarize", terminal[n].first, "not retryable", 1);
+    before = ctx.GRPC.CallsTo("Summarize").size();
+    o = outcome("t1", spanTurns(31 + 10 * static_cast<int>(n), 40 + 10 * static_cast<int>(n)));
+    made = ctx.GRPC.CallsTo("Summarize").size() - before;
+    ctx.Assert(made == 1, "summarizeSpan made %d calls after %s: only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt", made, terminal[n].second);
+    mustFailSummarizer(ctx, o, "after " + terminal[n].second);
+  }
+  ctx.GRPC.Fail("Summarize", grpc::StatusCode::DEADLINE_EXCEEDED, "deadline exceeded", 1);
+  before = ctx.GRPC.CallsTo("Summarize").size();
+  o = outcome("t1", spanTurns(61, 70));
+  made = ctx.GRPC.CallsTo("Summarize").size() - before;
+  ctx.Assert(!o.threw && made == 2, "one DEADLINE_EXCEEDED then an answer must take two calls and return the summary, got %d calls, %q and %s", made, o.text, o.what);
 }
 
 void CheckSpanIdentity(harness::Ctx& ctx) {
@@ -1099,6 +1185,8 @@ void CheckSpanIdentity(harness::Ctx& ctx) {
   const auto latest = summaries::latestSummary("t1", "s-1");
   ctx.Assert(latest && latest->span == "t-11:t-20" && latest->text == second, "summaries::latestSummary reads %q, expected the t-11:t-20 summary",
              latest ? latest->span : "nothing");
+  const long long ttl = ctx.Redis.TTL("summaries:t1:s-1");
+  ctx.Assert(ttl > 0 && ttl <= 86400, "summaries:t1:s-1 has TTL %d: the hash keeps the starter's one-day expiry (kSummaryTtl)", ttl);
 }
 
 void CheckFirstWriterWins(harness::Ctx& ctx) {

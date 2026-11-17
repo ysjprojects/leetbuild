@@ -23,8 +23,8 @@ content, lands in an analytics topic.
 
 Requirements:
 
-- Consumer group \`rag-eval\`; each offset is committed after \`evalstore.record\` (and any verdict) for
-  that record.
+- Consumer group \`rag-eval\`; each offset is committed after \`evalstore.record\` (and any verdict, once the
+  broker acknowledges it) for that record.
 - One verdict per release, when its count reaches \`MIN_SAMPLES\` = 200.
 - \`block\` when groundedness < 0.95, recall@k < \`MIN_RECALL\` = 0.90, or groundedness more than
   \`MAX_REGRESSION\` = 0.01 under \`evalstore.baseline()\`; a \`pass\` becomes the baseline.
@@ -58,7 +58,7 @@ Requirements:
       id: 'commit-after-store',
       title: 'Commits an offset only after its sample is counted',
       detail:
-        'At every commit, the samples counted in rag:eval:{release} cover every offset committed. The starter commits each record before it counts it.',
+        "At every commit, the samples counted in rag:eval:{release} cover every offset committed; when a release's verdict is not acknowledged, the sample that made it stays uncommitted, and redelivered it produces the verdict. The starter commits each record before it counts it.",
       match: {
         python: {order: [/^\s+handle\(/m, /consumer\.commit\(/]},
         typescript: {order: [/await handle\(/, /commitOffsets\(/]},
@@ -71,7 +71,7 @@ Requirements:
       id: 'min-samples',
       title: 'Publishes one verdict per release, at 200 samples',
       detail:
-        'A release with 205 samples gets exactly one verdict, made at 200; a release with 150 gets none. The starter publishes after every sample.',
+        'A release with 205 samples gets exactly one verdict, made at 200; a release with 199 gets none. The starter publishes after every sample.',
       match: {
         python: {all: [/(!=|==)\s*MIN_SAMPLES\b/]},
         typescript: {all: [/(!==?|===?)\s*MIN_SAMPLES\b/]},
@@ -84,7 +84,7 @@ Requirements:
       id: 'release-thresholds',
       title: 'Blocks on recall and on regression, not only on groundedness',
       detail:
-        'With a baseline of 0.98, a release at 0.98 groundedness and 0.85 recall is blocked, one at 0.96 and 0.95 is blocked as a regression, and one at 0.99 and 0.95 passes. The starter checks groundedness against 0.95 alone.',
+        'With a baseline of 0.98, a release at 0.98 groundedness and 0.85 recall is blocked, one at 0.96 and 0.95 is blocked as a regression, and one at 0.99 and 0.95 passes; one 0.005 under the baseline passes, and one exactly at 0.95 and 0.90 passes. The starter checks groundedness against 0.95 alone.',
       match: {
         python: {all: [/\bMIN_RECALL\b/, /\bMAX_REGRESSION\b/]},
         typescript: {all: [/\bMIN_RECALL\b/, /\bMAX_REGRESSION\b/]},
@@ -97,7 +97,7 @@ Requirements:
       id: 'no-raw-text',
       title: 'Keeps question text out of eval.metrics',
       detail:
-        "Verdicts carry the release, the four metrics and the verdict; no question text. The starter copies the sample's question into every event.",
+        "Verdicts carry exactly the release, the four metrics and the verdict; no question text and no other field. The starter copies the sample's question into every event.",
       match: {
         python: {none: [/\bquestion\b/]},
         typescript: {none: [/\bquestion\b/]},
@@ -871,15 +871,26 @@ def check_commit_after_store(ctx):
     assert seen, "no offset was ever committed"
     for committed, counted in seen:
         assert committed <= counted, f"an offset covering {committed} samples was committed while rag:eval:r1 counted {counted}: a crash right then loses the samples in between; commit after evalstore.record"
+    seen.clear()
+    _seed(ctx, "r2", 200)
+    ctx.kafka.fail_next(METRICS)  # r2's verdict is not acknowledged
+    try:
+        _run(ctx)
+    except Exception:  # noqa: BLE001 - the failure reaching run() is what is expected
+        pass
+    assert ctx.kafka.lag("rag-eval", SAMPLES) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit"
+    _run(ctx)  # the 200th sample, redelivered
+    r2 = [v for v in _verdicts(ctx) if v.get("release") == "r2"]
+    assert len(r2) == 1 and ctx.kafka.lag("rag-eval", SAMPLES) == 0, f"redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: {len(r2)} verdicts, lag {ctx.kafka.lag('rag-eval', SAMPLES)}"
 
 
 def check_min_samples(ctx):
     _seed(ctx, "r1", 205)
-    _seed(ctx, "r2", 150)
+    _seed(ctx, "r2", 199)
     _run(ctx)
     verdicts = _verdicts(ctx)
     r2 = [v for v in verdicts if v.get("release") == "r2"]
-    assert not r2, f"r2 has 150 samples and got {len(r2)} verdicts: a release is judged at MIN_SAMPLES = 200, not on a handful"
+    assert not r2, f"r2 has 199 samples and got {len(r2)} verdicts: a release is judged at MIN_SAMPLES = 200, not before"
     r1 = [v for v in verdicts if v.get("release") == "r1"]
     assert len(r1) == 1, f"r1 has 205 samples and got {len(r1)} verdicts: one verdict per release, made at the 200th"
     assert r1[0].get("samples") == 200 and r1[0].get("verdict") == "pass", f"r1's verdict is made on 200 samples, all grounded: {r1[0]}"
@@ -897,6 +908,15 @@ def check_release_thresholds(ctx):
     assert final["r2"]["verdict"] == "block", f"r2's groundedness 0.96 is 0.02 under the last release that passed (0.98): a regression over 0.01 is blocked, the gate said {final['r2']['verdict']!r}"
     assert final["r3"]["verdict"] == "pass", f"r3 clears every bar (0.99, 0.95): it must pass, the gate said {final['r3']['verdict']!r}"
     assert ctx.redis.hget("rag:eval:baseline", "release") == "r3", "a release that passes becomes the baseline"
+    _seed(ctx, "r4", 200, ungrounded=3, recall=0.95)  # groundedness 0.985: 0.005 under r3's 0.99
+    _run(ctx)
+    r4 = [v for v in _verdicts(ctx) if v.get("release") == "r4"]
+    assert len(r4) == 1 and r4[0]["verdict"] == "pass", f"r4 is 0.005 under the baseline, within MAX_REGRESSION = 0.01: it must pass, got {r4}"
+    ctx.redis.delete("rag:eval:baseline")
+    _seed(ctx, "r5", 200, ungrounded=10, recall=0.90)  # exactly 0.95 and 0.90, no baseline
+    _run(ctx)
+    r5 = [v for v in _verdicts(ctx) if v.get("release") == "r5"]
+    assert len(r5) == 1 and r5[0]["verdict"] == "pass", f"r5 sits exactly on the bars (groundedness 0.95, recall@k 0.90): only below them is a block, got {r5}"
 
 
 def check_no_raw_text(ctx):
@@ -907,6 +927,8 @@ def check_no_raw_text(ctx):
     for value in values:
         assert b"refund window" not in value, f"a verdict carries question text: {value[:160]!r}; eval.metrics is an analytics topic, ids and aggregates only"
         assert "question" not in json.loads(value), f"a verdict has a question field: {value[:160]!r}"
+        fields = sorted(json.loads(value))
+        assert fields == ["groundedness", "recall_at_k", "refusal_accuracy", "release", "samples", "verdict"], f"a verdict is {{release, samples, groundedness, recall_at_k, refusal_accuracy, verdict}} and nothing else, got the fields {fields}"
 `,
     typescript: `const SAMPLES = 'eval.samples';
 const METRICS = 'eval.metrics';
@@ -957,15 +979,26 @@ export async function check_commit_after_store(ctx) {
   assert(seen.length > 0, 'no offset was ever committed');
   for (const [committed, counted] of seen)
     assert(committed <= counted, \`an offset covering \${committed} samples was committed while rag:eval:r1 counted \${counted}: a crash right then loses the samples in between; commit after evalstore.record\`);
+  seed(ctx, 'r2', 200);
+  ctx.kafka.failNext(METRICS); // r2's verdict is not acknowledged
+  try {
+    await run(ctx);
+  } catch {
+    // the failure reaching run() is what is expected
+  }
+  assert(ctx.kafka.lag('rag-eval', SAMPLES) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit");
+  await run(ctx); // the 200th sample, redelivered
+  const r2 = verdicts(ctx).filter(v => v.release === 'r2');
+  assert(r2.length === 1 && ctx.kafka.lag('rag-eval', SAMPLES) === 0, \`redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: \${r2.length} verdicts, lag \${ctx.kafka.lag('rag-eval', SAMPLES)}\`);
 }
 
 export async function check_min_samples(ctx) {
   seed(ctx, 'r1', 205);
-  seed(ctx, 'r2', 150);
+  seed(ctx, 'r2', 199);
   await run(ctx);
   const all = verdicts(ctx);
   const r2 = all.filter(v => v.release === 'r2');
-  assert.equal(r2.length, 0, \`r2 has 150 samples and got \${r2.length} verdicts: a release is judged at MIN_SAMPLES = 200, not on a handful\`);
+  assert.equal(r2.length, 0, \`r2 has 199 samples and got \${r2.length} verdicts: a release is judged at MIN_SAMPLES = 200, not before\`);
   const r1 = all.filter(v => v.release === 'r1');
   assert.equal(r1.length, 1, \`r1 has 205 samples and got \${r1.length} verdicts: one verdict per release, made at the 200th\`);
   assert(r1[0].samples === 200 && r1[0].verdict === 'pass', \`r1's verdict is made on 200 samples, all grounded: \${JSON.stringify(r1[0])}\`);
@@ -984,6 +1017,15 @@ export async function check_release_thresholds(ctx) {
   assert.equal(final.r2.verdict, 'block', \`r2's groundedness 0.96 is 0.02 under the last release that passed (0.98): a regression over 0.01 is blocked, the gate said \${final.r2.verdict}\`);
   assert.equal(final.r3.verdict, 'pass', \`r3 clears every bar (0.99, 0.95): it must pass, the gate said \${final.r3.verdict}\`);
   assert.equal(ctx.redis.hget('rag:eval:baseline', 'release'), 'r3', 'a release that passes becomes the baseline');
+  seed(ctx, 'r4', 200, 3, 0.95); // groundedness 0.985: 0.005 under r3's 0.99
+  await run(ctx);
+  const r4 = verdicts(ctx).filter(v => v.release === 'r4');
+  assert(r4.length === 1 && r4[0].verdict === 'pass', \`r4 is 0.005 under the baseline, within MAX_REGRESSION = 0.01: it must pass, got \${JSON.stringify(r4)}\`);
+  ctx.redis.del('rag:eval:baseline');
+  seed(ctx, 'r5', 200, 10, 0.9); // exactly 0.95 and 0.90, no baseline
+  await run(ctx);
+  const r5 = verdicts(ctx).filter(v => v.release === 'r5');
+  assert(r5.length === 1 && r5[0].verdict === 'pass', \`r5 sits exactly on the bars (groundedness 0.95, recall@k 0.90): only below them is a block, got \${JSON.stringify(r5)}\`);
 }
 
 export async function check_no_raw_text(ctx) {
@@ -994,6 +1036,8 @@ export async function check_no_raw_text(ctx) {
   for (const value of values) {
     assert(!value.includes('refund window'), \`a verdict carries question text: \${value.slice(0, 160)}; eval.metrics is an analytics topic, ids and aggregates only\`);
     assert(!('question' in JSON.parse(value)), \`a verdict has a question field: \${value.slice(0, 160)}\`);
+    const fields = Object.keys(JSON.parse(value)).sort();
+    assert.deepEqual(fields, ['groundedness', 'recall_at_k', 'refusal_accuracy', 'release', 'samples', 'verdict'], \`a verdict is {release, samples, groundedness, recall_at_k, refusal_accuracy, verdict} and nothing else, got the fields \${JSON.stringify(fields)}\`);
   }
 }
 `,
@@ -1052,6 +1096,16 @@ func evalCount(ctx *harness.Ctx, release string) int {
 	return n
 }
 
+func evalVerdictsOf(ctx *harness.Ctx, release string) []map[string]any {
+	var out []map[string]any
+	for _, v := range evalVerdicts(ctx) {
+		if v["release"] == release {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 func CheckConsumerGroup(ctx *harness.Ctx) {
 	evalSeed(ctx, "r1", 3, 0, 0.95)
 	evalRun(ctx)
@@ -1082,11 +1136,18 @@ func CheckCommitAfterStore(ctx *harness.Ctx) {
 	for _, s := range seen {
 		ctx.Assert(s.committed <= s.counted, "an offset covering %d samples was committed while rag:eval:r1 counted %d: a crash right then loses the samples in between; commit after evalstore.Record", s.committed, s.counted)
 	}
+	evalSeed(ctx, "r2", 200, 0, 0.95)
+	ctx.Kafka.FailNext(evalMetrics, 1) // r2's verdict is not acknowledged
+	evalRun(ctx)
+	ctx.Assert(ctx.Kafka.Lag("rag-eval", evalSamples) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit")
+	evalRun(ctx) // the 200th sample, redelivered
+	r2 := evalVerdictsOf(ctx, "r2")
+	ctx.Assert(len(r2) == 1 && ctx.Kafka.Lag("rag-eval", evalSamples) == 0, "redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: %d verdicts, lag %d", len(r2), ctx.Kafka.Lag("rag-eval", evalSamples))
 }
 
 func CheckMinSamples(ctx *harness.Ctx) {
 	evalSeed(ctx, "r1", 205, 0, 0.95)
-	evalSeed(ctx, "r2", 150, 0, 0.95)
+	evalSeed(ctx, "r2", 199, 0, 0.95)
 	evalRun(ctx)
 	var r1, r2 []map[string]any
 	for _, v := range evalVerdicts(ctx) {
@@ -1097,7 +1158,7 @@ func CheckMinSamples(ctx *harness.Ctx) {
 			r2 = append(r2, v)
 		}
 	}
-	ctx.Assert(len(r2) == 0, "r2 has 150 samples and got %d verdicts: a release is judged at minSamples = 200, not on a handful", len(r2))
+	ctx.Assert(len(r2) == 0, "r2 has 199 samples and got %d verdicts: a release is judged at minSamples = 200, not before", len(r2))
 	ctx.Assert(len(r1) == 1, "r1 has 205 samples and got %d verdicts: one verdict per release, made at the 200th", len(r1))
 	ctx.Assert(r1[0]["samples"] == float64(200) && r1[0]["verdict"] == "pass", "r1's verdict is made on 200 samples, all grounded: %v", r1[0])
 }
@@ -1120,6 +1181,15 @@ func CheckReleaseThresholds(ctx *harness.Ctx) {
 	ctx.Equal(final["r3"], "pass", "r3 clears every bar (0.99, 0.95): its verdict")
 	release, _ := ctx.Redis.HGet("rag:eval:baseline", "release")
 	ctx.Equal(release, "r3", "a release that passes becomes the baseline")
+	evalSeed(ctx, "r4", 200, 3, 0.95) // groundedness 0.985: 0.005 under r3's 0.99
+	evalRun(ctx)
+	r4 := evalVerdictsOf(ctx, "r4")
+	ctx.Assert(len(r4) == 1 && r4[0]["verdict"] == "pass", "r4 is 0.005 under the baseline, within maxRegression = 0.01: it must pass, got %v", r4)
+	ctx.Redis.Do("DEL", "rag:eval:baseline")
+	evalSeed(ctx, "r5", 200, 10, 0.90) // exactly 0.95 and 0.90, no baseline
+	evalRun(ctx)
+	r5 := evalVerdictsOf(ctx, "r5")
+	ctx.Assert(len(r5) == 1 && r5[0]["verdict"] == "pass", "r5 sits exactly on the bars (groundedness 0.95, recall@k 0.90): only below them is a block, got %v", r5)
 }
 
 func CheckNoRawText(ctx *harness.Ctx) {
@@ -1133,6 +1203,12 @@ func CheckNoRawText(ctx *harness.Ctx) {
 		json.Unmarshal([]byte(value), &e)
 		_, has := e["question"]
 		ctx.Assert(!has, "a verdict has a question field: %.160s", value)
+		fields := make([]string, 0, len(e))
+		for key := range e {
+			fields = append(fields, key)
+		}
+		slices.Sort(fields)
+		ctx.Equal(fields, []string{"groundedness", "recall_at_k", "refusal_accuracy", "release", "samples", "verdict"}, "a verdict is {release, samples, groundedness, recall_at_k, refusal_accuracy, verdict} and nothing else; its fields")
 	}
 }
 `,
@@ -1181,6 +1257,13 @@ long long evalCount(harness::Ctx& ctx, const std::string& release) {
   return raw ? std::stoll(*raw) : 0;
 }
 
+std::vector<json> evalVerdictsOf(harness::Ctx& ctx, const std::string& release) {
+  std::vector<json> out;
+  for (const auto& v : evalVerdicts(ctx))
+    if (v.is_object() && v.value("release", "") == release) out.push_back(v);
+  return out;
+}
+
 }  // namespace
 
 void CheckConsumerGroup(harness::Ctx& ctx) {
@@ -1208,18 +1291,29 @@ void CheckCommitAfterStore(harness::Ctx& ctx) {
   ctx.Assert(!seen.empty(), "no offset was ever committed");
   for (const auto& [committed, counted] : seen)
     ctx.Assert(committed <= counted, "an offset covering %d samples was committed while rag:eval:r1 counted %d: a crash right then loses the samples in between; commit after evalstore::record", committed, counted);
+  evalSeed(ctx, "r2", 200);
+  ctx.Kafka.FailNext(kMetrics, 1);  // r2's verdict is not acknowledged
+  try {
+    evalRun(ctx);
+  } catch (const std::exception&) {
+    // the failure reaching run() is what is expected
+  }
+  ctx.Assert(ctx.Kafka.Lag("rag-eval", kSamples) >= 1, "r2's verdict was never acknowledged, yet every offset was committed: the 200th sample is gone and no verdict will ever be made; a failed publish must stop the commit");
+  evalRun(ctx);  // the 200th sample, redelivered
+  const auto r2 = evalVerdictsOf(ctx, "r2");
+  ctx.Assert(r2.size() == 1 && ctx.Kafka.Lag("rag-eval", kSamples) == 0, "redelivered after the failed publish, the 200th sample must produce r2's verdict and be committed: %d verdicts, lag %d", r2.size(), ctx.Kafka.Lag("rag-eval", kSamples));
 }
 
 void CheckMinSamples(harness::Ctx& ctx) {
   evalSeed(ctx, "r1", 205);
-  evalSeed(ctx, "r2", 150);
+  evalSeed(ctx, "r2", 199);
   evalRun(ctx);
   std::vector<json> r1, r2;
   for (const auto& v : evalVerdicts(ctx)) {
     if (v.value("release", "") == "r1") r1.push_back(v);
     if (v.value("release", "") == "r2") r2.push_back(v);
   }
-  ctx.Assert(r2.empty(), "r2 has 150 samples and got %d verdicts: a release is judged at kMinSamples = 200, not on a handful", r2.size());
+  ctx.Assert(r2.empty(), "r2 has 199 samples and got %d verdicts: a release is judged at kMinSamples = 200, not before", r2.size());
   ctx.Assert(r1.size() == 1, "r1 has 205 samples and got %d verdicts: one verdict per release, made at the 200th", r1.size());
   ctx.Assert(r1[0].value("samples", 0) == 200 && r1[0].value("verdict", "") == "pass", "r1's verdict is made on 200 samples, all grounded: %v", r1[0]);
 }
@@ -1238,6 +1332,15 @@ void CheckReleaseThresholds(harness::Ctx& ctx) {
   ctx.Equal(final["r2"], "block", "r2's groundedness 0.96 is 0.02 under the last release that passed (0.98), a regression over 0.01: its verdict");
   ctx.Equal(final["r3"], "pass", "r3 clears every bar (0.99, 0.95): its verdict");
   ctx.Equal(ctx.Redis.HGet("rag:eval:baseline", "release").value_or(""), "r3", "a release that passes becomes the baseline");
+  evalSeed(ctx, "r4", 200, 3, 0.95);  // groundedness 0.985: 0.005 under r3's 0.99
+  evalRun(ctx);
+  const auto r4 = evalVerdictsOf(ctx, "r4");
+  ctx.Assert(r4.size() == 1 && r4[0].value("verdict", "") == "pass", "r4 is 0.005 under the baseline, within kMaxRegression = 0.01: it must pass, got %v", r4);
+  ctx.Redis.Do("DEL", "rag:eval:baseline");
+  evalSeed(ctx, "r5", 200, 10, 0.90);  // exactly 0.95 and 0.90, no baseline
+  evalRun(ctx);
+  const auto r5 = evalVerdictsOf(ctx, "r5");
+  ctx.Assert(r5.size() == 1 && r5[0].value("verdict", "") == "pass", "r5 sits exactly on the bars (groundedness 0.95, recall@k 0.90): only below them is a block, got %v", r5);
 }
 
 void CheckNoRawText(harness::Ctx& ctx) {
@@ -1249,6 +1352,11 @@ void CheckNoRawText(harness::Ctx& ctx) {
     ctx.Assert(value.find("refund window") == std::string::npos, "a verdict carries question text: %s; eval.metrics is an analytics topic, ids and aggregates only", value.substr(0, 160));
     const json e = json::parse(value, nullptr, false);
     ctx.Assert(!e.is_object() || !e.contains("question"), "a verdict has a question field: %s", value.substr(0, 160));
+    std::vector<std::string> fields;
+    if (e.is_object())
+      for (const auto& [key, _] : e.items()) fields.push_back(key);
+    std::sort(fields.begin(), fields.end());
+    ctx.Equal(fields, {"groundedness", "recall_at_k", "refusal_accuracy", "release", "samples", "verdict"}, "a verdict is {release, samples, groundedness, recall_at_k, refusal_accuracy, verdict} and nothing else; its fields");
   }
 }
 `,

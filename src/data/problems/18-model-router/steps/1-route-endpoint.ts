@@ -63,7 +63,7 @@ a client retry that routes twice, and a prompt copied into the logs.
       id: 'validate',
       title: 'Caps the prompt at 256 KiB and max_tokens at 1…4096',
       detail:
-        'A prompt over `MAX_PROMPT_BYTES` UTF-8 bytes answers 413, an empty prompt or `max_tokens` outside 1…4096 answers 400, and a rejected request stores no decision.',
+        'A prompt over `MAX_PROMPT_BYTES` UTF-8 bytes (not characters) answers 413, an empty prompt or `max_tokens` outside 1…4096 answers 400 (both ends are allowed), and a rejected request stores no decision.',
       match: {
         python: {all: [/>\s*MAX_PROMPT_BYTES/, /\b413\b/, /[<>]=?\s*MAX_OUTPUT_TOKENS/]},
         typescript: {all: [/>\s*MAX_PROMPT_BYTES/, /\b413\b/, /[<>]=?\s*MAX_OUTPUT_TOKENS/]},
@@ -92,7 +92,7 @@ a client retry that routes twice, and a prompt copied into the logs.
       id: 'idempotency-key',
       title: 'Stores one decision per (tenant, Idempotency-Key)',
       detail:
-        '`Idempotency-Key` is required; the decision is written with `SET decision:{tenant}:{key} … NX EX 86400` and a retry answers the stored decision instead of routing again.',
+        "`Idempotency-Key` is required; the decision is written with `SET decision:{tenant}:{key} … NX EX 86400` and a retry answers the stored decision instead of routing again. When another replica stores a decision for the same key between two of this request's commands, the request answers that decision; the key has its expiry from the command that creates it.",
       match: {
         python: {all: [/["']idempotency-key["']/i, /nx\s*=\s*True/]},
         typescript: {all: [/['"]idempotency-key['"]/i, /['"]NX['"]/]},
@@ -781,6 +781,7 @@ void register_routes(httplib::Server& svr) {
   harness: {
     python: `import contextlib
 import io
+import json
 import logging
 
 AUTH = {"Authorization": "Bearer acme"}
@@ -819,9 +820,10 @@ async def check_validate(ctx):
     m = ctx.load("router_api")
     bad = [
         ("a prompt of 256 KiB + 1 byte", _body(prompt="x" * ((1 << 18) + 1)), 413),
+        ("a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)", _body(prompt="é" * ((1 << 17) + 1)), 413),
         ("an empty prompt", _body(prompt=""), 400),
         ("max_tokens 0", _body(max_tokens=0), 400),
-        ("max_tokens 5000", _body(max_tokens=5000), 400),
+        ("max_tokens 4097", _body(max_tokens=4097), 400),
     ]
     for i, (what, body, status) in enumerate(bad):
         r = await _route(ctx, m, body, key=f"bad-{i}")
@@ -830,6 +832,8 @@ async def check_validate(ctx):
     assert stored == [], f"rejected requests stored decisions: {stored}"
     ok = await _route(ctx, m, _body(prompt="x" * (1 << 18), max_tokens=4096, policy="large"), key="edge")
     assert ok.status_code == 200, f"a request at the limits (256 KiB, max_tokens 4096) answered {ok.status_code}: {ok.text}"
+    least = await _route(ctx, m, _body(max_tokens=1), key="edge-1")
+    assert least.status_code == 200, f"a request with max_tokens 1 answered {least.status_code}: {least.text}"
 
 
 async def check_policy(ctx):
@@ -862,6 +866,20 @@ async def check_idempotency_key(ctx):
     assert other.status_code == 200 and other.json().get("id") != first.json().get("id"), "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant"
     missing = await _route(ctx, m, _body(), key=None)
     assert missing.status_code == 400, f"a request without Idempotency-Key answered {missing.status_code}, expected 400"
+    # Another replica stores its decision for k-2 right after this request's first command on the key.
+    rival_decision = {"id": "d-rival", "model": "gpt-4o-mini", "policy": "auto", "estimated_tokens": 265}
+    rival = ctx.redis_after("decision:acme:k-2", lambda: (bool(ctx.redis.set("decision:acme:k-2", json.dumps(rival_decision), nx=True, ex=86400)), ctx.redis.ttl("decision:acme:k-2")))
+    raced = await _route(ctx, m, _body(), key="k-2")
+    assert rival.fired, "the request with Idempotency-Key k-2 never touched decision:acme:k-2"
+    if rival.error is not None:
+        raise rival.error
+    rival_won, ttl_then = rival.result
+    assert raced.status_code == 200, f"the request with Idempotency-Key k-2 answered {raced.status_code}: {raced.text}"
+    if rival_won:
+        held = json.loads(ctx.redis.get("decision:acme:k-2") or "{}").get("id")
+        assert raced.json().get("id") == "d-rival" and held == "d-rival", f"another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered {raced.json().get('id')!r} and decision:acme:k-2 holds {held!r}: the client holds two decisions. Check and store in one command"
+    else:
+        assert 0 < ttl_then <= 86400, f"right after the request stored decision:acme:k-2 its TTL was {ttl_then}: a crash before the expiry is set keeps the decision for good. Store the decision and its expiry in one command"
 
 
 async def check_no_prompt_log(ctx):
@@ -880,7 +898,10 @@ async def check_no_prompt_log(ctx):
         root.setLevel(level)
     assert r.status_code == 200, f"POST /v1/route answered {r.status_code}: {r.text}"
     assert "CANARY-7731" not in r.text, f"the answer echoes the prompt: {r.text}"
-    assert "CANARY-7731" not in captured.getvalue(), f"the prompt was printed or logged: {captured.getvalue().strip()!r}"
+    logged = captured.getvalue()
+    assert "CANARY-7731" not in logged, f"the prompt was printed or logged: {logged.strip()!r}"
+    missing = [field for field in ("acme", "gpt-4o-mini", "265") if field not in logged]
+    assert not missing, f"the log line must name the tenant, the model and the estimate; {missing} not found in {logged.strip()!r}"
 `,
     typescript: `const CANARY = 'CANARY-7731 my card number is 4111';
 const PROMPT = 'Summarise this ticket in one line.';
@@ -920,9 +941,10 @@ export async function check_validate(ctx) {
   const {route} = router(ctx);
   const bad: [string, unknown, number][] = [
     ['a prompt of 256 KiB + 1 byte', body({prompt: 'x'.repeat((1 << 18) + 1)}), 413],
+    ['a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)', body({prompt: 'é'.repeat((1 << 17) + 1)}), 413],
     ['an empty prompt', body({prompt: ''}), 400],
     ['max_tokens 0', body({max_tokens: 0}), 400],
-    ['max_tokens 5000', body({max_tokens: 5000}), 400],
+    ['max_tokens 4097', body({max_tokens: 4097}), 400],
   ];
   for (const [i, [what, b, status]] of bad.entries()) {
     const r = await route(b, \`bad-\${i}\`);
@@ -932,6 +954,8 @@ export async function check_validate(ctx) {
   assert.deepStrictEqual(stored, [], \`rejected requests stored decisions: \${JSON.stringify(stored)}\`);
   const ok = await route(body({prompt: 'x'.repeat(1 << 18), max_tokens: 4096, policy: 'large'}), 'edge');
   assert.equal(ok.status, 200, \`a request at the limits (256 KiB, max_tokens 4096) answered \${ok.status}: \${ok.text}\`);
+  const least = await route(body({max_tokens: 1}), 'edge-1');
+  assert.equal(least.status, 200, \`a request with max_tokens 1 answered \${least.status}: \${least.text}\`);
 }
 
 export async function check_policy(ctx) {
@@ -966,6 +990,20 @@ export async function check_idempotency_key(ctx) {
   assert(other.status === 200 && other.json().id !== first.json().id, "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant");
   const missing = await route(body(), null);
   assert.equal(missing.status, 400, \`a request without Idempotency-Key answered \${missing.status}, expected 400\`);
+  // Another replica stores its decision for k-2 right after this request's first command on the key.
+  const rivalDecision = {id: 'd-rival', model: 'gpt-4o-mini', policy: 'auto', estimated_tokens: 265};
+  const rival = ctx.redisAfter('decision:acme:k-2', () => [ctx.redis.set('decision:acme:k-2', JSON.stringify(rivalDecision), 'EX', 86400, 'NX') !== null, Number(ctx.redis.ttl('decision:acme:k-2'))]);
+  const raced = await route(body(), 'k-2');
+  assert(rival.fired, 'the request with Idempotency-Key k-2 never touched decision:acme:k-2');
+  if (rival.error !== undefined) throw rival.error;
+  const [rivalWon, ttlThen] = rival.result as [boolean, number];
+  assert.equal(raced.status, 200, \`the request with Idempotency-Key k-2 answered \${raced.status}: \${raced.text}\`);
+  if (rivalWon) {
+    const held = JSON.parse(ctx.redis.get('decision:acme:k-2') ?? '{}').id;
+    assert(raced.json().id === 'd-rival' && held === 'd-rival', \`another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered \${JSON.stringify(raced.json().id)} and decision:acme:k-2 holds \${JSON.stringify(held)}: the client holds two decisions. Check and store in one command\`);
+  } else {
+    assert(ttlThen > 0 && ttlThen <= 86400, \`right after the request stored decision:acme:k-2 its TTL was \${ttlThen}: a crash before the expiry is set keeps the decision for good. Store the decision and its expiry in one command\`);
+  }
 }
 
 export async function check_no_prompt_log(ctx) {
@@ -984,12 +1022,16 @@ export async function check_no_prompt_log(ctx) {
   assert(!r.text.includes('CANARY-7731'), \`the answer echoes the prompt: \${r.text}\`);
   const leak = logged.find(l => l.includes('CANARY-7731'));
   assert(leak === undefined, \`the prompt was printed or logged: \${JSON.stringify(leak)}\`);
+  const all = logged.join('\\n');
+  const absent = ['acme', 'gpt-4o-mini', '265'].filter(field => !all.includes(field));
+  assert.deepStrictEqual(absent, [], \`the log line must name the tenant, the model and the estimate; \${JSON.stringify(absent)} not found in \${JSON.stringify(all)}\`);
 }
 `,
     go: `package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -1052,9 +1094,10 @@ func CheckValidate(ctx *harness.Ctx) {
 		status int
 	}{
 		{"a prompt of 256 KiB + 1 byte", routeBody(strings.Repeat("x", 1<<18+1), 256, "auto"), 413},
+		{"a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)", routeBody(strings.Repeat("é", 1<<17+1), 256, "auto"), 413},
 		{"an empty prompt", routeBody("", 256, "auto"), 400},
 		{"max_tokens 0", routeBody(routePrompt, 0, "auto"), 400},
-		{"max_tokens 5000", routeBody(routePrompt, 5000, "auto"), 400},
+		{"max_tokens 4097", routeBody(routePrompt, 4097, "auto"), 400},
 	}
 	for i, b := range bad {
 		r := routeAs(c, b.body, fmt.Sprintf("bad-%d", i), "acme")
@@ -1064,6 +1107,8 @@ func CheckValidate(ctx *harness.Ctx) {
 	ctx.Assert(len(stored) == 0, "rejected requests stored decisions: %v", stored)
 	ok := routeAs(c, routeBody(strings.Repeat("x", 1<<18), 4096, "large"), "edge", "acme")
 	ctx.Equal(ok.Status, 200, "a request at the limits (256 KiB, max_tokens 4096) (%s)", ok.Text())
+	least := routeAs(c, routeBody(routePrompt, 1, "auto"), "edge-1", "acme")
+	ctx.Equal(least.Status, 200, "a request with max_tokens 1 (%s)", least.Text())
 }
 
 func CheckPolicy(ctx *harness.Ctx) {
@@ -1102,6 +1147,28 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	ctx.Assert(other.Status == 200 && routeOut(other)["id"] != routeOut(first)["id"], "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant")
 	missing := routeAs(c, routeBody(routePrompt, 256, "auto"), "", "acme")
 	ctx.Equal(missing.Status, 400, "a request without Idempotency-Key")
+	// Another replica stores its decision for k-2 right after this request's first command on the key.
+	rivalDecision := "{\\"id\\":\\"d-rival\\",\\"model\\":\\"gpt-4o-mini\\",\\"policy\\":\\"auto\\",\\"estimated_tokens\\":265}"
+	rival := ctx.Redis.After("decision:acme:k-2", func() any {
+		return []any{ctx.Redis.Set("decision:acme:k-2", rivalDecision, "EX", 86400, "NX"), ctx.Redis.TTL("decision:acme:k-2")}
+	})
+	raced := routeAs(c, routeBody(routePrompt, 256, "auto"), "k-2", "acme")
+	ctx.Assert(rival.Fired, "the request with Idempotency-Key k-2 never touched decision:acme:k-2")
+	ctx.Assert(rival.Err == nil, "the rival request failed: %v", rival.Err)
+	got, _ := rival.Result.([]any)
+	rivalWon, _ := got[0].(bool)
+	ttlThen, _ := got[1].(int64)
+	ctx.Equal(raced.Status, 200, "the request with Idempotency-Key k-2 (%s)", raced.Text())
+	if rivalWon {
+		stored, _ := ctx.Redis.Get("decision:acme:k-2")
+		var held struct {
+			ID string \`json:"id"\`
+		}
+		json.Unmarshal([]byte(stored), &held)
+		ctx.Assert(routeOut(raced)["id"] == "d-rival" && held.ID == "d-rival", "another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered %v and decision:acme:k-2 holds %q: the client holds two decisions. Check and store in one command", routeOut(raced)["id"], held.ID)
+	} else {
+		ctx.Assert(ttlThen > 0 && ttlThen <= 86400, "right after the request stored decision:acme:k-2 its TTL was %d: a crash before the expiry is set keeps the decision for good. Store the decision and its expiry in one command", ttlThen)
+	}
 }
 
 func CheckNoPromptLog(ctx *harness.Ctx) {
@@ -1112,6 +1179,13 @@ func CheckNoPromptLog(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 200, "POST /v1/route (%s)", r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "CANARY-7731"), "the answer echoes the prompt: %s", r.Text())
 	ctx.Assert(!strings.Contains(logged.String(), "CANARY-7731"), "the prompt was printed or logged: %q", strings.TrimSpace(logged.String()))
+	absent := []string{}
+	for _, field := range []string{"acme", "gpt-4o-mini", "265"} {
+		if !strings.Contains(logged.String(), field) {
+			absent = append(absent, field)
+		}
+	}
+	ctx.Assert(len(absent) == 0, "the log line must name the tenant, the model and the estimate; %v not found in %q", absent, strings.TrimSpace(logged.String()))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1119,6 +1193,7 @@ func CheckNoPromptLog(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1173,11 +1248,14 @@ void CheckValidate(harness::Ctx& ctx) {
     std::string what, body;
     int status;
   };
+  std::string two_byte;
+  for (int i = 0; i < (1 << 17) + 1; i++) two_byte += "é";
   const std::vector<Bad> bad = {
       {"a prompt of 256 KiB + 1 byte", routeBody(std::string((1 << 18) + 1, 'x')), 413},
+      {"a prompt of 131 073 two-byte characters (256 KiB + 2 bytes of UTF-8)", routeBody(two_byte), 413},
       {"an empty prompt", routeBody(""), 400},
       {"max_tokens 0", routeBody(kRoutePrompt, 0), 400},
-      {"max_tokens 5000", routeBody(kRoutePrompt, 5000), 400},
+      {"max_tokens 4097", routeBody(kRoutePrompt, 4097), 400},
   };
   for (size_t i = 0; i < bad.size(); i++) {
     const auto r = routeAs(c, bad[i].body, "bad-" + std::to_string(i));
@@ -1187,6 +1265,8 @@ void CheckValidate(harness::Ctx& ctx) {
   ctx.Assert(stored.empty(), "rejected requests stored decisions: %v", stored);
   const auto ok = routeAs(c, routeBody(std::string(1 << 18, 'x'), 4096, "large"), "edge");
   ctx.Equal(ok.Status, 200, "a request at the limits (256 KiB, max_tokens 4096) (%s)", ok.Text());
+  const auto least = routeAs(c, routeBody(kRoutePrompt, 1), "edge-1");
+  ctx.Equal(least.Status, 200, "a request with max_tokens 1 (%s)", least.Text());
 }
 
 void CheckPolicy(harness::Ctx& ctx) {
@@ -1225,6 +1305,32 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   ctx.Assert(other.Status == 200 && routeOut(other).value("id", "") != routeOut(first).value("id", ""), "another tenant using the same Idempotency-Key received acme's decision: the key is per tenant");
   const auto missing = routeAs(c, routeBody(), "", "acme");
   ctx.Equal(missing.Status, 400, "a request without Idempotency-Key");
+  // Another replica stores its decision for k-2 right after this request's first command on the key.
+  const std::string rival_decision = nlohmann::json{{"id", "d-rival"}, {"model", "gpt-4o-mini"}, {"policy", "auto"}, {"estimated_tokens", 265}}.dump();
+  auto fired = std::make_shared<bool>(false);
+  auto rival_won = std::make_shared<bool>(false);
+  auto ttl_then = std::make_shared<long long>(0);
+  auto failed = std::make_shared<std::string>();
+  ctx.Redis.After("decision:acme:k-2", [&ctx, rival_decision, fired, rival_won, ttl_then, failed] {
+    *fired = true;
+    try {
+      *rival_won = ctx.Redis.Set("decision:acme:k-2", rival_decision, "EX", "86400", "NX");
+      *ttl_then = ctx.Redis.TTL("decision:acme:k-2");
+    } catch (const std::exception& e) {
+      *failed = e.what();
+    }
+  });
+  const auto raced = routeAs(c, routeBody(), "k-2");
+  ctx.Assert(*fired, "the request with Idempotency-Key k-2 never touched decision:acme:k-2");
+  ctx.Assert(failed->empty(), "the rival request failed: %s", *failed);
+  ctx.Equal(raced.Status, 200, "the request with Idempotency-Key k-2 (%s)", raced.Text());
+  if (*rival_won) {
+    const auto held = nlohmann::json::parse(ctx.Redis.Get("decision:acme:k-2").value_or("{}"), nullptr, false);
+    const std::string held_id = held.is_object() ? held.value("id", "") : "";
+    ctx.Assert(routeOut(raced).value("id", "") == "d-rival" && held_id == "d-rival", "another replica stored decision d-rival for k-2 between this request's first command on the key and its write, yet this one answered %s and decision:acme:k-2 holds %s: the client holds two decisions. Check and store in one command", routeOut(raced).value("id", ""), held_id);
+  } else {
+    ctx.Assert(*ttl_then > 0 && *ttl_then <= 86400, "right after the request stored decision:acme:k-2 its TTL was %d: a crash before the expiry is set keeps the decision for good. Store the decision and its expiry in one command", *ttl_then);
+  }
 }
 
 void CheckNoPromptLog(harness::Ctx& ctx) {
@@ -1238,6 +1344,11 @@ void CheckNoPromptLog(harness::Ctx& ctx) {
   ctx.Equal(r.Status, 200, "POST /v1/route (%s)", r.Text());
   ctx.Assert(r.Text().find("CANARY-7731") == std::string::npos, "the answer echoes the prompt: %s", r.Text());
   ctx.Assert(logged.str().find("CANARY-7731") == std::string::npos, "the prompt was printed or logged: %q", logged.str());
+  std::vector<std::string> absent;
+  for (const std::string field : {"acme", "gpt-4o-mini", "265"}) {
+    if (logged.str().find(field) == std::string::npos) absent.push_back(field);
+  }
+  ctx.Assert(absent.empty(), "the log line must name the tenant, the model and the estimate; %v not found in %q", absent, logged.str());
 }
 `,
   },

@@ -60,7 +60,8 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
     {
       id: 'deadline',
       title: 'Every attempt carries a 2-second deadline',
-      detail: 'The call is made with a deadline (`timeout=DEADLINE_S`), so a hung model server is cut at 2 s.',
+      detail:
+        'The call is made with a deadline (`timeout=DEADLINE_S`), so a hung model server is cut at 2 s with `EmbedError("deadline_exceeded")`; the retry after an `UNAVAILABLE` that came late gets a full 2 s of its own.',
       match: {
         python: {all: [/timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -85,7 +86,7 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
       id: 'unavailable-only',
       title: 'Only UNAVAILABLE is retried',
       detail:
-        'The retry is conditioned on the status `UNAVAILABLE`; `INVALID_ARGUMENT` and the rest raise after one call.',
+        'The retry is conditioned on the status `UNAVAILABLE`; `INVALID_ARGUMENT` and the rest (`INTERNAL`, `RESOURCE_EXHAUSTED`, `PERMISSION_DENIED` …) raise after one call.',
       match: {
         python: {all: [/StatusCode\.UNAVAILABLE/]},
         typescript: {all: [/grpc\.status\.UNAVAILABLE/]},
@@ -98,7 +99,7 @@ and a replica still on \`embed-v1\` whose vectors are returned as \`embed-v2\` o
       id: 'model-check',
       title: 'Refuses a vector from another model',
       detail:
-        'The reply’s `model_version` is compared with the one asked for and its length with `DIMENSIONS`; a mismatch raises `EmbedError("model_mismatch")`.',
+        'The reply’s `model_version` is compared with the one asked for and its length with `DIMENSIONS` of that model; a mismatch raises `EmbedError("model_mismatch")`, and a matching `embed-v1` reply is returned.',
       match: {
         python: {all: [/reply\.model_version\s*!=|!=\s*reply\.model_version/, /DIMENSIONS/, /model_mismatch/]},
         typescript: {all: [/reply\.model_version\s*!==|!==\s*reply\.model_version/, /DIMENSIONS\[/, /model_mismatch/]},
@@ -524,13 +525,17 @@ TEXT = "Rotate keys every 90 days."
 
 
 class ModelServer(embedder_pb2_grpc.EmbedderServicer):
-    """The stand-in model server: answers from embedding.model; answer_as plays a replica on another model."""
+    """The stand-in model server: answers from embedding.model; answer_as plays a replica on another model, unavailable one that is draining."""
 
     def __init__(self):
         self.answer_as = None
         self.truncate = None
+        self.unavailable = 0
 
     def Embed(self, request, context):
+        if self.unavailable > 0:
+            self.unavailable -= 1
+            context.abort(grpc.StatusCode.UNAVAILABLE, "replica draining")
         version = self.answer_as or request.model_version
         values = model.vector_for(version, request.text)
         if self.truncate is not None:
@@ -566,7 +571,7 @@ def check_healthy(ctx):
 
 
 def check_deadline(ctx):
-    m, _ = _world(ctx)
+    m, server = _world(ctx)
     m.embed(TEXT, MODEL_VERSION)
     timeout = _calls(ctx)[0].timeout
     assert timeout is not None, "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs"
@@ -578,6 +583,15 @@ def check_deadline(ctx):
     assert err is not None, f"a model server that takes 5 s answered after {waited:.1f} s and embed returned {value}: the deadline must cut the call at 2 s and raise EmbedError"
     assert waited <= 2.6, f"embed waited {waited:.1f} s on a hung model server: the deadline must cut it at about 2 s"
     assert len(_calls(ctx)) == 2, f"a call cut by its deadline is not retried: saw {len(_calls(ctx)) - 1} calls for it"
+    assert err.reason == "deadline_exceeded", f"the EmbedError of a call cut by its deadline must name the status (deadline_exceeded), got {err.reason!r}"
+    # A replica that fails late: 1.5 s pass before its UNAVAILABLE, and the retry must still get a full deadline of its own.
+    ctx.grpc.set_latency("Embed", 1.5, MODEL_SERVER)
+    server.unavailable = 1
+    value, err = _attempt(lambda: m.embed("Audit key use weekly.", MODEL_VERSION))
+    late = _calls(ctx)[2:]
+    assert len(late) == 2, f"an UNAVAILABLE after 1.5 s earns one retry: expected 2 calls, saw {len(late)}"
+    assert late[1].timeout is not None and 1.5 <= late[1].timeout <= 2.5, f"the retry carried a deadline of {late[1].timeout} s: every attempt gets DEADLINE_S = 2 s of its own, not what the first attempt left over"
+    assert err is None and value == model.vector_for(MODEL_VERSION, "Audit key use weekly."), f"the retry of a late UNAVAILABLE has 2 s for a 1.5 s answer, yet embed gave {value if err is None else 'EmbedError(' + repr(err.reason) + ')'}"
 
 
 def check_bounded_retry(ctx):
@@ -595,11 +609,17 @@ def check_bounded_retry(ctx):
 
 def check_unavailable_only(ctx):
     m, _ = _world(ctx)
-    ctx.grpc.fail("Embed", grpc.StatusCode.INVALID_ARGUMENT, "input is empty", times=5, target=MODEL_SERVER)
+    ctx.grpc.fail("Embed", grpc.StatusCode.INVALID_ARGUMENT, "input is empty", times=1, target=MODEL_SERVER)
     value, err = _attempt(lambda: m.embed("", MODEL_VERSION))
     assert len(_calls(ctx)) == 1, f"INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed {len(_calls(ctx))} times"
     assert err is not None, f"an INVALID_ARGUMENT must raise EmbedError, embed returned {value}"
     assert err.reason == "invalid_argument", f"the EmbedError must name the status (invalid_argument), got {err.reason!r}"
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.PERMISSION_DENIED):
+        before = len(_calls(ctx))
+        ctx.grpc.fail("Embed", code, "refused", times=1, target=MODEL_SERVER)
+        value, err = _attempt(lambda: m.embed(f"An input for {code.name}.", MODEL_VERSION))
+        n = len(_calls(ctx)) - before
+        assert n == 1 and err is not None, f"{code.name} is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError, saw {n} calls and {value if err is None else 'EmbedError(' + repr(err.reason) + ')'}"
 
 
 def check_model_check(ctx):
@@ -613,17 +633,24 @@ def check_model_check(ctx):
     assert err is not None and err.reason == "model_mismatch", f"a reply that says {MODEL_VERSION} but carries 4 values must raise EmbedError('model_mismatch'), embed returned {value}"
     server.truncate = None
     assert m.embed(TEXT, MODEL_VERSION) == model.vector_for(MODEL_VERSION, TEXT), "a matching reply is returned"
+    value, err = _attempt(lambda: m.embed(TEXT, PREVIOUS_VERSION))
+    assert err is None and value == model.vector_for(PREVIOUS_VERSION, TEXT), f"an {PREVIOUS_VERSION} request answered by {PREVIOUS_VERSION} with its 4 values is a match (DIMENSIONS of the model asked for), yet embed gave {value if err is None else 'EmbedError(' + repr(err.reason) + ')'}"
 `,
     typescript: `const TEXT = 'Rotate keys every 90 days.';
 
-/** The stand-in model server at MODEL_SERVER (answerAs plays a replica on another model) and the learner's module. */
+/** The stand-in model server at MODEL_SERVER (answerAs plays a replica on another model, unavailable one that is draining) and the learner's module. */
 function world(ctx) {
   const {embedding} = ctx.proto('embedder.proto');
   const config = ctx.load('/support/embedding/config.ts');
   const model = ctx.load('/support/embedding/model.ts');
-  const server = {answerAs: null as string | null, truncate: null as number | null};
+  const server = {answerAs: null as string | null, truncate: null as number | null, unavailable: 0};
   ctx.grpc.serve(embedding.Embedder.service, {
     Embed(call, callback) {
+      if (server.unavailable > 0) {
+        server.unavailable -= 1;
+        callback({code: ctx.grpc.status.UNAVAILABLE, details: 'replica draining'});
+        return;
+      }
       const version = server.answerAs ?? call.request.model_version;
       let values = model.vectorFor(version, call.request.text);
       if (server.truncate !== null) values = values.slice(0, server.truncate);
@@ -653,7 +680,7 @@ export async function check_healthy(ctx) {
 }
 
 export async function check_deadline(ctx) {
-  const {m, config} = world(ctx);
+  const {m, server, config, model} = world(ctx);
   await m.embed(TEXT, config.MODEL_VERSION);
   const timeout = calls(ctx)[0].timeout;
   assert(timeout !== null, 'the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs');
@@ -665,6 +692,16 @@ export async function check_deadline(ctx) {
   assert(err !== null, \`a model server that takes 5 s answered after \${waited.toFixed(1)} s and embed resolved to \${JSON.stringify(value)}: the deadline must cut the call at 2 s and reject with EmbedError\`);
   assert(waited <= 2.6, \`embed waited \${waited.toFixed(1)} s on a hung model server: the deadline must cut it at about 2 s\`);
   assert.equal(calls(ctx).length, 2, \`a call cut by its deadline is not retried: saw \${calls(ctx).length - 1} calls for it\`);
+  assert.equal(err.reason, 'deadline_exceeded', \`the EmbedError of a call cut by its deadline must name the status (deadline_exceeded), got \${err.reason}\`);
+  // A replica that fails late: 1.5 s pass before its UNAVAILABLE, and the retry must still get a full deadline of its own.
+  ctx.grpc.setLatency('Embed', 1.5, config.MODEL_SERVER);
+  server.unavailable = 1;
+  const late = await attempt(m.embed('Audit key use weekly.', config.MODEL_VERSION));
+  const lateCalls = calls(ctx).slice(2);
+  assert.equal(lateCalls.length, 2, \`an UNAVAILABLE after 1.5 s earns one retry: expected 2 calls, saw \${lateCalls.length}\`);
+  const retryTimeout = lateCalls[1].timeout;
+  assert(retryTimeout !== null && 1.5 <= retryTimeout && retryTimeout <= 2.5, \`the retry carried a deadline of \${retryTimeout} s: every attempt gets DEADLINE_MS = 2000 ms of its own, not what the first attempt left over\`);
+  assert(late.err === null && JSON.stringify(late.value) === JSON.stringify(model.vectorFor(config.MODEL_VERSION, 'Audit key use weekly.')), \`the retry of a late UNAVAILABLE has 2 s for a 1.5 s answer, yet embed gave \${late.err === null ? JSON.stringify(late.value) : \`EmbedError(\${late.err.reason})\`}\`);
 }
 
 export async function check_bounded_retry(ctx) {
@@ -682,11 +719,18 @@ export async function check_bounded_retry(ctx) {
 
 export async function check_unavailable_only(ctx) {
   const {m, config} = world(ctx);
-  ctx.grpc.fail('Embed', ctx.grpc.status.INVALID_ARGUMENT, 'input is empty', 5, config.MODEL_SERVER);
+  ctx.grpc.fail('Embed', ctx.grpc.status.INVALID_ARGUMENT, 'input is empty', 1, config.MODEL_SERVER);
   const {value, err} = await attempt(m.embed('', config.MODEL_VERSION));
   assert.equal(calls(ctx).length, 1, \`INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed \${calls(ctx).length} times\`);
   assert(err !== null, \`an INVALID_ARGUMENT must reject with EmbedError, embed resolved to \${JSON.stringify(value)}\`);
   assert.equal(err.reason, 'invalid_argument', \`the EmbedError must name the status (invalid_argument), got \${err.reason}\`);
+  for (const name of ['INTERNAL', 'RESOURCE_EXHAUSTED', 'PERMISSION_DENIED']) {
+    const before = calls(ctx).length;
+    ctx.grpc.fail('Embed', ctx.grpc.status[name], 'refused', 1, config.MODEL_SERVER);
+    const r = await attempt(m.embed(\`An input for \${name}.\`, config.MODEL_VERSION));
+    const n = calls(ctx).length - before;
+    assert(n === 1 && r.err !== null, \`\${name} is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError, saw \${n} calls and \${r.err === null ? JSON.stringify(r.value) : \`EmbedError(\${r.err.reason})\`}\`);
+  }
 }
 
 export async function check_model_check(ctx) {
@@ -701,6 +745,8 @@ export async function check_model_check(ctx) {
   assert(r.err !== null && r.err.reason === 'model_mismatch', \`a reply that says embed-v2 but carries 4 values must reject with EmbedError('model_mismatch'), embed resolved to \${JSON.stringify(r.value)}\`);
   server.truncate = null;
   assert.deepEqual(await m.embed(TEXT, config.MODEL_VERSION), model.vectorFor(config.MODEL_VERSION, TEXT), 'a matching reply is returned');
+  r = await attempt(m.embed(TEXT, config.PREVIOUS_VERSION));
+  assert(r.err === null && JSON.stringify(r.value) === JSON.stringify(model.vectorFor(config.PREVIOUS_VERSION, TEXT)), \`an embed-v1 request answered by embed-v1 with its 4 values is a match (DIMENSIONS of the model asked for), yet embed gave \${r.err === null ? JSON.stringify(r.value) : \`EmbedError(\${r.err.reason})\`}\`);
 }
 `,
     go: `package main
@@ -711,6 +757,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"embedding/config"
 	pb "embedding/gen/embedder"
@@ -721,14 +768,20 @@ import (
 
 const clientText = "Rotate keys every 90 days."
 
-// clientPeer is the stand-in model server: answers from embedding/model; answerAs plays a replica on another model.
+// clientPeer is the stand-in model server: answers from embedding/model; answerAs plays a replica on another model,
+// unavailable one that is draining.
 type clientPeer struct {
 	pb.UnimplementedEmbedderServer
-	answerAs string
-	truncate int
+	answerAs    string
+	truncate    int
+	unavailable int
 }
 
 func (p *clientPeer) Embed(_ context.Context, req *pb.EmbedRequest) (*pb.EmbedReply, error) {
+	if p.unavailable > 0 {
+		p.unavailable--
+		return nil, status.Error(codes.Unavailable, "replica draining")
+	}
 	version := req.GetModelVersion()
 	if p.answerAs != "" {
 		version = p.answerAs
@@ -748,7 +801,12 @@ func clientWorld(ctx *harness.Ctx) *clientPeer {
 
 // clientAttempt is what embed returned and the *config.EmbedError it failed with (nil when it returned a vector).
 func clientAttempt(ctx *harness.Ctx, text string) ([]float32, *config.EmbedError) {
-	got, err := embed(context.Background(), text, config.ModelVersion)
+	return clientAttemptAs(ctx, text, config.ModelVersion)
+}
+
+// clientAttemptAs is clientAttempt for a request under modelVersion.
+func clientAttemptAs(ctx *harness.Ctx, text, modelVersion string) ([]float32, *config.EmbedError) {
+	got, err := embed(context.Background(), text, modelVersion)
 	if err == nil {
 		return got, nil
 	}
@@ -766,7 +824,7 @@ func CheckHealthy(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	clientWorld(ctx)
+	peer := clientWorld(ctx)
 	clientAttempt(ctx, clientText)
 	calls := ctx.GRPC.CallsTo("Embed", "")
 	ctx.Assert(len(calls) == 1 && calls[0].HasDeadline(), "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs")
@@ -778,6 +836,16 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(err != nil, "a model server that takes 5 s answered after %.1f s and embed returned %v: the deadline must cut the call at 2 s and return an EmbedError", waited, got)
 	ctx.Assert(waited <= 2.6, "embed waited %.1f s on a hung model server: the deadline must cut it at about 2 s", waited)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Embed", "")), 2, "a call cut by its deadline is not retried; Embed calls so far")
+	ctx.Equal(err.Reason, "deadline_exceeded", "the EmbedError of a call cut by its deadline must name the status")
+	// A replica that fails late: 1.5 s pass before its UNAVAILABLE, and the retry must still get a full deadline of its own.
+	ctx.GRPC.SetLatency("Embed", 1.5, config.ModelServer)
+	peer.unavailable = 1
+	got, err = clientAttempt(ctx, "Audit key use weekly.")
+	late := ctx.GRPC.CallsTo("Embed", "")[2:]
+	ctx.Assert(len(late) == 2, "an UNAVAILABLE after 1.5 s earns one retry: expected 2 calls, saw %d", len(late))
+	ctx.Assert(late[1].HasDeadline() && 1500*time.Millisecond <= late[1].Timeout && late[1].Timeout <= 2500*time.Millisecond, "the retry carried a deadline of %v: every attempt gets 2 s of its own, not what the first attempt left over", late[1].Timeout)
+	ctx.Assert(err == nil, "the retry of a late UNAVAILABLE has 2 s for a 1.5 s answer, yet embed failed: %v", err)
+	ctx.Equal(got, model.VectorFor(config.ModelVersion, "Audit key use weekly."), "the retry of a late UNAVAILABLE returns the vector")
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
@@ -795,12 +863,19 @@ func CheckBoundedRetry(ctx *harness.Ctx) {
 
 func CheckUnavailableOnly(ctx *harness.Ctx) {
 	clientWorld(ctx)
-	ctx.GRPC.Fail("Embed", codes.InvalidArgument, "input is empty", 5, config.ModelServer)
+	ctx.GRPC.Fail("Embed", codes.InvalidArgument, "input is empty", 1, config.ModelServer)
 	got, err := clientAttempt(ctx, "")
 	n := len(ctx.GRPC.CallsTo("Embed", ""))
 	ctx.Assert(n == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", n)
 	ctx.Assert(err != nil, "an INVALID_ARGUMENT must return an EmbedError, embed returned %v", got)
 	ctx.Equal(err.Reason, "invalid_argument", "the EmbedError must name the status")
+	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.PermissionDenied} {
+		before := len(ctx.GRPC.CallsTo("Embed", ""))
+		ctx.GRPC.Fail("Embed", code, "refused", 1, config.ModelServer)
+		got, err := clientAttempt(ctx, "An input for "+code.String()+".")
+		n := len(ctx.GRPC.CallsTo("Embed", "")) - before
+		ctx.Assert(n == 1 && err != nil, "%v is not UNAVAILABLE and earns no retry: expected one Embed call and an EmbedError, saw %d calls and %v (%v)", code, n, got, err)
+	}
 }
 
 func CheckModelCheck(ctx *harness.Ctx) {
@@ -816,6 +891,9 @@ func CheckModelCheck(ctx *harness.Ctx) {
 	got, err = clientAttempt(ctx, clientText)
 	ctx.Assert(err == nil, "a matching reply is returned, embed failed: %v", err)
 	ctx.Equal(got, model.VectorFor(config.ModelVersion, clientText), "a matching reply is returned")
+	got, err = clientAttemptAs(ctx, clientText, config.PreviousVersion)
+	ctx.Assert(err == nil, "an embed-v1 request answered by embed-v1 with its 4 values is a match (Dimensions of the model asked for), yet embed failed: %v", err)
+	ctx.Equal(got, model.VectorFor(config.PreviousVersion, clientText), "an embed-v1 request returns the embed-v1 vector")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -833,13 +911,19 @@ namespace {
 
 const std::string kText = "Rotate keys every 90 days.";
 
-// The stand-in model server: answers from embedding/model.h; answer_as plays a replica on another model.
+// The stand-in model server: answers from embedding/model.h; answer_as plays a replica on another model,
+// unavailable one that is draining.
 class ModelPeer final : public embedding::Embedder::Service {
  public:
   std::string answer_as;
   int truncate = 0;
+  int unavailable = 0;
 
   grpc::Status Embed(grpc::ServerContext*, const embedding::EmbedRequest* req, embedding::EmbedReply* reply) override {
+    if (unavailable > 0) {
+      unavailable--;
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "replica draining");
+    }
     const std::string version = answer_as.empty() ? req->model_version() : answer_as;
     std::vector<float> values = model::vectorFor(version, req->text());
     if (truncate > 0 && truncate < static_cast<int>(values.size())) values.resize(truncate);
@@ -863,9 +947,9 @@ struct Attempt {
   std::optional<std::string> reason;
 };
 
-Attempt clientAttempt(harness::Ctx& ctx, const std::string& text) {
+Attempt clientAttempt(harness::Ctx& ctx, const std::string& text, const std::string& model_version = config::kModelVersion) {
   try {
-    return {embed(text, config::kModelVersion), std::nullopt};
+    return {embed(text, model_version), std::nullopt};
   } catch (const config::EmbedError& e) {
     return {{}, e.reason};
   } catch (const std::exception& e) {
@@ -887,7 +971,7 @@ void CheckHealthy(harness::Ctx& ctx) {
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  clientWorld(ctx);
+  ModelPeer& peer = clientWorld(ctx);
   clientAttempt(ctx, kText);
   const auto first = ctx.GRPC.CallsTo("Embed");
   ctx.Assert(first.size() == 1 && first[0].HasDeadline(), "the Embed call carries no deadline: a model server that hangs holds the request, and its worker, for as long as it hangs");
@@ -899,6 +983,16 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(a.reason.has_value(), "a model server that takes 5 s answered after %.1f s and embed returned %v: the deadline must cut the call at 2 s and throw EmbedError", waited, a.value);
   ctx.Assert(waited <= 2.6, "embed waited %.1f s on a hung model server: the deadline must cut it at about 2 s", waited);
   ctx.Equal(calls(ctx), 2, "a call cut by its deadline is not retried; Embed calls so far");
+  ctx.Equal(a.reason.value_or(""), "deadline_exceeded", "the EmbedError of a call cut by its deadline must name the status");
+  // A replica that fails late: 1.5 s pass before its UNAVAILABLE, and the retry must still get a full deadline of its own.
+  ctx.GRPC.SetLatency("Embed", 1.5, config::kModelServer);
+  peer.unavailable = 1;
+  const Attempt late = clientAttempt(ctx, "Audit key use weekly.");
+  const auto all = ctx.GRPC.CallsTo("Embed");
+  ctx.Assert(all.size() == 4, "an UNAVAILABLE after 1.5 s earns one retry: expected 2 calls, saw %d", all.size() - 2);
+  ctx.Assert(all[3].HasDeadline() && 1.5 <= all[3].TimeoutSeconds() && all[3].TimeoutSeconds() <= 2.5, "the retry carried a deadline of %vs: every attempt gets 2 s of its own, not what the first attempt left over", all[3].TimeoutSeconds());
+  ctx.Assert(!late.reason, "the retry of a late UNAVAILABLE has 2 s for a 1.5 s answer, yet embed threw %s", late.reason.value_or(""));
+  ctx.Equal(late.value, model::vectorFor(config::kModelVersion, "Audit key use weekly."), "the retry of a late UNAVAILABLE returns the vector");
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
@@ -916,11 +1010,20 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
 
 void CheckUnavailableOnly(harness::Ctx& ctx) {
   clientWorld(ctx);
-  ctx.GRPC.Fail("Embed", grpc::StatusCode::INVALID_ARGUMENT, "input is empty", 5, config::kModelServer);
+  ctx.GRPC.Fail("Embed", grpc::StatusCode::INVALID_ARGUMENT, "input is empty", 1, config::kModelServer);
   const Attempt a = clientAttempt(ctx, "");
   ctx.Assert(calls(ctx) == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", calls(ctx));
   ctx.Assert(a.reason.has_value(), "an INVALID_ARGUMENT must throw EmbedError, embed returned %v", a.value);
   ctx.Equal(a.reason.value_or(""), "invalid_argument", "the EmbedError must name the status");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}};
+  for (const auto& [code, name] : terminal) {
+    const size_t before = calls(ctx);
+    ctx.GRPC.Fail("Embed", code, "refused", 1, config::kModelServer);
+    const Attempt t = clientAttempt(ctx, "An input for " + name + ".");
+    const size_t n = calls(ctx) - before;
+    ctx.Assert(n == 1 && t.reason.has_value(), "%s is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError, saw %d calls and %s", name, n, t.reason.value_or("a vector"));
+  }
 }
 
 void CheckModelCheck(harness::Ctx& ctx) {
@@ -937,6 +1040,9 @@ void CheckModelCheck(harness::Ctx& ctx) {
   a = clientAttempt(ctx, kText);
   ctx.Assert(!a.reason, "a matching reply is returned, embed threw %s", a.reason.value_or(""));
   ctx.Equal(a.value, model::vectorFor(config::kModelVersion, kText), "a matching reply is returned");
+  a = clientAttempt(ctx, kText, config::kPreviousVersion);
+  ctx.Assert(!a.reason, "an embed-v1 request answered by embed-v1 with its 4 values is a match (kDimensions of the model asked for), yet embed threw %s", a.reason.value_or(""));
+  ctx.Equal(a.value, model::vectorFor(config::kPreviousVersion, kText), "an embed-v1 request returns the embed-v1 vector");
 }
 `,
   },

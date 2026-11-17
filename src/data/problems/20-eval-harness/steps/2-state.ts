@@ -85,7 +85,7 @@ Requirements, kept by **one Lua script**:
       id: 'atomic-script',
       title: 'Folds a sample in one script: two workers, one count',
       detail:
-        "Another worker folding the same sample lands between two of this worker's commands; exactly one of them counts it and scored stays 1. The test, the claim and the increments run in one EVAL/EVALSHA. The starter reads with HGET and increments in separate round trips.",
+        "Another worker folding the same sample lands between two of this worker's commands; exactly one of them counts it, scored stays 1, and that worker never sees a sample id claimed in the seen set but not yet counted. The test, the claim and the increments run in one EVAL/EVALSHA. The starter reads with HGET and increments in separate round trips.",
       match: {
         python: {
           all: [
@@ -125,7 +125,7 @@ Requirements, kept by **one Lua script**:
       id: 'fallback-count',
       title: 'Counts the samples the string metric scored',
       detail:
-        'A sample whose judge is "fallback" also adds one to the fallback field, so the report can tell a judged run from a string-matched one. The starter logs the judge and counts nothing.',
+        'A sample whose judge is "fallback" also adds one to the fallback field, so the report can tell a judged run from a string-matched one; a redelivered fallback sample adds nothing. The starter logs the judge and counts nothing.',
       match: {
         python: {all: [/HINCRBY['"]\s*,\s*\w+\s*,\s*['"]fallback['"]|\.hincrby\(\s*[^,]+,\s*['"]fallback['"]/]},
         typescript: {all: [/HINCRBY['"]\s*,\s*\w+\s*,\s*['"]fallback['"]|\.hincrby\(\s*[^,]+,\s*['"]fallback['"]/]},
@@ -138,7 +138,7 @@ Requirements, kept by **one Lua script**:
       id: 'key-ttl',
       title: 'Expires the run keys and stamps updated_at from inside the script',
       detail:
-        'The progress hash and the seen set get EXPIRE TTL_S, and the hash carries updated_at, so a finished run disappears on its own and a report can tell two readings apart. The starter sets no expiry and no stamp.',
+        'The progress hash and the seen set carry EXPIRE TTL_S from the command that writes them, refreshed by every counted sample, and the hash carries updated_at in unix seconds, so a finished run disappears a week after its last move and a report can tell two readings apart. The starter sets no expiry and no stamp.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /TTL_S/, /updated_at/]},
@@ -649,7 +649,7 @@ def check_atomic_script(ctx):
         # another worker folding the same redelivered sample, landing between two of this worker's commands
         if landed:
             return None
-        landed.append(True)
+        landed.append((ctx.redis.scard(SEEN), _count(ctx, "scored")))
         if ctx.redis.sadd(SEEN, "s-1") == 0:
             return "duplicate"
         ctx.redis.hincrby(PROGRESS, "scored", 1)
@@ -660,6 +660,8 @@ def check_atomic_script(ctx):
     on_progress = ctx.redis_after(PROGRESS, other_worker)
     mine = m.record_sample(RUN, "s-1", 0.9, "model")
     assert landed, "record_sample never touched the run's keys"
+    claimed, counted = landed[0]
+    assert claimed == counted, f"between two of record_sample's commands another worker saw {claimed} sample id(s) in {SEEN} and scored {counted}: a claim and its count must land together in one script, or a worker that dies between them loses the sample"
     other = on_seen.result if on_seen.result is not None else on_progress.result
     assert _count(ctx, "scored") == 1, f"two workers folded sample s-1 at the same moment and scored is {_count(ctx, 'scored')}: the dedupe test and the increments must run in one script, so exactly one of them counts it"
     verdicts = sorted([str(mine.get("verdict")), str(other)])
@@ -672,19 +674,34 @@ def check_fallback_count(ctx):
     m.record_sample(RUN, "s-2", 0.75, "model")
     m.record_sample(RUN, "s-3", 0.0, "fallback")
     assert _count(ctx, "fallback") == 2, f"two of three samples were scored by the string metric and {PROGRESS} says fallback={ctx.redis.hget(PROGRESS, 'fallback')!r}: the release gate cannot tell a judged run from a string-matched one"
+    m.record_sample(RUN, "s-3", 0.0, "fallback")  # redelivered
+    assert _count(ctx, "fallback") == 2, f"a redelivered fallback sample moved fallback to {ctx.redis.hget(PROGRESS, 'fallback')!r}: a duplicate moves no counter, fallback included"
     assert _counts(ctx) == (3, 2, 1), f"fallback samples still count as scored and passed or failed: {_counts(ctx)}"
 
 
 def check_key_ttl(ctx):
     m = ctx.load("state")
+    at_fold = ctx.redis_after(PROGRESS, lambda: (ctx.redis.ttl(PROGRESS), ctx.redis.ttl(SEEN)))
     m.record_sample(RUN, "s-1", 0.9, "model")
-    for key in (PROGRESS, SEEN):
-        ttl = ctx.redis.ttl(key)
-        assert ttl != -2, f"{key} does not exist after a sample was recorded"
-        assert 0 < ttl <= TTL_S, f"{key} has TTL {ttl}: every key the run owns expires TTL_S ({TTL_S} s) after its last move"
-    stamp = ctx.redis.hget(PROGRESS, "updated_at")
-    assert stamp is not None and stamp.isdigit(), f"the progress hash must carry updated_at (unix seconds), it holds {ctx.redis.hgetall(PROGRESS)}"
-    ctx.clock.advance(TTL_S + 1)
+    assert at_fold.fired, f"record_sample never wrote {PROGRESS}"
+    assert -1 not in at_fold.result, f"right after the command that wrote {PROGRESS}, its TTL and {SEEN}'s were {at_fold.result}: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script"
+
+    def fresh(when):
+        for key in (PROGRESS, SEEN):
+            ttl = ctx.redis.ttl(key)
+            assert ttl != -2, f"{key} does not exist after a sample was recorded {when}"
+            assert TTL_S - 60 <= ttl <= TTL_S, f"{key} has TTL {ttl} after a sample was recorded {when}: every key the run owns expires TTL_S ({TTL_S} s) after its last move"
+        stamp = ctx.redis.hget(PROGRESS, "updated_at")
+        assert stamp is not None and stamp.isdigit(), f"the progress hash must carry updated_at (unix seconds), it holds {ctx.redis.hgetall(PROGRESS)}"
+        assert abs(int(stamp) - ctx.clock.time()) <= 2, f"updated_at is {stamp} after a sample was recorded {when}, the clock reads {int(ctx.clock.time())}: it is the unix time in seconds of the run's last move"
+
+    fresh("now")
+    ctx.clock.advance(5 * 86_400)
+    m.record_sample(RUN, "s-2", 0.1, "model")
+    fresh("five days later")
+    ctx.clock.advance(TTL_S - 3_600)
+    assert ctx.redis.exists(PROGRESS, SEEN) == 2, f"a run that moved {TTL_S - 3_600} s ago must still be there, found {ctx.redis.keys(f'evals:*:{RUN}')}"
+    ctx.clock.advance(3_601)
     assert ctx.redis.keys(f"evals:*:{RUN}") == [], f"a week after its last move the run must be gone, found {ctx.redis.keys(f'evals:*:{RUN}')}"
 `,
     typescript: `const RUN = 'r1';
@@ -720,10 +737,14 @@ export async function check_dedupe_sample(ctx) {
 export async function check_atomic_script(ctx) {
   const m = ctx.load('state');
   let landed = false;
+  let claimed = -1;
+  let counted = -1;
   // another worker folding the same redelivered sample, landing between two of this worker's commands
   const otherWorker = () => {
     if (landed) return null;
     landed = true;
+    claimed = Number(ctx.redis.scard(SEEN));
+    counted = count(ctx, 'scored');
     if (ctx.redis.sadd(SEEN, 's-1') === 0) return 'duplicate';
     ctx.redis.hincrby(PROGRESS, 'scored', 1);
     ctx.redis.hincrby(PROGRESS, 'passed', 1);
@@ -733,6 +754,7 @@ export async function check_atomic_script(ctx) {
   const onProgress = ctx.redisAfter(PROGRESS, otherWorker);
   const mine = await m.recordSample(RUN, 's-1', 0.9, 'model');
   assert(landed, 'recordSample never touched the run\\'s keys');
+  assert.equal(claimed, counted, \`between two of recordSample's commands another worker saw \${claimed} sample id(s) in \${SEEN} and scored \${counted}: a claim and its count must land together in one script, or a worker that dies between them loses the sample\`);
   const other = onSeen.result ?? onProgress.result;
   assert.equal(count(ctx, 'scored'), 1, \`two workers folded sample s-1 at the same moment and scored is \${count(ctx, 'scored')}: the dedupe test and the increments must run in one script, so exactly one of them counts it\`);
   const verdicts = [String(mine?.verdict), String(other)].sort();
@@ -745,20 +767,35 @@ export async function check_fallback_count(ctx) {
   await m.recordSample(RUN, 's-2', 0.75, 'model');
   await m.recordSample(RUN, 's-3', 0.0, 'fallback');
   assert.equal(count(ctx, 'fallback'), 2, \`two of three samples were scored by the string metric and \${PROGRESS} says fallback=\${JSON.stringify(ctx.redis.hget(PROGRESS, 'fallback'))}: the release gate cannot tell a judged run from a string-matched one\`);
+  await m.recordSample(RUN, 's-3', 0.0, 'fallback'); // redelivered
+  assert.equal(count(ctx, 'fallback'), 2, \`a redelivered fallback sample moved fallback to \${JSON.stringify(ctx.redis.hget(PROGRESS, 'fallback'))}: a duplicate moves no counter, fallback included\`);
   assert.deepEqual(counts(ctx), [3, 2, 1], \`fallback samples still count as scored and passed or failed: \${JSON.stringify(counts(ctx))}\`);
 }
 
 export async function check_key_ttl(ctx) {
   const m = ctx.load('state');
+  const atFold = ctx.redisAfter(PROGRESS, () => [Number(ctx.redis.ttl(PROGRESS)), Number(ctx.redis.ttl(SEEN))]);
   await m.recordSample(RUN, 's-1', 0.9, 'model');
-  for (const key of [PROGRESS, SEEN]) {
-    const ttl = Number(ctx.redis.ttl(key));
-    assert(ttl !== -2, \`\${key} does not exist after a sample was recorded\`);
-    assert(0 < ttl && ttl <= TTL_S, \`\${key} has TTL \${ttl}: every key the run owns expires TTL_S (\${TTL_S} s) after its last move\`);
-  }
-  const stamp = ctx.redis.hget(PROGRESS, 'updated_at');
-  assert(typeof stamp === 'string' && /^\\d+$/.test(stamp), \`the progress hash must carry updated_at (unix seconds), it holds \${JSON.stringify(ctx.redis.hgetall(PROGRESS))}\`);
-  ctx.clock.advance(TTL_S + 1);
+  assert(atFold.fired, \`recordSample never wrote \${PROGRESS}\`);
+  assert(!(atFold.result as number[]).includes(-1), \`right after the command that wrote \${PROGRESS}, its TTL and \${SEEN}'s were \${JSON.stringify(atFold.result)}: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script\`);
+  const fresh = (when: string) => {
+    for (const key of [PROGRESS, SEEN]) {
+      const ttl = Number(ctx.redis.ttl(key));
+      assert(ttl !== -2, \`\${key} does not exist after a sample was recorded \${when}\`);
+      assert(TTL_S - 60 <= ttl && ttl <= TTL_S, \`\${key} has TTL \${ttl} after a sample was recorded \${when}: every key the run owns expires TTL_S (\${TTL_S} s) after its last move\`);
+    }
+    const stamp = ctx.redis.hget(PROGRESS, 'updated_at');
+    assert(typeof stamp === 'string' && /^\\d+$/.test(stamp), \`the progress hash must carry updated_at (unix seconds), it holds \${JSON.stringify(ctx.redis.hgetall(PROGRESS))}\`);
+    const now = ctx.clock.now() / 1000;
+    assert(Math.abs(Number(stamp) - now) <= 2, \`updated_at is \${stamp} after a sample was recorded \${when}, the clock reads \${Math.floor(now)}: it is the unix time in seconds of the run's last move\`);
+  };
+  fresh('now');
+  ctx.clock.advance(5 * 86_400);
+  await m.recordSample(RUN, 's-2', 0.1, 'model');
+  fresh('five days later');
+  ctx.clock.advance(TTL_S - 3_600);
+  assert.equal(Number(ctx.redis.exists(PROGRESS, SEEN)), 2, \`a run that moved \${TTL_S - 3_600} s ago must still be there, found \${JSON.stringify(ctx.redis.keys(\`evals:*:\${RUN}\`))}\`);
+  ctx.clock.advance(3_601);
   assert.deepEqual(ctx.redis.keys(\`evals:*:\${RUN}\`), [], \`a week after its last move the run must be gone, found \${JSON.stringify(ctx.redis.keys(\`evals:*:\${RUN}\`))}\`);
 }
 `,
@@ -817,6 +854,7 @@ func CheckDedupeSample(ctx *harness.Ctx) {
 
 func CheckAtomicScript(ctx *harness.Ctx) {
 	landed := false
+	var claimed, counted int64
 	other := ""
 	// another worker folding the same redelivered sample, landing between two of this worker's commands
 	otherWorker := func() any {
@@ -824,6 +862,7 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 			return nil
 		}
 		landed = true
+		claimed, counted = ctx.Redis.SCard(stateSeen), stateCount(ctx, "scored")
 		if n, _ := ctx.Redis.Do("SADD", stateSeen, "s-1").(int64); n == 0 {
 			other = "duplicate"
 			return nil
@@ -837,6 +876,7 @@ func CheckAtomicScript(ctx *harness.Ctx) {
 	ctx.Redis.After(stateProgress, otherWorker)
 	mine := stateRecord(ctx, "s-1", 0.9, "model")
 	ctx.Assert(landed, "recordSample never touched the run's keys")
+	ctx.Assert(claimed == counted, "between two of recordSample's commands another worker saw %d sample id(s) in %s and scored %d: a claim and its count must land together in one script, or a worker that dies between them loses the sample", claimed, stateSeen, counted)
 	ctx.Equal(stateCount(ctx, "scored"), 1, "two workers folded sample s-1 at the same moment: the dedupe test and the increments must run in one script, so exactly one of them counts it; scored")
 	verdicts := []string{mine.Verdict, other}
 	sort.Strings(verdicts)
@@ -848,19 +888,39 @@ func CheckFallbackCount(ctx *harness.Ctx) {
 	stateRecord(ctx, "s-2", 0.75, "model")
 	stateRecord(ctx, "s-3", 0.0, "fallback")
 	ctx.Equal(stateCount(ctx, "fallback"), 2, "two of three samples were scored by the string metric (%v): the release gate cannot tell a judged run from a string-matched one; fallback", ctx.Redis.HGetAll(stateProgress))
+	stateRecord(ctx, "s-3", 0.0, "fallback") // redelivered
+	ctx.Equal(stateCount(ctx, "fallback"), 2, "a redelivered fallback sample: a duplicate moves no counter, fallback included; fallback")
 	ctx.Equal(stateCounts(ctx), []int64{3, 2, 1}, "fallback samples still count as scored and passed or failed; scored, passed, failed")
 }
 
 func CheckKeyTtl(ctx *harness.Ctx) {
+	var atFold []int64
+	probe := ctx.Redis.After(stateProgress, func() any {
+		atFold = []int64{ctx.Redis.TTL(stateProgress), ctx.Redis.TTL(stateSeen)}
+		return nil
+	})
 	stateRecord(ctx, "s-1", 0.9, "model")
-	for _, key := range []string{stateProgress, stateSeen} {
-		ttl := ctx.Redis.TTL(key)
-		ctx.Assert(ttl != -2, "%s does not exist after a sample was recorded", key)
-		ctx.Assert(0 < ttl && ttl <= stateTTL, "%s has TTL %d: every key the run owns expires TTLSeconds (%d s) after its last move", key, ttl, stateTTL)
+	ctx.Assert(probe.Fired, "recordSample never wrote %s", stateProgress)
+	ctx.Assert(atFold[0] != -1 && atFold[1] != -1, "right after the command that wrote %s, its TTL and %s's were %v: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script", stateProgress, stateSeen, atFold)
+	fresh := func(when string) {
+		for _, key := range []string{stateProgress, stateSeen} {
+			ttl := ctx.Redis.TTL(key)
+			ctx.Assert(ttl != -2, "%s does not exist after a sample was recorded %s", key, when)
+			ctx.Assert(stateTTL-60 <= ttl && ttl <= stateTTL, "%s has TTL %d after a sample was recorded %s: every key the run owns expires TTLSeconds (%d s) after its last move", key, ttl, when, stateTTL)
+		}
+		stamp, ok := ctx.Redis.HGet(stateProgress, "updated_at")
+		ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(stateProgress))
+		at, _ := strconv.ParseInt(stamp, 10, 64)
+		now := ctx.Clock.Now() / 1000
+		ctx.Assert(at-now <= 2 && now-at <= 2, "updated_at is %s after a sample was recorded %s, the clock reads %d: it is the unix time in seconds of the run's last move", stamp, when, now)
 	}
-	stamp, ok := ctx.Redis.HGet(stateProgress, "updated_at")
-	ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(stateProgress))
-	ctx.Clock.Advance(stateTTL + 1)
+	fresh("now")
+	ctx.Clock.Advance(5 * 86_400)
+	stateRecord(ctx, "s-2", 0.1, "model")
+	fresh("five days later")
+	ctx.Clock.Advance(stateTTL - 3_600)
+	ctx.Equal(ctx.Redis.Exists(stateProgress, stateSeen), 2, "a run that moved %d s ago must still be there (%v); keys", stateTTL-3_600, ctx.Redis.Keys("evals:*:"+stateRun))
+	ctx.Clock.Advance(3_601)
 	ctx.Equal(len(ctx.Redis.Keys("evals:*:"+stateRun)), 0, "a week after its last move the run must be gone (%v); keys left", ctx.Redis.Keys("evals:*:"+stateRun))
 }
 `,
@@ -911,11 +971,15 @@ void CheckDedupeSample(harness::Ctx& ctx) {
 
 void CheckAtomicScript(harness::Ctx& ctx) {
   bool landed = false;
+  long long claimed = -1;
+  long long counted = -1;
   std::string other;
   // another worker folding the same redelivered sample, landing between two of this worker's commands
   const auto otherWorker = [&] {
     if (landed) return;
     landed = true;
+    claimed = ctx.Redis.SCard(kSeen);
+    counted = stateCount(ctx, "scored");
     if (ctx.Redis.Do("SADD", kSeen, "s-1").Int() == 0) {
       other = "duplicate";
       return;
@@ -928,6 +992,7 @@ void CheckAtomicScript(harness::Ctx& ctx) {
   ctx.Redis.After(kProgress, otherWorker);
   const Progress mine = record_sample(kRun, "s-1", 0.9, "model");
   ctx.Assert(landed, "record_sample never touched the run's keys");
+  ctx.Assert(claimed == counted, "between two of record_sample's commands another worker saw %d sample id(s) in %s and scored %d: a claim and its count must land together in one script, or a worker that dies between them loses the sample", claimed, kSeen, counted);
   ctx.Equal(stateCount(ctx, "scored"), 1, "two workers folded sample s-1 at the same moment: the dedupe test and the increments must run in one script, so exactly one of them counts it; scored");
   std::vector<std::string> verdicts = {mine.verdict, other};
   std::sort(verdicts.begin(), verdicts.end());
@@ -939,20 +1004,43 @@ void CheckFallbackCount(harness::Ctx& ctx) {
   record_sample(kRun, "s-2", 0.75, "model");
   record_sample(kRun, "s-3", 0.0, "fallback");
   ctx.Equal(stateCount(ctx, "fallback"), 2, "two of three samples were scored by the string metric (%v): the release gate cannot tell a judged run from a string-matched one; fallback", ctx.Redis.HGetAll(kProgress));
+  record_sample(kRun, "s-3", 0.0, "fallback");  // redelivered
+  ctx.Equal(stateCount(ctx, "fallback"), 2, "a redelivered fallback sample: a duplicate moves no counter, fallback included; fallback");
   ctx.Equal(stateCounts(ctx), std::vector<long long>{3, 2, 1}, "fallback samples still count as scored and passed or failed; scored, passed, failed");
 }
 
 void CheckKeyTtl(harness::Ctx& ctx) {
+  bool fired = false;
+  long long progressTtl = 0;
+  long long seenTtl = 0;
+  ctx.Redis.After(kProgress, [&] {
+    fired = true;
+    progressTtl = ctx.Redis.TTL(kProgress);
+    seenTtl = ctx.Redis.TTL(kSeen);
+  });
   record_sample(kRun, "s-1", 0.9, "model");
-  for (const std::string& key : {kProgress, kSeen}) {
-    const long long ttl = ctx.Redis.TTL(key);
-    ctx.Assert(ttl != -2, "%s does not exist after a sample was recorded", key);
-    ctx.Assert(0 < ttl && ttl <= kTtl, "%s has TTL %d: every key the run owns expires kTtlSeconds (%d s) after its last move", key, ttl, kTtl);
-  }
-  const auto stamp = ctx.Redis.HGet(kProgress, "updated_at");
-  ctx.Assert(stamp && !stamp->empty() && std::all_of(stamp->begin(), stamp->end(), [](char c) { return c >= '0' && c <= '9'; }),
-             "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(kProgress));
-  ctx.Clock.Advance(kTtl + 1);
+  ctx.Assert(fired, "record_sample never wrote %s", kProgress);
+  ctx.Assert(progressTtl != -1 && seenTtl != -1, "right after the command that wrote %s, its TTL was %d and %s's %d: a worker that stops before a separate EXPIRE leaves keys that never expire, so the expiry belongs in the same script", kProgress, progressTtl, kSeen, seenTtl);
+  const auto fresh = [&](const std::string& when) {
+    for (const std::string& key : {kProgress, kSeen}) {
+      const long long ttl = ctx.Redis.TTL(key);
+      ctx.Assert(ttl != -2, "%s does not exist after a sample was recorded %s", key, when);
+      ctx.Assert(kTtl - 60 <= ttl && ttl <= kTtl, "%s has TTL %d after a sample was recorded %s: every key the run owns expires kTtlSeconds (%d s) after its last move", key, ttl, when, kTtl);
+    }
+    const auto stamp = ctx.Redis.HGet(kProgress, "updated_at");
+    ctx.Assert(stamp && !stamp->empty() && std::all_of(stamp->begin(), stamp->end(), [](char c) { return c >= '0' && c <= '9'; }),
+               "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll(kProgress));
+    const long long at = std::strtoll(stamp->c_str(), nullptr, 10);
+    const long long now = ctx.Clock.Now() / 1000;
+    ctx.Assert(at - now <= 2 && now - at <= 2, "updated_at is %s after a sample was recorded %s, the clock reads %d: it is the unix time in seconds of the run's last move", *stamp, when, now);
+  };
+  fresh("now");
+  ctx.Clock.Advance(5 * 86400);
+  record_sample(kRun, "s-2", 0.1, "model");
+  fresh("five days later");
+  ctx.Clock.Advance(kTtl - 3600);
+  ctx.Equal(ctx.Redis.Exists(kProgress, kSeen), 2, "a run that moved %d s ago must still be there (%v); keys", kTtl - 3600, ctx.Redis.Keys("evals:*:" + kRun));
+  ctx.Clock.Advance(3601);
   ctx.Equal(ctx.Redis.Keys("evals:*:" + kRun).size(), 0, "a week after its last move the run must be gone (%v); keys left", ctx.Redis.Keys("evals:*:" + kRun));
 }
 `,

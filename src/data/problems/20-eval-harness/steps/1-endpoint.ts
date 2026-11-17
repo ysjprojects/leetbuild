@@ -59,7 +59,7 @@ Requirements:
       id: 'dataset-404',
       title: 'Answers 404 for a golden set the registry does not know',
       detail:
-        'The dataset id is looked up with datasets.exists and an unknown one answers 404 with no run stored. The starter stores a run for any dataset id, a typo included.',
+        'The dataset id is looked up with datasets.exists and an unknown one answers 404 with no run stored: a typo, another case or a padded id is unknown. The starter stores a run for any dataset id, a typo included.',
       match: {
         python: {all: [/datasets\.exists\(/, /(status_code\s*=\s*|HTTPException\(\s*)404/]},
         typescript: {all: [/datasets\.exists\(/, /\.(code|status)\(\s*404\s*\)/]},
@@ -88,7 +88,7 @@ Requirements:
       id: 'idempotency-key',
       title: 'Keys runs by (tenant, Idempotency-Key)',
       detail:
-        'Idempotency-Key is required (400 without it); a replay of the same (tenant, key) answers 200 with the same run_id and stores nothing new; another tenant with the same key gets its own run. The starter stores each run under its own fresh id.',
+        'Idempotency-Key is required (400 without it or with an empty one, nothing stored); a replay of the same (tenant, key) answers 200 with the same run_id and stores nothing new; another tenant with the same key gets its own run. The starter stores each run under its own fresh id.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/i, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
@@ -699,6 +699,9 @@ async def check_dataset_404(ctx):
     async with _api(ctx) as c:
         r = await _post(c, {**GOOD, "dataset_id": "gs-suport-v3"}, key="k-typo")
         assert r.status_code == 404, f"a dataset id the registry does not know (gs-suport-v3) answered {r.status_code}, expected 404: the run would score against a golden set that does not exist"
+        for near in ("GS-SUPPORT-V3", " gs-support-v3"):
+            r = await _post(c, {**GOOD, "dataset_id": near}, key="k-near")
+            assert r.status_code == 404, f"the registry holds gs-support-v3, not {near!r}, which answered {r.status_code}, expected 404: a dataset id names a golden set exactly, or the run stores an id no golden set has"
         assert _runs(ctx) == [], f"a start for an unknown dataset must store no run, found {_runs(ctx)}"
         r = await _post(c, {**GOOD, "dataset_id": "gs-billing-v2"}, key="k-ok")
         assert r.status_code == 202, f"gs-billing-v2 is in the registry, got {r.status_code}: {r.text}"
@@ -720,8 +723,10 @@ async def check_budget_cap(ctx):
 
 async def check_idempotency_key(ctx):
     async with _api(ctx) as c:
-        r = await _post(c, GOOD, key=None)
-        assert r.status_code == 400, f"a start without Idempotency-Key answered {r.status_code}, expected 400"
+        for key in (None, ""):
+            r = await _post(c, GOOD, key=key)
+            assert r.status_code == 400, f"a start with {'no Idempotency-Key' if key is None else 'an empty Idempotency-Key'} answered {r.status_code}, expected 400"
+        assert _runs(ctx) == [], f"a start without a usable Idempotency-Key must store no run, found {_runs(ctx)}"
         first = await _post(c, GOOD, key="k-7")
         assert first.status_code == 202, f"the first start answered {first.status_code}: {first.text}"
         replay = await _post(c, GOOD, key="k-7")
@@ -775,6 +780,10 @@ export async function check_dataset_404(ctx) {
   const c = api(ctx);
   let r = await post(c, {...GOOD, dataset_id: 'gs-suport-v3'}, {key: 'k-typo'});
   assert.equal(r.status, 404, \`a dataset id the registry does not know (gs-suport-v3) answered \${r.status}, expected 404: the run would score against a golden set that does not exist\`);
+  for (const near of ['GS-SUPPORT-V3', ' gs-support-v3']) {
+    r = await post(c, {...GOOD, dataset_id: near}, {key: 'k-near'});
+    assert.equal(r.status, 404, \`the registry holds gs-support-v3, not \${JSON.stringify(near)}, which answered \${r.status}, expected 404: a dataset id names a golden set exactly, or the run stores an id no golden set has\`);
+  }
   assert.deepEqual(runKeys(ctx), [], \`a start for an unknown dataset must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
   r = await post(c, {...GOOD, dataset_id: 'gs-billing-v2'}, {key: 'k-ok'});
   assert.equal(r.status, 202, \`gs-billing-v2 is in the registry, got \${r.status}: \${r.text}\`);
@@ -798,8 +807,11 @@ export async function check_budget_cap(ctx) {
 
 export async function check_idempotency_key(ctx) {
   const c = api(ctx);
-  const noKey = await post(c, GOOD, {key: null});
-  assert.equal(noKey.status, 400, \`a start without Idempotency-Key answered \${noKey.status}, expected 400\`);
+  for (const key of [null, '']) {
+    const noKey = await post(c, GOOD, {key});
+    assert.equal(noKey.status, 400, \`a start with Idempotency-Key \${JSON.stringify(key)} answered \${noKey.status}, expected 400\`);
+  }
+  assert.deepEqual(runKeys(ctx), [], \`a start without a usable Idempotency-Key must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
   const first = await post(c, GOOD, {key: 'k-7'});
   assert.equal(first.status, 202, \`the first start answered \${first.status}: \${first.text}\`);
   const replay = await post(c, GOOD, {key: 'k-7'});
@@ -890,6 +902,10 @@ func CheckDataset404(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	r := apiPost(c, apiWith(map[string]any{"dataset_id": "gs-suport-v3"}), "k-typo", "t1")
 	ctx.Equal(r.Status, 404, "a dataset id the registry does not know (gs-suport-v3): the run would score against a golden set that does not exist")
+	for _, near := range []string{"GS-SUPPORT-V3", " gs-support-v3"} {
+		r = apiPost(c, apiWith(map[string]any{"dataset_id": near}), "k-near", "t1")
+		ctx.Equal(r.Status, 404, "the registry holds gs-support-v3, not %q: a dataset id names a golden set exactly, or the run stores an id no golden set has", near)
+	}
 	ctx.Equal(len(ctx.Redis.Keys("evals:run:*")), 0, "a start for an unknown dataset must store no run; runs stored")
 	r = apiPost(c, apiWith(map[string]any{"dataset_id": "gs-billing-v2"}), "k-ok", "t1")
 	ctx.Equal(r.Status, 202, "gs-billing-v2 is in the registry (%s)", r.Text())
@@ -914,6 +930,9 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	noKey := c.Post("/v1/evals/runs", apiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key")
+	emptyKey := apiPost(c, apiGood, "", "t1")
+	ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key")
+	ctx.Equal(len(ctx.Redis.Keys("evals:run:*")), 0, "a start without a usable Idempotency-Key must store no run; runs stored")
 	first := apiPost(c, apiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 202, "the first start (%s)", first.Text())
 	replay := apiPost(c, apiGood, "k-7", "t1")
@@ -993,6 +1012,10 @@ void CheckDataset404(harness::Ctx& ctx) {
   Api api(ctx);
   auto r = api.post(with(kGood, "dataset_id", "gs-suport-v3"), "k-typo");
   ctx.Equal(r.Status, 404, "a dataset id the registry does not know (gs-suport-v3): the run would score against a golden set that does not exist");
+  for (const char* near : {"GS-SUPPORT-V3", " gs-support-v3"}) {
+    r = api.post(with(kGood, "dataset_id", near), "k-near");
+    ctx.Equal(r.Status, 404, "the registry holds gs-support-v3, not \\"%s\\": a dataset id names a golden set exactly, or the run stores an id no golden set has", near);
+  }
   ctx.Equal(ctx.Redis.Keys("evals:run:*").size(), 0, "a start for an unknown dataset must store no run; runs stored");
   r = api.post(with(kGood, "dataset_id", "gs-billing-v2"), "k-ok");
   ctx.Equal(r.Status, 202, "gs-billing-v2 is in the registry (%s)", r.Text());
@@ -1019,6 +1042,9 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   Api api(ctx);
   const auto noKey = api.http.Post("/v1/evals/runs", kGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key");
+  const auto emptyKey = api.post(kGood, "");
+  ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key");
+  ctx.Equal(ctx.Redis.Keys("evals:run:*").size(), 0, "a start without a usable Idempotency-Key must store no run; runs stored");
   const auto first = api.post(kGood, "k-7");
   ctx.Equal(first.Status, 202, "the first start (%s)", first.Text());
   const auto replay = api.post(kGood, "k-7");

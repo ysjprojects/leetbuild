@@ -76,7 +76,7 @@ both miss and leave each caller holding a different vector.
       id: 'first-writer-wins',
       title: 'A lost NX returns the winner’s vector',
       detail:
-        'The write is `SET NX`; when it stores nothing, the key is read again and the stored vector is what the caller gets.',
+        'The write is `SET NX`; when it stores nothing, the key is read again and the stored vector is what the caller gets. A worker that stores between this one’s last read of the key and its write keeps its vector.',
       match: {
         python: {all: [/nx\s*=\s*True/], order: [/nx\s*=\s*True/, /r\.get\(/]},
         typescript: {all: [/['"]NX['"]/], order: [/['"]NX['"]/, /redis\.get\(/]},
@@ -428,13 +428,21 @@ def check_ttl_in_write(ctx):
     key = _key(MODEL_VERSION)
     probes = []
 
+    def watch():
+        # A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+        ttl = ctx.redis.ttl(key)
+        if ttl == -2:
+            probes.append(ctx.redis_after(key, watch))
+        return ttl
+
     def arm():
-        # The next command on the key is the one that writes the vector: what a crash right after it leaves.
-        probes.append(ctx.redis_after(key, lambda: ctx.redis.ttl(key)))
+        # The next command on the key that leaves it stored is the write: what a crash right after it leaves.
+        probes.append(ctx.redis_after(key, watch))
 
     m.store_vector(TENANT, MODEL_VERSION, TEXT, Compute(model.vector_for(MODEL_VERSION, TEXT), before=arm))
-    assert probes and probes[0].fired, f"store_vector never wrote {key}; keys: {sorted(ctx.redis.keys('emb:*'))}"
-    ttl = probes[0].result
+    written = [p for p in probes if p.fired and p.result != -2]
+    assert written, f"store_vector never wrote {key}; keys: {sorted(ctx.redis.keys('emb:*'))}"
+    ttl = written[0].result
     assert ttl is not None and ttl > 0, f"right after the command that wrote the vector its TTL was {ttl}: a crash before the EXPIRE leaves a vector that never expires. The TTL belongs in the SET"
     assert VECTOR_TTL_S - 5 <= ctx.redis.ttl(key) <= VECTOR_TTL_S, f"the vector must live VECTOR_TTL_S = {VECTOR_TTL_S} s, its TTL is {ctx.redis.ttl(key)}"
 
@@ -451,6 +459,23 @@ def check_first_writer_wins(ctx):
     got = m.store_vector(TENANT, MODEL_VERSION, TEXT, Compute(model.vector_for(MODEL_VERSION, TEXT), before=other_worker))
     assert _stored(ctx, MODEL_VERSION) == winner, f"another worker stored its vector while this one computed, and the cache now holds {_stored(ctx, MODEL_VERSION)}: the write overwrote the first writer"
     assert got == winner, f"store_vector returned its own vector {got} while the cache holds {winner}: two callers of one input now hold different vectors"
+
+    # A second worker lands right after this one's next command on the key, once it has computed: a
+    # check followed by a plain SET leaves a window between the two, and the racer stores first in it.
+    raced_text = "How do I revoke a leaked key?"
+    raced_key = vector_key(TENANT, MODEL_VERSION, content_hash(raced_text))
+    racer = [-0.5, 0.5, 0.25, -0.25, 0.75, -0.75, 0.125, -0.125]
+    probes = []
+
+    def arm():
+        probes.append(ctx.redis_after(raced_key, lambda: bool(ctx.redis.set(raced_key, json.dumps(racer), nx=True, ex=VECTOR_TTL_S))))
+
+    got = m.store_vector(TENANT, MODEL_VERSION, raced_text, Compute(model.vector_for(MODEL_VERSION, raced_text), before=arm))
+    raw = ctx.redis.get(raced_key)
+    held = json.loads(raw) if raw is not None else None
+    if probes and probes[0].result:
+        assert held == racer, f"another worker stored its vector between this one's check of the key and its write, and the cache now holds {held}: the write overwrote the first writer. Only SET NX decides who wins"
+    assert got == held, f"store_vector returned {got} while the cache holds {held}: two callers of one input now hold different vectors"
 `,
     typescript: `const TENANT = 'acme';
 const TEXT = 'How do I rotate an API key?';
@@ -509,11 +534,18 @@ export async function check_ttl_in_write(ctx) {
   const {m, config, model} = world(ctx);
   const key = config.vectorKey(TENANT, config.MODEL_VERSION, config.contentHash(TEXT));
   const probes = [];
-  // The next command on the key is the one that writes the vector: what a crash right after it leaves.
-  const arm = () => probes.push(ctx.redisAfter(key, () => ctx.redis.ttl(key)));
+  // A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+  const watch = () => {
+    const ttl = ctx.redis.ttl(key);
+    if (ttl === -2) probes.push(ctx.redisAfter(key, watch));
+    return ttl;
+  };
+  // The next command on the key that leaves it stored is the write: what a crash right after it leaves.
+  const arm = () => probes.push(ctx.redisAfter(key, watch));
   await m.storeVector(TENANT, config.MODEL_VERSION, TEXT, computing(model.vectorFor(config.MODEL_VERSION, TEXT), arm));
-  assert(probes.length === 1 && probes[0].fired, \`storeVector never wrote \${key}; keys: \${JSON.stringify(ctx.redis.keys('emb:*'))}\`);
-  const ttl = probes[0].result;
+  const written = probes.filter(p => p.fired && p.result !== -2);
+  assert(written.length > 0, \`storeVector never wrote \${key}; keys: \${JSON.stringify(ctx.redis.keys('emb:*'))}\`);
+  const ttl = written[0].result;
   assert(typeof ttl === 'number' && ttl > 0, \`right after the command that wrote the vector its TTL was \${ttl}: a crash before the EXPIRE leaves a vector that never expires. The TTL belongs in the SET\`);
   const now = ctx.redis.ttl(key);
   assert(now >= config.VECTOR_TTL_S - 5 && now <= config.VECTOR_TTL_S, \`the vector must live VECTOR_TTL_S = \${config.VECTOR_TTL_S} s, its TTL is \${now}\`);
@@ -528,6 +560,20 @@ export async function check_first_writer_wins(ctx) {
   const got = await m.storeVector(TENANT, config.MODEL_VERSION, TEXT, computing(model.vectorFor(config.MODEL_VERSION, TEXT), otherWorker));
   assert.deepEqual(stored(ctx, key), winner, \`another worker stored its vector while this one computed, and the cache now holds \${JSON.stringify(stored(ctx, key))}: the write overwrote the first writer\`);
   assert.deepEqual(got, winner, \`storeVector returned its own vector \${JSON.stringify(got)} while the cache holds \${JSON.stringify(winner)}: two callers of one input now hold different vectors\`);
+
+  // A second worker lands right after this one's next command on the key, once it has computed: a
+  // check followed by a plain SET leaves a window between the two, and the racer stores first in it.
+  const racedText = 'How do I revoke a leaked key?';
+  const racedKey = config.vectorKey(TENANT, config.MODEL_VERSION, config.contentHash(racedText));
+  const racer = [-0.5, 0.5, 0.25, -0.25, 0.75, -0.75, 0.125, -0.125];
+  const raced = [];
+  const arm = () => raced.push(ctx.redisAfter(racedKey, () => ctx.redis.set(racedKey, JSON.stringify(racer), 'EX', config.VECTOR_TTL_S, 'NX') !== null));
+  const second = await m.storeVector(TENANT, config.MODEL_VERSION, racedText, computing(model.vectorFor(config.MODEL_VERSION, racedText), arm));
+  const held = stored(ctx, racedKey);
+  if (raced.length > 0 && raced[0].result === true) {
+    assert.deepEqual(held, racer, \`another worker stored its vector between this one's check of the key and its write, and the cache now holds \${JSON.stringify(held)}: the write overwrote the first writer. Only SET NX decides who wins\`);
+  }
+  assert.deepEqual(second, held, \`storeVector returned \${JSON.stringify(second)} while the cache holds \${JSON.stringify(held)}: two callers of one input now hold different vectors\`);
 }
 `,
     go: `package main
@@ -609,20 +655,24 @@ func CheckVersionKey(ctx *harness.Ctx) {
 
 func CheckTtlInWrite(ctx *harness.Ctx) {
 	key := stateKey(config.ModelVersion)
-	var ttl any
-	fired := false
-	arm := func() {
-		// The next command on the key is the one that writes the vector: what a crash right after it leaves.
-		ctx.Redis.After(key, func() any {
-			fired = true
-			ttl = ctx.Redis.TTL(key)
-			return ttl
-		})
+	var ttl int64
+	written := false
+	// A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+	var watch func() any
+	watch = func() any {
+		n := ctx.Redis.TTL(key)
+		if n == -2 {
+			ctx.Redis.After(key, watch)
+		} else if !written {
+			written, ttl = true, n
+		}
+		return n
 	}
+	// The next command on the key that leaves it stored is the write: what a crash right after it leaves.
+	arm := func() { ctx.Redis.After(key, watch) }
 	stateStore(ctx, config.ModelVersion, &stateCompute{vector: model.VectorFor(config.ModelVersion, stateText), before: arm})
-	ctx.Assert(fired, "storeVector never wrote %s; keys: %v", key, ctx.Redis.Keys("emb:*"))
-	n, _ := ttl.(int64)
-	ctx.Assert(n > 0, "right after the command that wrote the vector its TTL was %v: a crash before the EXPIRE leaves a vector that never expires. The TTL belongs in the SET", ttl)
+	ctx.Assert(written, "storeVector never wrote %s; keys: %v", key, ctx.Redis.Keys("emb:*"))
+	ctx.Assert(ttl > 0, "right after the command that wrote the vector its TTL was %d: a crash before the EXPIRE leaves a vector that never expires. The TTL belongs in the SET", ttl)
 	now := ctx.Redis.TTL(key)
 	ctx.Assert(now >= config.VectorTTLSeconds-5 && now <= config.VectorTTLSeconds, "the vector must live VectorTTLSeconds = %d s, its TTL is %d", config.VectorTTLSeconds, now)
 }
@@ -636,6 +686,31 @@ func CheckFirstWriterWins(ctx *harness.Ctx) {
 	got := stateStore(ctx, config.ModelVersion, &stateCompute{vector: model.VectorFor(config.ModelVersion, stateText), before: otherWorker})
 	ctx.Equal(stateStored(ctx, config.ModelVersion), winner, "another worker stored its vector while this one computed: the write must not overwrite the first writer; the cache holds")
 	ctx.Equal(got, winner, "storeVector must return the cached vector, not its own, or two callers of one input hold different vectors; it returned")
+
+	// A second worker lands right after this one's next command on the key, once it has computed: a
+	// check followed by a plain SET leaves a window between the two, and the racer stores first in it.
+	racedText := "How do I revoke a leaked key?"
+	racedKey := config.VectorKey(stateTenant, config.ModelVersion, config.ContentHash(racedText))
+	racer := []float32{-0.5, 0.5, 0.25, -0.25, 0.75, -0.75, 0.125, -0.125}
+	racerDoc, _ := json.Marshal(racer)
+	racerStored := false
+	arm := func() {
+		ctx.Redis.After(racedKey, func() any {
+			racerStored = ctx.Redis.Set(racedKey, string(racerDoc), "EX", config.VectorTTLSeconds, "NX")
+			return racerStored
+		})
+	}
+	compute := &stateCompute{vector: model.VectorFor(config.ModelVersion, racedText), before: arm}
+	second, err := storeVector(context.Background(), stateTenant, config.ModelVersion, racedText, compute.fn())
+	ctx.NoError(err, "storeVector(%s)", racedText)
+	var held []float32
+	if raw, ok := ctx.Redis.Get(racedKey); ok {
+		json.Unmarshal([]byte(raw), &held)
+	}
+	if racerStored {
+		ctx.Equal(held, racer, "another worker stored its vector between this one's check of the key and its write: the write overwrote the first writer. Only SET NX decides who wins; the cache holds")
+	}
+	ctx.Equal(second, held, "storeVector must return the vector the cache holds, or two callers of one input hold different vectors; it returned")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -706,18 +781,23 @@ void CheckVersionKey(harness::Ctx& ctx) {
 
 void CheckTtlInWrite(harness::Ctx& ctx) {
   const std::string key = stateKey(config::kModelVersion);
-  bool fired = false;
+  bool written = false;
   long long ttl = 0;
-  Compute compute{model::vectorFor(config::kModelVersion, kText)};
-  compute.before = [&] {
-    // The next command on the key is the one that writes the vector: what a crash right after it leaves.
-    ctx.Redis.After(key, [&] {
-      fired = true;
-      ttl = ctx.Redis.TTL(key);
-    });
+  // A read of the still-missing key leaves nothing behind: keep watching until the command that wrote it.
+  std::function<void()> watch = [&] {
+    const long long n = ctx.Redis.TTL(key);
+    if (n == -2) {
+      ctx.Redis.After(key, watch);
+    } else if (!written) {
+      written = true;
+      ttl = n;
+    }
   };
+  Compute compute{model::vectorFor(config::kModelVersion, kText)};
+  // The next command on the key that leaves it stored is the write: what a crash right after it leaves.
+  compute.before = [&] { ctx.Redis.After(key, watch); };
   storeVector(kTenant, config::kModelVersion, kText, compute.fn());
-  ctx.Assert(fired, "storeVector never wrote %s; keys: %v", key, ctx.Redis.Keys("emb:*"));
+  ctx.Assert(written, "storeVector never wrote %s; keys: %v", key, ctx.Redis.Keys("emb:*"));
   ctx.Assert(ttl > 0, "right after the command that wrote the vector its TTL was %d: a crash before the EXPIRE leaves a vector that never expires. The TTL belongs in the SET", ttl);
   const long long now = ctx.Redis.TTL(key);
   ctx.Assert(now >= config::kVectorTtlSeconds - 5 && now <= config::kVectorTtlSeconds, "the vector must live kVectorTtlSeconds = %d s, its TTL is %d", config::kVectorTtlSeconds, now);
@@ -732,6 +812,24 @@ void CheckFirstWriterWins(harness::Ctx& ctx) {
   const auto got = storeVector(kTenant, config::kModelVersion, kText, compute.fn());
   ctx.Equal(stored(ctx, config::kModelVersion), std::optional<std::vector<float>>(winner), "another worker stored its vector while this one computed: the write must not overwrite the first writer; the cache holds");
   ctx.Equal(got, winner, "storeVector must return the cached vector, not its own, or two callers of one input hold different vectors; it returned");
+
+  // A second worker lands right after this one's next command on the key, once it has computed: a
+  // check followed by a plain SET leaves a window between the two, and the racer stores first in it.
+  const std::string raced_text = "How do I revoke a leaked key?";
+  const std::string raced_key = config::vectorKey(kTenant, config::kModelVersion, config::contentHash(raced_text));
+  const std::vector<float> racer = {-0.5f, 0.5f, 0.25f, -0.25f, 0.75f, -0.75f, 0.125f, -0.125f};
+  bool racer_stored = false;
+  Compute raced{model::vectorFor(config::kModelVersion, raced_text)};
+  raced.before = [&] {
+    ctx.Redis.After(raced_key, [&] { racer_stored = ctx.Redis.Set(raced_key, nlohmann::json(racer).dump(), "EX", config::kVectorTtlSeconds, "NX"); });
+  };
+  const auto second = storeVector(kTenant, config::kModelVersion, raced_text, raced.fn());
+  const auto raw = ctx.Redis.Get(raced_key);
+  const std::vector<float> held = raw ? nlohmann::json::parse(*raw).get<std::vector<float>>() : std::vector<float>{};
+  if (racer_stored) {
+    ctx.Equal(held, racer, "another worker stored its vector between this one's check of the key and its write: the write overwrote the first writer. Only SET NX decides who wins; the cache holds");
+  }
+  ctx.Equal(second, held, "storeVector must return the vector the cache holds, or two callers of one input hold different vectors; it returned");
 }
 `,
   },

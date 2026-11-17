@@ -25,7 +25,8 @@ conversation.
 - The summary counts against the budget: \`count_tokens\` of the summary plus the kept turns is at
   most 6000, and \`tokens\` reports that sum.
 - Cache under \`context:{tenant}:{session_id}:{latest_turn_id}\` (\`sessions.latest_turn_id\`) for 60 s,
-  so a new turn or another tenant is another entry.`,
+  so a new turn or another tenant is another entry, and no entry names a turn its context lacks,
+  even when a turn is appended during the read.`,
   sequence: {
     participants: ['Chat client', 'Memory API', 'Redis'],
     messages: [
@@ -55,7 +56,7 @@ conversation.
       id: 'newest-kept',
       title: 'Drops the oldest turns, not the newest',
       detail:
-        'The budget is spent from the newest turn backwards and the kept turns are returned oldest first; the starter walks from the oldest, so a long conversation loses the turns the model is answering.',
+        'The budget is spent from the newest turn backwards, stopping at the first turn that does not fit, and the kept turns are returned oldest first; the starter walks from the oldest, so a long conversation loses the turns the model is answering.',
       match: {
         python: {all: [/reversed\(|\[::-1\]/], none: [/for turn in turns:/]},
         typescript: {all: [/\.reverse\(\)/], none: [/for \(const turn of turns\)/]},
@@ -81,7 +82,7 @@ conversation.
       id: 'fresh-cache',
       title: 'Keys the cache by the latest turn',
       detail:
-        'The cache key ends with `sessions.latest_turn_id`, so an append changes the key and the next read assembles the new context; the starter keeps one entry per session for 60 s.',
+        'The cache key ends with `sessions.latest_turn_id`, so an append changes the key and the next read assembles the new context, and a turn appended during a read is in the next one; the starter keeps one entry per session for 60 s.',
       match: {
         python: {all: [/sessions\.latest_turn_id\(/, /context:[^\n]*\{latest\w*\}/]},
         typescript: {all: [/latestTurnId\(/, /context:[^\n]*\$\{latest\w*\}/]},
@@ -716,18 +717,22 @@ async def check_newest_kept(ctx):
     assert ids and ids[-1] == "t-50", f"the context ends at {ids[-1] if ids else None}: the newest turn, the one the model is answering, was dropped. Spend the budget from the newest end"
     assert ids == [f"t-{n}" for n in range(21, 51)], f"the context must hold the 30 newest turns t-21..t-50 oldest first, it holds {ids[:2]}..{ids[-2:]} ({len(ids)} turns)"
     assert _total(body) <= 6000, f"the context is {_total(body)} tokens, over MAX_CONTEXT_TOKENS = 6000"
+    _seed(ctx, "t2", ["a" * 40, "b" * 20800, "c" * 4000])  # 10, 5200 and 1000 tokens
+    async with _api(ctx) as c:
+        gap = await _read(c, "t2")
+    assert _ids(gap) == ["t-3"], f"with t-1 (10 tokens), t-2 (5200) and t-3 (1000) the context holds {_ids(gap)}: stop at the first turn that does not fit, so it holds t-3 alone; reaching past t-2 for t-1 leaves a hole in the conversation"
 
 
 async def check_summary_in_budget(ctx):
-    summary = "s" * 4000  # 1000 tokens
+    summary = "s" * 4001  # 1001 tokens
     ctx.redis.hset("summaries:t1:s-1", "t-1:t-40", summary)
     _seed(ctx, "t1", ["y" * 2400] * 10, start=40)  # 10 turns of 600 tokens
     async with _api(ctx) as c:
         body = await _read(c, "t1")
     assert body.get("summary") == summary, "the context must carry the summary"
     total = _total(body)
-    assert total <= 6000, f"the summary (1000 tokens) and {len(body.get('turns', []))} turns of 600 make {total} tokens: the summary is part of the prompt and counts against MAX_CONTEXT_TOKENS = 6000"
-    assert len(body.get("turns", [])) == 8, f"1000 tokens of summary leave room for 8 turns of 600, the context holds {len(body.get('turns', []))}"
+    assert total <= 6000, f"the summary (1001 tokens) and {len(body.get('turns', []))} turns of 600 make {total} tokens: the summary is part of the prompt and counts against MAX_CONTEXT_TOKENS = 6000"
+    assert len(body.get("turns", [])) == 8, f"1001 tokens of summary leave room for 8 turns of 600, the context holds {len(body.get('turns', []))}"
     assert body.get("tokens") == total, f"tokens says {body.get('tokens')}, the summary and the turns add up to {total}"
 
 
@@ -741,6 +746,18 @@ async def check_fresh_cache(ctx):
     assert _ids(second) == ["t-1", "t-2", "t-3", "t-4"], f"a read right after t-4 was appended answered {_ids(second)}: the cache served the context from before the append. Key it by the latest turn id"
     ttl = ctx.redis.ttl("context:t1:s-1:t-4")
     assert 0 < ttl <= 60, f"context:t1:s-1:t-4 has TTL {ttl}: the read must cache the context under the latest turn id for 60 s"
+    _seed(ctx, "t2", ["Is the budget approved?", "Yes, 40k.", "Book the venue then."])
+
+    def append_during_read():
+        ctx.redis.incr("turnseq:t2:s-1")
+        ctx.redis.rpush("turns:t2:s-1", '{"turn_id": "t-4", "role": "user", "content": "Which venue?", "tokens": 3}')
+
+    probe = ctx.redis_after("turns:t2:s-1", append_during_read)
+    async with _api(ctx) as c:
+        await _read(c, "t2")
+        assert probe.fired, "the read never touched turns:t2:s-1"
+        again = await _read(c, "t2")
+    assert _ids(again) == ["t-1", "t-2", "t-3", "t-4"], f"t-4 was appended while a read was assembling t-1..t-3, and the next read answered {_ids(again)}: the context was cached under a turn id it does not contain"
 
 
 async def check_tenant_cache(ctx):
@@ -804,19 +821,22 @@ export async function check_newest_kept(ctx) {
   const want = Array.from({length: 30}, (_, i) => \`t-\${i + 21}\`);
   assert.deepStrictEqual(held, want, \`the context must hold the 30 newest turns t-21..t-50 oldest first, it holds \${held[0]}..\${held[held.length - 1]} (\${held.length} turns)\`);
   assert(total(env.sessions, body) <= 6000, \`the context is \${total(env.sessions, body)} tokens, over MAX_CONTEXT_TOKENS = 6000\`);
+  await seed(ctx, env, 't2', ['a'.repeat(40), 'b'.repeat(20800), 'c'.repeat(4000)]); // 10, 5200 and 1000 tokens
+  const gap = ids(await read(env.c, 't2'));
+  assert.deepStrictEqual(gap, ['t-3'], \`with t-1 (10 tokens), t-2 (5200) and t-3 (1000) the context holds \${JSON.stringify(gap)}: stop at the first turn that does not fit, so it holds t-3 alone; reaching past t-2 for t-1 leaves a hole in the conversation\`);
 }
 
 export async function check_summary_in_budget(ctx) {
   const env = api(ctx);
-  const summary = 's'.repeat(4000); // 1000 tokens
+  const summary = 's'.repeat(4001); // 1001 tokens
   ctx.redis.hset('summaries:t1:s-1', 't-1:t-40', summary);
   await seed(ctx, env, 't1', Array(10).fill('y'.repeat(2400)), 40); // 10 turns of 600 tokens
   const body = await read(env.c, 't1');
   assert.equal(body.summary, summary, 'the context must carry the summary');
   const sum = total(env.sessions, body);
   const kept = (body.turns ?? []).length;
-  assert(sum <= 6000, \`the summary (1000 tokens) and \${kept} turns of 600 make \${sum} tokens: the summary is part of the prompt and counts against MAX_CONTEXT_TOKENS = 6000\`);
-  assert.equal(kept, 8, \`1000 tokens of summary leave room for 8 turns of 600, the context holds \${kept}\`);
+  assert(sum <= 6000, \`the summary (1001 tokens) and \${kept} turns of 600 make \${sum} tokens: the summary is part of the prompt and counts against MAX_CONTEXT_TOKENS = 6000\`);
+  assert.equal(kept, 8, \`1001 tokens of summary leave room for 8 turns of 600, the context holds \${kept}\`);
   assert.equal(body.tokens, sum, \`tokens says \${body.tokens}, the summary and the turns add up to \${sum}\`);
 }
 
@@ -830,6 +850,15 @@ export async function check_fresh_cache(ctx) {
   assert.deepStrictEqual(ids(second), ['t-1', 't-2', 't-3', 't-4'], \`a read right after t-4 was appended answered \${JSON.stringify(ids(second))}: the cache served the context from before the append. Key it by the latest turn id\`);
   const ttl = ctx.redis.ttl('context:t1:s-1:t-4');
   assert(0 < ttl && ttl <= 60, \`context:t1:s-1:t-4 has TTL \${ttl}: the read must cache the context under the latest turn id for 60 s\`);
+  await seed(ctx, env, 't2', ['Is the budget approved?', 'Yes, 40k.', 'Book the venue then.']);
+  const probe = ctx.redisAfter('turns:t2:s-1', () => {
+    ctx.redis.incr('turnseq:t2:s-1');
+    ctx.redis.rpush('turns:t2:s-1', '{"turn_id": "t-4", "role": "user", "content": "Which venue?", "tokens": 3}');
+  });
+  await read(env.c, 't2');
+  assert(probe.fired, 'the read never touched turns:t2:s-1');
+  const again = ids(await read(env.c, 't2'));
+  assert.deepStrictEqual(again, ['t-1', 't-2', 't-3', 't-4'], \`t-4 was appended while a read was assembling t-1..t-3, and the next read answered \${JSON.stringify(again)}: the context was cached under a turn id it does not contain\`);
 }
 
 export async function check_tenant_cache(ctx) {
@@ -956,18 +985,21 @@ func CheckNewestKept(ctx *harness.Ctx) {
 	}
 	ctx.Equal(held, want, "the context must hold the 30 newest turns t-21..t-50 oldest first")
 	ctx.Assert(totalTokens(body) <= 6000, "the context is %d tokens, over maxContextTokens = 6000", totalTokens(body))
+	seedTurns(ctx, "t2", []string{strings.Repeat("a", 40), strings.Repeat("b", 20800), strings.Repeat("c", 4000)}, 0) // 10, 5200 and 1000 tokens
+	gap := turnIDs(readAs(ctx, c, "t2"))
+	ctx.Assert(len(gap) == 1 && gap[0] == "t-3", "with t-1 (10 tokens), t-2 (5200) and t-3 (1000) the context holds %q: stop at the first turn that does not fit, so it holds t-3 alone; reaching past t-2 for t-1 leaves a hole in the conversation", gap)
 }
 
 func CheckSummaryInBudget(ctx *harness.Ctx) {
 	c := contextAPI(ctx)
-	summary := strings.Repeat("s", 4000) // 1000 tokens
+	summary := strings.Repeat("s", 4001) // 1001 tokens
 	ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", summary)
 	seedTurns(ctx, "t1", repeated(strings.Repeat("y", 2400), 10), 40) // 10 turns of 600 tokens
 	body := readAs(ctx, c, "t1")
 	ctx.Assert(body.Summary != nil && *body.Summary == summary, "the context must carry the summary")
 	total := totalTokens(body)
-	ctx.Assert(total <= 6000, "the summary (1000 tokens) and %d turns of 600 make %d tokens: the summary is part of the prompt and counts against maxContextTokens = 6000", len(body.Turns), total)
-	ctx.Equal(len(body.Turns), 8, "1000 tokens of summary leave room for 8 turns of 600; the turns")
+	ctx.Assert(total <= 6000, "the summary (1001 tokens) and %d turns of 600 make %d tokens: the summary is part of the prompt and counts against maxContextTokens = 6000", len(body.Turns), total)
+	ctx.Equal(len(body.Turns), 8, "1001 tokens of summary leave room for 8 turns of 600; the turns")
 	ctx.Equal(body.Tokens, total, "tokens must report the summary and the turns together")
 }
 
@@ -980,6 +1012,15 @@ func CheckFreshCache(ctx *harness.Ctx) {
 	ctx.Assert(len(second) == 4 && second[3] == "t-4", "a read right after t-4 was appended answered %q: the cache served the context from before the append. Key it by the latest turn id", second)
 	ttl := ctx.Redis.TTL("context:t1:s-1:t-4")
 	ctx.Assert(0 < ttl && ttl <= 60, "context:t1:s-1:t-4 has TTL %d: the read must cache the context under the latest turn id for 60 s", ttl)
+	seedTurns(ctx, "t2", []string{"Is the budget approved?", "Yes, 40k.", "Book the venue then."}, 0)
+	probe := ctx.Redis.After("turns:t2:s-1", func() any {
+		ctx.Redis.Do("INCR", "turnseq:t2:s-1")
+		return ctx.Redis.Do("RPUSH", "turns:t2:s-1", \`{"turn_id": "t-4", "role": "user", "content": "Which venue?", "tokens": 3}\`)
+	})
+	readAs(ctx, c, "t2")
+	ctx.Assert(probe.Fired, "the read never touched turns:t2:s-1")
+	again := turnIDs(readAs(ctx, c, "t2"))
+	ctx.Equal(again, []string{"t-1", "t-2", "t-3", "t-4"}, "t-4 was appended while a read was assembling t-1..t-3: the context was cached under a turn id it does not contain; the next read")
 }
 
 func CheckTenantCache(ctx *harness.Ctx) {
@@ -995,6 +1036,7 @@ func CheckTenantCache(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1071,15 +1113,15 @@ void CheckNewestKept(harness::Ctx& ctx) {
 
 void CheckSummaryInBudget(harness::Ctx& ctx) {
   auto c = contextApi(ctx);
-  const std::string summary(4000, 's');  // 1000 tokens
+  const std::string summary(4001, 's');  // 1001 tokens
   ctx.Redis.Do("HSET", "summaries:t1:s-1", "t-1:t-40", summary);
   seedTurns(ctx, "t1", std::vector<std::string>(10, std::string(2400, 'y')), 40);  // 10 turns of 600 tokens
   const auto body = readAs(ctx, c, "t1");
   ctx.Assert(body.value("summary", nlohmann::json()) == summary, "the context must carry the summary");
   const long total = totalTokens(body);
   const size_t kept = fieldOfTurns(body, "turn_id").size();
-  ctx.Assert(total <= 6000, "the summary (1000 tokens) and %d turns of 600 make %d tokens: the summary is part of the prompt and counts against kMaxContextTokens = 6000", kept, total);
-  ctx.Equal(kept, 8, "1000 tokens of summary leave room for 8 turns of 600; the turns");
+  ctx.Assert(total <= 6000, "the summary (1001 tokens) and %d turns of 600 make %d tokens: the summary is part of the prompt and counts against kMaxContextTokens = 6000", kept, total);
+  ctx.Equal(kept, 8, "1001 tokens of summary leave room for 8 turns of 600; the turns");
   ctx.Equal(body.value("tokens", 0L), total, "tokens must report the summary and the turns together");
 }
 
@@ -1092,6 +1134,17 @@ void CheckFreshCache(harness::Ctx& ctx) {
   ctx.Assert(second.size() == 4 && second[3] == "t-4", "a read right after t-4 was appended answered %q: the cache served the context from before the append. Key it by the latest turn id", second);
   const long long ttl = ctx.Redis.TTL("context:t1:s-1:t-4");
   ctx.Assert(0 < ttl && ttl <= 60, "context:t1:s-1:t-4 has TTL %d: the read must cache the context under the latest turn id for 60 s", ttl);
+  seedTurns(ctx, "t2", {"Is the budget approved?", "Yes, 40k.", "Book the venue then."});
+  auto fired = std::make_shared<bool>(false);
+  ctx.Redis.After("turns:t2:s-1", [&ctx, fired] {
+    *fired = true;
+    ctx.Redis.Do("INCR", "turnseq:t2:s-1");
+    ctx.Redis.Do("RPUSH", "turns:t2:s-1", R"({"turn_id": "t-4", "role": "user", "content": "Which venue?", "tokens": 3})");
+  });
+  readAs(ctx, c, "t2");
+  ctx.Assert(*fired, "the read never touched turns:t2:s-1");
+  ctx.Equal(fieldOfTurns(readAs(ctx, c, "t2"), "turn_id"), {"t-1", "t-2", "t-3", "t-4"},
+            "t-4 was appended while a read was assembling t-1..t-3: the context was cached under a turn id it does not contain; the next read");
 }
 
 void CheckTenantCache(harness::Ctx& ctx) {
