@@ -43,7 +43,8 @@ does not acknowledge the event drops it with the call reporting success.
     {
       id: 'topic',
       title: 'Publishes the outcome to dedupe.event',
-      detail: 'One call produces one record on `dedupe.event` with the outcome, the record id and the key digests.',
+      detail:
+        'One call produces one record on `dedupe.event` with the outcome, the tenant, the dataset id, the record id and the key digests, each taken from the record.',
       match: {
         python: {all: [/dedupe\.event/, /producer\.produce\(/]},
         typescript: {all: [/dedupe\.event/, /producer\.send\(/]},
@@ -101,7 +102,7 @@ does not acknowledge the event drops it with the call reporting success.
       id: 'outbox',
       title: 'Writes an outbox row when the delivery fails',
       detail:
-        'The delivery report decides: a failed delivery, or none within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter catches only local enqueue errors and reports success.',
+        'The delivery report decides: a failed delivery, or none within 2 s (the call returns by about 2.5 s), leaves an outbox row with the topic, the key and the same payload as the event, and the call returns false; a delivered event leaves no row. The starter catches only local enqueue errors and reports success.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=/], none: [/except KafkaException/]},
         typescript: {all: [/\binsert\(/, /await producer\.send\(/, /catch/], none: [/void producer\.send\(/]},
@@ -610,6 +611,10 @@ def _record(n, dataset="ds-1"):
     }
 
 
+def _payload(n, outcome, dataset="ds-1"):
+    return {"outcome": outcome, "tenant": "acme", "dataset_id": dataset, "record_id": f"r-{n}", "key_hashes": {"email_hash": EMAIL, "phone_hash": PHONE}}
+
+
 def _text(raw):
     return raw.decode() if isinstance(raw, bytes) else raw
 
@@ -626,6 +631,7 @@ def check_topic(ctx):
     value = json.loads(records[0].value)
     assert value.get("outcome") == "winner" and value.get("record_id") == "r-1", f"the event is {value}, expected outcome winner for r-1"
     assert value.get("key_hashes") == {"email_hash": EMAIL, "phone_hash": PHONE}, f"the event's key_hashes are {value.get('key_hashes')}, expected the record's key digests"
+    assert {k: value.get(k) for k in FIELDS} == _payload(1, "winner"), f"the event is {value}, expected {_payload(1, 'winner')}"
     assert ok is True, f"publish_outcome returned {ok!r} for a delivered event, expected True"
 
 
@@ -661,17 +667,21 @@ def check_idempotent(ctx):
 
 def check_outbox(ctx):
     m = ctx.load("events")
+    ok = m.publish_outcome(_record(9), "winner")
+    rows = _outbox(ctx)
+    assert ok is True and rows == [], f"the broker took the event, publish_outcome returned {ok!r} and the outbox holds {rows}: a row the relay publishes again duplicates the event. Only a failed delivery leaves a row"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_outcome(_record(1), "winner")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: the event is lost and publish_outcome returned {ok!r}"
     assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "ds-1" and rows[0].get("payload", {}).get("record_id") == "r-1", f"the outbox row is {rows[0]}, expected the topic, the key ds-1 and the payload"
+    assert rows[0].get("payload") == _payload(1, "winner"), f"the outbox row's payload is {rows[0].get('payload')}, expected the event's payload {_payload(1, 'winner')}: the relay publishes it as it is"
     assert ok is False, f"publish_outcome returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_outcome(_record(2), "winner")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_outcome waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_outcome waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("record_id") == "r-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_outcome returned {ok!r} without a delivery report, expected False"
@@ -692,6 +702,14 @@ const record = (n: number, dataset = 'ds-1') => ({
 
 const outboxRows = ctx => (ctx.redis.lrange('outbox', 0, -1) as string[]).map(row => JSON.parse(row));
 
+const payload = (n: number, outcome: string, dataset = 'ds-1') => ({
+  outcome,
+  tenant: 'acme',
+  dataset_id: dataset,
+  record_id: \`r-\${n}\`,
+  key_hashes: {email_hash: EMAIL, phone_hash: PHONE},
+});
+
 /** A real macrotask: every pending promise continuation has run. */
 const settle = (): Promise<void> => {
   const {promise, resolve} = Promise.withResolvers<void>();
@@ -708,6 +726,8 @@ export async function check_topic(ctx) {
   const value = JSON.parse(values[0]);
   assert(value.outcome === 'winner' && value.record_id === 'r-1', \`the event is \${values[0]}, expected outcome winner for r-1\`);
   assert.deepEqual(value.key_hashes, {email_hash: EMAIL, phone_hash: PHONE}, \`the event's key_hashes are \${JSON.stringify(value.key_hashes)}, expected the record's key digests\`);
+  const picked = Object.fromEntries(FIELDS.map(k => [k, value[k]]));
+  assert.deepEqual(picked, payload(1, 'winner'), \`the event is \${values[0]}, expected \${JSON.stringify(payload(1, 'winner'))}\`);
   assert.equal(ok, true, \`publishOutcome resolved \${JSON.stringify(ok)} for a delivered event, expected true\`);
 }
 
@@ -748,18 +768,23 @@ export async function check_idempotent(ctx) {
 
 export async function check_outbox(ctx) {
   const m = ctx.load('events');
-  ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishOutcome(record(1), 'winner');
+  let ok = await m.publishOutcome(record(9), 'winner');
   await settle();
   let rows = outboxRows(ctx);
+  assert(ok === true && rows.length === 0, \`the broker took the event, publishOutcome resolved \${JSON.stringify(ok)} and the outbox holds \${JSON.stringify(rows)}: a row the relay publishes again duplicates the event. Only a failed delivery leaves a row\`);
+  ctx.kafka.failNext(TOPIC, 1);
+  ok = await m.publishOutcome(record(1), 'winner');
+  await settle();
+  rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: the event is lost and publishOutcome resolved \${JSON.stringify(ok)}\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'ds-1' && rows[0].payload?.record_id === 'r-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key ds-1 and the payload\`);
+  assert.deepEqual(rows[0].payload, payload(1, 'winner'), \`the outbox row's payload is \${JSON.stringify(rows[0].payload)}, expected the event's payload: the relay publishes it as it is\`);
   assert.equal(ok, false, \`publishOutcome resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishOutcome(record(2), 'winner');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishOutcome waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishOutcome waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.record_id === 'r-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishOutcome resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -813,6 +838,13 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 	return rows
 }
 
+func eventsPayload(n int, outcome string) map[string]any {
+	return map[string]any{
+		"outcome": outcome, "tenant": "acme", "dataset_id": "ds-1", "record_id": fmt.Sprintf("r-%d", n),
+		"key_hashes": map[string]any{"email_hash": eventsEmail, "phone_hash": eventsPhone},
+	}
+}
+
 func CheckTopic(ctx *harness.Ctx) {
 	ok := eventsPublish(ctx, eventsRecord(1, "ds-1"), "winner")
 	ctx.Settle()
@@ -822,6 +854,11 @@ func CheckTopic(ctx *harness.Ctx) {
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &value), "the event must be JSON")
 	ctx.Assert(value["outcome"] == "winner" && value["record_id"] == "r-1", "the event is %s, expected outcome winner for r-1", values[0])
 	ctx.Equal(value["key_hashes"], map[string]any{"email_hash": eventsEmail, "phone_hash": eventsPhone}, "the event's key_hashes")
+	picked := map[string]any{}
+	for _, k := range []string{"dataset_id", "key_hashes", "outcome", "record_id", "tenant"} {
+		picked[k] = value[k]
+	}
+	ctx.Equal(picked, eventsPayload(1, "winner"), "the event's outcome, tenant, dataset_id, record_id and key_hashes")
 	ctx.Equal(ok, true, "publishOutcome's result for a delivered event")
 }
 
@@ -863,18 +900,23 @@ func CheckIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(topic, 1)
-	ok := eventsPublish(ctx, eventsRecord(1, "ds-1"), "winner")
+	ok := eventsPublish(ctx, eventsRecord(9, "ds-1"), "winner")
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
+	ctx.Assert(ok && len(rows) == 0, "the broker took the event, publishOutcome returned %v and the outbox holds %v: a row the relay publishes again duplicates the event. Only a failed delivery leaves a row", ok, rows)
+	ctx.Kafka.FailNext(topic, 1)
+	ok = eventsPublish(ctx, eventsRecord(1, "ds-1"), "winner")
+	ctx.Settle()
+	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 1, "the delivery failed and the outbox holds %d rows: the event is lost and publishOutcome returned %v", len(rows), ok)
 	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "ds-1" && rows[0].Payload["record_id"] == "r-1", "the outbox row is %v, expected the topic, the key ds-1 and the payload", rows[0])
+	ctx.Equal(rows[0].Payload, eventsPayload(1, "winner"), "the outbox row's payload must be the event's payload, which the relay publishes as it is; the payload")
 	ctx.Equal(ok, false, "publishOutcome's result after a failed delivery")
 	ctx.Kafka.Stall(topic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsRecord(2, "ds-1"), "winner")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishOutcome waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishOutcome waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["record_id"] == "r-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishOutcome's result without a delivery report")
@@ -909,8 +951,12 @@ std::vector<nlohmann::json> eventsOutbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string h_field(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
+}
+
+nlohmann::json eventsPayload(int n, const std::string& outcome) {
+  return {{"outcome", outcome}, {"tenant", "acme"}, {"dataset_id", "ds-1"}, {"record_id", "r-" + std::to_string(n)}, {"key_hashes", {{"email_hash", kEmail}, {"phone_hash", kPhone}}}};
 }
 
 }  // namespace
@@ -921,9 +967,12 @@ void CheckTopic(harness::Ctx& ctx) {
   const auto values = ctx.Kafka.Values(kTopic);
   ctx.Equal(values.size(), 1, "one publishOutcome must produce one record on dedupe.event; the records");
   const auto value = nlohmann::json::parse(values[0], nullptr, false);
-  ctx.Assert(field(value, "outcome") == "winner" && field(value, "record_id") == "r-1", "the event is %s, expected outcome winner for r-1", values[0]);
+  ctx.Assert(h_field(value, "outcome") == "winner" && h_field(value, "record_id") == "r-1", "the event is %s, expected outcome winner for r-1", values[0]);
   ctx.Equal(value.is_object() && value.contains("key_hashes") ? value["key_hashes"] : nlohmann::json(),
             nlohmann::json{{"email_hash", kEmail}, {"phone_hash", kPhone}}, "the event's key_hashes");
+  nlohmann::json picked = nlohmann::json::object();
+  for (const std::string k : {"dataset_id", "key_hashes", "outcome", "record_id", "tenant"}) picked[k] = value.is_object() && value.contains(k) ? value[k] : nlohmann::json();
+  ctx.Equal(picked, eventsPayload(1, "winner"), "the event's outcome, tenant, dataset_id, record_id and key_hashes");
   ctx.Equal(ok, true, "publishOutcome's result for a delivered event");
 }
 
@@ -965,21 +1014,26 @@ void CheckIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTopic, 1);
-  bool ok = publishOutcome(eventsRecord(1), "winner");
+  bool ok = publishOutcome(eventsRecord(9), "winner");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
+  ctx.Assert(ok && rows.empty(), "the broker took the event, publishOutcome returned %t and the outbox holds %d rows: a row the relay publishes again duplicates the event. Only a failed delivery leaves a row", ok, rows.size());
+  ctx.Kafka.FailNext(kTopic, 1);
+  ok = publishOutcome(eventsRecord(1), "winner");
+  ctx.Settle();
+  rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 1, "the delivery failed and the outbox holds %d rows: the event is lost and publishOutcome returned %t", rows.size(), ok);
-  ctx.Assert(field(rows[0], "topic") == kTopic && field(rows[0], "key") == "ds-1" && rows[0].contains("payload") && field(rows[0]["payload"], "record_id") == "r-1",
+  ctx.Assert(h_field(rows[0], "topic") == kTopic && h_field(rows[0], "key") == "ds-1" && rows[0].contains("payload") && h_field(rows[0]["payload"], "record_id") == "r-1",
              "the outbox row is %s, expected the topic, the key ds-1 and the payload", rows[0].dump());
+  ctx.Equal(rows[0]["payload"], eventsPayload(1, "winner"), "the outbox row's payload must be the event's payload, which the relay publishes as it is; the payload");
   ctx.Equal(ok, false, "publishOutcome's result after a failed delivery");
   ctx.Kafka.Stall(kTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishOutcome(eventsRecord(2), "winner");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishOutcome waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishOutcome waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
-  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && field(rows[1]["payload"], "record_id") == "r-2",
+  ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && h_field(rows[1]["payload"], "record_id") == "r-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishOutcome's result without a delivery report");
 }

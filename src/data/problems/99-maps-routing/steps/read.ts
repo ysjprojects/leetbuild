@@ -19,7 +19,7 @@ fields and the \`tenant\` that computed it), answers **404** when there is none,
 \`r-2\`, ...); a route solved at rush hour reads as solved a minute ago; and a straight-line estimate
 reads as a road route.
 
-- No \`X-Tenant-Id\` is **401**.
+- A missing or empty \`X-Tenant-Id\` is **401**.
 - Another tenant's route answers the same **404** and body as an unknown id.
 - \`epoch\` is the stored route's epoch, and \`stale\` is \`true\` when it differs from
   \`current_epoch()\`.
@@ -52,7 +52,8 @@ reads as a road route.
     {
       id: 'tenant-required',
       title: 'A read without a tenant is 401',
-      detail: 'No `X-Tenant-Id` answers **401** before the store is read; the starter has no tenant gate at all.',
+      detail:
+        'A missing or empty `X-Tenant-Id` answers **401** before the store is read; the starter has no tenant gate at all.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/]},
@@ -78,7 +79,7 @@ reads as a road route.
       id: 'epoch-provenance',
       title: "Reports the route's own epoch, and whether it is stale",
       detail:
-        "`epoch` is the stored route's, and `stale` says whether that epoch has passed; the starter stamps `current_epoch()` on stored geometry, so a rush-hour route reads as solved now.",
+        "`epoch` is the stored route's, and `stale` is true as soon as that epoch differs from the current one, the previous epoch included; the starter stamps `current_epoch()` on stored geometry, so a rush-hour route reads as solved now.",
       match: {
         python: {all: [/"epoch":\s*stored\["epoch"\]/, /"stale":/], none: [/"epoch":\s*current_epoch\(\)/]},
         typescript: {all: [/epoch:\s*stored\.epoch/, /stale:/], none: [/epoch:\s*currentEpoch\(\)/]},
@@ -495,7 +496,9 @@ async def check_tenant_required(ctx):
     route_id = save_route("acme", _route())
     async with _read(ctx) as c:
         r = await c.get(f"/v1/routes/{route_id}")
+        empty = await c.get(f"/v1/routes/{route_id}", headers={"X-Tenant-Id": ""})
     assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
+    assert empty.status_code == 401, f"a read with an empty X-Tenant-Id answered {empty.status_code}, expected 401"
 
 
 async def check_ownership_scope(ctx):
@@ -512,12 +515,15 @@ async def check_ownership_scope(ctx):
 async def check_epoch_provenance(ctx):
     old = current_epoch() - 12
     old_id = save_route("acme", _route(epoch=old))
+    last_id = save_route("acme", _route(epoch=current_epoch() - 1))
     fresh_id = save_route("acme", _route())
     async with _read(ctx) as c:
         stale = (await c.get(f"/v1/routes/{old_id}", headers=ACME)).json()
+        last = (await c.get(f"/v1/routes/{last_id}", headers=ACME)).json()
         fresh = (await c.get(f"/v1/routes/{fresh_id}", headers=ACME)).json()
     assert stale.get("epoch") == old, f"a route solved in epoch {old} reads as epoch {stale.get('epoch')}: the read must report the epoch it was solved under, not the current one"
     assert stale.get("stale") is True, f"a route from an hour ago must read stale: true, got {stale.get('stale')!r}"
+    assert last.get("epoch") == current_epoch() - 1 and last.get("stale") is True, f"a route from the previous epoch must read epoch {current_epoch() - 1} and stale: true (its epoch differs from the current one), got {last}"
     assert fresh.get("epoch") == current_epoch() and fresh.get("stale") is False, f"a route from this epoch must read epoch {current_epoch()} and stale: false, got {fresh}"
 
 
@@ -562,8 +568,10 @@ export async function check_route_read(ctx) {
 export async function check_tenant_required(ctx) {
   const {c, saveRoute, route} = read(ctx);
   const routeId = await saveRoute('acme', route());
-  const r = await c.get(\`/v1/routes/\${routeId}\`);
+  let r = await c.get(\`/v1/routes/\${routeId}\`);
   assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await c.get(\`/v1/routes/\${routeId}\`, {headers: {'X-Tenant-Id': ''}});
+  assert.equal(r.status, 401, \`a read with an empty X-Tenant-Id answered \${r.status}, expected 401\`);
 }
 
 export async function check_ownership_scope(ctx) {
@@ -581,11 +589,14 @@ export async function check_epoch_provenance(ctx) {
   const {c, currentEpoch, saveRoute, route} = read(ctx);
   const old = currentEpoch() - 12;
   const oldId = await saveRoute('acme', route(old));
+  const lastId = await saveRoute('acme', route(currentEpoch() - 1));
   const freshId = await saveRoute('acme', route());
   const stale = (await c.get(\`/v1/routes/\${oldId}\`, {headers: ACME})).json();
+  const last = (await c.get(\`/v1/routes/\${lastId}\`, {headers: ACME})).json();
   const fresh = (await c.get(\`/v1/routes/\${freshId}\`, {headers: ACME})).json();
   assert.equal(stale.epoch, old, \`a route solved in epoch \${old} reads as epoch \${stale.epoch}: the read must report the epoch it was solved under, not the current one\`);
   assert.equal(stale.stale, true, \`a route from an hour ago must read stale: true, got \${JSON.stringify(stale.stale)}\`);
+  assert(last.epoch === currentEpoch() - 1 && last.stale === true, \`a route from the previous epoch must read epoch \${currentEpoch() - 1} and stale: true (its epoch differs from the current one), got \${JSON.stringify(last)}\`);
   assert(fresh.epoch === currentEpoch() && fresh.stale === false, \`a route from this epoch must read epoch \${currentEpoch()} and stale: false, got \${JSON.stringify(fresh)}\`);
 }
 
@@ -611,22 +622,22 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hBg = context.Background()
 
-func storedRoute(epoch int64, degraded bool) geo.Route {
+func hStoredRoute(epoch int64, degraded bool) geo.Route {
 	if degraded {
 		return geo.Route{DistanceM: 2715.4, DurationS: 195.4, Epoch: epoch, EngineVersion: "straight-line", Degraded: true}
 	}
 	return geo.Route{DistanceM: 18842.5, DurationS: 1713.0, Geometry: "poly:2", Epoch: epoch, EngineVersion: "osrm-v26.9"}
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readJSON(ctx *harness.Ctx, c *harness.HTTP, routeID string) map[string]any {
+func hReadJSON(ctx *harness.Ctx, c *harness.HTTP, routeID string) map[string]any {
 	r := c.Get("/v1/routes/"+routeID, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/routes/%s (%s)", routeID, r.Text())
 	body, _ := r.JSON().(map[string]any)
@@ -634,9 +645,9 @@ func readJSON(ctx *harness.Ctx, c *harness.HTTP, routeID string) map[string]any 
 }
 
 func CheckRouteRead(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	routeID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
-	body := readJSON(ctx, c, routeID)
+	c := hReadAPI(ctx)
+	routeID := routes.SaveRoute(hBg, "acme", hStoredRoute(geo.CurrentEpoch(), false))
+	body := hReadJSON(ctx, c, routeID)
 	ctx.Equal(body["geometry"], "poly:2", "the read's geometry")
 	ctx.Equal(body["distance_m"], 18842.5, "the read's distance_m")
 	ctx.Equal(body["engine_version"], "osrm-v26.9", "the read's engine_version")
@@ -644,14 +655,15 @@ func CheckRouteRead(ctx *harness.Ctx) {
 }
 
 func CheckTenantRequired(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	routeID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
+	c := hReadAPI(ctx)
+	routeID := routes.SaveRoute(hBg, "acme", hStoredRoute(geo.CurrentEpoch(), false))
 	ctx.Equal(c.Get("/v1/routes/"+routeID).Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(c.Get("/v1/routes/"+routeID, "X-Tenant-Id", "").Status, 401, "a read with an empty X-Tenant-Id")
 }
 
 func CheckOwnershipScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	routeID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
+	c := hReadAPI(ctx)
+	routeID := routes.SaveRoute(hBg, "acme", hStoredRoute(geo.CurrentEpoch(), false))
 	foreign := c.Get("/v1/routes/"+routeID, "X-Tenant-Id", "beta")
 	missing := c.Get("/v1/routes/r-404", "X-Tenant-Id", "beta")
 	ctx.Equal(foreign.Status, 404, "tenant beta reading acme's route %s (%s)", routeID, foreign.Text())
@@ -660,24 +672,28 @@ func CheckOwnershipScope(ctx *harness.Ctx) {
 }
 
 func CheckEpochProvenance(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := hReadAPI(ctx)
 	now := geo.CurrentEpoch()
-	oldID := routes.SaveRoute(readBg, "acme", storedRoute(now-12, false))
-	freshID := routes.SaveRoute(readBg, "acme", storedRoute(now, false))
-	stale := readJSON(ctx, c, oldID)
-	fresh := readJSON(ctx, c, freshID)
+	oldID := routes.SaveRoute(hBg, "acme", hStoredRoute(now-12, false))
+	lastID := routes.SaveRoute(hBg, "acme", hStoredRoute(now-1, false))
+	freshID := routes.SaveRoute(hBg, "acme", hStoredRoute(now, false))
+	stale := hReadJSON(ctx, c, oldID)
+	last := hReadJSON(ctx, c, lastID)
+	fresh := hReadJSON(ctx, c, freshID)
 	ctx.Equal(stale["epoch"], float64(now-12), "a route solved an hour ago must report the epoch it was solved under, not the current one; its epoch")
 	ctx.Equal(stale["stale"], true, "a route from an hour ago must read stale")
+	ctx.Equal(last["epoch"], float64(now-1), "a route from the previous epoch, its epoch")
+	ctx.Equal(last["stale"], true, "a route from the previous epoch must read stale (its epoch differs from the current one)")
 	ctx.Equal(fresh["epoch"], float64(now), "a route from this epoch, its epoch")
 	ctx.Equal(fresh["stale"], false, "a route from this epoch must not read stale")
 }
 
 func CheckDegradedMarker(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	estimateID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), true))
-	roadID := routes.SaveRoute(readBg, "acme", storedRoute(geo.CurrentEpoch(), false))
-	ctx.Equal(readJSON(ctx, c, estimateID)["degraded"], true, "a straight-line estimate must read degraded")
-	ctx.Equal(readJSON(ctx, c, roadID)["degraded"], false, "a road route must read degraded: false")
+	c := hReadAPI(ctx)
+	estimateID := routes.SaveRoute(hBg, "acme", hStoredRoute(geo.CurrentEpoch(), true))
+	roadID := routes.SaveRoute(hBg, "acme", hStoredRoute(geo.CurrentEpoch(), false))
+	ctx.Equal(hReadJSON(ctx, c, estimateID)["degraded"], true, "a straight-line estimate must read degraded")
+	ctx.Equal(hReadJSON(ctx, c, roadID)["degraded"], false, "a road route must read degraded: false")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -693,7 +709,7 @@ using json = nlohmann::json;
 
 namespace {
 
-geo::Route storedRoute(long long epoch, bool degraded) {
+geo::Route hStoredRoute(long long epoch, bool degraded) {
   geo::Route r;
   r.distance_m = degraded ? 2715.4 : 18842.5;
   r.duration_s = degraded ? 195.4 : 1713.0;
@@ -704,7 +720,7 @@ geo::Route storedRoute(long long epoch, bool degraded) {
   return r;
 }
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP hReadApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -712,7 +728,7 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json readJson(harness::Ctx& ctx, harness::HTTP& c, const std::string& route_id) {
+json hReadJson(harness::Ctx& ctx, harness::HTTP& c, const std::string& route_id) {
   const auto r = c.Get("/v1/routes/" + route_id, "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET /v1/routes/%s (%s)", route_id, r.Text());
   return json::parse(r.Text());
@@ -721,9 +737,9 @@ json readJson(harness::Ctx& ctx, harness::HTTP& c, const std::string& route_id) 
 }  // namespace
 
 void CheckRouteRead(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string route_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
-  const json body = readJson(ctx, c, route_id);
+  auto c = hReadApi(ctx);
+  const std::string route_id = routes::saveRoute("acme", hStoredRoute(geo::currentEpoch(), false));
+  const json body = hReadJson(ctx, c, route_id);
   ctx.Equal(body.value("geometry", ""), "poly:2", "the read's geometry");
   ctx.Equal(body.value("distance_m", 0.0), 18842.5, "the read's distance_m");
   ctx.Equal(body.value("engine_version", ""), "osrm-v26.9", "the read's engine_version");
@@ -731,14 +747,15 @@ void CheckRouteRead(harness::Ctx& ctx) {
 }
 
 void CheckTenantRequired(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string route_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
+  auto c = hReadApi(ctx);
+  const std::string route_id = routes::saveRoute("acme", hStoredRoute(geo::currentEpoch(), false));
   ctx.Equal(c.Get("/v1/routes/" + route_id).Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(c.Get("/v1/routes/" + route_id, "X-Tenant-Id", "").Status, 401, "a read with an empty X-Tenant-Id");
 }
 
 void CheckOwnershipScope(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string route_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
+  auto c = hReadApi(ctx);
+  const std::string route_id = routes::saveRoute("acme", hStoredRoute(geo::currentEpoch(), false));
   const auto foreign = c.Get("/v1/routes/" + route_id, "X-Tenant-Id", "beta");
   const auto missing = c.Get("/v1/routes/r-404", "X-Tenant-Id", "beta");
   ctx.Equal(foreign.Status, 404, "tenant beta reading acme's route %s (%s)", route_id, foreign.Text());
@@ -747,24 +764,28 @@ void CheckOwnershipScope(harness::Ctx& ctx) {
 }
 
 void CheckEpochProvenance(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = hReadApi(ctx);
   const long long now = geo::currentEpoch();
-  const std::string old_id = routes::saveRoute("acme", storedRoute(now - 12, false));
-  const std::string fresh_id = routes::saveRoute("acme", storedRoute(now, false));
-  const json stale = readJson(ctx, c, old_id);
-  const json fresh = readJson(ctx, c, fresh_id);
+  const std::string old_id = routes::saveRoute("acme", hStoredRoute(now - 12, false));
+  const std::string last_id = routes::saveRoute("acme", hStoredRoute(now - 1, false));
+  const std::string fresh_id = routes::saveRoute("acme", hStoredRoute(now, false));
+  const json stale = hReadJson(ctx, c, old_id);
+  const json last = hReadJson(ctx, c, last_id);
+  const json fresh = hReadJson(ctx, c, fresh_id);
   ctx.Equal(stale.value("epoch", 0LL), now - 12, "a route solved an hour ago must report the epoch it was solved under, not the current one; its epoch");
   ctx.Assert(stale.contains("stale") && stale["stale"] == true, "a route from an hour ago must read stale: true, got %s", stale.dump());
+  ctx.Equal(last.value("epoch", 0LL), now - 1, "a route from the previous epoch, its epoch");
+  ctx.Assert(last.contains("stale") && last["stale"] == true, "a route from the previous epoch must read stale: true (its epoch differs from the current one), got %s", last.dump());
   ctx.Equal(fresh.value("epoch", 0LL), now, "a route from this epoch, its epoch");
   ctx.Assert(fresh.contains("stale") && fresh["stale"] == false, "a route from this epoch must read stale: false, got %s", fresh.dump());
 }
 
 void CheckDegradedMarker(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const std::string estimate_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), true));
-  const std::string road_id = routes::saveRoute("acme", storedRoute(geo::currentEpoch(), false));
-  const json estimate = readJson(ctx, c, estimate_id);
-  const json road = readJson(ctx, c, road_id);
+  auto c = hReadApi(ctx);
+  const std::string estimate_id = routes::saveRoute("acme", hStoredRoute(geo::currentEpoch(), true));
+  const std::string road_id = routes::saveRoute("acme", hStoredRoute(geo::currentEpoch(), false));
+  const json estimate = hReadJson(ctx, c, estimate_id);
+  const json road = hReadJson(ctx, c, road_id);
   ctx.Assert(estimate.contains("degraded") && estimate["degraded"] == true, "a straight-line estimate must read degraded: true, got %s", estimate.dump());
   ctx.Assert(road.contains("degraded") && road["degraded"] == false, "a road route must read degraded: false, got %s", road.dump());
 }

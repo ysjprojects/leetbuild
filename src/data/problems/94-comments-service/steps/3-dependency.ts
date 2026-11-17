@@ -25,10 +25,10 @@ service Moderation { rpc CheckComment(CheckRequest) returns (Verdict); }   // al
 service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
 \`\`\`
 
-- Both calls run under \`FANOUT_DEADLINE_S\` = 0.5 s.
+- Each call carries its own \`FANOUT_DEADLINE_S\` = 0.5 s deadline.
 - \`request_id\` is the comment id, on every call and on the \`notify:retry\` entry.
-- Moderation runs first. Only an \`allowed\` comment is announced; a failed announcement goes to
-  \`store.enqueue_notify_retry\`.
+- Moderation runs first. Only an \`allowed\` comment is announced; a failed announcement, whatever
+  the error (a timeout included), goes to \`store.enqueue_notify_retry\` and the comment stays \`allowed\`.
 - \`DEADLINE_EXCEEDED\` from moderation means \`pending_review\`: \`store.set_status\`,
   \`store.enqueue_review\`, return it. Any other moderation error raises.`,
   sequence: {
@@ -57,7 +57,7 @@ service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
       id: 'deadline',
       title: 'Both fan-out calls carry a 500 ms deadline',
       detail:
-        '`CheckComment` and `NotifyAuthor` are made with `FANOUT_DEADLINE_S` (0.5 s), so a stalled dependency costs the write at most half a second. The starter sets no deadline at all.',
+        '`CheckComment` and `NotifyAuthor` each carry their own `FANOUT_DEADLINE_S` (0.5 s) deadline, so a stalled dependency costs the write at most half a second per call, and a slow moderation does not shorten the notification’s. The starter sets no deadline at all.',
       match: {
         python: {all: [/FANOUT_DEADLINE_S\s*=\s*0\.5\b/, /timeout\s*=\s*FANOUT_DEADLINE_S/]},
         typescript: {all: [/FANOUT_DEADLINE_MS\s*=\s*500\b/, /deadline:\s*Date\.now\(\)\s*\+\s*FANOUT_DEADLINE_MS/]},
@@ -85,7 +85,7 @@ service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
       id: 'moderation-first',
       title: 'Moderation decides before anything is announced',
       detail:
-        '`CheckComment` runs before `NotifyAuthor`, a notifier failure only queues a retry, and a blocked comment is never announced. The starter notifies first and returns `allowed` when the notifier fails, so the comment ships unmoderated.',
+        '`CheckComment` runs before `NotifyAuthor`, a notifier failure (an error or a timeout) only queues a retry and leaves the comment `allowed`, and a blocked comment is never announced. The starter notifies first and returns `allowed` when the notifier fails, so the comment ships unmoderated.',
       match: {
         python: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
         typescript: {order: [/moderation\.CheckComment\(/, /notifier\.NotifyAuthor\(/]},
@@ -98,7 +98,7 @@ service Notifier   { rpc NotifyAuthor(NotifyRequest) returns (NotifyAck); }
       id: 'timeout-review',
       title: 'A moderation timeout becomes a review, not a failed post',
       detail:
-        '`DEADLINE_EXCEEDED` from moderation sets `pending_review`, queues the comment with `store.enqueue_review` and returns the status; any other moderation failure still raises. The starter lets the timeout escape.',
+        '`DEADLINE_EXCEEDED` from moderation (an injected one or a real stall) sets `pending_review`, queues the comment with `store.enqueue_review` and returns the status; any other moderation failure (`UNAVAILABLE`, `INTERNAL`, `PERMISSION_DENIED`) still raises and queues nothing. The starter lets the timeout escape.',
       match: {
         python: {all: [/DEADLINE_EXCEEDED/, /["']pending_review["']/, /store\.enqueue_review\(/]},
         typescript: {all: [/DEADLINE_EXCEEDED/, /['"]pending_review['"]/, /enqueueReview\(/]},
@@ -651,6 +651,11 @@ def check_deadline(ctx):
         for call in calls:
             assert call.timeout is not None, f"a {method} call carries no deadline: a stalled service holds the comment's POST open for as long as it stalls"
             assert 0.4 <= call.timeout <= 0.6, f"a {method} call carries a {call.timeout} s deadline, expected FANOUT_DEADLINE_S = 0.5"
+    ctx.grpc.set_latency("CheckComment", 0.3)
+    slow = _comment("Worth the wait")
+    assert m.fanout("acme", slow) == "allowed", "a comment moderation allows after 0.3 s must come back allowed"
+    notes = [call.timeout for call in ctx.grpc.calls_to("NotifyAuthor") if call.request.comment_id == slow["id"]]
+    assert notes and notes[0] is not None and 0.4 <= notes[0] <= 0.6, f"after a CheckComment that took 0.3 s, the NotifyAuthor call carried a {notes[0] if notes else None} s deadline: each call gets its own FANOUT_DEADLINE_S, not what is left of one shared budget"
 
 
 def check_request_id(ctx):
@@ -680,6 +685,17 @@ def check_moderation_first(ctx):
     assert m.fanout("acme", spam) == "blocked", "a comment moderation rejects must come back blocked"
     assert _status(spam) == "blocked", f"the blocked comment's status is {_status(spam)!r}"
     assert spam["id"] not in _notified(ctx), f"the thread was notified about {spam['id']}, a comment moderation blocked"
+    ctx.grpc.set_latency("NotifyAuthor", 2)
+    stalled = _comment("Notifier is slow")
+    try:
+        status = m.fanout("acme", stalled)
+    except Exception as exc:
+        code = exc.code() if isinstance(exc, grpc.RpcError) else exc
+        raise AssertionError(f"the notifier ran past its deadline after moderation allowed {stalled['id']} and fanout raised {type(exc).__name__} ({code}): any failed announcement only queues a retry")
+    assert status == "allowed" and _status(stalled) == "allowed", f"the notifier ran past its deadline after moderation allowed {stalled['id']}; fanout returned {status!r}, the store holds {_status(stalled)!r}, expected allowed: any failed announcement only queues a retry"
+    retried = [json.loads(entry)["comment_id"] for entry in ctx.redis.lrange("notify:retry", 0, -1)]
+    assert retried.count(stalled["id"]) == 1, f"notify:retry holds {retried}: the notification that timed out must be queued once for {stalled['id']}"
+    assert ctx.redis.llen("review:queue") == 0, "a notifier timeout is not a moderation timeout: nothing goes to review:queue"
 
 
 def check_timeout_review(ctx):
@@ -695,12 +711,22 @@ def check_timeout_review(ctx):
     queued = ctx.redis.lrange("review:queue", 0, -1)
     assert queued == [f"acme:{comment['id']}"], f"review:queue holds {queued}, expected the comment waiting for a moderator"
     assert comment["id"] not in _notified(ctx), "a comment waiting for review must not be announced yet"
-    ctx.grpc.fail("CheckComment", grpc.StatusCode.UNAVAILABLE)
-    try:
-        m.fanout("acme", _comment("Another"))
-    except Exception:
-        return
-    raise AssertionError("moderation answered UNAVAILABLE and fanout returned a status: only a deadline becomes a review, other failures must reach the caller")
+    for code in (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED):
+        ctx.grpc.fail("CheckComment", code)
+        other = _comment(f"Another ({code.name})")
+        try:
+            status = m.fanout("acme", other)
+        except Exception:
+            status = None
+        assert status is None, f"moderation answered {code.name} and fanout returned {status!r}: only a deadline becomes a review, other failures must reach the caller"
+        assert _status(other) != "pending_review" and ctx.redis.llen("review:queue") == 1, f"moderation answered {code.name} and the comment went to review anyway: only a deadline does"
+    ctx.grpc.set_latency("CheckComment", 2)
+    stalled = _comment("Moderation is slow")
+    started = ctx.clock.time()
+    status = m.fanout("acme", stalled)
+    waited = ctx.clock.time() - started
+    assert status == "pending_review" and _status(stalled) == "pending_review", f"moderation stalled for 2 s and fanout returned {status!r}, expected pending_review once its deadline passed"
+    assert waited <= 0.6, f"moderation stalled and fanout took {waited:.2f} s: the 0.5 s deadline must end the wait"
 `,
     typescript: `function client(ctx) {
   const pkg = ctx.proto('comments_service.proto');
@@ -738,6 +764,11 @@ export async function check_deadline(ctx) {
       assert(call.timeout >= 0.4 && call.timeout <= 0.6, \`a \${method} call carries a \${call.timeout} s deadline, expected FANOUT_DEADLINE_MS = 500\`);
     }
   }
+  ctx.grpc.setLatency('CheckComment', 0.3);
+  const slow = await comment(store, 'Worth the wait');
+  assert.equal(await m.fanout('acme', slow), 'allowed', 'a comment moderation allows after 0.3 s must come back allowed');
+  const notes = ctx.grpc.callsTo('NotifyAuthor').filter(call => call.request.comment_id === slow.id).map(call => call.timeout);
+  assert(notes.length > 0 && typeof notes[0] === 'number' && notes[0] >= 0.4 && notes[0] <= 0.6, \`after a CheckComment that took 0.3 s, the NotifyAuthor call carried a \${notes[0]} s deadline: each call gets its own FANOUT_DEADLINE_MS, not what is left of one shared budget\`);
 }
 
 export async function check_request_id(ctx) {
@@ -767,6 +798,19 @@ export async function check_moderation_first(ctx) {
   assert.equal(await m.fanout('acme', spam), 'blocked', 'a comment moderation rejects must come back blocked');
   assert.equal(await statusOf(store, spam), 'blocked', "the blocked comment's status");
   assert(!notified(ctx).includes(spam.id), \`the thread was notified about \${spam.id}, a comment moderation blocked\`);
+  ctx.grpc.setLatency('NotifyAuthor', 2);
+  const stalled = await comment(store, 'Notifier is slow');
+  let late;
+  try {
+    late = await m.fanout('acme', stalled);
+  } catch (e) {
+    assert.fail(\`the notifier ran past its deadline after moderation allowed \${stalled.id} and fanout threw \${(e as Error).message}: any failed announcement only queues a retry\`);
+  }
+  const lateStored = await statusOf(store, stalled);
+  assert(late === 'allowed' && lateStored === 'allowed', \`the notifier ran past its deadline after moderation allowed \${stalled.id}; fanout resolved \${late}, the store holds \${lateStored}, expected allowed: any failed announcement only queues a retry\`);
+  const retried = (ctx.redis.lrange('notify:retry', 0, -1) as string[]).map(entry => JSON.parse(entry).comment_id);
+  assert.equal(retried.filter(id => id === stalled.id).length, 1, \`notify:retry holds \${JSON.stringify(retried)}: the notification that timed out must be queued once for \${stalled.id}\`);
+  assert.equal(Number(ctx.redis.llen('review:queue')), 0, 'a notifier timeout is not a moderation timeout: nothing goes to review:queue');
 }
 
 export async function check_timeout_review(ctx) {
@@ -784,8 +828,26 @@ export async function check_timeout_review(ctx) {
   const queued = ctx.redis.lrange('review:queue', 0, -1);
   assert.deepStrictEqual(queued, [\`acme:\${c.id}\`], \`review:queue holds \${JSON.stringify(queued)}, expected the comment waiting for a moderator\`);
   assert(!notified(ctx).includes(c.id), 'a comment waiting for review must not be announced yet');
-  ctx.grpc.fail('CheckComment', ctx.grpc.status.UNAVAILABLE);
-  await assert.rejects(m.fanout('acme', await comment(store, 'Another')), 'moderation answered UNAVAILABLE and fanout resolved a status: only a deadline becomes a review, other failures must reach the caller');
+  for (const code of ['UNAVAILABLE', 'INTERNAL', 'PERMISSION_DENIED']) {
+    ctx.grpc.fail('CheckComment', ctx.grpc.status[code]);
+    const other = await comment(store, \`Another (\${code})\`);
+    let outcome;
+    try {
+      outcome = await m.fanout('acme', other);
+    } catch {
+      outcome = undefined;
+    }
+    assert.equal(outcome, undefined, \`moderation answered \${code} and fanout resolved \${outcome}: only a deadline becomes a review, other failures must reach the caller\`);
+    assert((await statusOf(store, other)) !== 'pending_review' && Number(ctx.redis.llen('review:queue')) === 1, \`moderation answered \${code} and the comment went to review anyway: only a deadline does\`);
+  }
+  ctx.grpc.setLatency('CheckComment', 2);
+  const stalled = await comment(store, 'Moderation is slow');
+  const started = ctx.clock.now();
+  const late = await m.fanout('acme', stalled);
+  const waited = (ctx.clock.now() - started) / 1000;
+  const lateStored = await statusOf(store, stalled);
+  assert(late === 'pending_review' && lateStored === 'pending_review', \`moderation stalled for 2 s and fanout resolved \${late}, expected pending_review once its deadline passed\`);
+  assert(waited <= 0.6, \`moderation stalled and fanout took \${waited.toFixed(2)} s: the 500 ms deadline must end the wait\`);
 }
 `,
     go: `package main
@@ -804,66 +866,58 @@ import (
 	"leetbuild/harness"
 )
 
-var fanoutBg = context.Background()
+var hBg = context.Background()
 
-// moderationPeer allows every comment that does not mention spam.
-type moderationPeer struct {
+// hModerationPeer allows every comment that does not mention spam.
+type hModerationPeer struct {
 	pb.UnimplementedModerationServer
 }
 
-func (moderationPeer) CheckComment(_ context.Context, req *pb.CheckRequest) (*pb.Verdict, error) {
+func (hModerationPeer) CheckComment(_ context.Context, req *pb.CheckRequest) (*pb.Verdict, error) {
 	spam := strings.Contains(req.GetText(), "spam")
 	return &pb.Verdict{Allowed: !spam}, nil
 }
 
-type notifierPeer struct {
+type hNotifierPeer struct {
 	pb.UnimplementedNotifierServer
 }
 
-func (notifierPeer) NotifyAuthor(context.Context, *pb.NotifyRequest) (*pb.NotifyAck, error) {
+func (hNotifierPeer) NotifyAuthor(context.Context, *pb.NotifyRequest) (*pb.NotifyAck, error) {
 	return &pb.NotifyAck{Queued: true}, nil
 }
 
-func peers(ctx *harness.Ctx) {
-	pb.RegisterModerationServer(ctx.GRPC.Server("moderation:9000"), moderationPeer{})
-	pb.RegisterNotifierServer(ctx.GRPC.Server("notifier:9000"), notifierPeer{})
+func hPeers(ctx *harness.Ctx) {
+	pb.RegisterModerationServer(ctx.GRPC.Server("moderation:9000"), hModerationPeer{})
+	pb.RegisterNotifierServer(ctx.GRPC.Server("notifier:9000"), hNotifierPeer{})
 }
 
-func storedComment(ctx *harness.Ctx, text string) store.Comment {
-	c, err := store.NewComment(fanoutBg, "t-1", "", "u-1", text, text)
+func hStoredComment(ctx *harness.Ctx, text string) store.Comment {
+	c, err := store.NewComment(hBg, "t-1", "", "u-1", text, text)
 	ctx.NoError(err, "store.NewComment failed")
-	ctx.NoError(store.Insert(fanoutBg, "acme", c), "store.Insert failed")
+	ctx.NoError(store.Insert(hBg, "acme", c), "store.Insert failed")
 	return c
 }
 
-func statusOf(c store.Comment) string { return store.Get(fanoutBg, "acme", c.ID).Status }
+func hStatusOf(c store.Comment) string { return store.Get(hBg, "acme", c.ID).Status }
 
-func notifiedIDs(ctx *harness.Ctx) []string {
-	var ids []string
+func hNotified(ctx *harness.Ctx, id string) bool {
 	for _, call := range ctx.GRPC.CallsTo("NotifyAuthor", "") {
-		ids = append(ids, call.Request.(*pb.NotifyRequest).GetCommentId())
-	}
-	return ids
-}
-
-func contains(ids []string, id string) bool {
-	for _, x := range ids {
-		if x == id {
+		if call.Request.(*pb.NotifyRequest).GetCommentId() == id {
 			return true
 		}
 	}
 	return false
 }
 
-func mustFanout(ctx *harness.Ctx, c store.Comment) string {
-	outcome, err := fanout(fanoutBg, "acme", c)
+func hFanout(ctx *harness.Ctx, c store.Comment) string {
+	outcome, err := fanout(hBg, "acme", c)
 	ctx.NoError(err, "fanout(%s) failed", c.ID)
 	return outcome
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peers(ctx)
-	ctx.Equal(mustFanout(ctx, storedComment(ctx, "Great write-up")), "allowed", "a comment moderation allows")
+	hPeers(ctx)
+	ctx.Equal(hFanout(ctx, hStoredComment(ctx, "Great write-up")), "allowed", "a comment moderation allows")
 	for _, method := range []string{"CheckComment", "NotifyAuthor"} {
 		calls := ctx.GRPC.CallsTo(method, "")
 		ctx.Assert(len(calls) > 0, "no %s call was made for an allowed comment", method)
@@ -872,13 +926,23 @@ func CheckDeadline(ctx *harness.Ctx) {
 			ctx.Assert(400*time.Millisecond <= call.Timeout && call.Timeout <= 600*time.Millisecond, "a %s call carries a %v deadline, expected fanoutDeadline = 500 ms", method, call.Timeout)
 		}
 	}
+	ctx.GRPC.SetLatency("CheckComment", 0.3, "")
+	slow := hStoredComment(ctx, "Worth the wait")
+	ctx.Equal(hFanout(ctx, slow), "allowed", "a comment moderation allows after 0.3 s")
+	var note time.Duration
+	for _, call := range ctx.GRPC.CallsTo("NotifyAuthor", "") {
+		if call.Request.(*pb.NotifyRequest).GetCommentId() == slow.ID && call.HasDeadline() {
+			note = call.Timeout
+		}
+	}
+	ctx.Assert(400*time.Millisecond <= note && note <= 600*time.Millisecond, "after a CheckComment that took 0.3 s, the NotifyAuthor call carried a %v deadline (0 is none): each call gets its own fanoutDeadline, not what is left of one shared budget", note)
 }
 
 func CheckRequestId(ctx *harness.Ctx) {
-	peers(ctx)
-	c := storedComment(ctx, "Great write-up")
-	mustFanout(ctx, c)
-	mustFanout(ctx, c) // the job is redelivered: the same comment fans out again
+	hPeers(ctx)
+	c := hStoredComment(ctx, "Great write-up")
+	hFanout(ctx, c)
+	hFanout(ctx, c) // the job is redelivered: the same comment fans out again
 	var ids []string
 	for _, call := range ctx.GRPC.CallsTo("CheckComment", "") {
 		ids = append(ids, call.Request.(*pb.CheckRequest).GetRequestId())
@@ -892,8 +956,8 @@ func CheckRequestId(ctx *harness.Ctx) {
 	}
 	ctx.Assert(same, "the calls about %s carried request_id %q: every attempt about one comment must carry its id, or a redelivered job looks like a new comment", c.ID, ids)
 	ctx.GRPC.Fail("NotifyAuthor", codes.Unavailable, "", 1, "")
-	other := storedComment(ctx, "Second thought")
-	mustFanout(ctx, other)
+	other := hStoredComment(ctx, "Second thought")
+	hFanout(ctx, other)
 	var retries []map[string]string
 	for _, entry := range ctx.Redis.LRange("notify:retry", 0, -1) {
 		var e map[string]string
@@ -904,31 +968,59 @@ func CheckRequestId(ctx *harness.Ctx) {
 }
 
 func CheckModerationFirst(ctx *harness.Ctx) {
-	peers(ctx)
+	hPeers(ctx)
 	ctx.GRPC.Fail("NotifyAuthor", codes.Unavailable, "", 1, "")
-	c := storedComment(ctx, "Great write-up")
-	outcome := mustFanout(ctx, c)
+	c := hStoredComment(ctx, "Great write-up")
+	outcome := hFanout(ctx, c)
 	ctx.Assert(len(ctx.GRPC.CallsTo("CheckComment", "")) > 0, "the notifier failed and moderation was never asked: the comment went live unmoderated. Moderate first; the notification is best effort")
-	ctx.Assert(outcome == "allowed" && statusOf(c) == "allowed", "with moderation allowing it, the comment must be allowed despite the notifier failing; fanout returned %q, the store holds %q", outcome, statusOf(c))
+	ctx.Assert(outcome == "allowed" && hStatusOf(c) == "allowed", "with moderation allowing it, the comment must be allowed despite the notifier failing; fanout returned %q, the store holds %q", outcome, hStatusOf(c))
 	ctx.Equal(ctx.Redis.LLen("notify:retry"), 1, "the failed notification must be queued once on notify:retry; the entries")
-	spam := storedComment(ctx, "Buy spam now")
-	ctx.Equal(mustFanout(ctx, spam), "blocked", "a comment moderation rejects")
-	ctx.Equal(statusOf(spam), "blocked", "the blocked comment's status")
-	ctx.Assert(!contains(notifiedIDs(ctx), spam.ID), "the thread was notified about %s, a comment moderation blocked", spam.ID)
+	spam := hStoredComment(ctx, "Buy spam now")
+	ctx.Equal(hFanout(ctx, spam), "blocked", "a comment moderation rejects")
+	ctx.Equal(hStatusOf(spam), "blocked", "the blocked comment's status")
+	ctx.Assert(!hNotified(ctx, spam.ID), "the thread was notified about %s, a comment moderation blocked", spam.ID)
+	ctx.GRPC.SetLatency("NotifyAuthor", 2, "")
+	stalled := hStoredComment(ctx, "Notifier is slow")
+	late, err := fanout(hBg, "acme", stalled)
+	ctx.Assert(err == nil, "the notifier ran past its deadline after moderation allowed %s and fanout failed: %v. Any failed announcement only queues a retry", stalled.ID, err)
+	ctx.Assert(late == "allowed" && hStatusOf(stalled) == "allowed", "the notifier ran past its deadline after moderation allowed %s; fanout returned %q, the store holds %q, expected allowed: any failed announcement only queues a retry", stalled.ID, late, hStatusOf(stalled))
+	queued := 0
+	var retried []string
+	for _, entry := range ctx.Redis.LRange("notify:retry", 0, -1) {
+		var e map[string]string
+		json.Unmarshal([]byte(entry), &e)
+		retried = append(retried, e["comment_id"])
+		if e["comment_id"] == stalled.ID {
+			queued++
+		}
+	}
+	ctx.Assert(queued == 1, "notify:retry holds %q: the notification that timed out must be queued once for %s", retried, stalled.ID)
+	ctx.Equal(ctx.Redis.LLen("review:queue"), 0, "a notifier timeout is not a moderation timeout: nothing goes to review:queue; its entries")
 }
 
 func CheckTimeoutReview(ctx *harness.Ctx) {
-	peers(ctx)
+	hPeers(ctx)
 	ctx.GRPC.Fail("CheckComment", codes.DeadlineExceeded, "", 1, "")
-	c := storedComment(ctx, "Great write-up")
-	outcome, err := fanout(fanoutBg, "acme", c)
+	c := hStoredComment(ctx, "Great write-up")
+	outcome, err := fanout(hBg, "acme", c)
 	ctx.Assert(err == nil, "moderation ran out of time and fanout failed: %v. A moderation timeout is not a failed post: flag the comment pending_review and queue it for review", err)
-	ctx.Assert(outcome == "pending_review" && statusOf(c) == "pending_review", "after a moderation timeout fanout returned %q and the store holds %q, expected pending_review", outcome, statusOf(c))
+	ctx.Assert(outcome == "pending_review" && hStatusOf(c) == "pending_review", "after a moderation timeout fanout returned %q and the store holds %q, expected pending_review", outcome, hStatusOf(c))
 	ctx.Equal(ctx.Redis.LRange("review:queue", 0, -1), []string{"acme:" + c.ID}, "review:queue must hold the comment waiting for a moderator")
-	ctx.Assert(!contains(notifiedIDs(ctx), c.ID), "a comment waiting for review must not be announced yet")
-	ctx.GRPC.Fail("CheckComment", codes.Unavailable, "", 1, "")
-	_, err = fanout(fanoutBg, "acme", storedComment(ctx, "Another"))
-	ctx.Assert(err != nil, "moderation answered UNAVAILABLE and fanout returned a status: only a deadline becomes a review, other failures must reach the caller")
+	ctx.Assert(!hNotified(ctx, c.ID), "a comment waiting for review must not be announced yet")
+	for _, code := range []codes.Code{codes.Unavailable, codes.Internal, codes.PermissionDenied} {
+		ctx.GRPC.Fail("CheckComment", code, "", 1, "")
+		other := hStoredComment(ctx, "Another ("+code.String()+")")
+		outcome, err := fanout(hBg, "acme", other)
+		ctx.Assert(err != nil, "moderation answered %v and fanout returned %q: only a deadline becomes a review, other failures must reach the caller", code, outcome)
+		ctx.Assert(hStatusOf(other) != "pending_review" && ctx.Redis.LLen("review:queue") == 1, "moderation answered %v and the comment went to review anyway: only a deadline does", code)
+	}
+	ctx.GRPC.SetLatency("CheckComment", 2, "")
+	stalled := hStoredComment(ctx, "Moderation is slow")
+	started := ctx.Clock.Now()
+	late, err := fanout(hBg, "acme", stalled)
+	waited := float64(ctx.Clock.Now()-started) / 1000
+	ctx.Assert(err == nil && late == "pending_review" && hStatusOf(stalled) == "pending_review", "moderation stalled for 2 s and fanout returned %q (%v), expected pending_review once its deadline passed", late, err)
+	ctx.Assert(waited <= 0.6, "moderation stalled and fanout took %.2f s: the 500 ms deadline must end the wait", waited)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -945,7 +1037,7 @@ func CheckTimeoutReview(ctx *harness.Ctx) {
 namespace {
 
 // Allows every comment that does not mention spam.
-class ModerationPeer final : public commentsd::Moderation::Service {
+class HModerationPeer final : public commentsd::Moderation::Service {
  public:
   grpc::Status CheckComment(grpc::ServerContext*, const commentsd::CheckRequest* req, commentsd::Verdict* out) override {
     out->set_allowed(req->text().find("spam") == std::string::npos);
@@ -953,7 +1045,7 @@ class ModerationPeer final : public commentsd::Moderation::Service {
   }
 };
 
-class NotifierPeer final : public commentsd::Notifier::Service {
+class HNotifierPeer final : public commentsd::Notifier::Service {
  public:
   grpc::Status NotifyAuthor(grpc::ServerContext*, const commentsd::NotifyRequest*, commentsd::NotifyAck* out) override {
     out->set_queued(true);
@@ -961,33 +1053,33 @@ class NotifierPeer final : public commentsd::Notifier::Service {
   }
 };
 
-struct Peers {
-  ModerationPeer moderation;
-  NotifierPeer notifier;
+struct HPeers {
+  HModerationPeer moderation;
+  HNotifierPeer notifier;
 };
 
-void peers(harness::Ctx& ctx) {
-  static Peers* p = nullptr;
+void hPeers(harness::Ctx& ctx) {
+  static HPeers* p = nullptr;
   delete p;
-  p = new Peers;
+  p = new HPeers;
   ctx.GRPC.Server("moderation:9000")->RegisterService(&p->moderation);
   ctx.GRPC.Server("notifier:9000")->RegisterService(&p->notifier);
 }
 
-store::Comment storedComment(const std::string& text) {
+store::Comment hStoredComment(const std::string& text) {
   return store::insert("acme", store::newComment("t-1", "", "u-1", text, text));
 }
 
-std::string statusOf(const store::Comment& c) { return store::get("acme", c.id)->status; }
+std::string hStatusOf(const store::Comment& c) { return store::get("acme", c.id)->status; }
 
-bool notified(harness::Ctx& ctx, const std::string& id) {
+bool hNotified(harness::Ctx& ctx, const std::string& id) {
   for (const auto& call : ctx.GRPC.CallsTo("NotifyAuthor")) {
     if (call.Request<commentsd::NotifyRequest>().comment_id() == id) return true;
   }
   return false;
 }
 
-std::string mustFanout(harness::Ctx& ctx, const store::Comment& c) {
+std::string hFanout(harness::Ctx& ctx, const store::Comment& c) {
   try {
     return fanout("acme", c);
   } catch (const std::exception& e) {
@@ -998,8 +1090,8 @@ std::string mustFanout(harness::Ctx& ctx, const store::Comment& c) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  peers(ctx);
-  ctx.Equal(mustFanout(ctx, storedComment("Great write-up")), "allowed", "a comment moderation allows");
+  hPeers(ctx);
+  ctx.Equal(hFanout(ctx, hStoredComment("Great write-up")), "allowed", "a comment moderation allows");
   for (const std::string method : {"CheckComment", "NotifyAuthor"}) {
     const auto calls = ctx.GRPC.CallsTo(method);
     ctx.Assert(!calls.empty(), "no %s call was made for an allowed comment", method);
@@ -1008,21 +1100,28 @@ void CheckDeadline(harness::Ctx& ctx) {
       ctx.Assert(0.4 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.6, "a %s call carries a %v s deadline, expected kFanoutDeadline = 500 ms", method, call.TimeoutSeconds());
     }
   }
+  ctx.GRPC.SetLatency("CheckComment", 0.3);
+  const store::Comment slow = hStoredComment("Worth the wait");
+  ctx.Equal(hFanout(ctx, slow), "allowed", "a comment moderation allows after 0.3 s");
+  double note = 0;
+  for (const auto& call : ctx.GRPC.CallsTo("NotifyAuthor"))
+    if (call.Request<commentsd::NotifyRequest>().comment_id() == slow.id && call.HasDeadline()) note = call.TimeoutSeconds();
+  ctx.Assert(0.4 <= note && note <= 0.6, "after a CheckComment that took 0.3 s, the NotifyAuthor call carried a %v s deadline (0 is none): each call gets its own kFanoutDeadline, not what is left of one shared budget", note);
 }
 
 void CheckRequestId(harness::Ctx& ctx) {
-  peers(ctx);
-  const store::Comment c = storedComment("Great write-up");
-  mustFanout(ctx, c);
-  mustFanout(ctx, c);  // the job is redelivered: the same comment fans out again
+  hPeers(ctx);
+  const store::Comment c = hStoredComment("Great write-up");
+  hFanout(ctx, c);
+  hFanout(ctx, c);  // the job is redelivered: the same comment fans out again
   std::vector<std::string> ids;
   for (const auto& call : ctx.GRPC.CallsTo("CheckComment")) ids.push_back(call.Request<commentsd::CheckRequest>().request_id());
   for (const auto& call : ctx.GRPC.CallsTo("NotifyAuthor")) ids.push_back(call.Request<commentsd::NotifyRequest>().request_id());
   const bool same = !ids.empty() && std::all_of(ids.begin(), ids.end(), [&](const std::string& id) { return id == c.id; });
   ctx.Assert(same, "the calls about %s carried request_id %q: every attempt about one comment must carry its id, or a redelivered job looks like a new comment", c.id, ids);
   ctx.GRPC.Fail("NotifyAuthor", grpc::StatusCode::UNAVAILABLE);
-  const store::Comment other = storedComment("Second thought");
-  mustFanout(ctx, other);
+  const store::Comment other = hStoredComment("Second thought");
+  hFanout(ctx, other);
   const auto entries = ctx.Redis.LRange("notify:retry", 0, -1);
   ctx.Equal(entries.size(), 1, "after a failed notification, the entries on notify:retry");
   const auto entry = nlohmann::json::parse(entries[0], nullptr, false);
@@ -1031,40 +1130,75 @@ void CheckRequestId(harness::Ctx& ctx) {
 }
 
 void CheckModerationFirst(harness::Ctx& ctx) {
-  peers(ctx);
+  hPeers(ctx);
   ctx.GRPC.Fail("NotifyAuthor", grpc::StatusCode::UNAVAILABLE);
-  const store::Comment c = storedComment("Great write-up");
-  const std::string outcome = mustFanout(ctx, c);
+  const store::Comment c = hStoredComment("Great write-up");
+  const std::string outcome = hFanout(ctx, c);
   ctx.Assert(!ctx.GRPC.CallsTo("CheckComment").empty(), "the notifier failed and moderation was never asked: the comment went live unmoderated. Moderate first; the notification is best effort");
-  ctx.Assert(outcome == "allowed" && statusOf(c) == "allowed", "with moderation allowing it, the comment must be allowed despite the notifier failing; fanout returned %q, the store holds %q", outcome, statusOf(c));
+  ctx.Assert(outcome == "allowed" && hStatusOf(c) == "allowed", "with moderation allowing it, the comment must be allowed despite the notifier failing; fanout returned %q, the store holds %q", outcome, hStatusOf(c));
   ctx.Equal(ctx.Redis.LLen("notify:retry"), 1, "the failed notification must be queued once on notify:retry; the entries");
-  const store::Comment spam = storedComment("Buy spam now");
-  ctx.Equal(mustFanout(ctx, spam), "blocked", "a comment moderation rejects");
-  ctx.Equal(statusOf(spam), "blocked", "the blocked comment's status");
-  ctx.Assert(!notified(ctx, spam.id), "the thread was notified about %s, a comment moderation blocked", spam.id);
+  const store::Comment spam = hStoredComment("Buy spam now");
+  ctx.Equal(hFanout(ctx, spam), "blocked", "a comment moderation rejects");
+  ctx.Equal(hStatusOf(spam), "blocked", "the blocked comment's status");
+  ctx.Assert(!hNotified(ctx, spam.id), "the thread was notified about %s, a comment moderation blocked", spam.id);
+  ctx.GRPC.SetLatency("NotifyAuthor", 2);
+  const store::Comment stalled = hStoredComment("Notifier is slow");
+  std::string late;
+  try {
+    late = fanout("acme", stalled);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("the notifier ran past its deadline after moderation allowed %s and fanout threw %s: %s. Any failed announcement only queues a retry", stalled.id, harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Assert(late == "allowed" && hStatusOf(stalled) == "allowed", "the notifier ran past its deadline after moderation allowed %s; fanout returned %q, the store holds %q, expected allowed: any failed announcement only queues a retry", stalled.id, late, hStatusOf(stalled));
+  int queued = 0;
+  for (const auto& raw : ctx.Redis.LRange("notify:retry", 0, -1)) {
+    const auto e = nlohmann::json::parse(raw, nullptr, false);
+    if (e.is_object() && e.value("comment_id", "") == stalled.id) queued++;
+  }
+  ctx.Assert(queued == 1, "notify:retry holds %q: the notification that timed out must be queued once for %s", ctx.Redis.LRange("notify:retry", 0, -1), stalled.id);
+  ctx.Equal(ctx.Redis.LLen("review:queue"), 0, "a notifier timeout is not a moderation timeout: nothing goes to review:queue; its entries");
 }
 
 void CheckTimeoutReview(harness::Ctx& ctx) {
-  peers(ctx);
+  hPeers(ctx);
   ctx.GRPC.Fail("CheckComment", grpc::StatusCode::DEADLINE_EXCEEDED);
-  const store::Comment c = storedComment("Great write-up");
+  const store::Comment c = hStoredComment("Great write-up");
   std::string outcome;
   try {
     outcome = fanout("acme", c);
   } catch (const std::exception& e) {
     ctx.Fatalf("moderation ran out of time and fanout threw %s: %s. A moderation timeout is not a failed post: flag the comment pending_review and queue it for review", harness::CurrentExceptionType(), e.what());
   }
-  ctx.Assert(outcome == "pending_review" && statusOf(c) == "pending_review", "after a moderation timeout fanout returned %q and the store holds %q, expected pending_review", outcome, statusOf(c));
+  ctx.Assert(outcome == "pending_review" && hStatusOf(c) == "pending_review", "after a moderation timeout fanout returned %q and the store holds %q, expected pending_review", outcome, hStatusOf(c));
   ctx.Equal(ctx.Redis.LRange("review:queue", 0, -1), std::vector<std::string>{"acme:" + c.id}, "review:queue must hold the comment waiting for a moderator");
-  ctx.Assert(!notified(ctx, c.id), "a comment waiting for review must not be announced yet");
-  ctx.GRPC.Fail("CheckComment", grpc::StatusCode::UNAVAILABLE);
-  bool threw = false;
-  try {
-    fanout("acme", storedComment("Another"));
-  } catch (const std::exception&) {
-    threw = true;
+  ctx.Assert(!hNotified(ctx, c.id), "a comment waiting for review must not be announced yet");
+  const std::vector<std::pair<grpc::StatusCode, std::string>> failures = {
+      {grpc::StatusCode::UNAVAILABLE, "UNAVAILABLE"}, {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}};
+  for (const auto& [code, name] : failures) {
+    ctx.GRPC.Fail("CheckComment", code);
+    const store::Comment other = hStoredComment("Another (" + name + ")");
+    bool threw = false;
+    std::string got;
+    try {
+      got = fanout("acme", other);
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    ctx.Assert(threw, "moderation answered %s and fanout returned %q: only a deadline becomes a review, other failures must reach the caller", name, got);
+    ctx.Assert(hStatusOf(other) != "pending_review" && ctx.Redis.LLen("review:queue") == 1, "moderation answered %s and the comment went to review anyway: only a deadline does", name);
   }
-  ctx.Assert(threw, "moderation answered UNAVAILABLE and fanout returned a status: only a deadline becomes a review, other failures must reach the caller");
+  ctx.GRPC.SetLatency("CheckComment", 2);
+  const store::Comment stalled = hStoredComment("Moderation is slow");
+  const int64_t started = ctx.Clock.Now();
+  std::string late;
+  try {
+    late = fanout("acme", stalled);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("moderation stalled for 2 s and fanout threw %s: %s, expected pending_review once its deadline passed", harness::CurrentExceptionType(), e.what());
+  }
+  const double waited = (ctx.Clock.Now() - started) / 1000.0;
+  ctx.Assert(late == "pending_review" && hStatusOf(stalled) == "pending_review", "moderation stalled for 2 s and fanout returned %q, expected pending_review once its deadline passed", late);
+  ctx.Assert(waited <= 0.6, "moderation stalled and fanout took %v s: the 500 ms deadline must end the wait", waited);
 }
 `,
   },

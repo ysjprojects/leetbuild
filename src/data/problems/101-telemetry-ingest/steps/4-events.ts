@@ -72,7 +72,7 @@ failover loses one; and a broker that refuses or stalls drops the window for goo
       id: 'bucketed-payload',
       title: 'Carries per-metric mean, count and max, not raw samples',
       detail:
-        'Five samples of one window produce one event whose `buckets` hold each metric’s mean, count and max, and no `samples` field. The starter ships every raw reading, one record per metric.',
+        'Five samples of one window produce one event whose `buckets` hold each metric’s mean, count and max, with `device_id` and `window_start` its only other fields. The starter ships every raw reading, one record per metric.',
       match: {
         python: {all: [/["']mean["']/, /["']count["']/, /["']max["']/], none: [/["']samples["']\s*:/]},
         typescript: {all: [/\bmean:/, /\bcount:/, /\bmax:/], none: [/samples:\s*points/]},
@@ -111,7 +111,7 @@ failover loses one; and a broker that refuses or stalls drops the window for goo
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A refused delivery, or none within 2 s, leaves an outbox row with the topic, the device key and the rollup, and the call returns false. The starter never looks at the broker’s answer.',
+        'A refused delivery, or none within 2 s, leaves an outbox row with the topic, the device key and the rollup, and the call returns false; a refused window does not hold back the next one. The starter never looks at the broker’s answer.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/\binsert\(/, /await producer\.send\(/, /catch/]},
@@ -718,6 +718,8 @@ def check_bucketed_payload(ctx):
     assert len(events) == 1, f"five samples of one window produced {len(events)} records, expected one rollup for the window: {events}"
     event = events[0]
     assert "samples" not in event, f"the rollup carries the raw samples: {event}. The topic is meant to be smaller than the store it summarises"
+    assert sorted(event) == ["buckets", "device_id", "window_start"], f"the rollup's fields are {sorted(event)}, expected exactly device_id, window_start and buckets: anything else is raw data the topic was meant to summarise"
+    assert event["device_id"] == "d-1", f"the rollup names device {event['device_id']!r}, expected d-1"
     buckets = event.get("buckets") or {}
     assert buckets.get("temp_c") == {"mean": 23, "count": 3, "max": 27}, f"temp_c's bucket is {buckets.get('temp_c')}, expected mean 23, count 3, max 27"
     assert buckets.get("humidity") == {"mean": 42, "count": 2, "max": 44}, f"humidity's bucket is {buckets.get('humidity')}, expected mean 42, count 2, max 44"
@@ -749,20 +751,22 @@ def check_acks_idempotent(ctx):
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
     ctx.kafka.fail_next(TOPIC, 1)
-    ok = m.publish_rollup("d-1", [_s("temp_c", 20, T0 + 1)])
+    ok = m.publish_rollup("d-1", [_s("temp_c", 20, T0 + 1), _s("temp_c", 21, T0 + 61)])
     _settle(m)
     rows = _outbox(ctx)
-    assert len(rows) == 1, f"the broker refused the rollup and the outbox holds {len(rows)} rows: the window is gone for every consumer"
+    assert len(rows) == 1, f"the broker refused the first of two rollups and the outbox holds {len(rows)} rows: the window is gone for every consumer"
     row = rows[0]
-    assert row.get("topic") == TOPIC and row.get("key") == "d-1" and (row.get("payload") or {}).get("window_start") == T0, f"the outbox row is {row}, expected the topic, the key d-1 and the rollup"
-    assert ok is False, f"publish_rollup returned {ok!r} after a refused delivery, expected False"
+    assert row.get("topic") == TOPIC and row.get("key") == "d-1" and (row.get("payload") or {}).get("window_start") == T0, f"the outbox row is {row}, expected the topic, the key d-1 and the refused rollup of window {T0}"
+    delivered = [e.get("window_start") for e in _events(ctx)]
+    assert delivered == [T0 + 60], f"the topic holds the windows {delivered}, expected {T0 + 60}: a refused rollup must not stop the next one"
+    assert ok is False, f"publish_rollup returned {ok!r} after one of its rollups was refused, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
-    ok = m.publish_rollup("d-1", [_s("temp_c", 22, T0 + 61)])
+    ok = m.publish_rollup("d-1", [_s("temp_c", 22, T0 + 121)])
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_rollup waited {waited:.0f} s for a broker that does not answer: wait at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_rollup waited {waited:.1f} s for a broker that does not answer: wait at most ACK_TIMEOUT_S = 2, then write the outbox row"
     rows = _outbox(ctx)
-    assert len(rows) == 2 and (rows[1].get("payload") or {}).get("window_start") == T0 + 60, f"no acknowledgement within the window and the outbox holds {rows}"
+    assert len(rows) == 2 and (rows[1].get("payload") or {}).get("window_start") == T0 + 120, f"no acknowledgement within the window and the outbox holds {rows}"
     assert ok is False, f"publish_rollup returned {ok!r} without an acknowledgement, expected False"
 `,
     typescript: `const TOPIC = 'telemetry.rollup';
@@ -799,6 +803,9 @@ export async function check_bucketed_payload(ctx) {
   assert.equal(all.length, 1, \`five samples of one window produced \${all.length} records, expected one rollup for the window: \${JSON.stringify(all)}\`);
   const event = all[0];
   assert(!('samples' in event), \`the rollup carries the raw samples: \${JSON.stringify(event)}. The topic is meant to be smaller than the store it summarises\`);
+  const fields = Object.keys(event).sort();
+  assert.deepEqual(fields, ['buckets', 'device_id', 'window_start'], \`the rollup's fields are \${JSON.stringify(fields)}, expected exactly device_id, window_start and buckets: anything else is raw data the topic was meant to summarise\`);
+  assert.equal(event.device_id, 'd-1', \`the rollup names device \${JSON.stringify(event.device_id)}, expected d-1\`);
   const buckets = event.buckets ?? {};
   assert.deepEqual(buckets.temp_c, {mean: 23, count: 3, max: 27}, \`temp_c's bucket is \${JSON.stringify(buckets.temp_c)}, expected mean 23, count 3, max 27\`);
   assert.deepEqual(buckets.humidity, {mean: 42, count: 2, max: 44}, \`humidity's bucket is \${JSON.stringify(buckets.humidity)}, expected mean 42, count 2, max 44\`);
@@ -830,19 +837,21 @@ export async function check_acks_idempotent(ctx) {
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishRollup('d-1', [s('temp_c', 20, T0 + 1)]);
+  let ok = await m.publishRollup('d-1', [s('temp_c', 20, T0 + 1), s('temp_c', 21, T0 + 61)]);
   await settle();
   let rows = outboxRows(ctx);
-  assert.equal(rows.length, 1, \`the broker refused the rollup and the outbox holds \${rows.length} rows: the window is gone for every consumer\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'd-1' && rows[0].payload?.window_start === T0, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key d-1 and the rollup\`);
-  assert.equal(ok, false, \`publishRollup resolved \${JSON.stringify(ok)} after a refused delivery, expected false\`);
+  assert.equal(rows.length, 1, \`the broker refused the first of two rollups and the outbox holds \${rows.length} rows: the window is gone for every consumer\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'd-1' && rows[0].payload?.window_start === T0, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key d-1 and the refused rollup of window \${T0}\`);
+  const delivered = events(ctx).map(e => e.window_start);
+  assert.deepEqual(delivered, [T0 + 60], \`the topic holds the windows \${JSON.stringify(delivered)}, expected \${T0 + 60}: a refused rollup must not stop the next one\`);
+  assert.equal(ok, false, \`publishRollup resolved \${JSON.stringify(ok)} after one of its rollups was refused, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
-  ok = await m.publishRollup('d-1', [s('temp_c', 22, T0 + 61)]);
+  ok = await m.publishRollup('d-1', [s('temp_c', 22, T0 + 121)]);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishRollup waited \${waited.toFixed(0)} s for a broker that does not answer: wait at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishRollup waited \${waited.toFixed(1)} s for a broker that does not answer: wait at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
-  assert(rows.length === 2 && rows[1].payload?.window_start === T0 + 60, \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
+  assert(rows.length === 2 && rows[1].payload?.window_start === T0 + 120, \`no acknowledgement within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishRollup resolved \${JSON.stringify(ok)} without an acknowledgement, expected false\`);
 }
 `,
@@ -851,6 +860,7 @@ export async function check_outbox_on_failure(ctx) {
 import (
 	"context"
 	"encoding/json"
+	"sort"
 
 	"ingestd/wal"
 
@@ -858,23 +868,23 @@ import (
 )
 
 const (
-	rollupTopic = "telemetry.rollup"
-	t0          = int64(1_800_000_000) // a window boundary
+	hRollupTopic = "telemetry.rollup"
+	hT0          = int64(1_800_000_000) // a window boundary
 )
 
-func smp(metric string, value float64, ts int64) wal.Sample {
+func hSmp(metric string, value float64, ts int64) wal.Sample {
 	return wal.Sample{Metric: metric, Value: value, TS: ts}
 }
 
-func publishAll(ctx *harness.Ctx, device string, samples ...wal.Sample) bool {
+func hPublishAll(ctx *harness.Ctx, device string, samples ...wal.Sample) bool {
 	ok, err := publishRollup(context.Background(), device, samples)
 	ctx.NoError(err, "publishRollup(%s)", device)
 	return ok
 }
 
-func rollupEvents(ctx *harness.Ctx) []map[string]any {
+func hRollupEvents(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
-	for _, value := range ctx.Kafka.Values(rollupTopic) {
+	for _, value := range ctx.Kafka.Values(hRollupTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(value), &e), "a rollup must be JSON: %s", value)
 		out = append(out, e)
@@ -882,88 +892,100 @@ func rollupEvents(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-type outboxEntry struct {
+type hOutboxEntry struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outboxEntries(ctx *harness.Ctx) []outboxEntry {
-	var rows []outboxEntry
+func hOutboxEntries(ctx *harness.Ctx) []hOutboxEntry {
+	var rows []hOutboxEntry
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxEntry
+		var row hOutboxEntry
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
 	return rows
 }
 
-func bucketOf(e map[string]any, metric string) map[string]any {
+func hBucketOf(e map[string]any, metric string) map[string]any {
 	buckets, _ := e["buckets"].(map[string]any)
 	b, _ := buckets[metric].(map[string]any)
 	return b
 }
 
 func CheckDeviceKey(ctx *harness.Ctx) {
-	publishAll(ctx, "d-1", smp("temp_c", 20, t0+1), smp("humidity", 40, t0+2))
-	publishAll(ctx, "d-2", smp("temp_c", 25, t0+3))
-	publishAll(ctx, "d-1", smp("temp_c", 22, t0+61))
+	hPublishAll(ctx, "d-1", hSmp("temp_c", 20, hT0+1), hSmp("humidity", 40, hT0+2))
+	hPublishAll(ctx, "d-2", hSmp("temp_c", 25, hT0+3))
+	hPublishAll(ctx, "d-1", hSmp("temp_c", 22, hT0+61))
 	ctx.Settle()
-	keys := ctx.Kafka.Keys(rollupTopic)
+	keys := ctx.Kafka.Keys(hRollupTopic)
 	ctx.Equal(keys, []string{"d-1", "d-2", "d-1"}, "the rollups must be keyed by the device ids (keyed by anything else, one device's windows scatter across partitions)")
-	records := ctx.Kafka.Records(rollupTopic)
+	records := ctx.Kafka.Records(hRollupTopic)
 	ctx.Equal(records[0].Partition, records[2].Partition, "both d-1 rollups must land on one partition, or a consumer reads its windows out of order; the partitions")
 }
 
 func CheckBucketedPayload(ctx *harness.Ctx) {
-	publishAll(ctx, "d-1", smp("temp_c", 20, t0+1), smp("temp_c", 22, t0+10), smp("temp_c", 27, t0+20), smp("humidity", 40, t0+5), smp("humidity", 44, t0+25))
+	hPublishAll(ctx, "d-1", hSmp("temp_c", 20, hT0+1), hSmp("temp_c", 22, hT0+10), hSmp("temp_c", 27, hT0+20), hSmp("humidity", 40, hT0+5), hSmp("humidity", 44, hT0+25))
 	ctx.Settle()
-	all := rollupEvents(ctx)
+	all := hRollupEvents(ctx)
 	ctx.Equal(len(all), 1, "five samples of one window must produce one rollup (%v); the records", all)
 	_, raw := all[0]["samples"]
 	ctx.Assert(!raw, "the rollup carries the raw samples: %v. The topic is meant to be smaller than the store it summarises", all[0])
-	ctx.Equal(bucketOf(all[0], "temp_c"), map[string]any{"mean": 23.0, "count": 3.0, "max": 27.0}, "temp_c's bucket")
-	ctx.Equal(bucketOf(all[0], "humidity"), map[string]any{"mean": 42.0, "count": 2.0, "max": 44.0}, "humidity's bucket")
+	var fields []string
+	for field := range all[0] {
+		fields = append(fields, field)
+	}
+	sort.Strings(fields)
+	ctx.Equal(fields, []string{"buckets", "device_id", "window_start"}, "the rollup must carry exactly device_id, window_start and buckets (anything else is raw data the topic was meant to summarise); its fields")
+	ctx.Equal(all[0]["device_id"], any("d-1"), "the rollup's device_id")
+	ctx.Equal(hBucketOf(all[0], "temp_c"), map[string]any{"mean": 23.0, "count": 3.0, "max": 27.0}, "temp_c's bucket")
+	ctx.Equal(hBucketOf(all[0], "humidity"), map[string]any{"mean": 42.0, "count": 2.0, "max": 44.0}, "humidity's bucket")
 }
 
 func CheckWindowEvents(ctx *harness.Ctx) {
-	publishAll(ctx, "d-1", smp("temp_c", 20, t0+5), smp("temp_c", 22, t0+30), smp("temp_c", 30, t0+65))
+	hPublishAll(ctx, "d-1", hSmp("temp_c", 20, hT0+5), hSmp("temp_c", 22, hT0+30), hSmp("temp_c", 30, hT0+65))
 	ctx.Settle()
 	var starts, counts []any
-	for _, e := range rollupEvents(ctx) {
+	for _, e := range hRollupEvents(ctx) {
 		starts = append(starts, e["window_start"])
-		counts = append(counts, bucketOf(e, "temp_c")["count"])
+		counts = append(counts, hBucketOf(e, "temp_c")["count"])
 	}
-	ctx.Equal(starts, []any{float64(t0), float64(t0 + 60)}, "samples at t0+5, t0+30 and t0+65 must produce one event per window; window_start")
+	ctx.Equal(starts, []any{float64(hT0), float64(hT0 + 60)}, "samples at t0+5, t0+30 and t0+65 must produce one event per window; window_start")
 	ctx.Equal(counts, []any{2.0, 1.0}, "each window counts only its own samples; the counts")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(rollupTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	publishAll(ctx, "d-1", smp("temp_c", 20, t0+1))
+	ctx.Kafka.LoseAcks(hRollupTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hPublishAll(ctx, "d-1", hSmp("temp_c", 20, hT0+1))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(rollupTopic)), 1, "after one lost acknowledgement the producer's retry must not write the rollup twice (enable.idempotence); the records")
-	publishAll(ctx, "d-1", smp("temp_c", 22, t0+61))
+	ctx.Equal(len(ctx.Kafka.Records(hRollupTopic)), 1, "after one lost acknowledgement the producer's retry must not write the rollup twice (enable.idempotence); the records")
+	hPublishAll(ctx, "d-1", hSmp("temp_c", 22, hT0+61))
 	ctx.Settle()
-	ctx.Kafka.Failover(rollupTopic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(rollupTopic)), 2, "a leader failover must not lose a rollup (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hRollupTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hRollupTopic)), 2, "a leader failover must not lose a rollup (acks=all waits for every in-sync replica); the records")
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(rollupTopic, 1)
-	ok := publishAll(ctx, "d-1", smp("temp_c", 20, t0+1))
+	ctx.Kafka.FailNext(hRollupTopic, 1)
+	ok := hPublishAll(ctx, "d-1", hSmp("temp_c", 20, hT0+1), hSmp("temp_c", 21, hT0+61))
 	ctx.Settle()
-	rows := outboxEntries(ctx)
-	ctx.Equal(len(rows), 1, "the broker refused the rollup: without an outbox row the window is gone for every consumer; the rows")
-	ctx.Assert(rows[0].Topic == rollupTopic && rows[0].Key == "d-1" && rows[0].Payload["window_start"] == float64(t0), "the outbox row is %+v, expected the topic, the key d-1 and the rollup", rows[0])
-	ctx.Equal(ok, false, "publishRollup's result after a refused delivery")
-	ctx.Kafka.Stall(rollupTopic) // the broker stops answering
+	rows := hOutboxEntries(ctx)
+	ctx.Equal(len(rows), 1, "the broker refused the first of two rollups: without an outbox row the window is gone for every consumer; the rows")
+	ctx.Assert(rows[0].Topic == hRollupTopic && rows[0].Key == "d-1" && rows[0].Payload["window_start"] == float64(hT0), "the outbox row is %+v, expected the topic, the key d-1 and the refused rollup of window %d", rows[0], hT0)
+	var delivered []any
+	for _, e := range hRollupEvents(ctx) {
+		delivered = append(delivered, e["window_start"])
+	}
+	ctx.Equal(delivered, []any{float64(hT0 + 60)}, "a refused rollup must not stop the next one; the windows on the topic")
+	ctx.Equal(ok, false, "publishRollup's result after one of its rollups was refused")
+	ctx.Kafka.Stall(hRollupTopic) // the broker stops answering
 	before := ctx.Clock.Now()
-	ok = publishAll(ctx, "d-1", smp("temp_c", 22, t0+61))
+	ok = hPublishAll(ctx, "d-1", hSmp("temp_c", 22, hT0+121))
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishRollup waited %.0f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited)
-	rows = outboxEntries(ctx)
-	ctx.Assert(len(rows) == 2 && rows[1].Payload["window_start"] == float64(t0+60), "no acknowledgement within the window and the outbox holds %+v", rows)
+	ctx.Assert(waited <= 2.5, "publishRollup waited %.1f s for a broker that does not answer: wait at most ackTimeout = 2 s, then write the outbox row", waited)
+	rows = hOutboxEntries(ctx)
+	ctx.Assert(len(rows) == 2 && rows[1].Payload["window_start"] == float64(hT0+120), "no acknowledgement within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "publishRollup's result without an acknowledgement")
 }
 `,
@@ -980,87 +1002,96 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kRollupTopic = "telemetry.rollup";
-constexpr long long kT0 = 1800000000LL;  // a window boundary
+const std::string hKRollupTopic = "telemetry.rollup";
+constexpr long long hKT0 = 1800000000LL;  // a window boundary
 
-wal::Sample smp(const std::string& metric, double value, long long ts) { return wal::Sample{metric, value, ts}; }
+wal::Sample hSmp(const std::string& metric, double value, long long ts) { return wal::Sample{metric, value, ts}; }
 
-std::vector<json> rollupEvents(harness::Ctx& ctx) {
+std::vector<json> hRollupEvents(harness::Ctx& ctx) {
   std::vector<json> out;
-  for (const auto& value : ctx.Kafka.Values(kRollupTopic)) out.push_back(json::parse(value, nullptr, false));
+  for (const auto& value : ctx.Kafka.Values(hKRollupTopic)) out.push_back(json::parse(value, nullptr, false));
   return out;
 }
 
-std::vector<json> outboxEntries(harness::Ctx& ctx) {
+std::vector<json> hOutboxEntries(harness::Ctx& ctx) {
   std::vector<json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) rows.push_back(json::parse(text, nullptr, false));
   return rows;
 }
 
-json at(const json& j, const std::string& field) { return j.is_object() && j.contains(field) ? j[field] : json(); }
+json hAt(const json& j, const std::string& field) { return j.is_object() && j.contains(field) ? j[field] : json(); }
 
 }  // namespace
 
 void CheckDeviceKey(harness::Ctx& ctx) {
-  publishRollup("d-1", {smp("temp_c", 20, kT0 + 1), smp("humidity", 40, kT0 + 2)});
-  publishRollup("d-2", {smp("temp_c", 25, kT0 + 3)});
-  publishRollup("d-1", {smp("temp_c", 22, kT0 + 61)});
+  publishRollup("d-1", {hSmp("temp_c", 20, hKT0 + 1), hSmp("humidity", 40, hKT0 + 2)});
+  publishRollup("d-2", {hSmp("temp_c", 25, hKT0 + 3)});
+  publishRollup("d-1", {hSmp("temp_c", 22, hKT0 + 61)});
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Keys(kRollupTopic), {"d-1", "d-2", "d-1"}, "the rollups must be keyed by the device ids (keyed by anything else, one device's windows scatter across partitions)");
-  const auto records = ctx.Kafka.Records(kRollupTopic);
+  ctx.Equal(ctx.Kafka.Keys(hKRollupTopic), {"d-1", "d-2", "d-1"}, "the rollups must be keyed by the device ids (keyed by anything else, one device's windows scatter across partitions)");
+  const auto records = ctx.Kafka.Records(hKRollupTopic);
   ctx.Equal(records[0].Partition, records[2].Partition, "both d-1 rollups must land on one partition, or a consumer reads its windows out of order; the partitions");
 }
 
 void CheckBucketedPayload(harness::Ctx& ctx) {
-  publishRollup("d-1", {smp("temp_c", 20, kT0 + 1), smp("temp_c", 22, kT0 + 10), smp("temp_c", 27, kT0 + 20), smp("humidity", 40, kT0 + 5), smp("humidity", 44, kT0 + 25)});
+  publishRollup("d-1", {hSmp("temp_c", 20, hKT0 + 1), hSmp("temp_c", 22, hKT0 + 10), hSmp("temp_c", 27, hKT0 + 20), hSmp("humidity", 40, hKT0 + 5), hSmp("humidity", 44, hKT0 + 25)});
   ctx.Settle();
-  const auto all = rollupEvents(ctx);
+  const auto all = hRollupEvents(ctx);
   ctx.Equal(all.size(), 1, "five samples of one window must produce one rollup; the records");
-  ctx.Assert(at(all[0], "samples").is_null(), "the rollup carries the raw samples: %s. The topic is meant to be smaller than the store it summarises", all[0].dump());
-  ctx.Equal(at(at(all[0], "buckets"), "temp_c"), json{{"mean", 23}, {"count", 3}, {"max", 27}}, "temp_c's bucket");
-  ctx.Equal(at(at(all[0], "buckets"), "humidity"), json{{"mean", 42}, {"count", 2}, {"max", 44}}, "humidity's bucket");
+  ctx.Assert(hAt(all[0], "samples").is_null(), "the rollup carries the raw samples: %s. The topic is meant to be smaller than the store it summarises", all[0].dump());
+  std::vector<std::string> fields;
+  if (all[0].is_object()) {
+    for (const auto& item : all[0].items()) fields.push_back(item.key());
+  }
+  ctx.Equal(fields, {"buckets", "device_id", "window_start"}, "the rollup must carry exactly device_id, window_start and buckets (anything else is raw data the topic was meant to summarise); its fields");
+  ctx.Equal(hAt(all[0], "device_id"), json("d-1"), "the rollup's device_id");
+  ctx.Equal(hAt(hAt(all[0], "buckets"), "temp_c"), json{{"mean", 23}, {"count", 3}, {"max", 27}}, "temp_c's bucket");
+  ctx.Equal(hAt(hAt(all[0], "buckets"), "humidity"), json{{"mean", 42}, {"count", 2}, {"max", 44}}, "humidity's bucket");
 }
 
 void CheckWindowEvents(harness::Ctx& ctx) {
-  publishRollup("d-1", {smp("temp_c", 20, kT0 + 5), smp("temp_c", 22, kT0 + 30), smp("temp_c", 30, kT0 + 65)});
+  publishRollup("d-1", {hSmp("temp_c", 20, hKT0 + 5), hSmp("temp_c", 22, hKT0 + 30), hSmp("temp_c", 30, hKT0 + 65)});
   ctx.Settle();
   json starts = json::array();
   json counts = json::array();
-  for (const json& e : rollupEvents(ctx)) {
-    starts.push_back(at(e, "window_start"));
-    counts.push_back(at(at(at(e, "buckets"), "temp_c"), "count"));
+  for (const json& e : hRollupEvents(ctx)) {
+    starts.push_back(hAt(e, "window_start"));
+    counts.push_back(hAt(hAt(hAt(e, "buckets"), "temp_c"), "count"));
   }
-  ctx.Equal(starts, json::array({kT0, kT0 + 60}), "samples at kT0+5, kT0+30 and kT0+65 must produce one event per window; window_start");
+  ctx.Equal(starts, json::array({hKT0, hKT0 + 60}), "samples at kT0+5, kT0+30 and kT0+65 must produce one event per window; window_start");
   ctx.Equal(counts, json::array({2, 1}), "each window counts only its own samples; the counts");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kRollupTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  publishRollup("d-1", {smp("temp_c", 20, kT0 + 1)});
+  ctx.Kafka.LoseAcks(hKRollupTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  publishRollup("d-1", {hSmp("temp_c", 20, hKT0 + 1)});
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kRollupTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the rollup twice (enable.idempotence); the records");
-  publishRollup("d-1", {smp("temp_c", 22, kT0 + 61)});
+  ctx.Equal(ctx.Kafka.Records(hKRollupTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the rollup twice (enable.idempotence); the records");
+  publishRollup("d-1", {hSmp("temp_c", 22, hKT0 + 61)});
   ctx.Settle();
-  ctx.Kafka.Failover(kRollupTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kRollupTopic).size(), 2, "a leader failover must not lose a rollup (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(hKRollupTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(hKRollupTopic).size(), 2, "a leader failover must not lose a rollup (acks=all waits for every in-sync replica); the records");
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kRollupTopic, 1);
-  bool ok = publishRollup("d-1", {smp("temp_c", 20, kT0 + 1)});
+  ctx.Kafka.FailNext(hKRollupTopic, 1);
+  bool ok = publishRollup("d-1", {hSmp("temp_c", 20, hKT0 + 1), hSmp("temp_c", 21, hKT0 + 61)});
   ctx.Settle();
-  auto rows = outboxEntries(ctx);
-  ctx.Equal(rows.size(), 1, "the broker refused the rollup: without an outbox row the window is gone for every consumer; the rows");
-  ctx.Assert(!rows.empty() && at(rows[0], "topic") == kRollupTopic && at(rows[0], "key") == "d-1" && at(at(rows[0], "payload"), "window_start") == kT0,
-             "the outbox row is %s, expected the topic, the key d-1 and the rollup", rows.empty() ? "none" : rows[0].dump());
-  ctx.Equal(ok, false, "publishRollup's result after a refused delivery");
-  ctx.Kafka.Stall(kRollupTopic);  // the broker stops answering
+  auto rows = hOutboxEntries(ctx);
+  ctx.Equal(rows.size(), 1, "the broker refused the first of two rollups: without an outbox row the window is gone for every consumer; the rows");
+  ctx.Assert(!rows.empty() && hAt(rows[0], "topic") == hKRollupTopic && hAt(rows[0], "key") == "d-1" && hAt(hAt(rows[0], "payload"), "window_start") == hKT0,
+             "the outbox row is %s, expected the topic, the key d-1 and the refused rollup of window %d", rows.empty() ? "none" : rows[0].dump(), hKT0);
+  json delivered = json::array();
+  for (const json& e : hRollupEvents(ctx)) delivered.push_back(hAt(e, "window_start"));
+  ctx.Equal(delivered, json::array({hKT0 + 60}), "a refused rollup must not stop the next one; the windows on the topic");
+  ctx.Equal(ok, false, "publishRollup's result after one of its rollups was refused");
+  ctx.Kafka.Stall(hKRollupTopic);  // the broker stops answering
   const long long before = ctx.Clock.Now();
-  ok = publishRollup("d-1", {smp("temp_c", 22, kT0 + 61)});
+  ok = publishRollup("d-1", {hSmp("temp_c", 22, hKT0 + 121)});
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishRollup waited %.0f s for a broker that does not answer: wait at most 2 s, then write the outbox row", waited);
-  rows = outboxEntries(ctx);
-  ctx.Assert(rows.size() == 2 && at(at(rows[1], "payload"), "window_start") == kT0 + 60, "no acknowledgement within the window and the outbox holds %d rows", rows.size());
+  ctx.Assert(waited <= 2.5, "publishRollup waited %.1f s for a broker that does not answer: wait at most kAckTimeout = 2 s, then write the outbox row", waited);
+  rows = hOutboxEntries(ctx);
+  ctx.Assert(rows.size() == 2 && hAt(hAt(rows[1], "payload"), "window_start") == hKT0 + 120, "no acknowledgement within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publishRollup's result without an acknowledgement");
 }
 `,

@@ -78,7 +78,7 @@ bot walking prefixes grows one tenant's cache until Redis evicts everyone's.
       id: 'coldest-cap',
       title: 'Caps each tenant at 100 prefixes, coldest out first',
       detail:
-        'A read or a write scores the prefix in `suggest:recent:{tenant}`; past `MAX_PREFIXES_PER_TENANT` (100) the lowest score is popped and its entry deleted, so a flood of prefixes from one tenant stays bounded and evicts its own coldest prefix, not the one just read.',
+        'A read or a write scores the prefix in `suggest:recent:{tenant}` by when it happened; past `MAX_PREFIXES_PER_TENANT` (100) the lowest score is popped and its entry deleted, so a flood of prefixes from one tenant stays bounded and evicts its own coldest prefix, not the one just read; rewriting a prefix already cached evicts nothing.',
       match: {
         python: {
           all: [
@@ -489,7 +489,13 @@ def check_catalog_version(ctx):
 
 def check_ttl(ctx):
     m = ctx.load("cache")
+    # -2: the first command on the key only read it; -1: it exists without an expiry.
+    created = ctx.redis_after("suggest:cache:acme:v0:ke", lambda: ctx.redis.ttl("suggest:cache:acme:v0:ke"))
     m.put_suggestions("acme", "ke", ["kettle"])
+    assert created.fired, "put_suggestions('acme', 'ke', ...) never touched suggest:cache:acme:v0:ke"
+    if created.error is not None:
+        raise created.error
+    assert created.result == -2 or 0 < created.result <= 300, f"right after the command that wrote suggest:cache:acme:v0:ke its TTL was {created.result}: the expiry comes with the SET that writes the entry, or a crash in between leaves an entry served forever"
     ctx.clock.advance(299)
     assert m.get_suggestions("acme", "ke") == ["kettle"], "an entry must still be served 299 s after it was written"
     ctx.clock.advance(2)
@@ -497,20 +503,29 @@ def check_ttl(ctx):
     assert got is None, f"301 s after it was written the entry is still served ({got}): write it with a 300 s expiry (TTL_SECONDS)"
 
 
+def _cap_name(n):
+    # Written out of name order, so the coldest prefix is never simply the first by name.
+    return f"p{n * 37 % 100:03d}"
+
+
 def check_coldest_cap(ctx):
     m = ctx.load("cache")
     m.put_suggestions("acme", "kettle", ["kettle"])
     for n in range(100):
-        m.put_suggestions("globex", f"p{n:03d}", [f"t{n}"])
+        m.put_suggestions("globex", _cap_name(n), [f"t{n}"])
         ctx.clock.advance(1)
     assert m.get_suggestions("globex", "p000") == ["t0"], "at the cap of 100 prefixes every entry must still be cached"
     ctx.clock.advance(1)
     m.put_suggestions("globex", "p100", ["t100"])
     cached = ctx.redis.keys("suggest:cache:*")
     assert len(cached) == 101, f"Redis holds {len(cached)} cache entries after acme's one and globex's 101 writes, expected 101: globex capped at 100"
-    assert m.get_suggestions("globex", "p001") is None, "p001 was the coldest prefix when the 101st arrived and must have been evicted"
+    assert m.get_suggestions("globex", "p037") is None, "p037, written second, was the coldest prefix when the 101st arrived and must have been evicted (the coldest is the least recently read or written)"
     assert m.get_suggestions("globex", "p000") == ["t0"], "p000 was read just before the cap was crossed and was evicted: the coldest prefix is the least recently read or written, not the oldest written"
     assert m.get_suggestions("globex", "p100") == ["t100"], "the newest prefix must be cached"
+    ctx.clock.advance(1)
+    m.put_suggestions("globex", "p100", ["t100", "t100b"])
+    assert len(ctx.redis.keys("suggest:cache:*")) == 101, f"rewriting p100, a prefix already cached, left {len(ctx.redis.keys('suggest:cache:*'))} entries, expected 101: a prefix already counted adds nothing, so nothing is evicted"
+    assert m.get_suggestions("globex", "p074") == ["t2"], "rewriting a prefix already cached evicted p074: only a prefix over the cap of 100 evicts"
     assert m.get_suggestions("acme", "kettle") == ["kettle"], "globex's flood evicted acme's entry: the cap is per tenant"
 `,
     typescript: `export async function check_tenant_key(ctx) {
@@ -539,7 +554,13 @@ export async function check_catalog_version(ctx) {
 
 export async function check_ttl(ctx) {
   const m = ctx.load('cache');
+  // -2: the first command on the key only read it; -1: it exists without an expiry.
+  const created = ctx.redisAfter('suggest:cache:acme:v0:ke', () => ctx.redis.ttl('suggest:cache:acme:v0:ke'));
   await m.putSuggestions('acme', 'ke', ['kettle']);
+  assert(created.fired, "putSuggestions('acme', 'ke', ...) never touched suggest:cache:acme:v0:ke");
+  if (created.error !== undefined) throw created.error;
+  const createdTtl = await created.result;
+  assert(createdTtl === -2 || (createdTtl > 0 && createdTtl <= 300), \`right after the command that wrote suggest:cache:acme:v0:ke its TTL was \${createdTtl}: the expiry comes with the SET that writes the entry, or a crash in between leaves an entry served forever\`);
   ctx.clock.advance(299);
   assert.deepStrictEqual(await m.getSuggestions('acme', 'ke'), ['kettle'], 'an entry must still be served 299 s after it was written');
   ctx.clock.advance(2);
@@ -550,7 +571,8 @@ export async function check_ttl(ctx) {
 export async function check_coldest_cap(ctx) {
   const m = ctx.load('cache');
   await m.putSuggestions('acme', 'kettle', ['kettle']);
-  const name = (n: number) => \`p\${String(n).padStart(3, '0')}\`;
+  // Written out of name order, so the coldest prefix is never simply the first by name.
+  const name = (n: number) => \`p\${String((n * 37) % 100).padStart(3, '0')}\`;
   for (let n = 0; n < 100; n++) {
     await m.putSuggestions('globex', name(n), [\`t\${n}\`]);
     ctx.clock.advance(1);
@@ -560,9 +582,14 @@ export async function check_coldest_cap(ctx) {
   await m.putSuggestions('globex', 'p100', ['t100']);
   const cached = ctx.redis.keys('suggest:cache:*') as string[];
   assert.equal(cached.length, 101, \`Redis holds \${cached.length} cache entries after acme's one and globex's 101 writes, expected 101: globex capped at 100\`);
-  assert.equal(await m.getSuggestions('globex', 'p001'), null, 'p001 was the coldest prefix when the 101st arrived and must have been evicted');
+  assert.equal(await m.getSuggestions('globex', 'p037'), null, 'p037, written second, was the coldest prefix when the 101st arrived and must have been evicted (the coldest is the least recently read or written)');
   assert.deepStrictEqual(await m.getSuggestions('globex', 'p000'), ['t0'], 'p000 was read just before the cap was crossed and was evicted: the coldest prefix is the least recently read or written, not the oldest written');
   assert.deepStrictEqual(await m.getSuggestions('globex', 'p100'), ['t100'], 'the newest prefix must be cached');
+  ctx.clock.advance(1);
+  await m.putSuggestions('globex', 'p100', ['t100', 't100b']);
+  const after = (ctx.redis.keys('suggest:cache:*') as string[]).length;
+  assert.equal(after, 101, \`rewriting p100, a prefix already cached, left \${after} entries, expected 101: a prefix already counted adds nothing, so nothing is evicted\`);
+  assert.deepStrictEqual(await m.getSuggestions('globex', 'p074'), ['t2'], 'rewriting a prefix already cached evicted p074: only a prefix over the cap of 100 evicts');
   assert.deepStrictEqual(await m.getSuggestions('acme', 'kettle'), ['kettle'], "globex's flood evicted acme's entry: the cap is per tenant");
 }
 `,
@@ -612,7 +639,12 @@ func CheckCatalogVersion(ctx *harness.Ctx) {
 }
 
 func CheckTtl(ctx *harness.Ctx) {
+	// -2: the first command on the key only read it; -1: it exists without an expiry.
+	created := ctx.Redis.After("suggest:cache:acme:v0:ke", func() any { return ctx.Redis.TTL("suggest:cache:acme:v0:ke") })
 	putSuggestions(cacheBg, "acme", "ke", []string{"kettle"})
+	ctx.Assert(created.Fired, "putSuggestions(acme, ke, ...) never touched suggest:cache:acme:v0:ke")
+	createdTTL, _ := created.Result.(int64)
+	ctx.Assert(createdTTL == -2 || (createdTTL > 0 && createdTTL <= 300), "right after the command that wrote suggest:cache:acme:v0:ke its TTL was %d: the expiry comes with the SET that writes the entry, or a crash in between leaves an entry served forever", createdTTL)
 	ctx.Clock.Advance(299)
 	ctx.Equal(cacheRead(ctx, "acme", "ke"), []string{"kettle"}, "an entry must still be served 299 s after it was written")
 	ctx.Clock.Advance(2)
@@ -623,22 +655,28 @@ func CheckTtl(ctx *harness.Ctx) {
 func CheckColdestCap(ctx *harness.Ctx) {
 	putSuggestions(cacheBg, "acme", "kettle", []string{"kettle"})
 	for n := 0; n < 100; n++ {
-		putSuggestions(cacheBg, "globex", fmt.Sprintf("p%03d", n), []string{fmt.Sprintf("t%d", n)})
+		// Written out of name order, so the coldest prefix is never simply the first by name.
+		putSuggestions(cacheBg, "globex", fmt.Sprintf("p%03d", n*37%100), []string{fmt.Sprintf("t%d", n)})
 		ctx.Clock.Advance(1)
 	}
 	ctx.Equal(cacheRead(ctx, "globex", "p000"), []string{"t0"}, "at the cap of 100 prefixes every entry must still be cached")
 	ctx.Clock.Advance(1)
 	putSuggestions(cacheBg, "globex", "p100", []string{"t100"})
 	ctx.Equal(len(ctx.Redis.Keys("suggest:cache:*")), 101, "the cache entries after acme's one and globex's 101 writes (globex capped at 100)")
-	ctx.Assert(cacheRead(ctx, "globex", "p001") == nil, "p001 was the coldest prefix when the 101st arrived and must have been evicted")
+	ctx.Assert(cacheRead(ctx, "globex", "p037") == nil, "p037, written second, was the coldest prefix when the 101st arrived and must have been evicted (the coldest is the least recently read or written)")
 	ctx.Equal(cacheRead(ctx, "globex", "p000"), []string{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000")
 	ctx.Equal(cacheRead(ctx, "globex", "p100"), []string{"t100"}, "the newest prefix must be cached")
+	ctx.Clock.Advance(1)
+	putSuggestions(cacheBg, "globex", "p100", []string{"t100", "t100b"})
+	ctx.Equal(len(ctx.Redis.Keys("suggest:cache:*")), 101, "the cache entries after rewriting p100, a prefix already cached (it adds nothing, so nothing is evicted)")
+	ctx.Equal(cacheRead(ctx, "globex", "p074"), []string{"t2"}, "rewriting a prefix already cached must not evict p074 (only a prefix over the cap of 100 evicts); p074")
 	ctx.Equal(cacheRead(ctx, "acme", "kettle"), []string{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -679,7 +717,13 @@ void CheckCatalogVersion(harness::Ctx& ctx) {
 }
 
 void CheckTtl(harness::Ctx& ctx) {
+  // -2: the first command on the key only read it; -1: it exists without an expiry.
+  auto created = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After("suggest:cache:acme:v0:ke", [created, &ctx] { *created = ctx.Redis.TTL("suggest:cache:acme:v0:ke"); });
   putSuggestions("acme", "ke", {"kettle"});
+  ctx.Assert(created->has_value(), "putSuggestions(acme, ke, ...) never touched suggest:cache:acme:v0:ke");
+  const long long createdTtl = created->value_or(0);
+  ctx.Assert(createdTtl == -2 || (createdTtl > 0 && createdTtl <= 300), "right after the command that wrote suggest:cache:acme:v0:ke its TTL was %d: the expiry comes with the SET that writes the entry, or a crash in between leaves an entry served forever", createdTtl);
   ctx.Clock.Advance(299);
   ctx.Equal(getSuggestions("acme", "ke"), Strings{"kettle"}, "an entry must still be served 299 s after it was written");
   ctx.Clock.Advance(2);
@@ -690,16 +734,21 @@ void CheckTtl(harness::Ctx& ctx) {
 void CheckColdestCap(harness::Ctx& ctx) {
   putSuggestions("acme", "kettle", {"kettle"});
   for (int n = 0; n < 100; ++n) {
-    putSuggestions("globex", cacheName("p%03d", n), {cacheName("t%d", n)});
+    // Written out of name order, so the coldest prefix is never simply the first by name.
+    putSuggestions("globex", cacheName("p%03d", n * 37 % 100), {cacheName("t%d", n)});
     ctx.Clock.Advance(1);
   }
   ctx.Equal(getSuggestions("globex", "p000"), Strings{"t0"}, "at the cap of 100 prefixes every entry must still be cached");
   ctx.Clock.Advance(1);
   putSuggestions("globex", "p100", {"t100"});
   ctx.Equal(ctx.Redis.Keys("suggest:cache:*").size(), 101, "the cache entries after acme's one and globex's 101 writes (globex capped at 100)");
-  ctx.Assert(!getSuggestions("globex", "p001"), "p001 was the coldest prefix when the 101st arrived and must have been evicted");
+  ctx.Assert(!getSuggestions("globex", "p037"), "p037, written second, was the coldest prefix when the 101st arrived and must have been evicted (the coldest is the least recently read or written)");
   ctx.Equal(getSuggestions("globex", "p000"), Strings{"t0"}, "p000 was read just before the cap was crossed: the coldest prefix is the least recently read or written, not the oldest written; p000");
   ctx.Equal(getSuggestions("globex", "p100"), Strings{"t100"}, "the newest prefix must be cached");
+  ctx.Clock.Advance(1);
+  putSuggestions("globex", "p100", {"t100", "t100b"});
+  ctx.Equal(ctx.Redis.Keys("suggest:cache:*").size(), 101, "the cache entries after rewriting p100, a prefix already cached (it adds nothing, so nothing is evicted)");
+  ctx.Equal(getSuggestions("globex", "p074"), Strings{"t2"}, "rewriting a prefix already cached must not evict p074 (only a prefix over the cap of 100 evicts); p074");
   ctx.Equal(getSuggestions("acme", "kettle"), Strings{"kettle"}, "globex's flood must not evict acme's entry (the cap is per tenant)");
 }
 `,

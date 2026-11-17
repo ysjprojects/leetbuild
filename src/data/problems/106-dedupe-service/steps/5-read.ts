@@ -55,7 +55,7 @@ why they are there, or how the cluster formed.
       id: 'tenant-scope',
       title: "Answers 404 for another tenant's cluster",
       detail:
-        'The tenant comes from `X-Tenant-Id` (**401** without it) and a cluster whose tenant differs is **404**, the same answer as no cluster. The starter answers any cluster by id.',
+        'The tenant comes from `X-Tenant-Id` (**401** without it) and a cluster whose tenant differs is **404** with the same body as no cluster, so the answer does not tell a caller the id exists. The starter answers any cluster by id.',
       match: {
         python: {all: [/\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*cluster\[["']tenant["']\]/, /\b401\b/]},
         typescript: {all: [/\.tenant\s*!==\s*tenant|tenant\s*!==\s*cluster\.tenant/, /code\(\s*401\s*\)/]},
@@ -68,7 +68,7 @@ why they are there, or how the cluster formed.
       id: 'weak-pair',
       title: 'Links members over strong pairs only',
       detail:
-        'A pair below `MIN_MERGE_CONFIDENCE` (0.85) bridges nothing: A–B at 0.97 and B–C at 0.62 is the cluster {A, B} with B–C under `review`. The starter links over every pair and pulls C, and whatever C links to, in.',
+        'A pair below `MIN_MERGE_CONFIDENCE` (0.85) bridges nothing, and a pair at exactly 0.85 links: A–B at 0.97 and B–C at 0.62 is the cluster {A, B} with B–C under `review`. `review` holds only the weak pairs that touch a member. The starter links over every pair and pulls C, and whatever C links to, in.',
       match: {
         python: {all: [/MIN_MERGE_CONFIDENCE\s*=\s*0?\.85\b/, /(>=|<)\s*MIN_MERGE_CONFIDENCE/]},
         typescript: {all: [/MIN_MERGE_CONFIDENCE\s*=\s*0?\.85\b/, /(>=|<)\s*MIN_MERGE_CONFIDENCE/]},
@@ -81,7 +81,7 @@ why they are there, or how the cluster formed.
       id: 'evidence',
       title: 'Answers the evidence and the pairs held for review',
       detail:
-        '`evidence` lists every strong pair between members as stored (both ids, the score, the key type) and `review` the weak pairs, so an operator can see why each member is there. The starter answers the members alone.',
+        '`evidence` lists every strong pair between members as stored (both ids, the score, the key type), including a pair between two members already linked another way, and `review` the weak pairs, so an operator can see why each member is there. The starter answers the members alone.',
       match: {
         python: {all: [/["']evidence["']\s*:/, /["']review["']\s*:/]},
         typescript: {all: [/\bevidence\b/, /\breview\b/]},
@@ -648,8 +648,9 @@ async def check_tenant_scope(ctx):
         r = await _get(c, foreign, tenant="acme")
         assert r.status_code == 404, f"acme reading globex's cluster {foreign} answered {r.status_code} {r.text}: a guessed id must not return another tenant's records. Expected 404"
         assert "r-8" not in r.text and "r-9" not in r.text, f"the 404 carries globex's records: {r.text}"
-        r = await _get(c, "c-404", tenant="acme")
-        assert r.status_code == 404, f"a cluster that does not exist answered {r.status_code}, expected 404"
+        missing = await _get(c, "c-404", tenant="acme")
+        assert missing.status_code == 404, f"a cluster that does not exist answered {missing.status_code}, expected 404"
+        assert r.text.replace(foreign, "{id}") == missing.text.replace("c-404", "{id}"), f"another tenant's cluster answered {r.text} and a missing one {missing.text}: the difference tells a caller the id exists. Answer both the same"
         own = clusters.create("acme", "r-1", [STRONG], [])
         r = await _get(c, own, tenant=None)
         assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code} {r.text}, expected 401"
@@ -661,20 +662,31 @@ async def check_weak_pair(ctx):
     cluster_id = clusters.create("acme", "r-1", [STRONG, WEAK, BEYOND], HISTORY)
     async with _api(ctx) as c:
         r = await _get(c, cluster_id)
-    assert r.status_code == 200, f"the read answered {r.status_code}: {r.text}"
+        assert r.status_code == 200, f"the read answered {r.status_code}: {r.text}"
+        body = r.json()
+        assert body.get("members") == ["r-1", "r-2"], f"r-1–r-2 scores 0.97 and r-2–r-3 only 0.62, and the cluster's members are {body.get('members')}: a pair below MIN_MERGE_CONFIDENCE = 0.85 bridged r-3 and r-4 in. Expected [r-1, r-2]"
+        assert body.get("review") == [WEAK], f"the weak pair must wait under review, the answer has review = {body.get('review')}"
+        at = {"a": "r-5", "b": "r-6", "score": 0.85, "key_type": "email_hash"}
+        under = {"a": "r-6", "b": "r-7", "score": 0.84, "key_type": "fuzzy"}
+        far = {"a": "r-8", "b": "r-9", "score": 0.5, "key_type": "fuzzy"}
+        r = await _get(c, clusters.create("acme", "r-6", [at, under, far], []))
     body = r.json()
-    assert body.get("members") == ["r-1", "r-2"], f"r-1–r-2 scores 0.97 and r-2–r-3 only 0.62, and the cluster's members are {body.get('members')}: a pair below MIN_MERGE_CONFIDENCE = 0.85 bridged r-3 and r-4 in. Expected [r-1, r-2]"
-    assert body.get("review") == [WEAK], f"the weak pair must wait under review, the answer has review = {body.get('review')}"
+    assert body.get("members") == ["r-5", "r-6"], f"r-5–r-6 scores exactly 0.85, r-6–r-7 0.84, and the members (sorted) are {body.get('members')}, expected [r-5, r-6]: a pair at MIN_MERGE_CONFIDENCE links, one below it does not"
+    assert body.get("review") == [under], f"review is {body.get('review')}, expected only the weak pair touching a member, {[under]}: r-8–r-9 touches no member"
 
 
 async def check_evidence(ctx):
     cluster_id = clusters.create("acme", "r-1", [STRONG, WEAK, BEYOND], HISTORY)
+    triangle = [STRONG, {"a": "r-2", "b": "r-5", "score": 0.9, "key_type": "phone_hash"}, {"a": "r-1", "b": "r-5", "score": 0.88, "key_type": "content_hash"}]
     async with _api(ctx) as c:
         r = await _get(c, cluster_id)
+        closed = await _get(c, clusters.create("acme", "r-1", triangle, []))
     body = r.json()
     assert "evidence" in body, f"the cluster answered {body}: no evidence, so nobody can see why r-2 is a member"
     assert body["evidence"] == [STRONG], f"the evidence is {body['evidence']}, expected the one strong pair between members as stored: {[STRONG]}"
     assert body.get("review") == [WEAK], f"review is {body.get('review')}, expected the weak pair {WEAK}"
+    evidence = closed.json().get("evidence")
+    assert evidence == triangle, f"r-1, r-2 and r-5 are linked by three strong pairs and the evidence is {evidence}: every strong pair between members is evidence, as stored, not only the ones that added a member"
 
 
 async def check_history(ctx):
@@ -716,8 +728,9 @@ export async function check_tenant_scope(ctx) {
   let r = await read(c, foreign, 'acme');
   assert.equal(r.status, 404, \`acme reading globex's cluster \${foreign} answered \${r.status} \${r.text}: a guessed id must not return another tenant's records. Expected 404\`);
   assert(!r.text.includes('r-8') && !r.text.includes('r-9'), \`the 404 carries globex's records: \${r.text}\`);
-  r = await read(c, 'c-404', 'acme');
-  assert.equal(r.status, 404, \`a cluster that does not exist answered \${r.status}, expected 404\`);
+  const missing = await read(c, 'c-404', 'acme');
+  assert.equal(missing.status, 404, \`a cluster that does not exist answered \${missing.status}, expected 404\`);
+  assert.equal(r.text.replaceAll(foreign, '{id}'), missing.text.replaceAll('c-404', '{id}'), \`another tenant's cluster answered \${r.text} and a missing one \${missing.text}: the difference tells a caller the id exists. Answer both the same\`);
   const own = await clusters.create('acme', 'r-1', [STRONG], []);
   r = await read(c, own, null);
   assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status} \${r.text}, expected 401\`);
@@ -728,11 +741,18 @@ export async function check_tenant_scope(ctx) {
 export async function check_weak_pair(ctx) {
   const {c, clusters} = api(ctx);
   const clusterId = await clusters.create('acme', 'r-1', [STRONG, WEAK, BEYOND], HISTORY);
-  const r = await read(c, clusterId);
+  let r = await read(c, clusterId);
   assert.equal(r.status, 200, \`the read answered \${r.status}: \${r.text}\`);
-  const body = r.json();
+  let body = r.json();
   assert(same(body.members, ['r-1', 'r-2']), \`r-1–r-2 scores 0.97 and r-2–r-3 only 0.62, and the cluster's members are \${JSON.stringify(body.members)}: a pair below MIN_MERGE_CONFIDENCE = 0.85 bridged r-3 and r-4 in. Expected [r-1, r-2]\`);
   assert(same(body.review, [WEAK]), \`the weak pair must wait under review, the answer has review = \${JSON.stringify(body.review)}\`);
+  const at = {a: 'r-5', b: 'r-6', score: 0.85, key_type: 'email_hash'};
+  const under = {a: 'r-6', b: 'r-7', score: 0.84, key_type: 'fuzzy'};
+  const far = {a: 'r-8', b: 'r-9', score: 0.5, key_type: 'fuzzy'};
+  r = await read(c, await clusters.create('acme', 'r-6', [at, under, far], []));
+  body = r.json();
+  assert(same(body.members, ['r-5', 'r-6']), \`r-5–r-6 scores exactly 0.85, r-6–r-7 0.84, and the members (sorted) are \${JSON.stringify(body.members)}, expected [r-5, r-6]: a pair at MIN_MERGE_CONFIDENCE links, one below it does not\`);
+  assert(same(body.review, [under]), \`review is \${JSON.stringify(body.review)}, expected only the weak pair touching a member, \${JSON.stringify([under])}: r-8–r-9 touches no member\`);
 }
 
 export async function check_evidence(ctx) {
@@ -742,6 +762,9 @@ export async function check_evidence(ctx) {
   assert(body.evidence !== undefined, \`the cluster answered \${JSON.stringify(body)}: no evidence, so nobody can see why r-2 is a member\`);
   assert(same(body.evidence, [STRONG]), \`the evidence is \${JSON.stringify(body.evidence)}, expected the one strong pair between members as stored: \${JSON.stringify([STRONG])}\`);
   assert(same(body.review, [WEAK]), \`review is \${JSON.stringify(body.review)}, expected the weak pair \${JSON.stringify(WEAK)}\`);
+  const triangle = [STRONG, {a: 'r-2', b: 'r-5', score: 0.9, key_type: 'phone_hash'}, {a: 'r-1', b: 'r-5', score: 0.88, key_type: 'content_hash'}];
+  const evidence = (await read(c, await clusters.create('acme', 'r-1', triangle, []))).json().evidence;
+  assert(same(evidence, triangle), \`r-1, r-2 and r-5 are linked by three strong pairs and the evidence is \${JSON.stringify(evidence)}: every strong pair between members is evidence, as stored, not only the ones that added a member\`);
 }
 
 export async function check_history(ctx) {
@@ -765,16 +788,16 @@ import (
 )
 
 var (
-	strongPair = clusters.Pair{A: "r-1", B: "r-2", Score: 0.97, KeyType: "email_hash"}
-	weakPair   = clusters.Pair{A: "r-2", B: "r-3", Score: 0.62, KeyType: "fuzzy"}
-	beyondPair = clusters.Pair{A: "r-3", B: "r-4", Score: 0.95, KeyType: "phone_hash"}
-	history    = []clusters.HistoryEntry{
+	hStrongPair = clusters.Pair{A: "r-1", B: "r-2", Score: 0.97, KeyType: "email_hash"}
+	hWeakPair   = clusters.Pair{A: "r-2", B: "r-3", Score: 0.62, KeyType: "fuzzy"}
+	hBeyondPair = clusters.Pair{A: "r-3", B: "r-4", Score: 0.95, KeyType: "phone_hash"}
+	hHistory    = []clusters.HistoryEntry{
 		{At: "2026-11-02T09:00:00Z", Action: "merge", A: "r-1", B: "r-2", By: "matcher"},
 		{At: "2026-11-02T09:05:00Z", Action: "hold", A: "r-2", B: "r-3", By: "matcher"},
 	}
 )
 
-type clusterReply struct {
+type hClusterReply struct {
 	ClusterID string                  \`json:"cluster_id"\`
 	Members   []string                \`json:"members"\`
 	Evidence  []clusters.Pair         \`json:"evidence"\`
@@ -782,27 +805,27 @@ type clusterReply struct {
 	History   []clusters.HistoryEntry \`json:"history"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func seedCluster(ctx *harness.Ctx, tenant, seed string, pairs []clusters.Pair, hist []clusters.HistoryEntry) string {
+func hSeedCluster(ctx *harness.Ctx, tenant, seed string, pairs []clusters.Pair, hist []clusters.HistoryEntry) string {
 	id, err := clusters.Create(context.Background(), tenant, seed, pairs, hist)
 	ctx.NoError(err, "seeding the cluster store")
 	return id
 }
 
-func read(c *harness.HTTP, clusterID, tenant string) *harness.Response {
+func hRead(c *harness.HTTP, clusterID, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/clusters/" + clusterID)
 	}
 	return c.Get("/v1/clusters/"+clusterID, "X-Tenant-Id", tenant)
 }
 
-func decode(ctx *harness.Ctx, r *harness.Response) (clusterReply, map[string]any) {
-	var body clusterReply
+func hDecode(ctx *harness.Ctx, r *harness.Response) (hClusterReply, map[string]any) {
+	var body hClusterReply
 	var fields map[string]any
 	ctx.NoError(json.Unmarshal([]byte(r.Text()), &body), "the cluster must be JSON (%s)", r.Text())
 	json.Unmarshal([]byte(r.Text()), &fields)
@@ -810,56 +833,66 @@ func decode(ctx *harness.Ctx, r *harness.Response) (clusterReply, map[string]any
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := seedCluster(ctx, "acme", "r-1", []clusters.Pair{strongPair}, history[:1])
-	r := read(c, id, "acme")
+	c := hAPI(ctx)
+	id := hSeedCluster(ctx, "acme", "r-1", []clusters.Pair{hStrongPair}, hHistory[:1])
+	r := hRead(c, id, "acme")
 	ctx.Equal(r.Status, 200, "GET /v1/clusters/%s (%s)", id, r.Text())
-	body, _ := decode(ctx, r)
+	body, _ := hDecode(ctx, r)
 	ctx.Assert(body.ClusterID == id && strings.Join(body.Members, ",") == "r-1,r-2", "a cluster of r-1 and r-2 linked at 0.97 answered %s", r.Text())
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	foreign := seedCluster(ctx, "globex", "r-8", []clusters.Pair{{A: "r-8", B: "r-9", Score: 0.99, KeyType: "email_hash"}}, nil)
-	r := read(c, foreign, "acme")
+	c := hAPI(ctx)
+	foreign := hSeedCluster(ctx, "globex", "r-8", []clusters.Pair{{A: "r-8", B: "r-9", Score: 0.99, KeyType: "email_hash"}}, nil)
+	r := hRead(c, foreign, "acme")
 	ctx.Assert(r.Status == 404, "acme reading globex's cluster %s answered %d %s: a guessed id must not return another tenant's records. Expected 404", foreign, r.Status, r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "r-8") && !strings.Contains(r.Text(), "r-9"), "the 404 carries globex's records: %s", r.Text())
-	r = read(c, "c-404", "acme")
-	ctx.Equal(r.Status, 404, "a cluster that does not exist; the status")
-	own := seedCluster(ctx, "acme", "r-1", []clusters.Pair{strongPair}, nil)
-	r = read(c, own, "")
+	missing := hRead(c, "c-404", "acme")
+	ctx.Equal(missing.Status, 404, "a cluster that does not exist; the status")
+	ctx.Assert(strings.ReplaceAll(r.Text(), foreign, "{id}") == strings.ReplaceAll(missing.Text(), "c-404", "{id}"), "another tenant's cluster answered %s and a missing one %s: the difference tells a caller the id exists. Answer both the same", r.Text(), missing.Text())
+	own := hSeedCluster(ctx, "acme", "r-1", []clusters.Pair{hStrongPair}, nil)
+	r = hRead(c, own, "")
 	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id (%s); the status", r.Text())
-	r = read(c, own, "acme")
+	r = hRead(c, own, "acme")
 	ctx.Equal(r.Status, 200, "acme reading its own cluster (%s); the status", r.Text())
 }
 
 func CheckWeakPair(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := seedCluster(ctx, "acme", "r-1", []clusters.Pair{strongPair, weakPair, beyondPair}, history)
-	r := read(c, id, "acme")
+	c := hAPI(ctx)
+	id := hSeedCluster(ctx, "acme", "r-1", []clusters.Pair{hStrongPair, hWeakPair, hBeyondPair}, hHistory)
+	r := hRead(c, id, "acme")
 	ctx.Equal(r.Status, 200, "the read (%s)", r.Text())
-	body, _ := decode(ctx, r)
+	body, _ := hDecode(ctx, r)
 	ctx.Assert(strings.Join(body.Members, ",") == "r-1,r-2", "r-1–r-2 scores 0.97 and r-2–r-3 only 0.62, and the cluster's members are %q: a pair below minMergeConfidence = 0.85 bridged r-3 and r-4 in. Expected [r-1 r-2]", body.Members)
-	ctx.Equal(body.Review, []clusters.Pair{weakPair}, "the weak pair must wait under review; review")
+	ctx.Equal(body.Review, []clusters.Pair{hWeakPair}, "the weak pair must wait under review; review")
+	at := clusters.Pair{A: "r-5", B: "r-6", Score: 0.85, KeyType: "email_hash"}
+	under := clusters.Pair{A: "r-6", B: "r-7", Score: 0.84, KeyType: "fuzzy"}
+	far := clusters.Pair{A: "r-8", B: "r-9", Score: 0.5, KeyType: "fuzzy"}
+	body, _ = hDecode(ctx, hRead(c, hSeedCluster(ctx, "acme", "r-6", []clusters.Pair{at, under, far}, nil), "acme"))
+	ctx.Assert(strings.Join(body.Members, ",") == "r-5,r-6", "r-5–r-6 scores exactly 0.85, r-6–r-7 0.84, and the members (sorted) are %q, expected [r-5 r-6]: a pair at minMergeConfidence links, one below it does not", body.Members)
+	ctx.Equal(body.Review, []clusters.Pair{under}, "only the weak pair touching a member goes to review, r-8–r-9 touches none; review")
 }
 
 func CheckEvidence(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := seedCluster(ctx, "acme", "r-1", []clusters.Pair{strongPair, weakPair, beyondPair}, history)
-	r := read(c, id, "acme")
-	body, fields := decode(ctx, r)
+	c := hAPI(ctx)
+	id := hSeedCluster(ctx, "acme", "r-1", []clusters.Pair{hStrongPair, hWeakPair, hBeyondPair}, hHistory)
+	r := hRead(c, id, "acme")
+	body, fields := hDecode(ctx, r)
 	_, has := fields["evidence"]
 	ctx.Assert(has, "the cluster answered %s: no evidence, so nobody can see why r-2 is a member", r.Text())
-	ctx.Equal(body.Evidence, []clusters.Pair{strongPair}, "the evidence must be the one strong pair between members as stored")
-	ctx.Equal(body.Review, []clusters.Pair{weakPair}, "review must hold the weak pair")
+	ctx.Equal(body.Evidence, []clusters.Pair{hStrongPair}, "the evidence must be the one strong pair between members as stored")
+	ctx.Equal(body.Review, []clusters.Pair{hWeakPair}, "review must hold the weak pair")
+	triangle := []clusters.Pair{hStrongPair, {A: "r-2", B: "r-5", Score: 0.9, KeyType: "phone_hash"}, {A: "r-1", B: "r-5", Score: 0.88, KeyType: "content_hash"}}
+	body, _ = hDecode(ctx, hRead(c, hSeedCluster(ctx, "acme", "r-1", triangle, nil), "acme"))
+	ctx.Equal(body.Evidence, triangle, "r-1, r-2 and r-5 are linked by three strong pairs: every strong pair between members is evidence, as stored, not only the ones that added a member; the evidence")
 }
 
 func CheckHistory(ctx *harness.Ctx) {
-	c := api(ctx)
-	id := seedCluster(ctx, "acme", "r-1", []clusters.Pair{strongPair, weakPair}, history)
-	r := read(c, id, "acme")
-	body, _ := decode(ctx, r)
-	ctx.Equal(body.History, history, "the cluster's history must be the stored merge actions, oldest first")
+	c := hAPI(ctx)
+	id := hSeedCluster(ctx, "acme", "r-1", []clusters.Pair{hStrongPair, hWeakPair}, hHistory)
+	r := hRead(c, id, "acme")
+	body, _ := hDecode(ctx, r)
+	ctx.Equal(body.History, hHistory, "the cluster's history must be the stored merge actions, oldest first")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -881,7 +914,7 @@ const std::vector<nlohmann::json> kHistory = {
     {{"at", "2026-11-02T09:05:00Z"}, {"action", "hold"}, {"a", "r-2"}, {"b", "r-3"}, {"by", "matcher"}},
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP h_api(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -889,71 +922,92 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response read(harness::HTTP& c, const std::string& cluster_id, const std::string& tenant = "acme") {
+harness::Response h_read(harness::HTTP& c, const std::string& cluster_id, const std::string& tenant = "acme") {
   if (tenant.empty()) return c.Get("/v1/clusters/" + cluster_id);
   return c.Get("/v1/clusters/" + cluster_id, "X-Tenant-Id", tenant);
 }
 
-nlohmann::json body(const harness::Response& r) {
+nlohmann::json h_body(const harness::Response& r) {
   const auto parsed = nlohmann::json::parse(r.Text(), nullptr, false);
   return parsed.is_object() ? parsed : nlohmann::json::object();
 }
 
-nlohmann::json field(const nlohmann::json& j, const std::string& name) { return j.contains(name) ? j[name] : nlohmann::json(); }
+nlohmann::json h_field(const nlohmann::json& j, const std::string& name) { return j.contains(name) ? j[name] : nlohmann::json(); }
+
+// The text with every occurrence of the id replaced, so two answers can be compared apart from the id they echo.
+std::string h_without_id(std::string text, const std::string& id) {
+  for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
+  return text;
+}
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   const std::string id = clusters::create("acme", "r-1", {kStrong}, {kHistory[0]});
-  const auto r = read(c, id);
+  const auto r = h_read(c, id);
   ctx.Equal(r.Status, 200, "GET /v1/clusters/%s (%s)", id, r.Text());
-  const auto b = body(r);
-  ctx.Assert(field(b, "cluster_id") == id && field(b, "members") == nlohmann::json{"r-1", "r-2"}, "a cluster of r-1 and r-2 linked at 0.97 answered %s", r.Text());
+  const auto b = h_body(r);
+  ctx.Assert(h_field(b, "cluster_id") == id && h_field(b, "members") == nlohmann::json{"r-1", "r-2"}, "a cluster of r-1 and r-2 linked at 0.97 answered %s", r.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   const std::string foreign = clusters::create("globex", "r-8", {{{"a", "r-8"}, {"b", "r-9"}, {"score", 0.99}, {"key_type", "email_hash"}}}, {});
-  auto r = read(c, foreign, "acme");
+  auto r = h_read(c, foreign, "acme");
   ctx.Assert(r.Status == 404, "acme reading globex's cluster %s answered %d %s: a guessed id must not return another tenant's records. Expected 404", foreign, r.Status, r.Text());
   ctx.Assert(r.Text().find("r-8") == std::string::npos && r.Text().find("r-9") == std::string::npos, "the 404 carries globex's records: %s", r.Text());
-  r = read(c, "c-404", "acme");
-  ctx.Equal(r.Status, 404, "a cluster that does not exist; the status");
+  const auto missing = h_read(c, "c-404", "acme");
+  ctx.Equal(missing.Status, 404, "a cluster that does not exist; the status");
+  ctx.Assert(h_without_id(r.Text(), foreign) == h_without_id(missing.Text(), "c-404"),
+             "another tenant's cluster answered %s and a missing one %s: the difference tells a caller the id exists. Answer both the same", r.Text(), missing.Text());
   const std::string own = clusters::create("acme", "r-1", {kStrong}, {});
-  r = read(c, own, "");
+  r = h_read(c, own, "");
   ctx.Equal(r.Status, 401, "a read without X-Tenant-Id (%s); the status", r.Text());
-  r = read(c, own, "acme");
+  r = h_read(c, own, "acme");
   ctx.Equal(r.Status, 200, "acme reading its own cluster (%s); the status", r.Text());
 }
 
 void CheckWeakPair(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   const std::string id = clusters::create("acme", "r-1", {kStrong, kWeak, kBeyond}, kHistory);
-  const auto r = read(c, id);
+  const auto r = h_read(c, id);
   ctx.Equal(r.Status, 200, "the read (%s)", r.Text());
-  const auto b = body(r);
-  ctx.Assert(field(b, "members") == nlohmann::json{"r-1", "r-2"},
+  auto b = h_body(r);
+  ctx.Assert(h_field(b, "members") == nlohmann::json{"r-1", "r-2"},
              "r-1–r-2 scores 0.97 and r-2–r-3 only 0.62, and the cluster's members are %s: a pair below kMinMergeConfidence = 0.85 bridged r-3 and r-4 in. Expected [r-1, r-2]",
-             field(b, "members").dump());
-  ctx.Equal(field(b, "review"), nlohmann::json::array({kWeak}), "the weak pair must wait under review; review");
+             h_field(b, "members").dump());
+  ctx.Equal(h_field(b, "review"), nlohmann::json::array({kWeak}), "the weak pair must wait under review; review");
+  const nlohmann::json at = {{"a", "r-5"}, {"b", "r-6"}, {"score", 0.85}, {"key_type", "email_hash"}};
+  const nlohmann::json under = {{"a", "r-6"}, {"b", "r-7"}, {"score", 0.84}, {"key_type", "fuzzy"}};
+  const nlohmann::json far = {{"a", "r-8"}, {"b", "r-9"}, {"score", 0.5}, {"key_type", "fuzzy"}};
+  b = h_body(h_read(c, clusters::create("acme", "r-6", {at, under, far}, {})));
+  ctx.Assert(h_field(b, "members") == nlohmann::json{"r-5", "r-6"},
+             "r-5–r-6 scores exactly 0.85, r-6–r-7 0.84, and the members (sorted) are %s, expected [r-5, r-6]: a pair at kMinMergeConfidence links, one below it does not",
+             h_field(b, "members").dump());
+  ctx.Equal(h_field(b, "review"), nlohmann::json::array({under}), "only the weak pair touching a member goes to review, r-8–r-9 touches none; review");
 }
 
 void CheckEvidence(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   const std::string id = clusters::create("acme", "r-1", {kStrong, kWeak, kBeyond}, kHistory);
-  const auto r = read(c, id);
-  const auto b = body(r);
+  const auto r = h_read(c, id);
+  const auto b = h_body(r);
   ctx.Assert(b.contains("evidence"), "the cluster answered %s: no evidence, so nobody can see why r-2 is a member", r.Text());
-  ctx.Equal(field(b, "evidence"), nlohmann::json::array({kStrong}), "the evidence must be the one strong pair between members as stored");
-  ctx.Equal(field(b, "review"), nlohmann::json::array({kWeak}), "review must hold the weak pair");
+  ctx.Equal(h_field(b, "evidence"), nlohmann::json::array({kStrong}), "the evidence must be the one strong pair between members as stored");
+  ctx.Equal(h_field(b, "review"), nlohmann::json::array({kWeak}), "review must hold the weak pair");
+  const std::vector<nlohmann::json> triangle = {
+      kStrong, {{"a", "r-2"}, {"b", "r-5"}, {"score", 0.9}, {"key_type", "phone_hash"}}, {{"a", "r-1"}, {"b", "r-5"}, {"score", 0.88}, {"key_type", "content_hash"}}};
+  const auto closed = h_body(h_read(c, clusters::create("acme", "r-1", triangle, {})));
+  ctx.Equal(h_field(closed, "evidence"), nlohmann::json(triangle),
+            "r-1, r-2 and r-5 are linked by three strong pairs: every strong pair between members is evidence, as stored, not only the ones that added a member; the evidence");
 }
 
 void CheckHistory(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   const std::string id = clusters::create("acme", "r-1", {kStrong, kWeak}, kHistory);
-  const auto b = body(read(c, id));
-  ctx.Equal(field(b, "history"), nlohmann::json(kHistory), "the cluster's history must be the stored merge actions, oldest first");
+  const auto b = h_body(h_read(c, id));
+  ctx.Equal(h_field(b, "history"), nlohmann::json(kHistory), "the cluster's history must be the stored merge actions, oldest first");
 }
 `,
   },

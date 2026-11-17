@@ -25,7 +25,7 @@ with another user's route.
 service RoutingEngine { rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRouteReply); }  // NOT_FOUND: no road
 \`\`\`
 
-- Every call carries a \`DEADLINE_S = 1.5\` s deadline.
+- Every call carries its own \`DEADLINE_S = 1.5\` s deadline.
 - At most \`MAX_ATTEMPTS = 3\` attempts. Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` are retried; any
   other status goes to the estimate at once.
 - \`NOT_FOUND\` raises \`NoRoute\` (Go: an error wrapping \`ErrNoRoute\`) after one call.
@@ -56,7 +56,7 @@ service RoutingEngine { rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRo
       id: 'deadline',
       title: 'Every engine call carries a 1.5-second deadline',
       detail:
-        'Each `ComputeRoute` is made with `DEADLINE_S` (1.5 s), so a stalled solver costs at most three short attempts; the starter sets no deadline and waits as long as the solver does.',
+        'Each `ComputeRoute` attempt is made with its own `DEADLINE_S` (1.5 s), so a stalled solver costs three short attempts and no more; the starter sets no deadline and waits as long as the solver does.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1\.5/, /ComputeRoute\([\s\S]{0,120}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1500/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -110,7 +110,7 @@ service RoutingEngine { rpc ComputeRoute(ComputeRouteRequest) returns (ComputeRo
       id: 'degraded-fallback',
       title: "The fallback is this trip's estimate, not a remembered route",
       detail:
-        'When the engine cannot answer, the result is `straight_line(origin, destination, epoch)`, marked degraded; the starter returns `last_known`, the last route the engine answered, whatever trip it was for.',
+        'When the engine cannot answer, the result is `straight_line(origin, destination, epoch)`, marked degraded, even for a trip the engine solved before; the starter returns `last_known`, the last route the engine answered, whatever trip it was for.',
       match: {
         python: {all: [/return straight_line\(origin, destination, epoch\)/], none: [/last_known/]},
         typescript: {all: [/return straightLine\(origin, destination, epoch\)/], none: [/lastKnown/]},
@@ -710,12 +710,14 @@ def check_deadline(ctx):
     m = _client(ctx)
     assert m.compute_route(SF, OAKLAND, [], 7)["degraded"] is False, "with the engine healthy the answer must be its road route"
     ctx.grpc.set_latency("ComputeRoute", 10.0)
+    before = _calls(ctx)
     started = ctx.clock.time()
     slow = m.compute_route(SAN_JOSE, PALO_ALTO, [], 7)
     waited = ctx.clock.time() - started
     for call in ctx.grpc.calls_to("ComputeRoute"):
         assert call.timeout is not None, "a ComputeRoute call carries no deadline: a stalled solver holds the request for as long as it likes"
         assert 1.4 <= call.timeout <= 1.6, f"a ComputeRoute call carries a {call.timeout} s deadline, expected DEADLINE_S = 1.5"
+    assert _calls(ctx) - before == 3, f"a stalled engine was called {_calls(ctx) - before} time(s) for one request: DEADLINE_EXCEEDED is retried, and every attempt gets its own 1.5 s, so expected MAX_ATTEMPTS = 3"
     assert waited <= 5, f"one request waited {waited:.1f} s on a stalled engine, expected at most three attempts of 1.5 s"
     assert slow["degraded"] is True, f"with every solve slower than the deadline the answer must be the degraded estimate, got {slow}"
 
@@ -730,11 +732,16 @@ def check_bounded_retry(ctx):
     down = m.compute_route(SAN_JOSE, PALO_ALTO, [], 7)
     assert _calls(ctx) - before == 3, f"an engine that stays UNAVAILABLE was called {_calls(ctx) - before} times for one request, expected MAX_ATTEMPTS = 3"
     assert down["degraded"] is True, f"after three UNAVAILABLE answers the answer must be the degraded estimate, got {down}"
-    ctx.grpc.fail("ComputeRoute", grpc.StatusCode.RESOURCE_EXHAUSTED, "solver queue full", times=1)
+    ctx.grpc.fail("ComputeRoute", grpc.StatusCode.DEADLINE_EXCEEDED, "solver timed out", times=2)
     before = _calls(ctx)
-    busy = m.compute_route(SAN_JOSE, PALO_ALTO, [], 7)
-    assert _calls(ctx) - before == 1, f"RESOURCE_EXHAUSTED was retried ({_calls(ctx) - before} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are"
-    assert busy["degraded"] is True, f"after a RESOURCE_EXHAUSTED answer the answer must be the degraded estimate, got {busy}"
+    route = m.compute_route(SAN_JOSE, PALO_ALTO, [], 7)
+    assert route["degraded"] is False and _calls(ctx) - before == 3, f"two DEADLINE_EXCEEDED answers, then a healthy engine: the third attempt must get the road route (calls {_calls(ctx) - before}, answer {route})"
+    for code in (grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.INTERNAL, grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.PERMISSION_DENIED):
+        ctx.grpc.fail("ComputeRoute", code, "the engine refused the request", times=1)
+        before = _calls(ctx)
+        busy = m.compute_route(SAN_JOSE, PALO_ALTO, [], 7)
+        assert _calls(ctx) - before == 1, f"{code.name} was retried ({_calls(ctx) - before} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are"
+        assert busy["degraded"] is True, f"after a {code.name} answer the answer must be the degraded estimate, got {busy}"
 
 
 def check_no_route(ctx):
@@ -751,12 +758,15 @@ def check_no_route(ctx):
 def check_degraded_fallback(ctx):
     m = _client(ctx)
     m.compute_route(SF, OAKLAND, [], 7)
-    ctx.grpc.fail("ComputeRoute", grpc.StatusCode.UNAVAILABLE, "engine down", times=5)
+    ctx.grpc.fail("ComputeRoute", grpc.StatusCode.UNAVAILABLE, "engine down", times=6)
     route = m.compute_route(SAN_JOSE, PALO_ALTO, [], 8)
     expected = haversine_m(SAN_JOSE, PALO_ALTO)
     assert route["degraded"] is True, f"with the engine down the answer must be marked degraded, got {route}"
     assert abs(route["distance_m"] - expected) < 1, f"the answer for San Jose to Palo Alto says {route['distance_m']:.0f} m, its straight line is {expected:.0f} m: it is another trip's route"
     assert route["epoch"] == 8, f"the estimate must carry the caller's epoch 8, got {route['epoch']}"
+    again = m.compute_route(SF, OAKLAND, [], 8)
+    expected = haversine_m(SF, OAKLAND)
+    assert again["degraded"] is True and abs(again["distance_m"] - expected) < 1, f"with the engine down, San Francisco to Oakland answered {again}: the route the engine solved for epoch 7 is a remembered route, the answer is this request's straight line ({expected:.0f} m), degraded"
 `,
     typescript: `const SF = {lat: 37.77412, lng: -122.41942};
 const OAKLAND = {lat: 37.80418, lng: -122.27112};
@@ -789,6 +799,7 @@ export async function check_deadline(ctx) {
   const {m} = client(ctx);
   assert.equal((await m.computeRoute(SF, OAKLAND, [], 7)).degraded, false, 'with the engine healthy the answer must be its road route');
   ctx.grpc.setLatency('ComputeRoute', 10.0);
+  const before = calls(ctx);
   const started = ctx.clock.now();
   const slow = await m.computeRoute(SAN_JOSE, PALO_ALTO, [], 7);
   const waited = (ctx.clock.now() - started) / 1000;
@@ -796,6 +807,7 @@ export async function check_deadline(ctx) {
     assert(call.timeout !== null, 'a ComputeRoute call carries no deadline: a stalled solver holds the request for as long as it likes');
     assert(1.4 <= call.timeout && call.timeout <= 1.6, \`a ComputeRoute call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 1500\`);
   }
+  assert.equal(calls(ctx) - before, 3, \`a stalled engine was called \${calls(ctx) - before} time(s) for one request: DEADLINE_EXCEEDED is retried, and every attempt gets its own 1.5 s, so expected MAX_ATTEMPTS = 3\`);
   assert(waited <= 5, \`one request waited \${waited} s on a stalled engine, expected at most three attempts of 1.5 s\`);
   assert.equal(slow.degraded, true, \`with every solve slower than the deadline the answer must be the degraded estimate, got \${JSON.stringify(slow)}\`);
 }
@@ -810,11 +822,17 @@ export async function check_bounded_retry(ctx) {
   const down = await m.computeRoute(SAN_JOSE, PALO_ALTO, [], 7);
   assert.equal(calls(ctx) - before, 3, \`an engine that stays UNAVAILABLE was called \${calls(ctx) - before} times for one request, expected MAX_ATTEMPTS = 3\`);
   assert.equal(down.degraded, true, \`after three UNAVAILABLE answers the answer must be the degraded estimate, got \${JSON.stringify(down)}\`);
-  ctx.grpc.fail('ComputeRoute', ctx.grpc.status.RESOURCE_EXHAUSTED, 'solver queue full', 1);
+  ctx.grpc.fail('ComputeRoute', ctx.grpc.status.DEADLINE_EXCEEDED, 'solver timed out', 2);
   before = calls(ctx);
-  const busy = await m.computeRoute(SAN_JOSE, PALO_ALTO, [], 7);
-  assert.equal(calls(ctx) - before, 1, \`RESOURCE_EXHAUSTED was retried (\${calls(ctx) - before} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are\`);
-  assert.equal(busy.degraded, true, \`after a RESOURCE_EXHAUSTED answer the answer must be the degraded estimate, got \${JSON.stringify(busy)}\`);
+  const late = await m.computeRoute(SAN_JOSE, PALO_ALTO, [], 7);
+  assert(late.degraded === false && calls(ctx) - before === 3, \`two DEADLINE_EXCEEDED answers, then a healthy engine: the third attempt must get the road route (calls \${calls(ctx) - before}, answer \${JSON.stringify(late)})\`);
+  for (const code of ['RESOURCE_EXHAUSTED', 'INTERNAL', 'INVALID_ARGUMENT', 'PERMISSION_DENIED']) {
+    ctx.grpc.fail('ComputeRoute', ctx.grpc.status[code], 'the engine refused the request', 1);
+    before = calls(ctx);
+    const busy = await m.computeRoute(SAN_JOSE, PALO_ALTO, [], 7);
+    assert.equal(calls(ctx) - before, 1, \`\${code} was retried (\${calls(ctx) - before} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are\`);
+    assert.equal(busy.degraded, true, \`after a \${code} answer the answer must be the degraded estimate, got \${JSON.stringify(busy)}\`);
+  }
 }
 
 export async function check_no_route(ctx) {
@@ -832,12 +850,15 @@ export async function check_no_route(ctx) {
 export async function check_degraded_fallback(ctx) {
   const {m, geo} = client(ctx);
   await m.computeRoute(SF, OAKLAND, [], 7);
-  ctx.grpc.fail('ComputeRoute', ctx.grpc.status.UNAVAILABLE, 'engine down', 5);
+  ctx.grpc.fail('ComputeRoute', ctx.grpc.status.UNAVAILABLE, 'engine down', 6);
   const route = await m.computeRoute(SAN_JOSE, PALO_ALTO, [], 8);
   const expected = geo.haversineM(SAN_JOSE, PALO_ALTO);
   assert.equal(route.degraded, true, \`with the engine down the answer must be marked degraded, got \${JSON.stringify(route)}\`);
   assert(Math.abs(route.distance_m - expected) < 1, \`the answer for San Jose to Palo Alto says \${route.distance_m} m, its straight line is \${expected} m: it is another trip's route\`);
   assert.equal(route.epoch, 8, \`the estimate must carry the caller's epoch 8, got \${route.epoch}\`);
+  const again = await m.computeRoute(SF, OAKLAND, [], 8);
+  const line = geo.haversineM(SF, OAKLAND);
+  assert(again.degraded === true && Math.abs(again.distance_m - line) < 1, \`with the engine down, San Francisco to Oakland answered \${JSON.stringify(again)}: the route the engine solved for epoch 7 is a remembered route, the answer is this request's straight line (\${line} m), degraded\`);
 }
 `,
     go: `package main
@@ -858,7 +879,7 @@ import (
 )
 
 var (
-	clientBg = context.Background()
+	hBg      = context.Background()
 	sf       = geo.Point{Lat: 37.77412, Lng: -122.41942}
 	oakland  = geo.Point{Lat: 37.80418, Lng: -122.27112}
 	alcatraz = geo.Point{Lat: 37.82667, Lng: -122.42306}
@@ -866,12 +887,12 @@ var (
 	paloAlto = geo.Point{Lat: 37.44188, Lng: -122.14302}
 )
 
-// enginePeer: a road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
-type enginePeer struct {
+// hEngine: a road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
+type hEngine struct {
 	pb.UnimplementedRoutingEngineServer
 }
 
-func (enginePeer) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (*pb.ComputeRouteReply, error) {
+func (hEngine) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (*pb.ComputeRouteReply, error) {
 	points := append([]*pb.LatLng{req.GetOrigin()}, req.GetWaypoints()...)
 	points = append(points, req.GetDestination())
 	distance := 0.0
@@ -887,67 +908,78 @@ func (enginePeer) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (
 	return &pb.ComputeRouteReply{DistanceM: distance, DurationS: distance / 11, Geometry: fmt.Sprintf("poly:%d", len(points)), EngineVersion: "osrm-v26.9"}, nil
 }
 
-func serveEngine(ctx *harness.Ctx) {
-	pb.RegisterRoutingEngineServer(ctx.GRPC.Server(""), enginePeer{})
+func hServeEngine(ctx *harness.Ctx) {
+	pb.RegisterRoutingEngineServer(ctx.GRPC.Server(""), hEngine{})
 }
 
-func calls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ComputeRoute", "")) }
+func hCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ComputeRoute", "")) }
 
-func mustCompute(ctx *harness.Ctx, origin, destination geo.Point, epoch int64) geo.Route {
-	route, err := computeRoute(clientBg, origin, destination, nil, epoch)
+func hCompute(ctx *harness.Ctx, origin, destination geo.Point, epoch int64) geo.Route {
+	route, err := computeRoute(hBg, origin, destination, nil, epoch)
 	ctx.NoError(err, "computeRoute failed")
 	return route
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveEngine(ctx)
-	ctx.Assert(!mustCompute(ctx, sf, oakland, 7).Degraded, "with the engine healthy the answer must be its road route")
+	hServeEngine(ctx)
+	ctx.Assert(!hCompute(ctx, sf, oakland, 7).Degraded, "with the engine healthy the answer must be its road route")
 	ctx.GRPC.SetLatency("ComputeRoute", 10.0, "")
+	before := hCalls(ctx)
 	started := ctx.Clock.Time()
-	slow := mustCompute(ctx, sanJose, paloAlto, 7)
+	slow := hCompute(ctx, sanJose, paloAlto, 7)
 	waited := ctx.Clock.Time().Sub(started)
 	for _, call := range ctx.GRPC.CallsTo("ComputeRoute", "") {
 		ctx.Assert(call.HasDeadline(), "a ComputeRoute call carries no deadline: a stalled solver holds the request for as long as it likes")
 		ctx.Assert(1400*time.Millisecond <= call.Timeout && call.Timeout <= 1600*time.Millisecond, "a ComputeRoute call carries a %v deadline, expected 1.5 s", call.Timeout)
 	}
+	ctx.Equal(hCalls(ctx)-before, 3, "a stalled engine, the calls for one request (DEADLINE_EXCEEDED is retried and every attempt gets its own 1.5 s, so maxAttempts = 3)")
 	ctx.Assert(waited <= 5*time.Second, "one request waited %v on a stalled engine, expected at most three attempts of 1.5 s", waited)
 	ctx.Assert(slow.Degraded, "with every solve slower than the deadline the answer must be the degraded estimate, got %+v", slow)
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	serveEngine(ctx)
+	hServeEngine(ctx)
 	ctx.GRPC.Fail("ComputeRoute", codes.Unavailable, "engine restarting", 2, "")
-	route := mustCompute(ctx, sf, oakland, 7)
-	ctx.Assert(!route.Degraded && calls(ctx) == 3, "two UNAVAILABLE answers, then a healthy engine: the third attempt must get the road route (calls %d, answer %+v)", calls(ctx), route)
+	route := hCompute(ctx, sf, oakland, 7)
+	ctx.Assert(!route.Degraded && hCalls(ctx) == 3, "two UNAVAILABLE answers, then a healthy engine: the third attempt must get the road route (calls %d, answer %+v)", hCalls(ctx), route)
 	ctx.GRPC.Fail("ComputeRoute", codes.Unavailable, "engine down", 3, "")
-	before := calls(ctx)
-	down := mustCompute(ctx, sanJose, paloAlto, 7)
-	ctx.Equal(calls(ctx)-before, 3, "an engine that stays UNAVAILABLE, the calls for one request (maxAttempts is 3)")
+	before := hCalls(ctx)
+	down := hCompute(ctx, sanJose, paloAlto, 7)
+	ctx.Equal(hCalls(ctx)-before, 3, "an engine that stays UNAVAILABLE, the calls for one request (maxAttempts is 3)")
 	ctx.Assert(down.Degraded, "after three UNAVAILABLE answers the answer must be the degraded estimate, got %+v", down)
-	ctx.GRPC.Fail("ComputeRoute", codes.ResourceExhausted, "solver queue full", 1, "")
-	before = calls(ctx)
-	busy := mustCompute(ctx, sanJose, paloAlto, 7)
-	ctx.Equal(calls(ctx)-before, 1, "RESOURCE_EXHAUSTED is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls")
-	ctx.Assert(busy.Degraded, "after a RESOURCE_EXHAUSTED answer the answer must be the degraded estimate, got %+v", busy)
+	ctx.GRPC.Fail("ComputeRoute", codes.DeadlineExceeded, "solver timed out", 2, "")
+	before = hCalls(ctx)
+	late := hCompute(ctx, sanJose, paloAlto, 7)
+	ctx.Assert(!late.Degraded && hCalls(ctx)-before == 3, "two DEADLINE_EXCEEDED answers, then a healthy engine: the third attempt must get the road route (calls %d, answer %+v)", hCalls(ctx)-before, late)
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Internal, codes.InvalidArgument, codes.PermissionDenied} {
+		ctx.GRPC.Fail("ComputeRoute", code, "the engine refused the request", 1, "")
+		before = hCalls(ctx)
+		busy := hCompute(ctx, sanJose, paloAlto, 7)
+		ctx.Equal(hCalls(ctx)-before, 1, "%v is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", code)
+		ctx.Assert(busy.Degraded, "after a %v answer the answer must be the degraded estimate, got %+v", code, busy)
+	}
 }
 
 func CheckNoRoute(ctx *harness.Ctx) {
-	serveEngine(ctx)
-	route, err := computeRoute(clientBg, sf, alcatraz, nil, 7)
+	hServeEngine(ctx)
+	route, err := computeRoute(hBg, sf, alcatraz, nil, 7)
 	ctx.Assert(err != nil, "no road reaches Alcatraz, but computeRoute returned %+v: NOT_FOUND must return ErrNoRoute, not become an estimate", route)
 	ctx.ErrorIs(err, ErrNoRoute, "no road reaches Alcatraz: computeRoute returned %v", err)
-	ctx.Equal(calls(ctx), 1, "a NOT_FOUND answer must not be retried (no road means no road); the calls")
+	ctx.Equal(hCalls(ctx), 1, "a NOT_FOUND answer must not be retried (no road means no road); the calls")
 }
 
 func CheckDegradedFallback(ctx *harness.Ctx) {
-	serveEngine(ctx)
-	mustCompute(ctx, sf, oakland, 7)
-	ctx.GRPC.Fail("ComputeRoute", codes.Unavailable, "engine down", 5, "")
-	route := mustCompute(ctx, sanJose, paloAlto, 8)
+	hServeEngine(ctx)
+	hCompute(ctx, sf, oakland, 7)
+	ctx.GRPC.Fail("ComputeRoute", codes.Unavailable, "engine down", 6, "")
+	route := hCompute(ctx, sanJose, paloAlto, 8)
 	expected := geo.HaversineM(sanJose, paloAlto)
 	ctx.Assert(route.Degraded, "with the engine down the answer must be marked degraded, got %+v", route)
 	ctx.Assert(math.Abs(route.DistanceM-expected) < 1, "the answer for San Jose to Palo Alto says %.0f m, its straight line is %.0f m: it is another trip's route", route.DistanceM, expected)
 	ctx.Equal(route.Epoch, int64(8), "the estimate must carry the caller's epoch")
+	again := hCompute(ctx, sf, oakland, 8)
+	line := geo.HaversineM(sf, oakland)
+	ctx.Assert(again.Degraded && math.Abs(again.DistanceM-line) < 1, "with the engine down, San Francisco to Oakland answered %+v: the route the engine solved for epoch 7 is a remembered route, the answer is this request's straight line (%.0f m), degraded", again, line)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -968,7 +1000,7 @@ const geo::Point kSanJose{37.33874, -121.88533};
 const geo::Point kPaloAlto{37.44188, -122.14302};
 
 // A road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
-class EnginePeer final : public mapsrouting::RoutingEngine::Service {
+class HEnginePeer final : public mapsrouting::RoutingEngine::Service {
  public:
   grpc::Status ComputeRoute(grpc::ServerContext*, const mapsrouting::ComputeRouteRequest* req, mapsrouting::ComputeRouteReply* out) override {
     std::vector<geo::Point> points = {{req->origin().lat(), req->origin().lng()}};
@@ -990,16 +1022,16 @@ class EnginePeer final : public mapsrouting::RoutingEngine::Service {
   }
 };
 
-void serveEngine(harness::Ctx& ctx) {
-  static EnginePeer* engine_peer = nullptr;
+void hServeEngine(harness::Ctx& ctx) {
+  static HEnginePeer* engine_peer = nullptr;
   delete engine_peer;
-  engine_peer = new EnginePeer;
+  engine_peer = new HEnginePeer;
   ctx.GRPC.Server("")->RegisterService(engine_peer);
 }
 
-size_t calls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ComputeRoute").size(); }
+size_t hCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ComputeRoute").size(); }
 
-geo::Route mustCompute(harness::Ctx& ctx, const geo::Point& origin, const geo::Point& destination, long long epoch) {
+geo::Route hCompute(harness::Ctx& ctx, const geo::Point& origin, const geo::Point& destination, long long epoch) {
   try {
     return computeRoute(origin, destination, {}, epoch);
   } catch (const std::exception& e) {
@@ -1010,39 +1042,53 @@ geo::Route mustCompute(harness::Ctx& ctx, const geo::Point& origin, const geo::P
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveEngine(ctx);
-  ctx.Assert(!mustCompute(ctx, kSf, kOakland, 7).degraded, "with the engine healthy the answer must be its road route");
+  hServeEngine(ctx);
+  ctx.Assert(!hCompute(ctx, kSf, kOakland, 7).degraded, "with the engine healthy the answer must be its road route");
   ctx.GRPC.SetLatency("ComputeRoute", 10.0);
+  const size_t stalled = hCalls(ctx);
   const int64_t started = ctx.Clock.Now();
-  const geo::Route slow = mustCompute(ctx, kSanJose, kPaloAlto, 7);
+  const geo::Route slow = hCompute(ctx, kSanJose, kPaloAlto, 7);
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   for (const auto& call : ctx.GRPC.CallsTo("ComputeRoute")) {
     ctx.Assert(call.HasDeadline(), "a ComputeRoute call carries no deadline: a stalled solver holds the request for as long as it likes");
     ctx.Assert(1.4 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.6, "a ComputeRoute call carries a %v s deadline, expected kDeadline = 1.5 s", call.TimeoutSeconds());
   }
+  ctx.Equal(hCalls(ctx) - stalled, 3, "a stalled engine, the calls for one request (DEADLINE_EXCEEDED is retried and every attempt gets its own 1.5 s, so kMaxAttempts = 3)");
   ctx.Assert(waited <= 5, "one request waited %v s on a stalled engine, expected at most three attempts of 1.5 s", waited);
   ctx.Assert(slow.degraded, "with every solve slower than the deadline the answer must be the degraded estimate, got engine_version %q", slow.engine_version);
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  serveEngine(ctx);
+  hServeEngine(ctx);
   ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::UNAVAILABLE, "engine restarting", 2);
-  const geo::Route route = mustCompute(ctx, kSf, kOakland, 7);
-  ctx.Assert(!route.degraded && calls(ctx) == 3, "two UNAVAILABLE answers, then a healthy engine: the third attempt must get the road route (calls %d)", calls(ctx));
+  const geo::Route route = hCompute(ctx, kSf, kOakland, 7);
+  ctx.Assert(!route.degraded && hCalls(ctx) == 3, "two UNAVAILABLE answers, then a healthy engine: the third attempt must get the road route (calls %d)", hCalls(ctx));
   ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::UNAVAILABLE, "engine down", 3);
-  size_t before = calls(ctx);
-  const geo::Route down = mustCompute(ctx, kSanJose, kPaloAlto, 7);
-  ctx.Equal(calls(ctx) - before, 3, "an engine that stays UNAVAILABLE, the calls for one request (kMaxAttempts is 3)");
+  size_t before = hCalls(ctx);
+  const geo::Route down = hCompute(ctx, kSanJose, kPaloAlto, 7);
+  ctx.Equal(hCalls(ctx) - before, 3, "an engine that stays UNAVAILABLE, the calls for one request (kMaxAttempts is 3)");
   ctx.Assert(down.degraded, "after three UNAVAILABLE answers the answer must be the degraded estimate");
-  ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::RESOURCE_EXHAUSTED, "solver queue full", 1);
-  before = calls(ctx);
-  const geo::Route busy = mustCompute(ctx, kSanJose, kPaloAlto, 7);
-  ctx.Equal(calls(ctx) - before, 1, "RESOURCE_EXHAUSTED is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls");
-  ctx.Assert(busy.degraded, "after a RESOURCE_EXHAUSTED answer the answer must be the degraded estimate");
+  ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::DEADLINE_EXCEEDED, "solver timed out", 2);
+  before = hCalls(ctx);
+  const geo::Route late = hCompute(ctx, kSanJose, kPaloAlto, 7);
+  ctx.Assert(!late.degraded && hCalls(ctx) - before == 3, "two DEADLINE_EXCEEDED answers, then a healthy engine: the third attempt must get the road route (calls %d)", hCalls(ctx) - before);
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
+  };
+  for (const auto& [code, name] : terminal) {
+    ctx.GRPC.Fail("ComputeRoute", code, "the engine refused the request", 1);
+    before = hCalls(ctx);
+    const geo::Route busy = hCompute(ctx, kSanJose, kPaloAlto, 7);
+    ctx.Equal(hCalls(ctx) - before, 1, "%s is not retried (only UNAVAILABLE and DEADLINE_EXCEEDED are); the calls", name);
+    ctx.Assert(busy.degraded, "after a %s answer the answer must be the degraded estimate", name);
+  }
 }
 
 void CheckNoRoute(harness::Ctx& ctx) {
-  serveEngine(ctx);
+  hServeEngine(ctx);
   bool raised = false;
   try {
     const geo::Route route = computeRoute(kSf, kAlcatraz, {}, 7);
@@ -1051,18 +1097,21 @@ void CheckNoRoute(harness::Ctx& ctx) {
     raised = true;
   }
   ctx.Assert(raised, "NOT_FOUND must throw NoRoute");
-  ctx.Equal(calls(ctx), 1, "a NOT_FOUND answer must not be retried (no road means no road); the calls");
+  ctx.Equal(hCalls(ctx), 1, "a NOT_FOUND answer must not be retried (no road means no road); the calls");
 }
 
 void CheckDegradedFallback(harness::Ctx& ctx) {
-  serveEngine(ctx);
-  mustCompute(ctx, kSf, kOakland, 7);
-  ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::UNAVAILABLE, "engine down", 5);
-  const geo::Route route = mustCompute(ctx, kSanJose, kPaloAlto, 8);
+  hServeEngine(ctx);
+  hCompute(ctx, kSf, kOakland, 7);
+  ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::UNAVAILABLE, "engine down", 6);
+  const geo::Route route = hCompute(ctx, kSanJose, kPaloAlto, 8);
   const double expected = geo::haversineM(kSanJose, kPaloAlto);
   ctx.Assert(route.degraded, "with the engine down the answer must be marked degraded");
   ctx.Assert(std::abs(route.distance_m - expected) < 1, "the answer for San Jose to Palo Alto says %v m, its straight line is %v m: it is another trip's route", route.distance_m, expected);
   ctx.Equal(route.epoch, 8, "the estimate must carry the caller's epoch");
+  const geo::Route again = hCompute(ctx, kSf, kOakland, 8);
+  const double line = geo::haversineM(kSf, kOakland);
+  ctx.Assert(again.degraded && std::abs(again.distance_m - line) < 1, "with the engine down, San Francisco to Oakland answered %v m (degraded %t): the route the engine solved for epoch 7 is a remembered route, the answer is this request's straight line (%v m), degraded", again.distance_m, again.degraded, line);
 }
 `,
   },

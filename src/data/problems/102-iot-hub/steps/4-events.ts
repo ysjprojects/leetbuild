@@ -61,7 +61,7 @@ broker that refuses the record or does not answer drops the transition with nobo
       id: 'ids-and-outcomes',
       title: 'Carries ids and the outcome, never the params',
       detail:
-        "The event is `{command_id, device_id, action, outcome, at_ms}`; the starter copies the command's `params` (an unlock PIN) into a topic every consumer group can read for as long as it is retained.",
+        "The event is exactly `{command_id, device_id, action, outcome, at_ms}`, with `at_ms` the transition's time in milliseconds; the starter copies the command's `params` (an unlock PIN) into a topic every consumer group can read for as long as it is retained.",
       match: {
         python: {all: [/["']outcome["']/], none: [/def event_payload(?:(?!\ndef )[\s\S])*?params/]},
         typescript: {all: [/outcome/], none: [/function eventPayload(?:(?!\nexport |\nfunction )[\s\S])*?params/]},
@@ -87,7 +87,7 @@ broker that refuses the record or does not answer drops the transition with nobo
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the device key and the payload, and the call returns false; the starter fires and forgets.',
+        'An acknowledged transition returns true and writes no row. A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the device key and the event payload (never the params), and the call returns false; the starter fires and forgets.',
       match: {
         python: {all: [/outbox\.insert\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -600,6 +600,7 @@ def check_device_key(ctx):
 
 def check_ids_and_outcomes(ctx):
     m = ctx.load("events")
+    now_ms = int(ctx.clock.time() * 1000)
     m.publish_transition(_command(1), "accepted")
     records = ctx.kafka.records(TOPIC)
     assert len(records) == 1, f"one transition produced {len(records)} records"
@@ -607,6 +608,8 @@ def check_ids_and_outcomes(ctx):
     value = json.loads(raw)
     assert (value.get("command_id"), value.get("device_id"), value.get("action"), value.get("outcome")) == ("cmd-1", "lock-7", "unlock", "accepted"), f"the event is {raw}, expected command_id, device_id, action and outcome"
     assert "params" not in value and "4711" not in raw, f"the event carries the command's params ({raw}): the unlock PIN now sits in a retained, replicated topic every consumer group can read"
+    assert set(value) == {"command_id", "device_id", "action", "outcome", "at_ms"}, f"the event carries the fields {sorted(value)}, expected exactly command_id, device_id, action, outcome and at_ms: the event names what it keeps, it does not copy the command and drop what looks secret"
+    assert isinstance(value["at_ms"], int) and abs(value["at_ms"] - now_ms) <= 1000, f"the event's at_ms is {value['at_ms']!r}, expected the time of the transition in milliseconds ({now_ms})"
 
 
 def check_acks_idempotent(ctx):
@@ -621,17 +624,21 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish_transition(_command(0), "accepted")
+    assert ok is True and _outbox(ctx) == [], f"a transition the broker acknowledged returned {ok!r} and left the outbox rows {_outbox(ctx)}, expected True and no row"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_transition(_command(1), "accepted")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the transition vanishes from the fleet audit"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "lock-7" and rows[0].get("payload", {}).get("command_id") == "cmd-1", f"the outbox row is {rows[0]}, expected the topic, the key lock-7 and the payload"
+    payload = rows[0].get("payload", {})
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "lock-7" and payload.get("command_id") == "cmd-1" and payload.get("outcome") == "accepted", f"the outbox row is {rows[0]}, expected the topic, the key lock-7 and the event payload"
+    assert "params" not in payload and "4711" not in json.dumps(payload), f"the outbox row carries the command's params ({payload}): the row holds the event the topic would have received, never the PIN"
     assert ok is False, f"publish_transition returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_transition(_command(2), "accepted")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_transition waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_transition waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S = 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("command_id") == "cmd-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_transition returned {ok!r} without a delivery report, expected False"
@@ -672,6 +679,7 @@ export async function check_device_key(ctx) {
 
 export async function check_ids_and_outcomes(ctx) {
   const m = ctx.load('events');
+  const nowMs = ctx.clock.now();
   await m.publishTransition(command(1), 'accepted');
   await settle();
   const values = ctx.kafka.values(TOPIC);
@@ -679,6 +687,9 @@ export async function check_ids_and_outcomes(ctx) {
   const value = JSON.parse(values[0]);
   assert(value.command_id === 'cmd-1' && value.device_id === 'lock-7' && value.action === 'unlock' && value.outcome === 'accepted', \`the event is \${values[0]}, expected command_id, device_id, action and outcome\`);
   assert(!('params' in value) && !values[0].includes('4711'), \`the event carries the command's params (\${values[0]}): the unlock PIN now sits in a retained, replicated topic every consumer group can read\`);
+  const fields = Object.keys(value).sort();
+  assert.deepEqual(fields, ['action', 'at_ms', 'command_id', 'device_id', 'outcome'], \`the event carries the fields \${JSON.stringify(fields)}, expected exactly command_id, device_id, action, outcome and at_ms: the event names what it keeps, it does not copy the command and drop what looks secret\`);
+  assert(Number.isInteger(value.at_ms) && Math.abs(value.at_ms - nowMs) <= 1000, \`the event's at_ms is \${JSON.stringify(value.at_ms)}, expected the time of the transition in milliseconds (\${nowMs})\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -695,18 +706,24 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
-  ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishTransition(command(1), 'accepted');
+  let ok = await m.publishTransition(command(0), 'accepted');
   await settle();
   let rows = outboxRows(ctx);
+  assert(ok === true && rows.length === 0, \`a transition the broker acknowledged resolved \${JSON.stringify(ok)} and left the outbox rows \${JSON.stringify(rows)}, expected true and no row\`);
+  ctx.kafka.failNext(TOPIC, 1);
+  ok = await m.publishTransition(command(1), 'accepted');
+  await settle();
+  rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the transition vanishes from the fleet audit\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'lock-7' && rows[0].payload?.command_id === 'cmd-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key lock-7 and the payload\`);
+  const payload = rows[0].payload ?? {};
+  assert(rows[0].topic === TOPIC && rows[0].key === 'lock-7' && payload.command_id === 'cmd-1' && payload.outcome === 'accepted', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key lock-7 and the event payload\`);
+  assert(!('params' in payload) && !JSON.stringify(payload).includes('4711'), \`the outbox row carries the command's params (\${JSON.stringify(payload)}): the row holds the event the topic would have received, never the PIN\`);
   assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishTransition(command(2), 'accepted');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishTransition waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishTransition waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.command_id === 'cmd-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishTransition resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -768,6 +785,7 @@ func CheckDeviceKey(ctx *harness.Ctx) {
 }
 
 func CheckIdsAndOutcomes(ctx *harness.Ctx) {
+	nowMs := ctx.Clock.Now()
 	eventsPublish(ctx, eventsCommand(1, "lock-7"), "accepted")
 	ctx.Settle()
 	values := ctx.Kafka.Values(eventsTopic)
@@ -777,6 +795,14 @@ func CheckIdsAndOutcomes(ctx *harness.Ctx) {
 	ctx.Assert(value["command_id"] == "cmd-1" && value["device_id"] == "lock-7" && value["action"] == "unlock" && value["outcome"] == "accepted", "the event is %s, expected command_id, device_id, action and outcome", values[0])
 	_, hasParams := value["params"]
 	ctx.Assert(!hasParams && !strings.Contains(values[0], "4711"), "the event carries the command's params (%s): the unlock PIN now sits in a retained, replicated topic every consumer group can read", values[0])
+	exact := len(value) == 5
+	for _, field := range []string{"command_id", "device_id", "action", "outcome", "at_ms"} {
+		_, has := value[field]
+		exact = exact && has
+	}
+	ctx.Assert(exact, "the event is %s, expected exactly command_id, device_id, action, outcome and at_ms: the event names what it keeps, it does not copy the command and drop what looks secret", values[0])
+	at, isNumber := value["at_ms"].(float64)
+	ctx.Assert(isNumber && float64(int64(at)) == at && at-float64(nowMs) <= 1000 && float64(nowMs)-at <= 1000, "the event's at_ms is %v, expected the time of the transition in milliseconds (%d)", value["at_ms"], nowMs)
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -791,18 +817,25 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, eventsCommand(1, "lock-7"), "accepted")
+	ok := eventsPublish(ctx, eventsCommand(0, "lock-7"), "accepted")
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
+	ctx.Assert(ok && len(rows) == 0, "a transition the broker acknowledged returned %v and left the outbox rows %v, expected true and no row", ok, rows)
+	ctx.Kafka.FailNext(eventsTopic, 1)
+	ok = eventsPublish(ctx, eventsCommand(1, "lock-7"), "accepted")
+	ctx.Settle()
+	rows = eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the transition vanishes from the fleet audit; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "lock-7" && rows[0].Payload["command_id"] == "cmd-1", "the outbox row is %v, expected the topic, the key lock-7 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "lock-7" && rows[0].Payload["command_id"] == "cmd-1" && rows[0].Payload["outcome"] == "accepted", "the outbox row is %v, expected the topic, the key lock-7 and the event payload", rows[0])
+	_, rowParams := rows[0].Payload["params"]
+	rowText, _ := json.Marshal(rows[0].Payload)
+	ctx.Assert(!rowParams && !strings.Contains(string(rowText), "4711"), "the outbox row carries the command's params (%s): the row holds the event the topic would have received, never the PIN", rowText)
 	ctx.Equal(ok, false, "publishTransition's result after a failed delivery")
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, eventsCommand(2, "lock-7"), "accepted")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishTransition waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout = 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["command_id"] == "cmd-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishTransition's result without a delivery report")
@@ -812,6 +845,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -861,6 +895,7 @@ void CheckDeviceKey(harness::Ctx& ctx) {
 }
 
 void CheckIdsAndOutcomes(harness::Ctx& ctx) {
+  const int64_t now_ms = ctx.Clock.Now();
   publishTransition(eventsCommand(1), "accepted");
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kEventsTopic);
@@ -871,6 +906,13 @@ void CheckIdsAndOutcomes(harness::Ctx& ctx) {
              "the event is %s, expected command_id, device_id, action and outcome", values[0]);
   ctx.Assert(!(value.is_object() && value.contains("params")) && values[0].find("4711") == std::string::npos,
              "the event carries the command's params (%s): the unlock PIN now sits in a retained, replicated topic every consumer group can read", values[0]);
+  bool exact = value.is_object() && value.size() == 5;
+  for (const char* field : {"command_id", "device_id", "action", "outcome", "at_ms"}) exact = exact && value.contains(field);
+  ctx.Assert(exact, "the event is %s, expected exactly command_id, device_id, action, outcome and at_ms: the event names what it keeps, it does not copy the command and drop what looks secret",
+             values[0]);
+  const bool at_ok = value.is_object() && value.contains("at_ms") && value["at_ms"].is_number_integer() &&
+                     std::llabs(value["at_ms"].get<long long>() - static_cast<long long>(now_ms)) <= 1000;
+  ctx.Assert(at_ok, "the event is %s, expected at_ms to be the time of the transition in milliseconds (%d)", values[0], now_ms);
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -886,20 +928,26 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publishTransition(eventsCommand(1), "accepted");
+  bool ok = publishTransition(eventsCommand(0), "accepted");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
+  ctx.Assert(ok && rows.empty(), "a transition the broker acknowledged returned %v and left %d outbox rows, expected true and no row", ok, rows.size());
+  ctx.Kafka.FailNext(kEventsTopic, 1);
+  ok = publishTransition(eventsCommand(1), "accepted");
+  ctx.Settle();
+  rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the transition vanishes from the fleet audit; the rows");
   ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "lock-7" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "command_id") == "cmd-1",
-             "the outbox row is %s, expected the topic, the key lock-7 and the payload", rows[0].dump());
+                 eventsField(rows[0]["payload"], "command_id") == "cmd-1" && eventsField(rows[0]["payload"], "outcome") == "accepted",
+             "the outbox row is %s, expected the topic, the key lock-7 and the event payload", rows[0].dump());
+  ctx.Assert(!(rows[0]["payload"].is_object() && rows[0]["payload"].contains("params")) && rows[0]["payload"].dump().find("4711") == std::string::npos,
+             "the outbox row carries the command's params (%s): the row holds the event the topic would have received, never the PIN", rows[0]["payload"].dump());
   ctx.Equal(ok, false, "publishTransition's result after a failed delivery");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishTransition(eventsCommand(2), "accepted");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishTransition waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishTransition waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "command_id") == "cmd-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());

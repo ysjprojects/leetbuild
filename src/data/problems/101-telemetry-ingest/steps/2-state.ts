@@ -23,7 +23,8 @@ full minute however much of the window is left.
 - A device may send **600 samples** (\`RATE_LIMIT\`) per **60-second window** (\`WINDOW_S\`), counted in
   \`rate:{device_id}\`.
 - One Lua script (\`ADMIT_LUA\`) reads the counter, refuses a batch that does not fit, and only then
-  increments it and writes each metric's latest value into \`latest:{device_id}\`.
+  increments it and writes each metric's latest value (its last sample in the batch) into
+  \`latest:{device_id}\`.
 - The window is the counter's life: the script \`EXPIRE\`s it with \`WINDOW_S\` when it creates it.
 - A refusal answers \`remaining\` (samples left in the window) and \`retry_after\`, the counter's
   remaining \`TTL\`, from the script's return value.`,
@@ -59,7 +60,7 @@ full minute however much of the window is left.
       id: 'refused-writes-nothing',
       title: 'A refused batch leaves the latest values and the counter alone',
       detail:
-        "The script decides first and writes `latest:{device}` only for an admitted batch. The starter writes every value before it looks at the counter, so a refused batch still changes the device's latest reading.",
+        "The script decides first and writes `latest:{device}` only for an admitted batch, each metric holding its last sample in the batch. The starter writes every value before it looks at the counter, so a refused batch still changes the device's latest reading.",
       match: {
         python: {order: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]HSET['"]/], none: [/\br\.hset\(/]},
         typescript: {order: [/redis\.call\(\s*['"]GET['"]/, /redis\.call\(\s*['"]HSET['"]/], none: [/redis\.hset\(/]},
@@ -72,7 +73,7 @@ full minute however much of the window is left.
       id: 'window-expiry',
       title: 'The counter expires with its window',
       detail:
-        'The script sets the counter’s expiry to the window when it creates it, so 61 seconds after a full window the device is admitted again. The starter never expires `rate:{device}`, so a busy minute refuses the device for good.',
+        'The script sets the counter’s expiry to the window when it creates it, in the same step, and a later batch does not push it back: exactly 600 samples fit, and 61 seconds after the first batch the device is admitted again. The starter never expires `rate:{device}`, so a busy minute refuses the device for good.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/]},
@@ -550,7 +551,11 @@ def check_atomic_admit(ctx):
 
 def check_refused_writes_nothing(ctx):
     m = ctx.load("state")
-    assert m.admit("d-1", _samples(590, value=20.0))["admitted"] is True, "590 samples fit a fresh window"
+    batch = [{"metric": "temp_c", "value": 19.0, "ts": TS0 + i} for i in range(588)]
+    batch += [{"metric": "humidity", "value": 40.0, "ts": TS0 + 588}, {"metric": "temp_c", "value": 20.0, "ts": TS0 + 589}]
+    assert m.admit("d-1", batch)["admitted"] is True, "590 samples fit a fresh window"
+    stored = ctx.redis.hgetall("latest:d-1")
+    assert {k: float(v) for k, v in stored.items()} == {"temp_c": 20.0, "humidity": 40.0}, f"an admitted batch whose last temp_c is 20.0 and whose humidity is 40.0 left latest:d-1 at {stored}: each metric's latest value is its last reading in the batch"
     refused = m.admit("d-1", _samples(20, value=99.0))
     assert refused["admitted"] is False, f"20 more samples with 10 left must be refused, got {refused}"
     latest = ctx.redis.hget("latest:d-1", "temp_c")
@@ -560,15 +565,22 @@ def check_refused_writes_nothing(ctx):
 
 def check_window_expiry(ctx):
     m = ctx.load("state")
+    created = ctx.redis_after("rate:d-1", lambda: ctx.redis.ttl("rate:d-1"))
     m.admit("d-1", _samples(500))
-    m.admit("d-1", _samples(100))
+    assert created.fired, "admitting 500 samples never touched rate:d-1"
+    if created.error is not None:
+        raise created.error
+    assert 0 < created.result <= 60, f"right after the command that created rate:d-1 its TTL was {created.result}: the expiry must come with the write that creates the counter, or a crash in between leaves a counter that never resets"
+    ctx.clock.advance(30)
+    full = m.admit("d-1", _samples(100))
+    assert full["admitted"] is True, f"100 samples on top of 500 make exactly 600, the limit, and must be admitted, got {full}"
+    ttl = ctx.redis.ttl("rate:d-1")
+    assert 0 < ttl <= 30, f"30 s into the window rate:d-1 has TTL {ttl}: the window starts with the device's first batch, and a later batch must not push its end back"
     over = m.admit("d-1", _samples(1))
     assert over["admitted"] is False, f"the 601st sample of a window must be refused, got {over}"
-    ttl = ctx.redis.ttl("rate:d-1")
-    assert 0 < ttl <= 60, f"rate:d-1 has TTL {ttl}: a counter without an expiry never resets, so a device that had one busy minute is refused for good"
-    ctx.clock.advance(61)
+    ctx.clock.advance(31)
     after = m.admit("d-1", _samples(1))
-    assert after["admitted"] is True, f"61 s later, in a new window, one sample was refused: {after}"
+    assert after["admitted"] is True, f"61 s after the window opened, in a new window, one sample was refused: {after}"
     assert _count(ctx) == 1, f"the new window's counter holds {_count(ctx)}, expected 1"
 
 
@@ -607,7 +619,12 @@ export async function check_atomic_admit(ctx) {
 
 export async function check_refused_writes_nothing(ctx) {
   const m = ctx.load('state');
-  assert.equal((await m.admit('d-1', samples(590, 20.0))).admitted, true, '590 samples fit a fresh window');
+  const batch = Array.from({length: 588}, (_, i) => ({metric: 'temp_c', value: 19.0, ts: TS0 + i}));
+  batch.push({metric: 'humidity', value: 40.0, ts: TS0 + 588}, {metric: 'temp_c', value: 20.0, ts: TS0 + 589});
+  assert.equal((await m.admit('d-1', batch)).admitted, true, '590 samples fit a fresh window');
+  const stored = ctx.redis.hgetall('latest:d-1');
+  const numbers = Object.fromEntries(Object.entries(stored).map(([k, v]) => [k, Number(v)]));
+  assert.deepEqual(numbers, {temp_c: 20, humidity: 40}, \`an admitted batch whose last temp_c is 20.0 and whose humidity is 40.0 left latest:d-1 at \${JSON.stringify(stored)}: each metric's latest value is its last reading in the batch\`);
   const refused = await m.admit('d-1', samples(20, 99.0));
   assert.equal(refused.admitted, false, \`20 more samples with 10 left must be refused, got \${JSON.stringify(refused)}\`);
   const latest = ctx.redis.hget('latest:d-1', 'temp_c');
@@ -617,15 +634,24 @@ export async function check_refused_writes_nothing(ctx) {
 
 export async function check_window_expiry(ctx) {
   const m = ctx.load('state');
+  // -2: the first command on rate:d-1 only read it; -1: it exists without an expiry.
+  const created = ctx.redisAfter('rate:d-1', () => ctx.redis.ttl('rate:d-1'));
   await m.admit('d-1', samples(500));
-  await m.admit('d-1', samples(100));
+  assert(created.fired, 'admitting 500 samples never touched rate:d-1');
+  if (created.error !== undefined) throw created.error;
+  const createdTtl = await created.result;
+  assert(createdTtl === -2 || (createdTtl > 0 && createdTtl <= 60), \`right after the command that created rate:d-1 its TTL was \${createdTtl}: the expiry must come with the write that creates the counter, or a crash in between leaves a counter that never resets\`);
+  ctx.clock.advance(30);
+  const full = await m.admit('d-1', samples(100));
+  assert.equal(full.admitted, true, \`100 samples on top of 500 make exactly 600, the limit, and must be admitted, got \${JSON.stringify(full)}\`);
+  const ttl = ctx.redis.ttl('rate:d-1');
+  assert(ttl !== -1, 'rate:d-1 has no TTL: a counter without an expiry never resets, so a device that had one busy minute is refused for good');
+  assert(ttl > 0 && ttl <= 30, \`30 s into the window rate:d-1 has TTL \${ttl}: the window starts with the device's first batch, and a later batch must not push its end back\`);
   const over = await m.admit('d-1', samples(1));
   assert.equal(over.admitted, false, \`the 601st sample of a window must be refused, got \${JSON.stringify(over)}\`);
-  const ttl = ctx.redis.ttl('rate:d-1');
-  assert(ttl > 0 && ttl <= 60, \`rate:d-1 has TTL \${ttl}: a counter without an expiry never resets, so a device that had one busy minute is refused for good\`);
-  ctx.clock.advance(61);
+  ctx.clock.advance(31);
   const after = await m.admit('d-1', samples(1));
-  assert.equal(after.admitted, true, \`61 s later, in a new window, one sample was refused: \${JSON.stringify(after)}\`);
+  assert.equal(after.admitted, true, \`61 s after the window opened, in a new window, one sample was refused: \${JSON.stringify(after)}\`);
   assert.equal(count(ctx), 1, \`the new window's counter holds \${count(ctx)}, expected 1\`);
 }
 
@@ -652,9 +678,9 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func batchOf(n int, value float64) []wal.Sample {
+func hBatchOf(n int, value float64) []wal.Sample {
 	out := make([]wal.Sample, n)
 	for i := range out {
 		out[i] = wal.Sample{Metric: "temp_c", Value: value, TS: 1_800_000_000}
@@ -662,72 +688,95 @@ func batchOf(n int, value float64) []wal.Sample {
 	return out
 }
 
-func mustAdmit(ctx *harness.Ctx, device string, n int, value float64) Admission {
-	a, err := admit(stateBg, device, batchOf(n, value))
+func hMustAdmit(ctx *harness.Ctx, device string, n int, value float64) Admission {
+	a, err := admit(hStateBg, device, hBatchOf(n, value))
 	ctx.NoError(err, "admit(%s, %d samples)", device, n)
 	return a
 }
 
-func counter(ctx *harness.Ctx, device string) int64 {
+func hCounter(ctx *harness.Ctx, device string) int64 {
 	raw, _ := ctx.Redis.Get("rate:" + device)
 	n, _ := strconv.ParseInt(raw, 10, 64)
 	return n
 }
 
 func CheckAtomicAdmit(ctx *harness.Ctx) {
-	ctx.Assert(mustAdmit(ctx, "d-1", 500, 20).Admitted, "the first 500 samples of a fresh window must be admitted")
+	ctx.Assert(hMustAdmit(ctx, "d-1", 500, 20).Admitted, "the first 500 samples of a fresh window must be admitted")
 	// A second batch lands right after this one's first command on the counter.
 	rival := ctx.Redis.After("rate:d-1", func() any {
-		a, err := admit(stateBg, "d-1", batchOf(80, 20))
+		a, err := admit(hStateBg, "d-1", hBatchOf(80, 20))
 		ctx.NoError(err, "the racing admit failed")
 		return a
 	})
-	mine := mustAdmit(ctx, "d-1", 80, 20)
+	mine := hMustAdmit(ctx, "d-1", 80, 20)
 	ctx.Assert(rival.Fired, "the second batch never touched rate:d-1")
 	ctx.Assert(rival.Err == nil, "the racing admit failed: %v", rival.Err)
 	theirs, _ := rival.Result.(Admission)
-	total := counter(ctx, "d-1")
+	total := hCounter(ctx, "d-1")
 	ctx.Assert(total <= 600, "two racing batches of 80 on top of 500 left rate:d-1 at %d, past the limit of 600: both read the counter before either moved it", total)
 	ctx.Assert(mine.Admitted != theirs.Admitted, "with 100 samples left exactly one batch of 80 fits; admitted: %v and %v", mine.Admitted, theirs.Admitted)
 	ctx.Equal(total, int64(580), "rate:d-1 after the race")
 }
 
 func CheckRefusedWritesNothing(ctx *harness.Ctx) {
-	ctx.Assert(mustAdmit(ctx, "d-1", 590, 20).Admitted, "590 samples fit a fresh window")
-	refused := mustAdmit(ctx, "d-1", 20, 99)
+	batch := make([]wal.Sample, 588)
+	for i := range batch {
+		batch[i] = wal.Sample{Metric: "temp_c", Value: 19, TS: 1_800_000_000 + int64(i)}
+	}
+	batch = append(batch, wal.Sample{Metric: "humidity", Value: 40, TS: 1_800_000_588}, wal.Sample{Metric: "temp_c", Value: 20, TS: 1_800_000_589})
+	first, err := admit(hStateBg, "d-1", batch)
+	ctx.NoError(err, "admit(d-1, 590 samples)")
+	ctx.Assert(first.Admitted, "590 samples fit a fresh window")
+	stored := ctx.Redis.HGetAll("latest:d-1")
+	numbers := map[string]float64{}
+	for k, v := range stored {
+		numbers[k], _ = strconv.ParseFloat(v, 64)
+	}
+	ctx.Assert(len(numbers) == 2 && numbers["temp_c"] == 20 && numbers["humidity"] == 40, "an admitted batch whose last temp_c is 20.0 and whose humidity is 40.0 left latest:d-1 at %v: each metric's latest value is its last reading in the batch", stored)
+	refused := hMustAdmit(ctx, "d-1", 20, 99)
 	ctx.Assert(!refused.Admitted, "20 more samples with 10 left must be refused, got %+v", refused)
 	latest, _ := ctx.Redis.HGet("latest:d-1", "temp_c")
 	value, _ := strconv.ParseFloat(latest, 64)
 	ctx.Assert(value == 20, "a refused batch moved latest:d-1 temp_c to %q: the dashboard shows a reading the pipeline never admitted", latest)
-	ctx.Equal(counter(ctx, "d-1"), int64(590), "a refused batch must leave rate:d-1")
+	ctx.Equal(hCounter(ctx, "d-1"), int64(590), "a refused batch must leave rate:d-1")
 }
 
 func CheckWindowExpiry(ctx *harness.Ctx) {
-	mustAdmit(ctx, "d-1", 500, 20)
-	mustAdmit(ctx, "d-1", 100, 20)
-	ctx.Assert(!mustAdmit(ctx, "d-1", 1, 20).Admitted, "the 601st sample of a window must be refused")
+	// -2: the first command on rate:d-1 only read it; -1: it exists without an expiry.
+	created := ctx.Redis.After("rate:d-1", func() any { return ctx.Redis.TTL("rate:d-1") })
+	hMustAdmit(ctx, "d-1", 500, 20)
+	ctx.Assert(created.Fired, "admitting 500 samples never touched rate:d-1")
+	createdTTL, _ := created.Result.(int64)
+	ctx.Assert(createdTTL == -2 || (createdTTL > 0 && createdTTL <= 60), "right after the command that created rate:d-1 its TTL was %d: the expiry must come with the write that creates the counter, or a crash in between leaves a counter that never resets", createdTTL)
+	ctx.Clock.Advance(30)
+	full := hMustAdmit(ctx, "d-1", 100, 20)
+	ctx.Assert(full.Admitted, "100 samples on top of 500 make exactly 600, the limit, and must be admitted, got %+v", full)
 	ttl := ctx.Redis.TTL("rate:d-1")
-	ctx.Assert(ttl > 0 && ttl <= 60, "rate:d-1 has TTL %d: a counter without an expiry never resets, so a device that had one busy minute is refused for good", ttl)
-	ctx.Clock.Advance(61)
-	after := mustAdmit(ctx, "d-1", 1, 20)
-	ctx.Assert(after.Admitted, "61 s later, in a new window, one sample was refused: %+v", after)
-	ctx.Equal(counter(ctx, "d-1"), int64(1), "the new window's counter")
+	ctx.Assert(ttl != -1, "rate:d-1 has no TTL: a counter without an expiry never resets, so a device that had one busy minute is refused for good")
+	ctx.Assert(ttl > 0 && ttl <= 30, "30 s into the window rate:d-1 has TTL %d: the window starts with the device's first batch, and a later batch must not push its end back", ttl)
+	ctx.Assert(!hMustAdmit(ctx, "d-1", 1, 20).Admitted, "the 601st sample of a window must be refused")
+	ctx.Clock.Advance(31)
+	after := hMustAdmit(ctx, "d-1", 1, 20)
+	ctx.Assert(after.Admitted, "61 s after the window opened, in a new window, one sample was refused: %+v", after)
+	ctx.Equal(hCounter(ctx, "d-1"), int64(1), "the new window's counter")
 }
 
 func CheckRetryAfter(ctx *harness.Ctx) {
-	mustAdmit(ctx, "d-1", 500, 20)
+	hMustAdmit(ctx, "d-1", 500, 20)
 	ctx.Clock.Advance(45)
-	refused := mustAdmit(ctx, "d-1", 200, 20)
+	refused := hMustAdmit(ctx, "d-1", 200, 20)
 	ctx.Assert(!refused.Admitted, "200 samples with 100 left must be refused, got %+v", refused)
 	ctx.Equal(refused.Remaining, int64(100), "remaining must be the samples left in the window")
 	ctx.Assert(refused.RetryAfter >= 14 && refused.RetryAfter <= 15, "45 s into a 60-second window RetryAfter is %d, expected the 15 s left on rate:d-1's TTL", refused.RetryAfter)
-	other := mustAdmit(ctx, "d-2", 10, 20)
+	other := hMustAdmit(ctx, "d-2", 10, 20)
 	ctx.Assert(other.Admitted && other.Remaining == 590, "d-2 has its own window: 10 samples leave 590, got %+v", other)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -735,14 +784,14 @@ func CheckRetryAfter(ctx *harness.Ctx) {
 
 namespace {
 
-std::vector<wal::Sample> batchOf(int n, double value) { return std::vector<wal::Sample>(n, wal::Sample{"temp_c", value, 1800000000LL}); }
+std::vector<wal::Sample> hBatchOf(int n, double value) { return std::vector<wal::Sample>(n, wal::Sample{"temp_c", value, 1800000000LL}); }
 
-long long counter(harness::Ctx& ctx, const std::string& device) {
+long long hCounter(harness::Ctx& ctx, const std::string& device) {
   const auto raw = ctx.Redis.Get("rate:" + device);
   return raw ? std::stoll(*raw) : 0;
 }
 
-struct Rival {
+struct hRival {
   bool fired = false;
   Admission result;
   std::string err;
@@ -751,54 +800,70 @@ struct Rival {
 }  // namespace
 
 void CheckAtomicAdmit(harness::Ctx& ctx) {
-  ctx.Assert(admit("d-1", batchOf(500, 20)).admitted, "the first 500 samples of a fresh window must be admitted");
+  ctx.Assert(admit("d-1", hBatchOf(500, 20)).admitted, "the first 500 samples of a fresh window must be admitted");
   // A second batch lands right after this one's first command on the counter.
-  auto rival = std::make_shared<Rival>();
+  auto rival = std::make_shared<hRival>();
   ctx.Redis.After("rate:d-1", [rival] {
     rival->fired = true;
     try {
-      rival->result = admit("d-1", batchOf(80, 20));
+      rival->result = admit("d-1", hBatchOf(80, 20));
     } catch (const std::exception& e) {
       rival->err = e.what();
     }
   });
-  const Admission mine = admit("d-1", batchOf(80, 20));
+  const Admission mine = admit("d-1", hBatchOf(80, 20));
   ctx.Assert(rival->fired, "the second batch never touched rate:d-1");
   ctx.Assert(rival->err.empty(), "the racing admit failed: %s", rival->err);
-  const long long total = counter(ctx, "d-1");
+  const long long total = hCounter(ctx, "d-1");
   ctx.Assert(total <= 600, "two racing batches of 80 on top of 500 left rate:d-1 at %d, past the limit of 600: both read the counter before either moved it", total);
   ctx.Assert(mine.admitted != rival->result.admitted, "with 100 samples left exactly one batch of 80 fits; admitted: %t and %t", mine.admitted, rival->result.admitted);
   ctx.Equal(total, 580LL, "rate:d-1 after the race");
 }
 
 void CheckRefusedWritesNothing(harness::Ctx& ctx) {
-  ctx.Assert(admit("d-1", batchOf(590, 20)).admitted, "590 samples fit a fresh window");
-  const Admission refused = admit("d-1", batchOf(20, 99));
+  std::vector<wal::Sample> batch;
+  for (int i = 0; i < 588; ++i) batch.push_back(wal::Sample{"temp_c", 19, 1800000000LL + i});
+  batch.push_back(wal::Sample{"humidity", 40, 1800000588LL});
+  batch.push_back(wal::Sample{"temp_c", 20, 1800000589LL});
+  ctx.Assert(admit("d-1", batch).admitted, "590 samples fit a fresh window");
+  const auto stored = ctx.Redis.HGetAll("latest:d-1");
+  std::map<std::string, double> numbers;
+  for (const auto& [k, v] : stored) numbers[k] = std::stod(v);
+  ctx.Assert(numbers == std::map<std::string, double>{{"humidity", 40}, {"temp_c", 20}}, "an admitted batch whose last temp_c is 20.0 and whose humidity is 40.0 left latest:d-1 at temp_c %q, humidity %q: each metric's latest value is its last reading in the batch", stored.count("temp_c") ? stored.at("temp_c") : "", stored.count("humidity") ? stored.at("humidity") : "");
+  const Admission refused = admit("d-1", hBatchOf(20, 99));
   ctx.Assert(!refused.admitted, "20 more samples with 10 left must be refused");
   const auto latest = ctx.Redis.HGet("latest:d-1", "temp_c");
   ctx.Assert(latest && std::stod(*latest) == 20, "a refused batch moved latest:d-1 temp_c to %q: the dashboard shows a reading the pipeline never admitted", latest.value_or(""));
-  ctx.Equal(counter(ctx, "d-1"), 590LL, "a refused batch must leave rate:d-1");
+  ctx.Equal(hCounter(ctx, "d-1"), 590LL, "a refused batch must leave rate:d-1");
 }
 
 void CheckWindowExpiry(harness::Ctx& ctx) {
-  admit("d-1", batchOf(500, 20));
-  admit("d-1", batchOf(100, 20));
-  ctx.Assert(!admit("d-1", batchOf(1, 20)).admitted, "the 601st sample of a window must be refused");
+  // -2: the first command on rate:d-1 only read it; -1: it exists without an expiry.
+  auto created = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After("rate:d-1", [created, &ctx] { *created = ctx.Redis.TTL("rate:d-1"); });
+  admit("d-1", hBatchOf(500, 20));
+  ctx.Assert(created->has_value(), "admitting 500 samples never touched rate:d-1");
+  const long long createdTtl = created->value_or(0);
+  ctx.Assert(createdTtl == -2 || (createdTtl > 0 && createdTtl <= 60), "right after the command that created rate:d-1 its TTL was %d: the expiry must come with the write that creates the counter, or a crash in between leaves a counter that never resets", createdTtl);
+  ctx.Clock.Advance(30);
+  ctx.Assert(admit("d-1", hBatchOf(100, 20)).admitted, "100 samples on top of 500 make exactly 600, the limit, and must be admitted");
   const long long ttl = ctx.Redis.TTL("rate:d-1");
-  ctx.Assert(ttl > 0 && ttl <= 60, "rate:d-1 has TTL %d: a counter without an expiry never resets, so a device that had one busy minute is refused for good", ttl);
-  ctx.Clock.Advance(61);
-  ctx.Assert(admit("d-1", batchOf(1, 20)).admitted, "61 s later, in a new window, one sample was refused");
-  ctx.Equal(counter(ctx, "d-1"), 1LL, "the new window's counter");
+  ctx.Assert(ttl != -1, "rate:d-1 has no TTL: a counter without an expiry never resets, so a device that had one busy minute is refused for good");
+  ctx.Assert(ttl > 0 && ttl <= 30, "30 s into the window rate:d-1 has TTL %d: the window starts with the device's first batch, and a later batch must not push its end back", ttl);
+  ctx.Assert(!admit("d-1", hBatchOf(1, 20)).admitted, "the 601st sample of a window must be refused");
+  ctx.Clock.Advance(31);
+  ctx.Assert(admit("d-1", hBatchOf(1, 20)).admitted, "61 s after the window opened, in a new window, one sample was refused");
+  ctx.Equal(hCounter(ctx, "d-1"), 1LL, "the new window's counter");
 }
 
 void CheckRetryAfter(harness::Ctx& ctx) {
-  admit("d-1", batchOf(500, 20));
+  admit("d-1", hBatchOf(500, 20));
   ctx.Clock.Advance(45);
-  const Admission refused = admit("d-1", batchOf(200, 20));
+  const Admission refused = admit("d-1", hBatchOf(200, 20));
   ctx.Assert(!refused.admitted, "200 samples with 100 left must be refused");
   ctx.Equal(refused.remaining, 100LL, "remaining must be the samples left in the window");
   ctx.Assert(refused.retry_after >= 14 && refused.retry_after <= 15, "45 s into a 60-second window retry_after is %d, expected the 15 s left on rate:d-1's TTL", refused.retry_after);
-  const Admission other = admit("d-2", batchOf(10, 20));
+  const Admission other = admit("d-2", hBatchOf(10, 20));
   ctx.Assert(other.admitted && other.remaining == 590, "d-2 has its own window: 10 samples must leave 590, got %d", other.remaining);
 }
 `,

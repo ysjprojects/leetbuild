@@ -24,8 +24,9 @@ rebuild after a failover hands a key to the duplicate instead of the original.
 - \`claim\` is **one Lua script** (\`HSETNX\`, then \`HGET\` of the holder) so no command lands between
   the check and the insert; it answers the outcome and the holder.
 - The index is the dedupe authority, not a cache: no TTL.
-- \`rebuild\` claims every record's keys oldest first through \`claim\`, so the record that held a key
-  first keeps it; it returns how many keys it claimed.`,
+- \`rebuild\` claims every record's keys oldest first (the record store's order) through \`claim\`, so
+  the record that held a key first keeps it; it returns how many keys it claimed, the claims that
+  answered \`winner\`.`,
   sequence: {
     participants: ['Dedupe API', 'Redis', 'record store'],
     messages: [
@@ -94,7 +95,7 @@ rebuild after a failover hands a key to the duplicate instead of the original.
       id: 'rebuild-first-wins',
       title: 'Rebuilds through claim, oldest record first',
       detail:
-        '`rebuild` walks `records.of_tenant` oldest first and claims each key through `claim`, so the original keeps its key and the duplicate does not take it over. The starter writes each key with `HSET`, and the newest record wins.',
+        '`rebuild` walks `records.of_tenant` oldest first, in the order the store returns, and claims each key through `claim`, so the original keeps its key and the duplicate does not take it over; it returns how many claims answered `winner`. The starter writes each key with `HSET`, and the newest record wins.',
       match: {
         python: {
           all: [/records\.of_tenant\(/, /def rebuild(?:(?!\ndef )[\s\S])*?\bclaim\(/],
@@ -671,14 +672,19 @@ def check_no_expiry(ctx):
 
 def check_rebuild_first_wins(ctx):
     m = ctx.load("state")
+    # Another tenant's records come first, so acme's original and its duplicate straddle a digit (r-9, r-10).
+    seq = 0
+    while len(str(seq + 2)) == len(str(seq + 1)):
+        seq = int(records.create("globex", "ds-0", "Filler", "filler@example.com", {})["record_id"][2:])
     original = records.create("acme", "ds-1", "Jane Doe", "jane@example.com", {"email_hash": EMAIL, "phone_hash": PHONE})
     duplicate = records.create("acme", "ds-1", "Jane Doe", "jane@example.com", {"email_hash": EMAIL})
     for key in ctx.redis.keys("*exact*"):
         ctx.redis.delete(key)  # the index was lost in a failover; the record store was not
-    m.rebuild("acme")
+    claimed = m.rebuild("acme")
     holder = m.lookup("acme", "email_hash", EMAIL)
-    assert holder == original["record_id"], f"after the rebuild the email hash points at {holder!r}, expected the original {original['record_id']}: {duplicate['record_id']} is the duplicate that slipped in later. Claim oldest first, through claim"
+    assert holder == original["record_id"], f"after the rebuild the email hash points at {holder!r}, expected the original {original['record_id']}: {duplicate['record_id']} is the duplicate that slipped in later. Claim oldest first (the record store's order), through claim"
     assert m.lookup("acme", "phone_hash", PHONE) == original["record_id"], "the rebuild must restore every key of every record, the phone hash included"
+    assert claimed == 2, f"rebuild returned {claimed!r}: it claimed the original's two keys, and the duplicate's email hash answered existing, so it claimed 2"
     again = m.claim("acme", "email_hash", EMAIL, "r-99")
     assert again == {"outcome": "existing", "record_id": original["record_id"]}, f"a new claim after the rebuild answered {again}, expected existing {original['record_id']}"
 `,
@@ -729,13 +735,19 @@ export async function check_no_expiry(ctx) {
 export async function check_rebuild_first_wins(ctx) {
   const m = ctx.load('state');
   const records = ctx.load('/support/dedupe/records.ts');
+  // Another tenant's records come first, so acme's original and its duplicate straddle a digit (r-9, r-10).
+  let seq = 0;
+  while (String(seq + 2).length === String(seq + 1).length) {
+    seq = Number((await records.create('globex', 'ds-0', 'Filler', 'filler@example.com', {})).record_id.slice(2));
+  }
   const original = await records.create('acme', 'ds-1', 'Jane Doe', 'jane@example.com', {email_hash: EMAIL, phone_hash: PHONE});
   const duplicate = await records.create('acme', 'ds-1', 'Jane Doe', 'jane@example.com', {email_hash: EMAIL});
   for (const key of ctx.redis.keys('*exact*')) ctx.redis.del(key); // the index was lost in a failover; the record store was not
-  await m.rebuild('acme');
+  const claimed = await m.rebuild('acme');
   const holder = await m.lookup('acme', 'email_hash', EMAIL);
-  assert.equal(holder, original.record_id, \`after the rebuild the email hash points at \${holder}, expected the original \${original.record_id}: \${duplicate.record_id} is the duplicate that slipped in later. Claim oldest first, through claim\`);
+  assert.equal(holder, original.record_id, \`after the rebuild the email hash points at \${holder}, expected the original \${original.record_id}: \${duplicate.record_id} is the duplicate that slipped in later. Claim oldest first (the record store's order), through claim\`);
   assert.equal(await m.lookup('acme', 'phone_hash', PHONE), original.record_id, 'the rebuild must restore every key of every record, the phone hash included');
+  assert.equal(claimed, 2, \`rebuild returned \${claimed}: it claimed the original's two keys, and the duplicate's email hash answered existing, so it claimed 2\`);
   const again = await m.claim('acme', 'email_hash', EMAIL, 'r-99');
   assert(same(again, {outcome: 'existing', record_id: original.record_id}), \`a new claim after the rebuild answered \${JSON.stringify(again)}, expected existing \${original.record_id}\`);
 }
@@ -744,6 +756,7 @@ export async function check_rebuild_first_wins(ctx) {
 
 import (
 	"context"
+	"strconv"
 
 	"dedupe/records"
 
@@ -758,31 +771,31 @@ const (
 
 var stateBg = context.Background()
 
-func mustClaim(ctx *harness.Ctx, tenant, keyType, value, recordID string) claimResult {
+func hMustClaim(ctx *harness.Ctx, tenant, keyType, value, recordID string) claimResult {
 	got, err := claim(stateBg, tenant, keyType, value, recordID)
 	ctx.NoError(err, "claim(%s, %s, …, %s) failed", tenant, keyType, recordID)
 	return got
 }
 
-func mustLookup(ctx *harness.Ctx, tenant, keyType, value string) string {
+func hMustLookup(ctx *harness.Ctx, tenant, keyType, value string) string {
 	got, err := lookup(stateBg, tenant, keyType, value)
 	ctx.NoError(err, "lookup(%s, %s, …) failed", tenant, keyType)
 	return got
 }
 
 func CheckTenantNamespace(ctx *harness.Ctx) {
-	ctx.Equal(mustClaim(ctx, "acme", "email_hash", stateEmail, "r-1"), claimResult{Outcome: "winner", RecordID: "r-1"}, "the first claim of a key")
-	other := mustClaim(ctx, "globex", "email_hash", stateEmail, "r-2")
+	ctx.Equal(hMustClaim(ctx, "acme", "email_hash", stateEmail, "r-1"), claimResult{Outcome: "winner", RecordID: "r-1"}, "the first claim of a key")
+	other := hMustClaim(ctx, "globex", "email_hash", stateEmail, "r-2")
 	ctx.Assert(other == claimResult{Outcome: "winner", RecordID: "r-2"}, "globex's new record with the same email hash answered %+v: it was reported as a duplicate of acme's record. Keep one index per tenant (t:{tenant}:exact:{key_type})", other)
 	ctx.Assert(indexKey("acme", "email_hash") != indexKey("globex", "email_hash"), "acme and globex share the hash %q", indexKey("acme", "email_hash"))
 	acme, _ := ctx.Redis.HGet("t:acme:exact:email_hash", stateEmail)
 	globex, _ := ctx.Redis.HGet("t:globex:exact:email_hash", stateEmail)
 	ctx.Assert(acme == "r-1" && globex == "r-2", "Redis holds %q, expected t:acme:exact:email_hash and t:globex:exact:email_hash each with its tenant's record", ctx.Redis.Keys("*exact*"))
-	ctx.Assert(mustLookup(ctx, "globex", "email_hash", stateEmail) == "r-2" && mustLookup(ctx, "acme", "email_hash", stateEmail) == "r-1", "each tenant's lookup must answer its own record")
+	ctx.Assert(hMustLookup(ctx, "globex", "email_hash", stateEmail) == "r-2" && hMustLookup(ctx, "acme", "email_hash", stateEmail) == "r-1", "each tenant's lookup must answer its own record")
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	mustClaim(ctx, "acme", "email_hash", stateOther, "r-0") // the index exists and its script is loaded
+	hMustClaim(ctx, "acme", "email_hash", stateOther, "r-0") // the index exists and its script is loaded
 	key := indexKey("acme", "email_hash")
 	// A second create of the same record lands right after the first command of this claim touches the index.
 	rival := ctx.Redis.After(key, func() any {
@@ -790,24 +803,31 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 		ctx.NoError(err, "the concurrent claim failed")
 		return got
 	})
-	mine := mustClaim(ctx, "acme", "email_hash", stateEmail, "r-1")
+	mine := hMustClaim(ctx, "acme", "email_hash", stateEmail, "r-1")
 	ctx.Assert(rival.Fired, "the claim never touched %s", key)
 	ctx.Assert(rival.Err == nil, "the concurrent claim failed: %v", rival.Err)
 	theirs := rival.Result.(claimResult)
 	ctx.Assert(mine.Outcome != theirs.Outcome, "two concurrent creates of one record answered %+v and %+v: both %s, so the store gets two rows (or none). Claim in one Lua script", mine, theirs, mine.Outcome)
 	ctx.Equal(mine.RecordID, theirs.RecordID, "the two claims must agree about who holds the key (%+v, %+v)", mine, theirs)
-	ctx.Equal(mustLookup(ctx, "acme", "email_hash", stateEmail), mine.RecordID, "the index must hold the record both claims named as the holder")
+	ctx.Equal(hMustLookup(ctx, "acme", "email_hash", stateEmail), mine.RecordID, "the index must hold the record both claims named as the holder")
 }
 
 func CheckNoExpiry(ctx *harness.Ctx) {
-	mustClaim(ctx, "acme", "email_hash", stateEmail, "r-1")
+	hMustClaim(ctx, "acme", "email_hash", stateEmail, "r-1")
 	key := indexKey("acme", "email_hash")
 	ctx.Equal(ctx.Redis.TTL(key), int64(-1), "%s must have no TTL: the index is the dedupe authority, and a key that expires lets the same customer be created again; the TTL", key)
 	ctx.Clock.Advance(2 * 86400)
-	ctx.Equal(mustClaim(ctx, "acme", "email_hash", stateEmail, "r-2"), claimResult{Outcome: "existing", RecordID: "r-1"}, "two days later the same email hash")
+	ctx.Equal(hMustClaim(ctx, "acme", "email_hash", stateEmail, "r-2"), claimResult{Outcome: "existing", RecordID: "r-1"}, "two days later the same email hash")
 }
 
 func CheckRebuildFirstWins(ctx *harness.Ctx) {
+	// Another tenant's records come first, so acme's original and its duplicate straddle a digit (r-9, r-10).
+	for seq := 0; len(strconv.Itoa(seq+2)) == len(strconv.Itoa(seq+1)); {
+		filler, err := records.Create(stateBg, "globex", "ds-0", "Filler", "filler@example.com", map[string]string{})
+		ctx.NoError(err, "creating another tenant's record")
+		seq, err = strconv.Atoi(filler.RecordID[2:])
+		ctx.NoError(err, "reading a record id")
+	}
 	original, err := records.Create(stateBg, "acme", "ds-1", "Jane Doe", "jane@example.com", map[string]string{"email_hash": stateEmail, "phone_hash": statePhone})
 	ctx.NoError(err, "creating the original record")
 	duplicate, err := records.Create(stateBg, "acme", "ds-1", "Jane Doe", "jane@example.com", map[string]string{"email_hash": stateEmail})
@@ -815,12 +835,13 @@ func CheckRebuildFirstWins(ctx *harness.Ctx) {
 	for _, key := range ctx.Redis.Keys("*exact*") {
 		ctx.Redis.Del(key) // the index was lost in a failover; the record store was not
 	}
-	_, err = rebuild(stateBg, "acme")
+	claimed, err := rebuild(stateBg, "acme")
 	ctx.NoError(err, "rebuild(acme) failed")
-	holder := mustLookup(ctx, "acme", "email_hash", stateEmail)
-	ctx.Assert(holder == original.RecordID, "after the rebuild the email hash points at %q, expected the original %s: %s is the duplicate that slipped in later. Claim oldest first, through claim", holder, original.RecordID, duplicate.RecordID)
-	ctx.Equal(mustLookup(ctx, "acme", "phone_hash", statePhone), original.RecordID, "the rebuild must restore every key of every record; the phone hash's holder")
-	ctx.Equal(mustClaim(ctx, "acme", "email_hash", stateEmail, "r-99"), claimResult{Outcome: "existing", RecordID: original.RecordID}, "a new claim after the rebuild")
+	holder := hMustLookup(ctx, "acme", "email_hash", stateEmail)
+	ctx.Assert(holder == original.RecordID, "after the rebuild the email hash points at %q, expected the original %s: %s is the duplicate that slipped in later. Claim oldest first (the record store's order), through claim", holder, original.RecordID, duplicate.RecordID)
+	ctx.Equal(hMustLookup(ctx, "acme", "phone_hash", statePhone), original.RecordID, "the rebuild must restore every key of every record; the phone hash's holder")
+	ctx.Equal(claimed, 2, "rebuild claimed the original's two keys, and the duplicate's email hash answered existing; what rebuild returned")
+	ctx.Equal(hMustClaim(ctx, "acme", "email_hash", stateEmail, "r-99"), claimResult{Outcome: "existing", RecordID: original.RecordID}, "a new claim after the rebuild")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -837,14 +858,14 @@ const std::string kEmail = "8c87b489ce35cf2e2f39f80e282cb2e804932a56a213983eeeb4
 const std::string kPhone = "602cd7fbbe41688e2d90224bcac362db2f1ff2e2ba7487d8585c9ce226cb6d00";
 const std::string kOther = "86e0b9e56c17cc4d12387e1949b85053fbe73bc3ce5a1188713a9d300cc6133d";
 
-void expectClaim(harness::Ctx& ctx, const ClaimResult& got, const std::string& outcome, const std::string& record_id, const std::string& what) {
+void h_expect_claim(harness::Ctx& ctx, const ClaimResult& got, const std::string& outcome, const std::string& record_id, const std::string& what) {
   ctx.Assert(got.outcome == outcome && got.record_id == record_id, "%s answered {%s, %s}, expected {%s, %s}", what, got.outcome, got.record_id, outcome, record_id);
 }
 
 }  // namespace
 
 void CheckTenantNamespace(harness::Ctx& ctx) {
-  expectClaim(ctx, claim("acme", "email_hash", kEmail, "r-1"), "winner", "r-1", "the first claim of a key");
+  h_expect_claim(ctx, claim("acme", "email_hash", kEmail, "r-1"), "winner", "r-1", "the first claim of a key");
   const ClaimResult other = claim("globex", "email_hash", kEmail, "r-2");
   ctx.Assert(other.outcome == "winner" && other.record_id == "r-2",
              "globex's new record with the same email hash answered {%s, %s}: it was reported as a duplicate of acme's record. Keep one index per tenant (t:{tenant}:exact:{key_type})",
@@ -884,19 +905,24 @@ void CheckNoExpiry(harness::Ctx& ctx) {
   const std::string key = indexKey("acme", "email_hash");
   ctx.Equal(ctx.Redis.TTL(key), -1, "%s must have no TTL: the index is the dedupe authority, and a key that expires lets the same customer be created again; the TTL", key);
   ctx.Clock.Advance(2 * 86400);
-  expectClaim(ctx, claim("acme", "email_hash", kEmail, "r-2"), "existing", "r-1", "two days later the same email hash");
+  h_expect_claim(ctx, claim("acme", "email_hash", kEmail, "r-2"), "existing", "r-1", "two days later the same email hash");
 }
 
 void CheckRebuildFirstWins(harness::Ctx& ctx) {
+  // Another tenant's records come first, so acme's original and its duplicate straddle a digit (r-9, r-10).
+  for (int seq = 0; std::to_string(seq + 2).size() == std::to_string(seq + 1).size();) {
+    seq = std::stoi(records::create("globex", "ds-0", "Filler", "filler@example.com", {}).record_id.substr(2));
+  }
   const records::Row original = records::create("acme", "ds-1", "Jane Doe", "jane@example.com", {{"email_hash", kEmail}, {"phone_hash", kPhone}});
   const records::Row duplicate = records::create("acme", "ds-1", "Jane Doe", "jane@example.com", {{"email_hash", kEmail}});
   for (const std::string& key : ctx.Redis.Keys("*exact*")) ctx.Redis.Del(key);  // the index was lost in a failover; the record store was not
-  rebuild("acme");
+  const int claimed = rebuild("acme");
   const std::string holder = lookup("acme", "email_hash", kEmail).value_or("");
-  ctx.Assert(holder == original.record_id, "after the rebuild the email hash points at %q, expected the original %s: %s is the duplicate that slipped in later. Claim oldest first, through claim",
+  ctx.Assert(holder == original.record_id, "after the rebuild the email hash points at %q, expected the original %s: %s is the duplicate that slipped in later. Claim oldest first (the record store's order), through claim",
              holder, original.record_id, duplicate.record_id);
   ctx.Equal(lookup("acme", "phone_hash", kPhone).value_or(""), original.record_id, "the rebuild must restore every key of every record; the phone hash's holder");
-  expectClaim(ctx, claim("acme", "email_hash", kEmail, "r-99"), "existing", original.record_id, "a new claim after the rebuild");
+  ctx.Equal(claimed, 2, "rebuild claimed the original's two keys, and the duplicate's email hash answered existing; what rebuild returned");
+  h_expect_claim(ctx, claim("acme", "email_hash", kEmail, "r-99"), "existing", original.record_id, "a new claim after the rebuild");
 }
 `,
   },

@@ -533,7 +533,14 @@ async def check_sensitive_filter(ctx):
         _seed(ctx, _hour(ctx), {"kettle": 150, "clinic near me": 400, "jane doe": 300, "lamp": 200})
         ctx.redis.hset("suggest:category:acme", mapping={"kettle": "kitchen", "clinic near me": "health", "jane doe": "person", "lamp": "home"})
         r = await _read(c)
-    assert _entries(r) == [("lamp", 200), ("kettle", 150)], f"the rail shows {_entries(r)}, expected lamp and kettle: a health term and a person's name never trend"
+        assert _entries(r) == [("lamp", 200), ("kettle", 150)], f"the rail shows {_entries(r)}, expected lamp and kettle: a health term and a person's name never trend"
+        # Thirteen terms over the floor, the two most searched sensitive: the cut to ten comes after the filter.
+        items = {f"item {n:02d}": 600 - 10 * n for n in range(1, 12)}
+        _seed(ctx, _hour(ctx), {"adult site": 900, "dr jane roe": 800, **items}, tenant="globex")
+        ctx.redis.hset("suggest:category:globex", mapping={"adult site": "adult", "dr jane roe": "person"})
+        r = await _read(c, tenant="globex")
+    want = [(f"item {n:02d}", 600 - 10 * n) for n in range(1, 11)]
+    assert _entries(r) == want, f"globex's rail shows {_entries(r)}, expected {want}: an adult term never trends, and the top ten are cut after the sensitive terms are dropped"
 
 
 async def check_no_user_linkage(ctx):
@@ -598,6 +605,13 @@ export async function check_sensitive_filter(ctx) {
   ctx.redis.hset('suggest:category:acme', {kettle: 'kitchen', 'clinic near me': 'health', 'jane doe': 'person', lamp: 'home'});
   const r = await read(c);
   assert.deepStrictEqual(entriesOf(r), [['lamp', 200], ['kettle', 150]], \`the rail shows \${JSON.stringify(entriesOf(r))}, expected lamp and kettle: a health term and a person's name never trend\`);
+  // Thirteen terms over the floor, the two most searched sensitive: the cut to ten comes after the filter.
+  const items = Array.from({length: 11}, (_, i) => [\`item \${String(i + 1).padStart(2, '0')}\`, 590 - 10 * i] as [string, number]);
+  seed(ctx, hourOf(ctx), {'adult site': 900, 'dr jane roe': 800, ...Object.fromEntries(items)}, 'globex');
+  ctx.redis.hset('suggest:category:globex', {'adult site': 'adult', 'dr jane roe': 'person'});
+  const top = entriesOf(await read(c, 'globex'));
+  const want = items.slice(0, 10);
+  assert.deepStrictEqual(top, want, \`globex's rail shows \${JSON.stringify(top)}, expected \${JSON.stringify(want)}: an adult term never trends, and the top ten are cut after the sensitive terms are dropped\`);
 }
 
 export async function check_no_user_linkage(ctx) {
@@ -690,6 +704,19 @@ func CheckSensitiveFilter(ctx *harness.Ctx) {
 	rdSeed(ctx, "acme", rdHour(ctx), map[string]int{"kettle": 150, "clinic near me": 400, "jane doe": 300, "lamp": 200})
 	ctx.Redis.Do("HSET", "suggest:category:acme", "kettle", "kitchen", "clinic near me", "health", "jane doe", "person", "lamp", "home")
 	ctx.Equal(rdEntries(rdRead(c)), []string{"lamp 200", "kettle 150"}, "a health term and a person's name never trend; the rail")
+	// Thirteen terms over the floor, the two most searched sensitive: the cut to ten comes after the filter.
+	counts := map[string]int{"adult site": 900, "dr jane roe": 800}
+	want := []string{}
+	for n := 1; n <= 11; n++ {
+		term := fmt.Sprintf("item %02d", n)
+		counts[term] = 600 - 10*n
+		if n <= 10 {
+			want = append(want, fmt.Sprintf("%s %d", term, 600-10*n))
+		}
+	}
+	rdSeed(ctx, "globex", rdHour(ctx), counts)
+	ctx.Redis.Do("HSET", "suggest:category:globex", "adult site", "adult", "dr jane roe", "person")
+	ctx.Equal(rdEntries(c.Get("/v1/trending", "X-Tenant-Id", "globex")), want, "an adult term never trends, and the top ten are cut after the sensitive terms are dropped; globex's rail")
 }
 
 func CheckNoUserLinkage(ctx *harness.Ctx) {
@@ -782,6 +809,17 @@ void CheckSensitiveFilter(harness::Ctx& ctx) {
   rdSeed(ctx, rdHour(ctx), {{"kettle", 150}, {"clinic near me", 400}, {"jane doe", 300}, {"lamp", 200}});
   ctx.Redis.Must({"HSET", "suggest:category:acme", "kettle", "kitchen", "clinic near me", "health", "jane doe", "person", "lamp", "home"});
   ctx.Equal(rdEntries(rdRead(c)), {"lamp 200", "kettle 150"}, "a health term and a person's name never trend; the rail");
+  // Thirteen terms over the floor, the two most searched sensitive: the cut to ten comes after the filter.
+  std::map<std::string, int> counts = {{"adult site", 900}, {"dr jane roe", 800}};
+  std::vector<std::string> want;
+  for (int n = 1; n <= 11; ++n) {
+    const std::string term = std::string("item ") + (n < 10 ? "0" : "") + std::to_string(n);
+    counts[term] = 600 - 10 * n;
+    if (n <= 10) want.push_back(term + " " + std::to_string(600 - 10 * n));
+  }
+  rdSeed(ctx, rdHour(ctx), counts, "globex");
+  ctx.Redis.Must({"HSET", "suggest:category:globex", "adult site", "adult", "dr jane roe", "person"});
+  ctx.Equal(rdEntries(c.Get("/v1/trending", "X-Tenant-Id", "globex")), want, "an adult term never trends, and the top ten are cut after the sensitive terms are dropped; globex's rail");
 }
 
 void CheckNoUserLinkage(harness::Ctx& ctx) {

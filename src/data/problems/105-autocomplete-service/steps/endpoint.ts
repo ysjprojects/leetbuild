@@ -541,14 +541,15 @@ async def check_fold_prefix(ctx):
 async def check_bounded_prefix(ctx):
     _seed(ctx, "acme", {"kettle": 50, "kettlebell": 40, "lamp": 20})
     async with _api(ctx) as c:
-        for raw, what in (("", "an empty prefix"), ("   ", "a prefix of spaces"), ("k" * 65, "a 65-character prefix")):
+        for raw, what in (("", "an empty prefix"), ("   ", "a prefix of spaces"), ("k" * 65, "a 65-character prefix"), ("ß" * 65, "a 65-character prefix of ß")):
             r = await _ask(c, raw)
             assert r.status_code == 400, f"{what} answered {r.status_code} {r.text[:120]}, expected 400: an empty prefix walks the tenant's whole index"
-        r = await _ask(c, "k" * 64)
-        assert r.status_code == 200, f"a 64-character prefix answered {r.status_code}, expected 200"
-        for raw in ("ke\\x00", "ke\\x1b[2J", "ke\\x7f", "ke\\nlamp"):
+        for raw, what in (("k" * 64, "a 64-character prefix"), ("  " + "k" * 64 + "  ", "a prefix that folds to 64 characters"), ("ß" * 64, "a prefix of 64 ß (128 bytes)"), ("k" * 60 + "😀" * 4, "a 64-character prefix ending in 4 emoji")):
             r = await _ask(c, raw)
-            assert r.status_code == 400, f"prefix {raw!r} answered {r.status_code}, expected 400: a control character must be rejected before any lookup"
+            assert r.status_code == 200, f"{what} answered {r.status_code}, expected 200: the bound is 64 characters of the folded prefix"
+        for raw in ("ke\\x00", "ke\\x1b[2J", "ke\\x7f", "ke\\nlamp", "\\tke", "ke\\r\\n"):
+            r = await _ask(c, raw)
+            assert r.status_code == 400, f"prefix {raw!r} answered {r.status_code}, expected 400: a control character in the raw prefix must be rejected before any lookup"
 
 
 async def check_dedupe_then_cap(ctx):
@@ -601,15 +602,17 @@ export async function check_fold_prefix(ctx) {
 export async function check_bounded_prefix(ctx) {
   seed(ctx, 'acme', {kettle: 50, kettlebell: 40, lamp: 20});
   const c = api(ctx);
-  for (const [raw, what] of [['', 'an empty prefix'], ['   ', 'a prefix of spaces'], ['k'.repeat(65), 'a 65-character prefix']]) {
+  for (const [raw, what] of [['', 'an empty prefix'], ['   ', 'a prefix of spaces'], ['k'.repeat(65), 'a 65-character prefix'], ['ß'.repeat(65), 'a 65-character prefix of ß']]) {
     const r = await ask(c, raw);
     assert.equal(r.status, 400, \`\${what} answered \${r.status} \${r.text.slice(0, 120)}, expected 400: an empty prefix walks the tenant's whole index\`);
   }
-  const r = await ask(c, 'k'.repeat(64));
-  assert.equal(r.status, 200, \`a 64-character prefix answered \${r.status}, expected 200\`);
-  for (const raw of ['ke\\x00', 'ke\\x1b[2J', 'ke\\x7f', 'ke\\nlamp']) {
+  for (const [raw, what] of [['k'.repeat(64), 'a 64-character prefix'], [\`  \${'k'.repeat(64)}  \`, 'a prefix that folds to 64 characters'], ['ß'.repeat(64), 'a prefix of 64 ß (128 bytes)'], ['k'.repeat(60) + '😀'.repeat(4), 'a 64-character prefix ending in 4 emoji']]) {
+    const r = await ask(c, raw);
+    assert.equal(r.status, 200, \`\${what} answered \${r.status}, expected 200: the bound is 64 characters of the folded prefix\`);
+  }
+  for (const raw of ['ke\\x00', 'ke\\x1b[2J', 'ke\\x7f', 'ke\\nlamp', '\\tke', 'ke\\r\\n']) {
     const bad = await ask(c, raw);
-    assert.equal(bad.status, 400, \`prefix \${JSON.stringify(raw)} answered \${bad.status}, expected 400: a control character must be rejected before any lookup\`);
+    assert.equal(bad.status, 400, \`prefix \${JSON.stringify(raw)} answered \${bad.status}, expected 400: a control character in the raw prefix must be rejected before any lookup\`);
   }
 }
 
@@ -692,13 +695,15 @@ func CheckFoldPrefix(ctx *harness.Ctx) {
 func CheckBoundedPrefix(ctx *harness.Ctx) {
 	acSeed(ctx, "acme", map[string]int{"kettle": 50, "kettlebell": 40, "lamp": 20})
 	c := acAPI(ctx)
-	for _, raw := range []string{"", "   ", strings.Repeat("k", 65)} {
+	for _, raw := range []string{"", "   ", strings.Repeat("k", 65), strings.Repeat("ß", 65)} {
 		r := acAsk(c, raw)
-		ctx.Equal(r.Status, 400, "prefix %q (%d characters) must be 400: an empty prefix walks the tenant's whole index", raw, len(raw))
+		ctx.Equal(r.Status, 400, "prefix %q (%d bytes) must be 400: an empty prefix walks the tenant's whole index", raw, len(raw))
 	}
-	ctx.Equal(acAsk(c, strings.Repeat("k", 64)).Status, 200, "a 64-character prefix")
-	for _, raw := range []string{"ke\\x00", "ke\\x1b[2J", "ke\\x7f", "ke\\nlamp"} {
-		ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character)", raw)
+	for _, raw := range []string{strings.Repeat("k", 64), "  " + strings.Repeat("k", 64) + "  ", strings.Repeat("ß", 64), strings.Repeat("k", 60) + strings.Repeat("😀", 4)} {
+		ctx.Equal(acAsk(c, raw).Status, 200, "prefix %q folds to 64 characters (the bound is characters of the folded prefix, not bytes)", raw)
+	}
+	for _, raw := range []string{"ke\\x00", "ke\\x1b[2J", "ke\\x7f", "ke\\nlamp", "\\tke", "ke\\r\\n"} {
+		ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character in the raw prefix)", raw)
 	}
 }
 
@@ -801,12 +806,17 @@ void CheckFoldPrefix(harness::Ctx& ctx) {
 void CheckBoundedPrefix(harness::Ctx& ctx) {
   acSeed(ctx, "acme", {{"kettle", 50}, {"kettlebell", 40}, {"lamp", 20}});
   auto c = acAPI(ctx);
-  for (const std::string raw : {std::string(), std::string("   "), std::string(65, 'k')}) {
-    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q (%d characters) must be 400: an empty prefix walks the tenant's whole index", raw, raw.size());
+  std::string ess;
+  for (int i = 0; i < 65; ++i) ess += "ß";
+  for (const std::string raw : {std::string(), std::string("   "), std::string(65, 'k'), ess}) {
+    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q (%d bytes) must be 400: an empty prefix walks the tenant's whole index", raw, raw.size());
   }
-  ctx.Equal(acAsk(c, std::string(64, 'k')).Status, 200, "a 64-character prefix");
-  for (const std::string raw : {std::string("ke\\0", 3), std::string("ke\\x1b[2J"), std::string("ke\\x7f"), std::string("ke\\nlamp")}) {
-    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character)", raw);
+  const std::string ess64 = ess.substr(2);
+  for (const std::string raw : {std::string(64, 'k'), "  " + std::string(64, 'k') + "  ", ess64, std::string(60, 'k') + "😀😀😀😀"}) {
+    ctx.Equal(acAsk(c, raw).Status, 200, "prefix %q folds to 64 characters (the bound is characters of the folded prefix, not bytes)", raw);
+  }
+  for (const std::string raw : {std::string("ke\\0", 3), std::string("ke\\x1b[2J"), std::string("ke\\x7f"), std::string("ke\\nlamp"), std::string("\\tke"), std::string("ke\\r\\n")}) {
+    ctx.Equal(acAsk(c, raw).Status, 400, "prefix %q must be rejected before any lookup (a control character in the raw prefix)", raw);
   }
 }
 

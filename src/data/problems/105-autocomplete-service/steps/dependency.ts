@@ -64,7 +64,7 @@ service Suggester { rpc Suggest(SuggestRequest) returns (SuggestReply); }  // te
       id: 'no-inline-retry',
       title: 'Makes one attempt per request',
       detail:
-        'A failed call is answered from the fallback, not retried in the request: three attempts per miss triple the load on a suggester that is already failing.',
+        'A failed call is answered from the fallback, not retried in the request, whatever its status code (`UNAVAILABLE`, `DEADLINE_EXCEEDED`, `INTERNAL` …): three attempts per miss triple the load on a suggester that is already failing.',
       match: {
         python: {all: [/except grpc\.RpcError/], none: [/ATTEMPTS|for \w+ in range\(/, /while True/, /time\.sleep\(/]},
         typescript: {all: [/catch/], none: [/ATTEMPTS|for \(let attempt/, /while \(true\)/]},
@@ -77,7 +77,7 @@ service Suggester { rpc Suggest(SuggestRequest) returns (SuggestReply); }  // te
       id: 'fallback',
       title: 'Answers a marked, versioned fallback on failure',
       detail:
-        'On a deadline or an error the answer is the curated `FALLBACK_SUGGESTIONS` matching the prefix, with `source` `"fallback"` and the `FALLBACK_VERSION` of the list, so the client and the metrics can tell a degraded answer and a bad list can be rolled back.',
+        'On a deadline or an error the answer is the curated `FALLBACK_SUGGESTIONS` that start with the prefix, with `source` `"fallback"` and the `FALLBACK_VERSION` of the list, so the client and the metrics can tell a degraded answer and a bad list can be rolled back.',
       match: {
         python: {
           all: [/FALLBACK_SUGGESTIONS\s*=/, /FALLBACK_VERSION\s*=/, /["']fallback["']/, /["']fallback_version["']/],
@@ -559,12 +559,12 @@ def check_deadline(ctx):
     assert calls, "no Suggest call was made"
     for call in calls:
         assert call.timeout is not None, "the Suggest call carries no deadline: a stalled suggester holds every keystroke"
-        assert 0.1 <= call.timeout <= 0.2, f"the Suggest call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.15"
+        assert 0.1 <= call.timeout <= 0.16, f"the Suggest call carries a {call.timeout} s deadline, expected DEADLINE_S = 0.15"
     ctx.grpc.set_latency("Suggest", 0.4)
     before = ctx.clock.time()
     m.suggest("acme", "in")
     waited = ctx.clock.time() - before
-    assert waited <= 0.25, f"suggest waited {waited:.2f} s for a suggester that takes 0.4 s: the dropdown has 150 ms"
+    assert waited <= 0.2, f"suggest waited {waited:.2f} s for a suggester that takes 0.4 s: the dropdown has 150 ms"
 
 
 def check_no_inline_retry(ctx):
@@ -574,6 +574,15 @@ def check_no_inline_retry(ctx):
     calls = len(ctx.grpc.calls_to("Suggest"))
     assert calls == 1, f"one keystroke against a failing suggester made {calls} Suggest calls: retrying in the request multiplies the load during an outage"
     assert ctx.clock.sleeps == 0, "a failure must not be slept on in the request"
+    # Whatever the error, one call: no status code earns a second attempt inside the request.
+    for code, prefix in ((grpc.StatusCode.DEADLINE_EXCEEDED, "kett"), (grpc.StatusCode.INTERNAL, "in"), (grpc.StatusCode.UNKNOWN, "inv"), (grpc.StatusCode.RESOURCE_EXHAUSTED, "key")):
+        ctx.grpc.failures.clear()
+        ctx.grpc.fail("Suggest", code, "suggester error", times=2)
+        before = len(ctx.grpc.calls_to("Suggest"))
+        got = m.suggest("acme", prefix)
+        calls = len(ctx.grpc.calls_to("Suggest")) - before
+        assert calls == 1, f"a keystroke whose Suggest call failed {code.name} made {calls} Suggest calls, expected 1: no error is retried inside the request"
+        assert got.get("source") == "fallback", f"a keystroke whose Suggest call failed {code.name} answered {got}, expected the fallback"
 
 
 def check_fallback(ctx):
@@ -588,6 +597,9 @@ def check_fallback(ctx):
     ctx.grpc.fail("Suggest", grpc.StatusCode.UNAVAILABLE, "deploy in progress")
     got = m.suggest("acme", "ke")
     assert got.get("source") == "fallback" and got.get("suggestions") == ["kettle", "keyboard"], f"with the suggester UNAVAILABLE suggest answered {got}, expected the fallback kettle, keyboard"
+    ctx.grpc.fail("Suggest", grpc.StatusCode.UNAVAILABLE, "deploy in progress")
+    got = m.suggest("acme", "ve")
+    assert got.get("source") == "fallback" and got.get("suggestions") == [], f"the fallback for 've' answered {got}, expected no suggestions: a curated term qualifies when it starts with the prefix (inventory only contains it)"
 
 
 def check_degraded_not_cached(ctx):
@@ -623,13 +635,13 @@ export async function check_deadline(ctx) {
   assert(calls.length > 0, 'no Suggest call was made');
   for (const call of calls) {
     assert(call.timeout !== null, 'the Suggest call carries no deadline: a stalled suggester holds every keystroke');
-    assert(0.1 <= call.timeout && call.timeout <= 0.2, \`the Suggest call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 150\`);
+    assert(0.1 <= call.timeout && call.timeout <= 0.16, \`the Suggest call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 150\`);
   }
   ctx.grpc.setLatency('Suggest', 0.4);
   const before = ctx.clock.now();
   await m.suggest('acme', 'in');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 0.25, \`suggest waited \${waited.toFixed(2)} s for a suggester that takes 0.4 s: the dropdown has 150 ms\`);
+  assert(waited <= 0.2, \`suggest waited \${waited.toFixed(2)} s for a suggester that takes 0.4 s: the dropdown has 150 ms\`);
 }
 
 export async function check_no_inline_retry(ctx) {
@@ -639,6 +651,16 @@ export async function check_no_inline_retry(ctx) {
   const calls = ctx.grpc.callsTo('Suggest').length;
   assert.equal(calls, 1, \`one keystroke against a failing suggester made \${calls} Suggest calls: retrying in the request multiplies the load during an outage\`);
   assert.equal(ctx.clock.sleeps, 0, 'a failure must not be slept on in the request');
+  // Whatever the error, one call: no status code earns a second attempt inside the request.
+  for (const [code, prefix] of [['DEADLINE_EXCEEDED', 'kett'], ['INTERNAL', 'in'], ['UNKNOWN', 'inv'], ['RESOURCE_EXHAUSTED', 'key']]) {
+    ctx.grpc.clearFailures();
+    ctx.grpc.fail('Suggest', ctx.grpc.status[code], 'suggester error', 2);
+    const before = ctx.grpc.callsTo('Suggest').length;
+    const got = await m.suggest('acme', prefix);
+    const made = ctx.grpc.callsTo('Suggest').length - before;
+    assert.equal(made, 1, \`a keystroke whose Suggest call failed \${code} made \${made} Suggest calls, expected 1: no error is retried inside the request\`);
+    assert.equal(got.source, 'fallback', \`a keystroke whose Suggest call failed \${code} answered \${JSON.stringify(got)}, expected the fallback\`);
+  }
 }
 
 export async function check_fallback(ctx) {
@@ -652,6 +674,9 @@ export async function check_fallback(ctx) {
   ctx.grpc.fail('Suggest', ctx.grpc.status.UNAVAILABLE, 'deploy in progress');
   got = await m.suggest('acme', 'ke');
   assert(got.source === 'fallback' && JSON.stringify(got.suggestions) === JSON.stringify(['kettle', 'keyboard']), \`with the suggester UNAVAILABLE suggest answered \${JSON.stringify(got)}, expected the fallback kettle, keyboard\`);
+  ctx.grpc.fail('Suggest', ctx.grpc.status.UNAVAILABLE, 'deploy in progress');
+  got = await m.suggest('acme', 've');
+  assert(got.source === 'fallback' && JSON.stringify(got.suggestions) === '[]', \`the fallback for "ve" answered \${JSON.stringify(got)}, expected no suggestions: a curated term qualifies when it starts with the prefix (inventory only contains it)\`);
 }
 
 export async function check_degraded_not_cached(ctx) {
@@ -707,13 +732,13 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(len(calls) > 0, "no Suggest call was made")
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline(), "the Suggest call carries no deadline: a stalled suggester holds every keystroke")
-		ctx.Assert(100*time.Millisecond <= call.Timeout && call.Timeout <= 200*time.Millisecond, "the Suggest call carries a %v deadline, expected 150 ms", call.Timeout)
+		ctx.Assert(100*time.Millisecond <= call.Timeout && call.Timeout <= 160*time.Millisecond, "the Suggest call carries a %v deadline, expected 150 ms", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Suggest", 0.4, "")
 	before := ctx.Clock.Now()
 	suggest(clientBg, "acme", "in")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 0.25, "suggest waited %.2f s for a suggester that takes 0.4 s: the dropdown has 150 ms", waited)
+	ctx.Assert(waited <= 0.2, "suggest waited %.2f s for a suggester that takes 0.4 s: the dropdown has 150 ms", waited)
 }
 
 func CheckNoInlineRetry(ctx *harness.Ctx) {
@@ -722,6 +747,18 @@ func CheckNoInlineRetry(ctx *harness.Ctx) {
 	suggest(clientBg, "acme", "ke")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Suggest", "")), 1, "one keystroke against a failing suggester: retrying in the request multiplies the load during an outage; the Suggest calls")
 	ctx.Equal(ctx.Clock.Sleeps(), 0, "a failure must not be slept on in the request; the sleeps")
+	// Whatever the error, one call: no status code earns a second attempt inside the request.
+	for _, tc := range []struct {
+		code   codes.Code
+		prefix string
+	}{{codes.DeadlineExceeded, "kett"}, {codes.Internal, "in"}, {codes.Unknown, "inv"}, {codes.ResourceExhausted, "key"}} {
+		ctx.GRPC.ClearFailures()
+		ctx.GRPC.Fail("Suggest", tc.code, "suggester error", 2, "")
+		before := len(ctx.GRPC.CallsTo("Suggest", ""))
+		got := suggest(clientBg, "acme", tc.prefix)
+		ctx.Equal(len(ctx.GRPC.CallsTo("Suggest", ""))-before, 1, "a keystroke whose Suggest call failed %v: no error is retried inside the request; the Suggest calls", tc.code)
+		ctx.Equal(got.Source, "fallback", "a keystroke whose Suggest call failed %v must answer the fallback; the source", tc.code)
+	}
 }
 
 func CheckFallback(ctx *harness.Ctx) {
@@ -736,6 +773,9 @@ func CheckFallback(ctx *harness.Ctx) {
 	got = suggest(clientBg, "acme", "ke")
 	ctx.Assert(got.Source == "fallback", "with the suggester UNAVAILABLE suggest answered %+v, expected the fallback", got)
 	ctx.Equal(got.Suggestions, []string{"kettle", "keyboard"}, "the fallback for \\"ke\\"")
+	ctx.GRPC.Fail("Suggest", codes.Unavailable, "deploy in progress", 1, "")
+	got = suggest(clientBg, "acme", "ve")
+	ctx.Assert(got.Source == "fallback" && len(got.Suggestions) == 0, "the fallback for \\"ve\\" answered %+v, expected no suggestions: a curated term qualifies when it starts with the prefix (inventory only contains it)", got)
 }
 
 func CheckDegradedNotCached(ctx *harness.Ctx) {
@@ -764,14 +804,14 @@ namespace {
 
 using Strings = std::vector<std::string>;
 
-const std::map<std::string, Strings> kTerms = {{"ke", {"kettle", "kettlebell", "keyboard"}}, {"in", {"inbox", "invoice templates"}}};
+const std::map<std::string, Strings> hTerms = {{"ke", {"kettle", "kettlebell", "keyboard"}}, {"in", {"inbox", "invoice templates"}}};
 
 // The ranking suggester: a fixed answer per prefix.
 class SuggesterPeer final : public suggestd::Suggester::Service {
  public:
   grpc::Status Suggest(grpc::ServerContext*, const suggestd::SuggestRequest* req, suggestd::SuggestReply* out) override {
-    const auto found = kTerms.find(req->prefix());
-    if (found != kTerms.end()) {
+    const auto found = hTerms.find(req->prefix());
+    if (found != hTerms.end()) {
       for (const std::string& term : found->second) out->add_terms(term);
     }
     out->set_model_version("rank-7");
@@ -792,18 +832,18 @@ void CheckDeadline(harness::Ctx& ctx) {
   clientPeer(ctx);
   const Answer got = suggest("acme", "ke");
   ctx.Equal(got.source, "suggester", "with a healthy suggester, the source");
-  ctx.Equal(got.suggestions, kTerms.at("ke"), "the suggester's terms");
+  ctx.Equal(got.suggestions, hTerms.at("ke"), "the suggester's terms");
   const auto calls = ctx.GRPC.CallsTo("Suggest");
   ctx.Assert(!calls.empty(), "no Suggest call was made");
   for (const auto& call : calls) {
     ctx.Assert(call.HasDeadline(), "the Suggest call carries no deadline: a stalled suggester holds every keystroke");
-    ctx.Assert(0.1 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.2, "the Suggest call carries a %v s deadline, expected kDeadline = 150 ms", call.TimeoutSeconds());
+    ctx.Assert(0.1 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.16, "the Suggest call carries a %v s deadline, expected kDeadline = 150 ms", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Suggest", 0.4);
   const int64_t before = ctx.Clock.Now();
   suggest("acme", "in");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 0.25, "suggest waited %.2f s for a suggester that takes 0.4 s: the dropdown has 150 ms", waited);
+  ctx.Assert(waited <= 0.2, "suggest waited %.2f s for a suggester that takes 0.4 s: the dropdown has 150 ms", waited);
 }
 
 void CheckNoInlineRetry(harness::Ctx& ctx) {
@@ -812,6 +852,17 @@ void CheckNoInlineRetry(harness::Ctx& ctx) {
   suggest("acme", "ke");
   ctx.Equal(ctx.GRPC.CallsTo("Suggest").size(), 1, "one keystroke against a failing suggester: retrying in the request multiplies the load during an outage; the Suggest calls");
   ctx.Equal(ctx.Clock.Sleeps(), 0, "a failure must not be slept on in the request; the sleeps");
+  // Whatever the error, one call: no status code earns a second attempt inside the request.
+  const std::vector<std::pair<grpc::StatusCode, std::string>> errors = {
+      {grpc::StatusCode::DEADLINE_EXCEEDED, "kett"}, {grpc::StatusCode::INTERNAL, "in"}, {grpc::StatusCode::UNKNOWN, "inv"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "key"}};
+  for (const auto& [code, prefix] : errors) {
+    ctx.GRPC.ClearFailures();
+    ctx.GRPC.Fail("Suggest", code, "suggester error", 2);
+    const size_t before = ctx.GRPC.CallsTo("Suggest").size();
+    const Answer got = suggest("acme", prefix);
+    ctx.Equal(ctx.GRPC.CallsTo("Suggest").size() - before, 1, "a keystroke whose Suggest call failed with status %d: no error is retried inside the request; the Suggest calls", static_cast<int>(code));
+    ctx.Equal(got.source, "fallback", "a keystroke whose Suggest call failed with status %d must answer the fallback; the source", static_cast<int>(code));
+  }
 }
 
 void CheckFallback(harness::Ctx& ctx) {
@@ -826,6 +877,10 @@ void CheckFallback(harness::Ctx& ctx) {
   got = suggest("acme", "ke");
   ctx.Equal(got.source, "fallback", "with the suggester UNAVAILABLE, the source");
   ctx.Equal(got.suggestions, Strings{"kettle", "keyboard"}, "the fallback for \\"ke\\"");
+  ctx.GRPC.Fail("Suggest", grpc::StatusCode::UNAVAILABLE, "deploy in progress", 1);
+  got = suggest("acme", "ve");
+  ctx.Equal(got.source, "fallback", "with the suggester UNAVAILABLE, the source for \\"ve\\"");
+  ctx.Equal(got.suggestions, Strings{}, "the fallback for \\"ve\\": a curated term qualifies when it starts with the prefix (inventory only contains it)");
 }
 
 void CheckDegradedNotCached(harness::Ctx& ctx) {
@@ -837,7 +892,7 @@ void CheckDegradedNotCached(harness::Ctx& ctx) {
   ctx.GRPC.ClearFailures();
   const Answer second = suggest("acme", "ke");
   ctx.Equal(second.source, "suggester", "once the suggester recovered, the next keystroke's source");
-  ctx.Equal(second.suggestions, kTerms.at("ke"), "the suggester's terms once it recovered");
+  ctx.Equal(second.suggestions, hTerms.at("ke"), "the suggester's terms once it recovered");
   ctx.Equal(suggest("acme", "ke").source, "cache", "the suggester's answer must be cached; the third keystroke's source");
 }
 `,

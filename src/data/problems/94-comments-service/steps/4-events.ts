@@ -22,9 +22,10 @@ delete at the old revision; every comment's text is copied into a retained topic
 acknowledgement writes an event twice and a leader failover loses one.
 
 - Key every record by \`thread_id\`.
-- Commit first (\`commit_comment\`, \`soft_delete\`), then produce from the committed row.
-- The payload is \`{type: "comment.<kind>", tenant, comment_id, thread_id, parent_id, revision}\`,
-  no text.
+- Commit first (\`commit_comment\`, \`soft_delete\`), then produce from the committed row; a failed
+  delivery still reaches the caller (the commit stays).
+- The payload of every event, created or deleted, is
+  \`{type: "comment.<kind>", tenant, comment_id, thread_id, parent_id, revision}\`, no text.
 - An idempotent producer with \`acks=all\`: \`enable.idempotence\` for confluent-kafka (Python and
   Go) and librdkafka, kafkajs \`idempotent: true\` with \`acks: -1\`.`,
   sequence: {
@@ -67,7 +68,7 @@ acknowledgement writes an event twice and a leader failover loses one.
       id: 'after-commit',
       title: 'Produces only what has been committed',
       detail:
-        '`create_comment` commits with `commit_comment` and `delete_comment` with `soft_delete` before producing, and the event is built from the committed row (a delete carries the revision the delete wrote). The starter produces first.',
+        '`create_comment` commits with `commit_comment` and `delete_comment` with `soft_delete` before producing, and the event is built from the committed row (a delete carries the revision the delete wrote). When the broker rejects the event, the comment is already committed (or deleted) and the failure reaches the caller. The starter produces first.',
       match: {
         python: {
           order: [
@@ -125,7 +126,7 @@ acknowledgement writes an event twice and a leader failover loses one.
       id: 'payload',
       title: 'Ids and revision, no text',
       detail:
-        'The payload is `{type, tenant, comment_id, thread_id, parent_id, revision}`: what a read model needs to fetch the comment and drop a stale update. The starter ships the author and the text into a retained, replicated topic and leaves the parent and the revision out.',
+        'The payload of a created and of a deleted event is `{type, tenant, comment_id, thread_id, parent_id, revision}`: what a read model needs to fetch the comment and drop a stale update. The starter ships the author and the text into a retained, replicated topic and leaves the parent and the revision out.',
       match: {
         python: {
           all: [/["']parent_id["']\s*:/, /["']revision["']\s*:/],
@@ -791,6 +792,24 @@ def check_after_commit(ctx):
     assert deleted is not None and deleted.get("revision") == 2, f"the deleted event must carry the revision the delete committed (2), got {deleted}: an event produced before the write describes the row as it was"
     assert m.delete_comment("acme", "c-404") is None, "deleting a comment that does not exist must answer None"
     assert len(ctx.kafka.records(TOPIC)) == 2, f"the topic holds {len(ctx.kafka.records(TOPIC))} records, expected the created and the deleted events"
+    # The broker rejects the next event: what the store holds then shows which came first.
+    ctx.kafka.fail_next(TOPIC)
+    unsent = _comment()
+    try:
+        m.create_comment("acme", unsent)
+        raised = False
+    except Exception:
+        raised = True
+    assert store.get("acme", unsent["id"]) is not None, "the broker rejected the created event and the comment was never committed: commit first, then produce"
+    assert raised, "the broker rejected the created event and create_comment returned as if it had been delivered: a failed delivery must reach the caller"
+    ctx.kafka.fail_next(TOPIC)
+    try:
+        m.delete_comment("acme", unsent["id"])
+        raised = False
+    except Exception:
+        raised = True
+    assert store.get("acme", unsent["id"])["deleted"] is True, "the broker rejected the deleted event and the comment is not deleted: the event was produced before soft_delete. Commit first: an event may lag the store, never lead it"
+    assert raised, "the broker rejected the deleted event and delete_comment returned as if it had been delivered: a failed delivery must reach the caller"
 
 
 def check_payload(ctx):
@@ -804,6 +823,12 @@ def check_payload(ctx):
     assert "butler" not in raw and "text" not in payload, f"the event carries the comment's text: {payload}. The topic is retained and replicated; carry ids, and let consumers read the text from the store"
     expected = {"type": "comment.created", "tenant": "acme", "comment_id": reply["id"], "thread_id": "t-1", "parent_id": root["id"], "revision": 1}
     assert payload == expected, f"the event is {payload}, expected {expected}"
+    m.delete_comment("acme", reply["id"])
+    events = _payloads(ctx)
+    assert len(events) == 3, f"deleting {reply['id']} left {len(events)} events on {TOPIC}, expected a third, the deleted event"
+    gone = events[2]
+    expected = {"type": "comment.deleted", "tenant": "acme", "comment_id": reply["id"], "thread_id": "t-1", "parent_id": root["id"], "revision": 2}
+    assert gone == expected, f"the deleted event is {gone}, expected {expected}: every event carries the same fields, from the committed row"
 
 
 def check_acks_idempotent(ctx):
@@ -871,6 +896,26 @@ export async function check_after_commit(ctx) {
   assert.equal(await m.deleteComment('acme', 'c-404'), null, 'deleting a comment that does not exist must resolve null');
   await settle();
   assert.equal(ctx.kafka.records(TOPIC).length, 2, 'the topic must hold the created and the deleted events');
+  // The broker rejects the next event: what the store holds then shows which came first.
+  ctx.kafka.failNext(TOPIC);
+  const unsent = await comment(store);
+  let raised = false;
+  try {
+    await m.createComment('acme', unsent);
+  } catch {
+    raised = true;
+  }
+  assert((await store.get('acme', unsent.id)) !== null, 'the broker rejected the created event and the comment was never committed: commit first, then produce');
+  assert(raised, 'the broker rejected the created event and createComment resolved as if it had been delivered: a failed delivery must reach the caller');
+  ctx.kafka.failNext(TOPIC);
+  raised = false;
+  try {
+    await m.deleteComment('acme', unsent.id);
+  } catch {
+    raised = true;
+  }
+  assert.equal((await store.get('acme', unsent.id)).deleted, true, 'the broker rejected the deleted event and the comment is not deleted: the event was produced before softDelete. Commit first: an event may lag the store, never lead it');
+  assert(raised, 'the broker rejected the deleted event and deleteComment resolved as if it had been delivered: a failed delivery must reach the caller');
 }
 
 export async function check_payload(ctx) {
@@ -885,6 +930,12 @@ export async function check_payload(ctx) {
   assert(!raw.includes('butler') && !('text' in payload), \`the event carries the comment's text: \${raw}. The topic is retained and replicated; carry ids, and let consumers read the text from the store\`);
   const expected = {type: 'comment.created', tenant: 'acme', comment_id: reply.id, thread_id: 't-1', parent_id: root.id, revision: 1};
   assert.deepStrictEqual(payload, expected, \`the event is \${raw}, expected \${JSON.stringify(expected)}\`);
+  await m.deleteComment('acme', reply.id);
+  await settle();
+  const all = payloads(ctx);
+  assert.equal(all.length, 3, \`deleting \${reply.id} left \${all.length} events on \${TOPIC}, expected a third, the deleted event\`);
+  const gone = {type: 'comment.deleted', tenant: 'acme', comment_id: reply.id, thread_id: 't-1', parent_id: root.id, revision: 2};
+  assert.deepStrictEqual(all[2], gone, \`the deleted event is \${JSON.stringify(all[2])}, expected \${JSON.stringify(gone)}: every event carries the same fields, from the committed row\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -904,6 +955,7 @@ export async function check_acks_idempotent(ctx) {
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"comments/store"
@@ -912,85 +964,104 @@ import (
 )
 
 const (
-	eventIndex = "thread:acme:t-1:comments"
-	eventText  = "The butler did it"
+	hTopic     = "comment.event"
+	hEventIdx  = "thread:acme:t-1:comments"
+	hEventText = "The butler did it"
 )
 
-var eventsBg = context.Background()
+var hBg = context.Background()
 
-func eventComment(ctx *harness.Ctx, threadID, author, parentID, text string) store.Comment {
-	c, err := store.NewComment(eventsBg, threadID, parentID, author, text, text)
+func hEventComment(ctx *harness.Ctx, threadID, author, parentID, text string) store.Comment {
+	c, err := store.NewComment(hBg, threadID, parentID, author, text, text)
 	ctx.NoError(err, "store.NewComment failed")
 	return c
 }
 
-func mustCreate(ctx *harness.Ctx, c store.Comment) map[string]any {
-	event, err := createComment(eventsBg, "acme", c)
+func hCreate(ctx *harness.Ctx, c store.Comment) map[string]any {
+	event, err := createComment(hBg, "acme", c)
 	ctx.NoError(err, "createComment(%s) failed", c.ID)
 	return event
 }
 
-func payloadAt(ctx *harness.Ctx, i int) map[string]any {
-	values := ctx.Kafka.Values(topic)
+func hPayloadAt(ctx *harness.Ctx, i int) (map[string]any, string) {
+	values := ctx.Kafka.Values(hTopic)
 	ctx.Assert(len(values) > i, "the topic holds %d records, expected at least %d", len(values), i+1)
 	var p map[string]any
 	ctx.Assert(json.Unmarshal([]byte(values[i]), &p) == nil, "a record's value is not JSON: %s", values[i])
-	return p
+	return p, values[i]
+}
+
+// hIsEvent reports whether p is exactly {type, tenant: acme, comment_id, thread_id: t-1, parent_id, revision}.
+func hIsEvent(p map[string]any, kind, commentID, parentID string, revision int) bool {
+	return len(p) == 6 && p["type"] == "comment."+kind && p["tenant"] == "acme" && p["comment_id"] == commentID && p["thread_id"] == "t-1" && p["parent_id"] == parentID && p["revision"] == float64(revision)
 }
 
 func CheckThreadKey(ctx *harness.Ctx) {
-	mustCreate(ctx, eventComment(ctx, "t-1", "u-1", "", eventText))
-	mustCreate(ctx, eventComment(ctx, "t-2", "u-1", "", eventText))
-	mustCreate(ctx, eventComment(ctx, "t-1", "u-2", "", eventText))
+	hCreate(ctx, hEventComment(ctx, "t-1", "u-1", "", hEventText))
+	hCreate(ctx, hEventComment(ctx, "t-2", "u-1", "", hEventText))
+	hCreate(ctx, hEventComment(ctx, "t-1", "u-2", "", hEventText))
 	ctx.Settle()
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 3, "three comments must produce three records on %s; the records", topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{"t-1", "t-2", "t-1"}, "the records must be keyed by the thread ids (keyed by anything else, one thread's events scatter across partitions)")
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 3, "three comments must produce three records on %s; the records", hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{"t-1", "t-2", "t-1"}, "the records must be keyed by the thread ids (keyed by anything else, one thread's events scatter across partitions)")
 	ctx.Equal(records[0].Partition, records[2].Partition, "both t-1 events must land on one partition, or a read model sees the thread out of order; the partitions")
 }
 
 func CheckAfterCommit(ctx *harness.Ctx) {
 	// The instant the comment is committed, what is already on the topic.
-	atCommit := ctx.Redis.After(eventIndex, func() any { return len(ctx.Kafka.Records(topic)) })
-	c := eventComment(ctx, "t-1", "u-1", "", eventText)
-	mustCreate(ctx, c)
+	atCommit := ctx.Redis.After(hEventIdx, func() any { return len(ctx.Kafka.Records(hTopic)) })
+	c := hEventComment(ctx, "t-1", "u-1", "", hEventText)
+	hCreate(ctx, c)
 	ctx.Settle()
-	ctx.Assert(atCommit.Fired, "createComment never committed the comment (nothing wrote %s)", eventIndex)
+	ctx.Assert(atCommit.Fired, "createComment never committed the comment (nothing wrote %s)", hEventIdx)
 	ctx.Equal(atCommit.Result, 0, "when the comment was committed the topic already held records: a consumer could look up a comment the store does not have. Commit first, then produce; the records at commit time")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "the event must still be produced after the commit; the records")
-	deleted, err := deleteComment(eventsBg, "acme", c.ID)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "the event must still be produced after the commit; the records")
+	deleted, err := deleteComment(hBg, "acme", c.ID)
 	ctx.NoError(err, "deleteComment(%s) failed", c.ID)
-	ctx.Assert(store.Get(eventsBg, "acme", c.ID).Deleted, "deleteComment must soft-delete the comment")
-	ctx.Assert(deleted != nil && deleted["revision"] == 2, "the deleted event must carry the revision the delete committed (2), got %v: an event produced before the write describes the row as it was", deleted)
-	none, err := deleteComment(eventsBg, "acme", "c-404")
+	ctx.Assert(store.Get(hBg, "acme", c.ID).Deleted, "deleteComment must soft-delete the comment")
+	ctx.Assert(deleted != nil && fmt.Sprint(deleted["revision"]) == "2", "the deleted event must carry the revision the delete committed (2), got %v: an event produced before the write describes the row as it was", deleted)
+	none, err := deleteComment(hBg, "acme", "c-404")
 	ctx.Assert(err == nil && none == nil, "deleting a comment that does not exist must return nil, nil; got %v, %v", none, err)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "the topic must hold the created and the deleted events; the records")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 2, "the topic must hold the created and the deleted events; the records")
+	// The broker rejects the next event: what the store holds then shows which came first.
+	ctx.Kafka.FailNext(hTopic, 1)
+	unsent := hEventComment(ctx, "t-1", "u-1", "", hEventText)
+	_, err = createComment(hBg, "acme", unsent)
+	ctx.Assert(store.Get(hBg, "acme", unsent.ID) != nil, "the broker rejected the created event and the comment was never committed: commit first, then produce")
+	ctx.Assert(err != nil, "the broker rejected the created event and createComment returned as if it had been delivered: a failed delivery must reach the caller")
+	ctx.Kafka.FailNext(hTopic, 1)
+	_, err = deleteComment(hBg, "acme", unsent.ID)
+	ctx.Assert(store.Get(hBg, "acme", unsent.ID).Deleted, "the broker rejected the deleted event and the comment is not deleted: the event was produced before store.SoftDelete. Commit first: an event may lag the store, never lead it")
+	ctx.Assert(err != nil, "the broker rejected the deleted event and deleteComment returned as if it had been delivered: a failed delivery must reach the caller")
 }
 
 func CheckPayload(ctx *harness.Ctx) {
-	root := eventComment(ctx, "t-1", "u-1", "", eventText)
-	mustCreate(ctx, root)
-	reply := eventComment(ctx, "t-1", "u-1", root.ID, "Not the butler")
-	mustCreate(ctx, reply)
+	root := hEventComment(ctx, "t-1", "u-1", "", hEventText)
+	hCreate(ctx, root)
+	reply := hEventComment(ctx, "t-1", "u-1", root.ID, "Not the butler")
+	hCreate(ctx, reply)
 	ctx.Settle()
-	raw := ctx.Kafka.Values(topic)[1]
-	p := payloadAt(ctx, 1)
+	p, raw := hPayloadAt(ctx, 1)
 	_, hasText := p["text"]
 	ctx.Assert(!strings.Contains(raw, "butler") && !hasText, "the event carries the comment's text: %s. The topic is retained and replicated; carry ids, and let consumers read the text from the store", raw)
-	ctx.Assert(len(p) == 6 && p["type"] == "comment.created" && p["tenant"] == "acme" && p["comment_id"] == reply.ID && p["thread_id"] == "t-1" && p["parent_id"] == root.ID && p["revision"] == 1.0,
-		"the event is %s, expected {type: comment.created, tenant: acme, comment_id: %s, thread_id: t-1, parent_id: %s, revision: 1}", raw, reply.ID, root.ID)
+	ctx.Assert(hIsEvent(p, "created", reply.ID, root.ID, 1), "the event is %s, expected {type: comment.created, tenant: acme, comment_id: %s, thread_id: t-1, parent_id: %s, revision: 1}", raw, reply.ID, root.ID)
+	_, err := deleteComment(hBg, "acme", reply.ID)
+	ctx.NoError(err, "deleteComment(%s) failed", reply.ID)
+	ctx.Settle()
+	gone, raw := hPayloadAt(ctx, 2)
+	ctx.Assert(hIsEvent(gone, "deleted", reply.ID, root.ID, 2), "the deleted event is %s, expected {type: comment.deleted, tenant: acme, comment_id: %s, thread_id: t-1, parent_id: %s, revision: 2}: every event carries the same fields, from the committed row", raw, reply.ID, root.ID)
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(topic, 1) // the broker wrote it, the acknowledgement never arrived
-	mustCreate(ctx, eventComment(ctx, "t-1", "u-1", "", eventText))
+	ctx.Kafka.LoseAcks(hTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	hCreate(ctx, hEventComment(ctx, "t-1", "u-1", "", hEventText))
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	mustCreate(ctx, eventComment(ctx, "t-1", "u-1", "", eventText))
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	hCreate(ctx, hEventComment(ctx, "t-1", "u-1", "", hEventText))
 	ctx.Settle()
-	ctx.Kafka.Failover(topic) // the partition leader dies right after acknowledging
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
+	ctx.Kafka.Failover(hTopic) // the partition leader dies right after acknowledging
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1004,15 +1075,16 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kEventIndex = "thread:acme:t-1:comments";
-const std::string kEventText = "The butler did it";
+const std::string hTopic = "comment.event";
+const std::string hEventIndex = "thread:acme:t-1:comments";
+const std::string hEventText = "The butler did it";
 
-store::Comment eventComment(const std::string& thread_id = "t-1", const std::string& author = "u-1", const std::string& parent_id = "",
-                            const std::string& text = kEventText) {
+store::Comment hEventComment(const std::string& thread_id = "t-1", const std::string& author = "u-1", const std::string& parent_id = "",
+                             const std::string& text = hEventText) {
   return store::newComment(thread_id, parent_id, author, text, text);
 }
 
-nlohmann::json mustCreate(harness::Ctx& ctx, const store::Comment& c) {
+nlohmann::json hCreate(harness::Ctx& ctx, const store::Comment& c) {
   try {
     return createComment("acme", c);
   } catch (const std::exception& e) {
@@ -1023,13 +1095,13 @@ nlohmann::json mustCreate(harness::Ctx& ctx, const store::Comment& c) {
 }  // namespace
 
 void CheckThreadKey(harness::Ctx& ctx) {
-  mustCreate(ctx, eventComment("t-1", "u-1"));
-  mustCreate(ctx, eventComment("t-2", "u-1"));
-  mustCreate(ctx, eventComment("t-1", "u-2"));
+  hCreate(ctx, hEventComment("t-1", "u-1"));
+  hCreate(ctx, hEventComment("t-2", "u-1"));
+  hCreate(ctx, hEventComment("t-1", "u-2"));
   ctx.Settle();
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three comments must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"t-1", "t-2", "t-1"}, "the records must be keyed by the thread ids (keyed by anything else, one thread's events scatter across partitions)");
+  const auto records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 3, "three comments must produce three records on %s; the records", hTopic);
+  ctx.Equal(ctx.Kafka.Keys(hTopic), {"t-1", "t-2", "t-1"}, "the records must be keyed by the thread ids (keyed by anything else, one thread's events scatter across partitions)");
   ctx.Equal(records[0].Partition, records[2].Partition, "both t-1 events must land on one partition, or a read model sees the thread out of order; the partitions");
 }
 
@@ -1037,32 +1109,52 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   // The instant the comment is committed, what is already on the topic.
   bool fired = false;
   size_t atCommit = 999;
-  ctx.Redis.After(kEventIndex, [&] {
+  ctx.Redis.After(hEventIndex, [&] {
     fired = true;
-    atCommit = ctx.Kafka.Records(kTopic).size();
+    atCommit = ctx.Kafka.Records(hTopic).size();
   });
-  const store::Comment c = eventComment();
-  mustCreate(ctx, c);
+  const store::Comment c = hEventComment();
+  hCreate(ctx, c);
   ctx.Settle();
-  ctx.Assert(fired, "createComment never committed the comment (nothing wrote %s)", kEventIndex);
+  ctx.Assert(fired, "createComment never committed the comment (nothing wrote %s)", hEventIndex);
   ctx.Equal(atCommit, 0, "when the comment was committed the topic already held records: a consumer could look up a comment the store does not have. Commit first, then produce; the records at commit time");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the event must still be produced after the commit; the records");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "the event must still be produced after the commit; the records");
   const auto deleted = deleteComment("acme", c.id);
   ctx.Assert(store::get("acme", c.id)->deleted, "deleteComment must soft-delete the comment");
   ctx.Assert(deleted && deleted->value("revision", 0) == 2, "the deleted event must carry the revision the delete committed (2), got %s: an event produced before the write describes the row as it was",
              deleted ? deleted->dump() : "nothing");
   ctx.Assert(!deleteComment("acme", "c-404"), "deleting a comment that does not exist must return nothing");
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "the topic must hold the created and the deleted events; the records");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 2, "the topic must hold the created and the deleted events; the records");
+  // The broker rejects the next event: what the store holds then shows which came first.
+  ctx.Kafka.FailNext(hTopic, 1);
+  const store::Comment unsent = hEventComment();
+  bool threw = false;
+  try {
+    createComment("acme", unsent);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Assert(store::get("acme", unsent.id).has_value(), "the broker rejected the created event and the comment was never committed: commit first, then produce");
+  ctx.Assert(threw, "the broker rejected the created event and createComment returned as if it had been delivered: a failed delivery must reach the caller");
+  ctx.Kafka.FailNext(hTopic, 1);
+  threw = false;
+  try {
+    deleteComment("acme", unsent.id);
+  } catch (const std::exception&) {
+    threw = true;
+  }
+  ctx.Assert(store::get("acme", unsent.id)->deleted, "the broker rejected the deleted event and the comment is not deleted: the event was produced before store::softDelete. Commit first: an event may lag the store, never lead it");
+  ctx.Assert(threw, "the broker rejected the deleted event and deleteComment returned as if it had been delivered: a failed delivery must reach the caller");
 }
 
 void CheckPayload(harness::Ctx& ctx) {
-  const store::Comment root = eventComment();
-  mustCreate(ctx, root);
-  const store::Comment reply = eventComment("t-1", "u-1", root.id, "Not the butler");
-  mustCreate(ctx, reply);
+  const store::Comment root = hEventComment();
+  hCreate(ctx, root);
+  const store::Comment reply = hEventComment("t-1", "u-1", root.id, "Not the butler");
+  hCreate(ctx, reply);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kTopic);
+  const auto values = ctx.Kafka.Values(hTopic);
   ctx.Equal(values.size(), 2, "two comments, the records");
   const std::string raw = values[1];
   const auto payload = nlohmann::json::parse(raw, nullptr, false);
@@ -1070,17 +1162,28 @@ void CheckPayload(harness::Ctx& ctx) {
   ctx.Assert(raw.find("butler") == std::string::npos && !payload.contains("text"), "the event carries the comment's text: %s. The topic is retained and replicated; carry ids, and let consumers read the text from the store", raw);
   const nlohmann::json expected = {{"type", "comment.created"}, {"tenant", "acme"}, {"comment_id", reply.id}, {"thread_id", "t-1"}, {"parent_id", root.id}, {"revision", 1}};
   ctx.Assert(payload == expected, "the event is %s, expected %s", raw, expected.dump());
+  try {
+    deleteComment("acme", reply.id);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("deleteComment(%s) threw %s: %s", reply.id, harness::CurrentExceptionType(), e.what());
+  }
+  ctx.Settle();
+  const auto all = ctx.Kafka.Values(hTopic);
+  ctx.Equal(all.size(), 3, "deleting %s must add the deleted event; the records", reply.id);
+  const auto gone = nlohmann::json::parse(all[2], nullptr, false);
+  const nlohmann::json deleted = {{"type", "comment.deleted"}, {"tenant", "acme"}, {"comment_id", reply.id}, {"thread_id", "t-1"}, {"parent_id", root.id}, {"revision", 2}};
+  ctx.Assert(gone == deleted, "the deleted event is %s, expected %s: every event carries the same fields, from the committed row", all[2], deleted.dump());
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  mustCreate(ctx, eventComment());
+  ctx.Kafka.LoseAcks(hTopic, 1);  // the broker wrote it, the acknowledgement never arrived
+  hCreate(ctx, hEventComment());
   ctx.Settle();
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  mustCreate(ctx, eventComment());
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  hCreate(ctx, hEventComment());
   ctx.Settle();
-  ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
+  ctx.Kafka.Failover(hTopic);  // the partition leader dies right after acknowledging
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");
 }
 `,
   },

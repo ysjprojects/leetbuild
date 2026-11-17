@@ -25,7 +25,7 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
 // DeliverReply.status: DELIVERED (the device acknowledged) · QUEUED (held for an offline device) · EXPIRED
 \`\`\`
 
-- Every call carries a **\`DEADLINE_S\` = 5 s** deadline.
+- Every call carries its own **\`DEADLINE_S\` = 5 s** deadline.
 - At most \`MAX_ATTEMPTS\` = 3 attempts, \`BACKOFF_S\` = 1 s apart, only while now < \`expires_at_ms\`;
   only \`RETRYABLE\` codes (UNAVAILABLE, DEADLINE_EXCEEDED) are retried, any other is \`"failed"\` at once.
 - The request carries \`expires_at_ms\`. A command whose window has closed is not sent and answers
@@ -56,7 +56,7 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
       id: 'deadline',
       title: 'Every Deliver call carries a 5-second deadline',
       detail:
-        'Each attempt is made with `DEADLINE_S` (5 s), so a gateway that never answers costs at most three deadlines; the starter calls with no deadline at all.',
+        'Each attempt is made with its own full `DEADLINE_S` (5 s), and a timed-out call is retried, so a gateway that never answers costs three 5-second deadlines and no more; the starter calls with no deadline at all.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*5\b/, /\.Deliver\([^)\n]*timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -69,7 +69,7 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
       id: 'bounded-retry',
       title: 'Retries three times, and only what can succeed on retry',
       detail:
-        'At most `MAX_ATTEMPTS` = 3 calls, and only after a `RETRYABLE` code (UNAVAILABLE, DEADLINE_EXCEEDED); any other code answers `failed` after one call. The starter loops until a reply says `accepted`.',
+        'At most `MAX_ATTEMPTS` = 3 calls, `BACKOFF_S` = 1 s apart, and only after a `RETRYABLE` code (UNAVAILABLE, DEADLINE_EXCEEDED); any other code (INVALID_ARGUMENT, PERMISSION_DENIED, FAILED_PRECONDITION, INTERNAL) answers `failed` after one call. The starter loops until a reply says `accepted`.',
       match: {
         python: {
           all: [/MAX_ATTEMPTS\s*=\s*3\b/, /RETRYABLE/, /attempts\s*<\s*MAX_ATTEMPTS/],
@@ -94,7 +94,7 @@ service DeviceGateway { rpc Deliver(DeliverRequest) returns (DeliverReply); }
       id: 'window',
       title: 'Sends the validity window and stops at it',
       detail:
-        "The request carries the command's `expires_at_ms`, a command past it is not sent, and an `EXPIRED` reply answers `expired`; the starter sends no window, so the gateway keeps the command for an offline lock indefinitely.",
+        "The request carries the command's `expires_at_ms`; no attempt starts once now reaches it (the first one included, and a retry when the window closes during the backoff), such a command answers `expired`, and so does an `EXPIRED` reply. The starter sends no window, so the gateway keeps the command for an offline lock indefinitely.",
       match: {
         python: {all: [/expires_at_ms\s*=\s*command\[["']expires_at_ms["']\]/, /\.EXPIRED\b/]},
         typescript: {all: [/expires_at_ms:\s*(expiresAtMs|command\.expires_at_ms)/, /EXPIRED/]},
@@ -626,6 +626,8 @@ def check_deadline(ctx):
     outcome = ctx.drain(m.deliver, _command(ctx, "cmd-2"))
     waited = ctx.clock.time() - before
     assert outcome == "failed", f"against a gateway that never answers in time deliver answered {outcome!r}, expected failed once its attempts are spent"
+    slow = ctx.grpc.calls_to("Deliver")[len(calls):]
+    assert len(slow) == 3 and all(c.timeout is not None and 4.5 <= c.timeout <= 5.5 for c in slow), f"against a gateway that never answers deliver made {len(slow)} calls with deadlines {[c.timeout for c in slow]}, expected three calls of 5 s each: DEADLINE_EXCEEDED is retried, and every attempt carries its own full deadline"
     assert waited <= 20, f"deliver spent {waited:.0f} s on a gateway that never answers, expected at most three 5 s deadlines"
 
 
@@ -642,6 +644,20 @@ def check_bounded_retry(ctx):
     outcome = ctx.drain(m.deliver, _command(ctx, "cmd-2"))
     refused = len(ctx.grpc.calls_to("Deliver")) - calls
     assert outcome == "failed" and refused == 1, f"a command the gateway refused with INVALID_ARGUMENT answered {outcome!r} after {refused} calls, expected failed after one: only RETRYABLE codes are retried"
+    for n, code in enumerate((grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.INTERNAL)):
+        ctx.grpc.failures.clear()
+        ctx.grpc.fail("Deliver", code, "refused", times=100)
+        before = len(ctx.grpc.calls_to("Deliver"))
+        outcome = ctx.drain(m.deliver, _command(ctx, f"cmd-{3 + n}"))
+        refused = len(ctx.grpc.calls_to("Deliver")) - before
+        assert outcome == "failed" and refused == 1, f"a command the gateway refused with {code.name} answered {outcome!r} after {refused} calls, expected failed after one: only RETRYABLE codes are retried"
+    ctx.grpc.failures.clear()
+    ctx.grpc.fail("Deliver", grpc.StatusCode.UNAVAILABLE, "gateway restarting", times=1)
+    before, started = len(ctx.grpc.calls_to("Deliver")), ctx.clock.time()
+    outcome = ctx.drain(m.deliver, _command(ctx, "cmd-9"))
+    tries, waited = len(ctx.grpc.calls_to("Deliver")) - before, ctx.clock.time() - started
+    assert outcome == "delivered" and tries == 2, f"a gateway UNAVAILABLE once, then back, got {tries} calls and deliver answered {outcome!r}, expected delivered on the second call"
+    assert waited >= 0.99, f"deliver called again {waited:.2f} s after UNAVAILABLE, expected BACKOFF_S = 1 s between attempts"
 
 
 def check_window(ctx):
@@ -653,17 +669,27 @@ def check_window(ctx):
     sent = calls[0].request.expires_at_ms
     assert sent == command["expires_at_ms"], f"the Deliver request carried expires_at_ms={sent}, expected the command's window {command['expires_at_ms']}: without it the gateway keeps the command for an offline lock and runs it whenever the lock reconnects"
     late = _command(ctx, "cmd-2", validity_s=60)
+    edge = _command(ctx, "cmd-4", validity_s=61)
     ctx.clock.advance(61)
     gateway.online.add(LOCK)
     before = len(ctx.grpc.calls_to("Deliver"))
     outcome = ctx.drain(m.deliver, late)
     assert outcome == "expired", f"a command whose window closed a second ago answered {outcome!r}, expected expired"
     assert len(ctx.grpc.calls_to("Deliver")) == before, "a command whose window has closed was sent to the gateway: a door must not unlock on a command nobody waits for any more"
+    outcome = ctx.drain(m.deliver, edge)
+    assert outcome == "expired" and len(ctx.grpc.calls_to("Deliver")) == before, f"a command whose window ends this very millisecond answered {outcome!r} and was sent {len(ctx.grpc.calls_to('Deliver')) - before} times, expected expired and no call: attempts run only while now < expires_at_ms"
     gateway.dropped.add("lock-9")
     before = len(ctx.grpc.calls_to("Deliver"))
     outcome = ctx.drain(m.deliver, _command(ctx, "cmd-3", device="lock-9"))
     tries = len(ctx.grpc.calls_to("Deliver")) - before
     assert outcome == "expired" and tries == 1, f"the gateway answered EXPIRED and deliver answered {outcome!r} after {tries} calls, expected expired after one"
+    ctx.grpc.fail("Deliver", grpc.StatusCode.UNAVAILABLE, "gateway restarting", times=100)
+    closing = _command(ctx, "cmd-5", validity_s=0)
+    closing["expires_at_ms"] += 1500
+    before = len(ctx.grpc.calls_to("Deliver"))
+    outcome = ctx.drain(m.deliver, closing)
+    tries = len(ctx.grpc.calls_to("Deliver")) - before
+    assert outcome == "expired" and tries == 2, f"a command with 1.5 s left, against a gateway that stays UNAVAILABLE, answered {outcome!r} after {tries} calls, expected expired after two: no attempt starts once the window has closed"
 
 
 def check_acknowledged(ctx):
@@ -717,6 +743,8 @@ export async function check_deadline(ctx) {
   outcome = await ctx.drain(m.deliver(command(ctx, 'cmd-2')));
   const waited = (ctx.clock.now() - before) / 1000;
   assert.equal(outcome, 'failed', \`against a gateway that never answers in time deliver answered \${outcome}, expected failed once its attempts are spent\`);
+  const slow = ctx.grpc.callsTo('Deliver').slice(calls.length);
+  assert(slow.length === 3 && slow.every(c => c.timeout !== null && c.timeout >= 4.5 && c.timeout <= 5.5), \`against a gateway that never answers deliver made \${slow.length} calls with deadlines \${JSON.stringify(slow.map(c => c.timeout))} s, expected three calls of 5 s each: DEADLINE_EXCEEDED is retried, and every attempt carries its own full deadline\`);
   assert(waited <= 20, \`deliver spent \${waited.toFixed(0)} s on a gateway that never answers, expected at most three 5 s deadlines\`);
 }
 
@@ -733,6 +761,24 @@ export async function check_bounded_retry(ctx) {
   outcome = await ctx.drain(m.deliver(command(ctx, 'cmd-2')));
   const refused = ctx.grpc.callsTo('Deliver').length - calls;
   assert(outcome === 'failed' && refused === 1, \`a command the gateway refused with INVALID_ARGUMENT answered \${outcome} after \${refused} calls, expected failed after one: only RETRYABLE codes are retried\`);
+  const terminal: [string, number][] = [['PERMISSION_DENIED', ctx.grpc.status.PERMISSION_DENIED], ['FAILED_PRECONDITION', ctx.grpc.status.FAILED_PRECONDITION], ['INTERNAL', ctx.grpc.status.INTERNAL]];
+  for (const [n, [name, code]] of terminal.entries()) {
+    ctx.grpc.clearFailures();
+    ctx.grpc.fail('Deliver', code, 'refused', 100);
+    const before = ctx.grpc.callsTo('Deliver').length;
+    outcome = await ctx.drain(m.deliver(command(ctx, \`cmd-\${3 + n}\`)));
+    const tries = ctx.grpc.callsTo('Deliver').length - before;
+    assert(outcome === 'failed' && tries === 1, \`a command the gateway refused with \${name} answered \${outcome} after \${tries} calls, expected failed after one: only RETRYABLE codes are retried\`);
+  }
+  ctx.grpc.clearFailures();
+  ctx.grpc.fail('Deliver', ctx.grpc.status.UNAVAILABLE, 'gateway restarting', 1);
+  const before = ctx.grpc.callsTo('Deliver').length;
+  const started = ctx.clock.now();
+  outcome = await ctx.drain(m.deliver(command(ctx, 'cmd-9')));
+  const tries = ctx.grpc.callsTo('Deliver').length - before;
+  const waited = (ctx.clock.now() - started) / 1000;
+  assert(outcome === 'delivered' && tries === 2, \`a gateway UNAVAILABLE once, then back, got \${tries} calls and deliver answered \${outcome}, expected delivered on the second call\`);
+  assert(waited >= 0.99, \`deliver called again \${waited.toFixed(2)} s after UNAVAILABLE, expected BACKOFF_MS = 1000 between attempts\`);
 }
 
 export async function check_window(ctx) {
@@ -744,17 +790,28 @@ export async function check_window(ctx) {
   const sent = Number(calls[0].request.expires_at_ms);
   assert.equal(sent, first.expires_at_ms, \`the Deliver request carried expires_at_ms=\${sent}, expected the command's window \${first.expires_at_ms}: without it the gateway keeps the command for an offline lock and runs it whenever the lock reconnects\`);
   const late = command(ctx, 'cmd-2', LOCK, 60);
+  const edge = command(ctx, 'cmd-4', LOCK, 61);
   ctx.clock.advance(61);
   gateway.online.add(LOCK);
   let before = ctx.grpc.callsTo('Deliver').length;
   let outcome = await ctx.drain(m.deliver(late));
   assert.equal(outcome, 'expired', \`a command whose window closed a second ago answered \${outcome}, expected expired\`);
   assert.equal(ctx.grpc.callsTo('Deliver').length, before, 'a command whose window has closed was sent to the gateway: a door must not unlock on a command nobody waits for any more');
+  outcome = await ctx.drain(m.deliver(edge));
+  const sentAtEdge = ctx.grpc.callsTo('Deliver').length - before;
+  assert(outcome === 'expired' && sentAtEdge === 0, \`a command whose window ends this very millisecond answered \${outcome} and was sent \${sentAtEdge} times, expected expired and no call: attempts run only while now < expires_at_ms\`);
   gateway.dropped.add('lock-9');
   before = ctx.grpc.callsTo('Deliver').length;
   outcome = await ctx.drain(m.deliver(command(ctx, 'cmd-3', 'lock-9')));
-  const tries = ctx.grpc.callsTo('Deliver').length - before;
+  let tries = ctx.grpc.callsTo('Deliver').length - before;
   assert(outcome === 'expired' && tries === 1, \`the gateway answered EXPIRED and deliver answered \${outcome} after \${tries} calls, expected expired after one\`);
+  ctx.grpc.fail('Deliver', ctx.grpc.status.UNAVAILABLE, 'gateway restarting', 100);
+  const closing = {...command(ctx, 'cmd-5', LOCK, 0)};
+  closing.expires_at_ms += 1500;
+  before = ctx.grpc.callsTo('Deliver').length;
+  outcome = await ctx.drain(m.deliver(closing));
+  tries = ctx.grpc.callsTo('Deliver').length - before;
+  assert(outcome === 'expired' && tries === 2, \`a command with 1.5 s left, against a gateway that stays UNAVAILABLE, answered \${outcome} after \${tries} calls, expected expired after two: no attempt starts once the window has closed\`);
 }
 
 export async function check_acknowledged(ctx) {
@@ -781,11 +838,11 @@ import (
 	"leetbuild/harness"
 )
 
-const gatewayLock = "lock-7"
+const hGatewayLock = "lock-7"
 
-// gatewayPeer: devices in online acknowledge at once; any other device is offline: its command is
+// hGatewayPeer: devices in online acknowledge at once; any other device is offline: its command is
 // queued until expires_at_ms (0: kept forever) and EXPIRED after; devices in dropped answer EXPIRED.
-type gatewayPeer struct {
+type hGatewayPeer struct {
 	pb.UnimplementedDeviceGatewayServer
 	ctx     *harness.Ctx
 	online  map[string]bool
@@ -793,7 +850,7 @@ type gatewayPeer struct {
 	queued  []string
 }
 
-func (g *gatewayPeer) Deliver(_ context.Context, req *pb.DeliverRequest) (*pb.DeliverReply, error) {
+func (g *hGatewayPeer) Deliver(_ context.Context, req *pb.DeliverRequest) (*pb.DeliverReply, error) {
 	if g.online[req.GetDeviceId()] {
 		return &pb.DeliverReply{Status: pb.DeliveryStatus_DELIVERED, Accepted: true}, nil
 	}
@@ -805,30 +862,30 @@ func (g *gatewayPeer) Deliver(_ context.Context, req *pb.DeliverRequest) (*pb.De
 	return &pb.DeliverReply{Status: pb.DeliveryStatus_QUEUED, Accepted: true}, nil
 }
 
-func gatewayFor(ctx *harness.Ctx) *gatewayPeer {
-	peer := &gatewayPeer{ctx: ctx, online: map[string]bool{}, dropped: map[string]bool{}}
+func hGatewayFor(ctx *harness.Ctx) *hGatewayPeer {
+	peer := &hGatewayPeer{ctx: ctx, online: map[string]bool{}, dropped: map[string]bool{}}
 	pb.RegisterDeviceGatewayServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func commandFor(ctx *harness.Ctx, commandID, device string, validityS int64) *commands.Command {
+func hCommandFor(ctx *harness.Ctx, commandID, device string, validityS int64) *commands.Command {
 	return &commands.Command{
 		CommandID: commandID, DeviceID: device, Action: "unlock", Params: map[string]string{"duration_s": "5"},
 		State: "pending_ack", ExpiresAtMs: ctx.Clock.Now() + validityS*1000, AckRequired: true,
 	}
 }
 
-// deliverDrained runs deliver until it returns or the runtime stops it; "" when it never returned.
-func deliverDrained(ctx *harness.Ctx, command *commands.Command) string {
+// hDeliverDrained runs deliver until it returns or the runtime stops it; "" when it never returned.
+func hDeliverDrained(ctx *harness.Ctx, command *commands.Command) string {
 	outcome := ""
 	ctx.Drain(func() { outcome = deliver(context.Background(), command) })
 	return outcome
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	gateway := gatewayFor(ctx)
-	gateway.online[gatewayLock] = true
-	outcome := deliverDrained(ctx, commandFor(ctx, "cmd-1", gatewayLock, 300))
+	gateway := hGatewayFor(ctx)
+	gateway.online[hGatewayLock] = true
+	outcome := hDeliverDrained(ctx, hCommandFor(ctx, "cmd-1", hGatewayLock, 300))
 	ctx.Equal(outcome, "delivered", "a connected lock acknowledged the command; deliver's answer")
 	calls := ctx.GRPC.CallsTo("Deliver", "")
 	ctx.Assert(len(calls) > 0, "no Deliver call was made")
@@ -838,59 +895,90 @@ func CheckDeadline(ctx *harness.Ctx) {
 	}
 	ctx.GRPC.SetLatency("Deliver", 30.0, "")
 	before := ctx.Clock.Now()
-	outcome = deliverDrained(ctx, commandFor(ctx, "cmd-2", gatewayLock, 300))
+	outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-2", hGatewayLock, 300))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Equal(outcome, "failed", "against a gateway that never answers in time deliver must answer failed once its attempts are spent; its answer")
+	slow := ctx.GRPC.CallsTo("Deliver", "")[len(calls):]
+	ctx.Equal(len(slow), 3, "against a gateway that never answers deliver must make three calls (DEADLINE_EXCEEDED is retried); the calls")
+	for _, call := range slow {
+		ctx.Assert(call.HasDeadline() && 4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "a retry against a gateway that never answers carried a %v deadline, expected 5 s: every attempt carries its own full deadline", call.Timeout)
+	}
 	ctx.Assert(waited <= 20, "deliver spent %.0f s on a gateway that never answers, expected at most three 5 s deadlines", waited)
 }
 
 func CheckBoundedRetry(ctx *harness.Ctx) {
-	gateway := gatewayFor(ctx)
-	gateway.online[gatewayLock] = true
+	gateway := hGatewayFor(ctx)
+	gateway.online[hGatewayLock] = true
 	ctx.GRPC.Fail("Deliver", codes.Unavailable, "gateway restarting", 100, "")
 	returned := false
 	outcome := ""
-	command := commandFor(ctx, "cmd-1", gatewayLock, 300)
+	command := hCommandFor(ctx, "cmd-1", hGatewayLock, 300)
 	returned = ctx.Drain(func() { outcome = deliver(context.Background(), command) })
 	calls := len(ctx.GRPC.CallsTo("Deliver", ""))
 	ctx.Assert(returned, "deliver never returned against a gateway that stays UNAVAILABLE: %d calls before the runtime stopped it. Cap the attempts at maxAttempts", calls)
 	ctx.Assert(outcome == "failed" && calls == 3, "against a gateway that stays UNAVAILABLE deliver answered %q after %d calls, expected failed after 3", outcome, calls)
 	ctx.GRPC.ClearFailures()
 	ctx.GRPC.Fail("Deliver", codes.InvalidArgument, "unknown action", 100, "")
-	outcome = deliverDrained(ctx, commandFor(ctx, "cmd-2", gatewayLock, 300))
+	outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-2", hGatewayLock, 300))
 	refused := len(ctx.GRPC.CallsTo("Deliver", "")) - calls
 	ctx.Assert(outcome == "failed" && refused == 1, "a command the gateway refused with INVALID_ARGUMENT answered %q after %d calls, expected failed after one: only retryable codes are retried", outcome, refused)
+	for _, code := range []codes.Code{codes.PermissionDenied, codes.FailedPrecondition, codes.Internal} {
+		ctx.GRPC.ClearFailures()
+		ctx.GRPC.Fail("Deliver", code, "refused", 100, "")
+		before := len(ctx.GRPC.CallsTo("Deliver", ""))
+		outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-"+code.String(), hGatewayLock, 300))
+		tries := len(ctx.GRPC.CallsTo("Deliver", "")) - before
+		ctx.Assert(outcome == "failed" && tries == 1, "a command the gateway refused with %s answered %q after %d calls, expected failed after one: only retryable codes are retried", code, outcome, tries)
+	}
+	ctx.GRPC.ClearFailures()
+	ctx.GRPC.Fail("Deliver", codes.Unavailable, "gateway restarting", 1, "")
+	before, started := len(ctx.GRPC.CallsTo("Deliver", "")), ctx.Clock.Now()
+	outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-9", hGatewayLock, 300))
+	tries, waited := len(ctx.GRPC.CallsTo("Deliver", ""))-before, float64(ctx.Clock.Now()-started)/1000
+	ctx.Assert(outcome == "delivered" && tries == 2, "a gateway UNAVAILABLE once, then back, got %d calls and deliver answered %q, expected delivered on the second call", tries, outcome)
+	ctx.Assert(waited >= 0.99, "deliver called again %.2f s after UNAVAILABLE, expected backoff = 1 s between attempts", waited)
 }
 
 func CheckWindow(ctx *harness.Ctx) {
-	gateway := gatewayFor(ctx)
-	first := commandFor(ctx, "cmd-1", gatewayLock, 600)
-	deliverDrained(ctx, first)
+	gateway := hGatewayFor(ctx)
+	first := hCommandFor(ctx, "cmd-1", hGatewayLock, 600)
+	hDeliverDrained(ctx, first)
 	calls := ctx.GRPC.CallsTo("Deliver", "")
 	ctx.Assert(len(calls) > 0, "deliver made no Deliver call for a command inside its window")
 	sent := calls[0].Request.(*pb.DeliverRequest).GetExpiresAtMs()
 	ctx.Assert(sent == first.ExpiresAtMs, "the Deliver request carried expires_at_ms=%d, expected the command's window %d: without it the gateway keeps the command for an offline lock and runs it whenever the lock reconnects", sent, first.ExpiresAtMs)
-	late := commandFor(ctx, "cmd-2", gatewayLock, 60)
+	late := hCommandFor(ctx, "cmd-2", hGatewayLock, 60)
+	edge := hCommandFor(ctx, "cmd-4", hGatewayLock, 61)
 	ctx.Clock.Advance(61)
-	gateway.online[gatewayLock] = true
+	gateway.online[hGatewayLock] = true
 	before := len(ctx.GRPC.CallsTo("Deliver", ""))
-	outcome := deliverDrained(ctx, late)
+	outcome := hDeliverDrained(ctx, late)
 	ctx.Equal(outcome, "expired", "a command whose window closed a second ago; deliver's answer")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Deliver", "")), before, "a command whose window has closed must not be sent to the gateway (a door must not unlock on a command nobody waits for any more); the calls")
+	outcome = hDeliverDrained(ctx, edge)
+	sentAtEdge := len(ctx.GRPC.CallsTo("Deliver", "")) - before
+	ctx.Assert(outcome == "expired" && sentAtEdge == 0, "a command whose window ends this very millisecond answered %q and was sent %d times, expected expired and no call: attempts run only while now < expires_at_ms", outcome, sentAtEdge)
 	gateway.dropped["lock-9"] = true
 	before = len(ctx.GRPC.CallsTo("Deliver", ""))
-	outcome = deliverDrained(ctx, commandFor(ctx, "cmd-3", "lock-9", 300))
+	outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-3", "lock-9", 300))
 	tries := len(ctx.GRPC.CallsTo("Deliver", "")) - before
 	ctx.Assert(outcome == "expired" && tries == 1, "the gateway answered EXPIRED and deliver answered %q after %d calls, expected expired after one", outcome, tries)
+	ctx.GRPC.Fail("Deliver", codes.Unavailable, "gateway restarting", 100, "")
+	closing := hCommandFor(ctx, "cmd-5", hGatewayLock, 0)
+	closing.ExpiresAtMs += 1500
+	before = len(ctx.GRPC.CallsTo("Deliver", ""))
+	outcome = hDeliverDrained(ctx, closing)
+	tries = len(ctx.GRPC.CallsTo("Deliver", "")) - before
+	ctx.Assert(outcome == "expired" && tries == 2, "a command with 1.5 s left, against a gateway that stays UNAVAILABLE, answered %q after %d calls, expected expired after two: no attempt starts once the window has closed", outcome, tries)
 }
 
 func CheckAcknowledged(ctx *harness.Ctx) {
-	gateway := gatewayFor(ctx)
-	outcome := deliverDrained(ctx, commandFor(ctx, "cmd-1", gatewayLock, 300))
+	gateway := hGatewayFor(ctx)
+	outcome := hDeliverDrained(ctx, hCommandFor(ctx, "cmd-1", hGatewayLock, 300))
 	ctx.Equal(outcome, "queued", "the gateway queued the command for an offline lock (QUEUED, accepted): only DELIVERED, the device's acknowledgement, is a delivery; deliver's answer")
 	ctx.Equal(gateway.queued, []string{"cmd-1"}, "the commands the gateway queued")
-	gateway.online[gatewayLock] = true
-	outcome = deliverDrained(ctx, commandFor(ctx, "cmd-2", gatewayLock, 300))
+	gateway.online[hGatewayLock] = true
+	outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-2", hGatewayLock, 300))
 	ctx.Equal(outcome, "delivered", "a connected lock acknowledged the command; deliver's answer")
 }
 `,
@@ -905,11 +993,11 @@ func CheckAcknowledged(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kGatewayLock = "lock-7";
+const std::string kHGatewayLock = "lock-7";
 
 // Devices in online acknowledge at once; any other device is offline: its command is queued until
 // expires_at_ms (0: kept forever) and EXPIRED after; devices in dropped answer EXPIRED.
-class GatewayPeer final : public devicegw::DeviceGateway::Service {
+class hGatewayPeer final : public devicegw::DeviceGateway::Service {
  public:
   harness::Ctx* ctx = nullptr;
   std::set<std::string> online;
@@ -935,16 +1023,16 @@ class GatewayPeer final : public devicegw::DeviceGateway::Service {
   }
 };
 
-GatewayPeer& gatewayFor(harness::Ctx& ctx) {
-  static GatewayPeer* peer = nullptr;
+hGatewayPeer& hGatewayFor(harness::Ctx& ctx) {
+  static hGatewayPeer* peer = nullptr;
   delete peer;
-  peer = new GatewayPeer;
+  peer = new hGatewayPeer;
   peer->ctx = &ctx;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-commands::Command commandFor(harness::Ctx& ctx, const std::string& command_id, const std::string& device, long long validity_s) {
+commands::Command hCommandFor(harness::Ctx& ctx, const std::string& command_id, const std::string& device, long long validity_s) {
   commands::Command c;
   c.command_id = command_id;
   c.device_id = device;
@@ -957,7 +1045,7 @@ commands::Command commandFor(harness::Ctx& ctx, const std::string& command_id, c
 }
 
 // deliver run until it returns or the runtime stops it; "" when it never returned.
-std::string deliverDrained(harness::Ctx& ctx, const commands::Command& command) {
+std::string hDeliverDrained(harness::Ctx& ctx, const commands::Command& command) {
   std::string outcome;
   ctx.Drain([&] { outcome = deliver(command); });
   return outcome;
@@ -966,9 +1054,9 @@ std::string deliverDrained(harness::Ctx& ctx, const commands::Command& command) 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  GatewayPeer& gateway = gatewayFor(ctx);
-  gateway.online.insert(kGatewayLock);
-  std::string outcome = deliverDrained(ctx, commandFor(ctx, "cmd-1", kGatewayLock, 300));
+  hGatewayPeer& gateway = hGatewayFor(ctx);
+  gateway.online.insert(kHGatewayLock);
+  std::string outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-1", kHGatewayLock, 300));
   ctx.Equal(outcome, "delivered", "a connected lock acknowledged the command; deliver's answer");
   const auto calls = ctx.GRPC.CallsTo("Deliver");
   ctx.Assert(!calls.empty(), "no Deliver call was made");
@@ -978,63 +1066,103 @@ void CheckDeadline(harness::Ctx& ctx) {
   }
   ctx.GRPC.SetLatency("Deliver", 30.0);
   const int64_t before = ctx.Clock.Now();
-  outcome = deliverDrained(ctx, commandFor(ctx, "cmd-2", kGatewayLock, 300));
+  outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-2", kHGatewayLock, 300));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Equal(outcome, "failed", "against a gateway that never answers in time deliver must answer failed once its attempts are spent; its answer");
+  const auto all = ctx.GRPC.CallsTo("Deliver");
+  ctx.Equal(all.size() - calls.size(), 3, "against a gateway that never answers deliver must make three calls (DEADLINE_EXCEEDED is retried); the calls");
+  for (size_t i = calls.size(); i < all.size(); i++) {
+    ctx.Assert(all[i].HasDeadline() && 4.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 5.5,
+               "a retry against a gateway that never answers carried a %v s deadline, expected 5 s: every attempt carries its own full deadline", all[i].TimeoutSeconds());
+  }
   ctx.Assert(waited <= 20, "deliver spent %.0f s on a gateway that never answers, expected at most three 5 s deadlines", waited);
 }
 
 void CheckBoundedRetry(harness::Ctx& ctx) {
-  GatewayPeer& gateway = gatewayFor(ctx);
-  gateway.online.insert(kGatewayLock);
+  hGatewayPeer& gateway = hGatewayFor(ctx);
+  gateway.online.insert(kHGatewayLock);
   ctx.GRPC.Fail("Deliver", grpc::StatusCode::UNAVAILABLE, "gateway restarting", 100);
   std::string outcome;
-  const commands::Command command = commandFor(ctx, "cmd-1", kGatewayLock, 300);
+  const commands::Command command = hCommandFor(ctx, "cmd-1", kHGatewayLock, 300);
   const bool returned = ctx.Drain([&] { outcome = deliver(command); });
   const size_t calls = ctx.GRPC.CallsTo("Deliver").size();
   ctx.Assert(returned, "deliver never returned against a gateway that stays UNAVAILABLE: %d calls before the runtime stopped it. Cap the attempts at kMaxAttempts", calls);
   ctx.Assert(outcome == "failed" && calls == 3, "against a gateway that stays UNAVAILABLE deliver answered %q after %d calls, expected failed after 3", outcome, calls);
   ctx.GRPC.ClearFailures();
   ctx.GRPC.Fail("Deliver", grpc::StatusCode::INVALID_ARGUMENT, "unknown action", 100);
-  outcome = deliverDrained(ctx, commandFor(ctx, "cmd-2", kGatewayLock, 300));
+  outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-2", kHGatewayLock, 300));
   const size_t refused = ctx.GRPC.CallsTo("Deliver").size() - calls;
   ctx.Assert(outcome == "failed" && refused == 1,
              "a command the gateway refused with INVALID_ARGUMENT answered %q after %d calls, expected failed after one: only kRetryable codes are retried", outcome, refused);
+  const std::vector<std::pair<std::string, grpc::StatusCode>> terminal = {
+      {"PERMISSION_DENIED", grpc::StatusCode::PERMISSION_DENIED}, {"FAILED_PRECONDITION", grpc::StatusCode::FAILED_PRECONDITION}, {"INTERNAL", grpc::StatusCode::INTERNAL}};
+  for (const auto& [name, code] : terminal) {
+    ctx.GRPC.ClearFailures();
+    ctx.GRPC.Fail("Deliver", code, "refused", 100);
+    const size_t prior = ctx.GRPC.CallsTo("Deliver").size();
+    outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-" + name, kHGatewayLock, 300));
+    const size_t tries = ctx.GRPC.CallsTo("Deliver").size() - prior;
+    ctx.Assert(outcome == "failed" && tries == 1, "a command the gateway refused with %s answered %q after %d calls, expected failed after one: only kRetryable codes are retried", name, outcome, tries);
+  }
+  ctx.GRPC.ClearFailures();
+  ctx.GRPC.Fail("Deliver", grpc::StatusCode::UNAVAILABLE, "gateway restarting", 1);
+  const size_t prior = ctx.GRPC.CallsTo("Deliver").size();
+  const int64_t started = ctx.Clock.Now();
+  outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-9", kHGatewayLock, 300));
+  const size_t tries = ctx.GRPC.CallsTo("Deliver").size() - prior;
+  const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
+  ctx.Assert(outcome == "delivered" && tries == 2, "a gateway UNAVAILABLE once, then back, got %d calls and deliver answered %q, expected delivered on the second call", tries, outcome);
+  ctx.Assert(waited >= 0.99, "deliver called again %.2f s after UNAVAILABLE, expected kBackoff = 1 s between attempts", waited);
 }
 
 void CheckWindow(harness::Ctx& ctx) {
-  GatewayPeer& gateway = gatewayFor(ctx);
-  const commands::Command first = commandFor(ctx, "cmd-1", kGatewayLock, 600);
-  deliverDrained(ctx, first);
+  hGatewayPeer& gateway = hGatewayFor(ctx);
+  const commands::Command first = hCommandFor(ctx, "cmd-1", kHGatewayLock, 600);
+  hDeliverDrained(ctx, first);
   const auto calls = ctx.GRPC.CallsTo("Deliver");
   ctx.Assert(!calls.empty(), "deliver made no Deliver call for a command inside its window");
   const long long sent = calls[0].Request<devicegw::DeliverRequest>().expires_at_ms();
   ctx.Assert(sent == first.expires_at_ms,
              "the Deliver request carried expires_at_ms=%d, expected the command's window %d: without it the gateway keeps the command for an offline lock and runs it whenever the lock reconnects",
              sent, first.expires_at_ms);
-  const commands::Command late = commandFor(ctx, "cmd-2", kGatewayLock, 60);
+  const commands::Command late = hCommandFor(ctx, "cmd-2", kHGatewayLock, 60);
+  const commands::Command edge = hCommandFor(ctx, "cmd-4", kHGatewayLock, 61);
   ctx.Clock.Advance(61);
-  gateway.online.insert(kGatewayLock);
+  gateway.online.insert(kHGatewayLock);
   size_t before = ctx.GRPC.CallsTo("Deliver").size();
-  std::string outcome = deliverDrained(ctx, late);
+  std::string outcome = hDeliverDrained(ctx, late);
   ctx.Equal(outcome, "expired", "a command whose window closed a second ago; deliver's answer");
   ctx.Equal(ctx.GRPC.CallsTo("Deliver").size(), before,
             "a command whose window has closed must not be sent to the gateway (a door must not unlock on a command nobody waits for any more); the calls");
+  outcome = hDeliverDrained(ctx, edge);
+  const size_t sent_at_edge = ctx.GRPC.CallsTo("Deliver").size() - before;
+  ctx.Assert(outcome == "expired" && sent_at_edge == 0,
+             "a command whose window ends this very millisecond answered %q and was sent %d times, expected expired and no call: attempts run only while now < expires_at_ms", outcome,
+             sent_at_edge);
   gateway.dropped.insert("lock-9");
   before = ctx.GRPC.CallsTo("Deliver").size();
-  outcome = deliverDrained(ctx, commandFor(ctx, "cmd-3", "lock-9", 300));
-  const size_t tries = ctx.GRPC.CallsTo("Deliver").size() - before;
+  outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-3", "lock-9", 300));
+  size_t tries = ctx.GRPC.CallsTo("Deliver").size() - before;
   ctx.Assert(outcome == "expired" && tries == 1, "the gateway answered EXPIRED and deliver answered %q after %d calls, expected expired after one", outcome, tries);
+  ctx.GRPC.Fail("Deliver", grpc::StatusCode::UNAVAILABLE, "gateway restarting", 100);
+  commands::Command closing = hCommandFor(ctx, "cmd-5", kHGatewayLock, 0);
+  closing.expires_at_ms += 1500;
+  before = ctx.GRPC.CallsTo("Deliver").size();
+  outcome = hDeliverDrained(ctx, closing);
+  tries = ctx.GRPC.CallsTo("Deliver").size() - before;
+  ctx.Assert(outcome == "expired" && tries == 2,
+             "a command with 1.5 s left, against a gateway that stays UNAVAILABLE, answered %q after %d calls, expected expired after two: no attempt starts once the window has closed",
+             outcome, tries);
 }
 
 void CheckAcknowledged(harness::Ctx& ctx) {
-  GatewayPeer& gateway = gatewayFor(ctx);
-  std::string outcome = deliverDrained(ctx, commandFor(ctx, "cmd-1", kGatewayLock, 300));
+  hGatewayPeer& gateway = hGatewayFor(ctx);
+  std::string outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-1", kHGatewayLock, 300));
   ctx.Equal(outcome, "queued",
             "the gateway queued the command for an offline lock (QUEUED, accepted): only DELIVERED, the device's acknowledgement, is a delivery; deliver's answer");
   ctx.Equal(gateway.queued, std::vector<std::string>{"cmd-1"}, "the commands the gateway queued");
-  gateway.online.insert(kGatewayLock);
-  outcome = deliverDrained(ctx, commandFor(ctx, "cmd-2", kGatewayLock, 300));
+  gateway.online.insert(kHGatewayLock);
+  outcome = hDeliverDrained(ctx, hCommandFor(ctx, "cmd-2", kHGatewayLock, 300));
   ctx.Equal(outcome, "delivered", "a connected lock acknowledged the command; deliver's answer");
 }
 `,

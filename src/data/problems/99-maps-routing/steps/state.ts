@@ -28,7 +28,7 @@ served after it recovers.
 - The key is \`route:{epoch}:{cells}\`: \`epoch\` is \`current_epoch()\`, and \`cells\` are the origin,
   each waypoint and the destination, each \`"{floor(lat / CELL_DEGREES)},{floor(lng / CELL_DEGREES)}"\`
   with \`CELL_DEGREES = 0.001\` (about 110 m), joined by \`;\`.
-- An entry expires after \`TTL_S = 2 * EPOCH_S\` (600 s).
+- An entry expires after \`TTL_S = 2 * EPOCH_S\` (600 s), set atomically with the write.
 - A route marked \`degraded\` is returned but not stored.`,
   sequence: {
     participants: ['Maps API', 'Redis', 'Routing engine'],
@@ -51,7 +51,7 @@ served after it recovers.
       id: 'cell-key',
       title: 'Two requests a few metres apart share one entry',
       detail:
-        'Every point is snapped to a `CELL_DEGREES` grid with a floor before it enters the key, so GPS noise lands in the same cell; the starter keys the raw floats and solves every request again.',
+        'Every point is snapped to a `CELL_DEGREES` grid with a floor before it enters the key, so GPS noise lands in the same cell and the key ends in the trip\'s `"{floor(lat / CELL_DEGREES)},{floor(lng / CELL_DEGREES)}"` cells; the starter keys the raw floats and solves every request again.',
       match: {
         python: {all: [/\/\s*CELL_DEGREES/, /math\.floor\(/]},
         typescript: {all: [/\/\s*CELL_DEGREES/, /Math\.floor\(/]},
@@ -64,7 +64,7 @@ served after it recovers.
       id: 'waypoint-key',
       title: 'A trip through a waypoint is a different entry',
       detail:
-        "The waypoints' cells are part of the key, so a detour is solved instead of being served the direct route; the starter's key has the two endpoints only.",
+        "The waypoints' cells are part of the key, between the origin's and the destination's, so a detour is solved instead of being served the direct route; the starter's key has the two endpoints only.",
       match: {
         python: {all: [/def route_key\([^)]*waypoints/, /route_key\([^)]*waypoints\)/]},
         typescript: {all: [/routeKey\s*=\s*\([^)]*waypoints|function routeKey\([^)]*waypoints/]},
@@ -90,7 +90,7 @@ served after it recovers.
       id: 'ttl',
       title: 'An entry expires after two epochs',
       detail:
-        'The write sets an expiry of `TTL_S` (600 s), so superseded entries leave Redis; the starter writes with no expiry.',
+        'The write sets an expiry of exactly `TTL_S` (600 s) atomically with the value, so the entry never exists without one and superseded entries leave Redis; the starter writes with no expiry.',
       match: {
         python: {all: [/TTL_S\s*=\s*2\s*\*\s*EPOCH_S|TTL_S\s*=\s*600/, /ex\s*=\s*TTL_S/]},
         typescript: {all: [/TTL_S\s*=\s*2\s*\*\s*EPOCH_S|TTL_S\s*=\s*600/, /['"]EX['"],\s*TTL_S/]},
@@ -456,7 +456,9 @@ geo::Route cachedRoute(const geo::Point& origin, const geo::Point& destination, 
     },
   },
   harness: {
-    python: `import grpc
+    python: `import math
+
+import grpc
 
 import maps_routing_pb2
 import maps_routing_pb2_grpc
@@ -487,9 +489,15 @@ def _solves(ctx):
     return len(ctx.grpc.calls_to("ComputeRoute"))
 
 
+def _cells(*points):
+    return ";".join(f"{math.floor(p.lat / 0.001)},{math.floor(p.lng / 0.001)}" for p in points)
+
+
 def check_cell_key(ctx):
     m = _cache(ctx)
     first = m.cached_route(SF, OAKLAND, [])
+    keys, cells = ctx.redis.keys("route:*"), _cells(SF, OAKLAND)
+    assert len(keys) == 1 and keys[0].endswith(":" + cells), f"the trip's entry is {keys}, expected a key ending in {cells!r}: each point is floor(lat / CELL_DEGREES),floor(lng / CELL_DEGREES)"
     again = m.cached_route(SF_JITTER, OAKLAND, [])
     assert _solves(ctx) == 1, f"two requests 4 m apart cost {_solves(ctx)} engine solves: GPS noise must land in the same cell and hit the cache"
     assert again["distance_m"] == first["distance_m"], f"the cached answer differs from the first: {again} vs {first}"
@@ -503,6 +511,8 @@ def check_waypoint_key(ctx):
     via = m.cached_route(SF, OAKLAND, [BERKELEY])
     assert _solves(ctx) == 2, "a trip through Berkeley was served the direct route from the cache: the waypoints are part of the trip and of the key"
     assert via["distance_m"] > direct["distance_m"], f"the trip through Berkeley answered {via['distance_m']:.0f} m, the direct one {direct['distance_m']:.0f} m"
+    cells = _cells(SF, BERKELEY, OAKLAND)
+    assert any(k.endswith(":" + cells) for k in ctx.redis.keys("route:*")), f"the trip through Berkeley is stored as {ctx.redis.keys('route:*')}, expected a key ending in {cells!r}: the origin, each waypoint, then the destination"
     again = m.cached_route(SF, OAKLAND, [BERKELEY])
     assert _solves(ctx) == 2 and again["distance_m"] == via["distance_m"], "the same trip through Berkeley, asked again, must hit the cache"
 
@@ -514,6 +524,8 @@ def check_epoch_key(ctx):
     after = m.cached_route(SF, OAKLAND, [])
     assert _solves(ctx) == 2, "after the traffic epoch moved, the route solved for the previous epoch was served from the cache: the epoch must be part of the key"
     assert before["epoch"] == current_epoch() - 1 and after["epoch"] == current_epoch(), f"the answers carry epochs {before['epoch']} and {after['epoch']}, expected {current_epoch() - 1} and {current_epoch()}"
+    prefix = f"route:{current_epoch()}:"
+    assert any(k.startswith(prefix) for k in ctx.redis.keys("route:*")), f"the entries are {ctx.redis.keys('route:*')}: this epoch's must start {prefix!r}"
 
 
 def check_ttl(ctx):
@@ -522,7 +534,20 @@ def check_ttl(ctx):
     keys = ctx.redis.keys("route:*")
     assert len(keys) == 1, f"one solved trip left {keys} in Redis, expected one route:* entry"
     ttl = ctx.redis.ttl(keys[0])
-    assert 0 < ttl <= 600, f"{keys[0]} has TTL {ttl}: an entry must expire after TTL_S = 600 s, or every cell ever asked for stays in Redis"
+    assert 595 < ttl <= 600, f"{keys[0]} has TTL {ttl}: an entry must expire after TTL_S = 600 s, or every cell ever asked for stays in Redis"
+    # The entry must carry its expiry from the moment it exists: a crash between a SET and an EXPIRE leaves it forever.
+    ctx.redis.delete(keys[0])
+    seen = []
+
+    def watch():
+        if ctx.redis.exists(keys[0]):
+            seen.append(ctx.redis.ttl(keys[0]))
+        else:
+            ctx.redis_after(keys[0], watch)
+
+    ctx.redis_after(keys[0], watch)
+    m.cached_route(SF, OAKLAND, [])
+    assert seen and seen[0] > 0, f"{keys[0]} was written with no expiry (TTL {seen[0] if seen else 'never written'} right after the write): set the value and its expiry atomically"
     ctx.clock.advance(601)
     assert not ctx.redis.exists(keys[0]), f"{keys[0]} is still in Redis 601 s after it was written"
 
@@ -560,9 +585,14 @@ function cache(ctx) {
 
 const solves = ctx => ctx.grpc.callsTo('ComputeRoute').length;
 
+const cells = (...points) => points.map(p => \`\${Math.floor(p.lat / 0.001)},\${Math.floor(p.lng / 0.001)}\`).join(';');
+
 export async function check_cell_key(ctx) {
   const {m} = cache(ctx);
   const first = await m.cachedRoute(SF, OAKLAND, []);
+  const keys = ctx.redis.keys('route:*');
+  const want = cells(SF, OAKLAND);
+  assert(keys.length === 1 && keys[0].endsWith(\`:\${want}\`), \`the trip's entry is \${JSON.stringify(keys)}, expected a key ending in '\${want}': each point is floor(lat / CELL_DEGREES),floor(lng / CELL_DEGREES)\`);
   const again = await m.cachedRoute(SF_JITTER, OAKLAND, []);
   assert.equal(solves(ctx), 1, \`two requests 4 m apart cost \${solves(ctx)} engine solves: GPS noise must land in the same cell and hit the cache\`);
   assert.equal(again.distance_m, first.distance_m, 'the cached answer differs from the first');
@@ -576,6 +606,8 @@ export async function check_waypoint_key(ctx) {
   const via = await m.cachedRoute(SF, OAKLAND, [BERKELEY]);
   assert.equal(solves(ctx), 2, 'a trip through Berkeley was served the direct route from the cache: the waypoints are part of the trip and of the key');
   assert(via.distance_m > direct.distance_m, \`the trip through Berkeley answered \${via.distance_m} m, the direct one \${direct.distance_m} m\`);
+  const want = cells(SF, BERKELEY, OAKLAND);
+  assert(ctx.redis.keys('route:*').some(k => k.endsWith(\`:\${want}\`)), \`the trip through Berkeley is stored as \${JSON.stringify(ctx.redis.keys('route:*'))}, expected a key ending in '\${want}': the origin, each waypoint, then the destination\`);
   const again = await m.cachedRoute(SF, OAKLAND, [BERKELEY]);
   assert(solves(ctx) === 2 && again.distance_m === via.distance_m, 'the same trip through Berkeley, asked again, must hit the cache');
 }
@@ -588,6 +620,8 @@ export async function check_epoch_key(ctx) {
   assert.equal(solves(ctx), 2, 'after the traffic epoch moved, the route solved for the previous epoch was served from the cache: the epoch must be part of the key');
   const now = geo.currentEpoch();
   assert(before.epoch === now - 1 && after.epoch === now, \`the answers carry epochs \${before.epoch} and \${after.epoch}, expected \${now - 1} and \${now}\`);
+  const prefix = \`route:\${now}:\`;
+  assert(ctx.redis.keys('route:*').some(k => k.startsWith(prefix)), \`the entries are \${JSON.stringify(ctx.redis.keys('route:*'))}: this epoch's must start '\${prefix}'\`);
 }
 
 export async function check_ttl(ctx) {
@@ -596,7 +630,17 @@ export async function check_ttl(ctx) {
   const keys = ctx.redis.keys('route:*');
   assert.equal(keys.length, 1, \`one solved trip left \${JSON.stringify(keys)} in Redis, expected one route:* entry\`);
   const ttl = ctx.redis.ttl(keys[0]);
-  assert(ttl > 0 && ttl <= 600, \`\${keys[0]} has TTL \${ttl}: an entry must expire after TTL_S = 600 s, or every cell ever asked for stays in Redis\`);
+  assert(ttl > 595 && ttl <= 600, \`\${keys[0]} has TTL \${ttl}: an entry must expire after TTL_S = 600 s, or every cell ever asked for stays in Redis\`);
+  // The entry must carry its expiry from the moment it exists: a crash between a SET and an EXPIRE leaves it forever.
+  ctx.redis.del(keys[0]);
+  const seen: number[] = [];
+  const watch = () => {
+    if (ctx.redis.exists(keys[0])) seen.push(ctx.redis.ttl(keys[0]));
+    else ctx.redisAfter(keys[0], watch);
+  };
+  ctx.redisAfter(keys[0], watch);
+  await m.cachedRoute(SF, OAKLAND, []);
+  assert(seen.length > 0 && seen[0] > 0, \`\${keys[0]} was written with no expiry (TTL \${seen.length > 0 ? seen[0] : 'never written'} right after the write): set the value and its expiry atomically\`);
   ctx.clock.advance(601);
   assert.equal(ctx.redis.exists(keys[0]), 0, \`\${keys[0]} is still in Redis 601 s after it was written\`);
 }
@@ -616,6 +660,8 @@ export async function check_degraded_uncached(ctx) {
 import (
 	"context"
 	"fmt"
+	"math"
+	"strings"
 
 	"google.golang.org/grpc/codes"
 
@@ -626,7 +672,7 @@ import (
 )
 
 var (
-	stateBg     = context.Background()
+	hBg         = context.Background()
 	sf          = geo.Point{Lat: 37.77412, Lng: -122.41942}
 	sfJitter    = geo.Point{Lat: 37.77415, Lng: -122.41945} // 4 m away, in the same cell
 	sfTwoBlocks = geo.Point{Lat: 37.77612, Lng: -122.41942} // 220 m north
@@ -634,12 +680,12 @@ var (
 	berkeley    = geo.Point{Lat: 37.87159, Lng: -122.27275}
 )
 
-// enginePeer: a road route is 1.3 times the great-circle legs.
-type enginePeer struct {
+// hEngine: a road route is 1.3 times the great-circle legs.
+type hEngine struct {
 	pb.UnimplementedRoutingEngineServer
 }
 
-func (enginePeer) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (*pb.ComputeRouteReply, error) {
+func (hEngine) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (*pb.ComputeRouteReply, error) {
 	points := append([]*pb.LatLng{req.GetOrigin()}, req.GetWaypoints()...)
 	points = append(points, req.GetDestination())
 	distance := 0.0
@@ -650,71 +696,110 @@ func (enginePeer) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (
 	return &pb.ComputeRouteReply{DistanceM: distance, DurationS: distance / 11, Geometry: fmt.Sprintf("poly:%d", len(points)), EngineVersion: "osrm-v26.9"}, nil
 }
 
-func serveEngine(ctx *harness.Ctx) {
-	pb.RegisterRoutingEngineServer(ctx.GRPC.Server(""), enginePeer{})
+func hServeEngine(ctx *harness.Ctx) {
+	pb.RegisterRoutingEngineServer(ctx.GRPC.Server(""), hEngine{})
 }
 
-func solves(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ComputeRoute", "")) }
+func hSolves(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ComputeRoute", "")) }
 
-func mustRoute(ctx *harness.Ctx, origin, destination geo.Point, waypoints ...geo.Point) geo.Route {
-	route, err := cachedRoute(stateBg, origin, destination, waypoints)
+func hRoute(ctx *harness.Ctx, origin, destination geo.Point, waypoints ...geo.Point) geo.Route {
+	route, err := cachedRoute(hBg, origin, destination, waypoints)
 	ctx.NoError(err, "cachedRoute failed")
 	return route
 }
 
+func hCells(points ...geo.Point) string {
+	parts := make([]string, len(points))
+	for i, p := range points {
+		parts[i] = fmt.Sprintf("%d,%d", int64(math.Floor(p.Lat/0.001)), int64(math.Floor(p.Lng/0.001)))
+	}
+	return strings.Join(parts, ";")
+}
+
 func CheckCellKey(ctx *harness.Ctx) {
-	serveEngine(ctx)
-	first := mustRoute(ctx, sf, oakland)
-	again := mustRoute(ctx, sfJitter, oakland)
-	ctx.Equal(solves(ctx), 1, "two requests 4 m apart must land in the same cell and hit the cache; the engine solves")
+	hServeEngine(ctx)
+	first := hRoute(ctx, sf, oakland)
+	keys, want := ctx.Redis.Keys("route:*"), hCells(sf, oakland)
+	ctx.Assert(len(keys) == 1 && strings.HasSuffix(keys[0], ":"+want), "the trip's entry is %v, expected a key ending in %q: each point is floor(lat / CELL_DEGREES),floor(lng / CELL_DEGREES)", keys, want)
+	again := hRoute(ctx, sfJitter, oakland)
+	ctx.Equal(hSolves(ctx), 1, "two requests 4 m apart must land in the same cell and hit the cache; the engine solves")
 	ctx.Equal(again.DistanceM, first.DistanceM, "the cached answer's distance")
-	mustRoute(ctx, sfTwoBlocks, oakland)
-	ctx.Equal(solves(ctx), 2, "a request starting two blocks away is another trip: it must be solved, not served from the cache; the engine solves")
+	hRoute(ctx, sfTwoBlocks, oakland)
+	ctx.Equal(hSolves(ctx), 2, "a request starting two blocks away is another trip: it must be solved, not served from the cache; the engine solves")
 }
 
 func CheckWaypointKey(ctx *harness.Ctx) {
-	serveEngine(ctx)
-	direct := mustRoute(ctx, sf, oakland)
-	via := mustRoute(ctx, sf, oakland, berkeley)
-	ctx.Equal(solves(ctx), 2, "a trip through Berkeley was served the direct route from the cache (the waypoints are part of the trip and of the key); the engine solves")
+	hServeEngine(ctx)
+	direct := hRoute(ctx, sf, oakland)
+	via := hRoute(ctx, sf, oakland, berkeley)
+	ctx.Equal(hSolves(ctx), 2, "a trip through Berkeley was served the direct route from the cache (the waypoints are part of the trip and of the key); the engine solves")
 	ctx.Assert(via.DistanceM > direct.DistanceM, "the trip through Berkeley answered %.0f m, the direct one %.0f m", via.DistanceM, direct.DistanceM)
-	again := mustRoute(ctx, sf, oakland, berkeley)
-	ctx.Assert(solves(ctx) == 2 && again.DistanceM == via.DistanceM, "the same trip through Berkeley, asked again, must hit the cache")
+	want := hCells(sf, berkeley, oakland)
+	found := false
+	for _, k := range ctx.Redis.Keys("route:*") {
+		found = found || strings.HasSuffix(k, ":"+want)
+	}
+	ctx.Assert(found, "the trip through Berkeley is stored as %v, expected a key ending in %q: the origin, each waypoint, then the destination", ctx.Redis.Keys("route:*"), want)
+	again := hRoute(ctx, sf, oakland, berkeley)
+	ctx.Assert(hSolves(ctx) == 2 && again.DistanceM == via.DistanceM, "the same trip through Berkeley, asked again, must hit the cache")
 }
 
 func CheckEpochKey(ctx *harness.Ctx) {
-	serveEngine(ctx)
-	before := mustRoute(ctx, sf, oakland)
+	hServeEngine(ctx)
+	before := hRoute(ctx, sf, oakland)
 	ctx.Clock.Advance(geo.EpochS)
-	after := mustRoute(ctx, sf, oakland)
-	ctx.Equal(solves(ctx), 2, "after the traffic epoch moved, the route solved for the previous epoch was served from the cache (the epoch must be part of the key); the engine solves")
+	after := hRoute(ctx, sf, oakland)
+	ctx.Equal(hSolves(ctx), 2, "after the traffic epoch moved, the route solved for the previous epoch was served from the cache (the epoch must be part of the key); the engine solves")
 	now := geo.CurrentEpoch()
 	ctx.Assert(before.Epoch == now-1 && after.Epoch == now, "the answers carry epochs %d and %d, expected %d and %d", before.Epoch, after.Epoch, now-1, now)
+	prefix := fmt.Sprintf("route:%d:", now)
+	found := false
+	for _, k := range ctx.Redis.Keys("route:*") {
+		found = found || strings.HasPrefix(k, prefix)
+	}
+	ctx.Assert(found, "the entries are %v: this epoch's must start %q", ctx.Redis.Keys("route:*"), prefix)
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	serveEngine(ctx)
-	mustRoute(ctx, sf, oakland)
+	hServeEngine(ctx)
+	hRoute(ctx, sf, oakland)
 	keys := ctx.Redis.Keys("route:*")
 	ctx.Equal(len(keys), 1, "one solved trip must leave one route:* entry; the entries %v", keys)
 	ttl := ctx.Redis.TTL(keys[0])
-	ctx.Assert(ttl > 0 && ttl <= 600, "%s has TTL %d: an entry must expire after TTL_S = 600 s, or every cell ever asked for stays in Redis", keys[0], ttl)
+	ctx.Assert(ttl > 595 && ttl <= 600, "%s has TTL %d: an entry must expire after TTL_S = 600 s, or every cell ever asked for stays in Redis", keys[0], ttl)
+	// The entry must carry its expiry from the moment it exists: a crash between a SET and an EXPIRE leaves it forever.
+	ctx.Redis.Del(keys[0])
+	var seen []int64
+	var watch func() any
+	watch = func() any {
+		if ctx.Redis.Exists(keys[0]) == 1 {
+			seen = append(seen, ctx.Redis.TTL(keys[0]))
+		} else {
+			ctx.Redis.After(keys[0], watch)
+		}
+		return nil
+	}
+	ctx.Redis.After(keys[0], watch)
+	hRoute(ctx, sf, oakland)
+	ctx.Assert(len(seen) > 0 && seen[0] > 0, "%s was written with no expiry (TTL right after the write %v): set the value and its expiry atomically", keys[0], seen)
 	ctx.Clock.Advance(601)
 	ctx.Equal(ctx.Redis.Exists(keys[0]), int64(0), "%s 601 s after it was written; still in Redis", keys[0])
 }
 
 func CheckDegradedUncached(ctx *harness.Ctx) {
-	serveEngine(ctx)
+	hServeEngine(ctx)
 	ctx.GRPC.Fail("ComputeRoute", codes.Unavailable, "engine restarting", 3, "")
-	down := mustRoute(ctx, sf, oakland)
+	down := hRoute(ctx, sf, oakland)
 	ctx.Assert(down.Degraded, "with the engine unavailable for three attempts the answer must be the degraded estimate, got %+v", down)
 	ctx.Equal(len(ctx.Redis.Keys("route:*")), 0, "the degraded estimate was stored and would be served after the engine recovers; the route:* entries")
-	up := mustRoute(ctx, sf, oakland)
+	up := hRoute(ctx, sf, oakland)
 	ctx.Assert(!up.Degraded, "the engine is back, but the next request got the straight-line estimate from the cache")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <cmath>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -730,7 +815,7 @@ const geo::Point kOakland{37.80418, -122.27112};
 const geo::Point kBerkeley{37.87159, -122.27275};
 
 // A road route is 1.3 times the great-circle legs.
-class EnginePeer final : public mapsrouting::RoutingEngine::Service {
+class HEnginePeer final : public mapsrouting::RoutingEngine::Service {
  public:
   grpc::Status ComputeRoute(grpc::ServerContext*, const mapsrouting::ComputeRouteRequest* req, mapsrouting::ComputeRouteReply* out) override {
     std::vector<geo::Point> points = {{req->origin().lat(), req->origin().lng()}};
@@ -747,60 +832,95 @@ class EnginePeer final : public mapsrouting::RoutingEngine::Service {
   }
 };
 
-void serveEngine(harness::Ctx& ctx) {
-  static EnginePeer* peer = nullptr;
+void hServeEngine(harness::Ctx& ctx) {
+  static HEnginePeer* peer = nullptr;
   delete peer;
-  peer = new EnginePeer;
+  peer = new HEnginePeer;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
-size_t solves(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ComputeRoute").size(); }
+size_t hSolves(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ComputeRoute").size(); }
+
+std::string hCells(const std::vector<geo::Point>& points) {
+  std::string out;
+  for (const auto& p : points) {
+    if (!out.empty()) out += ";";
+    out += std::to_string(static_cast<long long>(std::floor(p.lat / 0.001))) + "," + std::to_string(static_cast<long long>(std::floor(p.lng / 0.001)));
+  }
+  return out;
+}
+
+bool hEndsWith(const std::string& s, const std::string& tail) { return s.size() >= tail.size() && s.compare(s.size() - tail.size(), tail.size(), tail) == 0; }
 
 }  // namespace
 
 void CheckCellKey(harness::Ctx& ctx) {
-  serveEngine(ctx);
+  hServeEngine(ctx);
   const geo::Route first = cachedRoute(kSf, kOakland, {});
+  const auto keys = ctx.Redis.Keys("route:*");
+  const std::string want = hCells({kSf, kOakland});
+  ctx.Assert(keys.size() == 1 && hEndsWith(keys[0], ":" + want), "the trip's entry is %v, expected a key ending in %q: each point is floor(lat / kCellDegrees),floor(lng / kCellDegrees)", keys, want);
   const geo::Route again = cachedRoute(kSfJitter, kOakland, {});
-  ctx.Equal(solves(ctx), 1, "two requests 4 m apart must land in the same cell and hit the cache; the engine solves");
+  ctx.Equal(hSolves(ctx), 1, "two requests 4 m apart must land in the same cell and hit the cache; the engine solves");
   ctx.Equal(again.distance_m, first.distance_m, "the cached answer's distance");
   cachedRoute(kSfTwoBlocks, kOakland, {});
-  ctx.Equal(solves(ctx), 2, "a request starting two blocks away is another trip: it must be solved, not served from the cache; the engine solves");
+  ctx.Equal(hSolves(ctx), 2, "a request starting two blocks away is another trip: it must be solved, not served from the cache; the engine solves");
 }
 
 void CheckWaypointKey(harness::Ctx& ctx) {
-  serveEngine(ctx);
+  hServeEngine(ctx);
   const geo::Route direct = cachedRoute(kSf, kOakland, {});
   const geo::Route via = cachedRoute(kSf, kOakland, {kBerkeley});
-  ctx.Equal(solves(ctx), 2, "a trip through Berkeley was served the direct route from the cache (the waypoints are part of the trip and of the key); the engine solves");
+  ctx.Equal(hSolves(ctx), 2, "a trip through Berkeley was served the direct route from the cache (the waypoints are part of the trip and of the key); the engine solves");
   ctx.Assert(via.distance_m > direct.distance_m, "the trip through Berkeley answered %v m, the direct one %v m", via.distance_m, direct.distance_m);
+  const std::string want = hCells({kSf, kBerkeley, kOakland});
+  bool found = false;
+  for (const auto& k : ctx.Redis.Keys("route:*")) found = found || hEndsWith(k, ":" + want);
+  ctx.Assert(found, "the trip through Berkeley is stored as %v, expected a key ending in %q: the origin, each waypoint, then the destination", ctx.Redis.Keys("route:*"), want);
   const geo::Route again = cachedRoute(kSf, kOakland, {kBerkeley});
-  ctx.Assert(solves(ctx) == 2 && again.distance_m == via.distance_m, "the same trip through Berkeley, asked again, must hit the cache");
+  ctx.Assert(hSolves(ctx) == 2 && again.distance_m == via.distance_m, "the same trip through Berkeley, asked again, must hit the cache");
 }
 
 void CheckEpochKey(harness::Ctx& ctx) {
-  serveEngine(ctx);
+  hServeEngine(ctx);
   const geo::Route before = cachedRoute(kSf, kOakland, {});
   ctx.Clock.Advance(geo::kEpochS);
   const geo::Route after = cachedRoute(kSf, kOakland, {});
-  ctx.Equal(solves(ctx), 2, "after the traffic epoch moved, the route solved for the previous epoch was served from the cache (the epoch must be part of the key); the engine solves");
+  ctx.Equal(hSolves(ctx), 2, "after the traffic epoch moved, the route solved for the previous epoch was served from the cache (the epoch must be part of the key); the engine solves");
   const long long now = geo::currentEpoch();
   ctx.Assert(before.epoch == now - 1 && after.epoch == now, "the answers carry epochs %d and %d, expected %d and %d", before.epoch, after.epoch, now - 1, now);
+  const std::string prefix = "route:" + std::to_string(now) + ":";
+  bool found = false;
+  for (const auto& k : ctx.Redis.Keys("route:*")) found = found || k.rfind(prefix, 0) == 0;
+  ctx.Assert(found, "the entries are %v: this epoch's must start %q", ctx.Redis.Keys("route:*"), prefix);
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  serveEngine(ctx);
+  hServeEngine(ctx);
   cachedRoute(kSf, kOakland, {});
   const auto keys = ctx.Redis.Keys("route:*");
   ctx.Equal(keys.size(), 1, "one solved trip must leave one route:* entry; the entries");
   const long long ttl = ctx.Redis.TTL(keys[0]);
-  ctx.Assert(ttl > 0 && ttl <= 600, "%s has TTL %d: an entry must expire after kTtl = 600 s, or every cell ever asked for stays in Redis", keys[0], ttl);
+  ctx.Assert(ttl > 595 && ttl <= 600, "%s has TTL %d: an entry must expire after kTtl = 600 s, or every cell ever asked for stays in Redis", keys[0], ttl);
+  // The entry must carry its expiry from the moment it exists: a crash between a SET and an EXPIRE leaves it forever.
+  ctx.Redis.Del(keys[0]);
+  std::vector<long long> seen;
+  std::function<void()> watch = [&]() {
+    if (ctx.Redis.Exists(keys[0]) == 1) {
+      seen.push_back(ctx.Redis.TTL(keys[0]));
+    } else {
+      ctx.Redis.After(keys[0], watch);
+    }
+  };
+  ctx.Redis.After(keys[0], watch);
+  cachedRoute(kSf, kOakland, {});
+  ctx.Assert(!seen.empty() && seen[0] > 0, "%s was written with no expiry (TTL right after the write %v): set the value and its expiry atomically", keys[0], seen);
   ctx.Clock.Advance(601);
   ctx.Equal(ctx.Redis.Exists(keys[0]), 0, "%s 601 s after it was written; still in Redis", keys[0]);
 }
 
 void CheckDegradedUncached(harness::Ctx& ctx) {
-  serveEngine(ctx);
+  hServeEngine(ctx);
   ctx.GRPC.Fail("ComputeRoute", grpc::StatusCode::UNAVAILABLE, "engine restarting", 3);
   const geo::Route down = cachedRoute(kSf, kOakland, {});
   ctx.Assert(down.degraded, "with the engine unavailable for three attempts the answer must be the degraded estimate, got engine_version %q", down.engine_version);

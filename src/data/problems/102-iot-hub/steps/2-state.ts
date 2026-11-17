@@ -72,7 +72,7 @@ instances handling two reports of one device at once can leave the older report 
       id: 'report-atomic',
       title: 'A report is compared and written in one script',
       detail:
-        'The read of `reported_version`, the comparison and the write of the reported document run in one Lua script, so a newer report landing between them cannot be overwritten; the starter reads with `HGET` from the app and writes afterwards.',
+        'The read of `reported_version`, the numeric comparison and the write run in one Lua script: only a strictly newer report is kept (a second report of the same version is refused), it replaces the whole reported document, and a newer report landing in between cannot be overwritten. The starter reads with `HGET` from the app and writes afterwards.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]HGET['"]/],
@@ -684,12 +684,13 @@ def check_report_atomic(ctx):
     m = ctx.load("state")
     assert m.apply_report(THERMO, {"mode": "v7"}, 7) is True, "the device's first report (version 7) must be kept"
     assert m.apply_report(THERMO, {"mode": "v6"}, 6) is False, "a report of version 6 after version 7 must be refused"
+    assert m.apply_report(THERMO, {"mode": "v7-again"}, 7) is False, "a second report of version 7 must be refused: only a newer report is kept"
     assert ctx.redis.hgetall(f"shadow:{THERMO}:reported") == {"mode": "v7"}, f"a refused report changed the reported document to {ctx.redis.hgetall(f'shadow:{THERMO}:reported')}"
 
     def report_9_lands():
         # The device's next report, handled by another hub instance in the middle of this one.
         ctx.redis.delete(f"shadow:{THERMO}:reported")
-        ctx.redis.hset(f"shadow:{THERMO}:reported", mapping={"mode": "v9"})
+        ctx.redis.hset(f"shadow:{THERMO}:reported", mapping={"mode": "v9", "fan": "on"})
         ctx.redis.hset(f"shadow:{THERMO}", "reported_version", 9)
 
     probe = ctx.redis_after(f"shadow:{THERMO}", report_9_lands)
@@ -697,7 +698,11 @@ def check_report_atomic(ctx):
     assert probe.fired, f"apply_report never touched shadow:{THERMO}"
     reported = ctx.redis.hgetall(f"shadow:{THERMO}:reported")
     version = ctx.redis.hget(f"shadow:{THERMO}", "reported_version")
-    assert reported == {"mode": "v9"} and version == "9", f"report 9 landed on another instance while report 8 was being applied, and the shadow now holds {reported} at reported_version {version}: the read, the comparison and the write must be one script, or an older report overwrites a newer one"
+    assert reported == {"mode": "v9", "fan": "on"} and version == "9", f"report 9 landed on another instance while report 8 was being applied, and the shadow now holds {reported} at reported_version {version}: the read, the comparison and the write must be one script, or an older report overwrites a newer one"
+    assert m.apply_report(THERMO, {"mode": "v10"}, 10) is True, "the device's report 10 after its report 9 was refused: versions compare as numbers"
+    reported = ctx.redis.hgetall(f"shadow:{THERMO}:reported")
+    version = ctx.redis.hget(f"shadow:{THERMO}", "reported_version")
+    assert reported == {"mode": "v10"} and version == "10", f"after report 10 the shadow holds {reported} at reported_version {version}, expected only mode=v10 at 10: a report is the device's whole state and replaces the reported document"
 `,
     typescript: `const THERMO = 'thermo-3';
 
@@ -730,18 +735,23 @@ export async function check_report_atomic(ctx) {
   const m = ctx.load('state');
   assert.equal(await m.applyReport(THERMO, {mode: 'v7'}, 7), true, "the device's first report (version 7) must be kept");
   assert.equal(await m.applyReport(THERMO, {mode: 'v6'}, 6), false, 'a report of version 6 after version 7 must be refused');
+  assert.equal(await m.applyReport(THERMO, {mode: 'v7-again'}, 7), false, 'a second report of version 7 must be refused: only a newer report is kept');
   assert.deepEqual(ctx.redis.hgetall(\`shadow:\${THERMO}:reported\`), {mode: 'v7'}, 'a refused report must leave the reported document alone');
   // The device's next report, handled by another hub instance in the middle of this one.
   const probe = ctx.redisAfter(\`shadow:\${THERMO}\`, () => {
     ctx.redis.del(\`shadow:\${THERMO}:reported\`);
-    ctx.redis.hset(\`shadow:\${THERMO}:reported\`, {mode: 'v9'});
+    ctx.redis.hset(\`shadow:\${THERMO}:reported\`, {mode: 'v9', fan: 'on'});
     ctx.redis.hset(\`shadow:\${THERMO}\`, 'reported_version', '9');
   });
   await m.applyReport(THERMO, {mode: 'v8'}, 8);
   assert(probe.fired, \`applyReport never touched shadow:\${THERMO}\`);
-  const reported = ctx.redis.hgetall(\`shadow:\${THERMO}:reported\`);
-  const version = ctx.redis.hget(\`shadow:\${THERMO}\`, 'reported_version');
-  assert(reported.mode === 'v9' && Object.keys(reported).length === 1 && version === '9', \`report 9 landed on another instance while report 8 was being applied, and the shadow now holds \${JSON.stringify(reported)} at reported_version \${version}: the read, the comparison and the write must be one script, or an older report overwrites a newer one\`);
+  let reported = ctx.redis.hgetall(\`shadow:\${THERMO}:reported\`);
+  let version = ctx.redis.hget(\`shadow:\${THERMO}\`, 'reported_version');
+  assert(reported.mode === 'v9' && reported.fan === 'on' && Object.keys(reported).length === 2 && version === '9', \`report 9 landed on another instance while report 8 was being applied, and the shadow now holds \${JSON.stringify(reported)} at reported_version \${version}: the read, the comparison and the write must be one script, or an older report overwrites a newer one\`);
+  assert.equal(await m.applyReport(THERMO, {mode: 'v10'}, 10), true, "the device's report 10 after its report 9 was refused: versions compare as numbers");
+  reported = ctx.redis.hgetall(\`shadow:\${THERMO}:reported\`);
+  version = ctx.redis.hget(\`shadow:\${THERMO}\`, 'reported_version');
+  assert(reported.mode === 'v10' && Object.keys(reported).length === 1 && version === '10', \`after report 10 the shadow holds \${JSON.stringify(reported)} at reported_version \${version}, expected only mode=v10 at 10: a report is the device's whole state and replaces the reported document\`);
 }
 `,
     go: `package main
@@ -752,58 +762,65 @@ import (
 	"leetbuild/harness"
 )
 
-const thermo = "thermo-3"
+const hThermo = "thermo-3"
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
 func CheckDesiredMerge(ctx *harness.Ctx) {
-	_, err := updateDesired(stateBg, thermo, map[string]string{"mode": "eco"})
+	_, err := updateDesired(hStateBg, hThermo, map[string]string{"mode": "eco"})
 	ctx.NoError(err, "updateDesired")
-	updateDesired(stateBg, thermo, map[string]string{"setpoint": "21"})
-	ctx.Equal(ctx.Redis.HGetAll("shadow:"+thermo+":desired"), map[string]string{"mode": "eco", "setpoint": "21"}, "after the patches mode=eco and setpoint=21 the desired document (a patch merges into the document, it does not replace it)")
-	updateDesired(stateBg, thermo, map[string]string{"mode": "comfort"})
-	desired := ctx.Redis.HGetAll("shadow:" + thermo + ":desired")
+	updateDesired(hStateBg, hThermo, map[string]string{"setpoint": "21"})
+	ctx.Equal(ctx.Redis.HGetAll("shadow:"+hThermo+":desired"), map[string]string{"mode": "eco", "setpoint": "21"}, "after the patches mode=eco and setpoint=21 the desired document (a patch merges into the document, it does not replace it)")
+	updateDesired(hStateBg, hThermo, map[string]string{"mode": "comfort"})
+	desired := ctx.Redis.HGetAll("shadow:" + hThermo + ":desired")
 	ctx.Equal(desired, map[string]string{"mode": "comfort", "setpoint": "21"}, "after a third patch mode=comfort the desired document")
-	shadow, err := readShadow(stateBg, thermo)
+	shadow, err := readShadow(hStateBg, hThermo)
 	ctx.NoError(err, "readShadow")
 	ctx.Equal(shadow.Desired, desired, "readShadow must answer the stored desired document")
 }
 
 func CheckOwnVersions(ctx *harness.Ctx) {
-	kept, err := applyReport(stateBg, thermo, map[string]string{"mode": "normal"}, 10)
+	kept, err := applyReport(hStateBg, hThermo, map[string]string{"mode": "normal"}, 10)
 	ctx.NoError(err, "applyReport")
 	ctx.Equal(kept, true, "the device's first report (version 10) must be kept")
-	first, _ := updateDesired(stateBg, thermo, map[string]string{"mode": "eco"})
-	second, _ := updateDesired(stateBg, thermo, map[string]string{"setpoint": "21"})
+	first, _ := updateDesired(hStateBg, hThermo, map[string]string{"mode": "eco"})
+	second, _ := updateDesired(hStateBg, hThermo, map[string]string{"setpoint": "21"})
 	ctx.Assert(first == 1 && second == 2, "two operator updates answered desired versions %d and %d, expected 1 and 2: the desired document counts its own updates, not the device's reports", first, second)
-	kept, _ = applyReport(stateBg, thermo, map[string]string{"mode": "eco", "setpoint": "21"}, 11)
+	kept, _ = applyReport(hStateBg, hThermo, map[string]string{"mode": "eco", "setpoint": "21"}, 11)
 	ctx.Equal(kept, true, "the device's report 11, newer than its report 10, must be kept (operator updates must not move the version the device's reports are compared with)")
-	versions := ctx.Redis.HGetAll("shadow:" + thermo)
-	ctx.Assert(versions["desired_version"] == "2" && versions["reported_version"] == "11", "shadow:%s holds %v, expected desired_version 2 and reported_version 11", thermo, versions)
-	shadow, err := readShadow(stateBg, thermo)
+	versions := ctx.Redis.HGetAll("shadow:" + hThermo)
+	ctx.Assert(versions["desired_version"] == "2" && versions["reported_version"] == "11", "shadow:%s holds %v, expected desired_version 2 and reported_version 11", hThermo, versions)
+	shadow, err := readShadow(hStateBg, hThermo)
 	ctx.NoError(err, "readShadow")
 	ctx.Assert(shadow.DesiredVersion == 2 && shadow.ReportedVersion == 11, "readShadow answered desired_version %d and reported_version %d, expected 2 and 11", shadow.DesiredVersion, shadow.ReportedVersion)
 }
 
 func CheckReportAtomic(ctx *harness.Ctx) {
-	kept, err := applyReport(stateBg, thermo, map[string]string{"mode": "v7"}, 7)
+	kept, err := applyReport(hStateBg, hThermo, map[string]string{"mode": "v7"}, 7)
 	ctx.NoError(err, "applyReport")
 	ctx.Equal(kept, true, "the device's first report (version 7) must be kept")
-	kept, _ = applyReport(stateBg, thermo, map[string]string{"mode": "v6"}, 6)
+	kept, _ = applyReport(hStateBg, hThermo, map[string]string{"mode": "v6"}, 6)
 	ctx.Equal(kept, false, "a report of version 6 after version 7 must be refused")
-	ctx.Equal(ctx.Redis.HGetAll("shadow:"+thermo+":reported"), map[string]string{"mode": "v7"}, "a refused report must leave the reported document alone")
+	kept, _ = applyReport(hStateBg, hThermo, map[string]string{"mode": "v7-again"}, 7)
+	ctx.Equal(kept, false, "a second report of version 7 must be refused (only a newer report is kept)")
+	ctx.Equal(ctx.Redis.HGetAll("shadow:"+hThermo+":reported"), map[string]string{"mode": "v7"}, "a refused report must leave the reported document alone")
 	// The device's next report, handled by another hub instance in the middle of this one.
-	probe := ctx.Redis.After("shadow:"+thermo, func() any {
-		ctx.Redis.Del("shadow:" + thermo + ":reported")
-		ctx.Redis.Do("HSET", "shadow:"+thermo+":reported", "mode", "v9")
-		ctx.Redis.Do("HSET", "shadow:"+thermo, "reported_version", "9")
+	probe := ctx.Redis.After("shadow:"+hThermo, func() any {
+		ctx.Redis.Del("shadow:" + hThermo + ":reported")
+		ctx.Redis.Do("HSET", "shadow:"+hThermo+":reported", "mode", "v9", "fan", "on")
+		ctx.Redis.Do("HSET", "shadow:"+hThermo, "reported_version", "9")
 		return nil
 	})
-	applyReport(stateBg, thermo, map[string]string{"mode": "v8"}, 8)
-	ctx.Assert(probe.Fired, "applyReport never touched shadow:%s", thermo)
-	reported := ctx.Redis.HGetAll("shadow:" + thermo + ":reported")
-	version, _ := ctx.Redis.HGet("shadow:"+thermo, "reported_version")
-	ctx.Assert(len(reported) == 1 && reported["mode"] == "v9" && version == "9", "report 9 landed on another instance while report 8 was being applied, and the shadow now holds %v at reported_version %s: the read, the comparison and the write must be one script, or an older report overwrites a newer one", reported, version)
+	applyReport(hStateBg, hThermo, map[string]string{"mode": "v8"}, 8)
+	ctx.Assert(probe.Fired, "applyReport never touched shadow:%s", hThermo)
+	reported := ctx.Redis.HGetAll("shadow:" + hThermo + ":reported")
+	version, _ := ctx.Redis.HGet("shadow:"+hThermo, "reported_version")
+	ctx.Assert(len(reported) == 2 && reported["mode"] == "v9" && reported["fan"] == "on" && version == "9", "report 9 landed on another instance while report 8 was being applied, and the shadow now holds %v at reported_version %s: the read, the comparison and the write must be one script, or an older report overwrites a newer one", reported, version)
+	kept, _ = applyReport(hStateBg, hThermo, map[string]string{"mode": "v10"}, 10)
+	ctx.Equal(kept, true, "the device's report 10 after its report 9 must be kept (versions compare as numbers)")
+	reported = ctx.Redis.HGetAll("shadow:" + hThermo + ":reported")
+	version, _ = ctx.Redis.HGet("shadow:"+hThermo, "reported_version")
+	ctx.Assert(len(reported) == 1 && reported["mode"] == "v10" && version == "10", "after report 10 the shadow holds %v at reported_version %s, expected only mode=v10 at 10: a report is the device's whole state and replaces the reported document", reported, version)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -813,58 +830,65 @@ func CheckReportAtomic(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kThermo = "thermo-3";
+const std::string kHThermo = "thermo-3";
 
-using Doc = std::map<std::string, std::string>;
+using hDoc = std::map<std::string, std::string>;
 
 }  // namespace
 
 void CheckDesiredMerge(harness::Ctx& ctx) {
-  updateDesired(kThermo, {{"mode", "eco"}});
-  updateDesired(kThermo, {{"setpoint", "21"}});
-  ctx.Equal(ctx.Redis.HGetAll("shadow:" + kThermo + ":desired"), Doc{{"mode", "eco"}, {"setpoint", "21"}},
+  updateDesired(kHThermo, {{"mode", "eco"}});
+  updateDesired(kHThermo, {{"setpoint", "21"}});
+  ctx.Equal(ctx.Redis.HGetAll("shadow:" + kHThermo + ":desired"), hDoc{{"mode", "eco"}, {"setpoint", "21"}},
             "after the patches mode=eco and setpoint=21 the desired document (a patch merges into the document, it does not replace it)");
-  updateDesired(kThermo, {{"mode", "comfort"}});
-  const auto desired = ctx.Redis.HGetAll("shadow:" + kThermo + ":desired");
-  ctx.Equal(desired, Doc{{"mode", "comfort"}, {"setpoint", "21"}}, "after a third patch mode=comfort the desired document");
-  ctx.Equal(readShadow(kThermo).desired, desired, "readShadow must answer the stored desired document");
+  updateDesired(kHThermo, {{"mode", "comfort"}});
+  const auto desired = ctx.Redis.HGetAll("shadow:" + kHThermo + ":desired");
+  ctx.Equal(desired, hDoc{{"mode", "comfort"}, {"setpoint", "21"}}, "after a third patch mode=comfort the desired document");
+  ctx.Equal(readShadow(kHThermo).desired, desired, "readShadow must answer the stored desired document");
 }
 
 void CheckOwnVersions(harness::Ctx& ctx) {
-  ctx.Equal(applyReport(kThermo, {{"mode", "normal"}}, 10), true, "the device's first report (version 10) must be kept");
-  const long long first = updateDesired(kThermo, {{"mode", "eco"}});
-  const long long second = updateDesired(kThermo, {{"setpoint", "21"}});
+  ctx.Equal(applyReport(kHThermo, {{"mode", "normal"}}, 10), true, "the device's first report (version 10) must be kept");
+  const long long first = updateDesired(kHThermo, {{"mode", "eco"}});
+  const long long second = updateDesired(kHThermo, {{"setpoint", "21"}});
   ctx.Assert(first == 1 && second == 2,
              "two operator updates answered desired versions %d and %d, expected 1 and 2: the desired document counts its own updates, not the device's reports", first, second);
-  ctx.Equal(applyReport(kThermo, {{"mode", "eco"}, {"setpoint", "21"}}, 11), true,
+  ctx.Equal(applyReport(kHThermo, {{"mode", "eco"}, {"setpoint", "21"}}, 11), true,
             "the device's report 11, newer than its report 10, must be kept (operator updates must not move the version the device's reports are compared with)");
-  auto versions = ctx.Redis.HGetAll("shadow:" + kThermo);
+  auto versions = ctx.Redis.HGetAll("shadow:" + kHThermo);
   ctx.Assert(versions["desired_version"] == "2" && versions["reported_version"] == "11", "shadow:%s holds desired_version %q and reported_version %q, expected 2 and 11",
-             kThermo, versions["desired_version"], versions["reported_version"]);
-  const auto shadow = readShadow(kThermo);
+             kHThermo, versions["desired_version"], versions["reported_version"]);
+  const auto shadow = readShadow(kHThermo);
   ctx.Assert(shadow.desired_version == 2 && shadow.reported_version == 11, "readShadow answered desired_version %d and reported_version %d, expected 2 and 11",
              shadow.desired_version, shadow.reported_version);
 }
 
 void CheckReportAtomic(harness::Ctx& ctx) {
-  ctx.Equal(applyReport(kThermo, {{"mode", "v7"}}, 7), true, "the device's first report (version 7) must be kept");
-  ctx.Equal(applyReport(kThermo, {{"mode", "v6"}}, 6), false, "a report of version 6 after version 7 must be refused");
-  ctx.Equal(ctx.Redis.HGetAll("shadow:" + kThermo + ":reported"), Doc{{"mode", "v7"}}, "a refused report must leave the reported document alone");
+  ctx.Equal(applyReport(kHThermo, {{"mode", "v7"}}, 7), true, "the device's first report (version 7) must be kept");
+  ctx.Equal(applyReport(kHThermo, {{"mode", "v6"}}, 6), false, "a report of version 6 after version 7 must be refused");
+  ctx.Equal(applyReport(kHThermo, {{"mode", "v7-again"}}, 7), false, "a second report of version 7 must be refused (only a newer report is kept)");
+  ctx.Equal(ctx.Redis.HGetAll("shadow:" + kHThermo + ":reported"), hDoc{{"mode", "v7"}}, "a refused report must leave the reported document alone");
   // The device's next report, handled by another hub instance in the middle of this one.
   bool fired = false;
-  ctx.Redis.After("shadow:" + kThermo, [&ctx, &fired] {
+  ctx.Redis.After("shadow:" + kHThermo, [&ctx, &fired] {
     fired = true;
-    ctx.Redis.Del("shadow:" + kThermo + ":reported");
-    ctx.Redis.Do("HSET", "shadow:" + kThermo + ":reported", "mode", "v9");
-    ctx.Redis.Do("HSET", "shadow:" + kThermo, "reported_version", "9");
+    ctx.Redis.Del("shadow:" + kHThermo + ":reported");
+    ctx.Redis.Do("HSET", "shadow:" + kHThermo + ":reported", "mode", "v9", "fan", "on");
+    ctx.Redis.Do("HSET", "shadow:" + kHThermo, "reported_version", "9");
   });
-  applyReport(kThermo, {{"mode", "v8"}}, 8);
-  ctx.Assert(fired, "applyReport never touched shadow:%s", kThermo);
-  const auto reported = ctx.Redis.HGetAll("shadow:" + kThermo + ":reported");
-  const std::string version = ctx.Redis.HGet("shadow:" + kThermo, "reported_version").value_or("");
-  ctx.Assert(reported == Doc{{"mode", "v9"}} && version == "9",
+  applyReport(kHThermo, {{"mode", "v8"}}, 8);
+  ctx.Assert(fired, "applyReport never touched shadow:%s", kHThermo);
+  auto reported = ctx.Redis.HGetAll("shadow:" + kHThermo + ":reported");
+  std::string version = ctx.Redis.HGet("shadow:" + kHThermo, "reported_version").value_or("");
+  ctx.Assert(reported == hDoc{{"fan", "on"}, {"mode", "v9"}} && version == "9",
              "report 9 landed on another instance while report 8 was being applied, and the shadow now holds mode %q at reported_version %q: the read, the comparison and the write must be one script, or an older report overwrites a newer one",
              reported.count("mode") ? reported.at("mode") : std::string(), version);
+  ctx.Equal(applyReport(kHThermo, {{"mode", "v10"}}, 10), true, "the device's report 10 after its report 9 must be kept (versions compare as numbers)");
+  reported = ctx.Redis.HGetAll("shadow:" + kHThermo + ":reported");
+  version = ctx.Redis.HGet("shadow:" + kHThermo, "reported_version").value_or("");
+  ctx.Assert(reported == hDoc{{"mode", "v10"}} && version == "10",
+             "after report 10 the shadow holds %d fields at reported_version %q, expected only mode=v10 at 10: a report is the device's whole state and replaces the reported document",
+             reported.size(), version);
 }
 `,
   },

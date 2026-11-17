@@ -71,7 +71,7 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
       id: 'fleet-scope',
       title: 'Only the caller’s fleet, 401 without one, 404 for another fleet’s device',
       detail:
-        'A request without `X-Fleet-Id` is **401**; a device of another fleet answers **404** exactly like an unknown one, and the store is never queried for it. The starter serves any device id to anyone.',
+        'A request without `X-Fleet-Id` is **401**, whatever the query string says; a device of another fleet answers **404** with the same body as an unknown one, and the store is never queried for either. The starter serves any device id to anyone.',
       match: {
         python: {all: [/x-fleet-id/i, /\[\s*["']fleet["']\s*\]/, /\b401\b/]},
         typescript: {all: [/x-fleet-id/i, /\.fleet\b/, /\b401\b/]},
@@ -84,7 +84,7 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
       id: 'range-cap',
       title: 'A range over 24 hours is 400 before the store is asked',
       detail:
-        'A two-day range, a missing `from` and an empty range answer **400** with no `Query` call; exactly 24 hours is served. The starter fills in `from = 0` and passes any range to the store.',
+        'A two-day range, one second over 24 hours, a missing `from` or `to`, an empty or reversed range and a missing `metric` answer **400** with no `Query` call; exactly 24 hours is served. The starter fills in `from = 0` and passes any range to the store.',
       match: {
         python: {all: [/MAX_RANGE_S\s*=\s*86400/], order: [/>\s*MAX_RANGE_S/, /store\.Query\(/]},
         typescript: {all: [/MAX_RANGE_S\s*=\s*86400/], order: [/>\s*MAX_RANGE_S/, /store\.Query\(/]},
@@ -97,7 +97,7 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
       id: 'downsample',
       title: 'Keeps each bucket’s extremes and names the method',
       detail:
-        'A 5000-point series with one spike answers at most 1000 points that include the spike, in time order, with `downsample.method` `minmax`. The starter keeps every n-th point, so a spike between two of them disappears.',
+        'A 5000-point series with one spike and one dip answers at most 1000 points that include both, in time order, with `downsample` naming `minmax` and the points kept; a series of exactly 1000 points comes back whole with `downsample` null. The starter keeps every n-th point, so a spike between two of them disappears.',
       match: {
         python: {all: [/minmax/, /MAX_POINTS/], none: [/\[::\s*step\s*\]/]},
         typescript: {all: [/minmax/, /MAX_POINTS/], none: [/i\s*%\s*step\s*===\s*0/]},
@@ -110,7 +110,7 @@ a device that went silent an hour ago draws the same flat line as a healthy one.
       id: 'staleness',
       title: 'Reports the newest point’s age and whether it is stale',
       detail:
-        'A series whose newest point is 600 s old answers `age_seconds` 600 and `stale` true; one 30 s old is not stale; a series with no points has `age_seconds` null and is stale. The starter reports neither.',
+        'A series whose newest point is 600 s old answers `age_seconds` 600 and `stale` true; one 30 s old is not stale, nor is one exactly 300 s old, its age counted from now even when the range ends earlier; a series with no points has `age_seconds` null and is stale. The starter reports neither.',
       match: {
         python: {all: [/age_seconds/, /STALE_AFTER_S/]},
         typescript: {all: [/age_seconds/, /STALE_AFTER_S/]},
@@ -847,10 +847,6 @@ async def _get(c, device, frm, to, fleet="f-1"):
     return await c.get(f"/v1/devices/{device}/series", params=params, headers={"X-Fleet-Id": fleet} if fleet else {})
 
 
-def _queried(ctx, device):
-    return [call for call in ctx.grpc.calls_to("Query") if call.request.device_id == device]
-
-
 async def check_route(ctx):
     now = _now(ctx)
     client, store = _api(ctx)
@@ -868,12 +864,16 @@ async def check_fleet_scope(ctx):
     store.series[("d-9", "temp_c")] = [(now - 60, 30.0)]
     async with client as c:
         anonymous = await _get(c, "d-1", now - 3600, now, fleet=None)
+        smuggled = await c.get("/v1/devices/d-1/series", params={"metric": "temp_c", "from": now - 3600, "to": now, "fleet": "f-1", "fleet_id": "f-1"})
         foreign = await _get(c, "d-9", now - 3600, now, fleet="f-1")
         unknown = await _get(c, "d-404", now - 3600, now, fleet="f-1")
     assert anonymous.status_code == 401, f"a request without X-Fleet-Id answered {anonymous.status_code}, expected 401"
+    assert smuggled.status_code == 401, f"a request without X-Fleet-Id but with fleet=f-1 in the query answered {smuggled.status_code}, expected 401: the fleet comes from the header only"
     assert foreign.status_code == 404, f"fleet f-1 asking for d-9, a device of fleet f-2, answered {foreign.status_code}: {foreign.text}. Another fleet's device must look exactly like an unknown one (404)"
     assert unknown.status_code == 404, f"an unknown device answered {unknown.status_code}, expected 404"
-    assert not _queried(ctx, "d-9"), "the store was queried for another fleet's device: decide the fleet before Query"
+    assert foreign.text.replace("d-9", "<id>") == unknown.text.replace("d-404", "<id>"), f"another fleet's device answered {foreign.text} and an unknown one {unknown.text}: the difference tells a caller the id exists"
+    queried = sorted({call.request.device_id for call in ctx.grpc.calls_to("Query")})
+    assert queried == [], f"the store was queried for {queried}: the fleet and the device are decided before Query"
 
 
 async def check_range_cap(ctx):
@@ -882,13 +882,21 @@ async def check_range_cap(ctx):
     store.series[("d-1", "temp_c")] = [(now - 100, 20.0)]
     async with client as c:
         long = await _get(c, "d-1", now - 2 * 86400, now)
+        just_over = await _get(c, "d-1", now - 86401, now)
         open_ended = await _get(c, "d-1", None, now)
+        no_end = await _get(c, "d-1", now - 3600, None)
         empty = await _get(c, "d-1", now, now)
+        backwards = await _get(c, "d-1", now, now - 3600)
+        no_metric = await c.get("/v1/devices/d-1/series", params={"from": now - 3600, "to": now}, headers={"X-Fleet-Id": "f-1"})
         before = len(ctx.grpc.calls_to("Query"))
         day = await _get(c, "d-1", now - 86400, now)
     assert long.status_code == 400, f"a two-day range answered {long.status_code}, expected 400: the cap is 24 hours"
+    assert just_over.status_code == 400, f"a range of 86401 s answered {just_over.status_code}, expected 400: the cap is MAX_RANGE_S = 86400"
     assert open_ended.status_code == 400, f"a request without from answered {open_ended.status_code}, expected 400: a missing bound is not 'since 1970'"
+    assert no_end.status_code == 400, f"a request without to answered {no_end.status_code}, expected 400: from and to are both required"
     assert empty.status_code == 400, f"a range with to == from answered {empty.status_code}, expected 400"
+    assert backwards.status_code == 400, f"a range with to an hour before from answered {backwards.status_code}, expected 400"
+    assert no_metric.status_code == 400, f"a request without metric answered {no_metric.status_code}, expected 400"
     assert before == 0, f"the store was queried {before} times for ranges that must be refused: the cap is decided before Query"
     assert day.status_code == 200, f"exactly 24 hours answered {day.status_code}: {day.text}"
 
@@ -897,31 +905,40 @@ async def check_downsample(ctx):
     now = _now(ctx)
     client, store = _api(ctx)
     points = [(now - 5000 + i, 20.0 + (i % 7) * 0.1) for i in range(5000)]
-    spike_ts = points[2503][0]
+    spike_ts, dip_ts = points[2503][0], points[4101][0]
     points[2503] = (spike_ts, 80.0)
+    points[4101] = (dip_ts, -30.0)
     store.series[("d-1", "temp_c")] = points
+    store.series[("d-2", "temp_c")] = [(now - 1000 + i, 20.0 + (i % 7) * 0.1) for i in range(1000)]
     async with client as c:
         r = await _get(c, "d-1", now - 6000, now)
+        fits = await _get(c, "d-2", now - 6000, now)
     assert r.status_code == 200, f"the series read answered {r.status_code}: {r.text}"
     body = r.json()
     got = body.get("points") or []
     assert 0 < len(got) <= 1000, f"a 5000-point series answered {len(got)} points, expected at most MAX_POINTS = 1000"
     assert {"ts": spike_ts, "value": 80.0} in got, "the spike to 80.0 is missing from the downsampled series: keep each bucket's lowest and highest point, not every n-th one"
+    assert {"ts": dip_ts, "value": -30.0} in got, "the dip to -30.0 is missing from the downsampled series: each bucket keeps its lowest point as well as its highest"
     assert [p["ts"] for p in got] == sorted(p["ts"] for p in got), "the downsampled points must stay in time order"
     assert (body.get("downsample") or {}).get("method") == "minmax", f"the response must name the method, downsample.method = minmax; got {body.get('downsample')}"
+    assert body["downsample"].get("points") == len(got), f"downsample.points is {body['downsample'].get('points')}, but the response carries {len(got)} points"
+    assert fits.status_code == 200, f"the 1000-point series read answered {fits.status_code}: {fits.text}"
+    assert len(fits.json().get("points") or []) == 1000 and fits.json().get("downsample") is None, f"a series of exactly MAX_POINTS = 1000 points fits: expected all 1000 points and downsample null, got {len(fits.json().get('points') or [])} points and downsample {fits.json().get('downsample')}"
 
 
 async def check_staleness(ctx):
     now = _now(ctx)
     client, store = _api(ctx)
     store.series[("d-1", "temp_c")] = [(now - 900, 20.0), (now - 600, 21.0)]
-    store.series[("d-2", "temp_c")] = [(now - 30, 22.0)]
+    store.series[("d-2", "temp_c")] = [(now - 300, 21.5), (now - 30, 22.0)]
     async with client as c:
         silent = (await _get(c, "d-1", now - 3600, now)).json()
         live = (await _get(c, "d-2", now - 3600, now)).json()
+        edge = (await _get(c, "d-2", now - 3600, now - 200)).json()
         empty = (await _get(c, "d-2", now - 7200, now - 3600)).json()
     assert silent.get("age_seconds") == 600 and silent.get("stale") is True, f"d-1's newest point is 600 s old: expected age_seconds 600 and stale true, got age_seconds={silent.get('age_seconds')} stale={silent.get('stale')}"
     assert live.get("age_seconds") == 30 and live.get("stale") is False, f"d-2's newest point is 30 s old: expected age_seconds 30 and stale false, got age_seconds={live.get('age_seconds')} stale={live.get('stale')}"
+    assert edge.get("age_seconds") == 300 and edge.get("stale") is False, f"a range ending 200 s ago whose newest point is 300 s old: expected age_seconds 300 (now minus that point) and stale false (stale is older than STALE_AFTER_S = 300), got age_seconds={edge.get('age_seconds')} stale={edge.get('stale')}"
     assert "age_seconds" in empty and empty.get("age_seconds") is None and empty.get("stale") is True, f"a range with no points must answer age_seconds null and stale true, got {empty}"
 `,
     typescript: `const RANGES = {temp_c: [-40, 85]};
@@ -955,8 +972,6 @@ function get(c, device: string, from: number | null, to: number | null, fleet: s
   return c.get(\`/v1/devices/\${device}/series?\${params.join('&')}\`, {headers: fleet === null ? {} : {'X-Fleet-Id': fleet}});
 }
 
-const queried = (ctx, device: string) => ctx.grpc.callsTo('Query').filter(call => call.request.device_id === device);
-
 export async function check_route(ctx) {
   const now = nowS(ctx);
   const {c, series} = await api(ctx);
@@ -972,12 +987,16 @@ export async function check_fleet_scope(ctx) {
   const {c, series} = await api(ctx);
   series.set('d-9/temp_c', [[now - 60, 30]]);
   const anonymous = await get(c, 'd-1', now - 3600, now, null);
+  const smuggled = await c.get(\`/v1/devices/d-1/series?metric=temp_c&from=\${now - 3600}&to=\${now}&fleet=f-1&fleet_id=f-1\`, {headers: {}});
   const foreign = await get(c, 'd-9', now - 3600, now, 'f-1');
   const unknown = await get(c, 'd-404', now - 3600, now, 'f-1');
   assert.equal(anonymous.status, 401, \`a request without X-Fleet-Id answered \${anonymous.status}, expected 401\`);
+  assert.equal(smuggled.status, 401, \`a request without X-Fleet-Id but with fleet=f-1 in the query answered \${smuggled.status}, expected 401: the fleet comes from the header only\`);
   assert.equal(foreign.status, 404, \`fleet f-1 asking for d-9, a device of fleet f-2, answered \${foreign.status}: \${foreign.text}. Another fleet's device must look exactly like an unknown one (404)\`);
   assert.equal(unknown.status, 404, \`an unknown device answered \${unknown.status}, expected 404\`);
-  assert.equal(queried(ctx, 'd-9').length, 0, "the store was queried for another fleet's device: decide the fleet before Query");
+  assert.equal(foreign.text.replaceAll('d-9', '<id>'), unknown.text.replaceAll('d-404', '<id>'), \`another fleet's device answered \${foreign.text} and an unknown one \${unknown.text}: the difference tells a caller the id exists\`);
+  const asked = [...new Set(ctx.grpc.callsTo('Query').map(call => call.request.device_id))];
+  assert.deepEqual(asked, [], \`the store was queried for \${JSON.stringify(asked)}: the fleet and the device are decided before Query\`);
 }
 
 export async function check_range_cap(ctx) {
@@ -985,13 +1004,21 @@ export async function check_range_cap(ctx) {
   const {c, series} = await api(ctx);
   series.set('d-1/temp_c', [[now - 100, 20]]);
   const long = await get(c, 'd-1', now - 2 * 86400, now);
+  const justOver = await get(c, 'd-1', now - 86401, now);
   const openEnded = await get(c, 'd-1', null, now);
+  const noEnd = await get(c, 'd-1', now - 3600, null);
   const empty = await get(c, 'd-1', now, now);
+  const backwards = await get(c, 'd-1', now, now - 3600);
+  const noMetric = await c.get(\`/v1/devices/d-1/series?from=\${now - 3600}&to=\${now}\`, {headers: {'X-Fleet-Id': 'f-1'}});
   const before = ctx.grpc.callsTo('Query').length;
   const day = await get(c, 'd-1', now - 86400, now);
   assert.equal(long.status, 400, \`a two-day range answered \${long.status}, expected 400: the cap is 24 hours\`);
+  assert.equal(justOver.status, 400, \`a range of 86401 s answered \${justOver.status}, expected 400: the cap is MAX_RANGE_S = 86400\`);
   assert.equal(openEnded.status, 400, \`a request without from answered \${openEnded.status}, expected 400: a missing bound is not 'since 1970'\`);
+  assert.equal(noEnd.status, 400, \`a request without to answered \${noEnd.status}, expected 400: from and to are both required\`);
   assert.equal(empty.status, 400, \`a range with to == from answered \${empty.status}, expected 400\`);
+  assert.equal(backwards.status, 400, \`a range with to an hour before from answered \${backwards.status}, expected 400\`);
+  assert.equal(noMetric.status, 400, \`a request without metric answered \${noMetric.status}, expected 400\`);
   assert.equal(before, 0, \`the store was queried \${before} times for ranges that must be refused: the cap is decided before Query\`);
   assert.equal(day.status, 200, \`exactly 24 hours answered \${day.status}: \${day.text}\`);
 }
@@ -1001,28 +1028,39 @@ export async function check_downsample(ctx) {
   const {c, series} = await api(ctx);
   const points: [number, number][] = Array.from({length: 5000}, (_, i) => [now - 5000 + i, 20 + (i % 7) * 0.1]);
   const spikeTs = points[2503][0];
+  const dipTs = points[4101][0];
   points[2503] = [spikeTs, 80];
+  points[4101] = [dipTs, -30];
   series.set('d-1/temp_c', points);
+  series.set('d-2/temp_c', Array.from({length: 1000}, (_, i) => [now - 1000 + i, 20 + (i % 7) * 0.1]));
   const r = await get(c, 'd-1', now - 6000, now);
+  const fits = await get(c, 'd-2', now - 6000, now);
   assert.equal(r.status, 200, \`the series read answered \${r.status}: \${r.text}\`);
   const body = r.json();
   const got = body.points ?? [];
   assert(got.length > 0 && got.length <= 1000, \`a 5000-point series answered \${got.length} points, expected at most MAX_POINTS = 1000\`);
   assert(got.some(p => p.ts === spikeTs && p.value === 80), "the spike to 80 is missing from the downsampled series: keep each bucket's lowest and highest point, not every n-th one");
+  assert(got.some(p => p.ts === dipTs && p.value === -30), 'the dip to -30 is missing from the downsampled series: each bucket keeps its lowest point as well as its highest');
   assert(got.every((p, i) => i === 0 || got[i - 1].ts <= p.ts), 'the downsampled points must stay in time order');
   assert.equal(body.downsample?.method, 'minmax', \`the response must name the method, downsample.method = minmax; got \${JSON.stringify(body.downsample)}\`);
+  assert.equal(body.downsample.points, got.length, \`downsample.points is \${body.downsample.points}, but the response carries \${got.length} points\`);
+  assert.equal(fits.status, 200, \`the 1000-point series read answered \${fits.status}: \${fits.text}\`);
+  const fitsBody = fits.json();
+  assert((fitsBody.points ?? []).length === 1000 && fitsBody.downsample === null, \`a series of exactly MAX_POINTS = 1000 points fits: expected all 1000 points and downsample null, got \${(fitsBody.points ?? []).length} points and downsample \${JSON.stringify(fitsBody.downsample)}\`);
 }
 
 export async function check_staleness(ctx) {
   const now = nowS(ctx);
   const {c, series} = await api(ctx);
   series.set('d-1/temp_c', [[now - 900, 20], [now - 600, 21]]);
-  series.set('d-2/temp_c', [[now - 30, 22]]);
+  series.set('d-2/temp_c', [[now - 300, 21.5], [now - 30, 22]]);
   const silent = (await get(c, 'd-1', now - 3600, now)).json();
   const live = (await get(c, 'd-2', now - 3600, now)).json();
+  const edge = (await get(c, 'd-2', now - 3600, now - 200)).json();
   const empty = (await get(c, 'd-2', now - 7200, now - 3600)).json();
   assert(silent.age_seconds === 600 && silent.stale === true, \`d-1's newest point is 600 s old: expected age_seconds 600 and stale true, got age_seconds=\${silent.age_seconds} stale=\${silent.stale}\`);
   assert(live.age_seconds === 30 && live.stale === false, \`d-2's newest point is 30 s old: expected age_seconds 30 and stale false, got age_seconds=\${live.age_seconds} stale=\${live.stale}\`);
+  assert(edge.age_seconds === 300 && edge.stale === false, \`a range ending 200 s ago whose newest point is 300 s old: expected age_seconds 300 (now minus that point) and stale false (stale is older than STALE_AFTER_S = 300), got age_seconds=\${edge.age_seconds} stale=\${edge.stale}\`);
   assert('age_seconds' in empty && empty.age_seconds === null && empty.stale === true, \`a range with no points must answer age_seconds null and stale true, got \${JSON.stringify(empty)}\`);
 }
 `,
@@ -1033,6 +1071,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 
 	"ingestd/registry"
 	pb "tsdb/gen/telemetry_ingest"
@@ -1041,12 +1080,12 @@ import (
 )
 
 // readPeer serves series: "device/metric" → its points, oldest first.
-type readPeer struct {
+type hReadPeer struct {
 	pb.UnimplementedTimeSeriesServer
 	series map[string][]*pb.Point
 }
 
-func (p *readPeer) Query(_ context.Context, req *pb.QueryRequest) (*pb.QueryReply, error) {
+func (p *hReadPeer) Query(_ context.Context, req *pb.QueryRequest) (*pb.QueryReply, error) {
 	reply := &pb.QueryReply{}
 	for _, point := range p.series[req.GetDeviceId()+"/"+req.GetMetric()] {
 		if point.GetTs() >= req.GetFromTs() && point.GetTs() <= req.GetToTs() {
@@ -1056,15 +1095,20 @@ func (p *readPeer) Query(_ context.Context, req *pb.QueryRequest) (*pb.QueryRepl
 	return reply, nil
 }
 
-type readBody struct {
-	Points     []seriesPoint  \`json:"points"\`
+type hReadPoint struct {
+	TS    int64   \`json:"ts"\`
+	Value float64 \`json:"value"\`
+}
+
+type hReadBody struct {
+	Points     []hReadPoint    \`json:"points"\`
 	Downsample map[string]any \`json:"downsample"\`
 	AgeSeconds *int64         \`json:"age_seconds"\`
 	Stale      *bool          \`json:"stale"\`
 }
 
-func readAPI(ctx *harness.Ctx) (*harness.HTTP, *readPeer) {
-	peer := &readPeer{series: map[string][]*pb.Point{}}
+func hReadAPI(ctx *harness.Ctx) (*harness.HTTP, *hReadPeer) {
+	peer := &hReadPeer{series: map[string][]*pb.Point{}}
 	pb.RegisterTimeSeriesServer(ctx.GRPC.Server(""), peer)
 	ranges := map[string][2]float64{"temp_c": {-40, 85}}
 	for device, fleet := range map[string]string{"d-1": "f-1", "d-2": "f-1", "d-9": "f-2"} {
@@ -1076,7 +1120,7 @@ func readAPI(ctx *harness.Ctx) (*harness.HTTP, *readPeer) {
 	return ctx.HTTP(mux), peer
 }
 
-func seriesOf(points ...[2]float64) []*pb.Point {
+func hSeriesOf(points ...[2]float64) []*pb.Point {
 	out := []*pb.Point{}
 	for _, p := range points {
 		out = append(out, &pb.Point{Metric: "temp_c", Ts: int64(p[0]), Value: p[1]})
@@ -1084,7 +1128,7 @@ func seriesOf(points ...[2]float64) []*pb.Point {
 	return out
 }
 
-func readGet(c *harness.HTTP, device string, from, to *int64, fleet string) *harness.Response {
+func hReadGet(c *harness.HTTP, device string, from, to *int64, fleet string) *harness.Response {
 	path := "/v1/devices/" + device + "/series?metric=temp_c"
 	if from != nil {
 		path += fmt.Sprintf("&from=%d", *from)
@@ -1098,89 +1142,117 @@ func readGet(c *harness.HTTP, device string, from, to *int64, fleet string) *har
 	return c.Get(path, "X-Fleet-Id", fleet)
 }
 
-func ptr(v int64) *int64 { return &v }
+func hPtr(v int64) *int64 { return &v }
 
-func decodeRead(ctx *harness.Ctx, r *harness.Response) readBody {
-	var body readBody
+func hDecodeRead(ctx *harness.Ctx, r *harness.Response) hReadBody {
+	var body hReadBody
 	r.Decode(&body)
 	return body
 }
 
-func nowSeconds(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
+func hNowSeconds(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	now := nowSeconds(ctx)
-	c, peer := readAPI(ctx)
-	peer.series["d-1/temp_c"] = seriesOf([2]float64{float64(now - 300), 20}, [2]float64{float64(now - 200), 21}, [2]float64{float64(now - 100), 22})
-	r := readGet(c, "d-1", ptr(now-3600), ptr(now), "f-1")
+	now := hNowSeconds(ctx)
+	c, peer := hReadAPI(ctx)
+	peer.series["d-1/temp_c"] = hSeriesOf([2]float64{float64(now - 300), 20}, [2]float64{float64(now - 200), 21}, [2]float64{float64(now - 100), 22})
+	r := hReadGet(c, "d-1", hPtr(now-3600), hPtr(now), "f-1")
 	ctx.Equal(r.Status, 200, "GET /v1/devices/d-1/series (%s)", r.Text())
-	ctx.Equal(decodeRead(ctx, r).Points, []seriesPoint{{TS: now - 300, Value: 20}, {TS: now - 200, Value: 21}, {TS: now - 100, Value: 22}}, "the series must be d-1's three points in time order")
+	ctx.Equal(hDecodeRead(ctx, r).Points, []hReadPoint{{TS: now - 300, Value: 20}, {TS: now - 200, Value: 21}, {TS: now - 100, Value: 22}}, "the series must be d-1's three points in time order")
 }
 
 func CheckFleetScope(ctx *harness.Ctx) {
-	now := nowSeconds(ctx)
-	c, peer := readAPI(ctx)
-	peer.series["d-9/temp_c"] = seriesOf([2]float64{float64(now - 60), 30})
-	anonymous := readGet(c, "d-1", ptr(now-3600), ptr(now), "")
-	foreign := readGet(c, "d-9", ptr(now-3600), ptr(now), "f-1")
-	unknown := readGet(c, "d-404", ptr(now-3600), ptr(now), "f-1")
+	now := hNowSeconds(ctx)
+	c, peer := hReadAPI(ctx)
+	peer.series["d-9/temp_c"] = hSeriesOf([2]float64{float64(now - 60), 30})
+	anonymous := hReadGet(c, "d-1", hPtr(now-3600), hPtr(now), "")
+	smuggled := c.Get(fmt.Sprintf("/v1/devices/d-1/series?metric=temp_c&from=%d&to=%d&fleet=f-1&fleet_id=f-1", now-3600, now))
+	foreign := hReadGet(c, "d-9", hPtr(now-3600), hPtr(now), "f-1")
+	unknown := hReadGet(c, "d-404", hPtr(now-3600), hPtr(now), "f-1")
 	ctx.Equal(anonymous.Status, 401, "a request without X-Fleet-Id")
+	ctx.Equal(smuggled.Status, 401, "a request without X-Fleet-Id but with fleet=f-1 in the query (the fleet comes from the header only)")
 	ctx.Equal(foreign.Status, 404, "fleet f-1 asking for d-9, a device of fleet f-2, must look exactly like an unknown device (%s)", foreign.Text())
 	ctx.Equal(unknown.Status, 404, "an unknown device")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), "d-9", "<id>"), strings.ReplaceAll(unknown.Text(), "d-404", "<id>"), "another fleet's device and an unknown one must answer alike, or the difference tells a caller the id exists; the bodies")
+	var asked []string
 	for _, call := range ctx.GRPC.CallsTo("Query", "") {
-		ctx.Assert(call.Request.(*pb.QueryRequest).GetDeviceId() != "d-9", "the store was queried for another fleet's device: decide the fleet before Query")
+		asked = append(asked, call.Request.(*pb.QueryRequest).GetDeviceId())
 	}
+	ctx.Assert(len(asked) == 0, "the store was queried for %v: the fleet and the device are decided before Query", asked)
 }
 
 func CheckRangeCap(ctx *harness.Ctx) {
-	now := nowSeconds(ctx)
-	c, peer := readAPI(ctx)
-	peer.series["d-1/temp_c"] = seriesOf([2]float64{float64(now - 100), 20})
-	long := readGet(c, "d-1", ptr(now-2*86400), ptr(now), "f-1")
-	openEnded := readGet(c, "d-1", nil, ptr(now), "f-1")
-	empty := readGet(c, "d-1", ptr(now), ptr(now), "f-1")
+	now := hNowSeconds(ctx)
+	c, peer := hReadAPI(ctx)
+	peer.series["d-1/temp_c"] = hSeriesOf([2]float64{float64(now - 100), 20})
+	long := hReadGet(c, "d-1", hPtr(now-2*86400), hPtr(now), "f-1")
+	justOver := hReadGet(c, "d-1", hPtr(now-86401), hPtr(now), "f-1")
+	openEnded := hReadGet(c, "d-1", nil, hPtr(now), "f-1")
+	noEnd := hReadGet(c, "d-1", hPtr(now-3600), nil, "f-1")
+	empty := hReadGet(c, "d-1", hPtr(now), hPtr(now), "f-1")
+	backwards := hReadGet(c, "d-1", hPtr(now), hPtr(now-3600), "f-1")
+	noMetric := c.Get(fmt.Sprintf("/v1/devices/d-1/series?from=%d&to=%d", now-3600, now), "X-Fleet-Id", "f-1")
 	before := len(ctx.GRPC.CallsTo("Query", ""))
-	day := readGet(c, "d-1", ptr(now-86400), ptr(now), "f-1")
+	day := hReadGet(c, "d-1", hPtr(now-86400), hPtr(now), "f-1")
 	ctx.Equal(long.Status, 400, "a two-day range (the cap is 24 hours)")
+	ctx.Equal(justOver.Status, 400, "a range of 86401 s (the cap is maxRangeS = 86400)")
 	ctx.Equal(openEnded.Status, 400, "a request without from (a missing bound is not 'since 1970')")
+	ctx.Equal(noEnd.Status, 400, "a request without to (from and to are both required)")
 	ctx.Equal(empty.Status, 400, "a range with to == from")
+	ctx.Equal(backwards.Status, 400, "a range with to an hour before from")
+	ctx.Equal(noMetric.Status, 400, "a request without metric")
 	ctx.Equal(before, 0, "ranges that must be refused never reach the store: the cap is decided before Query; Query calls")
 	ctx.Equal(day.Status, 200, "exactly 24 hours (%s)", day.Text())
 }
 
 func CheckDownsample(ctx *harness.Ctx) {
-	now := nowSeconds(ctx)
-	c, peer := readAPI(ctx)
+	now := hNowSeconds(ctx)
+	c, peer := hReadAPI(ctx)
 	var raw [][2]float64
 	for i := 0; i < 5000; i++ {
 		raw = append(raw, [2]float64{float64(now - 5000 + int64(i)), 20 + float64(i%7)*0.1})
 	}
-	spikeTS := int64(raw[2503][0])
+	spikeTS, dipTS := int64(raw[2503][0]), int64(raw[4101][0])
 	raw[2503][1] = 80
-	peer.series["d-1/temp_c"] = seriesOf(raw...)
-	r := readGet(c, "d-1", ptr(now-6000), ptr(now), "f-1")
+	raw[4101][1] = -30
+	peer.series["d-1/temp_c"] = hSeriesOf(raw...)
+	fitting := make([][2]float64, 1000)
+	for i := range fitting {
+		fitting[i] = [2]float64{float64(now - 1000 + int64(i)), 20 + float64(i%7)*0.1}
+	}
+	peer.series["d-2/temp_c"] = hSeriesOf(fitting...)
+	r := hReadGet(c, "d-1", hPtr(now-6000), hPtr(now), "f-1")
+	fits := hReadGet(c, "d-2", hPtr(now-6000), hPtr(now), "f-1")
 	ctx.Equal(r.Status, 200, "the series read (%s)", r.Text())
-	body := decodeRead(ctx, r)
+	body := hDecodeRead(ctx, r)
 	ctx.Assert(len(body.Points) > 0 && len(body.Points) <= 1000, "a 5000-point series answered %d points, expected at most maxPoints = 1000", len(body.Points))
-	spike := false
+	spike, dip := false, false
 	for _, p := range body.Points {
 		spike = spike || (p.TS == spikeTS && p.Value == 80)
+		dip = dip || (p.TS == dipTS && p.Value == -30)
 	}
 	ctx.Assert(spike, "the spike to 80 is missing from the downsampled series: keep each bucket's lowest and highest point, not every n-th one")
+	ctx.Assert(dip, "the dip to -30 is missing from the downsampled series: each bucket keeps its lowest point as well as its highest")
 	ctx.Assert(sort.SliceIsSorted(body.Points, func(i, j int) bool { return body.Points[i].TS < body.Points[j].TS }), "the downsampled points must stay in time order")
 	ctx.Equal(body.Downsample["method"], "minmax", "the response must name the method; downsample.method")
+	ctx.Equal(body.Downsample["points"], any(float64(len(body.Points))), "downsample.points must count the points the response carries")
+	ctx.Equal(fits.Status, 200, "the 1000-point series read (%s)", fits.Text())
+	fitsBody := hDecodeRead(ctx, fits)
+	ctx.Assert(len(fitsBody.Points) == 1000 && fitsBody.Downsample == nil, "a series of exactly maxPoints = 1000 points fits: expected all 1000 points and downsample null, got %d points and downsample %v", len(fitsBody.Points), fitsBody.Downsample)
 }
 
 func CheckStaleness(ctx *harness.Ctx) {
-	now := nowSeconds(ctx)
-	c, peer := readAPI(ctx)
-	peer.series["d-1/temp_c"] = seriesOf([2]float64{float64(now - 900), 20}, [2]float64{float64(now - 600), 21})
-	peer.series["d-2/temp_c"] = seriesOf([2]float64{float64(now - 30), 22})
-	silent := decodeRead(ctx, readGet(c, "d-1", ptr(now-3600), ptr(now), "f-1"))
-	live := decodeRead(ctx, readGet(c, "d-2", ptr(now-3600), ptr(now), "f-1"))
-	empty := decodeRead(ctx, readGet(c, "d-2", ptr(now-7200), ptr(now-3600), "f-1"))
+	now := hNowSeconds(ctx)
+	c, peer := hReadAPI(ctx)
+	peer.series["d-1/temp_c"] = hSeriesOf([2]float64{float64(now - 900), 20}, [2]float64{float64(now - 600), 21})
+	peer.series["d-2/temp_c"] = hSeriesOf([2]float64{float64(now - 300), 21.5}, [2]float64{float64(now - 30), 22})
+	silent := hDecodeRead(ctx, hReadGet(c, "d-1", hPtr(now-3600), hPtr(now), "f-1"))
+	live := hDecodeRead(ctx, hReadGet(c, "d-2", hPtr(now-3600), hPtr(now), "f-1"))
+	edge := hDecodeRead(ctx, hReadGet(c, "d-2", hPtr(now-3600), hPtr(now-200), "f-1"))
+	empty := hDecodeRead(ctx, hReadGet(c, "d-2", hPtr(now-7200), hPtr(now-3600), "f-1"))
 	ctx.Assert(silent.AgeSeconds != nil && *silent.AgeSeconds == 600 && silent.Stale != nil && *silent.Stale, "d-1's newest point is 600 s old: expected age_seconds 600 and stale true, got %v", harness.Show(silent))
 	ctx.Assert(live.AgeSeconds != nil && *live.AgeSeconds == 30 && live.Stale != nil && !*live.Stale, "d-2's newest point is 30 s old: expected age_seconds 30 and stale false, got %v", harness.Show(live))
+	ctx.Assert(edge.AgeSeconds != nil && *edge.AgeSeconds == 300 && edge.Stale != nil && !*edge.Stale, "a range ending 200 s ago whose newest point is 300 s old: expected age_seconds 300 (now minus that point) and stale false (stale is older than staleAfterS = 300), got %v", harness.Show(edge))
 	ctx.Assert(empty.AgeSeconds == nil && empty.Stale != nil && *empty.Stale, "a range with no points must answer age_seconds null and stale true, got %v", harness.Show(empty))
 }
 `,
@@ -1202,7 +1274,7 @@ using json = nlohmann::json;
 namespace {
 
 // Serves series: "device/metric" → its (ts, value) points, oldest first.
-class ReadPeer final : public tsdb::TimeSeries::Service {
+class hReadPeer final : public tsdb::TimeSeries::Service {
  public:
   std::map<std::string, std::vector<std::pair<long long, double>>> series;
 
@@ -1218,15 +1290,15 @@ class ReadPeer final : public tsdb::TimeSeries::Service {
   }
 };
 
-struct ReadWorld {
-  ReadPeer peer;
+struct hReadWorld {
+  hReadPeer peer;
   httplib::Server svr;
 };
 
-ReadWorld& readWorld(harness::Ctx& ctx) {
-  static ReadWorld* world = nullptr;
+hReadWorld& hFreshWorld(harness::Ctx& ctx) {
+  static hReadWorld* world = nullptr;
   delete world;
-  world = new ReadWorld;
+  world = new hReadWorld;
   ctx.GRPC.Server("")->RegisterService(&world->peer);
   registry::registerDevice("d-1", "f-1", {{"temp_c", {-40, 85}}});
   registry::registerDevice("d-2", "f-1", {{"temp_c", {-40, 85}}});
@@ -1235,101 +1307,137 @@ ReadWorld& readWorld(harness::Ctx& ctx) {
   return *world;
 }
 
-harness::Response readGet(harness::Ctx& ctx, ReadWorld& w, const std::string& device, std::optional<long long> from, long long to, const std::string& fleet) {
+harness::Response hReadPath(harness::Ctx& ctx, hReadWorld& w, const std::string& path, const std::string& fleet) {
   auto c = ctx.HTTP(w.svr);
-  std::string path = "/v1/devices/" + device + "/series?metric=temp_c&to=" + std::to_string(to);
-  if (from) path += "&from=" + std::to_string(*from);
   if (fleet.empty()) return c.Get(path);
   return c.Get(path, "X-Fleet-Id", fleet);
 }
 
-json body(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
+harness::Response hReadGet(harness::Ctx& ctx, hReadWorld& w, const std::string& device, std::optional<long long> from, std::optional<long long> to, const std::string& fleet) {
+  std::string path = "/v1/devices/" + device + "/series?metric=temp_c";
+  if (to) path += "&to=" + std::to_string(*to);
+  if (from) path += "&from=" + std::to_string(*from);
+  return hReadPath(ctx, w, path, fleet);
+}
 
-json field(const json& j, const std::string& name) { return j.is_object() && j.contains(name) ? j[name] : json(); }
+json hBody(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
 
-long long nowSeconds(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
+json hField(const json& j, const std::string& name) { return j.is_object() && j.contains(name) ? j[name] : json(); }
+
+long long hNowSeconds(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const long long now = nowSeconds(ctx);
-  ReadWorld& w = readWorld(ctx);
+  const long long now = hNowSeconds(ctx);
+  hReadWorld& w = hFreshWorld(ctx);
   w.peer.series["d-1/temp_c"] = {{now - 300, 20.0}, {now - 200, 21.0}, {now - 100, 22.0}};
-  const auto r = readGet(ctx, w, "d-1", now - 3600, now, "f-1");
+  const auto r = hReadGet(ctx, w, "d-1", now - 3600, now, "f-1");
   ctx.Equal(r.Status, 200, "GET /v1/devices/d-1/series (%s)", r.Text());
   const json want = json::array({{{"ts", now - 300}, {"value", 20.0}}, {{"ts", now - 200}, {"value", 21.0}}, {{"ts", now - 100}, {"value", 22.0}}});
-  ctx.Equal(field(body(r), "points"), want, "the series must be d-1's three points in time order");
+  ctx.Equal(hField(hBody(r), "points"), want, "the series must be d-1's three points in time order");
 }
 
 void CheckFleetScope(harness::Ctx& ctx) {
-  const long long now = nowSeconds(ctx);
-  ReadWorld& w = readWorld(ctx);
+  const long long now = hNowSeconds(ctx);
+  hReadWorld& w = hFreshWorld(ctx);
   w.peer.series["d-9/temp_c"] = {{now - 60, 30.0}};
-  const auto anonymous = readGet(ctx, w, "d-1", now - 3600, now, "");
-  const auto foreign = readGet(ctx, w, "d-9", now - 3600, now, "f-1");
-  const auto unknown = readGet(ctx, w, "d-404", now - 3600, now, "f-1");
+  const auto anonymous = hReadGet(ctx, w, "d-1", now - 3600, now, "");
+  const auto smuggled = hReadPath(ctx, w, "/v1/devices/d-1/series?metric=temp_c&from=" + std::to_string(now - 3600) + "&to=" + std::to_string(now) + "&fleet=f-1&fleet_id=f-1", "");
+  const auto foreign = hReadGet(ctx, w, "d-9", now - 3600, now, "f-1");
+  const auto unknown = hReadGet(ctx, w, "d-404", now - 3600, now, "f-1");
   ctx.Equal(anonymous.Status, 401, "a request without X-Fleet-Id");
+  ctx.Equal(smuggled.Status, 401, "a request without X-Fleet-Id but with fleet=f-1 in the query (the fleet comes from the header only)");
   ctx.Equal(foreign.Status, 404, "fleet f-1 asking for d-9, a device of fleet f-2, must look exactly like an unknown device (%s)", foreign.Text());
   ctx.Equal(unknown.Status, 404, "an unknown device");
-  for (const auto& call : ctx.GRPC.CallsTo("Query")) {
-    ctx.Assert(call.Request<tsdb::QueryRequest>().device_id() != "d-9", "the store was queried for another fleet's device: decide the fleet before Query");
-  }
+  const auto masked = [](std::string text, const std::string& id) {
+    for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "<id>");
+    return text;
+  };
+  ctx.Equal(masked(foreign.Text(), "d-9"), masked(unknown.Text(), "d-404"), "another fleet's device and an unknown one must answer alike, or the difference tells a caller the id exists; the bodies");
+  std::vector<std::string> asked;
+  for (const auto& call : ctx.GRPC.CallsTo("Query")) asked.push_back(call.Request<tsdb::QueryRequest>().device_id());
+  ctx.Assert(asked.empty(), "the store was queried for %v: the fleet and the device are decided before Query", asked);
 }
 
 void CheckRangeCap(harness::Ctx& ctx) {
-  const long long now = nowSeconds(ctx);
-  ReadWorld& w = readWorld(ctx);
+  const long long now = hNowSeconds(ctx);
+  hReadWorld& w = hFreshWorld(ctx);
   w.peer.series["d-1/temp_c"] = {{now - 100, 20.0}};
-  const auto longRange = readGet(ctx, w, "d-1", now - 2 * 86400, now, "f-1");
-  const auto openEnded = readGet(ctx, w, "d-1", std::nullopt, now, "f-1");
-  const auto empty = readGet(ctx, w, "d-1", now, now, "f-1");
+  const auto longRange = hReadGet(ctx, w, "d-1", now - 2 * 86400, now, "f-1");
+  const auto justOver = hReadGet(ctx, w, "d-1", now - 86401, now, "f-1");
+  const auto openEnded = hReadGet(ctx, w, "d-1", std::nullopt, now, "f-1");
+  const auto noEnd = hReadGet(ctx, w, "d-1", now - 3600, std::nullopt, "f-1");
+  const auto empty = hReadGet(ctx, w, "d-1", now, now, "f-1");
+  const auto backwards = hReadGet(ctx, w, "d-1", now, now - 3600, "f-1");
+  const auto noMetric = hReadPath(ctx, w, "/v1/devices/d-1/series?from=" + std::to_string(now - 3600) + "&to=" + std::to_string(now), "f-1");
   const size_t before = ctx.GRPC.CallsTo("Query").size();
-  const auto day = readGet(ctx, w, "d-1", now - 86400, now, "f-1");
+  const auto day = hReadGet(ctx, w, "d-1", now - 86400, now, "f-1");
   ctx.Equal(longRange.Status, 400, "a two-day range (the cap is 24 hours)");
+  ctx.Equal(justOver.Status, 400, "a range of 86401 s (the cap is kMaxRangeS = 86400)");
   ctx.Equal(openEnded.Status, 400, "a request without from (a missing bound is not 'since 1970')");
+  ctx.Equal(noEnd.Status, 400, "a request without to (from and to are both required)");
   ctx.Equal(empty.Status, 400, "a range with to == from");
+  ctx.Equal(backwards.Status, 400, "a range with to an hour before from");
+  ctx.Equal(noMetric.Status, 400, "a request without metric");
   ctx.Equal(before, 0, "ranges that must be refused never reach the store: the cap is decided before Query; Query calls");
   ctx.Equal(day.Status, 200, "exactly 24 hours (%s)", day.Text());
 }
 
 void CheckDownsample(harness::Ctx& ctx) {
-  const long long now = nowSeconds(ctx);
-  ReadWorld& w = readWorld(ctx);
+  const long long now = hNowSeconds(ctx);
+  hReadWorld& w = hFreshWorld(ctx);
   std::vector<std::pair<long long, double>> raw;
   for (int i = 0; i < 5000; i++) raw.push_back({now - 5000 + i, 20 + (i % 7) * 0.1});
   const long long spike_ts = raw[2503].first;
+  const long long dip_ts = raw[4101].first;
   raw[2503].second = 80;
+  raw[4101].second = -30;
   w.peer.series["d-1/temp_c"] = raw;
-  const auto r = readGet(ctx, w, "d-1", now - 6000, now, "f-1");
+  std::vector<std::pair<long long, double>> fitting;
+  for (int i = 0; i < 1000; i++) fitting.push_back({now - 1000 + i, 20 + (i % 7) * 0.1});
+  w.peer.series["d-2/temp_c"] = fitting;
+  const auto r = hReadGet(ctx, w, "d-1", now - 6000, now, "f-1");
+  const auto fits = hReadGet(ctx, w, "d-2", now - 6000, now, "f-1");
   ctx.Equal(r.Status, 200, "the series read (%s)", r.Text());
-  const json b = body(r);
-  const json points = field(b, "points");
+  const json b = hBody(r);
+  const json points = hField(b, "points");
   ctx.Assert(points.is_array() && !points.empty() && points.size() <= 1000, "a 5000-point series answered %d points, expected at most kMaxPoints = 1000", points.is_array() ? points.size() : 0);
   bool spike = false;
+  bool dip = false;
   long long last = 0;
   bool ordered = true;
   for (const json& p : points) {
-    const long long ts = field(p, "ts").is_number() ? field(p, "ts").get<long long>() : 0;
-    spike = spike || (ts == spike_ts && field(p, "value") == 80);
+    const long long ts = hField(p, "ts").is_number() ? hField(p, "ts").get<long long>() : 0;
+    spike = spike || (ts == spike_ts && hField(p, "value") == 80);
+    dip = dip || (ts == dip_ts && hField(p, "value") == -30);
     ordered = ordered && ts >= last;
     last = ts;
   }
   ctx.Assert(spike, "the spike to 80 is missing from the downsampled series: keep each bucket's lowest and highest point, not every n-th one");
+  ctx.Assert(dip, "the dip to -30 is missing from the downsampled series: each bucket keeps its lowest point as well as its highest");
   ctx.Assert(ordered, "the downsampled points must stay in time order");
-  ctx.Equal(field(field(b, "downsample"), "method"), json("minmax"), "the response must name the method; downsample.method");
+  ctx.Equal(hField(hField(b, "downsample"), "method"), json("minmax"), "the response must name the method; downsample.method");
+  ctx.Equal(hField(hField(b, "downsample"), "points"), json(points.is_array() ? points.size() : 0), "downsample.points must count the points the response carries");
+  ctx.Equal(fits.Status, 200, "the 1000-point series read (%s)", fits.Text());
+  const json fitsBody = hBody(fits);
+  const json fitsPoints = hField(fitsBody, "points");
+  ctx.Assert(fitsPoints.is_array() && fitsPoints.size() == 1000 && hField(fitsBody, "downsample").is_null(), "a series of exactly kMaxPoints = 1000 points fits: expected all 1000 points and downsample null, got %d points and downsample %s", fitsPoints.is_array() ? fitsPoints.size() : 0, hField(fitsBody, "downsample").dump());
 }
 
 void CheckStaleness(harness::Ctx& ctx) {
-  const long long now = nowSeconds(ctx);
-  ReadWorld& w = readWorld(ctx);
+  const long long now = hNowSeconds(ctx);
+  hReadWorld& w = hFreshWorld(ctx);
   w.peer.series["d-1/temp_c"] = {{now - 900, 20.0}, {now - 600, 21.0}};
-  w.peer.series["d-2/temp_c"] = {{now - 30, 22.0}};
-  const json silent = body(readGet(ctx, w, "d-1", now - 3600, now, "f-1"));
-  const json live = body(readGet(ctx, w, "d-2", now - 3600, now, "f-1"));
-  const json empty = body(readGet(ctx, w, "d-2", now - 7200, now - 3600, "f-1"));
-  ctx.Assert(field(silent, "age_seconds") == 600 && field(silent, "stale") == true, "d-1's newest point is 600 s old: expected age_seconds 600 and stale true, got %s", silent.dump());
-  ctx.Assert(field(live, "age_seconds") == 30 && field(live, "stale") == false, "d-2's newest point is 30 s old: expected age_seconds 30 and stale false, got %s", live.dump());
-  ctx.Assert(empty.is_object() && empty.contains("age_seconds") && empty["age_seconds"].is_null() && field(empty, "stale") == true, "a range with no points must answer age_seconds null and stale true, got %s", empty.dump());
+  w.peer.series["d-2/temp_c"] = {{now - 300, 21.5}, {now - 30, 22.0}};
+  const json silent = hBody(hReadGet(ctx, w, "d-1", now - 3600, now, "f-1"));
+  const json live = hBody(hReadGet(ctx, w, "d-2", now - 3600, now, "f-1"));
+  const json edge = hBody(hReadGet(ctx, w, "d-2", now - 3600, now - 200, "f-1"));
+  const json empty = hBody(hReadGet(ctx, w, "d-2", now - 7200, now - 3600, "f-1"));
+  ctx.Assert(hField(silent, "age_seconds") == 600 && hField(silent, "stale") == true, "d-1's newest point is 600 s old: expected age_seconds 600 and stale true, got %s", silent.dump());
+  ctx.Assert(hField(live, "age_seconds") == 30 && hField(live, "stale") == false, "d-2's newest point is 30 s old: expected age_seconds 30 and stale false, got %s", live.dump());
+  ctx.Assert(hField(edge, "age_seconds") == 300 && hField(edge, "stale") == false, "a range ending 200 s ago whose newest point is 300 s old: expected age_seconds 300 (now minus that point) and stale false (stale is older than kStaleAfterS = 300), got %s", edge.dump());
+  ctx.Assert(empty.is_object() && empty.contains("age_seconds") && empty["age_seconds"].is_null() && hField(empty, "stale") == true, "a range with no points must answer age_seconds null and stale true, got %s", empty.dump());
 }
 `,
   },

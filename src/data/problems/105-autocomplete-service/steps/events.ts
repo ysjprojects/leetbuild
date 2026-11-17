@@ -85,7 +85,7 @@ leader failover loses one; and a delivery that fails after \`produce\` returned 
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'The delivery report decides (`on_delivery` and a bounded `flush`, an awaited `send`, the delivery channel, `dr_cb`, the send future): a failed delivery or no report within 2 s leaves an outbox row and returns false. Catching an exception around `produce` sees only local enqueue errors.',
+        'The delivery report decides (`on_delivery` and a bounded `flush`, an awaited `send`, the delivery channel, `dr_cb`, the send future): an acknowledged delivery returns true and leaves no outbox row; a failed delivery or no report within 2 s leaves one row carrying the event payload and returns false. Catching an exception around `produce` sees only local enqueue errors.',
       match: {
         python: {
           all: [/outbox\.insert\(/, /\.flush\(/, /on_delivery\s*=|callback\s*=/],
@@ -544,18 +544,23 @@ def check_idempotent_producer(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
+    ok = m.publish_event("acme", "impression", "kettle", 0, 15)
+    assert ok is True and len(ctx.kafka.records(TOPIC)) == 1, f"a delivery the broker acknowledged returned {ok!r} with {len(ctx.kafka.records(TOPIC))} records on {TOPIC}, expected True and one record"
+    assert _outbox(ctx) == [], f"a delivery the broker acknowledged left outbox rows {_outbox(ctx)}: the relay would publish the event a second time"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish_event("acme", "selection", "kettle", 2, 340)
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: the event is lost from every trend count"
     row = rows[0]
     assert row.get("topic") == TOPIC and row.get("key") == "acme" and row.get("payload", {}).get("prefix_hash") == prefix_hash("acme", "kettle"), f"the outbox row is {row}, expected the topic, the key acme and the payload"
+    payload = row.get("payload", {})
+    assert "kettle" not in json.dumps(row) and payload.get("type") == "selection" and payload.get("position") == 2 and payload.get("latency_ms") == 340, f"the outbox row is {row}, expected the payload the topic would have carried: prefix_hash and no prefix text"
     assert ok is False, f"publish_event returned {ok!r} after a failed delivery, expected False"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_event("acme", "impression", "ke", 0, 12)
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_event waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_event waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("prefix_hash") == prefix_hash("acme", "ke"), f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_event returned {ok!r} without a delivery report, expected False"
@@ -614,18 +619,24 @@ export async function check_idempotent_producer(ctx) {
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
   const {prefixHash} = ctx.load('/support/suggest/privacy.ts');
+  let ok = await m.publishEvent('acme', 'impression', 'kettle', 0, 15);
+  await settle();
+  assert(ok === true && ctx.kafka.records(TOPIC).length === 1, \`a delivery the broker acknowledged resolved \${JSON.stringify(ok)} with \${ctx.kafka.records(TOPIC).length} records on \${TOPIC}, expected true and one record\`);
+  assert.deepStrictEqual(outboxRows(ctx), [], \`a delivery the broker acknowledged left outbox rows \${JSON.stringify(outboxRows(ctx))}: the relay would publish the event a second time\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publishEvent('acme', 'selection', 'kettle', 2, 340);
+  ok = await m.publishEvent('acme', 'selection', 'kettle', 2, 340);
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: the event is lost from every trend count\`);
   assert(rows[0].topic === TOPIC && rows[0].key === 'acme' && rows[0].payload?.prefix_hash === prefixHash('acme', 'kettle'), \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key acme and the payload\`);
+  const payload = rows[0].payload ?? {};
+  assert(!JSON.stringify(rows[0]).includes('kettle') && payload.type === 'selection' && payload.position === 2 && payload.latency_ms === 340, \`the outbox row is \${JSON.stringify(rows[0])}, expected the payload the topic would have carried: prefix_hash and no prefix text\`);
   assert.equal(ok, false, \`publishEvent resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   ok = await m.publishEvent('acme', 'impression', 'ke', 0, 12);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishEvent waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishEvent waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.prefix_hash === prefixHash('acme', 'ke'), \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishEvent resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -693,18 +704,24 @@ func CheckIdempotentProducer(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
+	ok := evPublish(ctx, "acme", "impression", "kettle", 0, 15)
+	ctx.Settle()
+	ctx.Assert(ok && len(ctx.Kafka.Records(evTopic)) == 1, "a delivery the broker acknowledged returned %v with %d records on suggest.event, expected true and one record", ok, len(ctx.Kafka.Records(evTopic)))
+	ctx.Equal(len(outbox.Rows(evBg)), 0, "a delivery the broker acknowledged must leave no outbox row, or the relay publishes the event a second time; the rows")
 	ctx.Kafka.FailNext(evTopic, 1)
-	ok := evPublish(ctx, "acme", "selection", "kettle", 2, 340)
+	ok = evPublish(ctx, "acme", "selection", "kettle", 2, 340)
 	ctx.Settle()
 	rows := outbox.Rows(evBg)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the event is lost from every trend count; the rows")
 	ctx.Assert(rows[0].Topic == evTopic && rows[0].Key == "acme" && rows[0].Payload["prefix_hash"] == privacy.PrefixHash("acme", "kettle"), "the outbox row is %+v, expected the topic, the key acme and the payload", rows[0])
+	rowJSON, _ := json.Marshal(rows[0])
+	ctx.Assert(!strings.Contains(string(rowJSON), "kettle") && rows[0].Payload["type"] == "selection" && rows[0].Payload["position"] == 2.0 && rows[0].Payload["latency_ms"] == 340.0, "the outbox row is %s, expected the payload the topic would have carried: prefix_hash and no prefix text", rowJSON)
 	ctx.Equal(ok, false, "publishEvent's result after a failed delivery")
 	ctx.Kafka.Stall(evTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	ok = evPublish(ctx, "acme", "impression", "ke", 0, 12)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = outbox.Rows(evBg)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["prefix_hash"] == privacy.PrefixHash("acme", "ke"), "no delivery report within the window and the outbox holds %+v", rows)
 	ctx.Equal(ok, false, "publishEvent's result without a delivery report")
@@ -772,20 +789,28 @@ void CheckIdempotentProducer(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  bool ok = publishEvent("acme", "impression", "kettle", 0, 15);
+  ctx.Settle();
+  ctx.Assert(ok && ctx.Kafka.Records(kEvTopic).size() == 1, "a delivery the broker acknowledged returned %v with %d records on suggest.event, expected true and one record", ok, ctx.Kafka.Records(kEvTopic).size());
+  ctx.Equal(outbox::rows().size(), 0, "a delivery the broker acknowledged must leave no outbox row, or the relay publishes the event a second time; the rows");
   ctx.Kafka.FailNext(kEvTopic, 1);
-  bool ok = publishEvent("acme", "selection", "kettle", 2, 340);
+  ok = publishEvent("acme", "selection", "kettle", 2, 340);
   ctx.Settle();
   auto rows = outbox::rows();
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the event is lost from every trend count; the rows");
   ctx.Assert(evField(rows[0], "topic") == kEvTopic && evField(rows[0], "key") == "acme" && rows[0].contains("payload") &&
                  evField(rows[0]["payload"], "prefix_hash") == privacy::prefixHash("acme", "kettle"),
              "the outbox row is %s, expected the topic, the key acme and the payload", rows[0].dump());
+  const auto& payload = rows[0]["payload"];
+  ctx.Assert(rows[0].dump().find("kettle") == std::string::npos && evField(payload, "type") == "selection" && payload.value("position", -1) == 2 &&
+                 payload.value("latency_ms", -1) == 340,
+             "the outbox row is %s, expected the payload the topic would have carried: prefix_hash and no prefix text", rows[0].dump());
   ctx.Equal(ok, false, "publishEvent's result after a failed delivery");
   ctx.Kafka.Stall(kEvTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   ok = publishEvent("acme", "impression", "ke", 0, 12);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishEvent waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishEvent waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = outbox::rows();
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && evField(rows[1]["payload"], "prefix_hash") == privacy::prefixHash("acme", "ke"),
              "no delivery report within the window and the outbox holds %d rows", rows.size());

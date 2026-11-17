@@ -25,7 +25,7 @@ execution no device has confirmed.
 - Store \`expires_at_ms\` = now + \`validity_s\` × 1000; a \`validity_s\` outside 1..3600 is **400**, a
   replay after the window is **410** with \`state: "expired"\`.
 - At most \`COMMAND_RATE_LIMIT\` = 10 commands per device per 60 s
-  (\`commands.count_in_window(device_id, 60)\`), **429** past it, before anything is queued.
+  (\`commands.count_in_window(device_id, 60)\`), **429** past it, before anything is recorded or queued.
 - Answer **202** with \`state: "pending_ack"\`, or \`"queued"\` when \`ack_required\` is false.`,
   sequence: {
     participants: ['Operator', 'iothub', 'Command store'],
@@ -84,7 +84,7 @@ execution no device has confirmed.
       id: 'window',
       title: 'Records a validity window and refuses replays past it',
       detail:
-        'The command carries `expires_at_ms` = now + `validity_s` × 1000, a `validity_s` outside 1..3600 is 400, and a replay after the window is 410 `expired`; the starter records no window at all.',
+        'The command carries `expires_at_ms` = now + `validity_s` × 1000; a `validity_s` outside 1..3600 (both ends allowed) is 400 and records nothing; a replay inside the window answers the recorded command and one after it is 410 `expired`. The starter records no window at all.',
       match: {
         python: {all: [/expires_at_ms/, /\b410\b/, /\b400\b/]},
         typescript: {all: [/expires_at_ms:/, /code\(\s*410\s*\)/, /code\(\s*400\s*\)/]},
@@ -97,7 +97,7 @@ execution no device has confirmed.
       id: 'rate-limit',
       title: 'Caps each device at 10 commands a minute',
       detail:
-        'Every new command is counted per device with `count_in_window(device_id, 60)`; past `COMMAND_RATE_LIMIT` = 10 the answer is 429 and nothing is queued. The starter counts nothing.',
+        'Every new command is counted per device with `count_in_window(device_id, 60)`; past `COMMAND_RATE_LIMIT` = 10 the answer is 429, and nothing is recorded or queued. A replay is looked up before the count, so it still answers its recorded command once the budget is spent. The starter counts nothing.',
       match: {
         python: {
           all: [/COMMAND_RATE_LIMIT\s*=\s*10\b/, /commands\.count_in_window\(/, /\b429\b/],
@@ -125,7 +125,7 @@ execution no device has confirmed.
       id: 'ack',
       title: 'Answers pending_ack until the device acknowledges',
       detail:
-        'A new command answers 202 with `state: "pending_ack"` (`"queued"` when no acknowledgement is expected) and is recorded in that state; the starter answers 200 `executed` before any device has spoken.',
+        'A new command answers 202 with `state: "pending_ack"` (`"queued"` when no acknowledgement is expected) and is recorded in that state with its `ack_required`; the starter answers 200 `executed` before any device has spoken.',
       match: {
         python: {all: [/["']pending_ack["']/, /status_code\s*=\s*202/], none: [/["']executed["']/]},
         typescript: {all: [/['"]pending_ack['"]/, /code\(\s*202\s*\)/], none: [/['"]executed['"]/]},
@@ -692,10 +692,17 @@ async def check_window(ctx):
         assert r.json().get("expires_at_ms") == now_ms + 60_000, f"a command with validity_s=60 answered expires_at_ms={r.json().get('expires_at_ms')!r}, expected {now_ms + 60_000} (now + 60 s): without a window a command for an offline lock fires whenever it reconnects"
         recorded = commands.lookup(LOCK, "k-1")
         assert recorded is not None and recorded["expires_at_ms"] == now_ms + 60_000, f"the command store holds {recorded}, expected expires_at_ms {now_ms + 60_000}"
-        for bad in (0, 7200):
+        for bad in (0, 3601, 7200):
             r = await _submit(c, f"k-bad-{bad}", validity_s=bad)
             assert r.status_code == 400, f"validity_s={bad} answered {r.status_code}, expected 400: the window is 1 to 3600 s"
-        ctx.clock.advance(61)
+            assert commands.lookup(LOCK, f"k-bad-{bad}") is None, f"validity_s={bad} was refused but a command was recorded under ({LOCK}, k-bad-{bad}): a refused request records nothing"
+        for edge in (1, 3600):
+            r = await _submit(c, f"k-edge-{edge}", device="lock-9", validity_s=edge)
+            assert _ok(r), f"validity_s={edge} answered {r.status_code}: {r.text}. The window is 1 to 3600 s, both ends included"
+        ctx.clock.advance(59)
+        early = await _submit(c, "k-1")
+        assert _ok(early) and early.json().get("command_id") == recorded["command_id"], f"a replay 59 s into a 60 s window answered {early.status_code} {early.text}, expected the recorded command"
+        ctx.clock.advance(2)
         late = await _submit(c, "k-1")
     assert late.status_code == 410 and late.json().get("state") == "expired", f"a replay after the window answered {late.status_code} {late.text}, expected 410 with state expired"
     assert len(_queue(ctx)) == 1, f"the delivery queue holds {len(_queue(ctx))} commands: neither a refused nor an expired command may be queued"
@@ -709,6 +716,10 @@ async def check_rate_limit(ctx):
         over = await _submit(c, "k-10")
         assert over.status_code == 429, f"the 11th command for {LOCK} within a minute answered {over.status_code}, expected 429: one integration can flood a device"
         assert len(_queue(ctx)) == 10, f"{len(_queue(ctx))} commands reached the delivery queue: a refused command must not be queued"
+        assert commands.lookup(LOCK, "k-10") is None, f"the refused 11th command was recorded under ({LOCK}, k-10): a refused request records nothing, or its replay answers a command that was never queued"
+        replay = await _submit(c, "k-0")
+        assert _ok(replay) and replay.json().get("command_id") == commands.lookup(LOCK, "k-0")["command_id"], f"a replay of the first command, once the budget was spent, answered {replay.status_code} {replay.text}: the replay is looked up before the budget is counted and answers the recorded command"
+        assert len(_queue(ctx)) == 10, f"after a replay the delivery queue holds {len(_queue(ctx))} commands, expected 10"
         other = await _submit(c, "k-0", device="lock-9")
         assert _ok(other), f"another device's first command answered {other.status_code}: the budget is per device"
         ctx.clock.advance(60)
@@ -724,6 +735,8 @@ async def check_ack(ctx):
     assert fire.status_code == 202 and fire.json().get("state") == "queued", f"a command without acknowledgement answered {fire.status_code} with state {fire.json().get('state')!r}, expected 202 queued"
     stored = commands.lookup(LOCK, "k-1")
     assert stored is not None and stored["state"] == "pending_ack" and stored["ack_required"] is True, f"the command store holds {stored} under ({LOCK}, k-1), expected state pending_ack with ack_required"
+    stored = commands.lookup(LOCK, "k-2")
+    assert stored is not None and stored["state"] == "queued" and stored["ack_required"] is False, f"the command store holds {stored} under ({LOCK}, k-2), expected state queued without ack_required"
 `,
     typescript: `const LOCK = 'lock-7';
 
@@ -772,18 +785,26 @@ export async function check_window(ctx) {
   assert.equal(r.json().expires_at_ms, nowMs + 60_000, \`a command with validity_s=60 answered expires_at_ms=\${r.json().expires_at_ms}, expected now + 60 s: without a window a command for an offline lock fires whenever it reconnects\`);
   const recorded = await commands.lookup(LOCK, 'k-1');
   assert(recorded !== null && recorded.expires_at_ms === nowMs + 60_000, \`the command store holds \${JSON.stringify(recorded)}, expected expires_at_ms \${nowMs + 60_000}\`);
-  for (const bad of [0, 7200]) {
+  for (const bad of [0, 3601, 7200]) {
     r = await submit(c, \`k-bad-\${bad}\`, {validity_s: bad});
     assert.equal(r.status, 400, \`validity_s=\${bad} answered \${r.status}, expected 400: the window is 1 to 3600 s\`);
+    assert.equal(await commands.lookup(LOCK, \`k-bad-\${bad}\`), null, \`validity_s=\${bad} was refused but a command was recorded under (\${LOCK}, k-bad-\${bad}): a refused request records nothing\`);
   }
-  ctx.clock.advance(61);
+  for (const edge of [1, 3600]) {
+    r = await submit(c, \`k-edge-\${edge}\`, {validity_s: edge}, 'lock-9');
+    assert(ok(r), \`validity_s=\${edge} answered \${r.status}: \${r.text}. The window is 1 to 3600 s, both ends included\`);
+  }
+  ctx.clock.advance(59);
+  const early = await submit(c, 'k-1');
+  assert(ok(early) && early.json().command_id === recorded.command_id, \`a replay 59 s into a 60 s window answered \${early.status} \${early.text}, expected the recorded command\`);
+  ctx.clock.advance(2);
   const late = await submit(c, 'k-1');
   assert(late.status === 410 && late.json().state === 'expired', \`a replay after the window answered \${late.status} \${late.text}, expected 410 with state expired\`);
   assert.equal(queue(ctx).length, 1, \`the delivery queue holds \${queue(ctx).length} commands: neither a refused nor an expired command may be queued\`);
 }
 
 export async function check_rate_limit(ctx) {
-  const {c} = api(ctx);
+  const {c, commands} = api(ctx);
   for (let n = 0; n < 10; n += 1) {
     const r = await submit(c, \`k-\${n}\`);
     assert(ok(r), \`command \${n + 1} of 10 within one minute answered \${r.status}: \${r.text}\`);
@@ -791,6 +812,11 @@ export async function check_rate_limit(ctx) {
   const over = await submit(c, 'k-10');
   assert.equal(over.status, 429, \`the 11th command for \${LOCK} within a minute answered \${over.status}, expected 429: one integration can flood a device\`);
   assert.equal(queue(ctx).length, 10, \`\${queue(ctx).length} commands reached the delivery queue: a refused command must not be queued\`);
+  assert.equal(await commands.lookup(LOCK, 'k-10'), null, \`the refused 11th command was recorded under (\${LOCK}, k-10): a refused request records nothing, or its replay answers a command that was never queued\`);
+  const replay = await submit(c, 'k-0');
+  const first = await commands.lookup(LOCK, 'k-0');
+  assert(ok(replay) && first !== null && replay.json().command_id === first.command_id, \`a replay of the first command, once the budget was spent, answered \${replay.status} \${replay.text}: the replay is looked up before the budget is counted and answers the recorded command\`);
+  assert.equal(queue(ctx).length, 10, \`after a replay the delivery queue holds \${queue(ctx).length} commands, expected 10\`);
   const other = await submit(c, 'k-0', {}, 'lock-9');
   assert(ok(other), \`another device's first command answered \${other.status}: the budget is per device\`);
   ctx.clock.advance(60);
@@ -804,8 +830,10 @@ export async function check_ack(ctx) {
   const fire = await submit(c, 'k-2', {ack_required: false});
   assert(r.status === 202 && r.json().state === 'pending_ack', \`a command that expects an acknowledgement answered \${r.status} with state \${r.json().state}, expected 202 pending_ack: nothing has run on the device yet\`);
   assert(fire.status === 202 && fire.json().state === 'queued', \`a command without acknowledgement answered \${fire.status} with state \${fire.json().state}, expected 202 queued\`);
-  const stored = await commands.lookup(LOCK, 'k-1');
+  let stored = await commands.lookup(LOCK, 'k-1');
   assert(stored !== null && stored.state === 'pending_ack' && stored.ack_required === true, \`the command store holds \${JSON.stringify(stored)} under (\${LOCK}, k-1), expected state pending_ack with ack_required\`);
+  stored = await commands.lookup(LOCK, 'k-2');
+  assert(stored !== null && stored.state === 'queued' && stored.ack_required === false, \`the command store holds \${JSON.stringify(stored)} under (\${LOCK}, k-2), expected state queued without ack_required\`);
 }
 `,
     go: `package main
@@ -820,9 +848,9 @@ import (
 	"leetbuild/harness"
 )
 
-const lockID = "lock-7"
+const hLockID = "lock-7"
 
-type commandReply struct {
+type hCommandReply struct {
 	CommandID   string \`json:"command_id"\`
 	DeviceID    string \`json:"device_id"\`
 	Action      string \`json:"action"\`
@@ -831,13 +859,13 @@ type commandReply struct {
 	AckRequired bool   \`json:"ack_required"\`
 }
 
-func commandsAPI(ctx *harness.Ctx) *harness.HTTP {
+func hCommandsAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func submitTo(c *harness.HTTP, device, idempotencyID string, extra map[string]any) *harness.Response {
+func hSubmitTo(c *harness.HTTP, device, idempotencyID string, extra map[string]any) *harness.Response {
 	body := map[string]any{"idempotency_id": idempotencyID, "action": "unlock", "params": map[string]string{"duration_s": "5"}, "validity_s": 60, "ack_required": true}
 	for k, v := range extra {
 		body[k] = v
@@ -845,84 +873,103 @@ func submitTo(c *harness.HTTP, device, idempotencyID string, extra map[string]an
 	return c.Post("/v1/devices/"+device+"/commands", body)
 }
 
-func replyOf(r *harness.Response) commandReply {
-	var body commandReply
+func hReplyOf(r *harness.Response) hCommandReply {
+	var body hCommandReply
 	r.Decode(&body)
 	return body
 }
 
-func isOK(r *harness.Response) bool { return r.Status >= 200 && r.Status < 300 }
+func hIsOK(r *harness.Response) bool { return r.Status >= 200 && r.Status < 300 }
 
-func queueOf(ctx *harness.Ctx, device string) []string { return ctx.Redis.LRange("device:"+device+":queue", 0, -1) }
+func hQueueOf(ctx *harness.Ctx, device string) []string { return ctx.Redis.LRange("device:"+device+":queue", 0, -1) }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := commandsAPI(ctx)
-	r := submitTo(c, lockID, "k-1", nil)
-	ctx.Assert(isOK(r), "POST /v1/devices/%s/commands answered %d: %s", lockID, r.Status, r.Text())
-	body := replyOf(r)
-	ctx.Assert(body.CommandID != "" && body.DeviceID == lockID && body.Action == "unlock", "the response must carry the command's id, device and action, got %s", r.Text())
-	ctx.Equal(queueOf(ctx, lockID), []string{body.CommandID}, "the delivery queue of %s must hold the new command", lockID)
+	c := hCommandsAPI(ctx)
+	r := hSubmitTo(c, hLockID, "k-1", nil)
+	ctx.Assert(hIsOK(r), "POST /v1/devices/%s/commands answered %d: %s", hLockID, r.Status, r.Text())
+	body := hReplyOf(r)
+	ctx.Assert(body.CommandID != "" && body.DeviceID == hLockID && body.Action == "unlock", "the response must carry the command's id, device and action, got %s", r.Text())
+	ctx.Equal(hQueueOf(ctx, hLockID), []string{body.CommandID}, "the delivery queue of %s must hold the new command", hLockID)
 }
 
 func CheckIdentity(ctx *harness.Ctx) {
-	c := commandsAPI(ctx)
-	first := submitTo(c, lockID, "k-1", nil)
-	replay := submitTo(c, lockID, "k-1", nil)
-	other := submitTo(c, "lock-9", "k-1", nil)
-	ctx.Assert(isOK(first) && isOK(replay), "the request and its replay answered %d and %d", first.Status, replay.Status)
-	a, b := replyOf(first), replyOf(replay)
+	c := hCommandsAPI(ctx)
+	first := hSubmitTo(c, hLockID, "k-1", nil)
+	replay := hSubmitTo(c, hLockID, "k-1", nil)
+	other := hSubmitTo(c, "lock-9", "k-1", nil)
+	ctx.Assert(hIsOK(first) && hIsOK(replay), "the request and its replay answered %d and %d", first.Status, replay.Status)
+	a, b := hReplyOf(first), hReplyOf(replay)
 	ctx.Assert(b.CommandID == a.CommandID, "a replay of idempotency_id k-1 answered command %s, the first request %s: a replay must answer the recorded command", b.CommandID, a.CommandID)
-	ctx.Equal(len(queueOf(ctx, lockID)), 1, "two requests with idempotency_id k-1 must queue one command (the door unlocks once per request); the queued commands")
-	recorded, err := commands.Lookup(context.Background(), lockID, "k-1")
+	ctx.Equal(len(hQueueOf(ctx, hLockID)), 1, "two requests with idempotency_id k-1 must queue one command (the door unlocks once per request); the queued commands")
+	recorded, err := commands.Lookup(context.Background(), hLockID, "k-1")
 	ctx.NoError(err, "commands.Lookup")
-	ctx.Assert(recorded != nil && recorded.CommandID == a.CommandID, "the command store holds %+v under (%s, k-1), expected the command recorded under the caller's idempotency id", recorded, lockID)
-	ctx.Assert(replyOf(other).CommandID != a.CommandID && len(queueOf(ctx, "lock-9")) == 1, "the same idempotency_id on another device is another command: the key is (device, idempotency_id)")
+	ctx.Assert(recorded != nil && recorded.CommandID == a.CommandID, "the command store holds %+v under (%s, k-1), expected the command recorded under the caller's idempotency id", recorded, hLockID)
+	ctx.Assert(hReplyOf(other).CommandID != a.CommandID && len(hQueueOf(ctx, "lock-9")) == 1, "the same idempotency_id on another device is another command: the key is (device, idempotency_id)")
 }
 
 func CheckWindow(ctx *harness.Ctx) {
-	c := commandsAPI(ctx)
+	c := hCommandsAPI(ctx)
 	nowMs := ctx.Clock.Now()
-	r := submitTo(c, lockID, "k-1", map[string]any{"validity_s": 60})
-	ctx.Assert(isOK(r), "a command with validity_s=60 answered %d: %s", r.Status, r.Text())
-	ctx.Equal(replyOf(r).ExpiresAtMs, nowMs+60_000, "a command with validity_s=60 must answer expires_at_ms = now + 60 s (without a window a command for an offline lock fires whenever it reconnects); expires_at_ms")
-	recorded, err := commands.Lookup(context.Background(), lockID, "k-1")
+	r := hSubmitTo(c, hLockID, "k-1", map[string]any{"validity_s": 60})
+	ctx.Assert(hIsOK(r), "a command with validity_s=60 answered %d: %s", r.Status, r.Text())
+	ctx.Equal(hReplyOf(r).ExpiresAtMs, nowMs+60_000, "a command with validity_s=60 must answer expires_at_ms = now + 60 s (without a window a command for an offline lock fires whenever it reconnects); expires_at_ms")
+	recorded, err := commands.Lookup(context.Background(), hLockID, "k-1")
 	ctx.NoError(err, "commands.Lookup")
 	ctx.Assert(recorded != nil && recorded.ExpiresAtMs == nowMs+60_000, "the command store holds %+v, expected expires_at_ms %d", recorded, nowMs+60_000)
-	for _, bad := range []int{0, 7200} {
-		r = submitTo(c, lockID, fmt.Sprintf("k-bad-%d", bad), map[string]any{"validity_s": bad})
+	for _, bad := range []int{0, 3601, 7200} {
+		idem := fmt.Sprintf("k-bad-%d", bad)
+		r = hSubmitTo(c, hLockID, idem, map[string]any{"validity_s": bad})
 		ctx.Equal(r.Status, 400, "validity_s=%d must be refused (the window is 1 to 3600 s); the status", bad)
+		refused, _ := commands.Lookup(context.Background(), hLockID, idem)
+		ctx.Assert(refused == nil, "validity_s=%d was refused but a command was recorded under (%s, %s): a refused request records nothing", bad, hLockID, idem)
 	}
-	ctx.Clock.Advance(61)
-	late := submitTo(c, lockID, "k-1", nil)
-	ctx.Assert(late.Status == 410 && replyOf(late).State == "expired", "a replay after the window answered %d %s, expected 410 with state expired", late.Status, late.Text())
-	ctx.Equal(len(queueOf(ctx, lockID)), 1, "neither a refused nor an expired command may be queued; the queued commands")
+	for _, edge := range []int{1, 3600} {
+		r = hSubmitTo(c, "lock-9", fmt.Sprintf("k-edge-%d", edge), map[string]any{"validity_s": edge})
+		ctx.Assert(hIsOK(r), "validity_s=%d answered %d: %s. The window is 1 to 3600 s, both ends included", edge, r.Status, r.Text())
+	}
+	ctx.Clock.Advance(59)
+	early := hSubmitTo(c, hLockID, "k-1", nil)
+	ctx.Assert(hIsOK(early) && recorded != nil && hReplyOf(early).CommandID == recorded.CommandID, "a replay 59 s into a 60 s window answered %d %s, expected the recorded command", early.Status, early.Text())
+	ctx.Clock.Advance(2)
+	late := hSubmitTo(c, hLockID, "k-1", nil)
+	ctx.Assert(late.Status == 410 && hReplyOf(late).State == "expired", "a replay after the window answered %d %s, expected 410 with state expired", late.Status, late.Text())
+	ctx.Equal(len(hQueueOf(ctx, hLockID)), 1, "neither a refused nor an expired command may be queued; the queued commands")
 }
 
 func CheckRateLimit(ctx *harness.Ctx) {
-	c := commandsAPI(ctx)
+	c := hCommandsAPI(ctx)
 	for n := 0; n < 10; n++ {
-		r := submitTo(c, lockID, fmt.Sprintf("k-%d", n), nil)
-		ctx.Assert(isOK(r), "command %d of 10 within one minute answered %d: %s", n+1, r.Status, r.Text())
+		r := hSubmitTo(c, hLockID, fmt.Sprintf("k-%d", n), nil)
+		ctx.Assert(hIsOK(r), "command %d of 10 within one minute answered %d: %s", n+1, r.Status, r.Text())
 	}
-	over := submitTo(c, lockID, "k-10", nil)
-	ctx.Equal(over.Status, 429, "the 11th command for %s within a minute must be refused (one integration can flood a device); the status", lockID)
-	ctx.Equal(len(queueOf(ctx, lockID)), 10, "a refused command must not be queued; the queued commands")
-	other := submitTo(c, "lock-9", "k-0", nil)
-	ctx.Assert(isOK(other), "another device's first command answered %d: the budget is per device", other.Status)
+	over := hSubmitTo(c, hLockID, "k-10", nil)
+	ctx.Equal(over.Status, 429, "the 11th command for %s within a minute must be refused (one integration can flood a device); the status", hLockID)
+	ctx.Equal(len(hQueueOf(ctx, hLockID)), 10, "a refused command must not be queued; the queued commands")
+	refused, _ := commands.Lookup(context.Background(), hLockID, "k-10")
+	ctx.Assert(refused == nil, "the refused 11th command was recorded under (%s, k-10): a refused request records nothing, or its replay answers a command that was never queued", hLockID)
+	replay := hSubmitTo(c, hLockID, "k-0", nil)
+	first, _ := commands.Lookup(context.Background(), hLockID, "k-0")
+	ctx.Assert(hIsOK(replay) && first != nil && hReplyOf(replay).CommandID == first.CommandID, "a replay of the first command, once the budget was spent, answered %d %s: the replay is looked up before the budget is counted and answers the recorded command", replay.Status, replay.Text())
+	ctx.Equal(len(hQueueOf(ctx, hLockID)), 10, "a replay must queue nothing; the queued commands")
+	other := hSubmitTo(c, "lock-9", "k-0", nil)
+	ctx.Assert(hIsOK(other), "another device's first command answered %d: the budget is per device", other.Status)
 	ctx.Clock.Advance(60)
-	later := submitTo(c, lockID, "k-11", nil)
-	ctx.Assert(isOK(later), "a command in the next minute answered %d: the window must roll over", later.Status)
+	later := hSubmitTo(c, hLockID, "k-11", nil)
+	ctx.Assert(hIsOK(later), "a command in the next minute answered %d: the window must roll over", later.Status)
 }
 
 func CheckAck(ctx *harness.Ctx) {
-	c := commandsAPI(ctx)
-	r := submitTo(c, lockID, "k-1", map[string]any{"ack_required": true})
-	fire := submitTo(c, lockID, "k-2", map[string]any{"ack_required": false})
-	ctx.Assert(r.Status == 202 && replyOf(r).State == "pending_ack", "a command that expects an acknowledgement answered %d %s, expected 202 with state pending_ack: nothing has run on the device yet", r.Status, r.Text())
-	ctx.Assert(fire.Status == 202 && replyOf(fire).State == "queued", "a command without acknowledgement answered %d %s, expected 202 with state queued", fire.Status, fire.Text())
-	stored, err := commands.Lookup(context.Background(), lockID, "k-1")
+	c := hCommandsAPI(ctx)
+	r := hSubmitTo(c, hLockID, "k-1", map[string]any{"ack_required": true})
+	fire := hSubmitTo(c, hLockID, "k-2", map[string]any{"ack_required": false})
+	ctx.Assert(r.Status == 202 && hReplyOf(r).State == "pending_ack", "a command that expects an acknowledgement answered %d %s, expected 202 with state pending_ack: nothing has run on the device yet", r.Status, r.Text())
+	ctx.Assert(fire.Status == 202 && hReplyOf(fire).State == "queued", "a command without acknowledgement answered %d %s, expected 202 with state queued", fire.Status, fire.Text())
+	stored, err := commands.Lookup(context.Background(), hLockID, "k-1")
 	ctx.NoError(err, "commands.Lookup")
-	ctx.Assert(stored != nil && stored.State == "pending_ack" && stored.AckRequired, "the command store holds %+v under (%s, k-1), expected state pending_ack with ack_required", stored, lockID)
+	ctx.Assert(stored != nil && stored.State == "pending_ack" && stored.AckRequired, "the command store holds %+v under (%s, k-1), expected state pending_ack with ack_required", stored, hLockID)
+	stored, err = commands.Lookup(context.Background(), hLockID, "k-2")
+	ctx.NoError(err, "commands.Lookup")
+	ctx.Assert(stored != nil && stored.State == "queued" && !stored.AckRequired, "the command store holds %+v under (%s, k-2), expected state queued without ack_required", stored, hLockID)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -936,9 +983,9 @@ func CheckAck(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kLock = "lock-7";
+const std::string kHLock = "lock-7";
 
-harness::HTTP commandsApi(harness::Ctx& ctx) {
+harness::HTTP hCommandsApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -946,7 +993,7 @@ harness::HTTP commandsApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response submitTo(harness::HTTP& c, const std::string& device, const std::string& idempotency_id,
+harness::Response hSubmitTo(harness::HTTP& c, const std::string& device, const std::string& idempotency_id,
                            const nlohmann::json& extra = nlohmann::json::object()) {
   nlohmann::json body = {{"idempotency_id", idempotency_id}, {"action", "unlock"}, {"params", {{"duration_s", "5"}}},
                          {"validity_s", 60},                 {"ack_required", true}};
@@ -954,98 +1001,119 @@ harness::Response submitTo(harness::HTTP& c, const std::string& device, const st
   return c.Post("/v1/devices/" + device + "/commands", body.dump(), "Content-Type", "application/json");
 }
 
-nlohmann::json bodyOf(const harness::Response& r) {
+nlohmann::json hBodyOf(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-std::string textOf(const nlohmann::json& body, const std::string& field) {
+std::string hTextOf(const nlohmann::json& body, const std::string& field) {
   return body.contains(field) && body[field].is_string() ? body[field].get<std::string>() : "";
 }
 
-bool isOk(const harness::Response& r) { return r.Status >= 200 && r.Status < 300; }
+bool hIsOk(const harness::Response& r) { return r.Status >= 200 && r.Status < 300; }
 
-std::vector<std::string> queueOf(harness::Ctx& ctx, const std::string& device) {
+std::vector<std::string> hQueueOf(harness::Ctx& ctx, const std::string& device) {
   return ctx.Redis.LRange("device:" + device + ":queue", 0, -1);
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = commandsApi(ctx);
-  const auto r = submitTo(c, kLock, "k-1");
-  ctx.Assert(isOk(r), "POST /v1/devices/%s/commands answered %d: %s", kLock, r.Status, r.Text());
-  const auto body = bodyOf(r);
-  ctx.Assert(!textOf(body, "command_id").empty() && textOf(body, "device_id") == kLock && textOf(body, "action") == "unlock",
+  auto c = hCommandsApi(ctx);
+  const auto r = hSubmitTo(c, kHLock, "k-1");
+  ctx.Assert(hIsOk(r), "POST /v1/devices/%s/commands answered %d: %s", kHLock, r.Status, r.Text());
+  const auto body = hBodyOf(r);
+  ctx.Assert(!hTextOf(body, "command_id").empty() && hTextOf(body, "device_id") == kHLock && hTextOf(body, "action") == "unlock",
              "the response must carry the command's id, device and action, got %s", r.Text());
-  ctx.Equal(queueOf(ctx, kLock), std::vector<std::string>{textOf(body, "command_id")}, "the delivery queue of %s must hold the new command", kLock);
+  ctx.Equal(hQueueOf(ctx, kHLock), std::vector<std::string>{hTextOf(body, "command_id")}, "the delivery queue of %s must hold the new command", kHLock);
 }
 
 void CheckIdentity(harness::Ctx& ctx) {
-  auto c = commandsApi(ctx);
-  const auto first = submitTo(c, kLock, "k-1");
-  const auto replay = submitTo(c, kLock, "k-1");
-  const auto other = submitTo(c, "lock-9", "k-1");
-  ctx.Assert(isOk(first) && isOk(replay), "the request and its replay answered %d and %d", first.Status, replay.Status);
-  const std::string a = textOf(bodyOf(first), "command_id");
-  const std::string b = textOf(bodyOf(replay), "command_id");
+  auto c = hCommandsApi(ctx);
+  const auto first = hSubmitTo(c, kHLock, "k-1");
+  const auto replay = hSubmitTo(c, kHLock, "k-1");
+  const auto other = hSubmitTo(c, "lock-9", "k-1");
+  ctx.Assert(hIsOk(first) && hIsOk(replay), "the request and its replay answered %d and %d", first.Status, replay.Status);
+  const std::string a = hTextOf(hBodyOf(first), "command_id");
+  const std::string b = hTextOf(hBodyOf(replay), "command_id");
   ctx.Assert(a == b, "a replay of idempotency_id k-1 answered command %s, the first request %s: a replay must answer the recorded command", b, a);
-  ctx.Equal(queueOf(ctx, kLock).size(), 1, "two requests with idempotency_id k-1 must queue one command (the door unlocks once per request); the queued commands");
-  const auto recorded = commands::lookup(kLock, "k-1");
+  ctx.Equal(hQueueOf(ctx, kHLock).size(), 1, "two requests with idempotency_id k-1 must queue one command (the door unlocks once per request); the queued commands");
+  const auto recorded = commands::lookup(kHLock, "k-1");
   ctx.Assert(recorded && recorded->command_id == a, "the command store holds %q under (%s, k-1), expected the command recorded under the caller's idempotency id",
-             recorded ? recorded->command_id : std::string("nothing"), kLock);
-  ctx.Assert(textOf(bodyOf(other), "command_id") != a && queueOf(ctx, "lock-9").size() == 1,
+             recorded ? recorded->command_id : std::string("nothing"), kHLock);
+  ctx.Assert(hTextOf(hBodyOf(other), "command_id") != a && hQueueOf(ctx, "lock-9").size() == 1,
              "the same idempotency_id on another device is another command: the key is (device, idempotency_id)");
 }
 
 void CheckWindow(harness::Ctx& ctx) {
-  auto c = commandsApi(ctx);
+  auto c = hCommandsApi(ctx);
   const int64_t now_ms = ctx.Clock.Now();
-  auto r = submitTo(c, kLock, "k-1", {{"validity_s", 60}});
-  ctx.Assert(isOk(r), "a command with validity_s=60 answered %d: %s", r.Status, r.Text());
-  ctx.Equal(bodyOf(r).value("expires_at_ms", 0LL), now_ms + 60000,
+  auto r = hSubmitTo(c, kHLock, "k-1", {{"validity_s", 60}});
+  ctx.Assert(hIsOk(r), "a command with validity_s=60 answered %d: %s", r.Status, r.Text());
+  ctx.Equal(hBodyOf(r).value("expires_at_ms", 0LL), now_ms + 60000,
             "a command with validity_s=60 must answer expires_at_ms = now + 60 s (without a window a command for an offline lock fires whenever it reconnects); expires_at_ms");
-  const auto recorded = commands::lookup(kLock, "k-1");
+  const auto recorded = commands::lookup(kHLock, "k-1");
   ctx.Assert(recorded && recorded->expires_at_ms == now_ms + 60000, "the command store holds expires_at_ms %d, expected %d",
              recorded ? recorded->expires_at_ms : 0LL, now_ms + 60000);
-  for (const int bad : {0, 7200}) {
-    r = submitTo(c, kLock, "k-bad-" + std::to_string(bad), {{"validity_s", bad}});
+  for (const int bad : {0, 3601, 7200}) {
+    const std::string idem = "k-bad-" + std::to_string(bad);
+    r = hSubmitTo(c, kHLock, idem, {{"validity_s", bad}});
     ctx.Equal(r.Status, 400, "validity_s=%d must be refused (the window is 1 to 3600 s); the status", bad);
+    ctx.Assert(!commands::lookup(kHLock, idem), "validity_s=%d was refused but a command was recorded under (%s, %s): a refused request records nothing", bad, kHLock, idem);
   }
-  ctx.Clock.Advance(61);
-  const auto late = submitTo(c, kLock, "k-1");
-  ctx.Assert(late.Status == 410 && textOf(bodyOf(late), "state") == "expired", "a replay after the window answered %d %s, expected 410 with state expired",
+  for (const int edge : {1, 3600}) {
+    r = hSubmitTo(c, "lock-9", "k-edge-" + std::to_string(edge), {{"validity_s", edge}});
+    ctx.Assert(hIsOk(r), "validity_s=%d answered %d: %s. The window is 1 to 3600 s, both ends included", edge, r.Status, r.Text());
+  }
+  ctx.Clock.Advance(59);
+  const auto early = hSubmitTo(c, kHLock, "k-1");
+  ctx.Assert(hIsOk(early) && recorded && hTextOf(hBodyOf(early), "command_id") == recorded->command_id, "a replay 59 s into a 60 s window answered %d %s, expected the recorded command",
+             early.Status, early.Text());
+  ctx.Clock.Advance(2);
+  const auto late = hSubmitTo(c, kHLock, "k-1");
+  ctx.Assert(late.Status == 410 && hTextOf(hBodyOf(late), "state") == "expired", "a replay after the window answered %d %s, expected 410 with state expired",
              late.Status, late.Text());
-  ctx.Equal(queueOf(ctx, kLock).size(), 1, "neither a refused nor an expired command may be queued; the queued commands");
+  ctx.Equal(hQueueOf(ctx, kHLock).size(), 1, "neither a refused nor an expired command may be queued; the queued commands");
 }
 
 void CheckRateLimit(harness::Ctx& ctx) {
-  auto c = commandsApi(ctx);
+  auto c = hCommandsApi(ctx);
   for (int n = 0; n < 10; n++) {
-    const auto r = submitTo(c, kLock, "k-" + std::to_string(n));
-    ctx.Assert(isOk(r), "command %d of 10 within one minute answered %d: %s", n + 1, r.Status, r.Text());
+    const auto r = hSubmitTo(c, kHLock, "k-" + std::to_string(n));
+    ctx.Assert(hIsOk(r), "command %d of 10 within one minute answered %d: %s", n + 1, r.Status, r.Text());
   }
-  const auto over = submitTo(c, kLock, "k-10");
-  ctx.Equal(over.Status, 429, "the 11th command for %s within a minute must be refused (one integration can flood a device); the status", kLock);
-  ctx.Equal(queueOf(ctx, kLock).size(), 10, "a refused command must not be queued; the queued commands");
-  const auto other = submitTo(c, "lock-9", "k-0");
-  ctx.Assert(isOk(other), "another device's first command answered %d: the budget is per device", other.Status);
+  const auto over = hSubmitTo(c, kHLock, "k-10");
+  ctx.Equal(over.Status, 429, "the 11th command for %s within a minute must be refused (one integration can flood a device); the status", kHLock);
+  ctx.Equal(hQueueOf(ctx, kHLock).size(), 10, "a refused command must not be queued; the queued commands");
+  ctx.Assert(!commands::lookup(kHLock, "k-10"),
+             "the refused 11th command was recorded under (%s, k-10): a refused request records nothing, or its replay answers a command that was never queued", kHLock);
+  const auto replay = hSubmitTo(c, kHLock, "k-0");
+  const auto first = commands::lookup(kHLock, "k-0");
+  ctx.Assert(hIsOk(replay) && first && hTextOf(hBodyOf(replay), "command_id") == first->command_id,
+             "a replay of the first command, once the budget was spent, answered %d %s: the replay is looked up before the budget is counted and answers the recorded command",
+             replay.Status, replay.Text());
+  ctx.Equal(hQueueOf(ctx, kHLock).size(), 10, "a replay must queue nothing; the queued commands");
+  const auto other = hSubmitTo(c, "lock-9", "k-0");
+  ctx.Assert(hIsOk(other), "another device's first command answered %d: the budget is per device", other.Status);
   ctx.Clock.Advance(60);
-  const auto later = submitTo(c, kLock, "k-11");
-  ctx.Assert(isOk(later), "a command in the next minute answered %d: the window must roll over", later.Status);
+  const auto later = hSubmitTo(c, kHLock, "k-11");
+  ctx.Assert(hIsOk(later), "a command in the next minute answered %d: the window must roll over", later.Status);
 }
 
 void CheckAck(harness::Ctx& ctx) {
-  auto c = commandsApi(ctx);
-  const auto r = submitTo(c, kLock, "k-1", {{"ack_required", true}});
-  const auto fire = submitTo(c, kLock, "k-2", {{"ack_required", false}});
-  ctx.Assert(r.Status == 202 && textOf(bodyOf(r), "state") == "pending_ack",
+  auto c = hCommandsApi(ctx);
+  const auto r = hSubmitTo(c, kHLock, "k-1", {{"ack_required", true}});
+  const auto fire = hSubmitTo(c, kHLock, "k-2", {{"ack_required", false}});
+  ctx.Assert(r.Status == 202 && hTextOf(hBodyOf(r), "state") == "pending_ack",
              "a command that expects an acknowledgement answered %d %s, expected 202 with state pending_ack: nothing has run on the device yet", r.Status, r.Text());
-  ctx.Assert(fire.Status == 202 && textOf(bodyOf(fire), "state") == "queued", "a command without acknowledgement answered %d %s, expected 202 with state queued",
+  ctx.Assert(fire.Status == 202 && hTextOf(hBodyOf(fire), "state") == "queued", "a command without acknowledgement answered %d %s, expected 202 with state queued",
              fire.Status, fire.Text());
-  const auto stored = commands::lookup(kLock, "k-1");
+  auto stored = commands::lookup(kHLock, "k-1");
   ctx.Assert(stored && stored->state == "pending_ack" && stored->ack_required, "the command store holds state %q under (%s, k-1), expected pending_ack with ack_required",
-             stored ? stored->state : std::string("nothing"), kLock);
+             stored ? stored->state : std::string("nothing"), kHLock);
+  stored = commands::lookup(kHLock, "k-2");
+  ctx.Assert(stored && stored->state == "queued" && !stored->ack_required, "the command store holds state %q under (%s, k-2), expected queued without ack_required",
+             stored ? stored->state : std::string("nothing"), kHLock);
 }
 `,
   },

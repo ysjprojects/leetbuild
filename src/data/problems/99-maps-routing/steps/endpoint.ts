@@ -20,9 +20,10 @@ serves the demo and hides four flaws.
 a coordinate off the planet, a trip with hundreds of stops that ties the engine up for every
 tenant, and a trip outside the tenant's map, which gets a route its data cannot support.
 
-- No \`X-Tenant-Id\` is **401**.
+- A missing or empty \`X-Tenant-Id\` is **401**.
 - At most \`MAX_WAYPOINTS = 25\` waypoints; more is **422**.
-- Every point is finite, with \`lat\` within ±90 and \`lng\` within ±180; anything else is **422**.
+- Every point is finite, with \`lat\` within ±90 and \`lng\` within ±180, the bounds included; anything
+  else is **422**.
 - Every point lies in the tenant's coverage (\`covers(tenant, point)\`, provided as
   \`mapsd.coverage\`); otherwise **403** \`{"error": "OUT_OF_COVERAGE"}\`.
 - All four are answered before \`cached_route\` runs: a refused request costs no engine call.`,
@@ -65,7 +66,7 @@ tenant, and a trip outside the tenant's map, which gets a route its data cannot 
       id: 'tenant',
       title: 'A request without a tenant is 401',
       detail:
-        'No `X-Tenant-Id` answers **401** before anything is solved or stored; the starter routes it and stores the route under an empty tenant.',
+        'A missing or empty `X-Tenant-Id` answers **401** before anything is solved or stored; the starter routes it and stores the route under an empty tenant.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/]},
@@ -78,7 +79,7 @@ tenant, and a trip outside the tenant's map, which gets a route its data cannot 
       id: 'coordinates',
       title: 'A coordinate off the planet is 422',
       detail:
-        'Every point is finite with `lat` within ±90 and `lng` within ±180, or the request is **422** with no engine call; the starter hands the raw floats to the solver.',
+        'Every point, each waypoint included, is finite with `lat` within ±90 and `lng` within ±180, or the request is **422** with no engine call; a point exactly on those bounds is valid, so outside the coverage it is the 403. The starter hands the raw floats to the solver.',
       match: {
         python: {all: [/math\.isfinite\(|isfinite\(/, /\b90\b/, /\b180\b/]},
         typescript: {all: [/Number\.isFinite\(/, /\b90\b/, /\b180\b/]},
@@ -703,7 +704,9 @@ async def check_routes(ctx):
 async def check_tenant(ctx):
     async with _api(ctx) as c:
         r = await c.post("/v1/routes", json=_trip())
-    assert r.status_code == 401, f"a route request without X-Tenant-Id answered {r.status_code}, expected 401"
+        assert r.status_code == 401, f"a route request without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await c.post("/v1/routes", json=_trip(), headers={"X-Tenant-Id": ""})
+    assert r.status_code == 401, f"a route request with an empty X-Tenant-Id answered {r.status_code}, expected 401"
     assert _solves(ctx) == 0, "the engine solved a trip for a request with no tenant"
     assert not ctx.redis.keys("routes:r-*"), f"a route was stored for nobody: {ctx.redis.keys('routes:r-*')}"
 
@@ -714,12 +717,21 @@ async def check_coordinates(ctx):
             (_trip(origin={"lat": 91.0, "lng": SF["lng"]}), "an origin at lat 91"),
             (_trip(destination={"lat": OAKLAND["lat"], "lng": -190.0}), "a destination at lng -190"),
             (_trip(waypoints=[{"lat": -95.0, "lng": BERKELEY["lng"]}]), "a waypoint at lat -95"),
+            (_trip(waypoints=[BERKELEY, {"lat": BERKELEY["lat"], "lng": 200.0}]), "a second waypoint at lng 200"),
         ):
             r = await c.post("/v1/routes", json=trip, headers=ACME)
             assert r.status_code == 422, f"{what} answered {r.status_code}, expected 422"
         nan = '{"origin": {"lat": NaN, "lng": -122.41942}, "destination": {"lat": 37.80418, "lng": -122.27112}}'
         r = await c.post("/v1/routes", content=nan, headers={**ACME, "content-type": "application/json"})
         assert r.status_code == 422, f"an origin at lat NaN answered {r.status_code}, expected 422"
+        # The edges of the planet are coordinates: outside this tenant's map, so 403, not 422.
+        for trip, what in (
+            (_trip(origin={"lat": 90.0, "lng": SF["lng"]}), "an origin at lat 90"),
+            (_trip(destination={"lat": OAKLAND["lat"], "lng": -180.0}), "a destination at lng -180"),
+            (_trip(waypoints=[{"lat": -90.0, "lng": 180.0}]), "a waypoint at lat -90, lng 180"),
+        ):
+            r = await c.post("/v1/routes", json=trip, headers=ACME)
+            assert r.status_code == 403, f"{what} is on the planet and outside the tenant's coverage, so 403; it answered {r.status_code}"
     assert _solves(ctx) == 0, f"the engine was asked to solve {_solves(ctx)} trip(s) with a coordinate off the planet: refuse them before the solver"
 
 
@@ -793,8 +805,10 @@ export async function check_routes(ctx) {
 
 export async function check_tenant(ctx) {
   const {c} = await api(ctx);
-  const r = await c.post('/v1/routes', {json: trip()});
+  let r = await c.post('/v1/routes', {json: trip()});
   assert.equal(r.status, 401, \`a route request without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await c.post('/v1/routes', {json: trip(), headers: {'X-Tenant-Id': ''}});
+  assert.equal(r.status, 401, \`a route request with an empty X-Tenant-Id answered \${r.status}, expected 401\`);
   assert.equal(solves(ctx), 0, 'the engine solved a trip for a request with no tenant');
   assert.deepStrictEqual(ctx.redis.keys('routes:r-*'), [], 'a route was stored for nobody');
 }
@@ -805,10 +819,21 @@ export async function check_coordinates(ctx) {
     [trip({origin: {lat: 91.0, lng: SF.lng}}), 'an origin at lat 91'],
     [trip({destination: {lat: OAKLAND.lat, lng: -190.0}}), 'a destination at lng -190'],
     [trip({waypoints: [{lat: -95.0, lng: BERKELEY.lng}]}), 'a waypoint at lat -95'],
+    [trip({waypoints: [BERKELEY, {lat: BERKELEY.lat, lng: 200.0}]}), 'a second waypoint at lng 200'],
   ];
   for (const [body, what] of bad) {
     const r = await c.post('/v1/routes', {json: body, headers: ACME});
     assert.equal(r.status, 422, \`\${what} answered \${r.status}, expected 422\`);
+  }
+  // The edges of the planet are coordinates: outside this tenant's map, so 403, not 422.
+  const edges: [object, string][] = [
+    [trip({origin: {lat: 90.0, lng: SF.lng}}), 'an origin at lat 90'],
+    [trip({destination: {lat: OAKLAND.lat, lng: -180.0}}), 'a destination at lng -180'],
+    [trip({waypoints: [{lat: -90.0, lng: 180.0}]}), 'a waypoint at lat -90, lng 180'],
+  ];
+  for (const [body, what] of edges) {
+    const r = await c.post('/v1/routes', {json: body, headers: ACME});
+    assert.equal(r.status, 403, \`\${what} is on the planet and outside the tenant's coverage, so 403; it answered \${r.status}\`);
   }
   assert.equal(solves(ctx), 0, \`the engine was asked to solve \${solves(ctx)} trip(s) with a coordinate off the planet: refuse them before the solver\`);
 }
@@ -856,24 +881,24 @@ import (
 	"leetbuild/harness"
 )
 
-type point = map[string]float64
+type hPoint = map[string]float64
 
 var (
-	apiBg    = context.Background()
-	sf       = point{"lat": 37.77412, "lng": -122.41942}
-	oakland  = point{"lat": 37.80418, "lng": -122.27112}
-	berkeley = point{"lat": 37.87159, "lng": -122.27275}
-	alcatraz = point{"lat": 37.82667, "lng": -122.42306}
-	la       = point{"lat": 34.05223, "lng": -118.24368}
-	pasadena = point{"lat": 34.14778, "lng": -118.14452}
+	hBg      = context.Background()
+	sf       = hPoint{"lat": 37.77412, "lng": -122.41942}
+	oakland  = hPoint{"lat": 37.80418, "lng": -122.27112}
+	berkeley = hPoint{"lat": 37.87159, "lng": -122.27275}
+	alcatraz = hPoint{"lat": 37.82667, "lng": -122.42306}
+	la       = hPoint{"lat": 34.05223, "lng": -118.24368}
+	pasadena = hPoint{"lat": 34.14778, "lng": -118.14452}
 )
 
-// enginePeer: a road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
-type enginePeer struct {
+// hEngine: a road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
+type hEngine struct {
 	pb.UnimplementedRoutingEngineServer
 }
 
-func (enginePeer) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (*pb.ComputeRouteReply, error) {
+func (hEngine) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (*pb.ComputeRouteReply, error) {
 	points := append([]*pb.LatLng{req.GetOrigin()}, req.GetWaypoints()...)
 	points = append(points, req.GetDestination())
 	distance := 0.0
@@ -889,27 +914,27 @@ func (enginePeer) ComputeRoute(_ context.Context, req *pb.ComputeRouteRequest) (
 	return &pb.ComputeRouteReply{DistanceM: distance, DurationS: distance / 11, Geometry: fmt.Sprintf("poly:%d", len(points)), EngineVersion: "osrm-v26.9"}, nil
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterRoutingEngineServer(ctx.GRPC.Server(""), enginePeer{})
-	coverage.SetCoverage(apiBg, "acme", 37.0, 38.5, -123.0, -121.5)
-	coverage.SetCoverage(apiBg, "south", 33.5, 34.5, -118.8, -117.6)
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterRoutingEngineServer(ctx.GRPC.Server(""), hEngine{})
+	coverage.SetCoverage(hBg, "acme", 37.0, 38.5, -123.0, -121.5)
+	coverage.SetCoverage(hBg, "south", 33.5, 34.5, -118.8, -117.6)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func trip(origin, destination point, waypoints ...point) map[string]any {
+func hTrip(origin, destination hPoint, waypoints ...hPoint) map[string]any {
 	if waypoints == nil {
-		waypoints = []point{}
+		waypoints = []hPoint{}
 	}
 	return map[string]any{"origin": origin, "destination": destination, "waypoints": waypoints}
 }
 
-func solves(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ComputeRoute", "")) }
+func hSolves(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("ComputeRoute", "")) }
 
 func CheckRoutes(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/routes", trip(sf, oakland, berkeley), "X-Tenant-Id", "acme")
+	c := hAPI(ctx)
+	r := c.Post("/v1/routes", hTrip(sf, oakland, berkeley), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 201, "a covered trip (%s)", r.Text())
 	var body struct {
 		RouteID   string  \`json:"route_id"\`
@@ -918,60 +943,76 @@ func CheckRoutes(ctx *harness.Ctx) {
 	}
 	r.Decode(&body)
 	ctx.Assert(!body.Degraded && body.DistanceM > 0, "the answer must carry the engine's route, got %s", r.Text())
-	stored := routes.LoadRoute(apiBg, body.RouteID)
+	stored := routes.LoadRoute(hBg, body.RouteID)
 	ctx.Assert(stored != nil && stored.Tenant == "acme", "route %s must be stored under tenant acme, the store holds %+v", body.RouteID, stored)
-	r = c.Post("/v1/routes", trip(sf, alcatraz), "X-Tenant-Id", "acme")
+	r = c.Post("/v1/routes", hTrip(sf, alcatraz), "X-Tenant-Id", "acme")
 	ctx.Assert(r.Status == 422 && strings.Contains(r.Text(), "NO_ROUTE"), "a trip no road connects answered %d %s, expected 422 NO_ROUTE", r.Status, r.Text())
 }
 
 func CheckTenant(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/routes", trip(sf, oakland))
+	c := hAPI(ctx)
+	r := c.Post("/v1/routes", hTrip(sf, oakland))
 	ctx.Equal(r.Status, 401, "a route request without X-Tenant-Id")
-	ctx.Equal(solves(ctx), 0, "the engine solved a trip for a request with no tenant; the solves")
+	r = c.Post("/v1/routes", hTrip(sf, oakland), "X-Tenant-Id", "")
+	ctx.Equal(r.Status, 401, "a route request with an empty X-Tenant-Id")
+	ctx.Equal(hSolves(ctx), 0, "the engine solved a trip for a request with no tenant; the solves")
 	ctx.Equal(len(ctx.Redis.Keys("routes:r-*")), 0, "a route was stored for nobody; the stored routes")
 }
 
 func CheckCoordinates(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	bad := []struct {
 		body map[string]any
 		what string
 	}{
-		{trip(point{"lat": 91.0, "lng": sf["lng"]}, oakland), "an origin at lat 91"},
-		{trip(sf, point{"lat": oakland["lat"], "lng": -190.0}), "a destination at lng -190"},
-		{trip(sf, oakland, point{"lat": -95.0, "lng": berkeley["lng"]}), "a waypoint at lat -95"},
+		{hTrip(hPoint{"lat": 91.0, "lng": sf["lng"]}, oakland), "an origin at lat 91"},
+		{hTrip(sf, hPoint{"lat": oakland["lat"], "lng": -190.0}), "a destination at lng -190"},
+		{hTrip(sf, oakland, hPoint{"lat": -95.0, "lng": berkeley["lng"]}), "a waypoint at lat -95"},
+		{hTrip(sf, oakland, berkeley, hPoint{"lat": berkeley["lat"], "lng": 200.0}), "a second waypoint at lng 200"},
 	}
 	for _, b := range bad {
 		r := c.Post("/v1/routes", b.body, "X-Tenant-Id", "acme")
 		ctx.Equal(r.Status, 422, "%s", b.what)
 	}
-	ctx.Equal(solves(ctx), 0, "the engine was asked to solve trips with a coordinate off the planet (refuse them before the solver); the solves")
+	// The edges of the planet are coordinates: outside this tenant's map, so 403, not 422.
+	edges := []struct {
+		body map[string]any
+		what string
+	}{
+		{hTrip(hPoint{"lat": 90.0, "lng": sf["lng"]}, oakland), "an origin at lat 90"},
+		{hTrip(sf, hPoint{"lat": oakland["lat"], "lng": -180.0}), "a destination at lng -180"},
+		{hTrip(sf, oakland, hPoint{"lat": -90.0, "lng": 180.0}), "a waypoint at lat -90, lng 180"},
+	}
+	for _, b := range edges {
+		r := c.Post("/v1/routes", b.body, "X-Tenant-Id", "acme")
+		ctx.Equal(r.Status, 403, "%s (on the planet and outside the tenant's coverage, so 403)", b.what)
+	}
+	ctx.Equal(hSolves(ctx), 0, "the engine was asked to solve trips with a coordinate off the planet (refuse them before the solver); the solves")
 }
 
 func CheckWaypoints(ctx *harness.Ctx) {
-	c := api(ctx)
-	stops := make([]point, 26)
+	c := hAPI(ctx)
+	stops := make([]hPoint, 26)
 	for i := range stops {
-		stops[i] = point{"lat": 37.78 + float64(i)*0.002, "lng": -122.4}
+		stops[i] = hPoint{"lat": 37.78 + float64(i)*0.002, "lng": -122.4}
 	}
-	r := c.Post("/v1/routes", trip(sf, oakland, stops...), "X-Tenant-Id", "acme")
+	r := c.Post("/v1/routes", hTrip(sf, oakland, stops...), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 422, "a trip with 26 waypoints (MAX_WAYPOINTS is 25)")
-	ctx.Equal(solves(ctx), 0, "a trip with 26 waypoints reached the solver; the solves")
-	r = c.Post("/v1/routes", trip(sf, oakland, stops[:25]...), "X-Tenant-Id", "acme")
+	ctx.Equal(hSolves(ctx), 0, "a trip with 26 waypoints reached the solver; the solves")
+	r = c.Post("/v1/routes", hTrip(sf, oakland, stops[:25]...), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 201, "a trip with 25 waypoints (%s)", r.Text())
 }
 
 func CheckCoverage(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/routes", trip(sf, la), "X-Tenant-Id", "acme")
+	c := hAPI(ctx)
+	r := c.Post("/v1/routes", hTrip(sf, la), "X-Tenant-Id", "acme")
 	ctx.Assert(r.Status == 403 && strings.Contains(r.Text(), "OUT_OF_COVERAGE"), "a Bay Area tenant asking for Los Angeles answered %d %s, expected 403 OUT_OF_COVERAGE", r.Status, r.Text())
-	r = c.Post("/v1/routes", trip(sf, oakland, pasadena), "X-Tenant-Id", "acme")
+	r = c.Post("/v1/routes", hTrip(sf, oakland, pasadena), "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 403, "a waypoint outside the tenant's coverage")
-	r = c.Post("/v1/routes", trip(sf, oakland), "X-Tenant-Id", "nobody")
+	r = c.Post("/v1/routes", hTrip(sf, oakland), "X-Tenant-Id", "nobody")
 	ctx.Equal(r.Status, 403, "a tenant with no coverage")
-	ctx.Equal(solves(ctx), 0, "the engine solved trips outside the tenant's coverage; the solves")
-	r = c.Post("/v1/routes", trip(la, pasadena), "X-Tenant-Id", "south")
+	ctx.Equal(hSolves(ctx), 0, "the engine solved trips outside the tenant's coverage; the solves")
+	r = c.Post("/v1/routes", hTrip(la, pasadena), "X-Tenant-Id", "south")
 	ctx.Equal(r.Status, 201, "a Los Angeles trip for the Los Angeles tenant (%s)", r.Text())
 }
 `,
@@ -1000,7 +1041,7 @@ const json kLa = {{"lat", 34.05223}, {"lng", -118.24368}};
 const json kPasadena = {{"lat", 34.14778}, {"lng", -118.14452}};
 
 // A road route is 1.3 times the great-circle legs; no road reaches Alcatraz.
-class EnginePeer final : public mapsrouting::RoutingEngine::Service {
+class HEnginePeer final : public mapsrouting::RoutingEngine::Service {
  public:
   grpc::Status ComputeRoute(grpc::ServerContext*, const mapsrouting::ComputeRouteRequest* req, mapsrouting::ComputeRouteReply* out) override {
     std::vector<geo::Point> points = {{req->origin().lat(), req->origin().lng()}};
@@ -1022,11 +1063,11 @@ class EnginePeer final : public mapsrouting::RoutingEngine::Service {
   }
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
-  static EnginePeer* peer = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx) {
+  static HEnginePeer* peer = nullptr;
   static httplib::Server* svr = nullptr;
   delete peer;
-  peer = new EnginePeer;
+  peer = new HEnginePeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   coverage::setCoverage("acme", 37.0, 38.5, -123.0, -121.5);
   coverage::setCoverage("south", 33.5, 34.5, -118.8, -117.6);
@@ -1036,77 +1077,90 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string trip(const json& origin, const json& destination, const json& waypoints = json::array()) {
+std::string hTrip(const json& origin, const json& destination, const json& waypoints = json::array()) {
   return json{{"origin", origin}, {"destination", destination}, {"waypoints", waypoints}}.dump();
 }
 
-harness::Response post(harness::HTTP& c, const std::string& body, const std::string& tenant) {
+harness::Response hPost(harness::HTTP& c, const std::string& body, const std::string& tenant) {
   return c.Post("/v1/routes", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-size_t solves(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ComputeRoute").size(); }
+size_t hSolves(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("ComputeRoute").size(); }
 
-bool has(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
+bool hHas(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
 
 }  // namespace
 
 void CheckRoutes(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, trip(kSf, kOakland, json::array({kBerkeley})), "acme");
+  auto c = hApi(ctx);
+  auto r = hPost(c, hTrip(kSf, kOakland, json::array({kBerkeley})), "acme");
   ctx.Equal(r.Status, 201, "a covered trip (%s)", r.Text());
   const json body = json::parse(r.Text());
   ctx.Assert(!body.value("degraded", true) && body.value("distance_m", 0.0) > 0, "the answer must carry the engine's route, got %s", r.Text());
   const std::string route_id = body.value("route_id", "");
   const auto stored = routes::loadRoute(route_id);
   ctx.Assert(stored && stored->tenant == "acme", "route %s must be stored under tenant acme, the store holds tenant %q", route_id, stored ? stored->tenant : "(none)");
-  r = post(c, trip(kSf, kAlcatraz), "acme");
-  ctx.Assert(r.Status == 422 && has(r.Text(), "NO_ROUTE"), "a trip no road connects answered %d %s, expected 422 NO_ROUTE", r.Status, r.Text());
+  r = hPost(c, hTrip(kSf, kAlcatraz), "acme");
+  ctx.Assert(r.Status == 422 && hHas(r.Text(), "NO_ROUTE"), "a trip no road connects answered %d %s, expected 422 NO_ROUTE", r.Status, r.Text());
 }
 
 void CheckTenant(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = c.Post("/v1/routes", trip(kSf, kOakland), "Content-Type", "application/json");
+  auto c = hApi(ctx);
+  auto r = c.Post("/v1/routes", hTrip(kSf, kOakland), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a route request without X-Tenant-Id");
-  ctx.Equal(solves(ctx), 0, "the engine solved a trip for a request with no tenant; the solves");
+  r = hPost(c, hTrip(kSf, kOakland), "");
+  ctx.Equal(r.Status, 401, "a route request with an empty X-Tenant-Id");
+  ctx.Equal(hSolves(ctx), 0, "the engine solved a trip for a request with no tenant; the solves");
   ctx.Equal(ctx.Redis.Keys("routes:r-*").size(), 0, "a route was stored for nobody; the stored routes");
 }
 
 void CheckCoordinates(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const std::vector<std::pair<std::string, std::string>> bad = {
-      {trip({{"lat", 91.0}, {"lng", -122.41942}}, kOakland), "an origin at lat 91"},
-      {trip(kSf, {{"lat", 37.80418}, {"lng", -190.0}}), "a destination at lng -190"},
-      {trip(kSf, kOakland, json::array({{{"lat", -95.0}, {"lng", -122.27275}}})), "a waypoint at lat -95"},
+      {hTrip({{"lat", 91.0}, {"lng", -122.41942}}, kOakland), "an origin at lat 91"},
+      {hTrip(kSf, {{"lat", 37.80418}, {"lng", -190.0}}), "a destination at lng -190"},
+      {hTrip(kSf, kOakland, json::array({{{"lat", -95.0}, {"lng", -122.27275}}})), "a waypoint at lat -95"},
+      {hTrip(kSf, kOakland, json::array({kBerkeley, json{{"lat", 37.87159}, {"lng", 200.0}}})), "a second waypoint at lng 200"},
   };
   for (const auto& [body, what] : bad) {
-    const auto r = post(c, body, "acme");
+    const auto r = hPost(c, body, "acme");
     ctx.Equal(r.Status, 422, "%s", what);
   }
-  ctx.Equal(solves(ctx), 0, "the engine was asked to solve trips with a coordinate off the planet (refuse them before the solver); the solves");
+  // The edges of the planet are coordinates: outside this tenant's map, so 403, not 422.
+  const std::vector<std::pair<std::string, std::string>> edges = {
+      {hTrip({{"lat", 90.0}, {"lng", -122.41942}}, kOakland), "an origin at lat 90"},
+      {hTrip(kSf, {{"lat", 37.80418}, {"lng", -180.0}}), "a destination at lng -180"},
+      {hTrip(kSf, kOakland, json::array({json{{"lat", -90.0}, {"lng", 180.0}}})), "a waypoint at lat -90, lng 180"},
+  };
+  for (const auto& [body, what] : edges) {
+    const auto r = hPost(c, body, "acme");
+    ctx.Equal(r.Status, 403, "%s (on the planet and outside the tenant's coverage, so 403)", what);
+  }
+  ctx.Equal(hSolves(ctx), 0, "the engine was asked to solve trips with a coordinate off the planet (refuse them before the solver); the solves");
 }
 
 void CheckWaypoints(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   json stops = json::array();
   for (int i = 0; i < 26; i++) stops.push_back({{"lat", 37.78 + i * 0.002}, {"lng", -122.4}});
-  auto r = post(c, trip(kSf, kOakland, stops), "acme");
+  auto r = hPost(c, hTrip(kSf, kOakland, stops), "acme");
   ctx.Equal(r.Status, 422, "a trip with 26 waypoints (MAX_WAYPOINTS is 25)");
-  ctx.Equal(solves(ctx), 0, "a trip with 26 waypoints reached the solver; the solves");
+  ctx.Equal(hSolves(ctx), 0, "a trip with 26 waypoints reached the solver; the solves");
   stops.erase(stops.end() - 1);
-  r = post(c, trip(kSf, kOakland, stops), "acme");
+  r = hPost(c, hTrip(kSf, kOakland, stops), "acme");
   ctx.Equal(r.Status, 201, "a trip with 25 waypoints (%s)", r.Text());
 }
 
 void CheckCoverage(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = post(c, trip(kSf, kLa), "acme");
-  ctx.Assert(r.Status == 403 && has(r.Text(), "OUT_OF_COVERAGE"), "a Bay Area tenant asking for Los Angeles answered %d %s, expected 403 OUT_OF_COVERAGE", r.Status, r.Text());
-  r = post(c, trip(kSf, kOakland, json::array({kPasadena})), "acme");
+  auto c = hApi(ctx);
+  auto r = hPost(c, hTrip(kSf, kLa), "acme");
+  ctx.Assert(r.Status == 403 && hHas(r.Text(), "OUT_OF_COVERAGE"), "a Bay Area tenant asking for Los Angeles answered %d %s, expected 403 OUT_OF_COVERAGE", r.Status, r.Text());
+  r = hPost(c, hTrip(kSf, kOakland, json::array({kPasadena})), "acme");
   ctx.Equal(r.Status, 403, "a waypoint outside the tenant's coverage");
-  r = post(c, trip(kSf, kOakland), "nobody");
+  r = hPost(c, hTrip(kSf, kOakland), "nobody");
   ctx.Equal(r.Status, 403, "a tenant with no coverage");
-  ctx.Equal(solves(ctx), 0, "the engine solved trips outside the tenant's coverage; the solves");
-  r = post(c, trip(kLa, kPasadena), "south");
+  ctx.Equal(hSolves(ctx), 0, "the engine solved trips outside the tenant's coverage; the solves");
+  r = hPost(c, hTrip(kLa, kPasadena), "south");
   ctx.Equal(r.Status, 201, "a Los Angeles trip for the Los Angeles tenant (%s)", r.Text());
 }
 `,

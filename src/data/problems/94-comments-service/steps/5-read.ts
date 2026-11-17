@@ -23,7 +23,8 @@ page shows none.
 
 - \`next_cursor\` is opaque (\`encode_cursor\`) and resumes after the last row's \`seq\`:
   \`ZREVRANGEBYSCORE index (seq -inf LIMIT 0 PAGE_SIZE\`. It is \`null\` when the page is not
-  full; a cursor \`decode_cursor\` cannot read is 400.
+  full, so a full last page's cursor leads to an empty page; a cursor \`decode_cursor\` cannot read
+  is 400.
 - A deleted comment keeps its place as a tombstone: \`id\`, \`parent_id\`, \`created_at\`,
   \`revision\`, \`reply_count\`, \`deleted: true\`, and no \`author_id\`, \`text\` or \`html\`.
 - \`comment_count\` is \`threads.thread_count\`; each \`reply_count\` comes from
@@ -61,7 +62,7 @@ page shows none.
       id: 'cursor',
       title: 'Pages resume after a position, not an offset',
       detail:
-        '`next_cursor` encodes the last row’s `seq` and the next page starts strictly below it (`ZREVRANGEBYSCORE (seq -inf LIMIT 0 PAGE_SIZE`), so comments posted meanwhile neither repeat nor shift a page; it is null on a page that is not full, and an unreadable cursor is 400. The starter counts rows, which move.',
+        '`next_cursor` encodes the last row’s `seq` and the next page starts strictly below it (`ZREVRANGEBYSCORE (seq -inf LIMIT 0 PAGE_SIZE`), so comments posted meanwhile neither repeat nor shift a page; it is null on a page that is not full, a cursor past the last full page answers an empty page with a null cursor, and an unreadable cursor is 400. The starter counts rows, which move.',
       match: {
         python: {all: [/zrevrangebyscore\(/, /def encode_cursor/, /def decode_cursor/], none: [/\boffset\b/]},
         typescript: {
@@ -77,7 +78,7 @@ page shows none.
       id: 'tombstone',
       title: 'A deleted comment is a tombstone without its words',
       detail:
-        'A deleted comment stays in the page (its replies still point at it) with `deleted: true` and its ids, revision and reply count, but no `author_id`, `text` or `html`. The starter serves the row as stored.',
+        'A deleted comment stays in the page (its replies still point at it) with `deleted: true`, its `parent_id`, `created_at`, `revision` and the reply count of the replies still pointing at it, but no `author_id`, `text` or `html`. The starter serves the row as stored.',
       match: {
         python: {all: [/def serialize_comment/, /if row\[["']deleted["']\]/]},
         typescript: {all: [/function serializeComment/, /if \(row\.deleted\)/]},
@@ -785,7 +786,18 @@ async def check_cursor(ctx):
         assert _ids(second) == [m["id"] for m in reversed(made[:5])], f"page 2 lists {_ids(second)}, expected the 5 oldest comments"
         assert second.get("next_cursor") is None, f"the last page (5 of 20) must carry next_cursor null, got {second.get('next_cursor')!r}"
         bad = await c.get("/v1/threads/t-1/comments", params={"cursor": "not-a-cursor"}, headers={"X-Tenant-Id": "acme"})
-    assert bad.status_code == 400, f"an unreadable cursor answered {bad.status_code}, expected 400"
+        assert bad.status_code == 400, f"an unreadable cursor answered {bad.status_code}, expected 400"
+        # A thread of exactly one page: the cursor a full page offers must lead to an empty last page.
+        for i in range(20):
+            threads.commit_comment("acme", store.new_comment("t-2", "", "u-1", f"even {i}", f"even {i}"))
+        full = await c.get("/v1/threads/t-2/comments", headers={"X-Tenant-Id": "acme"})
+        shown = len(full.json().get("comments", [])) if full.status_code == 200 else 0
+        assert full.status_code == 200 and shown == 20, f"a thread of exactly 20 comments answered {full.status_code} with {shown} comments, expected all 20"
+        after = full.json().get("next_cursor")
+        if after is not None:
+            tail = await c.get("/v1/threads/t-2/comments", params={"cursor": after}, headers={"X-Tenant-Id": "acme"})
+            assert tail.status_code == 200, f"the cursor after a full last page answered {tail.status_code}: {tail.text}. A page past the end is empty, not an error"
+            assert tail.json().get("comments") == [] and tail.json().get("next_cursor") is None, f"the page after the last full page must be empty with next_cursor null, got {tail.json()}"
 
 
 async def check_tombstone(ctx):
@@ -800,6 +812,9 @@ async def check_tombstone(ctx):
     assert "555-0100" not in r.text, f"the page still serves the deleted comment's words: {tomb}"
     leaked = [k for k in ("author_id", "text", "html") if tomb.get(k)]
     assert not leaked, f"the tombstone still carries {leaked}: {tomb}"
+    kept = {k: tomb.get(k) for k in ("parent_id", "created_at", "revision", "reply_count")}
+    expected = {"parent_id": "", "created_at": root["created_at"], "revision": 2, "reply_count": 1}
+    assert kept == expected, f"the tombstone keeps {kept}, expected {expected}: it keeps its place, its revision and the count of the replies that still point at it"
     assert items[reply["id"]].get("parent_id") == root["id"] and items[reply["id"]].get("text"), f"the reply must still point at its deleted parent and keep its own text, got {items[reply['id']]}"
 
 
@@ -869,6 +884,18 @@ export async function check_cursor(ctx) {
   assert.equal(second.next_cursor, null, \`the last page (5 of 20) must carry next_cursor null, got \${JSON.stringify(second.next_cursor)}\`);
   const bad = await env.c.get('/v1/threads/t-1/comments', {headers: {'X-Tenant-Id': 'acme'}, query: {cursor: 'not-a-cursor'}});
   assert.equal(bad.status, 400, \`an unreadable cursor answered \${bad.status}, expected 400\`);
+  // A thread of exactly one page: the cursor a full page offers must lead to an empty last page.
+  for (let i = 0; i < 20; i++) await env.threads.commitComment('acme', await env.store.newComment('t-2', '', 'u-1', \`even \${i}\`, \`even \${i}\`));
+  const full = await env.c.get('/v1/threads/t-2/comments', {headers: {'X-Tenant-Id': 'acme'}});
+  const shown = full.status === 200 ? (full.json().comments ?? []).length : 0;
+  assert(full.status === 200 && shown === 20, \`a thread of exactly 20 comments answered \${full.status} with \${shown} comments, expected all 20\`);
+  const after = full.json().next_cursor;
+  if (after !== null && after !== undefined) {
+    const tail = await env.c.get('/v1/threads/t-2/comments', {headers: {'X-Tenant-Id': 'acme'}, query: {cursor: after}});
+    assert.equal(tail.status, 200, \`the cursor after a full last page answered \${tail.status}: \${tail.text}. A page past the end is empty, not an error\`);
+    const end = tail.json();
+    assert(Array.isArray(end.comments) && end.comments.length === 0 && end.next_cursor === null, \`the page after the last full page must be empty with next_cursor null, got \${tail.text}\`);
+  }
 }
 
 export async function check_tombstone(ctx) {
@@ -883,6 +910,9 @@ export async function check_tombstone(ctx) {
   assert(!r.text.includes('555-0100'), \`the page still serves the deleted comment's words: \${JSON.stringify(tomb)}\`);
   const leaked = ['author_id', 'text', 'html'].filter(k => tomb[k]);
   assert.equal(leaked.length, 0, \`the tombstone still carries \${JSON.stringify(leaked)}: \${JSON.stringify(tomb)}\`);
+  const kept = {parent_id: tomb.parent_id, created_at: tomb.created_at, revision: tomb.revision, reply_count: tomb.reply_count};
+  const expected = {parent_id: '', created_at: root.created_at, revision: 2, reply_count: 1};
+  assert.deepStrictEqual(kept, expected, \`the tombstone keeps \${JSON.stringify(kept)}, expected \${JSON.stringify(expected)}: it keeps its place, its revision and the count of the replies that still point at it\`);
   assert(items[reply.id]?.parent_id === root.id && items[reply.id]?.text, \`the reply must still point at its deleted parent and keep its own text, got \${JSON.stringify(items[reply.id])}\`);
 }
 
@@ -915,34 +945,36 @@ import (
 	"leetbuild/harness"
 )
 
-const secret = "call me on 555-0100"
+const hSecret = "call me on 555-0100"
 
-var readBg = context.Background()
+var hBg = context.Background()
 
-type pageItem struct {
+type hItem struct {
 	ID         string \`json:"id"\`
 	ParentID   string \`json:"parent_id"\`
 	AuthorID   string \`json:"author_id"\`
 	Text       string \`json:"text"\`
 	HTML       string \`json:"html"\`
+	CreatedAt  int64  \`json:"created_at"\`
+	Revision   int64  \`json:"revision"\`
 	Deleted    bool   \`json:"deleted"\`
 	ReplyCount int64  \`json:"reply_count"\`
 }
 
-type threadPage struct {
-	Comments     []pageItem \`json:"comments"\`
-	NextCursor   *string    \`json:"next_cursor"\`
-	CommentCount int64      \`json:"comment_count"\`
+type hPage struct {
+	Comments     []hItem \`json:"comments"\`
+	NextCursor   *string \`json:"next_cursor"\`
+	CommentCount int64   \`json:"comment_count"\`
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func hReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-// seed commits n comments in acme's thread t-1 with their counters; parentOf maps an index (1-based) to its parent's index.
-func seed(ctx *harness.Ctx, n int, parentOf map[int]int, text func(int) string) []store.Comment {
+// hSeed commits n comments in acme's thread with their counters; parentOf maps an index (1-based) to its parent's index.
+func hSeed(ctx *harness.Ctx, threadID string, n int, parentOf map[int]int, text func(int) string) []store.Comment {
 	var made []store.Comment
 	for i := 1; i <= n; i++ {
 		parent := ""
@@ -953,28 +985,28 @@ func seed(ctx *harness.Ctx, n int, parentOf map[int]int, text func(int) string) 
 		if text != nil {
 			body = text(i)
 		}
-		c, err := store.NewComment(readBg, "t-1", parent, "u-1", body, body)
+		c, err := store.NewComment(hBg, threadID, parent, "u-1", body, body)
 		ctx.NoError(err, "store.NewComment failed")
-		_, err = threads.CommitComment(readBg, "acme", c)
+		_, err = threads.CommitComment(hBg, "acme", c)
 		ctx.NoError(err, "threads.CommitComment failed")
 		made = append(made, c)
 	}
 	return made
 }
 
-func fetchPage(ctx *harness.Ctx, c *harness.HTTP, cursor string) threadPage {
-	path := "/v1/threads/t-1/comments"
+func hFetch(ctx *harness.Ctx, c *harness.HTTP, threadID, cursor string) hPage {
+	path := "/v1/threads/" + threadID + "/comments"
 	if cursor != "" {
 		path += "?cursor=" + url.QueryEscape(cursor)
 	}
 	r := c.Get(path, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "GET %s (%s)", path, r.Text())
-	var p threadPage
+	var p hPage
 	r.Decode(&p)
 	return p
 }
 
-func pageIDs(p threadPage) []string {
+func hIDs(p hPage) []string {
 	out := []string{}
 	for _, item := range p.Comments {
 		out = append(out, item.ID)
@@ -982,7 +1014,7 @@ func pageIDs(p threadPage) []string {
 	return out
 }
 
-func newestFirst(made []store.Comment) []string {
+func hNewestFirst(made []store.Comment) []string {
 	out := []string{}
 	for i := len(made) - 1; i >= 0; i-- {
 		out = append(out, made[i].ID)
@@ -991,50 +1023,61 @@ func newestFirst(made []store.Comment) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	made := seed(ctx, 3, nil, nil)
-	c := readClient(ctx)
-	ctx.Equal(pageIDs(fetchPage(ctx, c, "")), newestFirst(made), "the page must list the thread newest first")
+	made := hSeed(ctx, "t-1", 3, nil, nil)
+	c := hReadClient(ctx)
+	ctx.Equal(hIDs(hFetch(ctx, c, "t-1", "")), hNewestFirst(made), "the page must list the thread newest first")
 	ctx.Equal(c.Get("/v1/threads/t-1/comments").Status, 401, "a request without X-Tenant-Id")
 }
 
 func CheckCursor(ctx *harness.Ctx) {
-	made := seed(ctx, 25, nil, nil)
-	c := readClient(ctx)
-	first := fetchPage(ctx, c, "")
-	ctx.Equal(pageIDs(first), newestFirst(made[5:]), "page 1 must list the 20 newest comments")
+	made := hSeed(ctx, "t-1", 25, nil, nil)
+	c := hReadClient(ctx)
+	first := hFetch(ctx, c, "t-1", "")
+	ctx.Equal(hIDs(first), hNewestFirst(made[5:]), "page 1 must list the 20 newest comments")
 	ctx.Assert(first.NextCursor != nil && *first.NextCursor != "", "a full page must carry a next_cursor")
 	for i := 0; i < 3; i++ { // three comments arrive while the reader is on page 1
-		late, _ := store.NewComment(readBg, "t-1", "", "u-2", "late", "late")
-		threads.CommitComment(readBg, "acme", late)
+		late, _ := store.NewComment(hBg, "t-1", "", "u-2", "late", "late")
+		threads.CommitComment(hBg, "acme", late)
 	}
-	second := fetchPage(ctx, c, *first.NextCursor)
+	second := hFetch(ctx, c, "t-1", *first.NextCursor)
 	var repeated []string
-	for _, id := range pageIDs(second) {
-		for _, seen := range pageIDs(first) {
+	for _, id := range hIDs(second) {
+		for _, seen := range hIDs(first) {
 			if id == seen {
 				repeated = append(repeated, id)
 			}
 		}
 	}
 	ctx.Assert(len(repeated) == 0, "page 2 repeats %q from page 1: three comments arrived and every row moved down three places. Resume below the last row's seq, not at a row count", repeated)
-	ctx.Equal(pageIDs(second), newestFirst(made[:5]), "page 2 must list the 5 oldest comments")
+	ctx.Equal(hIDs(second), hNewestFirst(made[:5]), "page 2 must list the 5 oldest comments")
 	ctx.Assert(second.NextCursor == nil, "the last page (5 of 20) must carry next_cursor null, got %q", second.NextCursor)
 	ctx.Equal(c.Get("/v1/threads/t-1/comments?cursor=not-a-cursor", "X-Tenant-Id", "acme").Status, 400, "an unreadable cursor")
+	// A thread of exactly one page: the cursor a full page offers must lead to an empty last page.
+	hSeed(ctx, "t-2", 20, nil, nil)
+	full := hFetch(ctx, c, "t-2", "")
+	ctx.Equal(len(full.Comments), 20, "a thread of exactly 20 comments must list all 20; the comments")
+	if full.NextCursor != nil {
+		tail := c.Get("/v1/threads/t-2/comments?cursor="+url.QueryEscape(*full.NextCursor), "X-Tenant-Id", "acme")
+		ctx.Equal(tail.Status, 200, "the cursor after a full last page (%s): a page past the end is empty, not an error", tail.Text())
+		var end hPage
+		tail.Decode(&end)
+		ctx.Assert(len(end.Comments) == 0 && end.NextCursor == nil, "the page after the last full page must be empty with next_cursor null, got %s", tail.Text())
+	}
 }
 
 func CheckTombstone(ctx *harness.Ctx) {
-	made := seed(ctx, 3, map[int]int{2: 1}, func(i int) string {
+	made := hSeed(ctx, "t-1", 3, map[int]int{2: 1}, func(i int) string {
 		if i == 1 {
-			return secret
+			return hSecret
 		}
 		return fmt.Sprintf("comment %d", i)
 	})
 	root, reply := made[0], made[1]
-	store.SoftDelete(readBg, "acme", root.ID)
-	r := readClient(ctx).Get("/v1/threads/t-1/comments", "X-Tenant-Id", "acme")
-	var p threadPage
+	store.SoftDelete(hBg, "acme", root.ID)
+	r := hReadClient(ctx).Get("/v1/threads/t-1/comments", "X-Tenant-Id", "acme")
+	var p hPage
 	r.Decode(&p)
-	items := map[string]pageItem{}
+	items := map[string]hItem{}
 	for _, item := range p.Comments {
 		items[item.ID] = item
 	}
@@ -1043,27 +1086,30 @@ func CheckTombstone(ctx *harness.Ctx) {
 	ctx.Assert(tomb.Deleted, "the deleted comment must say deleted: true, got %+v", tomb)
 	ctx.Assert(!strings.Contains(r.Text(), "555-0100"), "the page still serves the deleted comment's words: %+v", tomb)
 	ctx.Assert(tomb.AuthorID == "" && tomb.Text == "" && tomb.HTML == "", "the tombstone still carries its author or words: %+v", tomb)
+	ctx.Assert(tomb.ParentID == "" && tomb.CreatedAt == root.CreatedAt && tomb.Revision == 2 && tomb.ReplyCount == 1,
+		"the tombstone keeps parent_id %q, created_at %d, revision %d, reply_count %d, expected \\"\\", %d, 2 and 1: it keeps its place, its revision and the count of the replies that still point at it",
+		tomb.ParentID, tomb.CreatedAt, tomb.Revision, tomb.ReplyCount, root.CreatedAt)
 	ctx.Assert(items[reply.ID].ParentID == root.ID && items[reply.ID].Text != "", "the reply must still point at its deleted parent and keep its own text, got %+v", items[reply.ID])
 }
 
 func CheckCounts(ctx *harness.Ctx) {
-	made := seed(ctx, 25, map[int]int{23: 1, 24: 1, 25: 2}, nil)
-	c := readClient(ctx)
-	first := fetchPage(ctx, c, "")
+	made := hSeed(ctx, "t-1", 25, map[int]int{23: 1, 24: 1, 25: 2}, nil)
+	c := hReadClient(ctx)
+	first := hFetch(ctx, c, "t-1", "")
 	cursor := "20"
 	if first.NextCursor != nil {
 		cursor = *first.NextCursor
 	}
-	second := fetchPage(ctx, c, cursor)
+	second := hFetch(ctx, c, "t-1", cursor)
 	ctx.Equal(first.CommentCount, 25, "page 1's comment_count on a thread of 25 comments (read the thread counter, not the page)")
 	ctx.Equal(second.CommentCount, 25, "page 2's comment_count on a thread of 25 comments (read the thread counter, not the page)")
-	items := map[string]pageItem{}
+	items := map[string]hItem{}
 	for _, item := range second.Comments {
 		items[item.ID] = item
 	}
 	_, has0 := items[made[0].ID]
 	_, has1 := items[made[1].ID]
-	ctx.Assert(has0 && has1, "page 2 lists %q, expected the oldest comments", pageIDs(second))
+	ctx.Assert(has0 && has1, "page 2 lists %q, expected the oldest comments", hIDs(second))
 	ctx.Assert(items[made[0].ID].ReplyCount == 2 && items[made[1].ID].ReplyCount == 1, "on page 2, %s shows %d replies and %s shows %d, expected 2 and 1: their replies are on page 1, the replies hash counts them all",
 		made[0].ID, items[made[0].ID].ReplyCount, made[1].ID, items[made[1].ID].ReplyCount)
 }
@@ -1084,9 +1130,9 @@ func CheckCounts(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kSecret = "call me on 555-0100";
+const std::string hSecret = "call me on 555-0100";
 
-harness::HTTP readClient(harness::Ctx& ctx) {
+harness::HTTP hReadClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1094,20 +1140,21 @@ harness::HTTP readClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-// n comments in acme's thread t-1, committed with their counters; parent_of maps an index (1-based) to its parent's index.
-std::vector<store::Comment> seed(int n, const std::map<int, int>& parent_of = {}, const std::function<std::string(int)>& text = nullptr) {
+// n comments in acme's thread, committed with their counters; parent_of maps an index (1-based) to its parent's index.
+std::vector<store::Comment> hSeed(const std::string& thread_id, int n, const std::map<int, int>& parent_of = {},
+                                  const std::function<std::string(int)>& text = nullptr) {
   std::vector<store::Comment> made;
   for (int i = 1; i <= n; i++) {
     const std::string parent = parent_of.count(i) ? made[parent_of.at(i) - 1].id : "";
     const std::string body = text ? text(i) : "comment " + std::to_string(i);
-    const store::Comment c = store::newComment("t-1", parent, "u-1", body, body);
+    const store::Comment c = store::newComment(thread_id, parent, "u-1", body, body);
     threads::commitComment("acme", c);
     made.push_back(c);
   }
   return made;
 }
 
-std::string escape(const std::string& s) {
+std::string hQueryEscape(const std::string& s) {
   std::string out;
   for (const unsigned char ch : s) {
     if (std::isalnum(ch) || ch == '-' || ch == '_' || ch == '.' || ch == '~') {
@@ -1121,8 +1168,8 @@ std::string escape(const std::string& s) {
   return out;
 }
 
-nlohmann::json fetchPage(harness::Ctx& ctx, harness::HTTP& c, const std::string& cursor = "") {
-  const std::string path = "/v1/threads/t-1/comments" + (cursor.empty() ? "" : "?cursor=" + escape(cursor));
+nlohmann::json hFetch(harness::Ctx& ctx, harness::HTTP& c, const std::string& thread_id = "t-1", const std::string& cursor = "") {
+  const std::string path = "/v1/threads/" + thread_id + "/comments" + (cursor.empty() ? "" : "?cursor=" + hQueryEscape(cursor));
   const auto r = c.Get(path, "X-Tenant-Id", "acme");
   ctx.Equal(r.Status, 200, "GET %s (%s)", path, r.Text());
   const auto page = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -1130,82 +1177,100 @@ nlohmann::json fetchPage(harness::Ctx& ctx, harness::HTTP& c, const std::string&
   return page;
 }
 
-std::vector<std::string> pageIds(const nlohmann::json& page) {
+std::vector<std::string> hIds(const nlohmann::json& page) {
   std::vector<std::string> out;
   for (const auto& item : page["comments"]) out.push_back(item.value("id", ""));
   return out;
 }
 
-std::vector<std::string> newestFirst(const std::vector<store::Comment>& made, size_t from, size_t to) {
+std::vector<std::string> hNewestFirst(const std::vector<store::Comment>& made, size_t from, size_t to) {
   std::vector<std::string> out;
   for (size_t i = to; i > from; i--) out.push_back(made[i - 1].id);
   return out;
 }
 
-std::map<std::string, nlohmann::json> byId(const nlohmann::json& page) {
+std::map<std::string, nlohmann::json> hById(const nlohmann::json& page) {
   std::map<std::string, nlohmann::json> out;
   for (const auto& item : page["comments"]) out[item.value("id", "")] = item;
   return out;
 }
 
+// A field the tombstone must not carry: absent, null or empty.
+bool hBlank(const nlohmann::json& item, const char* key) {
+  return !item.contains(key) || item[key].is_null() || (item[key].is_string() && item[key].get<std::string>().empty());
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const auto made = seed(3);
-  auto c = readClient(ctx);
-  ctx.Equal(pageIds(fetchPage(ctx, c)), newestFirst(made, 0, 3), "the page must list the thread newest first");
+  const auto made = hSeed("t-1", 3);
+  auto c = hReadClient(ctx);
+  ctx.Equal(hIds(hFetch(ctx, c)), hNewestFirst(made, 0, 3), "the page must list the thread newest first");
   ctx.Equal(c.Get("/v1/threads/t-1/comments").Status, 401, "a request without X-Tenant-Id");
 }
 
 void CheckCursor(harness::Ctx& ctx) {
-  const auto made = seed(25);
-  auto c = readClient(ctx);
-  const auto first = fetchPage(ctx, c);
-  ctx.Equal(pageIds(first), newestFirst(made, 5, 25), "page 1 must list the 20 newest comments");
+  const auto made = hSeed("t-1", 25);
+  auto c = hReadClient(ctx);
+  const auto first = hFetch(ctx, c);
+  ctx.Equal(hIds(first), hNewestFirst(made, 5, 25), "page 1 must list the 20 newest comments");
   ctx.Assert(first.contains("next_cursor") && first["next_cursor"].is_string() && !first["next_cursor"].get<std::string>().empty(), "a full page must carry a next_cursor, got %s", first.dump());
   for (int i = 0; i < 3; i++) threads::commitComment("acme", store::newComment("t-1", "", "u-2", "late", "late"));  // three comments arrive meanwhile
-  const auto second = fetchPage(ctx, c, first["next_cursor"].get<std::string>());
+  const auto second = hFetch(ctx, c, "t-1", first["next_cursor"].get<std::string>());
   std::vector<std::string> repeated;
-  for (const auto& id : pageIds(second)) {
-    for (const auto& seen : pageIds(first)) {
+  for (const auto& id : hIds(second)) {
+    for (const auto& seen : hIds(first)) {
       if (id == seen) repeated.push_back(id);
     }
   }
   ctx.Assert(repeated.empty(), "page 2 repeats %q from page 1: three comments arrived and every row moved down three places. Resume below the last row's seq, not at a row count", repeated);
-  ctx.Equal(pageIds(second), newestFirst(made, 0, 5), "page 2 must list the 5 oldest comments");
+  ctx.Equal(hIds(second), hNewestFirst(made, 0, 5), "page 2 must list the 5 oldest comments");
   ctx.Assert(second.contains("next_cursor") && second["next_cursor"].is_null(), "the last page (5 of 20) must carry next_cursor null, got %s", second.value("next_cursor", nlohmann::json()).dump());
   ctx.Equal(c.Get("/v1/threads/t-1/comments?cursor=not-a-cursor", "X-Tenant-Id", "acme").Status, 400, "an unreadable cursor");
+  // A thread of exactly one page: the cursor a full page offers must lead to an empty last page.
+  hSeed("t-2", 20);
+  const auto full = hFetch(ctx, c, "t-2");
+  ctx.Equal(full["comments"].size(), 20, "a thread of exactly 20 comments must list all 20; the comments");
+  if (full.contains("next_cursor") && full["next_cursor"].is_string()) {
+    const auto tail = c.Get("/v1/threads/t-2/comments?cursor=" + hQueryEscape(full["next_cursor"].get<std::string>()), "X-Tenant-Id", "acme");
+    ctx.Equal(tail.Status, 200, "the cursor after a full last page (%s): a page past the end is empty, not an error", tail.Text());
+    const auto end = nlohmann::json::parse(tail.Text(), nullptr, false);
+    ctx.Assert(end.is_object() && end.contains("comments") && end["comments"].is_array() && end["comments"].empty() && end.contains("next_cursor") && end["next_cursor"].is_null(),
+               "the page after the last full page must be empty with next_cursor null, got %s", tail.Text());
+  }
 }
 
 void CheckTombstone(harness::Ctx& ctx) {
-  const auto made = seed(3, {{2, 1}}, [](int i) { return i == 1 ? kSecret : "comment " + std::to_string(i); });
+  const auto made = hSeed("t-1", 3, {{2, 1}}, [](int i) { return i == 1 ? hSecret : "comment " + std::to_string(i); });
   const store::Comment& root = made[0];
   const store::Comment& reply = made[1];
   store::softDelete("acme", root.id);
-  auto c = readClient(ctx);
+  auto c = hReadClient(ctx);
   const auto r = c.Get("/v1/threads/t-1/comments", "X-Tenant-Id", "acme");
   const auto page = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(page.is_object() && page.contains("comments"), "the page is not {comments: [...]}: %s", r.Text());
-  const auto items = byId(page);
+  const auto items = hById(page);
   ctx.Assert(items.count(root.id) == 1, "the deleted comment %s vanished from the page: its reply %s now hangs off nothing. Keep it as a tombstone", root.id, reply.id);
   const auto& tomb = items.at(root.id);
   ctx.Assert(tomb.value("deleted", false), "the deleted comment must say deleted: true, got %s", tomb.dump());
   ctx.Assert(r.Text().find("555-0100") == std::string::npos, "the page still serves the deleted comment's words: %s", tomb.dump());
-  ctx.Assert(!tomb.contains("author_id") && !tomb.contains("text") && !tomb.contains("html"), "the tombstone still carries its author or words: %s", tomb.dump());
+  ctx.Assert(hBlank(tomb, "author_id") && hBlank(tomb, "text") && hBlank(tomb, "html"), "the tombstone still carries its author or words: %s", tomb.dump());
+  ctx.Assert(tomb.value("parent_id", "?") == "" && tomb.value("created_at", 0LL) == root.created_at && tomb.value("revision", 0LL) == 2 && tomb.value("reply_count", 0LL) == 1,
+             "the tombstone is %s, expected parent_id \\"\\", created_at %d, revision 2 and reply_count 1: it keeps its place, its revision and the count of the replies that still point at it", tomb.dump(), root.created_at);
   ctx.Assert(items.count(reply.id) && items.at(reply.id).value("parent_id", "") == root.id && !items.at(reply.id).value("text", "").empty(),
              "the reply must still point at its deleted parent and keep its own text, got %s", items.count(reply.id) ? items.at(reply.id).dump() : "nothing");
 }
 
 void CheckCounts(harness::Ctx& ctx) {
-  const auto made = seed(25, {{23, 1}, {24, 1}, {25, 2}});
-  auto c = readClient(ctx);
-  const auto first = fetchPage(ctx, c);
+  const auto made = hSeed("t-1", 25, {{23, 1}, {24, 1}, {25, 2}});
+  auto c = hReadClient(ctx);
+  const auto first = hFetch(ctx, c);
   const std::string cursor = first.contains("next_cursor") && first["next_cursor"].is_string() ? first["next_cursor"].get<std::string>() : "20";
-  const auto second = fetchPage(ctx, c, cursor);
+  const auto second = hFetch(ctx, c, "t-1", cursor);
   ctx.Equal(first.value("comment_count", 0), 25, "page 1's comment_count on a thread of 25 comments (read the thread counter, not the page)");
   ctx.Equal(second.value("comment_count", 0), 25, "page 2's comment_count on a thread of 25 comments (read the thread counter, not the page)");
-  const auto items = byId(second);
-  ctx.Assert(items.count(made[0].id) && items.count(made[1].id), "page 2 lists %q, expected the oldest comments", pageIds(second));
+  const auto items = hById(second);
+  ctx.Assert(items.count(made[0].id) && items.count(made[1].id), "page 2 lists %q, expected the oldest comments", hIds(second));
   const long long r0 = items.at(made[0].id).value("reply_count", 0LL);
   const long long r1 = items.at(made[1].id).value("reply_count", 0LL);
   ctx.Assert(r0 == 2 && r1 == 1, "on page 2, %s shows %d replies and %s shows %d, expected 2 and 1: their replies are on page 1, the replies hash counts them all", made[0].id, r0, made[1].id, r1);

@@ -72,7 +72,7 @@ record that matches on its second key is reported as new.
       id: 'hash-shape',
       title: 'Requires a lowercase SHA-256 hex digest',
       detail:
-        'Each `value` must fully match `HASH_RE` (64 lowercase hex characters) or the check is **400**, so a raw email or a SHA-1 cannot reach the index. The starter looks up whatever it is sent.',
+        'Each `value` must fully match `HASH_RE` (64 lowercase hex characters) or the check is **400** before any lookup, so a raw email, a SHA-1, a 65-character value or a digest with a trailing newline cannot reach the index, even after a valid key. The starter looks up whatever it is sent.',
       match: {
         python: {all: [/HASH_RE\s*=\s*re\.compile\(/, /\{64\}/, /HASH_RE\.(fullmatch|match)\(/]},
         typescript: {all: [/HASH_RE\s*=\s*\//, /\{64\}/, /HASH_RE\.test\(/]},
@@ -101,7 +101,7 @@ record that matches on its second key is reported as new.
       id: 'every-key',
       title: 'Looks up every key, not the first',
       detail:
-        'A record that matches on its phone hash while the email hash is new is a duplicate: every key in the body is looked up. The starter reads `keys[0]` only.',
+        'A record that matches on its phone hash while the email hash is new is a duplicate: every key in the body is looked up, in the order sent, and the first one held answers. The starter reads `keys[0]` only.',
       match: {
         python: {all: [/exact\.lookup\(/], none: [/keys\[\s*0\s*\]/]},
         typescript: {all: [/\blookup\(/], none: [/keys\[\s*0\s*\]/]},
@@ -580,10 +580,13 @@ async def check_key_type(ctx):
 
 async def check_hash_shape(ctx):
     exact.claim("acme", "email_hash", "jane@example.com", "r-1")
+    exact.claim("acme", "email_hash", EMAIL, "r-2")
     async with _api(ctx) as c:
-        for bad, what in (("jane@example.com", "a raw email"), (SHA1, "a 40-character SHA-1"), (EMAIL.upper(), "an uppercase digest"), (EMAIL[:63], "a 63-character value")):
+        for bad, what in (("jane@example.com", "a raw email"), (SHA1, "a 40-character SHA-1"), (EMAIL.upper(), "an uppercase digest"), (EMAIL[:63], "a 63-character value"), (EMAIL + "0", "a 65-character value"), (EMAIL + "\\n", "a digest with a trailing newline")):
             r = await _check(c, [_key("email_hash", bad)])
-            assert r.status_code == 400, f"{what} as the email_hash value answered {r.status_code} {r.text}, expected 400: only a lowercase SHA-256 hex digest may reach the index"
+            assert r.status_code == 400, f"{what} as the email_hash value answered {r.status_code} {r.text}, expected 400: only a value that fully matches a lowercase SHA-256 hex digest may reach the index"
+        r = await _check(c, [_key("email_hash", EMAIL), _key("phone_hash", "555-0100")])
+        assert r.status_code == 400, f"a body whose second value is not a digest, after a held key, answered {r.status_code} {r.text}, expected 400 before any lookup"
         r = await _check(c, [_key("email_hash", EMAIL)])
     assert r.status_code == 200, f"a lowercase SHA-256 digest answered {r.status_code} {r.text}, expected 200"
 
@@ -607,6 +610,9 @@ async def check_every_key(ctx):
         r = await _check(c, [_key("email_hash", OTHER), _key("phone_hash", PHONE)])
         assert r.status_code == 200, f"the check answered {r.status_code}: {r.text}"
         assert r.json().get("duplicate") is True and r.json().get("match") == {"record_id": "r-7", "key_type": "phone_hash"}, f"r-7 holds the phone hash of the second key and the check answered {r.text}: every key must be looked up, not the first"
+        exact.claim("acme", "email_hash", EMAIL, "r-1")
+        r = await _check(c, [_key("phone_hash", PHONE), _key("email_hash", EMAIL)])
+        assert r.json().get("match") == {"record_id": "r-7", "key_type": "phone_hash"}, f"r-7 holds the first key and r-1 the second, and the check answered {r.text}: the first key in the body that is held answers"
         r = await _check(c, [_key("content_hash", OTHER), _key("email_hash", OTHER)])
     assert r.json().get("duplicate") is False, f"no key is held and the check answered {r.text}"
 `,
@@ -654,16 +660,21 @@ export async function check_key_type(ctx) {
 export async function check_hash_shape(ctx) {
   const {c, exact} = api(ctx);
   await exact.claim('acme', 'email_hash', 'jane@example.com', 'r-1');
+  await exact.claim('acme', 'email_hash', EMAIL, 'r-2');
   const bad: [string, string][] = [
     ['jane@example.com', 'a raw email'],
     [SHA1, 'a 40-character SHA-1'],
     [EMAIL.toUpperCase(), 'an uppercase digest'],
     [EMAIL.slice(0, 63), 'a 63-character value'],
+    [EMAIL + '0', 'a 65-character value'],
+    [EMAIL + '\\n', 'a digest with a trailing newline'],
   ];
   for (const [value, what] of bad) {
     const r = await check(c, [key('email_hash', value)]);
-    assert.equal(r.status, 400, \`\${what} as the email_hash value answered \${r.status} \${r.text}, expected 400: only a lowercase SHA-256 hex digest may reach the index\`);
+    assert.equal(r.status, 400, \`\${what} as the email_hash value answered \${r.status} \${r.text}, expected 400: only a value that fully matches a lowercase SHA-256 hex digest may reach the index\`);
   }
+  const mixed = await check(c, [key('email_hash', EMAIL), key('phone_hash', '555-0100')]);
+  assert.equal(mixed.status, 400, \`a body whose second value is not a digest, after a held key, answered \${mixed.status} \${mixed.text}, expected 400 before any lookup\`);
   const r = await check(c, [key('email_hash', EMAIL)]);
   assert.equal(r.status, 200, \`a lowercase SHA-256 digest answered \${r.status} \${r.text}, expected 200\`);
 }
@@ -687,6 +698,9 @@ export async function check_every_key(ctx) {
   let r = await check(c, [key('email_hash', OTHER), key('phone_hash', PHONE)]);
   assert.equal(r.status, 200, \`the check answered \${r.status}: \${r.text}\`);
   assert(r.json().duplicate === true && JSON.stringify(r.json().match) === JSON.stringify({record_id: 'r-7', key_type: 'phone_hash'}), \`r-7 holds the phone hash of the second key and the check answered \${r.text}: every key must be looked up, not the first\`);
+  await exact.claim('acme', 'email_hash', EMAIL, 'r-1');
+  r = await check(c, [key('phone_hash', PHONE), key('email_hash', EMAIL)]);
+  assert(JSON.stringify(r.json().match) === JSON.stringify({record_id: 'r-7', key_type: 'phone_hash'}), \`r-7 holds the first key and r-1 the second, and the check answered \${r.text}: the first key in the body that is held answers\`);
   r = await check(c, [key('content_hash', OTHER), key('email_hash', OTHER)]);
   assert.equal(r.json().duplicate, false, \`no key is held and the check answered \${r.text}\`);
 }
@@ -710,27 +724,27 @@ const (
 	apiSHA1  = "0850a4cffb73cbc53fd33e8990c2184c915ff041"
 )
 
-type checkReply struct {
+type hCheckReply struct {
 	Duplicate bool              \`json:"duplicate"\`
 	Match     map[string]string \`json:"match"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func seed(ctx *harness.Ctx, tenant, keyType, value, recordID string) {
+func hSeed(ctx *harness.Ctx, tenant, keyType, value, recordID string) {
 	_, err := exact.Claim(context.Background(), tenant, keyType, value, recordID)
 	ctx.NoError(err, "seeding the index")
 }
 
-func key(keyType, value string) map[string]string {
+func hKey(keyType, value string) map[string]string {
 	return map[string]string{"type": keyType, "value": value}
 }
 
-func post(c *harness.HTTP, tenant string, keys ...map[string]string) *harness.Response {
+func hPost(c *harness.HTTP, tenant string, keys ...map[string]string) *harness.Response {
 	body := map[string]any{"keys": keys}
 	if tenant == "" {
 		return c.Post("/v1/dedupe/check", body)
@@ -738,80 +752,88 @@ func post(c *harness.HTTP, tenant string, keys ...map[string]string) *harness.Re
 	return c.Post("/v1/dedupe/check", body, "X-Tenant-Id", tenant)
 }
 
-func reply(r *harness.Response) checkReply {
-	var out checkReply
+func hReply(r *harness.Response) hCheckReply {
+	var out hCheckReply
 	r.Decode(&out)
 	return out
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	seed(ctx, "acme", "email_hash", apiEmail, "r-1")
-	r := post(c, "acme", key("email_hash", apiEmail))
+	c := hAPI(ctx)
+	hSeed(ctx, "acme", "email_hash", apiEmail, "r-1")
+	r := hPost(c, "acme", hKey("email_hash", apiEmail))
 	ctx.Equal(r.Status, 200, "POST /v1/dedupe/check (%s)", r.Text())
-	got := reply(r)
+	got := hReply(r)
 	ctx.Assert(got.Duplicate && got.Match["record_id"] == "r-1", "acme holds this email hash as r-1 and the check answered %s", r.Text())
-	r = post(c, "acme", key("email_hash", apiOther))
-	got = reply(r)
+	r = hPost(c, "acme", hKey("email_hash", apiOther))
+	got = hReply(r)
 	ctx.Assert(r.Status == 200 && !got.Duplicate && got.Match == nil, "a key nobody holds answered %d %s, expected 200 with duplicate false", r.Status, r.Text())
 }
 
 func CheckKeyType(ctx *harness.Ctx) {
-	c := api(ctx)
-	seed(ctx, "acme", "email_hash", apiEmail, "r-1")
+	c := hAPI(ctx)
+	hSeed(ctx, "acme", "email_hash", apiEmail, "r-1")
 	for _, bad := range []string{"emial_hash", "ssn"} {
-		r := post(c, "acme", key(bad, apiOther))
+		r := hPost(c, "acme", hKey(bad, apiOther))
 		ctx.Equal(r.Status, 400, "a key of type %q answered %s: an unknown type is a client bug, not \\"no duplicate\\"; the status", bad, r.Text())
 	}
-	r := post(c, "acme", key("email_hash", apiEmail), key("tax_id", apiOther))
+	r := hPost(c, "acme", hKey("email_hash", apiEmail), hKey("tax_id", apiOther))
 	ctx.Equal(r.Status, 400, "a body with an unknown key type after a valid one must be rejected before any lookup (%s); the status", r.Text())
 	for _, good := range []string{"email_hash", "content_hash", "phone_hash"} {
-		r := post(c, "acme", key(good, apiOther))
+		r := hPost(c, "acme", hKey(good, apiOther))
 		ctx.Equal(r.Status, 200, "a %s key (%s); the status", good, r.Text())
 	}
 }
 
 func CheckHashShape(ctx *harness.Ctx) {
-	c := api(ctx)
-	seed(ctx, "acme", "email_hash", "jane@example.com", "r-1")
+	c := hAPI(ctx)
+	hSeed(ctx, "acme", "email_hash", "jane@example.com", "r-1")
+	hSeed(ctx, "acme", "email_hash", apiEmail, "r-2")
 	bad := [][2]string{
 		{"jane@example.com", "a raw email"},
 		{apiSHA1, "a 40-character SHA-1"},
 		{strings.ToUpper(apiEmail), "an uppercase digest"},
 		{apiEmail[:63], "a 63-character value"},
+		{apiEmail + "0", "a 65-character value"},
+		{apiEmail + "\\n", "a digest with a trailing newline"},
 	}
 	for _, b := range bad {
-		r := post(c, "acme", key("email_hash", b[0]))
-		ctx.Equal(r.Status, 400, "%s as the email_hash value answered %s: only a lowercase SHA-256 hex digest may reach the index; the status", b[1], r.Text())
+		r := hPost(c, "acme", hKey("email_hash", b[0]))
+		ctx.Equal(r.Status, 400, "%s as the email_hash value answered %s: only a value that fully matches a lowercase SHA-256 hex digest may reach the index; the status", b[1], r.Text())
 	}
-	r := post(c, "acme", key("email_hash", apiEmail))
+	r := hPost(c, "acme", hKey("email_hash", apiEmail), hKey("phone_hash", "555-0100"))
+	ctx.Equal(r.Status, 400, "a body whose second value is not a digest, after a held key, must be rejected before any lookup (%s); the status", r.Text())
+	r = hPost(c, "acme", hKey("email_hash", apiEmail))
 	ctx.Equal(r.Status, 200, "a lowercase SHA-256 digest (%s); the status", r.Text())
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := api(ctx)
-	seed(ctx, "globex", "email_hash", apiEmail, "r-9")
-	r := post(c, "acme", key("email_hash", apiEmail))
+	c := hAPI(ctx)
+	hSeed(ctx, "globex", "email_hash", apiEmail, "r-9")
+	r := hPost(c, "acme", hKey("email_hash", apiEmail))
 	ctx.Equal(r.Status, 200, "acme's check (%s)", r.Text())
-	ctx.Assert(!reply(r).Duplicate && !strings.Contains(r.Text(), "r-9") && !strings.Contains(r.Text(), "globex"), "acme's check answered %s: it confirms, and names, a record globex holds. Look up the caller's tenant only", r.Text())
-	r = post(c, "", key("email_hash", apiEmail))
+	ctx.Assert(!hReply(r).Duplicate && !strings.Contains(r.Text(), "r-9") && !strings.Contains(r.Text(), "globex"), "acme's check answered %s: it confirms, and names, a record globex holds. Look up the caller's tenant only", r.Text())
+	r = hPost(c, "", hKey("email_hash", apiEmail))
 	ctx.Equal(r.Status, 401, "a check without X-Tenant-Id (%s); the status", r.Text())
-	seed(ctx, "acme", "email_hash", apiEmail, "r-1")
-	r = post(c, "acme", key("email_hash", apiEmail))
+	hSeed(ctx, "acme", "email_hash", apiEmail, "r-1")
+	r = hPost(c, "acme", hKey("email_hash", apiEmail))
 	ctx.Equal(r.Status, 200, "acme's own duplicate (%s); the status", r.Text())
-	ctx.Equal(reply(r).Match, map[string]string{"record_id": "r-1", "key_type": "email_hash"}, "acme's own duplicate must answer the record id and the key type and nothing about any tenant; the match")
+	ctx.Equal(hReply(r).Match, map[string]string{"record_id": "r-1", "key_type": "email_hash"}, "acme's own duplicate must answer the record id and the key type and nothing about any tenant; the match")
 }
 
 func CheckEveryKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	seed(ctx, "acme", "phone_hash", apiPhone, "r-7")
-	r := post(c, "acme", key("email_hash", apiOther), key("phone_hash", apiPhone))
+	c := hAPI(ctx)
+	hSeed(ctx, "acme", "phone_hash", apiPhone, "r-7")
+	r := hPost(c, "acme", hKey("email_hash", apiOther), hKey("phone_hash", apiPhone))
 	ctx.Equal(r.Status, 200, "the check (%s)", r.Text())
-	got := reply(r)
+	got := hReply(r)
 	ctx.Assert(got.Duplicate, "r-7 holds the phone hash of the second key and the check answered %s: every key must be looked up, not the first", r.Text())
 	ctx.Equal(got.Match, map[string]string{"record_id": "r-7", "key_type": "phone_hash"}, "the match for the second key")
-	r = post(c, "acme", key("content_hash", apiOther), key("email_hash", apiOther))
-	ctx.Assert(!reply(r).Duplicate, "no key is held and the check answered %s", r.Text())
+	hSeed(ctx, "acme", "email_hash", apiEmail, "r-1")
+	r = hPost(c, "acme", hKey("phone_hash", apiPhone), hKey("email_hash", apiEmail))
+	ctx.Equal(hReply(r).Match, map[string]string{"record_id": "r-7", "key_type": "phone_hash"}, "r-7 holds the first key and r-1 the second (%s): the first key in the body that is held answers; the match", r.Text())
+	r = hPost(c, "acme", hKey("content_hash", apiOther), hKey("email_hash", apiOther))
+	ctx.Assert(!hReply(r).Duplicate, "no key is held and the check answered %s", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -832,7 +854,7 @@ const std::string kPhone = "602cd7fbbe41688e2d90224bcac362db2f1ff2e2ba7487d8585c
 const std::string kOther = "86e0b9e56c17cc4d12387e1949b85053fbe73bc3ce5a1188713a9d300cc6133d";
 const std::string kSha1 = "0850a4cffb73cbc53fd33e8990c2184c915ff041";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP h_api(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -840,90 +862,98 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json key(const std::string& type, const std::string& value) { return {{"type", type}, {"value", value}}; }
+nlohmann::json h_key(const std::string& type, const std::string& value) { return {{"type", type}, {"value", value}}; }
 
-harness::Response post(harness::HTTP& c, const std::string& tenant, const std::vector<nlohmann::json>& keys) {
+harness::Response h_post(harness::HTTP& c, const std::string& tenant, const std::vector<nlohmann::json>& keys) {
   const std::string body = nlohmann::json{{"keys", keys}}.dump();
   if (tenant.empty()) return c.Post("/v1/dedupe/check", body, "Content-Type", "application/json");
   return c.Post("/v1/dedupe/check", body, "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json reply(const harness::Response& r) {
+nlohmann::json h_reply(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : nlohmann::json::object();
 }
 
-bool duplicate(const nlohmann::json& body) { return body.value("duplicate", false); }
+bool h_duplicate(const nlohmann::json& body) { return body.value("duplicate", false); }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   exact::claim("acme", "email_hash", kEmail, "r-1");
-  auto r = post(c, "acme", {key("email_hash", kEmail)});
+  auto r = h_post(c, "acme", {h_key("email_hash", kEmail)});
   ctx.Equal(r.Status, 200, "POST /v1/dedupe/check (%s)", r.Text());
-  auto body = reply(r);
-  ctx.Assert(duplicate(body) && body["match"].is_object() && body["match"].value("record_id", "") == "r-1", "acme holds this email hash as r-1 and the check answered %s", r.Text());
-  r = post(c, "acme", {key("email_hash", kOther)});
-  body = reply(r);
-  ctx.Assert(r.Status == 200 && !duplicate(body) && body.contains("match") && body["match"].is_null(), "a key nobody holds answered %d %s, expected 200 with duplicate false", r.Status, r.Text());
+  auto body = h_reply(r);
+  ctx.Assert(h_duplicate(body) && body["match"].is_object() && body["match"].value("record_id", "") == "r-1", "acme holds this email hash as r-1 and the check answered %s", r.Text());
+  r = h_post(c, "acme", {h_key("email_hash", kOther)});
+  body = h_reply(r);
+  ctx.Assert(r.Status == 200 && !h_duplicate(body) && body.contains("match") && body["match"].is_null(), "a key nobody holds answered %d %s, expected 200 with duplicate false", r.Status, r.Text());
 }
 
 void CheckKeyType(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   exact::claim("acme", "email_hash", kEmail, "r-1");
   for (const std::string bad : {"emial_hash", "ssn"}) {
-    const auto r = post(c, "acme", {key(bad, kOther)});
+    const auto r = h_post(c, "acme", {h_key(bad, kOther)});
     ctx.Equal(r.Status, 400, "a key of type %q answered %s: an unknown type is a client bug, not \\"no duplicate\\"; the status", bad, r.Text());
   }
-  const auto mixed = post(c, "acme", {key("email_hash", kEmail), key("tax_id", kOther)});
+  const auto mixed = h_post(c, "acme", {h_key("email_hash", kEmail), h_key("tax_id", kOther)});
   ctx.Equal(mixed.Status, 400, "a body with an unknown key type after a valid one must be rejected before any lookup (%s); the status", mixed.Text());
   for (const std::string good : {"email_hash", "content_hash", "phone_hash"}) {
-    const auto r = post(c, "acme", {key(good, kOther)});
+    const auto r = h_post(c, "acme", {h_key(good, kOther)});
     ctx.Equal(r.Status, 200, "a %s key (%s); the status", good, r.Text());
   }
 }
 
 void CheckHashShape(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   exact::claim("acme", "email_hash", "jane@example.com", "r-1");
+  exact::claim("acme", "email_hash", kEmail, "r-2");
   std::string upper = kEmail;
   for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
   const std::vector<std::pair<std::string, std::string>> bad = {
-      {"jane@example.com", "a raw email"}, {kSha1, "a 40-character SHA-1"}, {upper, "an uppercase digest"}, {kEmail.substr(0, 63), "a 63-character value"}};
+      {"jane@example.com", "a raw email"}, {kSha1, "a 40-character SHA-1"}, {upper, "an uppercase digest"}, {kEmail.substr(0, 63), "a 63-character value"},
+      {kEmail + "0", "a 65-character value"}, {kEmail + "\\n", "a digest with a trailing newline"}};
   for (const auto& [value, what] : bad) {
-    const auto r = post(c, "acme", {key("email_hash", value)});
-    ctx.Equal(r.Status, 400, "%s as the email_hash value answered %s: only a lowercase SHA-256 hex digest may reach the index; the status", what, r.Text());
+    const auto r = h_post(c, "acme", {h_key("email_hash", value)});
+    ctx.Equal(r.Status, 400, "%s as the email_hash value answered %s: only a value that fully matches a lowercase SHA-256 hex digest may reach the index; the status", what, r.Text());
   }
-  const auto r = post(c, "acme", {key("email_hash", kEmail)});
+  auto r = h_post(c, "acme", {h_key("email_hash", kEmail), h_key("phone_hash", "555-0100")});
+  ctx.Equal(r.Status, 400, "a body whose second value is not a digest, after a held key, must be rejected before any lookup (%s); the status", r.Text());
+  r = h_post(c, "acme", {h_key("email_hash", kEmail)});
   ctx.Equal(r.Status, 200, "a lowercase SHA-256 digest (%s); the status", r.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   exact::claim("globex", "email_hash", kEmail, "r-9");
-  auto r = post(c, "acme", {key("email_hash", kEmail)});
+  auto r = h_post(c, "acme", {h_key("email_hash", kEmail)});
   ctx.Equal(r.Status, 200, "acme's check (%s)", r.Text());
-  ctx.Assert(!duplicate(reply(r)) && r.Text().find("r-9") == std::string::npos && r.Text().find("globex") == std::string::npos,
+  ctx.Assert(!h_duplicate(h_reply(r)) && r.Text().find("r-9") == std::string::npos && r.Text().find("globex") == std::string::npos,
              "acme's check answered %s: it confirms, and names, a record globex holds. Look up the caller's tenant only", r.Text());
-  r = post(c, "", {key("email_hash", kEmail)});
+  r = h_post(c, "", {h_key("email_hash", kEmail)});
   ctx.Equal(r.Status, 401, "a check without X-Tenant-Id (%s); the status", r.Text());
   exact::claim("acme", "email_hash", kEmail, "r-1");
-  r = post(c, "acme", {key("email_hash", kEmail)});
+  r = h_post(c, "acme", {h_key("email_hash", kEmail)});
   ctx.Equal(r.Status, 200, "acme's own duplicate (%s); the status", r.Text());
-  ctx.Equal(reply(r)["match"], nlohmann::json{{"record_id", "r-1"}, {"key_type", "email_hash"}},
+  ctx.Equal(h_reply(r)["match"], nlohmann::json{{"record_id", "r-1"}, {"key_type", "email_hash"}},
             "acme's own duplicate must answer the record id and the key type and nothing about any tenant; the match");
 }
 
 void CheckEveryKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = h_api(ctx);
   exact::claim("acme", "phone_hash", kPhone, "r-7");
-  auto r = post(c, "acme", {key("email_hash", kOther), key("phone_hash", kPhone)});
+  auto r = h_post(c, "acme", {h_key("email_hash", kOther), h_key("phone_hash", kPhone)});
   ctx.Equal(r.Status, 200, "the check (%s)", r.Text());
-  ctx.Assert(duplicate(reply(r)), "r-7 holds the phone hash of the second key and the check answered %s: every key must be looked up, not the first", r.Text());
-  ctx.Equal(reply(r)["match"], nlohmann::json{{"record_id", "r-7"}, {"key_type", "phone_hash"}}, "the match for the second key");
-  r = post(c, "acme", {key("content_hash", kOther), key("email_hash", kOther)});
-  ctx.Assert(!duplicate(reply(r)), "no key is held and the check answered %s", r.Text());
+  ctx.Assert(h_duplicate(h_reply(r)), "r-7 holds the phone hash of the second key and the check answered %s: every key must be looked up, not the first", r.Text());
+  ctx.Equal(h_reply(r)["match"], nlohmann::json{{"record_id", "r-7"}, {"key_type", "phone_hash"}}, "the match for the second key");
+  exact::claim("acme", "email_hash", kEmail, "r-1");
+  r = h_post(c, "acme", {h_key("phone_hash", kPhone), h_key("email_hash", kEmail)});
+  ctx.Equal(h_reply(r)["match"], nlohmann::json{{"record_id", "r-7"}, {"key_type", "phone_hash"}},
+            "r-7 holds the first key and r-1 the second: the first key in the body that is held answers; the match");
+  r = h_post(c, "acme", {h_key("content_hash", kOther), h_key("email_hash", kOther)});
+  ctx.Assert(!h_duplicate(h_reply(r)), "no key is held and the check answered %s", r.Text());
 }
 `,
   },

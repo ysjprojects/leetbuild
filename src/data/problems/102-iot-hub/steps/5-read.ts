@@ -76,7 +76,7 @@ any tenant reads another tenant's device configuration by guessing its id.
       id: 'delta',
       title: 'Lists the desired fields the device has not reached',
       detail:
-        '`delta` is the sorted list of desired fields whose reported value differs or is missing, empty once the device has converged; the starter has no delta, and its merge hides the difference.',
+        '`delta` is the sorted list of desired fields whose reported value differs or is missing (a field only the device reports is never in it), empty once the device has converged; the starter has no delta, and its merge hides the difference.',
       match: {
         python: {all: [/["']delta["']\s*:/, /sorted\(/]},
         typescript: {all: [/delta:/, /\.sort\(/]},
@@ -89,7 +89,7 @@ any tenant reads another tenant's device configuration by guessing its id.
       id: 'foreign-device-404',
       title: 'A device of another tenant is 404',
       detail:
-        "Without `X-Tenant-Id` the read is 401; the device's owner is compared with the tenant before the shadow is read, and another tenant's device answers 404 like an unknown one. The starter serves any device to any caller.",
+        "Without `X-Tenant-Id` the read is 401; the device's owner is compared with the tenant before the shadow is read, and another tenant's device answers 404 with the same body as an unknown one. The starter serves any device to any caller.",
       match: {
         python: {
           all: [/registry\.owner\(/, /\b404\b/, /\b401\b/, /x-tenant-id/i],
@@ -464,7 +464,7 @@ void register_routes(httplib::Server& svr) {
 
 THERMO = "thermo-3"
 DESIRED = {"mode": "eco", "setpoint": "21", "fan": "auto"}
-REPORTED = {"mode": "normal", "setpoint": "21"}
+REPORTED = {"mode": "normal", "setpoint": "21", "firmware": "4.2"}
 
 
 def _api(ctx):
@@ -499,10 +499,10 @@ async def check_side_by_side(ctx):
 async def check_delta(ctx):
     async with _api(ctx) as c:
         body = (await _read(c)).json()
-        assert body.get("delta") == ["fan", "mode"], f"the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto, and the read answered delta {body.get('delta')!r}, expected ['fan', 'mode']"
-        shadow.apply_report(THERMO, DESIRED, 8)
+        assert body.get("delta") == ["fan", "mode"], f"the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto, and the read answered delta {body.get('delta')!r}, expected ['fan', 'mode']: only desired fields count, so the reported-only firmware is not in it"
+        shadow.apply_report(THERMO, {**DESIRED, "firmware": "4.2"}, 8)
         converged = (await _read(c)).json()
-    assert converged.get("delta") == [], f"once the device reports every desired value the read answered delta {converged.get('delta')!r}, expected []"
+    assert converged.get("delta") == [], f"once the device reports every desired value (and its own firmware) the read answered delta {converged.get('delta')!r}, expected []"
 
 
 async def check_foreign_device_404(ctx):
@@ -513,11 +513,12 @@ async def check_foreign_device_404(ctx):
     assert foreign.status_code == 404, f"tenant globex read acme's {THERMO} and got {foreign.status_code}: {foreign.text}. Another tenant's device must answer 404"
     assert "eco" not in foreign.text, f"the refused read still carried the shadow: {foreign.text}"
     assert unknown.status_code == 404, f"an unknown device answered {unknown.status_code}, expected 404"
+    assert foreign.text.replace(THERMO, "{id}") == unknown.text.replace("thermo-404", "{id}"), f"another tenant's device answered {foreign.text} and an unknown one {unknown.text}: the two must read the same, or the 404 confirms the id exists elsewhere"
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
 `,
     typescript: `const THERMO = 'thermo-3';
 const DESIRED = {mode: 'eco', setpoint: '21', fan: 'auto'};
-const REPORTED = {mode: 'normal', setpoint: '21'};
+const REPORTED = {mode: 'normal', setpoint: '21', firmware: '4.2'};
 
 async function api(ctx) {
   const m = ctx.load('read');
@@ -553,10 +554,10 @@ export async function check_side_by_side(ctx) {
 export async function check_delta(ctx) {
   const {c, shadow} = await api(ctx);
   const body = (await read(c)).json();
-  assert.deepEqual(body.delta, ['fan', 'mode'], \`the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto, and the read answered delta \${JSON.stringify(body.delta)}, expected ["fan","mode"]\`);
-  await shadow.applyReport(THERMO, DESIRED, 8);
+  assert.deepEqual(body.delta, ['fan', 'mode'], \`the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto, and the read answered delta \${JSON.stringify(body.delta)}, expected ["fan","mode"]: only desired fields count, so the reported-only firmware is not in it\`);
+  await shadow.applyReport(THERMO, {...DESIRED, firmware: '4.2'}, 8);
   const converged = (await read(c)).json();
-  assert.deepEqual(converged.delta, [], \`once the device reports every desired value the read answered delta \${JSON.stringify(converged.delta)}, expected []\`);
+  assert.deepEqual(converged.delta, [], \`once the device reports every desired value (and its own firmware) the read answered delta \${JSON.stringify(converged.delta)}, expected []\`);
 }
 
 export async function check_foreign_device_404(ctx) {
@@ -567,6 +568,7 @@ export async function check_foreign_device_404(ctx) {
   assert.equal(foreign.status, 404, \`tenant globex read acme's \${THERMO} and got \${foreign.status}: \${foreign.text}. Another tenant's device must answer 404\`);
   assert(!foreign.text.includes('eco'), \`the refused read still carried the shadow: \${foreign.text}\`);
   assert.equal(unknown.status, 404, \`an unknown device answered \${unknown.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll(THERMO, '{id}'), unknown.text.replaceAll('thermo-404', '{id}'), \`another tenant's device answered \${foreign.text} and an unknown one \${unknown.text}: the two must read the same, or the 404 confirms the id exists elsewhere\`);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
 }
 `,
@@ -583,14 +585,14 @@ import (
 	"leetbuild/harness"
 )
 
-const readThermo = "thermo-3"
+const hReadThermo = "thermo-3"
 
 var (
-	readDesired  = map[string]string{"mode": "eco", "setpoint": "21", "fan": "auto"}
-	readReported = map[string]string{"mode": "normal", "setpoint": "21"}
+	hReadDesired  = map[string]string{"mode": "eco", "setpoint": "21", "fan": "auto"}
+	hReadReported = map[string]string{"mode": "normal", "setpoint": "21", "firmware": "4.2"}
 )
 
-type shadowReply struct {
+type hShadowReply struct {
 	DeviceID        string            \`json:"device_id"\`
 	Desired         map[string]string \`json:"desired"\`
 	Reported        map[string]string \`json:"reported"\`
@@ -599,65 +601,66 @@ type shadowReply struct {
 	Delta           []string          \`json:"delta"\`
 }
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
 	bg := context.Background()
-	registry.Enroll(bg, readThermo, "acme")
+	registry.Enroll(bg, hReadThermo, "acme")
 	registry.Enroll(bg, "thermo-8", "globex")
 	for _, field := range []string{"mode", "setpoint", "fan"} {
-		shadow.UpdateDesired(bg, readThermo, map[string]string{field: readDesired[field]})
+		shadow.UpdateDesired(bg, hReadThermo, map[string]string{field: hReadDesired[field]})
 	}
-	shadow.ApplyReport(bg, readThermo, readReported, 7)
+	shadow.ApplyReport(bg, hReadThermo, hReadReported, 7)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readAs(c *harness.HTTP, device, tenant string) *harness.Response {
+func hReadAs(c *harness.HTTP, device, tenant string) *harness.Response {
 	if tenant == "" {
 		return c.Get("/v1/devices/" + device + "/shadow")
 	}
 	return c.Get("/v1/devices/"+device+"/shadow", "X-Tenant-Id", tenant)
 }
 
-func shadowOf(ctx *harness.Ctx, r *harness.Response) shadowReply {
+func hShadowOf(ctx *harness.Ctx, r *harness.Response) hShadowReply {
 	ctx.Equal(r.Status, 200, "the owner's shadow read (%s); the status", r.Text())
-	var body shadowReply
+	var body hShadowReply
 	r.Decode(&body)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	r := readAs(c, readThermo, "acme")
-	ctx.Equal(r.Status, 200, "GET /v1/devices/%s/shadow by its owner (%s); the status", readThermo, r.Text())
-	ctx.Equal(shadowOf(ctx, r).DeviceID, readThermo, "the shadow read must name the device")
+	c := hReadAPI(ctx)
+	r := hReadAs(c, hReadThermo, "acme")
+	ctx.Equal(r.Status, 200, "GET /v1/devices/%s/shadow by its owner (%s); the status", hReadThermo, r.Text())
+	ctx.Equal(hShadowOf(ctx, r).DeviceID, hReadThermo, "the shadow read must name the device")
 }
 
 func CheckSideBySide(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	body := shadowOf(ctx, readAs(c, readThermo, "acme"))
-	ctx.Equal(body.Desired, readDesired, "the shadow read must answer the stored desired document (merged, the desired values hide that the device still runs mode=normal); desired")
-	ctx.Equal(body.Reported, readReported, "the shadow read must answer the stored reported document; reported")
+	c := hReadAPI(ctx)
+	body := hShadowOf(ctx, hReadAs(c, hReadThermo, "acme"))
+	ctx.Equal(body.Desired, hReadDesired, "the shadow read must answer the stored desired document (merged, the desired values hide that the device still runs mode=normal); desired")
+	ctx.Equal(body.Reported, hReadReported, "the shadow read must answer the stored reported document; reported")
 	ctx.Assert(body.DesiredVersion == 3 && body.ReportedVersion == 7, "the shadow read answered desired_version %d and reported_version %d, expected 3 and 7 as stored", body.DesiredVersion, body.ReportedVersion)
 }
 
 func CheckDelta(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	body := shadowOf(ctx, readAs(c, readThermo, "acme"))
-	ctx.Equal(body.Delta, []string{"fan", "mode"}, "the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto; delta")
-	shadow.ApplyReport(context.Background(), readThermo, readDesired, 8)
-	converged := shadowOf(ctx, readAs(c, readThermo, "acme"))
-	ctx.Assert(converged.Delta != nil && len(converged.Delta) == 0, "once the device reports every desired value the read must answer an empty delta, got %v", converged.Delta)
+	c := hReadAPI(ctx)
+	body := hShadowOf(ctx, hReadAs(c, hReadThermo, "acme"))
+	ctx.Equal(body.Delta, []string{"fan", "mode"}, "the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto (only desired fields count, so the reported-only firmware is not in it); delta")
+	shadow.ApplyReport(context.Background(), hReadThermo, map[string]string{"mode": "eco", "setpoint": "21", "fan": "auto", "firmware": "4.2"}, 8)
+	converged := hShadowOf(ctx, hReadAs(c, hReadThermo, "acme"))
+	ctx.Assert(converged.Delta != nil && len(converged.Delta) == 0, "once the device reports every desired value (and its own firmware) the read must answer an empty delta, got %v", converged.Delta)
 }
 
 func CheckForeignDevice404(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	foreign := readAs(c, readThermo, "globex")
-	unknown := readAs(c, "thermo-404", "acme")
-	anonymous := readAs(c, readThermo, "")
-	ctx.Equal(foreign.Status, 404, "tenant globex read acme's %s (%s): another tenant's device must answer 404; the status", readThermo, foreign.Text())
+	c := hReadAPI(ctx)
+	foreign := hReadAs(c, hReadThermo, "globex")
+	unknown := hReadAs(c, "thermo-404", "acme")
+	anonymous := hReadAs(c, hReadThermo, "")
+	ctx.Equal(foreign.Status, 404, "tenant globex read acme's %s (%s): another tenant's device must answer 404; the status", hReadThermo, foreign.Text())
 	ctx.Assert(!strings.Contains(foreign.Text(), "eco"), "the refused read still carried the shadow: %s", foreign.Text())
 	ctx.Equal(unknown.Status, 404, "an unknown device; the status")
+	ctx.Equal(strings.ReplaceAll(foreign.Text(), hReadThermo, "{id}"), strings.ReplaceAll(unknown.Text(), "thermo-404", "{id}"), "another tenant's device and an unknown one must read the same (or the 404 confirms the id exists elsewhere); the body")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id; the status")
 }
 `,
@@ -674,15 +677,15 @@ func CheckForeignDevice404(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kReadThermo = "thermo-3";
-const std::map<std::string, std::string> kDesired = {{"mode", "eco"}, {"setpoint", "21"}, {"fan", "auto"}};
-const std::map<std::string, std::string> kReported = {{"mode", "normal"}, {"setpoint", "21"}};
+const std::string kHReadThermo = "thermo-3";
+const std::map<std::string, std::string> kHDesired = {{"mode", "eco"}, {"setpoint", "21"}, {"fan", "auto"}};
+const std::map<std::string, std::string> kHReported = {{"mode", "normal"}, {"setpoint", "21"}, {"firmware", "4.2"}};
 
-harness::HTTP readApi(harness::Ctx& ctx) {
-  registry::enroll(kReadThermo, "acme");
+harness::HTTP hReadApi(harness::Ctx& ctx) {
+  registry::enroll(kHReadThermo, "acme");
   registry::enroll("thermo-8", "globex");
-  for (const std::string field : {"mode", "setpoint", "fan"}) shadow::updateDesired(kReadThermo, {{field, kDesired.at(field)}});
-  shadow::applyReport(kReadThermo, kReported, 7);
+  for (const std::string field : {"mode", "setpoint", "fan"}) shadow::updateDesired(kHReadThermo, {{field, kHDesired.at(field)}});
+  shadow::applyReport(kHReadThermo, kHReported, 7);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -690,12 +693,12 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& device, const std::string& tenant) {
+harness::Response hReadAs(harness::HTTP& c, const std::string& device, const std::string& tenant) {
   if (tenant.empty()) return c.Get("/v1/devices/" + device + "/shadow");
   return c.Get("/v1/devices/" + device + "/shadow", "X-Tenant-Id", tenant);
 }
 
-nlohmann::json shadowOf(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hShadowOf(harness::Ctx& ctx, const harness::Response& r) {
   ctx.Equal(r.Status, 200, "the owner's shadow read (%s); the status", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the shadow read must answer a JSON object, got %s", r.Text());
@@ -705,41 +708,49 @@ nlohmann::json shadowOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto r = readAs(c, kReadThermo, "acme");
-  ctx.Equal(r.Status, 200, "GET /v1/devices/%s/shadow by its owner (%s); the status", kReadThermo, r.Text());
-  ctx.Equal(shadowOf(ctx, r).value("device_id", ""), kReadThermo, "the shadow read must name the device");
+  auto c = hReadApi(ctx);
+  const auto r = hReadAs(c, kHReadThermo, "acme");
+  ctx.Equal(r.Status, 200, "GET /v1/devices/%s/shadow by its owner (%s); the status", kHReadThermo, r.Text());
+  ctx.Equal(hShadowOf(ctx, r).value("device_id", ""), kHReadThermo, "the shadow read must name the device");
 }
 
 void CheckSideBySide(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto body = shadowOf(ctx, readAs(c, kReadThermo, "acme"));
-  ctx.Equal(body.value("desired", nlohmann::json()), nlohmann::json(kDesired),
+  auto c = hReadApi(ctx);
+  const auto body = hShadowOf(ctx, hReadAs(c, kHReadThermo, "acme"));
+  ctx.Equal(body.value("desired", nlohmann::json()), nlohmann::json(kHDesired),
             "the shadow read must answer the stored desired document (merged, the desired values hide that the device still runs mode=normal); desired");
-  ctx.Equal(body.value("reported", nlohmann::json()), nlohmann::json(kReported), "the shadow read must answer the stored reported document; reported");
+  ctx.Equal(body.value("reported", nlohmann::json()), nlohmann::json(kHReported), "the shadow read must answer the stored reported document; reported");
   ctx.Assert(body.value("desired_version", 0LL) == 3 && body.value("reported_version", 0LL) == 7,
              "the shadow read answered desired_version %d and reported_version %d, expected 3 and 7 as stored", body.value("desired_version", 0LL),
              body.value("reported_version", 0LL));
 }
 
 void CheckDelta(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto body = shadowOf(ctx, readAs(c, kReadThermo, "acme"));
+  auto c = hReadApi(ctx);
+  const auto body = hShadowOf(ctx, hReadAs(c, kHReadThermo, "acme"));
   ctx.Equal(body.value("delta", nlohmann::json()), nlohmann::json({"fan", "mode"}),
-            "the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto; delta");
-  shadow::applyReport(kReadThermo, kDesired, 8);
-  const auto converged = shadowOf(ctx, readAs(c, kReadThermo, "acme"));
-  ctx.Equal(converged.value("delta", nlohmann::json()), nlohmann::json::array(), "once the device reports every desired value; delta");
+            "the device reports mode=normal and no fan, the operator wants mode=eco and fan=auto (only desired fields count, so the reported-only firmware is not in it); delta");
+  auto converged_report = kHDesired;
+  converged_report["firmware"] = "4.2";
+  shadow::applyReport(kHReadThermo, converged_report, 8);
+  const auto converged = hShadowOf(ctx, hReadAs(c, kHReadThermo, "acme"));
+  ctx.Equal(converged.value("delta", nlohmann::json()), nlohmann::json::array(), "once the device reports every desired value (and its own firmware); delta");
 }
 
 void CheckForeignDevice404(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
-  const auto foreign = readAs(c, kReadThermo, "globex");
-  const auto unknown = readAs(c, "thermo-404", "acme");
-  const auto anonymous = readAs(c, kReadThermo, "");
-  ctx.Equal(foreign.Status, 404, "tenant globex read acme's %s (%s): another tenant's device must answer 404; the status", kReadThermo, foreign.Text());
+  auto c = hReadApi(ctx);
+  const auto foreign = hReadAs(c, kHReadThermo, "globex");
+  const auto unknown = hReadAs(c, "thermo-404", "acme");
+  const auto anonymous = hReadAs(c, kHReadThermo, "");
+  ctx.Equal(foreign.Status, 404, "tenant globex read acme's %s (%s): another tenant's device must answer 404; the status", kHReadThermo, foreign.Text());
   ctx.Assert(foreign.Text().find("eco") == std::string::npos, "the refused read still carried the shadow: %s", foreign.Text());
   ctx.Equal(unknown.Status, 404, "an unknown device; the status");
+  const auto with_id_masked = [](std::string text, const std::string& id) {
+    for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at)) text.replace(at, id.size(), "{id}");
+    return text;
+  };
+  ctx.Equal(with_id_masked(foreign.Text(), kHReadThermo), with_id_masked(unknown.Text(), "thermo-404"),
+            "another tenant's device and an unknown one must read the same (or the 404 confirms the id exists elsewhere); the body");
   ctx.Equal(anonymous.Status, 401, "a read without X-Tenant-Id; the status");
 }
 `,

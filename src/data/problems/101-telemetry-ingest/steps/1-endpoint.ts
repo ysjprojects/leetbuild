@@ -88,7 +88,7 @@ and a device whose clock runs a year ahead pins the dashboard's newest point to 
       id: 'value-range',
       title: 'An out-of-range value is 422 naming the metric and the range',
       detail:
-        "A value outside its metric's declared `[low, high]` answers **422** naming the metric and the bounds, and nothing of the batch reaches the WAL. The starter appends it, overflow readings included.",
+        "A value outside its metric's declared `[low, high]`, above or below, answers **422** naming the metric and the bounds, and nothing of the batch reaches the WAL; both bounds are inside the range. The starter appends it, overflow readings included.",
       match: {
         python: {all: [/\b422\b/, /\blow\b/, /\bhigh\b/]},
         typescript: {all: [/\b422\b/, /\blow\b/, /\bhigh\b/]},
@@ -101,7 +101,7 @@ and a device whose clock runs a year ahead pins the dashboard's newest point to 
       id: 'timestamp-window',
       title: 'A timestamp outside the ingest window is 422',
       detail:
-        'A reading older than `MAX_AGE_S` (one hour) or more than `MAX_SKEW_S` (five minutes) ahead of the clock answers **422**. The starter takes any `ts`, so one device with a wrong clock owns the newest point of its series.',
+        'A reading older than `MAX_AGE_S` (one hour) or more than `MAX_SKEW_S` (five minutes) ahead of the clock answers **422**, wherever it sits in the batch; readings at the edges of the window are accepted. The starter takes any `ts`, so one device with a wrong clock owns the newest point of its series.',
       match: {
         python: {all: [/MAX_AGE_S/, /MAX_SKEW_S/, /time\.time\(\)/]},
         typescript: {all: [/MAX_AGE_S/, /MAX_SKEW_S/, /Date\.now\(\)/]},
@@ -671,24 +671,43 @@ async def check_value_range(ctx):
     async with _api(ctx) as c:
         r = await c.post("/v1/telemetry", json=_batch([{"metric": "humidity", "value": 40, "ts": now}, {"metric": "temp_c", "value": 9.2e18, "ts": now}]))
         edge = await c.post("/v1/telemetry", json=_batch([{"metric": "temp_c", "value": 85, "ts": now}], batch_id="b-2"))
+        below = await c.post("/v1/telemetry", json=_batch([{"metric": "temp_c", "value": 20, "ts": now}, {"metric": "humidity", "value": -0.5, "ts": now}], batch_id="b-3"))
+        floor = await c.post("/v1/telemetry", json=_batch([{"metric": "temp_c", "value": -40, "ts": now}], batch_id="b-4"))
     assert r.status_code == 422, f"temp_c = 9.2e18 against a declared range of [-40, 85] answered {r.status_code}, expected 422"
     assert "temp_c" in r.text and "85" in r.text, f"the 422 must name the metric temp_c and its range [-40, 85], got {r.text}"
-    rows = _wal(ctx)
-    assert all(row["batch_id"] != "b-1" for row in rows), f"the batch with the overflow reading reached the WAL: {rows}"
     assert edge.status_code == 202, f"temp_c = 85, the top of its declared range, answered {edge.status_code}: the range is inclusive"
+    assert below.status_code == 422, f"humidity = -0.5 against a declared range of [0, 100] answered {below.status_code}, expected 422"
+    assert "humidity" in below.text, f"the 422 must name the metric humidity, got {below.text}"
+    assert floor.status_code == 202, f"temp_c = -40, the bottom of its declared range, answered {floor.status_code}: the range is inclusive"
+    batches = [row["batch_id"] for row in _wal(ctx)]
+    assert batches == ["b-2", "b-4"], f"the WAL holds batches {batches}, expected b-2 and b-4: a batch with an out-of-range reading appends nothing"
 
 
 async def check_timestamp_window(ctx):
-    now = _now(ctx)
     async with _api(ctx) as c:
-        ahead = await c.post("/v1/telemetry", json=_batch([{"metric": "temp_c", "value": 21.5, "ts": now + 365 * 86400}]))
-        stale = await c.post("/v1/telemetry", json=_batch([{"metric": "temp_c", "value": 21.5, "ts": now - 7200}], batch_id="b-2"))
-        skewed = await c.post("/v1/telemetry", json=_batch([{"metric": "temp_c", "value": 21.5, "ts": now + 60}], batch_id="b-3"))
+
+        async def post(batch_id, *offsets):
+            now = _now(ctx)
+            return await c.post("/v1/telemetry", json=_batch([{"metric": "temp_c", "value": 21.5, "ts": now + offset} for offset in offsets], batch_id=batch_id))
+
+        ahead = await post("b-1", 365 * 86400)
+        stale = await post("b-2", -7200)
+        skewed = await post("b-3", 60)
+        skew_edge = await post("b-4", 300)
+        skew_past = await post("b-5", 301)
+        age_edge = await post("b-6", -3599)
+        age_past = await post("b-7", -3601)
+        mixed = await post("b-8", 0, -10, 900)
     assert ahead.status_code == 422, f"a reading stamped a year ahead of the clock answered {ahead.status_code}, expected 422"
     assert stale.status_code == 422, f"a reading stamped two hours ago (past MAX_AGE_S) answered {stale.status_code}, expected 422"
     assert skewed.status_code == 202, f"a reading 60 s ahead (inside MAX_SKEW_S) answered {skewed.status_code}: {skewed.text}"
+    assert skew_edge.status_code == 202, f"a reading 300 s ahead (exactly MAX_SKEW_S) answered {skew_edge.status_code}: {skew_edge.text}"
+    assert skew_past.status_code == 422, f"a reading 301 s ahead (past MAX_SKEW_S = 300) answered {skew_past.status_code}, expected 422"
+    assert age_edge.status_code == 202, f"a reading 3599 s old (inside MAX_AGE_S) answered {age_edge.status_code}: {age_edge.text}"
+    assert age_past.status_code == 422, f"a reading 3601 s old (past MAX_AGE_S = 3600) answered {age_past.status_code}, expected 422"
+    assert mixed.status_code == 422, f"a batch whose third reading is 900 s ahead answered {mixed.status_code}, expected 422: every sample is checked"
     batches = [row["batch_id"] for row in _wal(ctx)]
-    assert batches == ["b-3"], f"the WAL holds batches {batches}, expected only b-3"
+    assert batches == ["b-3", "b-4", "b-6"], f"the WAL holds batches {batches}, expected b-3, b-4 and b-6"
 `,
     typescript: `const RANGES = {temp_c: [-40, 85], humidity: [0, 100]};
 
@@ -739,23 +758,41 @@ export async function check_value_range(ctx) {
   const r = await c.post('/v1/telemetry', {json: batch([{metric: 'humidity', value: 40, ts: now}, {metric: 'temp_c', value: 9.2e18, ts: now}])});
   assert.equal(r.status, 422, \`temp_c = 9.2e18 against a declared range of [-40, 85] answered \${r.status}, expected 422\`);
   assert(r.text.includes('temp_c') && r.text.includes('85'), \`the 422 must name the metric temp_c and its range [-40, 85], got \${r.text}\`);
-  const rows = walRows(ctx);
-  assert(rows.every(row => row.batch_id !== 'b-1'), \`the batch with the overflow reading reached the WAL: \${JSON.stringify(rows)}\`);
   const edge = await c.post('/v1/telemetry', {json: batch([{metric: 'temp_c', value: 85, ts: now}], 'd-1', 'b-2')});
   assert.equal(edge.status, 202, \`temp_c = 85, the top of its declared range, answered \${edge.status}: the range is inclusive\`);
+  const below = await c.post('/v1/telemetry', {json: batch([{metric: 'temp_c', value: 20, ts: now}, {metric: 'humidity', value: -0.5, ts: now}], 'd-1', 'b-3')});
+  assert.equal(below.status, 422, \`humidity = -0.5 against a declared range of [0, 100] answered \${below.status}, expected 422\`);
+  assert(below.text.includes('humidity'), \`the 422 must name the metric humidity, got \${below.text}\`);
+  const floor = await c.post('/v1/telemetry', {json: batch([{metric: 'temp_c', value: -40, ts: now}], 'd-1', 'b-4')});
+  assert.equal(floor.status, 202, \`temp_c = -40, the bottom of its declared range, answered \${floor.status}: the range is inclusive\`);
+  const batches = walRows(ctx).map(row => row.batch_id);
+  assert.deepEqual(batches, ['b-2', 'b-4'], \`the WAL holds batches \${JSON.stringify(batches)}, expected b-2 and b-4: a batch with an out-of-range reading appends nothing\`);
 }
 
 export async function check_timestamp_window(ctx) {
-  const now = nowS(ctx);
   const {c} = await api(ctx);
-  const ahead = await c.post('/v1/telemetry', {json: batch([{metric: 'temp_c', value: 21.5, ts: now + 365 * 86400}])});
-  const stale = await c.post('/v1/telemetry', {json: batch([{metric: 'temp_c', value: 21.5, ts: now - 7200}], 'd-1', 'b-2')});
-  const skewed = await c.post('/v1/telemetry', {json: batch([{metric: 'temp_c', value: 21.5, ts: now + 60}], 'd-1', 'b-3')});
+  const post = (batchId, ...offsets) => {
+    const now = nowS(ctx);
+    return c.post('/v1/telemetry', {json: batch(offsets.map(offset => ({metric: 'temp_c', value: 21.5, ts: now + offset})), 'd-1', batchId)});
+  };
+  const ahead = await post('b-1', 365 * 86400);
   assert.equal(ahead.status, 422, \`a reading stamped a year ahead of the clock answered \${ahead.status}, expected 422\`);
+  const stale = await post('b-2', -7200);
   assert.equal(stale.status, 422, \`a reading stamped two hours ago (past MAX_AGE_S) answered \${stale.status}, expected 422\`);
+  const skewed = await post('b-3', 60);
   assert.equal(skewed.status, 202, \`a reading 60 s ahead (inside MAX_SKEW_S) answered \${skewed.status}: \${skewed.text}\`);
+  const skewEdge = await post('b-4', 300);
+  assert.equal(skewEdge.status, 202, \`a reading 300 s ahead (exactly MAX_SKEW_S) answered \${skewEdge.status}: \${skewEdge.text}\`);
+  const skewPast = await post('b-5', 301);
+  assert.equal(skewPast.status, 422, \`a reading 301 s ahead (past MAX_SKEW_S = 300) answered \${skewPast.status}, expected 422\`);
+  const ageEdge = await post('b-6', -3599);
+  assert.equal(ageEdge.status, 202, \`a reading 3599 s old (inside MAX_AGE_S) answered \${ageEdge.status}: \${ageEdge.text}\`);
+  const agePast = await post('b-7', -3601);
+  assert.equal(agePast.status, 422, \`a reading 3601 s old (past MAX_AGE_S = 3600) answered \${agePast.status}, expected 422\`);
+  const mixed = await post('b-8', 0, -10, 900);
+  assert.equal(mixed.status, 422, \`a batch whose third reading is 900 s ahead answered \${mixed.status}, expected 422: every sample is checked\`);
   const batches = walRows(ctx).map(row => row.batch_id);
-  assert.deepEqual(batches, ['b-3'], \`the WAL holds batches \${JSON.stringify(batches)}, expected only b-3\`);
+  assert.deepEqual(batches, ['b-3', 'b-4', 'b-6'], \`the WAL holds batches \${JSON.stringify(batches)}, expected b-3, b-4 and b-6\`);
 }
 `,
     go: `package main
@@ -771,12 +808,12 @@ import (
 	"leetbuild/harness"
 )
 
-type walRow struct {
+type hWalRow struct {
 	BatchID string           \`json:"batch_id"\`
 	Samples []map[string]any \`json:"samples"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hApi(ctx *harness.Ctx) *harness.HTTP {
 	_, err := registry.RegisterDevice(context.Background(), "d-1", "f-1", map[string][2]float64{"temp_c": {-40, 85}, "humidity": {0, 100}})
 	ctx.NoError(err, "registering d-1")
 	mux := http.NewServeMux()
@@ -784,89 +821,113 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func telemetry(batchID, deviceID string, samples ...map[string]any) map[string]any {
+func hTelemetry(batchID, deviceID string, samples ...map[string]any) map[string]any {
 	return map[string]any{"batch_id": batchID, "device_id": deviceID, "samples": samples}
 }
 
-func reading(metric string, value float64, ts int64) map[string]any {
+func hReading(metric string, value float64, ts int64) map[string]any {
 	return map[string]any{"metric": metric, "value": value, "ts": ts}
 }
 
-func walRows(ctx *harness.Ctx) []walRow {
-	var rows []walRow
+func hWalRows(ctx *harness.Ctx) []hWalRow {
+	var rows []hWalRow
 	for _, text := range ctx.Redis.LRange("wal:ingest", 0, -1) {
-		var row walRow
+		var row hWalRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "a WAL entry must be JSON: %s", text)
 		rows = append(rows, row)
 	}
 	return rows
 }
 
-func nowS(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
+func hNowS(ctx *harness.Ctx) int64 { return ctx.Clock.Now() / 1000 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	now := nowS(ctx)
-	c := api(ctx)
-	r := c.Post("/v1/telemetry", telemetry("b-1", "d-1", reading("temp_c", 21.5, now-10), reading("humidity", 40, now-10)))
+	now := hNowS(ctx)
+	c := hApi(ctx)
+	r := c.Post("/v1/telemetry", hTelemetry("b-1", "d-1", hReading("temp_c", 21.5, now-10), hReading("humidity", 40, now-10)))
 	ctx.Equal(r.Status, 202, "a valid batch from d-1 (%s)", r.Text())
 	var body struct {
 		Accepted int \`json:"accepted"\`
 	}
 	r.Decode(&body)
 	ctx.Equal(body.Accepted, 2, "the 202 must carry the accepted count (%s)", r.Text())
-	rows := walRows(ctx)
+	rows := hWalRows(ctx)
 	ctx.Assert(len(rows) == 1 && rows[0].BatchID == "b-1" && len(rows[0].Samples) == 2, "the WAL must hold batch b-1 with its two samples, it holds %v", rows)
-	empty := c.Post("/v1/telemetry", telemetry("b-2", "d-1"))
+	empty := c.Post("/v1/telemetry", hTelemetry("b-2", "d-1"))
 	ctx.Equal(empty.Status, 400, "a batch with no samples")
 }
 
 func CheckDeviceKnown(ctx *harness.Ctx) {
-	now := nowS(ctx)
-	c := api(ctx)
-	r := c.Post("/v1/telemetry", telemetry("b-1", "d-typo", reading("temp_c", 21.5, now)))
+	now := hNowS(ctx)
+	c := hApi(ctx)
+	r := c.Post("/v1/telemetry", hTelemetry("b-1", "d-typo", hReading("temp_c", 21.5, now)))
 	ctx.Equal(r.Status, 404, "a batch from d-typo, a device the registry does not know")
 	created, err := registry.Lookup(context.Background(), "d-typo")
 	ctx.NoError(err, "looking d-typo up")
 	ctx.Assert(created == nil, "the ingest path created a registry row for d-typo: %+v. Only provisioning registers devices", created)
-	ctx.Equal(len(walRows(ctx)), 0, "a batch from an unknown device must not reach the WAL; WAL entries")
+	ctx.Equal(len(hWalRows(ctx)), 0, "a batch from an unknown device must not reach the WAL; WAL entries")
 }
 
 func CheckMetricKnown(ctx *harness.Ctx) {
-	now := nowS(ctx)
-	c := api(ctx)
-	r := c.Post("/v1/telemetry", telemetry("b-1", "d-1", reading("temp_c", 21.5, now), reading("pressure_hpa", 1013, now)))
+	now := hNowS(ctx)
+	c := hApi(ctx)
+	r := c.Post("/v1/telemetry", hTelemetry("b-1", "d-1", hReading("temp_c", 21.5, now), hReading("pressure_hpa", 1013, now)))
 	ctx.Equal(r.Status, 400, "a batch with pressure_hpa, a metric d-1 never declared")
 	ctx.Assert(strings.Contains(r.Text(), "pressure_hpa"), "the 400 must name the undeclared metric pressure_hpa, got %s", r.Text())
-	ctx.Equal(len(walRows(ctx)), 0, "a batch with an undeclared metric must not reach the WAL; WAL entries")
+	ctx.Equal(len(hWalRows(ctx)), 0, "a batch with an undeclared metric must not reach the WAL; WAL entries")
 }
 
 func CheckValueRange(ctx *harness.Ctx) {
-	now := nowS(ctx)
-	c := api(ctx)
-	r := c.Post("/v1/telemetry", telemetry("b-1", "d-1", reading("humidity", 40, now), reading("temp_c", 9.2e18, now)))
+	now := hNowS(ctx)
+	c := hApi(ctx)
+	r := c.Post("/v1/telemetry", hTelemetry("b-1", "d-1", hReading("humidity", 40, now), hReading("temp_c", 9.2e18, now)))
 	ctx.Equal(r.Status, 422, "temp_c = 9.2e18 against a declared range of [-40, 85]")
 	ctx.Assert(strings.Contains(r.Text(), "temp_c") && strings.Contains(r.Text(), "85"), "the 422 must name the metric temp_c and its range [-40, 85], got %s", r.Text())
-	for _, row := range walRows(ctx) {
-		ctx.Assert(row.BatchID != "b-1", "the batch with the overflow reading reached the WAL: %v", row)
-	}
-	edge := c.Post("/v1/telemetry", telemetry("b-2", "d-1", reading("temp_c", 85, now)))
+	edge := c.Post("/v1/telemetry", hTelemetry("b-2", "d-1", hReading("temp_c", 85, now)))
 	ctx.Equal(edge.Status, 202, "temp_c = 85, the top of its declared range (the range is inclusive)")
+	below := c.Post("/v1/telemetry", hTelemetry("b-3", "d-1", hReading("temp_c", 20, now), hReading("humidity", -0.5, now)))
+	ctx.Equal(below.Status, 422, "humidity = -0.5 against a declared range of [0, 100]")
+	ctx.Assert(strings.Contains(below.Text(), "humidity"), "the 422 must name the metric humidity, got %s", below.Text())
+	floor := c.Post("/v1/telemetry", hTelemetry("b-4", "d-1", hReading("temp_c", -40, now)))
+	ctx.Equal(floor.Status, 202, "temp_c = -40, the bottom of its declared range (the range is inclusive)")
+	var batches []string
+	for _, row := range hWalRows(ctx) {
+		batches = append(batches, row.BatchID)
+	}
+	ctx.Equal(batches, []string{"b-2", "b-4"}, "a batch with an out-of-range reading appends nothing: the WAL must hold b-2 and b-4; it holds")
 }
 
 func CheckTimestampWindow(ctx *harness.Ctx) {
-	now := nowS(ctx)
-	c := api(ctx)
-	ahead := c.Post("/v1/telemetry", telemetry("b-1", "d-1", reading("temp_c", 21.5, now+365*86400)))
-	stale := c.Post("/v1/telemetry", telemetry("b-2", "d-1", reading("temp_c", 21.5, now-7200)))
-	skewed := c.Post("/v1/telemetry", telemetry("b-3", "d-1", reading("temp_c", 21.5, now+60)))
+	c := hApi(ctx)
+	post := func(batchID string, offsets ...int64) *harness.Response {
+		now := hNowS(ctx)
+		var samples []map[string]any
+		for _, offset := range offsets {
+			samples = append(samples, hReading("temp_c", 21.5, now+offset))
+		}
+		return c.Post("/v1/telemetry", hTelemetry(batchID, "d-1", samples...))
+	}
+	ahead := post("b-1", 365*86400)
 	ctx.Equal(ahead.Status, 422, "a reading stamped a year ahead of the clock")
+	stale := post("b-2", -7200)
 	ctx.Equal(stale.Status, 422, "a reading stamped two hours ago (past maxAgeS)")
+	skewed := post("b-3", 60)
 	ctx.Equal(skewed.Status, 202, "a reading 60 s ahead, inside maxSkewS (%s)", skewed.Text())
+	skewEdge := post("b-4", 300)
+	ctx.Equal(skewEdge.Status, 202, "a reading 300 s ahead, exactly maxSkewS (%s)", skewEdge.Text())
+	skewPast := post("b-5", 301)
+	ctx.Equal(skewPast.Status, 422, "a reading 301 s ahead, past maxSkewS = 300")
+	ageEdge := post("b-6", -3599)
+	ctx.Equal(ageEdge.Status, 202, "a reading 3599 s old, inside maxAgeS (%s)", ageEdge.Text())
+	agePast := post("b-7", -3601)
+	ctx.Equal(agePast.Status, 422, "a reading 3601 s old, past maxAgeS = 3600")
+	mixed := post("b-8", 0, -10, 900)
+	ctx.Equal(mixed.Status, 422, "a batch whose third reading is 900 s ahead (every sample is checked)")
 	var batches []string
-	for _, row := range walRows(ctx) {
+	for _, row := range hWalRows(ctx) {
 		batches = append(batches, row.BatchID)
 	}
-	ctx.Equal(batches, []string{"b-3"}, "the WAL must hold only b-3; it holds")
+	ctx.Equal(batches, []string{"b-3", "b-4", "b-6"}, "the WAL must hold b-3, b-4 and b-6; it holds")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -882,7 +943,7 @@ using json = nlohmann::json;
 
 namespace {
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   registry::registerDevice("d-1", "f-1", {{"temp_c", {-40, 85}}, {"humidity", {0, 100}}});
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -891,78 +952,100 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json reading(const std::string& metric, double value, long long ts) { return {{"metric", metric}, {"value", value}, {"ts", ts}}; }
+json hReading(const std::string& metric, double value, long long ts) { return {{"metric", metric}, {"value", value}, {"ts", ts}}; }
 
-harness::Response postBatch(harness::HTTP& c, const std::string& batch_id, const std::string& device_id, const json& samples) {
+harness::Response hPostBatch(harness::HTTP& c, const std::string& batch_id, const std::string& device_id, const json& samples) {
   return c.Post("/v1/telemetry", json{{"batch_id", batch_id}, {"device_id", device_id}, {"samples", samples}}.dump(), "Content-Type", "application/json");
 }
 
-std::vector<json> walRows(harness::Ctx& ctx) {
+std::vector<json> hWalRows(harness::Ctx& ctx) {
   std::vector<json> rows;
   for (const auto& text : ctx.Redis.LRange("wal:ingest", 0, -1)) rows.push_back(json::parse(text, nullptr, false));
   return rows;
 }
 
-long long nowS(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
+long long hNowS(harness::Ctx& ctx) { return ctx.Clock.Now() / 1000; }
 
-bool contains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
+bool hContains(const std::string& text, const std::string& part) { return text.find(part) != std::string::npos; }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  const long long now = nowS(ctx);
-  auto c = api(ctx);
-  const auto r = postBatch(c, "b-1", "d-1", json::array({reading("temp_c", 21.5, now - 10), reading("humidity", 40, now - 10)}));
+  const long long now = hNowS(ctx);
+  auto c = hApi(ctx);
+  const auto r = hPostBatch(c, "b-1", "d-1", json::array({hReading("temp_c", 21.5, now - 10), hReading("humidity", 40, now - 10)}));
   ctx.Equal(r.Status, 202, "a valid batch from d-1 (%s)", r.Text());
   ctx.Equal(json::parse(r.Text(), nullptr, false).value("accepted", 0), 2, "the 202 must carry the accepted count (%s)", r.Text());
-  const auto rows = walRows(ctx);
+  const auto rows = hWalRows(ctx);
   ctx.Assert(rows.size() == 1 && rows[0].value("batch_id", "") == "b-1" && rows[0]["samples"].size() == 2, "the WAL must hold batch b-1 with its two samples, it holds %d entries", rows.size());
-  const auto empty = postBatch(c, "b-2", "d-1", json::array());
+  const auto empty = hPostBatch(c, "b-2", "d-1", json::array());
   ctx.Equal(empty.Status, 400, "a batch with no samples");
 }
 
 void CheckDeviceKnown(harness::Ctx& ctx) {
-  const long long now = nowS(ctx);
-  auto c = api(ctx);
-  const auto r = postBatch(c, "b-1", "d-typo", json::array({reading("temp_c", 21.5, now)}));
+  const long long now = hNowS(ctx);
+  auto c = hApi(ctx);
+  const auto r = hPostBatch(c, "b-1", "d-typo", json::array({hReading("temp_c", 21.5, now)}));
   ctx.Equal(r.Status, 404, "a batch from d-typo, a device the registry does not know");
   const auto created = registry::lookup("d-typo");
   ctx.Assert(!created, "the ingest path created a registry row for d-typo (fleet %q). Only provisioning registers devices", created ? created->fleet : "");
-  ctx.Equal(walRows(ctx).size(), 0, "a batch from an unknown device must not reach the WAL; WAL entries");
+  ctx.Equal(hWalRows(ctx).size(), 0, "a batch from an unknown device must not reach the WAL; WAL entries");
 }
 
 void CheckMetricKnown(harness::Ctx& ctx) {
-  const long long now = nowS(ctx);
-  auto c = api(ctx);
-  const auto r = postBatch(c, "b-1", "d-1", json::array({reading("temp_c", 21.5, now), reading("pressure_hpa", 1013, now)}));
+  const long long now = hNowS(ctx);
+  auto c = hApi(ctx);
+  const auto r = hPostBatch(c, "b-1", "d-1", json::array({hReading("temp_c", 21.5, now), hReading("pressure_hpa", 1013, now)}));
   ctx.Equal(r.Status, 400, "a batch with pressure_hpa, a metric d-1 never declared");
-  ctx.Assert(contains(r.Text(), "pressure_hpa"), "the 400 must name the undeclared metric pressure_hpa, got %s", r.Text());
-  ctx.Equal(walRows(ctx).size(), 0, "a batch with an undeclared metric must not reach the WAL; WAL entries");
+  ctx.Assert(hContains(r.Text(), "pressure_hpa"), "the 400 must name the undeclared metric pressure_hpa, got %s", r.Text());
+  ctx.Equal(hWalRows(ctx).size(), 0, "a batch with an undeclared metric must not reach the WAL; WAL entries");
 }
 
 void CheckValueRange(harness::Ctx& ctx) {
-  const long long now = nowS(ctx);
-  auto c = api(ctx);
-  const auto r = postBatch(c, "b-1", "d-1", json::array({reading("humidity", 40, now), reading("temp_c", 9.2e18, now)}));
+  const long long now = hNowS(ctx);
+  auto c = hApi(ctx);
+  const auto r = hPostBatch(c, "b-1", "d-1", json::array({hReading("humidity", 40, now), hReading("temp_c", 9.2e18, now)}));
   ctx.Equal(r.Status, 422, "temp_c = 9.2e18 against a declared range of [-40, 85]");
-  ctx.Assert(contains(r.Text(), "temp_c") && contains(r.Text(), "85"), "the 422 must name the metric temp_c and its range [-40, 85], got %s", r.Text());
-  for (const auto& row : walRows(ctx)) ctx.Assert(row.value("batch_id", "") != "b-1", "the batch with the overflow reading reached the WAL: %s", row.dump());
-  const auto edge = postBatch(c, "b-2", "d-1", json::array({reading("temp_c", 85, now)}));
+  ctx.Assert(hContains(r.Text(), "temp_c") && hContains(r.Text(), "85"), "the 422 must name the metric temp_c and its range [-40, 85], got %s", r.Text());
+  const auto edge = hPostBatch(c, "b-2", "d-1", json::array({hReading("temp_c", 85, now)}));
   ctx.Equal(edge.Status, 202, "temp_c = 85, the top of its declared range (the range is inclusive)");
+  const auto below = hPostBatch(c, "b-3", "d-1", json::array({hReading("temp_c", 20, now), hReading("humidity", -0.5, now)}));
+  ctx.Equal(below.Status, 422, "humidity = -0.5 against a declared range of [0, 100]");
+  ctx.Assert(hContains(below.Text(), "humidity"), "the 422 must name the metric humidity, got %s", below.Text());
+  const auto bottom = hPostBatch(c, "b-4", "d-1", json::array({hReading("temp_c", -40, now)}));
+  ctx.Equal(bottom.Status, 202, "temp_c = -40, the bottom of its declared range (the range is inclusive)");
+  std::vector<std::string> batches;
+  for (const auto& row : hWalRows(ctx)) batches.push_back(row.value("batch_id", ""));
+  ctx.Equal(batches, {"b-2", "b-4"}, "a batch with an out-of-range reading appends nothing: the WAL must hold b-2 and b-4; it holds");
 }
 
 void CheckTimestampWindow(harness::Ctx& ctx) {
-  const long long now = nowS(ctx);
-  auto c = api(ctx);
-  const auto ahead = postBatch(c, "b-1", "d-1", json::array({reading("temp_c", 21.5, now + 365LL * 86400)}));
-  const auto stale = postBatch(c, "b-2", "d-1", json::array({reading("temp_c", 21.5, now - 7200)}));
-  const auto skewed = postBatch(c, "b-3", "d-1", json::array({reading("temp_c", 21.5, now + 60)}));
+  auto c = hApi(ctx);
+  const auto post = [&](const std::string& batch_id, std::vector<long long> offsets) {
+    const long long now = hNowS(ctx);
+    json samples = json::array();
+    for (const long long offset : offsets) samples.push_back(hReading("temp_c", 21.5, now + offset));
+    return hPostBatch(c, batch_id, "d-1", samples);
+  };
+  const auto ahead = post("b-1", {365LL * 86400});
   ctx.Equal(ahead.Status, 422, "a reading stamped a year ahead of the clock");
+  const auto stale = post("b-2", {-7200});
   ctx.Equal(stale.Status, 422, "a reading stamped two hours ago (past kMaxAgeS)");
+  const auto skewed = post("b-3", {60});
   ctx.Equal(skewed.Status, 202, "a reading 60 s ahead, inside kMaxSkewS (%s)", skewed.Text());
+  const auto skewEdge = post("b-4", {300});
+  ctx.Equal(skewEdge.Status, 202, "a reading 300 s ahead, exactly kMaxSkewS (%s)", skewEdge.Text());
+  const auto skewPast = post("b-5", {301});
+  ctx.Equal(skewPast.Status, 422, "a reading 301 s ahead, past kMaxSkewS = 300");
+  const auto ageEdge = post("b-6", {-3599});
+  ctx.Equal(ageEdge.Status, 202, "a reading 3599 s old, inside kMaxAgeS (%s)", ageEdge.Text());
+  const auto agePast = post("b-7", {-3601});
+  ctx.Equal(agePast.Status, 422, "a reading 3601 s old, past kMaxAgeS = 3600");
+  const auto mixed = post("b-8", {0, -10, 900});
+  ctx.Equal(mixed.Status, 422, "a batch whose third reading is 900 s ahead (every sample is checked)");
   std::vector<std::string> batches;
-  for (const auto& row : walRows(ctx)) batches.push_back(row.value("batch_id", ""));
-  ctx.Equal(batches, {"b-3"}, "the WAL must hold only b-3; it holds");
+  for (const auto& row : hWalRows(ctx)) batches.push_back(row.value("batch_id", ""));
+  ctx.Equal(batches, {"b-3", "b-4", "b-6"}, "the WAL must hold b-3, b-4 and b-6; it holds");
 }
 `,
   },

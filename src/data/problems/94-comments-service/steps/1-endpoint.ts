@@ -26,8 +26,9 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
   longer is **413**, and nothing is written.
 - A \`parent_id\` must name a comment of this tenant **in the same thread** (\`store.get\`):
   otherwise **422**.
-- \`render_html\` escapes the whole text, then turns back on only \`ALLOWED_TAGS\` (\`b\`, \`i\`,
-  \`code\`) and line breaks (\`<br>\`). \`text\` stays as written.`,
+- \`render_html\` escapes the whole text (\`<\`, \`>\`, \`&\` and both quotes), then turns back on only
+  the bare \`ALLOWED_TAGS\` (\`<b>\`, \`<i>\`, \`<code>\` and their closing tags, no attributes) and line
+  breaks (\`<br>\`), so the page shows the text exactly as written. \`text\` stays as written.`,
   sequence: {
     participants: ['Client', 'Comments API', 'comment store'],
     messages: [
@@ -67,7 +68,7 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
       id: 'idempotency-key',
       title: 'A retried POST answers the first comment',
       detail:
-        'The `Idempotency-Key` is required (400 without it) and looked up per tenant before anything is written; a retry answers 200 with the first comment, and a new comment records its key. The starter ignores the header, so every retry is a second comment.',
+        'The `Idempotency-Key` is required (400 without it) and looked up per tenant before anything is written; a retry answers 200 with the whole comment the first attempt made, and a new comment records its key. The starter ignores the header, so every retry is a second comment.',
       match: {
         python: {
           all: [/idempotency-key/i, /store\.by_key\(/, /store\.remember_key\(/, /\b400\b/],
@@ -135,7 +136,7 @@ a 2 MB paste is stored whole; a reply naming a parent from another thread lands 
       id: 'safe-render',
       title: 'Renders html from escaped text and a safe tag list',
       detail:
-        '`render_html` escapes every `<`, `>`, `&` and quote, then turns back on only `ALLOWED_TAGS` and line breaks, so a `<script>` or an `onerror` attribute arrives as text. The starter only turns newlines into `<br>`.',
+        '`render_html` escapes every `<`, `>`, `&` and quote, then turns back on only the bare `ALLOWED_TAGS` (no attributes) and line breaks, so a `<script>`, an `onerror` attribute or a `<b onmouseover=…>` arrives as text and the page shows the text exactly as written. The starter only turns newlines into `<br>`.',
       match: {
         python: {all: [/html\.escape\(/, /ALLOWED_TAGS/]},
         typescript: {all: [/ALLOWED_TAGS/, /&lt;/, /&amp;/]},
@@ -690,9 +691,14 @@ void register_routes(httplib::Server& svr) {
     },
   },
   harness: {
-    python: `from comments import store
+    python: `import html
+import re
+
+from comments import store
 
 SCRIPT = 'Nice <b>point</b>\\n<script>alert(1)</script><img src=x onerror="alert(2)">'
+ATTRS = '<b onmouseover="alert(3)">bold</b> <i style=\\'color:red\\'>it</i> <code>5 &lt; 6 & 7</code>'
+SAFE_TAGS = ("<b>", "</b>", "<i>", "</i>", "<code>", "</code>", "<br>")
 
 
 def _api(ctx):
@@ -725,6 +731,7 @@ async def check_idempotency_key(ctx):
         first = _created(await _post(c, "k-1"), "the first POST")
         retry = await _post(c, "k-1")
         assert retry.status_code == 200 and retry.json().get("id") == first["id"], f"a retry with the same Idempotency-Key answered {retry.status_code} {retry.text}, expected 200 with comment {first['id']}"
+        assert retry.json() == first, f"a retry must answer the comment the first attempt made, whole: {retry.text} vs {first}"
         assert store.indexed_count("acme", "t-1") == 1, f"one comment retried once left {store.indexed_count('acme', 't-1')} comments in thread t-1"
         other = _created(await _post(c, "k-1", tenant="globex"), "another tenant's POST with the same key")
         assert other["id"] != first["id"], "keys are per tenant: globex's k-1 must create its own comment"
@@ -759,17 +766,49 @@ async def check_parent_thread(ctx):
     assert store.indexed_count("acme", "t-1") == 2, f"thread t-1 indexes {store.indexed_count('acme', 't-1')} comments, expected the root and its one valid reply"
 
 
+def _assert_escaped(page, text):
+    rest = page
+    for tag in SAFE_TAGS:
+        rest = rest.replace(tag, "")
+    live = re.findall(r"[<>\\"']", rest)
+    assert not live, f"html carries {''.join(sorted(set(live)))} outside the allowed tags, so markup or an attribute the author typed reaches the page: {page!r}. Escape every <, >, & and quote, then turn back on only the exact ALLOWED_TAGS"
+    shown = html.unescape(page.replace("<br>", "\\n"))
+    assert shown == text, f"the html must show exactly the text as written (every &, < and quote escaped once), it shows {shown!r} for {text!r}"
+
+
 async def check_safe_render(ctx):
     async with _api(ctx) as c:
         body = _created(await _post(c, "k-1", text=SCRIPT), "a comment with markup")
+        attrs = _created(await _post(c, "k-2", text=ATTRS), "a comment with attributes on allowed tags")
     page = body.get("html", "")
     assert "<script" not in page and "<img" not in page, f"html carries live markup a reader's browser would run: {page!r}. Escape the text, then turn back on only ALLOWED_TAGS"
-    assert "&lt;script&gt;" in page, f"the script must arrive escaped, as text: {page!r}"
     assert "<b>point</b>" in page and "<br>" in page, f"the allowed tags and line breaks must still render: {page!r}"
+    _assert_escaped(page, SCRIPT)
+    _assert_escaped(attrs.get("html", ""), ATTRS)
     stored = store.get("acme", body["id"])
     assert stored is not None and stored["html"] == page and stored["text"] == SCRIPT, f"the store must keep the text as written and the html as rendered, got {stored}"
 `,
     typescript: `const SCRIPT = 'Nice <b>point</b>\\n<script>alert(1)</script><img src=x onerror="alert(2)">';
+const ATTRS = '<b onmouseover="alert(3)">bold</b> <i style=\\'color:red\\'>it</i> <code>5 &lt; 6 & 7</code>';
+const SAFE_TAGS = ['<b>', '</b>', '<i>', '</i>', '<code>', '</code>', '<br>'];
+const NAMED: Record<string, string> = {lt: '<', gt: '>', amp: '&', quot: '"', apos: "'"};
+
+function unescapeHtml(s: string): string {
+  return s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|[a-zA-Z]+);/g, (m, e: string) => {
+    if (e.startsWith('#x') || e.startsWith('#X')) return String.fromCodePoint(parseInt(e.slice(2), 16));
+    if (e.startsWith('#')) return String.fromCodePoint(parseInt(e.slice(1), 10));
+    return NAMED[e] ?? m;
+  });
+}
+
+function assertEscaped(page: string, text: string) {
+  let rest = page;
+  for (const tag of SAFE_TAGS) rest = rest.split(tag).join('');
+  const live = [...new Set(rest.match(/[<>"']/g) ?? [])].sort().join('');
+  assert(live === '', \`html carries \${live} outside the allowed tags, so markup or an attribute the author typed reaches the page: \${JSON.stringify(page)}. Escape every <, >, & and quote, then turn back on only the exact ALLOWED_TAGS\`);
+  const shown = unescapeHtml(page.split('<br>').join('\\n'));
+  assert.equal(shown, text, \`the html must show exactly the text as written (every &, < and quote escaped once), it shows \${JSON.stringify(shown)} for \${JSON.stringify(text)}\`);
+}
 
 function api(ctx) {
   return {c: ctx.client(ctx.load('api').app), store: ctx.load('/support/comments/store.ts')};
@@ -800,6 +839,7 @@ export async function check_idempotency_key(ctx) {
   const first = created(await post(c, 'k-1'), 'the first POST');
   const retry = await post(c, 'k-1');
   assert(retry.status === 200 && retry.json().id === first.id, \`a retry with the same Idempotency-Key answered \${retry.status} \${retry.text}, expected 200 with comment \${first.id}\`);
+  assert.deepEqual(retry.json(), first, 'a retry must answer the comment the first attempt made, whole');
   assert.equal(await store.indexedCount('acme', 't-1'), 1, 'one comment retried once must leave one comment in thread t-1');
   const other = created(await post(c, 'k-1', {}, 'globex'), "another tenant's POST with the same key");
   assert(other.id !== first.id, "keys are per tenant: globex's k-1 must create its own comment");
@@ -837,10 +877,12 @@ export async function check_parent_thread(ctx) {
 export async function check_safe_render(ctx) {
   const {c, store} = api(ctx);
   const body = created(await post(c, 'k-1', {text: SCRIPT}), 'a comment with markup');
+  const attrs = created(await post(c, 'k-2', {text: ATTRS}), 'a comment with attributes on allowed tags');
   const page = String(body.html ?? '');
   assert(!page.includes('<script') && !page.includes('<img'), \`html carries live markup a reader's browser would run: \${JSON.stringify(page)}. Escape the text, then turn back on only ALLOWED_TAGS\`);
-  assert(page.includes('&lt;script&gt;'), \`the script must arrive escaped, as text: \${JSON.stringify(page)}\`);
   assert(page.includes('<b>point</b>') && page.includes('<br>'), \`the allowed tags and line breaks must still render: \${JSON.stringify(page)}\`);
+  assertEscaped(page, SCRIPT);
+  assertEscaped(String(attrs.html ?? ''), ATTRS);
   const stored = await store.get('acme', body.id);
   assert(stored !== null && stored.html === page && stored.text === SCRIPT, \`the store must keep the text as written and the html as rendered, got \${JSON.stringify(stored)}\`);
 }
@@ -849,7 +891,10 @@ export async function check_safe_render(ctx) {
 
 import (
 	"context"
+	"html"
 	"net/http"
+	"reflect"
+	"regexp"
 	"strings"
 
 	"comments/store"
@@ -857,22 +902,26 @@ import (
 	"leetbuild/harness"
 )
 
-const script = "Nice <b>point</b>\\n<script>alert(1)</script><img src=x onerror=\\"alert(2)\\">"
+const hScript = "Nice <b>point</b>\\n<script>alert(1)</script><img src=x onerror=\\"alert(2)\\">"
+const hAttrs = "<b onmouseover=\\"alert(3)\\">bold</b> <i style='color:red'>it</i> <code>5 &lt; 6 & 7</code>"
 
-type postedComment struct {
+var hSafeTags = []string{"<b>", "</b>", "<i>", "</i>", "<code>", "</code>", "<br>"}
+var hLiveChar = regexp.MustCompile(\`[<>"']\`)
+
+type hPosted struct {
 	ID       string \`json:"id"\`
 	ThreadID string \`json:"thread_id"\`
 	ParentID string \`json:"parent_id"\`
 	HTML     string \`json:"html"\`
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func hAPIClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func postComment(c *harness.HTTP, tenant, key string, fields map[string]any) *harness.Response {
+func hPost(c *harness.HTTP, tenant, key string, fields map[string]any) *harness.Response {
 	body := map[string]any{"thread_id": "t-1", "author_id": "u-1", "text": "First!"}
 	for k, v := range fields {
 		body[k] = v
@@ -884,75 +933,90 @@ func postComment(c *harness.HTTP, tenant, key string, fields map[string]any) *ha
 	return c.Post("/v1/comments", body, header...)
 }
 
-func created(ctx *harness.Ctx, r *harness.Response, what string) postedComment {
+func hCreated(ctx *harness.Ctx, r *harness.Response, what string) hPosted {
 	ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text())
-	var p postedComment
+	var p hPosted
 	r.Decode(&p)
 	return p
 }
 
-func indexed(tenant, threadID string) int64 { return store.IndexedCount(context.Background(), tenant, threadID) }
+func hIndexed(tenant, threadID string) int64 { return store.IndexedCount(context.Background(), tenant, threadID) }
+
+func hAssertEscaped(ctx *harness.Ctx, page, text string) {
+	rest := page
+	for _, tag := range hSafeTags {
+		rest = strings.ReplaceAll(rest, tag, "")
+	}
+	live := hLiveChar.FindAllString(rest, -1)
+	ctx.Assert(len(live) == 0, "html carries %v outside the allowed tags, so markup or an attribute the author typed reaches the page: %q. Escape every <, >, & and quote, then turn back on only the exact allowedTags", live, page)
+	shown := html.UnescapeString(strings.ReplaceAll(page, "<br>", "\\n"))
+	ctx.Assert(shown == text, "the html must show exactly the text as written (every &, < and quote escaped once), it shows %q for %q", shown, text)
+}
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	p := created(ctx, postComment(c, "acme", "k-1", nil), "POST /v1/comments with a tenant and a key")
+	c := hAPIClient(ctx)
+	p := hCreated(ctx, hPost(c, "acme", "k-1", nil), "POST /v1/comments with a tenant and a key")
 	ctx.Assert(p.ID != "" && p.ThreadID == "t-1", "the 201 must carry the comment's id and thread_id, got %+v", p)
 	stored := store.Get(context.Background(), "acme", p.ID)
 	ctx.Assert(stored != nil && stored.Text == "First!", "the comment %s is not in the store: %+v", p.ID, stored)
-	ctx.Equal(indexed("acme", "t-1"), 1, "the comments thread t-1 indexes after one POST")
+	ctx.Equal(hIndexed("acme", "t-1"), 1, "the comments thread t-1 indexes after one POST")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	first := created(ctx, postComment(c, "acme", "k-1", nil), "the first POST")
-	retry := postComment(c, "acme", "k-1", nil)
-	var again postedComment
+	c := hAPIClient(ctx)
+	firstResp := hPost(c, "acme", "k-1", nil)
+	first := hCreated(ctx, firstResp, "the first POST")
+	retry := hPost(c, "acme", "k-1", nil)
+	var again hPosted
 	if retry.Status == 200 {
 		retry.Decode(&again)
 	}
 	ctx.Assert(retry.Status == 200 && again.ID == first.ID, "a retry with the same Idempotency-Key answered %d %s, expected 200 with comment %s", retry.Status, retry.Text(), first.ID)
-	ctx.Equal(indexed("acme", "t-1"), 1, "one comment retried once: the comments in thread t-1")
-	other := created(ctx, postComment(c, "globex", "k-1", nil), "another tenant's POST with the same key")
+	ctx.Assert(reflect.DeepEqual(retry.JSON(), firstResp.JSON()), "a retry must answer the comment the first attempt made, whole: %s vs %s", retry.Text(), firstResp.Text())
+	ctx.Equal(hIndexed("acme", "t-1"), 1, "one comment retried once: the comments in thread t-1")
+	other := hCreated(ctx, hPost(c, "globex", "k-1", nil), "another tenant's POST with the same key")
 	ctx.Assert(other.ID != first.ID, "keys are per tenant: globex's k-1 must create its own comment")
-	missing := postComment(c, "acme", "", nil)
+	missing := hPost(c, "acme", "", nil)
 	ctx.Equal(missing.Status, 400, "a POST without Idempotency-Key")
-	ctx.Equal(indexed("acme", "t-1"), 1, "a POST without a key must write nothing; the comments in thread t-1")
+	ctx.Equal(hIndexed("acme", "t-1"), 1, "a POST without a key must write nothing; the comments in thread t-1")
 }
 
 func CheckBodyCap(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	created(ctx, postComment(c, "acme", "k-1", map[string]any{"text": strings.Repeat("a", 16384)}), "a text of exactly 16 KiB")
-	over := postComment(c, "acme", "k-2", map[string]any{"text": strings.Repeat("a", 16385)})
+	c := hAPIClient(ctx)
+	hCreated(ctx, hPost(c, "acme", "k-1", map[string]any{"text": strings.Repeat("a", 16384)}), "a text of exactly 16 KiB")
+	over := hPost(c, "acme", "k-2", map[string]any{"text": strings.Repeat("a", 16385)})
 	ctx.Equal(over.Status, 413, "a text of 16385 bytes")
-	wide := postComment(c, "acme", "k-3", map[string]any{"text": strings.Repeat("é", 8193)})
+	wide := hPost(c, "acme", "k-3", map[string]any{"text": strings.Repeat("é", 8193)})
 	ctx.Equal(wide.Status, 413, "8193 two-byte characters (16386 bytes of UTF-8): the cap counts bytes, not characters")
-	ctx.Equal(indexed("acme", "t-1"), 1, "a text over the cap must not be written; the comments in thread t-1")
+	ctx.Equal(hIndexed("acme", "t-1"), 1, "a text over the cap must not be written; the comments in thread t-1")
 }
 
 func CheckParentThread(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	root := created(ctx, postComment(c, "acme", "k-1", nil), "a top-level comment in t-1")
-	elsewhere := created(ctx, postComment(c, "acme", "k-2", map[string]any{"thread_id": "t-2"}), "a comment in t-2")
-	foreign := created(ctx, postComment(c, "globex", "k-3", nil), "globex's comment in t-1")
-	reply := created(ctx, postComment(c, "acme", "k-4", map[string]any{"parent_id": root.ID}), "a reply to a comment of the same thread")
+	c := hAPIClient(ctx)
+	root := hCreated(ctx, hPost(c, "acme", "k-1", nil), "a top-level comment in t-1")
+	elsewhere := hCreated(ctx, hPost(c, "acme", "k-2", map[string]any{"thread_id": "t-2"}), "a comment in t-2")
+	foreign := hCreated(ctx, hPost(c, "globex", "k-3", nil), "globex's comment in t-1")
+	reply := hCreated(ctx, hPost(c, "acme", "k-4", map[string]any{"parent_id": root.ID}), "a reply to a comment of the same thread")
 	ctx.Equal(reply.ParentID, root.ID, "the reply's parent_id")
-	cross := postComment(c, "acme", "k-5", map[string]any{"parent_id": elsewhere.ID})
+	cross := hPost(c, "acme", "k-5", map[string]any{"parent_id": elsewhere.ID})
 	ctx.Equal(cross.Status, 422, "a reply in t-1 to %s (a comment of t-2)", elsewhere.ID)
-	ghost := postComment(c, "acme", "k-6", map[string]any{"parent_id": "c-404"})
+	ghost := hPost(c, "acme", "k-6", map[string]any{"parent_id": "c-404"})
 	ctx.Equal(ghost.Status, 422, "a reply to a comment that does not exist")
-	otherTenant := postComment(c, "acme", "k-7", map[string]any{"parent_id": foreign.ID})
+	otherTenant := hPost(c, "acme", "k-7", map[string]any{"parent_id": foreign.ID})
 	ctx.Equal(otherTenant.Status, 422, "acme's reply to globex's comment %s", foreign.ID)
-	ctx.Equal(indexed("acme", "t-1"), 2, "thread t-1 must index the root and its one valid reply")
+	ctx.Equal(hIndexed("acme", "t-1"), 2, "thread t-1 must index the root and its one valid reply")
 }
 
 func CheckSafeRender(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	p := created(ctx, postComment(c, "acme", "k-1", map[string]any{"text": script}), "a comment with markup")
+	c := hAPIClient(ctx)
+	p := hCreated(ctx, hPost(c, "acme", "k-1", map[string]any{"text": hScript}), "a comment with markup")
+	attrs := hCreated(ctx, hPost(c, "acme", "k-2", map[string]any{"text": hAttrs}), "a comment with attributes on allowed tags")
 	ctx.Assert(!strings.Contains(p.HTML, "<script") && !strings.Contains(p.HTML, "<img"), "html carries live markup a reader's browser would run: %q. Escape the text, then turn back on only allowedTags", p.HTML)
-	ctx.Assert(strings.Contains(p.HTML, "&lt;script&gt;"), "the script must arrive escaped, as text: %q", p.HTML)
 	ctx.Assert(strings.Contains(p.HTML, "<b>point</b>") && strings.Contains(p.HTML, "<br>"), "the allowed tags and line breaks must still render: %q", p.HTML)
+	hAssertEscaped(ctx, p.HTML, hScript)
+	hAssertEscaped(ctx, attrs.HTML, hAttrs)
 	stored := store.Get(context.Background(), "acme", p.ID)
-	ctx.Assert(stored != nil && stored.HTML == p.HTML && stored.Text == script, "the store must keep the text as written and the html as rendered, got %+v", stored)
+	ctx.Assert(stored != nil && stored.HTML == p.HTML && stored.Text == hScript, "the store must keep the text as written and the html as rendered, got %+v", stored)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -965,9 +1029,10 @@ func CheckSafeRender(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kScript = "Nice <b>point</b>\\n<script>alert(1)</script><img src=x onerror=\\"alert(2)\\">";
+const std::string hScript = "Nice <b>point</b>\\n<script>alert(1)</script><img src=x onerror=\\"alert(2)\\">";
+const std::string hAttrs = "<b onmouseover=\\"alert(3)\\">bold</b> <i style='color:red'>it</i> <code>5 &lt; 6 & 7</code>";
 
-harness::HTTP apiClient(harness::Ctx& ctx) {
+harness::HTTP hApiClient(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -975,86 +1040,147 @@ harness::HTTP apiClient(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response postComment(harness::HTTP& c, const std::string& tenant, const std::string& key, const nlohmann::json& fields = nlohmann::json::object()) {
+harness::Response hPost(harness::HTTP& c, const std::string& tenant, const std::string& key, const nlohmann::json& fields = nlohmann::json::object()) {
   nlohmann::json body = {{"thread_id", "t-1"}, {"author_id", "u-1"}, {"text", "First!"}};
   for (const auto& item : fields.items()) body[item.key()] = item.value();
   if (key.empty()) return c.Post("/v1/comments", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/comments", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json created(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+nlohmann::json hCreated(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "%s: the body is not a JSON object: %s", what, r.Text());
   return body;
 }
 
-std::string text(const nlohmann::json& j, const char* name) { return j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : ""; }
+std::string hField(const nlohmann::json& j, const char* name) { return j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : ""; }
+
+std::string hReplaceAll(std::string s, const std::string& from, const std::string& to) {
+  for (size_t at = s.find(from); at != std::string::npos; at = s.find(from, at + to.size())) s.replace(at, from.size(), to);
+  return s;
+}
+
+void hAppendUtf8(std::string& out, unsigned long cp) {
+  if (cp < 0x80) {
+    out += static_cast<char>(cp);
+  } else if (cp < 0x800) {
+    out += static_cast<char>(0xC0 | (cp >> 6));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else if (cp < 0x10000) {
+    out += static_cast<char>(0xE0 | (cp >> 12));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  } else {
+    out += static_cast<char>(0xF0 | (cp >> 18));
+    out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+    out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+    out += static_cast<char>(0x80 | (cp & 0x3F));
+  }
+}
+
+// The text a browser shows for the html: character references decoded (numeric, and the named lt, gt, amp, quot, apos).
+std::string hUnescape(const std::string& s) {
+  std::string out;
+  for (size_t i = 0; i < s.size();) {
+    const size_t semi = s[i] == '&' ? s.find(';', i) : std::string::npos;
+    if (semi == std::string::npos || semi - i > 10) {
+      out += s[i++];
+      continue;
+    }
+    const std::string name = s.substr(i + 1, semi - i - 1);
+    if (name == "lt") out += '<';
+    else if (name == "gt") out += '>';
+    else if (name == "amp") out += '&';
+    else if (name == "quot") out += '"';
+    else if (name == "apos") out += '\\'';
+    else if (name.size() > 2 && name[0] == '#' && (name[1] == 'x' || name[1] == 'X')) hAppendUtf8(out, std::stoul(name.substr(2), nullptr, 16));
+    else if (name.size() > 1 && name[0] == '#' && name.find_first_not_of("0123456789", 1) == std::string::npos) hAppendUtf8(out, std::stoul(name.substr(1)));
+    else {
+      out += s[i++];
+      continue;
+    }
+    i = semi + 1;
+  }
+  return out;
+}
+
+void hAssertEscaped(harness::Ctx& ctx, const std::string& page, const std::string& text) {
+  std::string rest = page;
+  for (const char* tag : {"<b>", "</b>", "<i>", "</i>", "<code>", "</code>", "<br>"}) rest = hReplaceAll(rest, tag, "");
+  ctx.Assert(rest.find_first_of("<>\\"'") == std::string::npos,
+             "html carries markup or a quote outside the allowed tags, so an attribute the author typed reaches the page: %q. Escape every <, >, & and quote, then turn back on only the exact kAllowedTags", page);
+  const std::string shown = hUnescape(hReplaceAll(page, "<br>", "\\n"));
+  ctx.Assert(shown == text, "the html must show exactly the text as written (every &, < and quote escaped once), it shows %q for %q", shown, text);
+}
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto body = created(ctx, postComment(c, "acme", "k-1"), "POST /v1/comments with a tenant and a key");
-  ctx.Assert(!text(body, "id").empty() && text(body, "thread_id") == "t-1", "the 201 must carry the comment's id and thread_id, got %s", body.dump());
-  const auto stored = store::get("acme", text(body, "id"));
-  ctx.Assert(stored && stored->text == "First!", "the comment %s is not in the store", text(body, "id"));
+  auto c = hApiClient(ctx);
+  const auto body = hCreated(ctx, hPost(c, "acme", "k-1"), "POST /v1/comments with a tenant and a key");
+  ctx.Assert(!hField(body, "id").empty() && hField(body, "thread_id") == "t-1", "the 201 must carry the comment's id and thread_id, got %s", body.dump());
+  const auto stored = store::get("acme", hField(body, "id"));
+  ctx.Assert(stored && stored->text == "First!", "the comment %s is not in the store", hField(body, "id"));
   ctx.Equal(store::indexedCount("acme", "t-1"), 1, "the comments thread t-1 indexes after one POST");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto first = created(ctx, postComment(c, "acme", "k-1"), "the first POST");
-  const auto retry = postComment(c, "acme", "k-1");
+  auto c = hApiClient(ctx);
+  const auto first = hCreated(ctx, hPost(c, "acme", "k-1"), "the first POST");
+  const auto retry = hPost(c, "acme", "k-1");
   const auto again = nlohmann::json::parse(retry.Text(), nullptr, false);
-  ctx.Assert(retry.Status == 200 && again.is_object() && text(again, "id") == text(first, "id"),
-             "a retry with the same Idempotency-Key answered %d %s, expected 200 with comment %s", retry.Status, retry.Text(), text(first, "id"));
+  ctx.Assert(retry.Status == 200 && again.is_object() && hField(again, "id") == hField(first, "id"),
+             "a retry with the same Idempotency-Key answered %d %s, expected 200 with comment %s", retry.Status, retry.Text(), hField(first, "id"));
+  ctx.Assert(again == first, "a retry must answer the comment the first attempt made, whole: %s vs %s", retry.Text(), first.dump());
   ctx.Equal(store::indexedCount("acme", "t-1"), 1, "one comment retried once: the comments in thread t-1");
-  const auto other = created(ctx, postComment(c, "globex", "k-1"), "another tenant's POST with the same key");
-  ctx.Assert(text(other, "id") != text(first, "id"), "keys are per tenant: globex's k-1 must create its own comment");
-  const auto missing = postComment(c, "acme", "");
+  const auto other = hCreated(ctx, hPost(c, "globex", "k-1"), "another tenant's POST with the same key");
+  ctx.Assert(hField(other, "id") != hField(first, "id"), "keys are per tenant: globex's k-1 must create its own comment");
+  const auto missing = hPost(c, "acme", "");
   ctx.Equal(missing.Status, 400, "a POST without Idempotency-Key");
   ctx.Equal(store::indexedCount("acme", "t-1"), 1, "a POST without a key must write nothing; the comments in thread t-1");
 }
 
 void CheckBodyCap(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  created(ctx, postComment(c, "acme", "k-1", {{"text", std::string(16384, 'a')}}), "a text of exactly 16 KiB");
-  const auto over = postComment(c, "acme", "k-2", {{"text", std::string(16385, 'a')}});
+  auto c = hApiClient(ctx);
+  hCreated(ctx, hPost(c, "acme", "k-1", {{"text", std::string(16384, 'a')}}), "a text of exactly 16 KiB");
+  const auto over = hPost(c, "acme", "k-2", {{"text", std::string(16385, 'a')}});
   ctx.Equal(over.Status, 413, "a text of 16385 bytes");
   std::string wide;
   for (int i = 0; i < 8193; i++) wide += "é";
-  const auto r = postComment(c, "acme", "k-3", {{"text", wide}});
+  const auto r = hPost(c, "acme", "k-3", {{"text", wide}});
   ctx.Equal(r.Status, 413, "8193 two-byte characters (16386 bytes of UTF-8): the cap counts bytes, not characters");
   ctx.Equal(store::indexedCount("acme", "t-1"), 1, "a text over the cap must not be written; the comments in thread t-1");
 }
 
 void CheckParentThread(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto root = created(ctx, postComment(c, "acme", "k-1"), "a top-level comment in t-1");
-  const auto elsewhere = created(ctx, postComment(c, "acme", "k-2", {{"thread_id", "t-2"}}), "a comment in t-2");
-  const auto foreign = created(ctx, postComment(c, "globex", "k-3"), "globex's comment in t-1");
-  const auto reply = created(ctx, postComment(c, "acme", "k-4", {{"parent_id", text(root, "id")}}), "a reply to a comment of the same thread");
-  ctx.Equal(text(reply, "parent_id"), text(root, "id"), "the reply's parent_id");
-  const auto cross = postComment(c, "acme", "k-5", {{"parent_id", text(elsewhere, "id")}});
-  ctx.Equal(cross.Status, 422, "a reply in t-1 to %s (a comment of t-2)", text(elsewhere, "id"));
-  const auto ghost = postComment(c, "acme", "k-6", {{"parent_id", "c-404"}});
+  auto c = hApiClient(ctx);
+  const auto root = hCreated(ctx, hPost(c, "acme", "k-1"), "a top-level comment in t-1");
+  const auto elsewhere = hCreated(ctx, hPost(c, "acme", "k-2", {{"thread_id", "t-2"}}), "a comment in t-2");
+  const auto foreign = hCreated(ctx, hPost(c, "globex", "k-3"), "globex's comment in t-1");
+  const auto reply = hCreated(ctx, hPost(c, "acme", "k-4", {{"parent_id", hField(root, "id")}}), "a reply to a comment of the same thread");
+  ctx.Equal(hField(reply, "parent_id"), hField(root, "id"), "the reply's parent_id");
+  const auto cross = hPost(c, "acme", "k-5", {{"parent_id", hField(elsewhere, "id")}});
+  ctx.Equal(cross.Status, 422, "a reply in t-1 to %s (a comment of t-2)", hField(elsewhere, "id"));
+  const auto ghost = hPost(c, "acme", "k-6", {{"parent_id", "c-404"}});
   ctx.Equal(ghost.Status, 422, "a reply to a comment that does not exist");
-  const auto otherTenant = postComment(c, "acme", "k-7", {{"parent_id", text(foreign, "id")}});
-  ctx.Equal(otherTenant.Status, 422, "acme's reply to globex's comment %s", text(foreign, "id"));
+  const auto otherTenant = hPost(c, "acme", "k-7", {{"parent_id", hField(foreign, "id")}});
+  ctx.Equal(otherTenant.Status, 422, "acme's reply to globex's comment %s", hField(foreign, "id"));
   ctx.Equal(store::indexedCount("acme", "t-1"), 2, "thread t-1 must index the root and its one valid reply");
 }
 
 void CheckSafeRender(harness::Ctx& ctx) {
-  auto c = apiClient(ctx);
-  const auto body = created(ctx, postComment(c, "acme", "k-1", {{"text", kScript}}), "a comment with markup");
-  const std::string page = text(body, "html");
+  auto c = hApiClient(ctx);
+  const auto body = hCreated(ctx, hPost(c, "acme", "k-1", {{"text", hScript}}), "a comment with markup");
+  const auto attrs = hCreated(ctx, hPost(c, "acme", "k-2", {{"text", hAttrs}}), "a comment with attributes on allowed tags");
+  const std::string page = hField(body, "html");
   ctx.Assert(page.find("<script") == std::string::npos && page.find("<img") == std::string::npos,
              "html carries live markup a reader's browser would run: %q. Escape the text, then turn back on only kAllowedTags", page);
-  ctx.Assert(page.find("&lt;script&gt;") != std::string::npos, "the script must arrive escaped, as text: %q", page);
   ctx.Assert(page.find("<b>point</b>") != std::string::npos && page.find("<br>") != std::string::npos, "the allowed tags and line breaks must still render: %q", page);
-  const auto stored = store::get("acme", text(body, "id"));
-  ctx.Assert(stored && stored->html == page && stored->text == kScript, "the store must keep the text as written and the html as rendered");
+  hAssertEscaped(ctx, page, hScript);
+  hAssertEscaped(ctx, hField(attrs, "html"), hAttrs);
+  const auto stored = store::get("acme", hField(body, "id"));
+  ctx.Assert(stored && stored->html == page && stored->text == hScript, "the store must keep the text as written and the html as rendered");
 }
 `,
   },

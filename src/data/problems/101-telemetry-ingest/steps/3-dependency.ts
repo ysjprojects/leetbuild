@@ -51,7 +51,7 @@ its sub-batches is missing.
       id: 'deadline',
       title: 'Every attempt carries a 4-second deadline',
       detail:
-        'Each `Write` is sent with a deadline of 4 seconds, so a stalled store costs at most three deadlines. The starter sets none and waits for as long as the store does.',
+        'Each `Write` is sent with its own deadline of 4 seconds, retries included, so a stalled store costs exactly three deadlines. The starter sets none and waits for as long as the store does.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*4/, /timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*4000/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -106,7 +106,7 @@ its sub-batches is missing.
       id: 'done-all',
       title: 'Complete only when every sub-batch is stored',
       detail:
-        'A sub-batch that fails on every attempt leaves the batch incomplete, with that id in `failed` and the others in `accepted`. The starter answers complete as soon as one sub-batch was accepted.',
+        'A sub-batch that fails on every attempt leaves the batch incomplete after `MAX_ATTEMPTS` calls, with that id in `failed` and the others in `accepted`. The starter answers complete as soon as one sub-batch was accepted.',
       match: {
         python: {
           all: [/not\s+pending|len\(pending\)\s*==\s*0/],
@@ -599,11 +599,15 @@ def check_deadline(ctx):
         assert call.timeout is not None, "a Write call carries no deadline: a stalled store holds the writer for as long as it stalls"
         assert 3.5 <= call.timeout <= 4.5, f"a Write call carries a {call.timeout} s deadline, expected DEADLINE_S = 4"
     ctx.grpc.set_latency("Write", 30.0)
+    healthy = len(calls)
     before = ctx.clock.time()
     stalled = m.write_batch("b-2", _subs())
     waited = ctx.clock.time() - before
     assert stalled["complete"] is False, f"against a store that answers in 30 s the batch must be incomplete, got {stalled}"
     assert waited <= 13, f"write_batch waited {waited:.0f} s on a stalled store, expected at most three 4-second deadlines"
+    timeouts = [call.timeout for call in ctx.grpc.calls_to("Write")[healthy:]]
+    assert len(timeouts) == 3, f"against a stalled store write_batch made {len(timeouts)} Write calls, expected MAX_ATTEMPTS = 3, each with its own deadline"
+    assert all(t is not None and 3.5 <= t <= 4.5 for t in timeouts), f"the attempts against a stalled store carried deadlines {timeouts}: every attempt gets its own 4 s, not what is left of the first one's"
 
 
 def check_bounded_attempts(ctx):
@@ -641,6 +645,8 @@ def check_done_all(ctx):
     result = m.write_batch("b-1", _subs())
     assert result["complete"] is False, f"s3 failed on every attempt and write_batch answered {result}: a batch is complete only when every sub-batch is stored"
     assert sorted(result["accepted"]) == ["s1", "s2"] and result["failed"] == ["s3"], f"accepted must be s1 and s2 and failed s3, got {result}"
+    attempts = len(ctx.grpc.calls_to("Write"))
+    assert attempts == 3, f"s3 failed on every attempt and write_batch made {attempts} Write calls, expected MAX_ATTEMPTS = 3: a reply that stored something still counts as an attempt"
 `,
     typescript: `const subs = () =>
   [1, 2, 3].map(i => ({id: \`s\${i}\`, device_id: 'd-1', points: [{metric: 'temp_c', value: 20 + i, ts: 1_800_000_000 + i}]}));
@@ -686,11 +692,15 @@ export async function check_deadline(ctx) {
     assert(call.timeout >= 3.5 && call.timeout <= 4.5, \`a Write call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 4000\`);
   }
   ctx.grpc.setLatency('Write', 30.0);
+  const healthy = calls.length;
   const before = ctx.clock.now();
   const stalled = await m.writeBatch('b-2', subs());
   const waited = (ctx.clock.now() - before) / 1000;
   assert.equal(stalled.complete, false, \`against a store that answers in 30 s the batch must be incomplete, got \${JSON.stringify(stalled)}\`);
   assert(waited <= 13, \`writeBatch waited \${waited.toFixed(0)} s on a stalled store, expected at most three 4-second deadlines\`);
+  const timeouts = ctx.grpc.callsTo('Write').slice(healthy).map(call => call.timeout);
+  assert.equal(timeouts.length, 3, \`against a stalled store writeBatch made \${timeouts.length} Write calls, expected MAX_ATTEMPTS = 3, each with its own deadline\`);
+  assert(timeouts.every(t => t !== null && t >= 3.5 && t <= 4.5), \`the attempts against a stalled store carried deadlines \${JSON.stringify(timeouts)}: every attempt gets its own 4 s, not what is left of the first one's\`);
 }
 
 export async function check_bounded_attempts(ctx) {
@@ -729,6 +739,8 @@ export async function check_done_all(ctx) {
   const result = await m.writeBatch('b-1', subs());
   assert.equal(result.complete, false, \`s3 failed on every attempt and writeBatch answered \${JSON.stringify(result)}: a batch is complete only when every sub-batch is stored\`);
   assert([...result.accepted].sort().join() === 's1,s2' && result.failed.join() === 's3', \`accepted must be s1 and s2 and failed s3, got \${JSON.stringify(result)}\`);
+  const attempts = ctx.grpc.callsTo('Write').length;
+  assert.equal(attempts, 3, \`s3 failed on every attempt and writeBatch made \${attempts} Write calls, expected MAX_ATTEMPTS = 3: a reply that stored something still counts as an attempt\`);
 }
 `,
     go: `package main
@@ -749,14 +761,14 @@ import (
 
 // seriesPeer accepts every sub-batch but those in failing (id → attempts it still fails); down
 // answers Unavailable for that many calls.
-type seriesPeer struct {
+type hSeriesPeer struct {
 	pb.UnimplementedTimeSeriesServer
 	failing map[string]int
 	down    int
 	stored  map[string]int
 }
 
-func (p *seriesPeer) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
+func (p *hSeriesPeer) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteReply, error) {
 	if p.down > 0 {
 		p.down--
 		return nil, status.Error(codes.Unavailable, "the store is restarting")
@@ -774,13 +786,13 @@ func (p *seriesPeer) Write(_ context.Context, req *pb.WriteRequest) (*pb.WriteRe
 	return reply, nil
 }
 
-func peerFor(ctx *harness.Ctx) *seriesPeer {
-	peer := &seriesPeer{failing: map[string]int{}, stored: map[string]int{}}
+func hPeerFor(ctx *harness.Ctx) *hSeriesPeer {
+	peer := &hSeriesPeer{failing: map[string]int{}, stored: map[string]int{}}
 	pb.RegisterTimeSeriesServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func threeSubs() []*pb.SubBatch {
+func hThreeSubs() []*pb.SubBatch {
 	var out []*pb.SubBatch
 	for i := 1; i <= 3; i++ {
 		out = append(out, &pb.SubBatch{Id: fmt.Sprintf("s%d", i), DeviceId: "d-1", Points: []*pb.Point{{Metric: "temp_c", Value: 20 + float64(i), Ts: 1_800_000_000 + int64(i)}}})
@@ -788,7 +800,7 @@ func threeSubs() []*pb.SubBatch {
 	return out
 }
 
-func sentIDs(ctx *harness.Ctx) [][]string {
+func hSentIDs(ctx *harness.Ctx) [][]string {
 	var out [][]string
 	for _, call := range ctx.GRPC.CallsTo("Write", "") {
 		var ids []string
@@ -800,15 +812,15 @@ func sentIDs(ctx *harness.Ctx) [][]string {
 	return out
 }
 
-func sortedIDs(ids []string) []string {
+func hSortedIDs(ids []string) []string {
 	out := append([]string{}, ids...)
 	sort.Strings(out)
 	return out
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	peerFor(ctx)
-	result := writeBatch(context.Background(), "b-1", threeSubs())
+	hPeerFor(ctx)
+	result := writeBatch(context.Background(), "b-1", hThreeSubs())
 	ctx.Assert(result.Complete, "with a healthy store the batch must be complete, got %+v", result)
 	calls := ctx.GRPC.CallsTo("Write", "")
 	ctx.Assert(len(calls) > 0, "writeBatch made no Write call")
@@ -817,37 +829,43 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(3500*time.Millisecond <= call.Timeout && call.Timeout <= 4500*time.Millisecond, "a Write call carries a %v deadline, expected 4 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Write", 30.0, "")
+	healthy := len(calls)
 	before := ctx.Clock.Now()
-	stalled := writeBatch(context.Background(), "b-2", threeSubs())
+	stalled := writeBatch(context.Background(), "b-2", hThreeSubs())
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(!stalled.Complete, "against a store that answers in 30 s the batch must be incomplete, got %+v", stalled)
 	ctx.Assert(waited <= 13, "writeBatch waited %.0f s on a stalled store, expected at most three 4-second deadlines", waited)
+	attempts := ctx.GRPC.CallsTo("Write", "")[healthy:]
+	ctx.Assert(len(attempts) == 3, "against a stalled store writeBatch made %d Write calls, expected maxAttempts = 3, each with its own deadline", len(attempts))
+	for _, call := range attempts {
+		ctx.Assert(call.HasDeadline() && 3500*time.Millisecond <= call.Timeout && call.Timeout <= 4500*time.Millisecond, "an attempt against a stalled store carried a %v deadline: every attempt gets its own 4 s, not what is left of the first one's", call.Timeout)
+	}
 }
 
 func CheckBoundedAttempts(ctx *harness.Ctx) {
-	peer := peerFor(ctx)
+	peer := hPeerFor(ctx)
 	peer.down = 6
-	result := writeBatch(context.Background(), "b-1", threeSubs())
+	result := writeBatch(context.Background(), "b-1", hThreeSubs())
 	calls := len(ctx.GRPC.CallsTo("Write", ""))
 	ctx.Assert(calls == 3, "with the store down writeBatch made %d Write calls, expected maxAttempts = 3: a retry without a bound turns an outage into a loop", calls)
 	ctx.Assert(!result.Complete, "after three failed attempts the batch must be incomplete, got %+v", result)
-	ctx.Equal(sortedIDs(result.Failed), []string{"s1", "s2", "s3"}, "Failed must list every sub-batch still pending")
+	ctx.Equal(hSortedIDs(result.Failed), []string{"s1", "s2", "s3"}, "Failed must list every sub-batch still pending")
 }
 
 func CheckFailedOnly(ctx *harness.Ctx) {
-	peer := peerFor(ctx)
+	peer := hPeerFor(ctx)
 	peer.failing["s3"] = 2
-	result := writeBatch(context.Background(), "b-1", threeSubs())
-	sent := sentIDs(ctx)
+	result := writeBatch(context.Background(), "b-1", hThreeSubs())
+	sent := hSentIDs(ctx)
 	ctx.Equal(sent, [][]string{{"s1", "s2", "s3"}, {"s3"}, {"s3"}}, "after the first reply only s3 was pending, so only s3 may be sent again; the Write requests carried")
 	ctx.Equal(peer.stored, map[string]int{"s1": 1, "s2": 1, "s3": 1}, "a sub-batch the store accepted must not be sent again; the store holds them this many times")
 	ctx.Assert(result.Complete && len(result.Accepted) == 3, "once s3 is stored the batch is complete, got %+v", result)
 }
 
 func CheckBatchId(ctx *harness.Ctx) {
-	peer := peerFor(ctx)
+	peer := hPeerFor(ctx)
 	peer.failing["s2"] = 1
-	writeBatch(context.Background(), "b-7", threeSubs())
+	writeBatch(context.Background(), "b-7", hThreeSubs())
 	var ids []string
 	for _, call := range ctx.GRPC.CallsTo("Write", "") {
 		ids = append(ids, call.Request.(*pb.WriteRequest).GetBatchId())
@@ -859,12 +877,14 @@ func CheckBatchId(ctx *harness.Ctx) {
 }
 
 func CheckDoneAll(ctx *harness.Ctx) {
-	peer := peerFor(ctx)
+	peer := hPeerFor(ctx)
 	peer.failing["s3"] = 99
-	result := writeBatch(context.Background(), "b-1", threeSubs())
+	result := writeBatch(context.Background(), "b-1", hThreeSubs())
 	ctx.Assert(!result.Complete, "s3 failed on every attempt and writeBatch answered %+v: a batch is complete only when every sub-batch is stored", result)
-	ctx.Equal(sortedIDs(result.Accepted), []string{"s1", "s2"}, "Accepted")
+	ctx.Equal(hSortedIDs(result.Accepted), []string{"s1", "s2"}, "Accepted")
 	ctx.Equal(result.Failed, []string{"s3"}, "Failed")
+	attempts := len(ctx.GRPC.CallsTo("Write", ""))
+	ctx.Assert(attempts == 3, "s3 failed on every attempt and writeBatch made %d Write calls, expected maxAttempts = 3: a reply that stored something still counts as an attempt", attempts)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -880,7 +900,7 @@ namespace {
 
 // Accepts every sub-batch but those in failing (id → attempts it still fails); down answers
 // UNAVAILABLE for that many calls.
-class SeriesPeer final : public tsdb::TimeSeries::Service {
+class hSeriesPeer final : public tsdb::TimeSeries::Service {
  public:
   std::map<std::string, int> failing;
   int down = 0;
@@ -904,15 +924,15 @@ class SeriesPeer final : public tsdb::TimeSeries::Service {
   }
 };
 
-SeriesPeer& peerFor(harness::Ctx& ctx) {
-  static SeriesPeer* peer = nullptr;
+hSeriesPeer& hPeerFor(harness::Ctx& ctx) {
+  static hSeriesPeer* peer = nullptr;
   delete peer;
-  peer = new SeriesPeer;
+  peer = new hSeriesPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-std::vector<tsdb::SubBatch> threeSubs() {
+std::vector<tsdb::SubBatch> hThreeSubs() {
   std::vector<tsdb::SubBatch> out;
   for (int i = 1; i <= 3; i++) {
     tsdb::SubBatch sub;
@@ -927,7 +947,7 @@ std::vector<tsdb::SubBatch> threeSubs() {
   return out;
 }
 
-std::vector<std::vector<std::string>> sentIds(harness::Ctx& ctx) {
+std::vector<std::vector<std::string>> hSentIds(harness::Ctx& ctx) {
   std::vector<std::vector<std::string>> out;
   for (const auto& call : ctx.GRPC.CallsTo("Write")) {
     std::vector<std::string> ids;
@@ -938,7 +958,7 @@ std::vector<std::vector<std::string>> sentIds(harness::Ctx& ctx) {
   return out;
 }
 
-std::vector<std::string> sortedIds(std::vector<std::string> ids) {
+std::vector<std::string> hSortedIds(std::vector<std::string> ids) {
   std::sort(ids.begin(), ids.end());
   return ids;
 }
@@ -946,8 +966,8 @@ std::vector<std::string> sortedIds(std::vector<std::string> ids) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  peerFor(ctx);
-  const WriteResult result = writeBatch("b-1", threeSubs());
+  hPeerFor(ctx);
+  const WriteResult result = writeBatch("b-1", hThreeSubs());
   ctx.Assert(result.complete, "with a healthy store the batch must be complete");
   const auto calls = ctx.GRPC.CallsTo("Write");
   ctx.Assert(!calls.empty(), "writeBatch made no Write call");
@@ -956,38 +976,44 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(3.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 4.5, "a Write call carries a %v s deadline, expected kDeadline = 4 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Write", 30.0);
+  const size_t healthy = calls.size();
   const long long before = ctx.Clock.Now();
-  const WriteResult stalled = writeBatch("b-2", threeSubs());
+  const WriteResult stalled = writeBatch("b-2", hThreeSubs());
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(!stalled.complete, "against a store that answers in 30 s the batch must be incomplete");
   ctx.Assert(waited <= 13, "writeBatch waited %.0f s on a stalled store, expected at most three 4-second deadlines", waited);
+  const auto all = ctx.GRPC.CallsTo("Write");
+  ctx.Assert(all.size() - healthy == 3, "against a stalled store writeBatch made %d Write calls, expected kMaxAttempts = 3, each with its own deadline", all.size() - healthy);
+  for (size_t i = healthy; i < all.size(); ++i) {
+    ctx.Assert(all[i].HasDeadline() && 3.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 4.5, "an attempt against a stalled store carried a %v s deadline: every attempt gets its own 4 s, not what is left of the first one's", all[i].TimeoutSeconds());
+  }
 }
 
 void CheckBoundedAttempts(harness::Ctx& ctx) {
-  SeriesPeer& peer = peerFor(ctx);
+  hSeriesPeer& peer = hPeerFor(ctx);
   peer.down = 6;
-  const WriteResult result = writeBatch("b-1", threeSubs());
+  const WriteResult result = writeBatch("b-1", hThreeSubs());
   const size_t calls = ctx.GRPC.CallsTo("Write").size();
   ctx.Assert(calls == 3, "with the store down writeBatch made %d Write calls, expected kMaxAttempts = 3: a retry without a bound turns an outage into a loop", calls);
   ctx.Assert(!result.complete, "after three failed attempts the batch must be incomplete");
-  ctx.Equal(sortedIds(result.failed), {"s1", "s2", "s3"}, "failed must list every sub-batch still pending");
+  ctx.Equal(hSortedIds(result.failed), {"s1", "s2", "s3"}, "failed must list every sub-batch still pending");
 }
 
 void CheckFailedOnly(harness::Ctx& ctx) {
-  SeriesPeer& peer = peerFor(ctx);
+  hSeriesPeer& peer = hPeerFor(ctx);
   peer.failing["s3"] = 2;
-  const WriteResult result = writeBatch("b-1", threeSubs());
+  const WriteResult result = writeBatch("b-1", hThreeSubs());
   const std::vector<std::vector<std::string>> want = {{"s1", "s2", "s3"}, {"s3"}, {"s3"}};
-  ctx.Equal(sentIds(ctx), want, "after the first reply only s3 was pending, so only s3 may be sent again; the Write requests carried");
+  ctx.Equal(hSentIds(ctx), want, "after the first reply only s3 was pending, so only s3 may be sent again; the Write requests carried");
   const std::map<std::string, int> once = {{"s1", 1}, {"s2", 1}, {"s3", 1}};
   ctx.Equal(peer.stored, once, "a sub-batch the store accepted must not be sent again; the store holds them this many times");
   ctx.Assert(result.complete && result.accepted.size() == 3, "once s3 is stored the batch is complete");
 }
 
 void CheckBatchId(harness::Ctx& ctx) {
-  SeriesPeer& peer = peerFor(ctx);
+  hSeriesPeer& peer = hPeerFor(ctx);
   peer.failing["s2"] = 1;
-  writeBatch("b-7", threeSubs());
+  writeBatch("b-7", hThreeSubs());
   std::vector<std::string> ids;
   for (const auto& call : ctx.GRPC.CallsTo("Write")) ids.push_back(call.Request<tsdb::WriteRequest>().batch_id());
   for (const auto& id : ids) ctx.Assert(id == "b-7", "the Write requests carried batch ids %q: every attempt must carry the caller's b-7, the key the store dedupes on", ids);
@@ -995,12 +1021,14 @@ void CheckBatchId(harness::Ctx& ctx) {
 }
 
 void CheckDoneAll(harness::Ctx& ctx) {
-  SeriesPeer& peer = peerFor(ctx);
+  hSeriesPeer& peer = hPeerFor(ctx);
   peer.failing["s3"] = 99;
-  const WriteResult result = writeBatch("b-1", threeSubs());
+  const WriteResult result = writeBatch("b-1", hThreeSubs());
   ctx.Assert(!result.complete, "s3 failed on every attempt and writeBatch answered complete: a batch is complete only when every sub-batch is stored");
-  ctx.Equal(sortedIds(result.accepted), {"s1", "s2"}, "accepted");
+  ctx.Equal(hSortedIds(result.accepted), {"s1", "s2"}, "accepted");
   ctx.Equal(result.failed, {"s3"}, "failed");
+  const size_t attempts = ctx.GRPC.CallsTo("Write").size();
+  ctx.Assert(attempts == 3, "s3 failed on every attempt and writeBatch made %d Write calls, expected kMaxAttempts = 3: a reply that stored something still counts as an attempt", attempts);
 }
 `,
   },

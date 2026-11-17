@@ -24,7 +24,7 @@ runs is counted out again.
 - One Lua script writes the comment (\`SET\` its \`store.row_key\`, \`ZADD\` its \`store.index_key\`
   by \`seq\`) and its counters: \`INCR thread:{tenant}:{thread}:count\`, \`HINCRBY\`
   \`thread:{tenant}:{thread}:replies\` for a reply, \`ZINCRBY hot:{tenant}\` with
-  \`EXPIRE HOT_TTL_S\` (3600). It returns the thread's count.
+  \`EXPIRE HOT_TTL_S\` (3600), refreshed by every comment. It returns the thread's count.
 - \`hot_threads\` returns the first \`HOT_PAGE_SIZE\` (10), most comments first.
 - \`recount_thread\` counts the index (\`ZCARD\`) and sets the counter in one script.`,
   sequence: {
@@ -47,7 +47,7 @@ runs is counted out again.
       id: 'atomic-commit',
       title: 'The comment and its counters land in one script',
       detail:
-        'One Lua script `SET`s the comment, `ZADD`s it to the thread index and `INCR`s the counters, so the instant the comment is indexed its counter already counts it. The starter inserts first and increments afterwards, in separate commands.',
+        'One Lua script `SET`s the comment, `ZADD`s it to the thread index and bumps the counters, so the instant the comment is indexed its thread counter, its parent’s reply count and the hot list already count it. The starter inserts first and increments afterwards, in separate commands.',
       match: {
         python: {
           all: [
@@ -125,7 +125,7 @@ runs is counted out again.
       id: 'hot-expiry',
       title: 'The hot list expires and is read one page at a time',
       detail:
-        'The script refreshes `EXPIRE hot:{tenant} HOT_TTL_S` (3600) on every comment, and `hot_threads` reads `HOT_PAGE_SIZE` (10) entries, most comments first. The starter never expires the set and reads it whole.',
+        'The same script sets `EXPIRE hot:{tenant} HOT_TTL_S` (3600) on every comment, so the list has its TTL from the instant it exists and lives 3600 s past the tenant’s last comment; `hot_threads` reads `HOT_PAGE_SIZE` (10) entries, most comments first. The starter never expires the set and reads it whole.',
       match: {
         python: {all: [/HOT_TTL_S\s*=\s*3600/, /['"]EXPIRE['"]/, /HOT_PAGE_SIZE\s*-\s*1/]},
         typescript: {all: [/HOT_TTL_S\s*=\s*3600/, /['"]EXPIRE['"]/, /HOT_PAGE_SIZE\s*-\s*1/]},
@@ -753,6 +753,16 @@ def _counted(ctx):
     return sum(int(ctx.redis.get(k) or 0) for k in ctx.redis.keys("*:count"))
 
 
+def _replies_of(ctx, parent_id):
+    """The parent's reply count across every replies hash, whatever the keys are called."""
+    return sum(int(ctx.redis.hget(k, parent_id) or 0) for k in ctx.redis.keys("*replies*") if ctx.redis.type(k) == "hash")
+
+
+def _hot_score(ctx, thread_id):
+    """The thread's score across every hot list, whatever the keys are called."""
+    return sum(ctx.redis.zscore(k, thread_id) or 0 for k in ctx.redis.keys("hot*") if ctx.redis.type(k) == "zset")
+
+
 def check_atomic_commit(ctx):
     m = ctx.load("state")
     first = _comment()
@@ -764,7 +774,11 @@ def check_atomic_commit(ctx):
     assert indexed == counted, f"the instant the comment was indexed, the thread held {indexed} comment(s) and its counter said {counted}: a crash there leaves the counter short for good. Write the comment and its counters in one script"
     assert count == 1, f"commit_comment of the thread's first comment returned {count}, expected 1"
     reply = _comment(parent_id=first["id"])
+    replied = ctx.redis_after(INDEX, lambda: (_replies_of(ctx, first["id"]), _hot_score(ctx, "t-1")))
     assert m.commit_comment("acme", reply) == 2, "the second comment of t-1 must return 2"
+    assert replied.fired, f"commit_comment of a reply never wrote the thread's index {INDEX}"
+    replies_then, hot_then = replied.result
+    assert replies_then == 1 and hot_then == 2, f"the instant the reply was indexed, its parent's reply count said {replies_then} and the hot list scored t-1 {hot_then}, expected 1 and 2: the replies hash and the hot list belong in the same script as the comment"
     assert m.thread_count("acme", "t-1") == 2, f"thread_count gives {m.thread_count('acme', 't-1')} after two comments"
     replies = m.reply_counts("acme", "t-1", [first["id"], reply["id"]])
     assert replies == {first["id"]: 1, reply["id"]: 0}, f"reply_counts gives {replies}, expected one reply under {first['id']}"
@@ -799,6 +813,14 @@ def check_hot_expiry(ctx):
     for key in ctx.redis.keys("hot:*"):
         ttl = ctx.redis.ttl(key)
         assert 0 < ttl <= 3600, f"the hot list {key} has TTL {ttl}: it must expire HOT_TTL_S = 3600 s after the tenant's last comment, or it holds every thread ever posted to"
+    created = ctx.redis_after("hot:initech", lambda: ctx.redis.ttl("hot:initech"))
+    m.commit_comment("initech", _comment())
+    assert created.fired, f"initech's first comment never wrote hot:initech (keys: {sorted(ctx.redis.keys('hot*'))})"
+    assert 3590 <= created.result <= 3600, f"the instant initech's first comment created hot:initech, its TTL was {created.result}: the script that bumps the hot list sets EXPIRE HOT_TTL_S = 3600 s in the same step"
+    ctx.clock.advance(3000)
+    refreshed = ctx.redis_after("hot:acme", lambda: ctx.redis.ttl("hot:acme"))
+    m.commit_comment("acme", _comment("t-12"))
+    assert refreshed.fired and 3590 <= refreshed.result <= 3600, f"a comment 3000 s after the first left hot:acme with TTL {refreshed.result}: every comment refreshes EXPIRE HOT_TTL_S, so the list lives 3600 s past the tenant's last comment"
 
 
 def check_recount(ctx):
@@ -827,6 +849,14 @@ const comment = (store, threadId = 't-1', parentId = '') => store.newComment(thr
 /** What every thread counter in Redis adds up to, whatever the keys are called. */
 const counted = ctx => (ctx.redis.keys('*:count') as string[]).reduce((sum, k) => sum + Number(ctx.redis.get(k) ?? 0), 0);
 
+/** The parent's reply count across every replies hash, whatever the keys are called. */
+const repliesOf = (ctx, parentId: string) =>
+  (ctx.redis.keys('*replies*') as string[]).filter(k => ctx.redis.type(k) === 'hash').reduce((sum, k) => sum + Number(ctx.redis.hget(k, parentId) ?? 0), 0);
+
+/** The thread's score across every hot list, whatever the keys are called. */
+const hotScore = (ctx, threadId: string) =>
+  (ctx.redis.keys('hot*') as string[]).filter(k => ctx.redis.type(k) === 'zset').reduce((sum, k) => sum + Number(ctx.redis.zscore(k, threadId) ?? 0), 0);
+
 async function settled(probe, what: string) {
   assert(probe.fired, \`nothing touched \${what}\`);
   if (probe.error !== undefined) throw probe.error;
@@ -843,7 +873,10 @@ export async function check_atomic_commit(ctx) {
   assert.equal(total, indexed, \`the instant the comment was indexed, the thread held \${indexed} comment(s) and its counter said \${total}: a crash there leaves the counter short for good. Write the comment and its counters in one script\`);
   assert.equal(count, 1, "commitComment of the thread's first comment must resolve 1");
   const reply = await comment(store, 't-1', first.id);
+  const replied = ctx.redisAfter(INDEX, () => [repliesOf(ctx, first.id), hotScore(ctx, 't-1')]);
   assert.equal(await m.commitComment('acme', reply), 2, 'the second comment of t-1 must resolve 2');
+  const [repliesThen, hotThen] = await settled(replied, INDEX);
+  assert(repliesThen === 1 && hotThen === 2, \`the instant the reply was indexed, its parent's reply count said \${repliesThen} and the hot list scored t-1 \${hotThen}, expected 1 and 2: the replies hash and the hot list belong in the same script as the comment\`);
   assert.equal(await m.threadCount('acme', 't-1'), 2, 'threadCount after two comments');
   assert.deepStrictEqual(await m.replyCounts('acme', 't-1', [first.id, reply.id]), {[first.id]: 1, [reply.id]: 0}, \`replyCounts must show one reply under \${first.id}\`);
   assert.deepStrictEqual(await store.get('acme', reply.id), reply, \`the comment itself must be stored under \${store.rowKey('acme', reply.id)}\`);
@@ -877,6 +910,14 @@ export async function check_hot_expiry(ctx) {
     const ttl = Number(ctx.redis.ttl(key));
     assert(ttl > 0 && ttl <= 3600, \`the hot list \${key} has TTL \${ttl}: it must expire HOT_TTL_S = 3600 s after the tenant's last comment, or it holds every thread ever posted to\`);
   }
+  const created = ctx.redisAfter('hot:initech', () => Number(ctx.redis.ttl('hot:initech')));
+  await m.commitComment('initech', await comment(store));
+  assert(created.fired, \`initech's first comment never wrote hot:initech (keys: \${JSON.stringify(ctx.redis.keys('hot*'))})\`);
+  assert(created.result >= 3590 && created.result <= 3600, \`the instant initech's first comment created hot:initech, its TTL was \${created.result}: the script that bumps the hot list sets EXPIRE HOT_TTL_S = 3600 s in the same step\`);
+  ctx.clock.advance(3000);
+  const refreshed = ctx.redisAfter('hot:acme', () => Number(ctx.redis.ttl('hot:acme')));
+  await m.commitComment('acme', await comment(store, 't-12'));
+  assert(refreshed.fired && refreshed.result >= 3590 && refreshed.result <= 3600, \`a comment 3000 s after the first left hot:acme with TTL \${refreshed.result}: every comment refreshes EXPIRE HOT_TTL_S, so the list lives 3600 s past the tenant's last comment\`);
 }
 
 export async function check_recount(ctx) {
@@ -903,24 +944,24 @@ import (
 	"leetbuild/harness"
 )
 
-const index = "thread:acme:t-1:comments"
+const hIndex = "thread:acme:t-1:comments"
 
-var stateBg = context.Background()
+var hBg = context.Background()
 
-func newTestComment(ctx *harness.Ctx, threadID, parentID string) store.Comment {
-	c, err := store.NewComment(stateBg, threadID, parentID, "u-1", "hello", "hello")
+func hNewComment(ctx *harness.Ctx, threadID, parentID string) store.Comment {
+	c, err := store.NewComment(hBg, threadID, parentID, "u-1", "hello", "hello")
 	ctx.NoError(err, "store.NewComment failed")
 	return c
 }
 
-func mustCommit(ctx *harness.Ctx, tenant string, c store.Comment) int64 {
-	count, err := commitComment(stateBg, tenant, c)
+func hCommit(ctx *harness.Ctx, tenant string, c store.Comment) int64 {
+	count, err := commitComment(hBg, tenant, c)
 	ctx.NoError(err, "commitComment(%s, %s) failed", tenant, c.ID)
 	return count
 }
 
-// counted is what every thread counter in Redis adds up to, whatever the keys are called.
-func counted(ctx *harness.Ctx) int64 {
+// hCounted is what every thread counter in Redis adds up to, whatever the keys are called.
+func hCounted(ctx *harness.Ctx) int64 {
 	var total int64
 	for _, k := range ctx.Redis.Keys("*:count") {
 		v, _ := ctx.Redis.Get(k)
@@ -931,37 +972,67 @@ func counted(ctx *harness.Ctx) int64 {
 	return total
 }
 
-func zcard(ctx *harness.Ctx, key string) int64 { return ctx.Redis.Do("ZCARD", key).(int64) }
+// hRepliesOf is the parent's reply count across every replies hash, whatever the keys are called.
+func hRepliesOf(ctx *harness.Ctx, parentID string) float64 {
+	var total float64
+	for _, k := range ctx.Redis.Keys("*replies*") {
+		if ctx.Redis.Type(k) != "hash" {
+			continue
+		}
+		v, _ := ctx.Redis.HGet(k, parentID)
+		var n float64
+		fmt.Sscan(v, &n)
+		total += n
+	}
+	return total
+}
+
+// hHotScore is the thread's score across every hot list, whatever the keys are called.
+func hHotScore(ctx *harness.Ctx, threadID string) float64 {
+	var total float64
+	for _, k := range ctx.Redis.Keys("hot*") {
+		if ctx.Redis.Type(k) != "zset" {
+			continue
+		}
+		s, _ := ctx.Redis.ZScore(k, threadID)
+		total += s
+	}
+	return total
+}
 
 func CheckAtomicCommit(ctx *harness.Ctx) {
-	first := newTestComment(ctx, "t-1", "")
+	first := hNewComment(ctx, "t-1", "")
 	// The instant the comment reaches the thread's index, what the counters say.
-	seen := ctx.Redis.After(index, func() any { return [2]int64{zcard(ctx, index), counted(ctx)} })
-	count := mustCommit(ctx, "acme", first)
-	ctx.Assert(seen.Fired, "commitComment never wrote the thread's index %s", index)
+	seen := ctx.Redis.After(hIndex, func() any { return [2]int64{ctx.Redis.ZCard(hIndex), hCounted(ctx)} })
+	count := hCommit(ctx, "acme", first)
+	ctx.Assert(seen.Fired, "commitComment never wrote the thread's index %s", hIndex)
 	got, _ := seen.Result.([2]int64)
 	ctx.Assert(got[0] == got[1], "the instant the comment was indexed, the thread held %d comment(s) and its counter said %d: a crash there leaves the counter short for good. Write the comment and its counters in one script", got[0], got[1])
 	ctx.Equal(count, 1, "commitComment of the thread's first comment")
-	reply := newTestComment(ctx, "t-1", first.ID)
-	ctx.Equal(mustCommit(ctx, "acme", reply), 2, "commitComment of the second comment of t-1")
-	ctx.Equal(threadCount(stateBg, "acme", "t-1"), 2, "threadCount after two comments")
-	ctx.Equal(replyCounts(stateBg, "acme", "t-1", []string{first.ID, reply.ID}), map[string]int64{first.ID: 1, reply.ID: 0}, "replyCounts after one reply under %s", first.ID)
-	stored := store.Get(stateBg, "acme", reply.ID)
+	reply := hNewComment(ctx, "t-1", first.ID)
+	replied := ctx.Redis.After(hIndex, func() any { return [2]float64{hRepliesOf(ctx, first.ID), hHotScore(ctx, "t-1")} })
+	ctx.Equal(hCommit(ctx, "acme", reply), 2, "commitComment of the second comment of t-1")
+	ctx.Assert(replied.Fired, "commitComment of a reply never wrote the thread's index %s", hIndex)
+	then, _ := replied.Result.([2]float64)
+	ctx.Assert(then[0] == 1 && then[1] == 2, "the instant the reply was indexed, its parent's reply count said %v and the hot list scored t-1 %v, expected 1 and 2: the replies hash and the hot list belong in the same script as the comment", then[0], then[1])
+	ctx.Equal(threadCount(hBg, "acme", "t-1"), 2, "threadCount after two comments")
+	ctx.Equal(replyCounts(hBg, "acme", "t-1", []string{first.ID, reply.ID}), map[string]int64{first.ID: 1, reply.ID: 0}, "replyCounts after one reply under %s", first.ID)
+	stored := store.Get(hBg, "acme", reply.ID)
 	ctx.Assert(stored != nil && *stored == reply, "the comment itself must be stored under %s, got %+v", store.RowKey("acme", reply.ID), stored)
 }
 
 func CheckTenantKeys(ctx *harness.Ctx) {
 	for _, threadID := range []string{"t-1", "t-1", "t-1", "t-2"} {
-		mustCommit(ctx, "acme", newTestComment(ctx, threadID, ""))
+		hCommit(ctx, "acme", hNewComment(ctx, threadID, ""))
 	}
-	root := newTestComment(ctx, "t-1", "")
-	mustCommit(ctx, "globex", root)
-	mustCommit(ctx, "globex", newTestComment(ctx, "t-1", root.ID))
-	acme, globex := threadCount(stateBg, "acme", "t-1"), threadCount(stateBg, "globex", "t-1")
+	root := hNewComment(ctx, "t-1", "")
+	hCommit(ctx, "globex", root)
+	hCommit(ctx, "globex", hNewComment(ctx, "t-1", root.ID))
+	acme, globex := threadCount(hBg, "acme", "t-1"), threadCount(hBg, "globex", "t-1")
 	ctx.Assert(acme == 3 && globex == 2, "acme's t-1 counts %d and globex's t-1 counts %d, expected 3 and 2: two tenants' threads share one counter", acme, globex)
-	ctx.Equal(replyCounts(stateBg, "acme", "t-1", []string{root.ID}), map[string]int64{root.ID: 0}, "globex's reply must not count in acme's thread; acme's replyCounts")
-	ctx.Equal(replyCounts(stateBg, "globex", "t-1", []string{root.ID}), map[string]int64{root.ID: 1}, "globex's reply must count under its parent; globex's replyCounts")
-	hot, err := hotThreads(stateBg, "globex")
+	ctx.Equal(replyCounts(hBg, "acme", "t-1", []string{root.ID}), map[string]int64{root.ID: 0}, "globex's reply must not count in acme's thread; acme's replyCounts")
+	ctx.Equal(replyCounts(hBg, "globex", "t-1", []string{root.ID}), map[string]int64{root.ID: 1}, "globex's reply must count under its parent; globex's replyCounts")
+	hot, err := hotThreads(hBg, "globex")
 	ctx.NoError(err, "hotThreads(globex) failed")
 	ctx.Equal(hot, []string{"t-1"}, "globex's hot threads (acme's threads must not show up on another tenant's list)")
 	v, _ := ctx.Redis.Get("thread:acme:t-1:count")
@@ -973,12 +1044,12 @@ func CheckTenantKeys(ctx *harness.Ctx) {
 
 func CheckHotExpiry(ctx *harness.Ctx) {
 	for n := 1; n <= 12; n++ {
-		mustCommit(ctx, "acme", newTestComment(ctx, fmt.Sprintf("t-%d", n), ""))
+		hCommit(ctx, "acme", hNewComment(ctx, fmt.Sprintf("t-%d", n), ""))
 	}
 	for _, threadID := range []string{"t-5", "t-5", "t-9"} {
-		mustCommit(ctx, "acme", newTestComment(ctx, threadID, ""))
+		hCommit(ctx, "acme", hNewComment(ctx, threadID, ""))
 	}
-	hot, err := hotThreads(stateBg, "acme")
+	hot, err := hotThreads(hBg, "acme")
 	ctx.NoError(err, "hotThreads(acme) failed")
 	ctx.Equal(len(hot), 10, "hotThreads must return the first page of hotPageSize = 10 threads; the threads")
 	ctx.Assert(len(hot) >= 2 && hot[0] == "t-5" && hot[1] == "t-9", "hotThreads starts %q, expected the busiest threads first: t-5 (3 comments), t-9 (2)", hot)
@@ -986,26 +1057,36 @@ func CheckHotExpiry(ctx *harness.Ctx) {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl > 0 && ttl <= 3600, "the hot list %s has TTL %d: it must expire hotTTLSeconds = 3600 s after the tenant's last comment, or it holds every thread ever posted to", key, ttl)
 	}
+	created := ctx.Redis.After("hot:initech", func() any { return ctx.Redis.TTL("hot:initech") })
+	hCommit(ctx, "initech", hNewComment(ctx, "t-1", ""))
+	ctx.Assert(created.Fired, "initech's first comment never wrote hot:initech (keys: %q)", ctx.Redis.Keys("hot*"))
+	ttl, _ := created.Result.(int64)
+	ctx.Assert(ttl >= 3590 && ttl <= 3600, "the instant initech's first comment created hot:initech, its TTL was %d: the script that bumps the hot list sets EXPIRE hotTTLSeconds = 3600 s in the same step", ttl)
+	ctx.Clock.Advance(3000)
+	refreshed := ctx.Redis.After("hot:acme", func() any { return ctx.Redis.TTL("hot:acme") })
+	hCommit(ctx, "acme", hNewComment(ctx, "t-12", ""))
+	ttl, _ = refreshed.Result.(int64)
+	ctx.Assert(refreshed.Fired && ttl >= 3590 && ttl <= 3600, "a comment 3000 s after the first left hot:acme with TTL %d: every comment refreshes EXPIRE hotTTLSeconds, so the list lives 3600 s past the tenant's last comment", ttl)
 }
 
 func CheckRecount(ctx *harness.Ctx) {
 	for i := 0; i < 3; i++ {
-		mustCommit(ctx, "acme", newTestComment(ctx, "t-1", ""))
+		hCommit(ctx, "acme", hNewComment(ctx, "t-1", ""))
 	}
-	n, err := recountThread(stateBg, "acme", "t-1")
+	n, err := recountThread(hBg, "acme", "t-1")
 	ctx.NoError(err, "recountThread failed")
 	ctx.Equal(n, 3, "recountThread of a thread with 3 comments")
-	late := newTestComment(ctx, "t-1", "")
+	late := hNewComment(ctx, "t-1", "")
 	// Another server commits a comment while the recount is running.
-	rival := ctx.Redis.After(index, func() any {
-		_, err := commitComment(stateBg, "acme", late)
+	rival := ctx.Redis.After(hIndex, func() any {
+		_, err := commitComment(hBg, "acme", late)
 		return err
 	})
-	_, err = recountThread(stateBg, "acme", "t-1")
+	_, err = recountThread(hBg, "acme", "t-1")
 	ctx.NoError(err, "recountThread failed")
-	ctx.Assert(rival.Fired, "recountThread never read the thread's index %s", index)
+	ctx.Assert(rival.Fired, "recountThread never read the thread's index %s", hIndex)
 	ctx.Assert(rival.Result == nil, "the rival commit failed: %v", rival.Result)
-	total, indexed := threadCount(stateBg, "acme", "t-1"), store.IndexedCount(stateBg, "acme", "t-1")
+	total, indexed := threadCount(hBg, "acme", "t-1"), store.IndexedCount(hBg, "acme", "t-1")
 	ctx.Assert(total == 4 && indexed == 4, "a comment committed while recountThread ran left the counter at %d with %d comments indexed: the count and the SET must be one script", total, indexed)
 }
 `,
@@ -1020,36 +1101,60 @@ func CheckRecount(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kIndex = "thread:acme:t-1:comments";
+const std::string hIndex = "thread:acme:t-1:comments";
 
-store::Comment testComment(const std::string& thread_id = "t-1", const std::string& parent_id = "") {
+store::Comment hComment(const std::string& thread_id = "t-1", const std::string& parent_id = "") {
   return store::newComment(thread_id, parent_id, "u-1", "hello", "hello");
 }
 
 // What every thread counter in Redis adds up to, whatever the keys are called.
-long long counted(harness::Ctx& ctx) {
+long long hCounted(harness::Ctx& ctx) {
   long long total = 0;
   for (const auto& k : ctx.Redis.Keys("*:count")) total += std::stoll(ctx.Redis.Get(k).value_or("0"));
+  return total;
+}
+
+// The parent's reply count across every replies hash, whatever the keys are called.
+double hRepliesOf(harness::Ctx& ctx, const std::string& parent_id) {
+  double total = 0;
+  for (const auto& k : ctx.Redis.Keys("*replies*"))
+    if (ctx.Redis.Type(k) == "hash") total += std::stod(ctx.Redis.HGet(k, parent_id).value_or("0"));
+  return total;
+}
+
+// The thread's score across every hot list, whatever the keys are called.
+double hHotScore(harness::Ctx& ctx, const std::string& thread_id) {
+  double total = 0;
+  for (const auto& k : ctx.Redis.Keys("hot*"))
+    if (ctx.Redis.Type(k) == "zset") total += ctx.Redis.ZScore(k, thread_id).value_or(0);
   return total;
 }
 
 }  // namespace
 
 void CheckAtomicCommit(harness::Ctx& ctx) {
-  const store::Comment first = testComment();
+  const store::Comment first = hComment();
   // The instant the comment reaches the thread's index, what the counters say.
   bool fired = false;
   std::array<long long, 2> seen{-1, -1};
-  ctx.Redis.After(kIndex, [&] {
+  ctx.Redis.After(hIndex, [&] {
     fired = true;
-    seen = {ctx.Redis.ZCard(kIndex), counted(ctx)};
+    seen = {ctx.Redis.ZCard(hIndex), hCounted(ctx)};
   });
   const long long count = commitComment("acme", first);
-  ctx.Assert(fired, "commitComment never wrote the thread's index %s", kIndex);
+  ctx.Assert(fired, "commitComment never wrote the thread's index %s", hIndex);
   ctx.Assert(seen[0] == seen[1], "the instant the comment was indexed, the thread held %d comment(s) and its counter said %d: a crash there leaves the counter short for good. Write the comment and its counters in one script", seen[0], seen[1]);
   ctx.Equal(count, 1, "commitComment of the thread's first comment");
-  const store::Comment reply = testComment("t-1", first.id);
+  const store::Comment reply = hComment("t-1", first.id);
+  bool replied = false;
+  std::array<double, 2> then{-1, -1};
+  ctx.Redis.After(hIndex, [&] {
+    replied = true;
+    then = {hRepliesOf(ctx, first.id), hHotScore(ctx, "t-1")};
+  });
   ctx.Equal(commitComment("acme", reply), 2, "commitComment of the second comment of t-1");
+  ctx.Assert(replied, "commitComment of a reply never wrote the thread's index %s", hIndex);
+  ctx.Assert(then[0] == 1 && then[1] == 2, "the instant the reply was indexed, its parent's reply count said %v and the hot list scored t-1 %v, expected 1 and 2: the replies hash and the hot list belong in the same script as the comment", then[0], then[1]);
   ctx.Equal(threadCount("acme", "t-1"), 2, "threadCount after two comments");
   const auto replies = replyCounts("acme", "t-1", {first.id, reply.id});
   ctx.Assert(replies.size() == 2 && replies.at(first.id) == 1 && replies.at(reply.id) == 0, "replyCounts must show one reply under %s and none under %s", first.id, reply.id);
@@ -1058,10 +1163,10 @@ void CheckAtomicCommit(harness::Ctx& ctx) {
 }
 
 void CheckTenantKeys(harness::Ctx& ctx) {
-  for (const std::string thread_id : {"t-1", "t-1", "t-1", "t-2"}) commitComment("acme", testComment(thread_id));
-  const store::Comment root = testComment();
+  for (const std::string thread_id : {"t-1", "t-1", "t-1", "t-2"}) commitComment("acme", hComment(thread_id));
+  const store::Comment root = hComment();
   commitComment("globex", root);
-  commitComment("globex", testComment("t-1", root.id));
+  commitComment("globex", hComment("t-1", root.id));
   const long long acme = threadCount("acme", "t-1");
   const long long globex = threadCount("globex", "t-1");
   ctx.Assert(acme == 3 && globex == 2, "acme's t-1 counts %d and globex's t-1 counts %d, expected 3 and 2: two tenants' threads share one counter", acme, globex);
@@ -1074,8 +1179,8 @@ void CheckTenantKeys(harness::Ctx& ctx) {
 }
 
 void CheckHotExpiry(harness::Ctx& ctx) {
-  for (int n = 1; n <= 12; n++) commitComment("acme", testComment("t-" + std::to_string(n)));
-  for (const std::string thread_id : {"t-5", "t-5", "t-9"}) commitComment("acme", testComment(thread_id));
+  for (int n = 1; n <= 12; n++) commitComment("acme", hComment("t-" + std::to_string(n)));
+  for (const std::string thread_id : {"t-5", "t-5", "t-9"}) commitComment("acme", hComment(thread_id));
   const auto hot = hotThreads("acme");
   ctx.Equal(hot.size(), 10, "hotThreads must return the first page of kHotPageSize = 10 threads; the threads");
   ctx.Assert(hot.size() >= 2 && hot[0] == "t-5" && hot[1] == "t-9", "hotThreads starts %q, expected the busiest threads first: t-5 (3 comments), t-9 (2)", hot);
@@ -1083,16 +1188,34 @@ void CheckHotExpiry(harness::Ctx& ctx) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl > 0 && ttl <= 3600, "the hot list %s has TTL %d: it must expire kHotTtlSeconds = 3600 s after the tenant's last comment, or it holds every thread ever posted to", key, ttl);
   }
+  bool created = false;
+  long long ttl = -3;
+  ctx.Redis.After("hot:initech", [&] {
+    created = true;
+    ttl = ctx.Redis.TTL("hot:initech");
+  });
+  commitComment("initech", hComment());
+  ctx.Assert(created, "initech's first comment never wrote hot:initech (keys: %q)", ctx.Redis.Keys("hot*"));
+  ctx.Assert(ttl >= 3590 && ttl <= 3600, "the instant initech's first comment created hot:initech, its TTL was %d: the script that bumps the hot list sets EXPIRE kHotTtlSeconds = 3600 s in the same step", ttl);
+  ctx.Clock.Advance(3000);
+  bool refreshed = false;
+  ttl = -3;
+  ctx.Redis.After("hot:acme", [&] {
+    refreshed = true;
+    ttl = ctx.Redis.TTL("hot:acme");
+  });
+  commitComment("acme", hComment("t-12"));
+  ctx.Assert(refreshed && ttl >= 3590 && ttl <= 3600, "a comment 3000 s after the first left hot:acme with TTL %d: every comment refreshes EXPIRE kHotTtlSeconds, so the list lives 3600 s past the tenant's last comment", ttl);
 }
 
 void CheckRecount(harness::Ctx& ctx) {
-  for (int i = 0; i < 3; i++) commitComment("acme", testComment());
+  for (int i = 0; i < 3; i++) commitComment("acme", hComment());
   ctx.Equal(recountThread("acme", "t-1"), 3, "recountThread of a thread with 3 comments");
-  const store::Comment late = testComment();
+  const store::Comment late = hComment();
   // Another server commits a comment while the recount is running.
   bool fired = false;
   std::string failed;
-  ctx.Redis.After(kIndex, [&] {
+  ctx.Redis.After(hIndex, [&] {
     fired = true;
     try {
       commitComment("acme", late);
@@ -1101,7 +1224,7 @@ void CheckRecount(harness::Ctx& ctx) {
     }
   });
   recountThread("acme", "t-1");
-  ctx.Assert(fired, "recountThread never read the thread's index %s", kIndex);
+  ctx.Assert(fired, "recountThread never read the thread's index %s", hIndex);
   ctx.Assert(failed.empty(), "the rival commit failed: %s", failed);
   const long long total = threadCount("acme", "t-1");
   const long long indexed = store::indexedCount("acme", "t-1");
