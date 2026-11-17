@@ -19,7 +19,9 @@ document; the body carries the wholesale \`cost_cents\`; a price change never re
 already read the product; and an hour of public caching lets a shared proxy serve one tenant's page,
 and an old price, to everyone.
 
-- Read the caller's catalog only (\`get_product(tenant, id)\`); an id outside it is **404**.
+- The tenant comes from \`X-Tenant-Id\` only. Read the caller's catalog only
+  (\`get_product(tenant, id)\`); an id outside it is **404**, the same answer as an id no catalog
+  holds, and two tenants may use the same id.
 - Answer \`public_view(product)\`: the shopper's fields and \`price_version\`, no \`cost_cents\`.
 - Read the catalog on every request: no process-level copy.
 - Answer \`Cache-Control: private, max-age=30\` and \`ETag: "{price_version}"\`; a request whose
@@ -48,7 +50,7 @@ and an old price, to everyone.
       id: 'tenant-scope',
       title: 'Another tenant’s product is 404',
       detail:
-        'The document is read with `get_product(tenant, id)`, so an id from another tenant’s catalog answers **404**; the starter’s `find_product` looks in every tenant’s catalog.',
+        'The document is read with `get_product(tenant, id)`, so an id from another tenant’s catalog answers **404**, byte for byte like an id nobody has, and each tenant reading a shared id gets its own document; the starter’s `find_product` looks in every tenant’s catalog. The tenant comes from the `X-Tenant-Id` header alone.',
       match: {
         python: {all: [/catalog\.get_product\(\s*tenant/], none: [/find_product\(/]},
         typescript: {all: [/getProduct\(\s*tenant/], none: [/findProduct\(/]},
@@ -461,8 +463,17 @@ async def check_tenant_scope(ctx):
     async with _api(ctx) as c:
         other = await _get(c, tenant="t-2")
         assert other.status_code == 404, f"tenant t-2 reading t-1's p-1 answered {other.status_code}: {other.text}. Read the caller's catalog only (get_product(tenant, id))"
+        missing = await c.get("/v1/products/p-404", headers={"X-Tenant-Id": "t-2"})
+        assert missing.status_code == 404 and other.text == missing.text, f"t-2 reading t-1's p-1 answered {other.status_code} {other.text}, and a product no catalog holds answered {missing.status_code} {missing.text}: another tenant's id must answer exactly like a missing one, or the page tells t-2 what t-1 sells"
+        revalidated = await _get(c, tenant="t-2", **{"If-None-Match": '"1"'})
+        assert revalidated.status_code == 404, f"t-2 revalidating t-1's p-1 with If-None-Match \\"1\\" answered {revalidated.status_code}, expected 404"
+        unsigned = await c.get("/v1/products/p-1", params={"tenant": "t-1"})
+        assert unsigned.status_code == 401, f"a request without X-Tenant-Id but with ?tenant=t-1 answered {unsigned.status_code}: the tenant comes from the header only, so a missing one is 401"
+        catalog.put_product("t-2", {**KETTLE, "title": "Copper Kettle", "price_cents": 5999})
+        theirs = await _get(c, tenant="t-2")
+        assert theirs.status_code == 200 and theirs.json().get("title") == "Copper Kettle", f"t-2 reading its own p-1 answered {theirs.status_code} {theirs.text}, expected t-2's Copper Kettle: two tenants may use one id"
         own = await _get(c)
-    assert own.status_code == 200 and own.json().get("id") == "p-1", f"t-1 reading its own p-1 answered {own.status_code} {own.text}"
+    assert own.status_code == 200 and own.json().get("id") == "p-1" and own.json().get("title") == "Steel Kettle", f"t-1 reading its own p-1 answered {own.status_code} {own.text}"
 
 
 async def check_public_fields(ctx):
@@ -510,11 +521,20 @@ const get = (c, tenant = 't-1', headers: Record<string, string> = {}) => c.get('
 const directives = r => new Set((r.headers['cache-control'] ?? '').split(',').map(d => d.trim()).filter(d => d !== ''));
 
 export async function check_tenant_scope(ctx) {
-  const {c} = await api(ctx);
+  const {c, catalog} = await api(ctx);
   const other = await get(c, 't-2');
   assert.equal(other.status, 404, \`tenant t-2 reading t-1's p-1 answered \${other.status}: \${other.text}. Read the caller's catalog only (getProduct(tenant, id))\`);
+  const missing = await c.get('/v1/products/p-404', {headers: {'X-Tenant-Id': 't-2'}});
+  assert(missing.status === 404 && other.text === missing.text, \`t-2 reading t-1's p-1 answered \${other.status} \${other.text}, and a product no catalog holds answered \${missing.status} \${missing.text}: another tenant's id must answer exactly like a missing one, or the page tells t-2 what t-1 sells\`);
+  const revalidated = await get(c, 't-2', {'If-None-Match': '"1"'});
+  assert.equal(revalidated.status, 404, \`t-2 revalidating t-1's p-1 with If-None-Match "1" answered \${revalidated.status}, expected 404\`);
+  const unsigned = await c.get('/v1/products/p-1', {query: {tenant: 't-1'}});
+  assert.equal(unsigned.status, 401, \`a request without X-Tenant-Id but with ?tenant=t-1 answered \${unsigned.status}: the tenant comes from the header only, so a missing one is 401\`);
+  await catalog.putProduct('t-2', {...KETTLE, title: 'Copper Kettle', price_cents: 5999});
+  const theirs = await get(c, 't-2');
+  assert(theirs.status === 200 && theirs.json().title === 'Copper Kettle', \`t-2 reading its own p-1 answered \${theirs.status} \${theirs.text}, expected t-2's Copper Kettle: two tenants may use one id\`);
   const own = await get(c);
-  assert(own.status === 200 && own.json().id === 'p-1', \`t-1 reading its own p-1 answered \${own.status} \${own.text}\`);
+  assert(own.status === 200 && own.json().id === 'p-1' && own.json().title === 'Steel Kettle', \`t-1 reading its own p-1 answered \${own.status} \${own.text}\`);
 }
 
 export async function check_public_fields(ctx) {
@@ -562,20 +582,20 @@ import (
 
 var productKettle = catalog.Product{ID: "p-1", Title: "Steel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 3499, InStock: true, CostCents: 1200}
 
-func productAPI(ctx *harness.Ctx) *harness.HTTP {
+func hProductAPI(ctx *harness.Ctx) *harness.HTTP {
 	catalog.PutProduct(context.Background(), "t-1", productKettle)
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func pageBody(r *harness.Response) map[string]any {
+func hPageBody(r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	return body
 }
 
-func directives(r *harness.Response) map[string]bool {
+func hDirectives(r *harness.Response) map[string]bool {
 	out := map[string]bool{}
 	for _, d := range strings.Split(r.Header.Get("Cache-Control"), ",") {
 		if d = strings.TrimSpace(d); d != "" {
@@ -586,38 +606,49 @@ func directives(r *harness.Response) map[string]bool {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := productAPI(ctx)
+	c := hProductAPI(ctx)
 	other := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-2")
 	ctx.Equal(other.Status, 404, "tenant t-2 reading t-1's p-1 answered %s: read the caller's catalog only (catalog.GetProduct(ctx, tenant, id)); the status", other.Text())
+	missing := c.Get("/v1/products/p-404", "X-Tenant-Id", "t-2")
+	ctx.Assert(missing.Status == 404 && other.Text() == missing.Text(), "t-2 reading t-1's p-1 answered %d %s, and a product no catalog holds answered %d %s: another tenant's id must answer exactly like a missing one, or the page tells t-2 what t-1 sells", other.Status, other.Text(), missing.Status, missing.Text())
+	revalidated := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-2", "If-None-Match", \`"1"\`)
+	ctx.Equal(revalidated.Status, 404, "t-2 revalidating t-1's p-1 with If-None-Match \\"1\\"; the status")
+	unsigned := c.Get("/v1/products/p-1?tenant=t-1")
+	ctx.Equal(unsigned.Status, 401, "a request without X-Tenant-Id but with ?tenant=t-1 (the tenant comes from the header only, so a missing one is 401); the status")
+	theirs := productKettle
+	theirs.Title, theirs.PriceCents = "Copper Kettle", 5999
+	catalog.PutProduct(context.Background(), "t-2", theirs)
+	mine := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-2")
+	ctx.Assert(mine.Status == 200 && hPageBody(mine)["title"] == "Copper Kettle", "t-2 reading its own p-1 answered %d %s, expected t-2's Copper Kettle: two tenants may use one id", mine.Status, mine.Text())
 	own := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1")
-	ctx.Assert(own.Status == 200 && pageBody(own)["id"] == "p-1", "t-1 reading its own p-1 answered %d %s", own.Status, own.Text())
+	ctx.Assert(own.Status == 200 && hPageBody(own)["id"] == "p-1" && hPageBody(own)["title"] == "Steel Kettle", "t-1 reading its own p-1 answered %d %s", own.Status, own.Text())
 }
 
 func CheckPublicFields(ctx *harness.Ctx) {
-	c := productAPI(ctx)
+	c := hProductAPI(ctx)
 	r := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "GET /v1/products/p-1 (%s)", r.Text())
-	body := pageBody(r)
+	body := hPageBody(r)
 	_, leaked := body["cost_cents"]
 	ctx.Assert(!leaked, "the product page carries the wholesale cost: %s. Answer catalog.PublicView(product)", r.Text())
 	ctx.Equal(body, map[string]any{"id": "p-1", "title": "Steel Kettle", "brand": "acme", "category": "kitchen", "price_cents": float64(3499), "in_stock": true, "price_version": float64(1)}, "the product page must be the public view")
 }
 
 func CheckFreshPrice(ctx *harness.Ctx) {
-	c := productAPI(ctx)
+	c := hProductAPI(ctx)
 	first := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1")
-	ctx.Assert(first.Status == 200 && pageBody(first)["price_cents"] == float64(3499), "the first read answered %d %s", first.Status, first.Text())
+	ctx.Assert(first.Status == 200 && hPageBody(first)["price_cents"] == float64(3499), "the first read answered %d %s", first.Status, first.Text())
 	repriced := productKettle
 	repriced.PriceCents = 2999
 	catalog.PutProduct(context.Background(), "t-1", repriced)
-	body := pageBody(c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1"))
+	body := hPageBody(c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1"))
 	ctx.Assert(body["price_cents"] == float64(2999) && body["price_version"] == float64(2), "after a reprice to 2999 the page answered price %v version %v: a process-level copy keeps the old price. Read the catalog on every request", body["price_cents"], body["price_version"])
 }
 
 func CheckCacheHeaders(ctx *harness.Ctx) {
-	c := productAPI(ctx)
+	c := hProductAPI(ctx)
 	r := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1")
-	d := directives(r)
+	d := hDirectives(r)
 	ctx.Assert(!d["public"] && d["private"] && d["max-age=30"], "the page answered Cache-Control %q: a shared cache would hand this tenant's page to anyone. Use private, max-age=30", r.Header.Get("Cache-Control"))
 	ctx.Equal(r.Header.Get("ETag"), \`"1"\`, "the ETag must be the price version in quotes")
 	again := c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1", "If-None-Match", \`"1"\`)
@@ -641,10 +672,10 @@ func CheckCacheHeaders(ctx *harness.Ctx) {
 
 namespace {
 
-const catalog::Product kKettle{"p-1", "Steel Kettle", "acme", "kitchen", 3499, true, 1200, 0};
+const catalog::Product hKettle{"p-1", "Steel Kettle", "acme", "kitchen", 3499, true, 1200, 0};
 
-harness::HTTP productAPI(harness::Ctx& ctx) {
-  catalog::putProduct("t-1", kKettle);
+harness::HTTP hProductAPI(harness::Ctx& ctx) {
+  catalog::putProduct("t-1", hKettle);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -652,9 +683,9 @@ harness::HTTP productAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json pageBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
+nlohmann::json hPageBody(const harness::Response& r) { return nlohmann::json::parse(r.Text(), nullptr, false); }
 
-std::set<std::string> directives(const harness::Response& r) {
+std::set<std::string> hDirectives(const harness::Response& r) {
   std::set<std::string> out;
   std::stringstream in(r.HeaderValue("Cache-Control"));
   std::string d;
@@ -666,8 +697,8 @@ std::set<std::string> directives(const harness::Response& r) {
   return out;
 }
 
-catalog::Product repriced() {
-  catalog::Product p = kKettle;
+catalog::Product hRepriced() {
+  catalog::Product p = hKettle;
   p.price_cents = 2999;
   return p;
 }
@@ -675,42 +706,54 @@ catalog::Product repriced() {
 }  // namespace
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = productAPI(ctx);
+  auto c = hProductAPI(ctx);
   const auto other = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-2");
   ctx.Equal(other.Status, 404, "tenant t-2 reading t-1's p-1 answered %s: read the caller's catalog only (catalog::getProduct(tenant, id)); the status", other.Text());
+  const auto missing = c.Get("/v1/products/p-404", "X-Tenant-Id", "t-2");
+  ctx.Assert(missing.Status == 404 && other.Text() == missing.Text(), "t-2 reading t-1's p-1 answered %d %s, and a product no catalog holds answered %d %s: another tenant's id must answer exactly like a missing one, or the page tells t-2 what t-1 sells", other.Status, other.Text(), missing.Status, missing.Text());
+  const auto revalidated = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-2", "If-None-Match", "\\"1\\"");
+  ctx.Equal(revalidated.Status, 404, "t-2 revalidating t-1's p-1 with If-None-Match \\"1\\"; the status");
+  const auto unsigned_ = c.Get("/v1/products/p-1?tenant=t-1");
+  ctx.Equal(unsigned_.Status, 401, "a request without X-Tenant-Id but with ?tenant=t-1 (the tenant comes from the header only, so a missing one is 401); the status");
+  catalog::Product theirs = hKettle;
+  theirs.title = "Copper Kettle";
+  theirs.price_cents = 5999;
+  catalog::putProduct("t-2", theirs);
+  const auto mine = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-2");
+  ctx.Assert(mine.Status == 200 && hPageBody(mine).value("title", "") == "Copper Kettle", "t-2 reading its own p-1 answered %d %s, expected t-2's Copper Kettle: two tenants may use one id", mine.Status, mine.Text());
   const auto own = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1");
-  ctx.Assert(own.Status == 200 && pageBody(own).value("id", "") == "p-1", "t-1 reading its own p-1 answered %d %s", own.Status, own.Text());
+  ctx.Assert(own.Status == 200 && hPageBody(own).value("id", "") == "p-1" && hPageBody(own).value("title", "") == "Steel Kettle", "t-1 reading its own p-1 answered %d %s", own.Status, own.Text());
 }
 
 void CheckPublicFields(harness::Ctx& ctx) {
-  auto c = productAPI(ctx);
+  auto c = hProductAPI(ctx);
   const auto r = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1");
   ctx.Equal(r.Status, 200, "GET /v1/products/p-1 (%s)", r.Text());
-  const auto body = pageBody(r);
+  const auto body = hPageBody(r);
   ctx.Assert(body.is_object() && !body.contains("cost_cents"), "the product page carries the wholesale cost: %s. Answer catalog::publicView(product)", r.Text());
   const nlohmann::json expected = {{"id", "p-1"}, {"title", "Steel Kettle"}, {"brand", "acme"}, {"category", "kitchen"}, {"price_cents", 3499}, {"in_stock", true}, {"price_version", 1}};
   ctx.Assert(body == expected, "the product page is %s, expected the public view %s", r.Text(), expected.dump());
 }
 
 void CheckFreshPrice(harness::Ctx& ctx) {
-  auto c = productAPI(ctx);
+  auto c = hProductAPI(ctx);
   const auto first = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1");
-  ctx.Assert(first.Status == 200 && pageBody(first).value("price_cents", 0) == 3499, "the first read answered %d %s", first.Status, first.Text());
-  catalog::putProduct("t-1", repriced());
-  const auto body = pageBody(c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1"));
+  ctx.Assert(first.Status == 200 && hPageBody(first).value("price_cents", 0) == 3499, "the first read answered %d %s", first.Status, first.Text());
+  catalog::putProduct("t-1", hRepriced());
+  const auto body = hPageBody(c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1"));
   ctx.Assert(body.value("price_cents", 0) == 2999 && body.value("price_version", 0) == 2, "after a reprice to 2999 the page answered price %d version %d: a process-level copy keeps the old price. Read the catalog on every request",
              body.value("price_cents", 0), body.value("price_version", 0));
 }
 
 void CheckCacheHeaders(harness::Ctx& ctx) {
-  auto c = productAPI(ctx);
+  auto c = hProductAPI(ctx);
   const auto r = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1");
-  const auto d = directives(r);
+  const auto d = hDirectives(r);
   ctx.Assert(!d.count("public") && d.count("private") && d.count("max-age=30"), "the page answered Cache-Control %q: a shared cache would hand this tenant's page to anyone. Use private, max-age=30", r.HeaderValue("Cache-Control"));
   ctx.Equal(r.HeaderValue("ETag"), "\\"1\\"", "the ETag must be the price version in quotes");
   const auto again = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1", "If-None-Match", "\\"1\\"");
   ctx.Assert(again.Status == 304 && again.Text().empty(), "a revalidation with If-None-Match \\"1\\" answered %d %q, expected 304 with no body", again.Status, again.Text());
-  catalog::putProduct("t-1", repriced());
+  catalog::putProduct("t-1", hRepriced());
   const auto stale = c.Get("/v1/products/p-1", "X-Tenant-Id", "t-1", "If-None-Match", "\\"1\\"");
   ctx.Assert(stale.Status == 200 && stale.HeaderValue("ETag") == "\\"2\\"", "after a reprice, If-None-Match \\"1\\" answered %d with ETag %q, expected 200 and \\"2\\"", stale.Status, stale.HeaderValue("ETag"));
 }

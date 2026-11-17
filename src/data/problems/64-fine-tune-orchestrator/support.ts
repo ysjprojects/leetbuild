@@ -56,12 +56,13 @@ BASE_MODELS = {
     "mistral-7b-v0.3": {"id": "mistral-7b-v0.3", "supported": ["learning_rate", "epochs", "batch_size"]},
 }
 
-# Dataset versions with the SHA-256 of their content. status: registered, or retired
-# (support-tickets@v2 held unredacted e-mail addresses).
+# Dataset versions with the SHA-256 of their content. status: registered, retired
+# (support-tickets@v2 held unredacted e-mail addresses) or pending (legal-qa@v2 awaits its PII review).
 DATASETS = {
     "support-tickets@v3": {"id": "support-tickets@v3", "sha256": "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031", "status": "registered"},
     "support-tickets@v2": {"id": "support-tickets@v2", "sha256": "f6e096ac4484030db0ef9db46599ba8a0b4c935d2340da369602e3ceea2774e8", "status": "retired"},
     "legal-qa@v1": {"id": "legal-qa@v1", "sha256": "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc", "status": "registered"},
+    "legal-qa@v2": {"id": "legal-qa@v2", "sha256": "68be2e493a1cf67e980a1d54e01888185a9a974ef2eae727327902685e37e151", "status": "pending"},
 }
 
 
@@ -216,7 +217,7 @@ export interface Dataset {
   id: string;
   /** SHA-256 of the version's content. */
   sha256: string;
-  /** registered, or retired (support-tickets@v2 held unredacted e-mail addresses). */
+  /** registered, retired (support-tickets@v2 held unredacted e-mail addresses) or pending (legal-qa@v2 awaits its PII review). */
   status: string;
 }
 
@@ -229,6 +230,7 @@ const DATASETS: Record<string, Dataset> = {
   'support-tickets@v3': {id: 'support-tickets@v3', sha256: 'b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031', status: 'registered'},
   'support-tickets@v2': {id: 'support-tickets@v2', sha256: 'f6e096ac4484030db0ef9db46599ba8a0b4c935d2340da369602e3ceea2774e8', status: 'retired'},
   'legal-qa@v1': {id: 'legal-qa@v1', sha256: '06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc', status: 'registered'},
+  'legal-qa@v2': {id: 'legal-qa@v2', sha256: '68be2e493a1cf67e980a1d54e01888185a9a974ef2eae727327902685e37e151', status: 'pending'},
 };
 
 export const registry = {
@@ -418,8 +420,8 @@ type BaseModel struct {
 	Supported []string
 }
 
-// Dataset is a dataset version: the SHA-256 of its content and its status (registered, or retired:
-// support-tickets@v2 held unredacted e-mail addresses).
+// Dataset is a dataset version: the SHA-256 of its content and its status (registered, retired:
+// support-tickets@v2 held unredacted e-mail addresses, or pending: legal-qa@v2 awaits its PII review).
 type Dataset struct {
 	ID     string
 	SHA256 string
@@ -435,6 +437,7 @@ var datasets = map[string]Dataset{
 	"support-tickets@v3": {ID: "support-tickets@v3", SHA256: "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031", Status: "registered"},
 	"support-tickets@v2": {ID: "support-tickets@v2", SHA256: "f6e096ac4484030db0ef9db46599ba8a0b4c935d2340da369602e3ceea2774e8", Status: "retired"},
 	"legal-qa@v1":        {ID: "legal-qa@v1", SHA256: "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc", Status: "registered"},
+	"legal-qa@v2":        {ID: "legal-qa@v2", SHA256: "68be2e493a1cf67e980a1d54e01888185a9a974ef2eae727327902685e37e151", Status: "pending"},
 }
 
 // GetBaseModel is the base model; false for one the registry does not know.
@@ -690,8 +693,8 @@ struct BaseModel {
   std::vector<std::string> supported;
 };
 
-// A dataset version: the SHA-256 of its content and its status (registered, or retired:
-// support-tickets@v2 held unredacted e-mail addresses).
+// A dataset version: the SHA-256 of its content and its status (registered, retired:
+// support-tickets@v2 held unredacted e-mail addresses, or pending: legal-qa@v2 awaits its PII review).
 struct Dataset {
   std::string id;
   std::string sha256;
@@ -711,6 +714,7 @@ inline const std::map<std::string, Dataset>& datasets() {
       {"support-tickets@v3", {"support-tickets@v3", "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031", "registered"}},
       {"support-tickets@v2", {"support-tickets@v2", "f6e096ac4484030db0ef9db46599ba8a0b4c935d2340da369602e3ceea2774e8", "retired"}},
       {"legal-qa@v1", {"legal-qa@v1", "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc", "registered"}},
+      {"legal-qa@v2", {"legal-qa@v2", "68be2e493a1cf67e980a1d54e01888185a9a974ef2eae727327902685e37e151", "pending"}},
   };
   return versions;
 }
@@ -897,7 +901,7 @@ object Config {
 /** A base model and the hyperparameters its fine-tune recipe reads. */
 final case class BaseModel(id: String, supported: Set[String])
 
-/** A dataset version: the SHA-256 of its content and its status (registered, or retired). */
+/** A dataset version: the SHA-256 of its content and its status (registered, retired or pending). */
 final case class Dataset(id: String, sha256: String, status: String)
 
 /** The model and dataset registry (provided, read-only here): what a fine-tune may name. */
@@ -907,11 +911,12 @@ object Registry {
     "mistral-7b-v0.3" -> BaseModel("mistral-7b-v0.3", Set("learning_rate", "epochs", "batch_size"))
   )
 
-  // support-tickets@v2 is retired: it held unredacted e-mail addresses.
+  // support-tickets@v2 is retired: it held unredacted e-mail addresses. legal-qa@v2 is pending its PII review.
   private val datasets = Map(
     "support-tickets@v3" -> Dataset("support-tickets@v3", "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031", "registered"),
     "support-tickets@v2" -> Dataset("support-tickets@v2", "f6e096ac4484030db0ef9db46599ba8a0b4c935d2340da369602e3ceea2774e8", "retired"),
-    "legal-qa@v1" -> Dataset("legal-qa@v1", "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc", "registered")
+    "legal-qa@v1" -> Dataset("legal-qa@v1", "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc", "registered"),
+    "legal-qa@v2" -> Dataset("legal-qa@v2", "68be2e493a1cf67e980a1d54e01888185a9a974ef2eae727327902685e37e151", "pending")
   )
 
   /** The base model, None for one the registry does not know. */

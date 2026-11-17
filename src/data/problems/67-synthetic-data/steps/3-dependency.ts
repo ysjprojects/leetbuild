@@ -80,7 +80,7 @@ message ScoreReply   { double score = 1; bool refused = 2; string judge_version 
       id: 'retry-unavailable',
       title: 'Retries only UNAVAILABLE, at most three calls',
       detail:
-        'One UNAVAILABLE earns a retry after a backoff and the record is admitted on the second call; three in a row park it as judge_unavailable after exactly three calls; INVALID_ARGUMENT rejects it after one. The starter retries every status and then admits.',
+        'One UNAVAILABLE earns a retry after a backoff and the record is admitted on the second call; three in a row park it as judge_unavailable after exactly three calls, each waiting a backoff and each carrying its own full 900 ms deadline. INVALID_ARGUMENT, RESOURCE_EXHAUSTED, PERMISSION_DENIED and INTERNAL each reject it after one call. The starter retries every status and then admits.',
       match: {
         python: {all: [/grpc\.StatusCode\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/RETRY_LIMIT/]},
         typescript: {all: [/status\.UNAVAILABLE/, /MAX_ATTEMPTS/], none: [/RETRY_LIMIT/]},
@@ -864,12 +864,19 @@ def check_retry_unavailable(ctx):
     verdict = m.judge_record(state, _record(2))
     _expect(verdict, "parked", "judge_unavailable")
     assert len(_calls(ctx)) == 5 and verdict.get("attempts") == 3, f"a judge that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then the record is parked: saw {len(_calls(ctx)) - 2} calls and {verdict}"
-    ctx.grpc.fail("Score", grpc.StatusCode.INVALID_ARGUMENT, "text too long", times=1, target=config.JUDGE)
-    verdict = m.judge_record(state, _record(3))
-    _expect(verdict, "rejected", "invalid_argument")
-    assert len(_calls(ctx)) == 6, f"INVALID_ARGUMENT will not change on a retry: one call, saw {len(_calls(ctx)) - 5}"
+    timeouts = [c.timeout for c in _calls(ctx)]
+    assert all(t is not None and 0.8 <= t <= 1.0 and abs(t - timeouts[0]) <= 0.02 for t in timeouts), f"every attempt carries its own 900 ms deadline, the calls carried {timeouts}: a deadline shared by the retries leaves the last attempt only what the first ones and the backoff did not use"
+    gaps = [round(b.started - a.started, 3) for a, b in zip(_calls(ctx)[2:], _calls(ctx)[3:])]
+    assert all(g > 0 for g in gaps), f"each retry waits a backoff after an UNAVAILABLE, the gaps between the three calls were {gaps} s"
+    terminal = [(grpc.StatusCode.INVALID_ARGUMENT, "invalid_argument"), (grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.PERMISSION_DENIED, "permission_denied"), (grpc.StatusCode.INTERNAL, None)]
+    for n, (code, reason) in enumerate(terminal, start=3):
+        before = len(_calls(ctx))
+        ctx.grpc.fail("Score", code, "judge says no", times=1, target=config.JUDGE)
+        verdict = m.judge_record(state, _record(n))
+        _expect(verdict, "rejected", reason)
+        assert len(_calls(ctx)) - before == 1 and verdict.get("attempts") == 1, f"{code.name} will not change on a retry (only UNAVAILABLE is retried): one call, saw {len(_calls(ctx)) - before} and {verdict}"
     progress = _progress(ctx)
-    assert (progress.get("admitted"), progress.get("parked"), progress.get("rejected")) == (1, 1, 1), f"one admitted, one parked, one rejected, settled once each: progress holds {progress}"
+    assert (progress.get("admitted"), progress.get("parked"), progress.get("rejected")) == (1, 1, 4), f"one admitted, one parked, four rejected, settled once each: progress holds {progress}"
 
 
 def check_refusal_terminal(ctx):
@@ -963,12 +970,21 @@ export async function check_retry_unavailable(ctx) {
   verdict = await m.judgeRecord(state, record(2));
   expect(verdict, 'parked', 'judge_unavailable');
   assert(calls(ctx).length === 5 && verdict.attempts === 3, \`a judge that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls, then the record is parked: saw \${calls(ctx).length - 2} calls and \${JSON.stringify(verdict)}\`);
-  ctx.grpc.fail('Score', ctx.grpc.status.INVALID_ARGUMENT, 'text too long', 1, config.JUDGE);
-  verdict = await m.judgeRecord(state, record(3));
-  expect(verdict, 'rejected', 'invalid_argument');
-  assert.equal(calls(ctx).length, 6, \`INVALID_ARGUMENT will not change on a retry: one call, saw \${calls(ctx).length - 5}\`);
+  const timeouts = calls(ctx).map(c => c.timeout);
+  assert(timeouts.every(t => t !== null && 0.8 <= t && t <= 1.0 && Math.abs(t - timeouts[0]) <= 0.02), \`every attempt carries its own 900 ms deadline, the calls carried \${JSON.stringify(timeouts)}: a deadline shared by the retries leaves the last attempt only what the first ones and the backoff did not use\`);
+  const tail = calls(ctx).slice(2);
+  const gaps = tail.slice(1).map((c, i) => c.started - tail[i].started);
+  assert(gaps.every(g => g > 0), \`each retry waits a backoff after an UNAVAILABLE, the gaps between the three calls were \${JSON.stringify(gaps)} ms\`);
+  const terminal: [string, string | undefined][] = [['INVALID_ARGUMENT', 'invalid_argument'], ['RESOURCE_EXHAUSTED', 'resource_exhausted'], ['PERMISSION_DENIED', 'permission_denied'], ['INTERNAL', undefined]];
+  for (const [i, [name, reason]] of terminal.entries()) {
+    const before = calls(ctx).length;
+    ctx.grpc.fail('Score', ctx.grpc.status[name], 'judge says no', 1, config.JUDGE);
+    verdict = await m.judgeRecord(state, record(3 + i));
+    expect(verdict, 'rejected', reason);
+    assert(calls(ctx).length - before === 1 && verdict.attempts === 1, \`\${name} will not change on a retry (only UNAVAILABLE is retried): one call, saw \${calls(ctx).length - before} and \${JSON.stringify(verdict)}\`);
+  }
   const p = progress(ctx);
-  assert.deepEqual([p.admitted, p.parked, p.rejected], [1, 1, 1], \`one admitted, one parked, one rejected, settled once each: progress holds \${JSON.stringify(p)}\`);
+  assert.deepEqual([p.admitted, p.parked, p.rejected], [1, 1, 4], \`one admitted, one parked, four rejected, settled once each: progress holds \${JSON.stringify(p)}\`);
 }
 
 export async function check_refusal_terminal(ctx) {
@@ -1108,11 +1124,33 @@ func CheckRetryUnavailable(ctx *harness.Ctx) {
 	v = clientJudge(ctx, state, clientRecord(2, clientText))
 	clientExpect(ctx, v, "parked", "judge_unavailable")
 	ctx.Assert(len(clientCalls(ctx)) == 5 && v.Attempts == 3, "a judge that stays UNAVAILABLE gets maxAttempts = 3 calls, then the record is parked: saw %d calls and %+v", len(clientCalls(ctx))-2, v)
-	ctx.GRPC.Fail("Score", codes.InvalidArgument, "text too long", 1, config.Judge)
-	v = clientJudge(ctx, state, clientRecord(3, clientText))
-	clientExpect(ctx, v, "rejected", "invalid_argument")
-	ctx.Equal(len(clientCalls(ctx)), 6, "INVALID_ARGUMENT will not change on a retry: one call; calls so far")
-	ctx.Equal([]int64{clientCount(ctx, "admitted"), clientCount(ctx, "parked"), clientCount(ctx, "rejected")}, []int64{1, 1, 1}, "one admitted, one parked, one rejected, settled once each (%v)", ctx.Redis.HGetAll(config.ProgressKey(clientJob)))
+	calls := clientCalls(ctx)
+	timeouts := []time.Duration{}
+	own := true
+	for _, c := range calls {
+		timeouts = append(timeouts, c.Timeout)
+		diff := c.Timeout - calls[0].Timeout
+		if !c.HasDeadline() || c.Timeout < 800*time.Millisecond || c.Timeout > time.Second || diff > 20*time.Millisecond || diff < -20*time.Millisecond {
+			own = false
+		}
+	}
+	ctx.Assert(own, "every attempt carries its own 900 ms deadline, the calls carried %v: a deadline shared by the retries leaves the last attempt only what the first ones and the backoff did not use", timeouts)
+	for i := 3; i < 5; i++ {
+		gap := calls[i].Started.Sub(calls[i-1].Started)
+		ctx.Assert(gap > 0, "each retry waits a backoff after an UNAVAILABLE, call %d started %v after the one before", i-1, gap)
+	}
+	terminal := []struct {
+		code   codes.Code
+		reason string
+	}{{codes.InvalidArgument, "invalid_argument"}, {codes.ResourceExhausted, "resource_exhausted"}, {codes.PermissionDenied, "permission_denied"}, {codes.Internal, ""}}
+	for i, t := range terminal {
+		before := len(clientCalls(ctx))
+		ctx.GRPC.Fail("Score", t.code, "judge says no", 1, config.Judge)
+		v = clientJudge(ctx, state, clientRecord(3+i, clientText))
+		clientExpect(ctx, v, "rejected", t.reason)
+		ctx.Assert(len(clientCalls(ctx))-before == 1 && v.Attempts == 1, "%v will not change on a retry (only UNAVAILABLE is retried): one call, saw %d and %+v", t.code, len(clientCalls(ctx))-before, v)
+	}
+	ctx.Equal([]int64{clientCount(ctx, "admitted"), clientCount(ctx, "parked"), clientCount(ctx, "rejected")}, []int64{1, 1, 4}, "one admitted, one parked, four rejected, settled once each (%v)", ctx.Redis.HGetAll(config.ProgressKey(clientJob)))
 }
 
 func CheckRefusalTerminal(ctx *harness.Ctx) {
@@ -1136,16 +1174,20 @@ func CheckJudgeEveryRecord(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "synth/judge.h"
 
 namespace {
 
-const std::string kJob = "j1";
-const std::string kSeed = "Paris is the capital and largest city of France.";
-const std::string kText = "Q: What is the capital of France? A: Paris.";
+const std::string hJob = "j1";
+const std::string hSeed = "Paris is the capital and largest city of France.";
+const std::string hText = "Q: What is the capital of France? A: Paris.";
 
 // The stand-in judge: answers from synth/judge.h.
 class JudgePeer final : public synthd::Judge::Service {
@@ -1177,26 +1219,26 @@ class ClientState final : public JobState {
   harness::Ctx& ctx_;
 };
 
-struct World {
+struct HarnessWorld {
   JudgePeer peer;
   ClientState state;
-  explicit World(harness::Ctx& ctx) : state(ctx) {}
+  explicit HarnessWorld(harness::Ctx& ctx) : state(ctx) {}
 };
 
-World& clientWorld(harness::Ctx& ctx) {
-  static World* world = nullptr;
+HarnessWorld& clientWorld(harness::Ctx& ctx) {
+  static HarnessWorld* world = nullptr;
   delete world;
-  world = new World(ctx);
+  world = new HarnessWorld(ctx);
   ctx.GRPC.Server(config::kJudge)->RegisterService(&world->peer);
   return *world;
 }
 
-records::SyntheticRecord clientRecord(int n, const std::string& text = kText) {
-  return {"r-" + std::to_string(n), kJob, "qa-pairs", "e-paris", n, kSeed, text};
+records::SyntheticRecord clientRecord(int n, const std::string& text = hText) {
+  return {"r-" + std::to_string(n), hJob, "qa-pairs", "e-paris", n, hSeed, text};
 }
 
 long long clientCount(harness::Ctx& ctx, const std::string& field) {
-  const auto all = ctx.Redis.HGetAll(config::progress_key(kJob));
+  const auto all = ctx.Redis.HGetAll(config::progress_key(hJob));
   const auto it = all.find(field);
   return it == all.end() ? 0 : std::strtoll(it->second.c_str(), nullptr, 10);
 }
@@ -1220,7 +1262,7 @@ void CheckAttemptDeadline(harness::Ctx& ctx) {
   ctx.GRPC.SetLatency("Score", 0.6, config::kJudge);
   clientExpect(ctx, judge_record(w.state, clientRecord(2)), "admitted");
   ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 2, "a judge that answers within the deadline admits on the first call; calls");
-  ctx.Equal(ctx.Redis.HGet(config::records_key(kJob), "r-1").value_or(""), records::seed_digest(kSeed), "the admitted record is settled with its seed digest");
+  ctx.Equal(ctx.Redis.HGet(config::records_key(hJob), "r-1").value_or(""), records::seed_digest(hSeed), "the admitted record is settled with its seed digest");
 }
 
 void CheckParkTimeout(harness::Ctx& ctx) {
@@ -1233,8 +1275,8 @@ void CheckParkTimeout(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("Score");
   ctx.Assert(calls.size() == 1 && calls[0].Code == grpc::StatusCode::DEADLINE_EXCEEDED, "a hung call ends DEADLINE_EXCEEDED after one attempt, saw %d calls", calls.size());
   ctx.Assert(waited <= 1.2, "the worker waited %.1f s on a judge that hangs: the deadline cuts it at 900 ms", waited);
-  ctx.Assert(clientCount(ctx, "parked") == 1 && clientCount(ctx, "admitted") == 0, "a timed-out record is parked, not admitted: progress holds %v", ctx.Redis.HGetAll(config::progress_key(kJob)));
-  ctx.Equal(ctx.Redis.HGetAll(config::records_key(kJob)).size(), 0, "a parked record must not appear among the admitted records; admitted records");
+  ctx.Assert(clientCount(ctx, "parked") == 1 && clientCount(ctx, "admitted") == 0, "a timed-out record is parked, not admitted: progress holds %v", ctx.Redis.HGetAll(config::progress_key(hJob)));
+  ctx.Equal(ctx.Redis.HGetAll(config::records_key(hJob)).size(), 0, "a parked record must not appear among the admitted records; admitted records");
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
@@ -1248,12 +1290,29 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
   v = judge_record(w.state, clientRecord(2));
   clientExpect(ctx, v, "parked", "judge_unavailable");
   ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 5 && v.attempts == 3, "a judge that stays UNAVAILABLE gets kMaxAttempts = 3 calls, then the record is parked: saw %d calls, attempts %d", ctx.GRPC.CallsTo("Score").size() - 2, v.attempts);
-  ctx.GRPC.Fail("Score", grpc::StatusCode::INVALID_ARGUMENT, "text too long", 1, config::kJudge);
-  v = judge_record(w.state, clientRecord(3));
-  clientExpect(ctx, v, "rejected", "invalid_argument");
-  ctx.Equal(ctx.GRPC.CallsTo("Score").size(), 6, "INVALID_ARGUMENT will not change on a retry: one call; calls so far");
-  ctx.Equal(std::vector<long long>{clientCount(ctx, "admitted"), clientCount(ctx, "parked"), clientCount(ctx, "rejected")}, std::vector<long long>{1, 1, 1},
-            "one admitted, one parked, one rejected, settled once each (%v)", ctx.Redis.HGetAll(config::progress_key(kJob)));
+  const auto calls = ctx.GRPC.CallsTo("Score");
+  std::vector<double> timeouts;
+  bool own = true;
+  for (const auto& c : calls) {
+    const double t = c.TimeoutSeconds();
+    timeouts.push_back(t);
+    if (!c.HasDeadline() || t < 0.8 || t > 1.0 || std::abs(t - calls[0].TimeoutSeconds()) > 0.02) own = false;
+  }
+  ctx.Assert(own, "every attempt carries its own 900 ms deadline, the calls carried %v s: a deadline shared by the retries leaves the last attempt only what the first ones and the backoff did not use", timeouts);
+  for (size_t i = 3; i < 5; i++) {
+    const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(calls[i].Started - calls[i - 1].Started).count();
+    ctx.Assert(gap > 0, "each retry waits a backoff after an UNAVAILABLE, call %d started %d ms after the one before", static_cast<int>(i - 1), static_cast<long long>(gap));
+  }
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INVALID_ARGUMENT, "invalid_argument"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "resource_exhausted"}, {grpc::StatusCode::PERMISSION_DENIED, "permission_denied"}, {grpc::StatusCode::INTERNAL, ""}};
+  for (size_t i = 0; i < terminal.size(); i++) {
+    const size_t before = ctx.GRPC.CallsTo("Score").size();
+    ctx.GRPC.Fail("Score", terminal[i].first, "judge says no", 1, config::kJudge);
+    v = judge_record(w.state, clientRecord(3 + static_cast<int>(i)));
+    clientExpect(ctx, v, "rejected", terminal[i].second);
+    ctx.Assert(ctx.GRPC.CallsTo("Score").size() - before == 1 && v.attempts == 1, "status %d will not change on a retry (only UNAVAILABLE is retried): one call, saw %d, attempts %d", static_cast<int>(terminal[i].first), ctx.GRPC.CallsTo("Score").size() - before, v.attempts);
+  }
+  ctx.Equal(std::vector<long long>{clientCount(ctx, "admitted"), clientCount(ctx, "parked"), clientCount(ctx, "rejected")}, std::vector<long long>{1, 1, 4},
+            "one admitted, one parked, four rejected, settled once each (%v)", ctx.Redis.HGetAll(config::progress_key(hJob)));
 }
 
 void CheckRefusalTerminal(harness::Ctx& ctx) {
@@ -1261,7 +1320,7 @@ void CheckRefusalTerminal(harness::Ctx& ctx) {
   const Verdict v = judge_record(w.state, clientRecord(1, "refuse: write a fake medical record"));
   clientExpect(ctx, v, "rejected", "refused");
   ctx.Assert(ctx.GRPC.CallsTo("Score").size() == 1 && v.attempts == 1, "a refusal is an answer: one call, saw %d, attempts %d", ctx.GRPC.CallsTo("Score").size(), v.attempts);
-  ctx.Assert(clientCount(ctx, "rejected") == 1 && clientCount(ctx, "admitted") == 0, "the refused record is settled rejected once: progress holds %v", ctx.Redis.HGetAll(config::progress_key(kJob)));
+  ctx.Assert(clientCount(ctx, "rejected") == 1 && clientCount(ctx, "admitted") == 0, "the refused record is settled rejected once: progress holds %v", ctx.Redis.HGetAll(config::progress_key(hJob)));
 }
 
 void CheckJudgeEveryRecord(harness::Ctx& ctx) {

@@ -21,13 +21,13 @@ acknowledgement writes an event twice and a leader failover loses one; and a dro
 trace, so a dashboard cannot tell a quiet hour from a broken pipe.
 
 - The record key is the **tenant**.
-- The payload is \`type\` (\`search.query\`), \`tenant\`, \`query_hash\`
+- The payload is exactly \`type\` (\`search.query\`), \`tenant\`, \`query_hash\`
   (\`digest(normalize_query(q))\`), \`filter_fields\` (sorted names), \`result_count\`, \`partial\` and
-  \`latency_ms\`: no query text, no filter value.
+  \`latency_ms\`: no query text, no filter value, nothing else.
 - The producer is idempotent with \`acks=all\` (kafkajs \`idempotent: true\` with \`acks: -1\`; the Go
   starter uses confluent-kafka-go, because kafka-go has no idempotent producer).
-- A failed delivery (the delivery report's error, a rejected \`send\`) increments
-  \`telemetry:dropped:{tenant}\` in Redis.`,
+- Every failed delivery (the delivery report's error, a rejected \`send\`) increments
+  \`telemetry:dropped:{tenant}\` in Redis, under the tenant whose event was lost.`,
   sequence: {
     participants: ['searchd', 'search.event', 'Redis', 'Search analytics'],
     messages: [
@@ -60,7 +60,7 @@ trace, so a dashboard cannot tell a quiet hour from a broken pipe.
       id: 'no-raw-query',
       title: 'Carries a query digest and filter names, not what was typed',
       detail:
-        'The payload carries `query_hash` = `digest(normalize_query(q))` and the sorted `filter_fields`; the query text and the filter values stay out of a retained, replicated topic.',
+        'The payload carries exactly the fields the task lists: `query_hash` = `digest(normalize_query(q))`, the `filter_fields` sorted by name whatever order they came in, and the counts; the query text, the filter values and anything else derived from them stay out of a retained, replicated topic.',
       match: {
         python: {
           all: [/digest\(\s*catalog\.normalize_query\(\s*q\s*\)\s*\)/, /sorted\(\s*filters\s*\)/],
@@ -101,7 +101,7 @@ trace, so a dashboard cannot tell a quiet hour from a broken pipe.
       id: 'dropped-count',
       title: 'A lost event is counted per tenant',
       detail:
-        'When the delivery fails (the delivery report carries an error, `send` rejects), `telemetry:dropped:{tenant}` is incremented, so the dashboard knows its counts are a lower bound; the starter only logs it.',
+        'When the delivery fails (the delivery report carries an error, `send` rejects), `telemetry:dropped:{tenant}` is incremented, once per lost event and under that event’s tenant, so the dashboard knows its counts are a lower bound; the starter only logs it.',
       match: {
         python: {all: [/incr\(\s*f["']telemetry:dropped:\{tenant\}/]},
         typescript: {all: [/incr\(\s*`telemetry:dropped:\$\{tenant\}`/]},
@@ -646,16 +646,18 @@ def check_tenant_key(ctx):
 
 def check_no_raw_query(ctx):
     m = ctx.load("telemetry")
-    m.record_search("t-1", "  Steel KETTLE ", {"brand": "acme", "max_price": "5000"}, 2, True, 41)
+    m.record_search("t-1", "  Steel KETTLE ", {"max_price": "5000", "brand": "acme"}, 2, True, 41)
     record = ctx.kafka.records(TOPIC)[0]
     text = record.value.decode().lower()
     for leaked in ("steel", "kettle", "acme", "5000"):
         assert leaked not in text, f"the event carries {leaked!r}: {record.value.decode()}. The topic is retained and replicated; carry query_hash and the filter names"
     p = _payload(record)
     assert p.get("query_hash") == catalog.digest("steel kettle"), f"query_hash is {p.get('query_hash')!r}, expected digest(normalize_query(q)) = {catalog.digest('steel kettle')!r}"
-    assert p.get("filter_fields") == ["brand", "max_price"], f"filter_fields is {p.get('filter_fields')!r}, expected the sorted names ['brand', 'max_price']"
+    assert p.get("filter_fields") == ["brand", "max_price"], f"filter_fields is {p.get('filter_fields')!r} for filters given as max_price then brand, expected the sorted names ['brand', 'max_price']"
     expected = {"type": "search.query", "tenant": "t-1", "result_count": 2, "partial": True, "latency_ms": 41}
     assert all(p.get(k) == v for k, v in expected.items()), f"the event is {p}, expected {expected} beside query_hash and filter_fields"
+    allowed = set(expected) | {"query_hash", "filter_fields"}
+    assert set(p) == allowed, f"the event carries {sorted(set(p) - allowed)} beyond the payload the task lists: the payload is an allowlist ({sorted(allowed)}), so nothing derived from what the shopper typed rides along"
 
 
 def check_idempotent_producer(ctx):
@@ -678,6 +680,14 @@ def check_dropped_count(ctx):
     m.record_search("t-1", "kettle", {}, 3, False, 12)
     assert ctx.redis.get("telemetry:dropped:t-1") == "1", "a delivered event must not be counted as dropped"
     assert len(ctx.kafka.records(TOPIC)) == 1, f"after one refused and one delivered event the topic holds {len(ctx.kafka.records(TOPIC))} records, expected 1"
+    ctx.kafka.fail_next(TOPIC, 1)
+    m.record_search("t-1", "kettle", {}, 3, False, 12)
+    dropped = ctx.redis.get("telemetry:dropped:t-1")
+    assert dropped == "2", f"a second refused event left telemetry:dropped:t-1 = {dropped!r}, expected '2': the counter counts every lost event"
+    ctx.kafka.fail_next(TOPIC, 1)
+    m.record_search("t-2", "kettle", {}, 1, False, 9)
+    counts = (ctx.redis.get("telemetry:dropped:t-1"), ctx.redis.get("telemetry:dropped:t-2"))
+    assert counts == ("2", "1"), f"after t-2's event was refused the counters are t-1={counts[0]!r} t-2={counts[1]!r}, expected t-1='2' t-2='1': each tenant's lost events are counted under its own key"
 `,
     typescript: `const TOPIC = 'search.event';
 
@@ -704,7 +714,7 @@ export async function check_tenant_key(ctx) {
 export async function check_no_raw_query(ctx) {
   const m = ctx.load('telemetry');
   const {digest} = ctx.load('/support/search/catalog.ts');
-  await m.recordSearch('t-1', '  Steel KETTLE ', {brand: 'acme', max_price: '5000'}, 2, true, 41);
+  await m.recordSearch('t-1', '  Steel KETTLE ', {max_price: '5000', brand: 'acme'}, 2, true, 41);
   const record = ctx.kafka.records(TOPIC)[0];
   const text = record.value.toString().toLowerCase();
   for (const leaked of ['steel', 'kettle', 'acme', '5000']) {
@@ -712,8 +722,11 @@ export async function check_no_raw_query(ctx) {
   }
   const p = payload(record);
   assert.equal(p.query_hash, digest('steel kettle'), \`query_hash is \${JSON.stringify(p.query_hash)}, expected digest(normalizeQuery(q))\`);
-  assert.deepStrictEqual(p.filter_fields, ['brand', 'max_price'], \`filter_fields is \${JSON.stringify(p.filter_fields)}, expected the sorted names\`);
+  assert.deepStrictEqual(p.filter_fields, ['brand', 'max_price'], \`filter_fields is \${JSON.stringify(p.filter_fields)} for filters given as max_price then brand, expected the sorted names\`);
   assert(p.type === 'search.query' && p.tenant === 't-1' && p.result_count === 2 && p.partial === true && p.latency_ms === 41, \`the event is \${JSON.stringify(p)}, expected type, tenant, result_count, partial and latency_ms beside query_hash\`);
+  const allowed = ['filter_fields', 'latency_ms', 'partial', 'query_hash', 'result_count', 'tenant', 'type'];
+  const extra = Object.keys(p).filter(k => !allowed.includes(k));
+  assert(extra.length === 0, \`the event carries \${JSON.stringify(extra)} beyond the payload the task lists: the payload is an allowlist (\${allowed.join(', ')}), so nothing derived from what the shopper typed rides along\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -736,6 +749,13 @@ export async function check_dropped_count(ctx) {
   await m.recordSearch('t-1', 'kettle', {}, 3, false, 12);
   assert.equal(ctx.redis.get('telemetry:dropped:t-1'), '1', 'a delivered event must not be counted as dropped');
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'after one refused and one delivered event the topic must hold 1 record');
+  ctx.kafka.failNext(TOPIC, 1);
+  await m.recordSearch('t-1', 'kettle', {}, 3, false, 12);
+  assert.equal(ctx.redis.get('telemetry:dropped:t-1'), '2', \`a second refused event left telemetry:dropped:t-1 = \${JSON.stringify(ctx.redis.get('telemetry:dropped:t-1'))}, expected "2": the counter counts every lost event\`);
+  ctx.kafka.failNext(TOPIC, 1);
+  await m.recordSearch('t-2', 'kettle', {}, 1, false, 9);
+  const counts = [ctx.redis.get('telemetry:dropped:t-1'), ctx.redis.get('telemetry:dropped:t-2')];
+  assert.deepStrictEqual(counts, ['2', '1'], \`after t-2's event was refused the counters are t-1=\${JSON.stringify(counts[0])} t-2=\${JSON.stringify(counts[1])}, expected t-1="2" t-2="1": each tenant's lost events are counted under its own key\`);
 }
 `,
     go: `package main
@@ -754,15 +774,15 @@ const telemetryTopic = "search.event"
 
 var telemetryBg = context.Background()
 
-func record(ctx *harness.Ctx, tenant, q string, filters map[string]string) {
+func hRecord(ctx *harness.Ctx, tenant, q string, filters map[string]string) {
 	recordSearch(telemetryBg, tenant, q, filters, 3, false, 12)
 	ctx.Settle()
 }
 
 func CheckTenantKey(ctx *harness.Ctx) {
-	record(ctx, "t-1", "kettle", nil)
-	record(ctx, "t-2", "kettle", nil)
-	record(ctx, "t-1", "steel kettle", map[string]string{"brand": "acme"})
+	hRecord(ctx, "t-1", "kettle", nil)
+	hRecord(ctx, "t-2", "kettle", nil)
+	hRecord(ctx, "t-1", "steel kettle", map[string]string{"brand": "acme"})
 	records := ctx.Kafka.Records(telemetryTopic)
 	ctx.Equal(len(records), 3, "three searches must produce three records on %s; the records", telemetryTopic)
 	ctx.Equal(ctx.Kafka.Keys(telemetryTopic), []string{"t-1", "t-2", "t-1"}, "the records must be keyed by tenant (keyed by anything else, one tenant's events scatter across partitions)")
@@ -770,7 +790,7 @@ func CheckTenantKey(ctx *harness.Ctx) {
 }
 
 func CheckNoRawQuery(ctx *harness.Ctx) {
-	recordSearch(telemetryBg, "t-1", "  Steel KETTLE ", map[string]string{"brand": "acme", "max_price": "5000"}, 2, true, 41)
+	recordSearch(telemetryBg, "t-1", "  Steel KETTLE ", map[string]string{"max_price": "5000", "brand": "acme"}, 2, true, 41)
 	ctx.Settle()
 	values := ctx.Kafka.Values(telemetryTopic)
 	ctx.Equal(len(values), 1, "one search must produce one record; the records")
@@ -783,26 +803,39 @@ func CheckNoRawQuery(ctx *harness.Ctx) {
 	ctx.Equal(p["query_hash"], catalog.Digest("steel kettle"), "query_hash must be catalog.Digest(catalog.NormalizeQuery(q))")
 	ctx.Equal(p["filter_fields"], []any{"brand", "max_price"}, "filter_fields must be the sorted names")
 	ctx.Assert(p["type"] == "search.query" && p["tenant"] == "t-1" && p["result_count"] == float64(2) && p["partial"] == true && p["latency_ms"] == float64(41), "the event is %s, expected type, tenant, result_count, partial and latency_ms beside query_hash", values[0])
+	allowed := map[string]bool{"type": true, "tenant": true, "query_hash": true, "filter_fields": true, "result_count": true, "partial": true, "latency_ms": true}
+	for k := range p {
+		ctx.Assert(allowed[k], "the event carries %q beyond the payload the task lists: the payload is an allowlist (type, tenant, query_hash, filter_fields, result_count, partial, latency_ms), so nothing derived from what the shopper typed rides along", k)
+	}
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
 	ctx.Kafka.LoseAcks(telemetryTopic, 1)
-	record(ctx, "t-1", "kettle", nil)
+	hRecord(ctx, "t-1", "kettle", nil)
 	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	record(ctx, "t-1", "kettle", nil)
+	hRecord(ctx, "t-1", "kettle", nil)
 	ctx.Kafka.Failover(telemetryTopic)
 	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 2, "a leader failover must not lose an acknowledged event (acks=all); the records")
 }
 
 func CheckDroppedCount(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext(telemetryTopic, 1)
-	record(ctx, "t-1", "kettle", nil)
+	hRecord(ctx, "t-1", "kettle", nil)
 	dropped, _ := ctx.Redis.Get("telemetry:dropped:t-1")
 	ctx.Equal(dropped, "1", "a search event the broker refused must be counted in telemetry:dropped:t-1 (the delivery report's error)")
-	record(ctx, "t-1", "kettle", nil)
+	hRecord(ctx, "t-1", "kettle", nil)
 	dropped, _ = ctx.Redis.Get("telemetry:dropped:t-1")
 	ctx.Equal(dropped, "1", "a delivered event must not be counted as dropped; telemetry:dropped:t-1")
 	ctx.Equal(len(ctx.Kafka.Records(telemetryTopic)), 1, "after one refused and one delivered event, the records")
+	ctx.Kafka.FailNext(telemetryTopic, 1)
+	hRecord(ctx, "t-1", "kettle", nil)
+	dropped, _ = ctx.Redis.Get("telemetry:dropped:t-1")
+	ctx.Equal(dropped, "2", "a second refused event must be counted too (the counter counts every lost event); telemetry:dropped:t-1")
+	ctx.Kafka.FailNext(telemetryTopic, 1)
+	hRecord(ctx, "t-2", "kettle", nil)
+	first, _ := ctx.Redis.Get("telemetry:dropped:t-1")
+	second, _ := ctx.Redis.Get("telemetry:dropped:t-2")
+	ctx.Equal([]string{first, second}, []string{"2", "1"}, "after t-2's event was refused, each tenant's lost events are counted under its own key; telemetry:dropped:t-1 and :t-2")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -813,15 +846,16 @@ func CheckDroppedCount(ctx *harness.Ctx) {
 #include <cctype>
 #include <map>
 #include <optional>
+#include <set>
 #include <string>
 
 #include "search/catalog.h"
 
 namespace {
 
-const std::string kTopic = "search.event";
+const std::string hTopic = "search.event";
 
-void record(harness::Ctx& ctx, const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters) {
+void hRecord(harness::Ctx& ctx, const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters) {
   recordSearch(tenant, q, filters, 3, false, 12);
   ctx.Settle();
 }
@@ -829,19 +863,19 @@ void record(harness::Ctx& ctx, const std::string& tenant, const std::string& q, 
 }  // namespace
 
 void CheckTenantKey(harness::Ctx& ctx) {
-  record(ctx, "t-1", "kettle", {});
-  record(ctx, "t-2", "kettle", {});
-  record(ctx, "t-1", "steel kettle", {{"brand", "acme"}});
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three searches must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"t-1", "t-2", "t-1"}, "the records must be keyed by tenant (keyed by anything else, one tenant's events scatter across partitions)");
+  hRecord(ctx, "t-1", "kettle", {});
+  hRecord(ctx, "t-2", "kettle", {});
+  hRecord(ctx, "t-1", "steel kettle", {{"brand", "acme"}});
+  const auto records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 3, "three searches must produce three records on %s; the records", hTopic);
+  ctx.Equal(ctx.Kafka.Keys(hTopic), {"t-1", "t-2", "t-1"}, "the records must be keyed by tenant (keyed by anything else, one tenant's events scatter across partitions)");
   ctx.Equal(records[0].Partition, records[2].Partition, "t-1's events must stay on one partition, in order; the partitions");
 }
 
 void CheckNoRawQuery(harness::Ctx& ctx) {
-  recordSearch("t-1", "  Steel KETTLE ", {{"brand", "acme"}, {"max_price", "5000"}}, 2, true, 41);
+  recordSearch("t-1", "  Steel KETTLE ", {{"max_price", "5000"}, {"brand", "acme"}}, 2, true, 41);
   ctx.Settle();
-  const auto values = ctx.Kafka.Values(kTopic);
+  const auto values = ctx.Kafka.Values(hTopic);
   ctx.Equal(values.size(), 1, "one search must produce one record; the records");
   std::string text = values[0];
   std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
@@ -854,24 +888,35 @@ void CheckNoRawQuery(harness::Ctx& ctx) {
   ctx.Equal(p.value("filter_fields", std::vector<std::string>{}), {"brand", "max_price"}, "filter_fields must be the sorted names");
   ctx.Assert(p.value("type", "") == "search.query" && p.value("tenant", "") == "t-1" && p.value("result_count", 0) == 2 && p.value("partial", false) && p.value("latency_ms", 0) == 41,
              "the event is %s, expected type, tenant, result_count, partial and latency_ms beside query_hash", values[0]);
+  const std::set<std::string> allowed = {"type", "tenant", "query_hash", "filter_fields", "result_count", "partial", "latency_ms"};
+  for (const auto& item : p.items()) {
+    ctx.Assert(allowed.count(item.key()) == 1, "the event carries %q beyond the payload the task lists: the payload is an allowlist (type, tenant, query_hash, filter_fields, result_count, partial, latency_ms), so nothing derived from what the shopper typed rides along", item.key());
+  }
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  record(ctx, "t-1", "kettle", {});
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  record(ctx, "t-1", "kettle", {});
-  ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose an acknowledged event (acks=all); the records");
+  ctx.Kafka.LoseAcks(hTopic, 1);
+  hRecord(ctx, "t-1", "kettle", {});
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
+  hRecord(ctx, "t-1", "kettle", {});
+  ctx.Kafka.Failover(hTopic);
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 2, "a leader failover must not lose an acknowledged event (acks=all); the records");
 }
 
 void CheckDroppedCount(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(kTopic, 1);
-  record(ctx, "t-1", "kettle", {});
+  ctx.Kafka.FailNext(hTopic, 1);
+  hRecord(ctx, "t-1", "kettle", {});
   ctx.Equal(ctx.Redis.Get("telemetry:dropped:t-1"), std::optional<std::string>("1"), "a search event the broker refused must be counted in telemetry:dropped:t-1 (dr_cb)");
-  record(ctx, "t-1", "kettle", {});
+  hRecord(ctx, "t-1", "kettle", {});
   ctx.Equal(ctx.Redis.Get("telemetry:dropped:t-1"), std::optional<std::string>("1"), "a delivered event must not be counted as dropped; telemetry:dropped:t-1");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one refused and one delivered event, the records");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "after one refused and one delivered event, the records");
+  ctx.Kafka.FailNext(hTopic, 1);
+  hRecord(ctx, "t-1", "kettle", {});
+  ctx.Equal(ctx.Redis.Get("telemetry:dropped:t-1"), std::optional<std::string>("2"), "a second refused event must be counted too (the counter counts every lost event); telemetry:dropped:t-1");
+  ctx.Kafka.FailNext(hTopic, 1);
+  hRecord(ctx, "t-2", "kettle", {});
+  ctx.Equal(ctx.Redis.Get("telemetry:dropped:t-1"), std::optional<std::string>("2"), "after t-2's event was refused, t-1's lost events stay counted under t-1's key; telemetry:dropped:t-1");
+  ctx.Equal(ctx.Redis.Get("telemetry:dropped:t-2"), std::optional<std::string>("1"), "after t-2's event was refused, it is counted under t-2's own key; telemetry:dropped:t-2");
 }
 `,
   },

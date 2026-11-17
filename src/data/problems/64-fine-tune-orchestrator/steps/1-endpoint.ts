@@ -64,7 +64,7 @@ Requirements:
       id: 'registered-dataset',
       title: 'Trains only on a registered dataset version',
       detail:
-        'A retired version (support-tickets@v2) or a version the registry does not know is 400 and stores nothing; a registered one is accepted with its sha256. The starter checks only that the registry knows the version.',
+        'A retired version (support-tickets@v2), a version pending review (legal-qa@v2) or a version the registry does not know is 400 and stores nothing; a registered one is accepted with its sha256. The starter checks only that the registry knows the version.',
       match: {
         python: {all: [/["']registered["']/]},
         typescript: {all: [/["']registered["']/]},
@@ -922,6 +922,8 @@ async def check_registered_dataset(ctx):
         assert r.status_code == 400, f"support-tickets@v2 is retired (it held customer e-mail addresses) and the submission answered {r.status_code}: a job must train only on a registered version"
         r = await _post(c, {**GOOD, "dataset_version": "s3://exports/tickets-final.jsonl"}, key="k-path")
         assert r.status_code == 400, f"a path the registry does not know answered {r.status_code}, expected 400"
+        r = await _post(c, {**GOOD, "dataset_version": "legal-qa@v2"}, key="k-pending")
+        assert r.status_code == 400, f"legal-qa@v2 is pending its PII review and the submission answered {r.status_code}: only a registered version trains, whatever other status a version carries"
         assert _jobs(ctx) == [], f"a refused dataset must store no job, found {_jobs(ctx)}"
         r = await _post(c, {**GOOD, "dataset_version": "legal-qa@v1"}, key="k-legal")
         assert r.status_code == 201, f"legal-qa@v1 is registered, got {r.status_code}: {r.text}"
@@ -1006,6 +1008,8 @@ export async function check_registered_dataset(ctx) {
   assert.equal(r.status, 400, \`support-tickets@v2 is retired (it held customer e-mail addresses) and the submission answered \${r.status}: a job must train only on a registered version\`);
   r = await post(c, {...GOOD, dataset_version: 's3://exports/tickets-final.jsonl'}, {key: 'k-path'});
   assert.equal(r.status, 400, \`a path the registry does not know answered \${r.status}, expected 400\`);
+  r = await post(c, {...GOOD, dataset_version: 'legal-qa@v2'}, {key: 'k-pending'});
+  assert.equal(r.status, 400, \`legal-qa@v2 is pending its PII review and the submission answered \${r.status}: only a registered version trains, whatever other status a version carries\`);
   assert.deepEqual(jobKeys(ctx), [], \`a refused dataset must store no job, found \${JSON.stringify(jobKeys(ctx))}\`);
   r = await post(c, {...GOOD, dataset_version: 'legal-qa@v1'}, {key: 'k-legal'});
   assert.equal(r.status, 201, \`legal-qa@v1 is registered, got \${r.status}: \${r.text}\`);
@@ -1063,11 +1067,11 @@ import (
 )
 
 const (
-	apiV3SHA    = "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031"
-	apiLegalSHA = "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc"
+	harnessAPIV3SHA    = "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031"
+	harnessAPILegalSHA = "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc"
 )
 
-func apiGood() map[string]any {
+func harnessAPIGood() map[string]any {
 	return map[string]any{
 		"base_model":      "llama-3.1-8b",
 		"dataset_version": "support-tickets@v3",
@@ -1076,102 +1080,104 @@ func apiGood() map[string]any {
 	}
 }
 
-func apiWith(field string, value any) map[string]any {
-	body := apiGood()
+func harnessAPIWith(field string, value any) map[string]any {
+	body := harnessAPIGood()
 	body[field] = value
 	return body
 }
 
-func apiClient(ctx *harness.Ctx) *harness.HTTP {
+func harnessAPIClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func apiPost(c *harness.HTTP, body map[string]any, key, team string) *harness.Response {
+func harnessAPIPost(c *harness.HTTP, body map[string]any, key, team string) *harness.Response {
 	return c.Post("/v1/finetune/jobs", body, "X-Team-Id", team, "Idempotency-Key", key)
 }
 
-func apiJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func harnessAPIJob(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	job, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return job
 }
 
-func apiJobs(ctx *harness.Ctx) []string { return ctx.Redis.Keys("ft:job:*") }
+func harnessAPIJobs(ctx *harness.Ctx) []string { return ctx.Redis.Keys("ft:job:*") }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiGood(), "k-1", "ml-search")
+	c := harnessAPIClient(ctx)
+	r := harnessAPIPost(c, harnessAPIGood(), "k-1", "ml-search")
 	ctx.Equal(r.Status, 201, "a valid submission (%s)", r.Text())
-	job := apiJob(ctx, r)
+	job := harnessAPIJob(ctx, r)
 	for _, key := range []string{"job_id", "status", "base_model", "dataset_version", "dataset_sha256", "config_hash", "hyperparameters", "compute_budget"} {
 		_, ok := job[key]
 		ctx.Assert(ok, "the 201 body lacks %s: %s", key, r.Text())
 	}
 	ctx.Assert(job["status"] == "queued" && job["base_model"] == "llama-3.1-8b" && job["dataset_version"] == "support-tickets@v3" && job["compute_budget"] == float64(400), "the job echoes the request with status queued: %s", r.Text())
-	ctx.Equal(job["dataset_sha256"], apiV3SHA, "dataset_sha256 must be the registry's hash of support-tickets@v3")
+	ctx.Equal(job["dataset_sha256"], harnessAPIV3SHA, "dataset_sha256 must be the registry's hash of support-tickets@v3")
 	hash, _ := job["config_hash"].(string)
 	ctx.Assert(regexp.MustCompile("^[0-9a-f]{64}$").MatchString(hash), "config_hash must be recipe.ConfigHash's SHA-256 hex, got %q", hash)
 	id, _ := job["job_id"].(string)
 	team, _ := ctx.Redis.HGet("ft:job:"+id, "team")
-	ctx.Equal(team, "ml-search", "the job must be in the job store (ft:job:{id}) with its team (keys %v)", apiJobs(ctx))
-	noTeam := c.Post("/v1/finetune/jobs", apiGood(), "Idempotency-Key", "k-2")
+	ctx.Equal(team, "ml-search", "the job must be in the job store (ft:job:{id}) with its team (keys %v)", harnessAPIJobs(ctx))
+	noTeam := c.Post("/v1/finetune/jobs", harnessAPIGood(), "Idempotency-Key", "k-2")
 	ctx.Equal(noTeam.Status, 401, "without X-Team-Id the submission")
 }
 
 func CheckRegisteredDataset(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith("dataset_version", "support-tickets@v2"), "k-retired", "ml-search")
+	c := harnessAPIClient(ctx)
+	r := harnessAPIPost(c, harnessAPIWith("dataset_version", "support-tickets@v2"), "k-retired", "ml-search")
 	ctx.Equal(r.Status, 400, "support-tickets@v2 is retired (it held customer e-mail addresses): a job must train only on a registered version; the submission")
-	r = apiPost(c, apiWith("dataset_version", "s3://exports/tickets-final.jsonl"), "k-path", "ml-search")
+	r = harnessAPIPost(c, harnessAPIWith("dataset_version", "s3://exports/tickets-final.jsonl"), "k-path", "ml-search")
 	ctx.Equal(r.Status, 400, "a path the registry does not know")
-	ctx.Equal(len(apiJobs(ctx)), 0, "a refused dataset must store no job; jobs stored")
-	r = apiPost(c, apiWith("dataset_version", "legal-qa@v1"), "k-legal", "ml-search")
+	r = harnessAPIPost(c, harnessAPIWith("dataset_version", "legal-qa@v2"), "k-pending", "ml-search")
+	ctx.Equal(r.Status, 400, "legal-qa@v2 is pending its PII review: only a registered version trains, whatever other status a version carries; the submission")
+	ctx.Equal(len(harnessAPIJobs(ctx)), 0, "a refused dataset must store no job; jobs stored")
+	r = harnessAPIPost(c, harnessAPIWith("dataset_version", "legal-qa@v1"), "k-legal", "ml-search")
 	ctx.Equal(r.Status, 201, "legal-qa@v1 is registered (%s)", r.Text())
-	ctx.Equal(apiJob(ctx, r)["dataset_sha256"], apiLegalSHA, "the job carries the registry's sha256 of legal-qa@v1")
+	ctx.Equal(harnessAPIJob(ctx, r)["dataset_sha256"], harnessAPILegalSHA, "the job carries the registry's sha256 of legal-qa@v1")
 }
 
 func CheckSupportedHyperparameters(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	r := apiPost(c, apiWith("base_model", "mistral-7b-v0.3"), "k-mistral-lora", "ml-search")
+	c := harnessAPIClient(ctx)
+	r := harnessAPIPost(c, harnessAPIWith("base_model", "mistral-7b-v0.3"), "k-mistral-lora", "ml-search")
 	ctx.Equal(r.Status, 400, "mistral-7b-v0.3 is a full fine-tune and does not read lora_rank: the trainer would ignore it and the config hash would describe a recipe that never ran; the submission")
-	r = apiPost(c, apiWith("hyperparameters", map[string]any{"learning_rate": 0.0002, "warmup_ratio": 0.1}), "k-warmup", "ml-search")
+	r = harnessAPIPost(c, harnessAPIWith("hyperparameters", map[string]any{"learning_rate": 0.0002, "warmup_ratio": 0.1}), "k-warmup", "ml-search")
 	ctx.Equal(r.Status, 400, "warmup_ratio is supported by no base model")
-	ctx.Equal(len(apiJobs(ctx)), 0, "refused hyperparameters must store no job; jobs stored")
-	mistral := apiWith("base_model", "mistral-7b-v0.3")
+	ctx.Equal(len(harnessAPIJobs(ctx)), 0, "refused hyperparameters must store no job; jobs stored")
+	mistral := harnessAPIWith("base_model", "mistral-7b-v0.3")
 	mistral["hyperparameters"] = map[string]any{"learning_rate": 0.00001, "epochs": 2}
-	r = apiPost(c, mistral, "k-mistral", "ml-search")
+	r = harnessAPIPost(c, mistral, "k-mistral", "ml-search")
 	ctx.Equal(r.Status, 201, "learning_rate and epochs are in mistral-7b-v0.3's supported list (%s)", r.Text())
-	r = apiPost(c, apiGood(), "k-llama", "ml-search")
+	r = harnessAPIPost(c, harnessAPIGood(), "k-llama", "ml-search")
 	ctx.Equal(r.Status, 201, "lora_rank is in llama-3.1-8b's supported list (%s)", r.Text())
 }
 
 func CheckPositiveBudget(ctx *harness.Ctx) {
-	c := apiClient(ctx)
+	c := harnessAPIClient(ctx)
 	for _, budget := range []int{0, -5, 10_001} {
-		r := apiPost(c, apiWith("compute_budget", budget), "k-"+harness.Show(budget), "ml-search")
+		r := harnessAPIPost(c, harnessAPIWith("compute_budget", budget), "k-"+harness.Show(budget), "ml-search")
 		ctx.Equal(r.Status, 400, "compute_budget=%d (1..10000 GPU-hours)", budget)
 	}
-	ctx.Equal(len(apiJobs(ctx)), 0, "refused budgets must store no job; jobs stored")
+	ctx.Equal(len(harnessAPIJobs(ctx)), 0, "refused budgets must store no job; jobs stored")
 	for _, budget := range []int{1, 10_000} {
-		r := apiPost(c, apiWith("compute_budget", budget), "k-"+harness.Show(budget), "ml-search")
+		r := harnessAPIPost(c, harnessAPIWith("compute_budget", budget), "k-"+harness.Show(budget), "ml-search")
 		ctx.Equal(r.Status, 201, "compute_budget=%d is within 1..10000 (%s)", budget, r.Text())
 	}
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := apiClient(ctx)
-	noKey := c.Post("/v1/finetune/jobs", apiGood(), "X-Team-Id", "ml-search")
+	c := harnessAPIClient(ctx)
+	noKey := c.Post("/v1/finetune/jobs", harnessAPIGood(), "X-Team-Id", "ml-search")
 	ctx.Equal(noKey.Status, 400, "a submission without Idempotency-Key")
-	first := apiPost(c, apiGood(), "k-7", "ml-search")
+	first := harnessAPIPost(c, harnessAPIGood(), "k-7", "ml-search")
 	ctx.Equal(first.Status, 201, "the first submission (%s)", first.Text())
-	replay := apiPost(c, apiGood(), "k-7", "ml-search")
+	replay := harnessAPIPost(c, harnessAPIGood(), "k-7", "ml-search")
 	ctx.Equal(replay.Status, 200, "a replay of the same (team, Idempotency-Key) must answer the stored job: the client timed out and retried, it must not get a second job")
-	ctx.Equal(apiJob(ctx, replay)["job_id"], apiJob(ctx, first)["job_id"], "the replay must answer the same job")
-	ctx.Equal(len(apiJobs(ctx)), 1, "one key, one job: jobs stored after a submission and its replay")
-	other := apiPost(c, apiGood(), "k-7", "ml-legal")
-	ctx.Assert(other.Status == 201 && apiJob(ctx, other)["job_id"] != apiJob(ctx, first)["job_id"], "another team reusing the key gets its own job (keys are per team)")
+	ctx.Equal(harnessAPIJob(ctx, replay)["job_id"], harnessAPIJob(ctx, first)["job_id"], "the replay must answer the same job")
+	ctx.Equal(len(harnessAPIJobs(ctx)), 1, "one key, one job: jobs stored after a submission and its replay")
+	other := harnessAPIPost(c, harnessAPIGood(), "k-7", "ml-legal")
+	ctx.Assert(other.Status == 201 && harnessAPIJob(ctx, other)["job_id"] != harnessAPIJob(ctx, first)["job_id"], "another team reusing the key gets its own job (keys are per team)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1185,32 +1191,32 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kV3Sha = "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031";
-const std::string kLegalSha = "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc";
+const std::string kHarnessV3Sha = "b108b116b5f56ba4df62e748a011bf05de20e7c8756e0c18471ff5d04ca29031";
+const std::string kHarnessLegalSha = "06e8599cc710041a091e9b7278ce26cf29e740a60cd3bbe8544805004264cabc";
 
-const json kGood = {
+const json kHarnessGood = {
     {"base_model", "llama-3.1-8b"},
     {"dataset_version", "support-tickets@v3"},
     {"hyperparameters", {{"learning_rate", 0.0002}, {"lora_rank", 16}, {"epochs", 3}}},
     {"compute_budget", 400},
 };
 
-struct Api {
+struct HarnessApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HarnessApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& key, const std::string& team = "ml-search") {
     return http.Post("/v1/finetune/jobs", body.dump(), "X-Team-Id", team, "Idempotency-Key", key);
   }
 };
 
-json with(json body, const std::string& field, const json& value) {
+json harnessWith(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
 }
 
-json jobOf(harness::Ctx& ctx, const harness::Response& r) {
+json harnessJobOf(harness::Ctx& ctx, const harness::Response& r) {
   const json job = json::parse(r.Text(), nullptr, false);
   ctx.Assert(job.is_object(), "the body must be a JSON object: %s", r.Text());
   return job;
@@ -1219,76 +1225,78 @@ json jobOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood, "k-1");
+  HarnessApi api(ctx);
+  const auto r = api.post(kHarnessGood, "k-1");
   ctx.Equal(r.Status, 201, "a valid submission (%s)", r.Text());
-  const json job = jobOf(ctx, r);
+  const json job = harnessJobOf(ctx, r);
   for (const char* key : {"job_id", "status", "base_model", "dataset_version", "dataset_sha256", "config_hash", "hyperparameters", "compute_budget"}) {
     ctx.Assert(job.contains(key), "the 201 body lacks %s: %s", key, r.Text());
   }
   ctx.Assert(job.value("status", "") == "queued" && job.value("base_model", "") == "llama-3.1-8b" && job.value("dataset_version", "") == "support-tickets@v3" &&
                  job.value("compute_budget", 0) == 400,
              "the job echoes the request with status queued: %s", r.Text());
-  ctx.Equal(job.value("dataset_sha256", ""), kV3Sha, "dataset_sha256 must be the registry's hash of support-tickets@v3");
+  ctx.Equal(job.value("dataset_sha256", ""), kHarnessV3Sha, "dataset_sha256 must be the registry's hash of support-tickets@v3");
   const std::string hash = job.value("config_hash", "");
   ctx.Assert(std::regex_match(hash, std::regex("[0-9a-f]{64}")), "config_hash must be recipe::config_hash's SHA-256 hex, got %q", hash);
   const auto team = ctx.Redis.HGet("ft:job:" + job.value("job_id", ""), "team");
   ctx.Assert(team && *team == "ml-search", "the job must be in the job store (ft:job:{id}) with its team (keys %v)", ctx.Redis.Keys("ft:job:*"));
-  const auto noTeam = api.http.Post("/v1/finetune/jobs", kGood.dump(), "Idempotency-Key", "k-2");
+  const auto noTeam = api.http.Post("/v1/finetune/jobs", kHarnessGood.dump(), "Idempotency-Key", "k-2");
   ctx.Equal(noTeam.Status, 401, "without X-Team-Id the submission");
 }
 
 void CheckRegisteredDataset(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(with(kGood, "dataset_version", "support-tickets@v2"), "k-retired");
+  HarnessApi api(ctx);
+  auto r = api.post(harnessWith(kHarnessGood, "dataset_version", "support-tickets@v2"), "k-retired");
   ctx.Equal(r.Status, 400, "support-tickets@v2 is retired (it held customer e-mail addresses): a job must train only on a registered version; the submission");
-  r = api.post(with(kGood, "dataset_version", "s3://exports/tickets-final.jsonl"), "k-path");
+  r = api.post(harnessWith(kHarnessGood, "dataset_version", "s3://exports/tickets-final.jsonl"), "k-path");
   ctx.Equal(r.Status, 400, "a path the registry does not know");
+  r = api.post(harnessWith(kHarnessGood, "dataset_version", "legal-qa@v2"), "k-pending");
+  ctx.Equal(r.Status, 400, "legal-qa@v2 is pending its PII review: only a registered version trains, whatever other status a version carries; the submission");
   ctx.Equal(ctx.Redis.Keys("ft:job:*").size(), 0, "a refused dataset must store no job; jobs stored");
-  r = api.post(with(kGood, "dataset_version", "legal-qa@v1"), "k-legal");
+  r = api.post(harnessWith(kHarnessGood, "dataset_version", "legal-qa@v1"), "k-legal");
   ctx.Equal(r.Status, 201, "legal-qa@v1 is registered (%s)", r.Text());
-  ctx.Equal(jobOf(ctx, r).value("dataset_sha256", ""), kLegalSha, "the job carries the registry's sha256 of legal-qa@v1");
+  ctx.Equal(harnessJobOf(ctx, r).value("dataset_sha256", ""), kHarnessLegalSha, "the job carries the registry's sha256 of legal-qa@v1");
 }
 
 void CheckSupportedHyperparameters(harness::Ctx& ctx) {
-  Api api(ctx);
-  const json mistral = with(kGood, "base_model", "mistral-7b-v0.3");
+  HarnessApi api(ctx);
+  const json mistral = harnessWith(kHarnessGood, "base_model", "mistral-7b-v0.3");
   auto r = api.post(mistral, "k-mistral-lora");
   ctx.Equal(r.Status, 400, "mistral-7b-v0.3 is a full fine-tune and does not read lora_rank: the trainer would ignore it and the config hash would describe a recipe that never ran; the submission");
-  r = api.post(with(kGood, "hyperparameters", {{"learning_rate", 0.0002}, {"warmup_ratio", 0.1}}), "k-warmup");
+  r = api.post(harnessWith(kHarnessGood, "hyperparameters", {{"learning_rate", 0.0002}, {"warmup_ratio", 0.1}}), "k-warmup");
   ctx.Equal(r.Status, 400, "warmup_ratio is supported by no base model");
   ctx.Equal(ctx.Redis.Keys("ft:job:*").size(), 0, "refused hyperparameters must store no job; jobs stored");
-  r = api.post(with(mistral, "hyperparameters", {{"learning_rate", 0.00001}, {"epochs", 2}}), "k-mistral");
+  r = api.post(harnessWith(mistral, "hyperparameters", {{"learning_rate", 0.00001}, {"epochs", 2}}), "k-mistral");
   ctx.Equal(r.Status, 201, "learning_rate and epochs are in mistral-7b-v0.3's supported list (%s)", r.Text());
-  r = api.post(kGood, "k-llama");
+  r = api.post(kHarnessGood, "k-llama");
   ctx.Equal(r.Status, 201, "lora_rank is in llama-3.1-8b's supported list (%s)", r.Text());
 }
 
 void CheckPositiveBudget(harness::Ctx& ctx) {
-  Api api(ctx);
+  HarnessApi api(ctx);
   for (int budget : {0, -5, 10001}) {
-    const auto r = api.post(with(kGood, "compute_budget", budget), "k-" + std::to_string(budget));
+    const auto r = api.post(harnessWith(kHarnessGood, "compute_budget", budget), "k-" + std::to_string(budget));
     ctx.Equal(r.Status, 400, "compute_budget=%d (1..10000 GPU-hours)", budget);
   }
   ctx.Equal(ctx.Redis.Keys("ft:job:*").size(), 0, "refused budgets must store no job; jobs stored");
   for (int budget : {1, 10000}) {
-    const auto r = api.post(with(kGood, "compute_budget", budget), "k-" + std::to_string(budget));
+    const auto r = api.post(harnessWith(kHarnessGood, "compute_budget", budget), "k-" + std::to_string(budget));
     ctx.Equal(r.Status, 201, "compute_budget=%d is within 1..10000 (%s)", budget, r.Text());
   }
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto noKey = api.http.Post("/v1/finetune/jobs", kGood.dump(), "X-Team-Id", "ml-search");
+  HarnessApi api(ctx);
+  const auto noKey = api.http.Post("/v1/finetune/jobs", kHarnessGood.dump(), "X-Team-Id", "ml-search");
   ctx.Equal(noKey.Status, 400, "a submission without Idempotency-Key");
-  const auto first = api.post(kGood, "k-7");
+  const auto first = api.post(kHarnessGood, "k-7");
   ctx.Equal(first.Status, 201, "the first submission (%s)", first.Text());
-  const auto replay = api.post(kGood, "k-7");
+  const auto replay = api.post(kHarnessGood, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (team, Idempotency-Key) must answer the stored job: the client timed out and retried, it must not get a second job");
-  ctx.Equal(jobOf(ctx, replay)["job_id"], jobOf(ctx, first)["job_id"], "the replay must answer the same job");
+  ctx.Equal(harnessJobOf(ctx, replay)["job_id"], harnessJobOf(ctx, first)["job_id"], "the replay must answer the same job");
   ctx.Equal(ctx.Redis.Keys("ft:job:*").size(), 1, "one key, one job: jobs stored after a submission and its replay");
-  const auto other = api.post(kGood, "k-7", "ml-legal");
-  ctx.Assert(other.Status == 201 && jobOf(ctx, other)["job_id"] != jobOf(ctx, first)["job_id"], "another team reusing the key gets its own job (keys are per team)");
+  const auto other = api.post(kHarnessGood, "k-7", "ml-legal");
+  ctx.Assert(other.Status == 201 && harnessJobOf(ctx, other)["job_id"] != harnessJobOf(ctx, first)["job_id"], "another team reusing the key gets its own job (keys are per team)");
 }
 `,
   },

@@ -675,8 +675,10 @@ async def check_tenant_scoped_read(ctx):
         r = await _get(c, "run-1", tenant="t2")
         assert r.status_code == 404, f"tenant t2 read t1's run and got {r.status_code}: another tenant's run must be 404, like a run that does not exist"
         assert "checkout-shadow" not in r.text, f"the 404 must not leak the run: {r.text}"
-        r = await _get(c, "run-404")
+        foreign = r
+        r = await _get(c, "run-404", tenant="t2")
         assert r.status_code == 404, f"a run that does not exist answered {r.status_code}, expected 404"
+        assert foreign.text.replace("run-1", "{id}") == r.text.replace("run-404", "{id}"), f"another tenant's run must answer exactly like a run that does not exist, or the difference tells t2 which ids are real: {foreign.text!r} vs {r.text!r} (run id masked)"
 `,
     typescript: `const PLAN = [{category: 'prompt-injection', probes: 4}, {category: 'jailbreak', probes: 3}, {category: 'data-exfil', probes: 3}];
 const ALL_BLOCKED = {'prompt-injection:blocked': 4, 'jailbreak:blocked': 3, 'data-exfil:blocked': 3};
@@ -743,8 +745,10 @@ export async function check_tenant_scoped_read(ctx) {
   let r = await get(c, 'run-1', 't2');
   assert.equal(r.status, 404, \`tenant t2 read t1's run and got \${r.status}: another tenant's run must be 404, like a run that does not exist\`);
   assert(!r.text.includes('checkout-shadow'), \`the 404 must not leak the run: \${r.text}\`);
-  r = await get(c, 'run-404');
+  const foreign = r;
+  r = await get(c, 'run-404', 't2');
   assert.equal(r.status, 404, \`a run that does not exist answered \${r.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll('run-1', '{id}'), r.text.replaceAll('run-404', '{id}'), \`another tenant's run must answer exactly like a run that does not exist, or the difference tells t2 which ids are real: \${foreign.text} vs \${r.text} (run id masked)\`);
 }
 `,
     go: `package main
@@ -848,7 +852,9 @@ func CheckTenantScopedRead(ctx *harness.Ctx) {
 	r := c.Get("/v1/redteam/runs/run-1", "X-Tenant-Id", "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 read t1's run: another tenant's run must be 404, like a run that does not exist")
 	ctx.Assert(!strings.Contains(r.Text(), "checkout-shadow"), "the 404 must not leak the run: %s", r.Text())
-	ctx.Equal(c.Get("/v1/redteam/runs/run-404", "X-Tenant-Id", "t1").Status, 404, "a run that does not exist")
+	missing := c.Get("/v1/redteam/runs/run-404", "X-Tenant-Id", "t2")
+	ctx.Equal(missing.Status, 404, "a run that does not exist")
+	ctx.Equal(strings.ReplaceAll(r.Text(), "run-1", "{id}"), strings.ReplaceAll(missing.Text(), "run-404", "{id}"), "another tenant's run must answer exactly like a run that does not exist, or the difference tells t2 which ids are real; the 404 bodies (run id masked)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -865,21 +871,26 @@ using json = nlohmann::json;
 const json kPlan = json::array({{{"category", "prompt-injection"}, {"probes", 4}}, {{"category", "jailbreak"}, {"probes", 3}}, {{"category", "data-exfil"}, {"probes", 3}}});
 const std::map<std::string, int> kAllBlocked = {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 3}, {"data-exfil:blocked", 3}};
 
-void seed(harness::Ctx& ctx, const std::string& run_id, const std::map<std::string, int>& outcomes, const std::string& tenant = "t1", const std::string& status = "complete") {
+void harness_seed(harness::Ctx& ctx, const std::string& run_id, const std::map<std::string, int>& outcomes, const std::string& tenant = "t1", const std::string& status = "complete") {
   const json row = {{"run_id", run_id}, {"status", status}, {"target", "checkout-shadow"}, {"endpoint", "checkout-shadow.sandbox.internal"}, {"probe_set", "baseline"}, {"plan", kPlan}, {"probes", 10}, {"tenant", tenant}, {"resume_at", nullptr}};
   ctx.Redis.Set("redteam:run:" + run_id, row.dump());
   for (const auto& [field, n] : outcomes) ctx.Redis.Do("HSET", "redteam:coverage:" + run_id, field, n);
 }
 
-std::map<std::string, int> with(std::map<std::string, int> base, const std::map<std::string, int>& extra) {
+std::map<std::string, int> harness_with(std::map<std::string, int> base, const std::map<std::string, int>& extra) {
   for (const auto& [k, v] : extra) base[k] = v;
   return base;
 }
 
-struct Api {
+std::string harness_replace_all(std::string text, const std::string& from, const std::string& to) {
+  for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) text.replace(at, from.size(), to);
+  return text;
+}
+
+struct HarnessReadApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HarnessReadApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response get(const std::string& run_id, const std::string& tenant = "t1") { return http.Get("/v1/redteam/runs/" + run_id, "X-Tenant-Id", tenant); }
 
@@ -894,9 +905,9 @@ struct Api {
 }  // namespace
 
 void CheckRouteGet(harness::Ctx& ctx) {
-  seed(ctx, "run-1", kAllBlocked);
-  seed(ctx, "run-2", with(kAllBlocked, {{"jailbreak:blocked", 2}, {"jailbreak:succeeded", 1}}));
-  Api api(ctx);
+  harness_seed(ctx, "run-1", kAllBlocked);
+  harness_seed(ctx, "run-2", harness_with(kAllBlocked, {{"jailbreak:blocked", 2}, {"jailbreak:succeeded", 1}}));
+  HarnessReadApi api(ctx);
   const auto r = api.get("run-1");
   ctx.Equal(r.Status, 200, "the report (%s)", r.Text());
   json body = api.body(ctx, "run-1");
@@ -908,8 +919,8 @@ void CheckRouteGet(harness::Ctx& ctx) {
 }
 
 void CheckCoverageByCategory(harness::Ctx& ctx) {
-  seed(ctx, "run-1", {{"prompt-injection:blocked", 3}, {"prompt-injection:succeeded", 1}, {"jailbreak:blocked", 3}, {"data-exfil:blocked", 2}, {"data-exfil:timeout", 1}});
-  Api api(ctx);
+  harness_seed(ctx, "run-1", {{"prompt-injection:blocked", 3}, {"prompt-injection:succeeded", 1}, {"jailbreak:blocked", 3}, {"data-exfil:blocked", 2}, {"data-exfil:timeout", 1}});
+  HarnessReadApi api(ctx);
   const json body = api.body(ctx, "run-1");
   const json expected = json::array({
       {{"category", "prompt-injection"}, {"planned", 4}, {"blocked", 3}, {"succeeded", 1}, {"missing", 0}},
@@ -920,8 +931,8 @@ void CheckCoverageByCategory(harness::Ctx& ctx) {
 }
 
 void CheckSkippedVisible(harness::Ctx& ctx) {
-  seed(ctx, "run-1", {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 1}}, "t1", "aborted");
-  Api api(ctx);
+  harness_seed(ctx, "run-1", {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 1}}, "t1", "aborted");
+  HarnessReadApi api(ctx);
   const json body = api.body(ctx, "run-1");
   ctx.Assert(body.contains("skipped_categories") && body["skipped_categories"] == json::array({"jailbreak", "data-exfil"}), "the kill switch stopped the run in jailbreak: skipped_categories must be [jailbreak, data-exfil], got %s", body.value("skipped_categories", json()).dump());
   long long missing = -1;
@@ -932,22 +943,25 @@ void CheckSkippedVisible(harness::Ctx& ctx) {
 }
 
 void CheckIncompleteNotPass(harness::Ctx& ctx) {
-  seed(ctx, "run-1", {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 1}}, "t1", "aborted");
-  seed(ctx, "run-2", with(kAllBlocked, {{"data-exfil:blocked", 2}, {"data-exfil:timeout", 1}}));
-  seed(ctx, "run-3", {{"prompt-injection:blocked", 3}, {"prompt-injection:succeeded", 1}}, "t1", "aborted");
-  Api api(ctx);
+  harness_seed(ctx, "run-1", {{"prompt-injection:blocked", 4}, {"jailbreak:blocked", 1}}, "t1", "aborted");
+  harness_seed(ctx, "run-2", harness_with(kAllBlocked, {{"data-exfil:blocked", 2}, {"data-exfil:timeout", 1}}));
+  harness_seed(ctx, "run-3", {{"prompt-injection:blocked", 3}, {"prompt-injection:succeeded", 1}}, "t1", "aborted");
+  HarnessReadApi api(ctx);
   ctx.Equal(api.body(ctx, "run-1").value("status", ""), "incomplete", "an aborted run with two categories untested: nothing succeeded because most of it never ran; the status");
   ctx.Equal(api.body(ctx, "run-2").value("status", ""), "incomplete", "a probe that timed out has no verdict; the status");
   ctx.Equal(api.body(ctx, "run-3").value("status", ""), "fail", "a probe that got through is a fail even when coverage is incomplete; the status");
 }
 
 void CheckTenantScopedRead(harness::Ctx& ctx) {
-  seed(ctx, "run-1", kAllBlocked, "t1");
-  Api api(ctx);
+  harness_seed(ctx, "run-1", kAllBlocked, "t1");
+  HarnessReadApi api(ctx);
   const auto r = api.get("run-1", "t2");
   ctx.Equal(r.Status, 404, "tenant t2 read t1's run: another tenant's run must be 404, like a run that does not exist");
   ctx.Assert(r.Text().find("checkout-shadow") == std::string::npos, "the 404 must not leak the run: %s", r.Text());
-  ctx.Equal(api.get("run-404").Status, 404, "a run that does not exist");
+  const auto missing = api.get("run-404", "t2");
+  ctx.Equal(missing.Status, 404, "a run that does not exist");
+  ctx.Equal(harness_replace_all(r.Text(), "run-1", "{id}"), harness_replace_all(missing.Text(), "run-404", "{id}"),
+            "another tenant's run must answer exactly like a run that does not exist, or the difference tells t2 which ids are real; the 404 bodies (run id masked)");
 }
 `,
   },

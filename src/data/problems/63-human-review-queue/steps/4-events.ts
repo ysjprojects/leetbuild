@@ -62,7 +62,7 @@ a leader failover duplicates or loses an event.
       id: 'reviewer-ref',
       title: 'The reviewer travels as a pseudonym',
       detail:
-        "The event carries `reviewer_ref` from the store's pseudonym table and no reviewer email: the topic is retained and replicated, and its readers have no business knowing who decided.",
+        "The event carries `reviewer_ref` from the store's pseudonym table and nothing else about the reviewer, not even part of the email: the topic is retained and replicated, and its readers have no business knowing who decided.",
       match: {
         python: {all: [/store\.reviewer_ref\(/], none: [/reviewer_email/]},
         typescript: {all: [/store\.reviewerRef\(/], none: [/reviewer_email/]},
@@ -88,7 +88,7 @@ a leader failover duplicates or loses an event.
       id: 'delivery-parked',
       title: 'A refused delivery is parked for the relay',
       detail:
-        'The delivery report decides: an event the broker did not take goes to `park_event`/`parkEvent` (`review:outbox`), so the committed decision still reaches the consumer; the starter only logs it.',
+        'The delivery report decides: an event the broker did not take goes to `park_event`/`parkEvent` (`review:outbox`) whole, the same event `decide` answers, so the relay can produce it and the committed decision still reaches the consumer; the starter only logs it.',
       match: {
         python: {all: [/store\.park_event\(/, /on_delivery/]},
         typescript: {all: [/store\.parkEvent\(/]},
@@ -681,7 +681,7 @@ def check_reviewer_ref(ctx):
     m.decide("r-2", ALICE, "keep")
     raw = [r.value.decode() for r in ctx.kafka.records(TOPIC)]
     assert len(raw) == 2, f"two decisions produced {len(raw)} records"
-    assert not any("alice" in v for v in raw), f"the topic carries the reviewer's email: {raw[0]}. It is retained and replicated; carry reviewer_ref from the pseudonym table"
+    assert not any("alice" in v or "example.com" in v for v in raw), f"the topic carries something about the reviewer's email: {raw[0]}. It is retained and replicated; carry reviewer_ref from the pseudonym table and nothing else about the reviewer"
     ref = store.reviewer_ref(ALICE)
     payloads = _payloads(ctx)
     assert [p.get("reviewer_ref") for p in payloads] == [ref, ref], f"both events must carry alice's pseudonym {ref!r}, got {[p.get('reviewer_ref') for p in payloads]}"
@@ -714,6 +714,7 @@ def check_delivery_parked(ctx):
     assert ctx.kafka.records(TOPIC) == [], "the broker refused the record, yet it is on the topic"
     parked = [json.loads(v) for v in ctx.redis.lrange("review:outbox", 0, -1)]
     assert len(parked) == 1 and parked[0].get("item_id") == "r-1" and parked[0].get("type") == "review.decided", f"the broker refused the event for r-1's decision and review:outbox holds {parked}: the decision is committed, so the event must be parked for the relay"
+    assert parked[0] == event, f"review:outbox holds {parked[0]} but the event for r-1's decision is {event}: the relay produces what is parked, so park the event itself"
     m.decide("r-2", ALICE, "keep")
     assert len(ctx.kafka.records(TOPIC)) == 1, "a delivered event must be on the topic"
     assert ctx.redis.llen("review:outbox") == 1, "a delivered event must not be parked"
@@ -770,7 +771,7 @@ export async function check_reviewer_ref(ctx) {
   await m.decide('r-2', ALICE, 'keep');
   const raw = ctx.kafka.records(TOPIC).map(r => r.value.toString());
   assert.equal(raw.length, 2, \`two decisions produced \${raw.length} records\`);
-  assert(!raw.some(v => v.includes('alice')), \`the topic carries the reviewer's email: \${raw[0]}. It is retained and replicated; carry reviewer_ref from the pseudonym table\`);
+  assert(!raw.some(v => v.includes('alice') || v.includes('example.com')), \`the topic carries something about the reviewer's email: \${raw[0]}. It is retained and replicated; carry reviewer_ref from the pseudonym table and nothing else about the reviewer\`);
   const ref = await store.reviewerRef(ALICE);
   const p = payloads(ctx);
   assert.deepStrictEqual(p.map(e => e.reviewer_ref), [ref, ref], \`both events must carry alice's pseudonym \${ref}\`);
@@ -803,6 +804,7 @@ export async function check_delivery_parked(ctx) {
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'the broker refused the record, yet it is on the topic');
   const parked = (ctx.redis.lrange('review:outbox', 0, -1) as string[]).map(v => JSON.parse(v));
   assert(parked.length === 1 && parked[0].item_id === 'r-1' && parked[0].type === 'review.decided', \`the broker refused the event for r-1's decision and review:outbox holds \${JSON.stringify(parked)}: the decision is committed, so the event must be parked for the relay\`);
+  assert.deepStrictEqual(parked[0], {...event}, \`review:outbox holds \${JSON.stringify(parked[0])} but the event for r-1's decision is \${JSON.stringify(event)}: the relay produces what is parked, so park the event itself\`);
   await m.decide('r-2', ALICE, 'keep');
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'a delivered event must be on the topic');
   assert.equal(ctx.redis.llen('review:outbox'), 1, 'a delivered event must not be parked');
@@ -833,76 +835,76 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "review.event"
+const hTopic = "review.event"
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-func seedItems() {
+func hSeedItems() {
 	for _, n := range []int{1, 2} {
-		store.CreateItem(eventsBg, map[string]string{
+		store.CreateItem(hEventsBg, map[string]string{
 			"item_id": fmt.Sprintf("r-%d", n), "tenant": "t1", "source_type": "user_report",
 			"source_id": fmt.Sprintf("s-%d", n), "priority": "p2", "payload_ref": fmt.Sprintf("blob://%d", n),
 		})
 	}
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]string {
+func hPayloadOf(ctx *harness.Ctx, value []byte) map[string]string {
 	var p map[string]string
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "a record's value is not a JSON object of strings: %s", value)
 	return p
 }
 
-func mustDecide(ctx *harness.Ctx, itemID, reviewer, decision string) map[string]string {
-	event, err := decide(eventsBg, itemID, reviewer, decision)
+func hDecide(ctx *harness.Ctx, itemID, reviewer, decision string) map[string]string {
+	event, err := decide(hEventsBg, itemID, reviewer, decision)
 	ctx.NoError(err, "decide(%s, %s) failed", itemID, reviewer)
 	return event
 }
 
 func CheckItemKey(ctx *harness.Ctx) {
-	seedItems()
-	_, err := recordEvent(eventsBg, "assigned", store.GetItem(eventsBg, "r-1"), "alice@example.com")
+	hSeedItems()
+	_, err := recordEvent(hEventsBg, "assigned", store.GetItem(hEventsBg, "r-1"), "alice@example.com")
 	ctx.NoError(err, "recordEvent(assigned) failed")
-	ctx.Assert(mustDecide(ctx, "r-1", "bob@example.com", "remove") != nil, "bob's decision on r-1 must be recorded")
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 2, "an assignment and a decision; the records on %s", topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{"r-1", "r-1"}, "records must be keyed by the item id (keyed by the reviewer, r-1's assignment and decision land on different partitions)")
+	ctx.Assert(hDecide(ctx, "r-1", "bob@example.com", "remove") != nil, "bob's decision on r-1 must be recorded")
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 2, "an assignment and a decision; the records on %s", hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{"r-1", "r-1"}, "records must be keyed by the item id (keyed by the reviewer, r-1's assignment and decision land on different partitions)")
 	ctx.Assert(records[0].Partition == records[1].Partition, "r-1's events landed on partitions %d and %d: the consumer may apply the decision before the assignment", records[0].Partition, records[1].Partition)
 }
 
 func CheckReviewerRef(ctx *harness.Ctx) {
-	seedItems()
-	mustDecide(ctx, "r-1", "alice@example.com", "remove")
-	mustDecide(ctx, "r-2", "alice@example.com", "keep")
-	records := ctx.Kafka.Records(topic)
+	hSeedItems()
+	hDecide(ctx, "r-1", "alice@example.com", "remove")
+	hDecide(ctx, "r-2", "alice@example.com", "keep")
+	records := ctx.Kafka.Records(hTopic)
 	ctx.Equal(len(records), 2, "two decisions; the records")
 	for _, r := range records {
-		ctx.Assert(!strings.Contains(string(r.Value), "alice"), "the topic carries the reviewer's email: %s. It is retained and replicated; carry reviewer_ref from the pseudonym table", r.Value)
+		ctx.Assert(!strings.Contains(string(r.Value), "alice") && !strings.Contains(string(r.Value), "example.com"), "the topic carries something about the reviewer's email: %s. It is retained and replicated; carry reviewer_ref from the pseudonym table and nothing else about the reviewer", r.Value)
 	}
-	ref := store.ReviewerRef(eventsBg, "alice@example.com")
-	first, second := payloadOf(ctx, records[0].Value), payloadOf(ctx, records[1].Value)
+	ref := store.ReviewerRef(hEventsBg, "alice@example.com")
+	first, second := hPayloadOf(ctx, records[0].Value), hPayloadOf(ctx, records[1].Value)
 	ctx.Equal([]string{first["reviewer_ref"], second["reviewer_ref"]}, []string{ref, ref}, "both events must carry alice's pseudonym")
 	ctx.Assert(first["type"] == "review.decided" && first["decision"] == "remove", "the event must say what was decided, got %v", first)
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
-	seedItems()
-	ctx.Assert(mustDecide(ctx, "r-1", "alice@example.com", "remove") != nil, "alice's decision on r-1 must be recorded")
-	ctx.Assert(mustDecide(ctx, "r-1", "bob@example.com", "keep") == nil, "a second decision on a decided item must answer nil")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "two decisions on r-1, of which the store accepted one: the event for bob's decision went out before the store refused it. Commit the decision, then produce; the records")
-	ctx.Equal(store.GetItem(eventsBg, "r-1")["decision"], "remove", "the store must keep alice's decision")
+	hSeedItems()
+	ctx.Assert(hDecide(ctx, "r-1", "alice@example.com", "remove") != nil, "alice's decision on r-1 must be recorded")
+	ctx.Assert(hDecide(ctx, "r-1", "bob@example.com", "keep") == nil, "a second decision on a decided item must answer nil")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "two decisions on r-1, of which the store accepted one: the event for bob's decision went out before the store refused it. Commit the decision, then produce; the records")
+	ctx.Equal(store.GetItem(hEventsBg, "r-1")["decision"], "remove", "the store must keep alice's decision")
 	// Another reviewer decides r-2 right after decide's first command on it.
 	rival := ctx.Redis.After("review:item:r-2", func() any {
-		return store.Decide(eventsBg, "r-2", "carol@example.com", "keep") != nil
+		return store.Decide(hEventsBg, "r-2", "carol@example.com", "keep") != nil
 	})
-	answer := mustDecide(ctx, "r-2", "alice@example.com", "remove")
+	answer := hDecide(ctx, "r-2", "alice@example.com", "remove")
 	ctx.Assert(rival.Fired, "decide never touched review:item:r-2")
 	var onTopic []map[string]string
-	for _, r := range ctx.Kafka.Records(topic) {
-		if p := payloadOf(ctx, r.Value); p["item_id"] == "r-2" {
+	for _, r := range ctx.Kafka.Records(hTopic) {
+		if p := hPayloadOf(ctx, r.Value); p["item_id"] == "r-2" {
 			onTopic = append(onTopic, p)
 		}
 	}
-	stored := store.GetItem(eventsBg, "r-2")["decision"]
+	stored := store.GetItem(hEventsBg, "r-2")["decision"]
 	want := 0
 	if answer != nil {
 		want = 1
@@ -914,29 +916,32 @@ func CheckCommitBeforeProduce(ctx *harness.Ctx) {
 }
 
 func CheckDeliveryParked(ctx *harness.Ctx) {
-	seedItems()
-	ctx.Kafka.FailNext(topic, 1)
-	ctx.Assert(mustDecide(ctx, "r-1", "alice@example.com", "remove") != nil, "the decision was committed: decide must answer its event even when the broker refused it")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "the broker refused the record; the records on the topic")
+	hSeedItems()
+	ctx.Kafka.FailNext(hTopic, 1)
+	event := hDecide(ctx, "r-1", "alice@example.com", "remove")
+	ctx.Assert(event != nil, "the decision was committed: decide must answer its event even when the broker refused it")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 0, "the broker refused the record; the records on the topic")
 	parked := ctx.Redis.LRange("review:outbox", 0, -1)
 	ok := len(parked) == 1
+	var p map[string]string
 	if ok {
-		p := payloadOf(ctx, []byte(parked[0]))
+		p = hPayloadOf(ctx, []byte(parked[0]))
 		ok = p["item_id"] == "r-1" && p["type"] == "review.decided"
 	}
 	ctx.Assert(ok, "the broker refused the event for r-1's decision and review:outbox holds %q: the decision is committed, so the event must be parked for the relay", parked)
-	mustDecide(ctx, "r-2", "alice@example.com", "keep")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "a delivered event must be on the topic; the records")
+	ctx.Equal(fmt.Sprint(p), fmt.Sprint(event), "the relay produces what is parked, so park the event itself; the parked event")
+	hDecide(ctx, "r-2", "alice@example.com", "keep")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "a delivered event must be on the topic; the records")
 	ctx.Equal(ctx.Redis.LLen("review:outbox"), int64(1), "a delivered event must not be parked; the parked events")
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	seedItems()
-	mustDecide(ctx, "r-1", "alice@example.com", "remove")
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "one decision, the records on the topic")
-	mustDecide(ctx, "r-2", "alice@example.com", "keep")
-	lost := ctx.Kafka.Failover(topic)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
+	hSeedItems()
+	hDecide(ctx, "r-1", "alice@example.com", "remove")
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "one decision, the records on the topic")
+	hDecide(ctx, "r-2", "alice@example.com", "keep")
+	lost := ctx.Kafka.Failover(hTopic)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -953,59 +958,60 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "review.event";
+const std::string kHTopic = "review.event";
 
-void seedItems() {
+void hSeedItems() {
   for (const std::string n : {"1", "2"}) {
     store::createItem({{"item_id", "r-" + n}, {"tenant", "t1"}, {"source_type", "user_report"}, {"source_id", "s-" + n}, {"priority", "p2"}, {"payload_ref", "blob://" + n}});
   }
 }
 
-json payloadOf(harness::Ctx& ctx, const std::string& value) {
+json hPayloadOf(harness::Ctx& ctx, const std::string& value) {
   const json p = json::parse(value, nullptr, false);
   ctx.Assert(p.is_object(), "a record's value is not a JSON object: %s", value);
   return p;
 }
 
-std::vector<json> payloads(harness::Ctx& ctx) {
+std::vector<json> hPayloads(harness::Ctx& ctx) {
   std::vector<json> out;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) out.push_back(payloadOf(ctx, r.Value.value_or("")));
+  for (const auto& r : ctx.Kafka.Records(kHTopic)) out.push_back(hPayloadOf(ctx, r.Value.value_or("")));
   return out;
 }
 
 }  // namespace
 
 void CheckItemKey(harness::Ctx& ctx) {
-  seedItems();
+  hSeedItems();
   record_event("assigned", store::getItem("r-1").value_or(store::Item{}), "alice@example.com");
   ctx.Assert(decide("r-1", "bob@example.com", "remove").has_value(), "bob's decision on r-1 must be recorded");
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 2, "an assignment and a decision; the records on %s", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"r-1", "r-1"}, "records must be keyed by the item id (keyed by the reviewer, r-1's assignment and decision land on different partitions)");
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 2, "an assignment and a decision; the records on %s", kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"r-1", "r-1"}, "records must be keyed by the item id (keyed by the reviewer, r-1's assignment and decision land on different partitions)");
   ctx.Assert(records[0].Partition == records[1].Partition, "r-1's events landed on partitions %d and %d: the consumer may apply the decision before the assignment", records[0].Partition, records[1].Partition);
 }
 
 void CheckReviewerRef(harness::Ctx& ctx) {
-  seedItems();
+  hSeedItems();
   decide("r-1", "alice@example.com", "remove");
   decide("r-2", "alice@example.com", "keep");
-  const auto records = ctx.Kafka.Records(kTopic);
+  const auto records = ctx.Kafka.Records(kHTopic);
   ctx.Equal(records.size(), 2, "two decisions; the records");
   for (const auto& r : records) {
     const std::string value = r.Value.value_or("");
-    ctx.Assert(value.find("alice") == std::string::npos, "the topic carries the reviewer's email: %s. It is retained and replicated; carry reviewer_ref from the pseudonym table", value);
+    ctx.Assert(value.find("alice") == std::string::npos && value.find("example.com") == std::string::npos,
+               "the topic carries something about the reviewer's email: %s. It is retained and replicated; carry reviewer_ref from the pseudonym table and nothing else about the reviewer", value);
   }
   const std::string ref = store::reviewerRef("alice@example.com");
-  const auto p = payloads(ctx);
+  const auto p = hPayloads(ctx);
   ctx.Equal(std::vector<std::string>{p[0].value("reviewer_ref", ""), p[1].value("reviewer_ref", "")}, {ref, ref}, "both events must carry alice's pseudonym");
   ctx.Assert(p[0].value("type", "") == "review.decided" && p[0].value("decision", "") == "remove", "the event must say what was decided, got %s", p[0].dump());
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
-  seedItems();
+  hSeedItems();
   ctx.Assert(decide("r-1", "alice@example.com", "remove").has_value(), "alice's decision on r-1 must be recorded");
   ctx.Assert(!decide("r-1", "bob@example.com", "keep").has_value(), "a second decision on a decided item must answer nothing");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "two decisions on r-1, of which the store accepted one: the event for bob's decision went out before the store refused it. Commit the decision, then produce; the records");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "two decisions on r-1, of which the store accepted one: the event for bob's decision went out before the store refused it. Commit the decision, then produce; the records");
   ctx.Equal(store::getItem("r-1").value_or(store::Item{})["decision"], "remove", "the store must keep alice's decision");
   // Another reviewer decides r-2 right after decide's first command on it.
   bool fired = false;
@@ -1016,7 +1022,7 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
   const auto answer = decide("r-2", "alice@example.com", "remove");
   ctx.Assert(fired, "decide never touched review:item:r-2");
   std::vector<json> on_topic;
-  for (const auto& p : payloads(ctx)) {
+  for (const auto& p : hPayloads(ctx)) {
     if (p.value("item_id", "") == "r-2") on_topic.push_back(p);
   }
   const std::string stored = store::getItem("r-2").value_or(store::Item{})["decision"];
@@ -1025,30 +1031,33 @@ void CheckCommitBeforeProduce(harness::Ctx& ctx) {
 }
 
 void CheckDeliveryParked(harness::Ctx& ctx) {
-  seedItems();
-  ctx.Kafka.FailNext(kTopic, 1);
-  ctx.Assert(decide("r-1", "alice@example.com", "remove").has_value(), "the decision was committed: decide must answer its event even when the broker refused it");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 0, "the broker refused the record; the records on the topic");
+  hSeedItems();
+  ctx.Kafka.FailNext(kHTopic, 1);
+  const auto event = decide("r-1", "alice@example.com", "remove");
+  ctx.Assert(event.has_value(), "the decision was committed: decide must answer its event even when the broker refused it");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 0, "the broker refused the record; the records on the topic");
   const auto parked = ctx.Redis.LRange("review:outbox", 0, -1);
   bool ok = parked.size() == 1;
+  json p;
   if (ok) {
-    const json p = payloadOf(ctx, parked[0]);
+    p = hPayloadOf(ctx, parked[0]);
     ok = p.value("item_id", "") == "r-1" && p.value("type", "") == "review.decided";
   }
   ctx.Assert(ok, "the broker refused the event for r-1's decision and review:outbox holds %q: the decision is committed, so the event must be parked for the relay", parked);
+  ctx.Equal(p.dump(), event.value_or(json::object()).dump(), "the relay produces what is parked, so park the event itself; the parked event");
   decide("r-2", "alice@example.com", "keep");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "a delivered event must be on the topic; the records");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "a delivered event must be on the topic; the records");
   ctx.Equal(ctx.Redis.LLen("review:outbox"), 1, "a delivered event must not be parked; the parked events");
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  seedItems();
-  ctx.Kafka.LoseAcks(kTopic, 1);
+  hSeedItems();
+  ctx.Kafka.LoseAcks(kHTopic, 1);
   decide("r-1", "alice@example.com", "remove");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "one decision whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "one decision whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
   decide("r-2", "alice@example.com", "keep");
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  const int lost = ctx.Kafka.Failover(kHTopic);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

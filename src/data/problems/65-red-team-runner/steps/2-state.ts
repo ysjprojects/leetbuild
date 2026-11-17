@@ -86,7 +86,7 @@ Requirements, kept by **one Lua script**:
       id: 'atomic-claim',
       title: 'Claims the probe in one Lua script',
       detail:
-        'The test, the budget and the claim run in one EVAL/EVALSHA, so when a second runner claims the same probe at the same moment exactly one of them gets ok. The starter reads the key with GET and writes it with SET, and a second runner lands between them.',
+        'The test, the budget and the claim run in one EVAL/EVALSHA, so when a second runner claims the same probe at the same moment exactly one of them gets ok, and when two runners reach for the hour’s last slot exactly one gets it. The starter reads the key with GET and writes it with SET, and a second runner lands between them.',
       match: {
         python: {
           all: [/register_script\(|\.eval\(/, /redis\.call\(\s*['"]EXISTS['"]/],
@@ -111,7 +111,7 @@ Requirements, kept by **one Lua script**:
       id: 'destructive-cap',
       title: 'Caps destructive categories at their own budget',
       detail:
-        'A category in DESTRUCTIVE_CATEGORIES stops at DESTRUCTIVE_PROBE_BUDGET (20) an hour while other categories go on. The starter has one shared cap, so destructive probes can spend the whole hour.',
+        'A category in DESTRUCTIVE_CATEGORIES stops at DESTRUCTIVE_PROBE_BUDGET (20) an hour, counting destructive probes only, while other categories go on. The starter has one shared cap, so destructive probes can spend the whole hour.',
       match: {
         python: {all: [/DESTRUCTIVE_PROBE_BUDGET/, /DESTRUCTIVE_CATEGORIES/]},
         typescript: {all: [/DESTRUCTIVE_PROBE_BUDGET/, /DESTRUCTIVE_CATEGORIES/]},
@@ -124,7 +124,7 @@ Requirements, kept by **one Lua script**:
       id: 'hourly-window',
       title: 'Keeps the budget per hour window, with an expiry',
       detail:
-        'The counters live in budget_key(target, window) with a TTL of at most WINDOW_S, so a target that spent its 200 probes can be probed again the next hour. The starter counts in one key with no window and no expiry.',
+        'The counters live in budget_key(target, window); the script that counts sets a TTL of at most WINDOW_S seconds, so the budget holds until the window ends and a target that spent its 200 probes can be probed again the next hour. The starter counts in one key with no window and no expiry.',
       match: {
         python: {all: [/budget_key\(/, /WINDOW_S/], none: [/["']redteam:budget:/]},
         typescript: {all: [/budgetKey\(/, /WINDOW_S/], none: [/['"`]redteam:budget:/]},
@@ -137,7 +137,7 @@ Requirements, kept by **one Lua script**:
       id: 'claim-ttl',
       title: 'Expires a claimed probe after DEDUPE_TTL_S',
       detail:
-        'The probe key is set with EX DEDUPE_TTL_S (a day), so tomorrow’s run can send the probe again. The starter sets it with no expiry, so a probe runs once per target forever.',
+        'The claiming script sets the probe key with EX DEDUPE_TTL_S (a day), so the probe stays a duplicate all day and tomorrow’s run can send it again. The starter sets it with no expiry, so a probe runs once per target forever.',
       match: {
         python: {all: [/DEDUPE_TTL_S/]},
         typescript: {all: [/DEDUPE_TTL_S/]},
@@ -498,6 +498,15 @@ def _claim(m, probe_hash, category="prompt-injection"):
     return result
 
 
+def _align(ctx):
+    """Move the clock to one second into a fresh budget window, so a scenario never straddles two."""
+    ctx.clock.advance(config.WINDOW_S - time.time() % config.WINDOW_S + 1)
+
+
+def _budget(ctx):
+    return config.budget_key(TARGET, int(time.time()) // config.WINDOW_S)
+
+
 def check_duplicate_free(ctx):
     m = ctx.load("state")
     first = _claim(m, "h-1")
@@ -523,42 +532,75 @@ def check_atomic_claim(ctx):
     verdicts = sorted([mine["verdict"], probe.result])
     assert verdicts == ["duplicate", "ok"], f"two runners claimed the same probe and got {verdicts}: the test and the claim must run in one script, so exactly one runner sends it"
 
+    # the hour's last slot: another runner takes it between this runner's budget read and its count
+    _align(ctx)
+    budget = _budget(ctx)
+    ctx.redis.hset(budget, "probes", config.PROBE_BUDGET - 1)
+
+    def last_slot():
+        if int(ctx.redis.hget(budget, "probes") or 0) >= config.PROBE_BUDGET:
+            return "budget"
+        ctx.redis.hincrby(budget, "probes", 1)
+        return "ok"
+
+    rival = ctx.redis_after(budget, last_slot)
+    mine = _claim(m, "h-last")
+    assert rival.fired, f"claim_probe never touched this hour's budget {budget}"
+    verdicts = sorted([mine["verdict"], rival.result])
+    assert verdicts == ["budget", "ok"], f"two runners took the hour's last probe slot and got {verdicts}: the budget test and the count must run in the same script, so the budget holds at {config.PROBE_BUDGET}"
+
 
 def check_destructive_cap(ctx):
     m = ctx.load("state")
+    for i in range(5):
+        r = _claim(m, f"n-{i}", "jailbreak")
+        assert r["verdict"] == "ok", f"non-destructive probe {i + 1} must be claimed, got {r}"
     for i in range(20):
         r = _claim(m, f"d-{i}", "data-exfil")
-        assert r["verdict"] == "ok", f"destructive probe {i + 1} of 20 must be claimed, got {r}"
+        assert r["verdict"] == "ok", f"destructive probe {i + 1} of 20 must be claimed after 5 non-destructive ones, got {r}: only destructive probes count toward DESTRUCTIVE_PROBE_BUDGET"
     over = _claim(m, "d-20", "resource-exhaustion")
     assert over["verdict"] == "budget", f"the 21st destructive probe this hour answered {over}: DESTRUCTIVE_PROBE_BUDGET is 20"
     other = _claim(m, "p-1", "prompt-injection")
-    assert other["verdict"] == "ok" and other["remaining"] == 179, f"other categories go on with the hour's budget (179 left after 21 claims), got {other}"
+    assert other["verdict"] == "ok" and other["remaining"] == 174, f"other categories go on with the hour's budget (174 left after 26 claims), got {other}"
     again = _claim(m, "d-20", "data-exfil")
     assert again["verdict"] == "budget", f"a refused probe is not claimed: asking again must still be budget, got {again}"
 
 
 def check_hourly_window(ctx):
     m = ctx.load("state")
+    _align(ctx)
+    key = _budget(ctx)
+    at_first = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
     for i in range(200):
         r = _claim(m, f"p-{i}")
         assert r["verdict"] == "ok", f"probe {i + 1} of 200 must be claimed, got {r}"
+    assert at_first.fired, f"the hour's counters belong in {key} (budget_key(target, window)), the budget keys are {ctx.redis.keys('redteam:budget:*')}"
+    assert at_first.result != -1, f"right after the first claim {key} existed with no expiry: the expiry is set by the same script that counts"
     refused = _claim(m, "p-200")
     assert refused["verdict"] == "budget", f"the 201st probe this hour answered {refused}"
-    key = config.budget_key(TARGET, int(time.time()) // config.WINDOW_S)
     assert ctx.redis.hget(key, "probes") == "200", f"the hour's counters belong in {key} (budget_key(target, window)), the budget keys are {ctx.redis.keys('redteam:budget:*')}"
     ttl = ctx.redis.ttl(key)
     assert 0 < ttl <= config.WINDOW_S, f"{key} has TTL {ttl}: a window's counters expire within WINDOW_S"
-    ctx.clock.advance(config.WINDOW_S)
+    ctx.clock.advance(config.WINDOW_S - 10)
+    late = _claim(m, "p-201")
+    assert late["verdict"] == "budget", f"10 s before the hour ends the target's budget is still spent, got {late}: the counters expired inside their window (EXPIRE takes seconds)"
+    ctx.clock.advance(10)
     later = _claim(m, "p-200")
     assert later["verdict"] == "ok", f"an hour later the target has a fresh budget, got {later}: the cap became permanent"
 
 
 def check_claim_ttl(ctx):
     m = ctx.load("state")
+    key = config.probe_key(TARGET, "h-1")
+    at_claim = ctx.redis_after(key, lambda: ctx.redis.ttl(key))
     assert _claim(m, "h-1")["verdict"] == "ok"
-    ttl = ctx.redis.ttl(config.probe_key(TARGET, "h-1"))
+    assert at_claim.fired and at_claim.result != -1, "right after the claim the probe key existed with no expiry: SET it with EX in the claiming script"
+    ttl = ctx.redis.ttl(key)
     assert 0 < ttl <= config.DEDUPE_TTL_S, f"the claimed probe key has TTL {ttl}: it expires after DEDUPE_TTL_S (86400 s)"
-    ctx.clock.advance(config.DEDUPE_TTL_S + 1)
+    ctx.clock.advance(config.DEDUPE_TTL_S - 60)
+    same_day = _claim(m, "h-1")
+    assert same_day["verdict"] == "duplicate", f"a minute short of a day the probe is still claimed, got {same_day}: the claim lasts DEDUPE_TTL_S (86400 s)"
+    ctx.clock.advance(61)
     again = _claim(m, "h-1")
     assert again["verdict"] == "ok", f"a day later the probe may run again, got {again}: the claim never expires"
 `,
@@ -572,6 +614,13 @@ async function claim(m, probeHash: string, category = 'prompt-injection') {
   const result = await m.claimProbe(TARGET, probeHash, category);
   assert(result !== null && typeof result === 'object' && 'verdict' in result, \`claimProbe must resolve to {verdict, remaining}, got \${JSON.stringify(result)}\`);
   return result;
+}
+
+/** Move the clock to one second into a fresh budget window, so a scenario never straddles two. */
+function align(ctx, config) {
+  const nowS = ctx.clock.now() / 1000;
+  ctx.clock.advance(config.WINDOW_S - (nowS % config.WINDOW_S) + 1);
+  return config.budgetKey(TARGET, Math.floor(ctx.clock.now() / 1000 / config.WINDOW_S));
 }
 
 export async function check_duplicate_free(ctx) {
@@ -594,45 +643,74 @@ export async function check_atomic_claim(ctx) {
   assert(probe.fired, 'claimProbe never touched the probe key');
   const verdicts = [mine.verdict, probe.result].sort();
   assert.deepEqual(verdicts, ['duplicate', 'ok'], \`two runners claimed the same probe and got \${JSON.stringify(verdicts)}: the test and the claim must run in one script, so exactly one runner sends it\`);
+
+  // the hour's last slot: another runner takes it between this runner's budget read and its count
+  const budget = align(ctx, config);
+  ctx.redis.hset(budget, 'probes', config.PROBE_BUDGET - 1);
+  const rival = ctx.redisAfter(budget, () => {
+    if (Number(ctx.redis.hget(budget, 'probes') ?? 0) >= config.PROBE_BUDGET) return 'budget';
+    ctx.redis.hincrby(budget, 'probes', 1);
+    return 'ok';
+  });
+  const last = await claim(m, 'h-last');
+  assert(rival.fired, \`claimProbe never touched this hour's budget \${budget}\`);
+  const lastVerdicts = [last.verdict, rival.result].sort();
+  assert.deepEqual(lastVerdicts, ['budget', 'ok'], \`two runners took the hour's last probe slot and got \${JSON.stringify(lastVerdicts)}: the budget test and the count must run in the same script, so the budget holds at \${config.PROBE_BUDGET}\`);
 }
 
 export async function check_destructive_cap(ctx) {
   const {m} = world(ctx);
+  for (let i = 0; i < 5; i += 1) {
+    const r = await claim(m, \`n-\${i}\`, 'jailbreak');
+    assert.equal(r.verdict, 'ok', \`non-destructive probe \${i + 1} must be claimed, got \${JSON.stringify(r)}\`);
+  }
   for (let i = 0; i < 20; i += 1) {
     const r = await claim(m, \`d-\${i}\`, 'data-exfil');
-    assert.equal(r.verdict, 'ok', \`destructive probe \${i + 1} of 20 must be claimed, got \${JSON.stringify(r)}\`);
+    assert.equal(r.verdict, 'ok', \`destructive probe \${i + 1} of 20 must be claimed after 5 non-destructive ones, got \${JSON.stringify(r)}: only destructive probes count toward DESTRUCTIVE_PROBE_BUDGET\`);
   }
   const over = await claim(m, 'd-20', 'resource-exhaustion');
   assert.equal(over.verdict, 'budget', \`the 21st destructive probe this hour answered \${JSON.stringify(over)}: DESTRUCTIVE_PROBE_BUDGET is 20\`);
   const other = await claim(m, 'p-1', 'prompt-injection');
-  assert(other.verdict === 'ok' && other.remaining === 179, \`other categories go on with the hour's budget (179 left after 21 claims), got \${JSON.stringify(other)}\`);
+  assert(other.verdict === 'ok' && other.remaining === 174, \`other categories go on with the hour's budget (174 left after 26 claims), got \${JSON.stringify(other)}\`);
   const again = await claim(m, 'd-20', 'data-exfil');
   assert.equal(again.verdict, 'budget', \`a refused probe is not claimed: asking again must still be budget, got \${JSON.stringify(again)}\`);
 }
 
 export async function check_hourly_window(ctx) {
   const {m, config} = world(ctx);
+  const key = align(ctx, config);
+  const atFirst = ctx.redisAfter(key, () => Number(ctx.redis.ttl(key)));
   for (let i = 0; i < 200; i += 1) {
     const r = await claim(m, \`p-\${i}\`);
     assert.equal(r.verdict, 'ok', \`probe \${i + 1} of 200 must be claimed, got \${JSON.stringify(r)}\`);
   }
+  assert(atFirst.fired, \`the hour's counters belong in \${key} (budgetKey(target, window)), the budget keys are \${JSON.stringify(ctx.redis.keys('redteam:budget:*'))}\`);
+  assert(atFirst.result !== -1, \`right after the first claim \${key} existed with no expiry: the expiry is set by the same script that counts\`);
   const refused = await claim(m, 'p-200');
   assert.equal(refused.verdict, 'budget', \`the 201st probe this hour answered \${JSON.stringify(refused)}\`);
-  const key = config.budgetKey(TARGET, Math.floor(ctx.clock.now() / 1000 / config.WINDOW_S));
   assert.equal(ctx.redis.hget(key, 'probes'), '200', \`the hour's counters belong in \${key} (budgetKey(target, window)), the budget keys are \${JSON.stringify(ctx.redis.keys('redteam:budget:*'))}\`);
   const ttl = Number(ctx.redis.ttl(key));
   assert(0 < ttl && ttl <= config.WINDOW_S, \`\${key} has TTL \${ttl}: a window's counters expire within WINDOW_S\`);
-  ctx.clock.advance(config.WINDOW_S);
+  ctx.clock.advance(config.WINDOW_S - 10);
+  const late = await claim(m, 'p-201');
+  assert.equal(late.verdict, 'budget', \`10 s before the hour ends the target's budget is still spent, got \${JSON.stringify(late)}: the counters expired inside their window (EXPIRE takes seconds)\`);
+  ctx.clock.advance(10);
   const later = await claim(m, 'p-200');
   assert.equal(later.verdict, 'ok', \`an hour later the target has a fresh budget, got \${JSON.stringify(later)}: the cap became permanent\`);
 }
 
 export async function check_claim_ttl(ctx) {
   const {m, config} = world(ctx);
+  const key = config.probeKey(TARGET, 'h-1');
+  const atClaim = ctx.redisAfter(key, () => Number(ctx.redis.ttl(key)));
   assert.equal((await claim(m, 'h-1')).verdict, 'ok');
-  const ttl = Number(ctx.redis.ttl(config.probeKey(TARGET, 'h-1')));
+  assert(atClaim.fired && atClaim.result !== -1, 'right after the claim the probe key existed with no expiry: SET it with EX in the claiming script');
+  const ttl = Number(ctx.redis.ttl(key));
   assert(0 < ttl && ttl <= config.DEDUPE_TTL_S, \`the claimed probe key has TTL \${ttl}: it expires after DEDUPE_TTL_S (86400 s)\`);
-  ctx.clock.advance(config.DEDUPE_TTL_S + 1);
+  ctx.clock.advance(config.DEDUPE_TTL_S - 60);
+  const sameDay = await claim(m, 'h-1');
+  assert.equal(sameDay.verdict, 'duplicate', \`a minute short of a day the probe is still claimed, got \${JSON.stringify(sameDay)}: the claim lasts DEDUPE_TTL_S (86400 s)\`);
+  ctx.clock.advance(61);
   const again = await claim(m, 'h-1');
   assert.equal(again.verdict, 'ok', \`a day later the probe may run again, got \${JSON.stringify(again)}: the claim never expires\`);
 }
@@ -643,6 +721,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 
 	"redteam/config"
 
@@ -655,6 +734,13 @@ func stateClaim(ctx *harness.Ctx, probeHash, category string) Claim {
 	c, err := claimProbe(context.Background(), stateTarget, probeHash, category)
 	ctx.NoError(err, "claimProbe(%q)", probeHash)
 	return c
+}
+
+// stateAlign moves the clock to one second into a fresh budget window, so a scenario never straddles two, and returns that window's budget key.
+func stateAlign(ctx *harness.Ctx) string {
+	windowMs := int64(config.WindowSeconds) * 1000
+	ctx.Clock.Advance(float64(windowMs-ctx.Clock.Now()%windowMs)/1000 + 1)
+	return config.BudgetKey(stateTarget, ctx.Clock.Now()/1000/config.WindowSeconds)
 }
 
 func CheckDuplicateFree(ctx *harness.Ctx) {
@@ -684,43 +770,86 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	verdicts := []string{mine.Verdict, other}
 	sort.Strings(verdicts)
 	ctx.Equal(verdicts, []string{"duplicate", "ok"}, "two runners claimed the same probe: the test and the claim must run in one script, so exactly one runner sends it; the verdicts")
+
+	// the hour's last slot: another runner takes it between this runner's budget read and its count
+	budget := stateAlign(ctx)
+	ctx.Redis.Do("HSET", budget, "probes", config.ProbeBudget-1)
+	rival := ""
+	ctx.Redis.After(budget, func() any {
+		used, _ := ctx.Redis.HGet(budget, "probes")
+		if n, _ := strconv.Atoi(used); n >= config.ProbeBudget {
+			rival = "budget"
+		} else {
+			ctx.Redis.Do("HINCRBY", budget, "probes", 1)
+			rival = "ok"
+		}
+		return nil
+	})
+	last := stateClaim(ctx, "h-last", "prompt-injection")
+	ctx.Assert(rival != "", "claimProbe never touched this hour's budget %s", budget)
+	lastVerdicts := []string{last.Verdict, rival}
+	sort.Strings(lastVerdicts)
+	ctx.Equal(lastVerdicts, []string{"budget", "ok"}, "two runners took the hour's last probe slot: the budget test and the count must run in the same script, so the budget holds at 200; the verdicts")
 }
 
 func CheckDestructiveCap(ctx *harness.Ctx) {
+	for i := 0; i < 5; i++ {
+		r := stateClaim(ctx, fmt.Sprintf("n-%d", i), "jailbreak")
+		ctx.Equal(r.Verdict, "ok", "non-destructive probe %d; the verdict", i+1)
+	}
 	for i := 0; i < 20; i++ {
 		r := stateClaim(ctx, fmt.Sprintf("d-%d", i), "data-exfil")
-		ctx.Equal(r.Verdict, "ok", "destructive probe %d of 20; the verdict", i+1)
+		ctx.Equal(r.Verdict, "ok", "destructive probe %d of 20 after 5 non-destructive ones (only destructive probes count toward DestructiveProbeBudget); the verdict", i+1)
 	}
 	over := stateClaim(ctx, "d-20", "resource-exhaustion")
 	ctx.Equal(over.Verdict, "budget", "the 21st destructive probe this hour (DestructiveProbeBudget is 20); the verdict")
 	other := stateClaim(ctx, "p-1", "prompt-injection")
-	ctx.Assert(other.Verdict == "ok" && other.Remaining == 179, "other categories go on with the hour's budget (179 left after 21 claims), got %+v", other)
+	ctx.Assert(other.Verdict == "ok" && other.Remaining == 174, "other categories go on with the hour's budget (174 left after 26 claims), got %+v", other)
 	again := stateClaim(ctx, "d-20", "data-exfil")
 	ctx.Equal(again.Verdict, "budget", "a refused probe is not claimed: asking again; the verdict")
 }
 
 func CheckHourlyWindow(ctx *harness.Ctx) {
+	key := stateAlign(ctx)
+	atFirst := int64(-3)
+	ctx.Redis.After(key, func() any {
+		atFirst = ctx.Redis.TTL(key)
+		return nil
+	})
 	for i := 0; i < 200; i++ {
 		r := stateClaim(ctx, fmt.Sprintf("p-%d", i), "prompt-injection")
 		ctx.Equal(r.Verdict, "ok", "probe %d of 200; the verdict", i+1)
 	}
+	ctx.Assert(atFirst != -3, "the hour's counters belong in %s (BudgetKey(target, window)); budget keys %v", key, ctx.Redis.Keys("redteam:budget:*"))
+	ctx.Assert(atFirst != -1, "right after the first claim %s existed with no expiry: the expiry is set by the same script that counts", key)
 	refused := stateClaim(ctx, "p-200", "prompt-injection")
 	ctx.Equal(refused.Verdict, "budget", "the 201st probe this hour; the verdict")
-	key := config.BudgetKey(stateTarget, ctx.Clock.Now()/1000/config.WindowSeconds)
 	probes, _ := ctx.Redis.HGet(key, "probes")
 	ctx.Equal(probes, "200", "the hour's counters belong in %s (BudgetKey(target, window)); budget keys %v; its probes", key, ctx.Redis.Keys("redteam:budget:*"))
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= config.WindowSeconds, "%s has TTL %d: a window's counters expire within WindowSeconds", key, ttl)
-	ctx.Clock.Advance(config.WindowSeconds)
+	ctx.Clock.Advance(config.WindowSeconds - 10)
+	late := stateClaim(ctx, "p-201", "prompt-injection")
+	ctx.Equal(late.Verdict, "budget", "10 s before the hour ends the target's budget is still spent (the counters expired inside their window; EXPIRE takes seconds); the verdict")
+	ctx.Clock.Advance(10)
 	later := stateClaim(ctx, "p-200", "prompt-injection")
 	ctx.Equal(later.Verdict, "ok", "an hour later the target has a fresh budget (the cap became permanent); the verdict")
 }
 
 func CheckClaimTtl(ctx *harness.Ctx) {
+	key := config.ProbeKey(stateTarget, "h-1")
+	atClaim := int64(-3)
+	ctx.Redis.After(key, func() any {
+		atClaim = ctx.Redis.TTL(key)
+		return nil
+	})
 	ctx.Equal(stateClaim(ctx, "h-1", "prompt-injection").Verdict, "ok", "a fresh probe; the verdict")
-	ttl := ctx.Redis.TTL(config.ProbeKey(stateTarget, "h-1"))
+	ctx.Assert(atClaim != -3 && atClaim != -1, "right after the claim the probe key existed with no expiry: SET it with EX in the claiming script")
+	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(0 < ttl && ttl <= config.DedupeTTLSeconds, "the claimed probe key has TTL %d: it expires after DedupeTTLSeconds (86400 s)", ttl)
-	ctx.Clock.Advance(config.DedupeTTLSeconds + 1)
+	ctx.Clock.Advance(config.DedupeTTLSeconds - 60)
+	ctx.Equal(stateClaim(ctx, "h-1", "prompt-injection").Verdict, "duplicate", "a minute short of a day the probe is still claimed (the claim lasts DedupeTTLSeconds, 86400 s); the verdict")
+	ctx.Clock.Advance(61)
 	again := stateClaim(ctx, "h-1", "prompt-injection")
 	ctx.Equal(again.Verdict, "ok", "a day later the probe may run again (the claim never expires); the verdict")
 }
@@ -733,63 +862,104 @@ func CheckClaimTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTarget = "checkout-shadow";
+const std::string kStateTarget = "checkout-shadow";
+
+// Move the clock to one second into a fresh budget window, so a scenario never straddles two; that window's budget key.
+std::string harness_align_window(harness::Ctx& ctx) {
+  const long long window_ms = config::kWindowSeconds * 1000;
+  ctx.Clock.Advance(static_cast<double>(window_ms - ctx.Clock.Now() % window_ms) / 1000 + 1);
+  return config::budget_key(kStateTarget, ctx.Clock.Now() / 1000 / config::kWindowSeconds);
+}
 
 }  // namespace
 
 void CheckDuplicateFree(harness::Ctx& ctx) {
-  const Claim first = claim_probe(kTarget, "h-1", "prompt-injection");
+  const Claim first = claim_probe(kStateTarget, "h-1", "prompt-injection");
   ctx.Assert(first.verdict == "ok" && first.remaining == 199, "a fresh probe is claimed with 199 left this hour, got %s with %d left", first.verdict, first.remaining);
-  const Claim again = claim_probe(kTarget, "h-1", "prompt-injection");
+  const Claim again = claim_probe(kStateTarget, "h-1", "prompt-injection");
   ctx.Equal(again.verdict, "duplicate", "the same probe again; the verdict");
   ctx.Equal(again.remaining, 199, "a duplicate draws nothing (the counter moved before the probe key was tested); remaining after the replay");
-  const Claim second = claim_probe(kTarget, "h-2", "prompt-injection");
+  const Claim second = claim_probe(kStateTarget, "h-2", "prompt-injection");
   ctx.Assert(second.verdict == "ok" && second.remaining == 198, "the second distinct probe leaves 198, got %s with %d left: replays were charged", second.verdict, second.remaining);
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  const std::string key = config::probe_key(kTarget, "h-race");
+  const std::string key = config::probe_key(kStateTarget, "h-race");
   std::string other;
   // a second runner replaying the same probe, landing between two of this runner's commands
   ctx.Redis.After(key, [&] { other = ctx.Redis.Set(key, "1", "NX", "EX", config::kDedupeTtlSeconds) ? "ok" : "duplicate"; });
-  const Claim mine = claim_probe(kTarget, "h-race", "prompt-injection");
+  const Claim mine = claim_probe(kStateTarget, "h-race", "prompt-injection");
   ctx.Assert(!other.empty(), "claim_probe never touched the probe key");
   std::vector<std::string> verdicts = {mine.verdict, other};
   std::sort(verdicts.begin(), verdicts.end());
   ctx.Equal(verdicts, {"duplicate", "ok"}, "two runners claimed the same probe: the test and the claim must run in one script, so exactly one runner sends it; the verdicts");
+
+  // the hour's last slot: another runner takes it between this runner's budget read and its count
+  const std::string budget = harness_align_window(ctx);
+  ctx.Redis.Do("HSET", budget, "probes", config::kProbeBudget - 1);
+  std::string rival;
+  ctx.Redis.After(budget, [&] {
+    const auto used = ctx.Redis.HGet(budget, "probes");
+    if (used && std::stoll(*used) >= config::kProbeBudget) {
+      rival = "budget";
+    } else {
+      ctx.Redis.Do("HINCRBY", budget, "probes", 1);
+      rival = "ok";
+    }
+  });
+  const Claim last = claim_probe(kStateTarget, "h-last", "prompt-injection");
+  ctx.Assert(!rival.empty(), "claim_probe never touched this hour's budget %s", budget);
+  std::vector<std::string> last_verdicts = {last.verdict, rival};
+  std::sort(last_verdicts.begin(), last_verdicts.end());
+  ctx.Equal(last_verdicts, {"budget", "ok"}, "two runners took the hour's last probe slot: the budget test and the count must run in the same script, so the budget holds at 200; the verdicts");
 }
 
 void CheckDestructiveCap(harness::Ctx& ctx) {
-  for (int i = 0; i < 20; i++) {
-    ctx.Equal(claim_probe(kTarget, "d-" + std::to_string(i), "data-exfil").verdict, "ok", "destructive probe %d of 20; the verdict", i + 1);
+  for (int i = 0; i < 5; i++) {
+    ctx.Equal(claim_probe(kStateTarget, "n-" + std::to_string(i), "jailbreak").verdict, "ok", "non-destructive probe %d; the verdict", i + 1);
   }
-  const Claim over = claim_probe(kTarget, "d-20", "resource-exhaustion");
+  for (int i = 0; i < 20; i++) {
+    ctx.Equal(claim_probe(kStateTarget, "d-" + std::to_string(i), "data-exfil").verdict, "ok", "destructive probe %d of 20 after 5 non-destructive ones (only destructive probes count toward kDestructiveProbeBudget); the verdict", i + 1);
+  }
+  const Claim over = claim_probe(kStateTarget, "d-20", "resource-exhaustion");
   ctx.Equal(over.verdict, "budget", "the 21st destructive probe this hour (kDestructiveProbeBudget is 20); the verdict");
-  const Claim other = claim_probe(kTarget, "p-1", "prompt-injection");
-  ctx.Assert(other.verdict == "ok" && other.remaining == 179, "other categories go on with the hour's budget (179 left after 21 claims), got %s with %d left", other.verdict, other.remaining);
-  ctx.Equal(claim_probe(kTarget, "d-20", "data-exfil").verdict, "budget", "a refused probe is not claimed: asking again; the verdict");
+  const Claim other = claim_probe(kStateTarget, "p-1", "prompt-injection");
+  ctx.Assert(other.verdict == "ok" && other.remaining == 174, "other categories go on with the hour's budget (174 left after 26 claims), got %s with %d left", other.verdict, other.remaining);
+  ctx.Equal(claim_probe(kStateTarget, "d-20", "data-exfil").verdict, "budget", "a refused probe is not claimed: asking again; the verdict");
 }
 
 void CheckHourlyWindow(harness::Ctx& ctx) {
+  const std::string key = harness_align_window(ctx);
+  long long at_first = -3;
+  ctx.Redis.After(key, [&] { at_first = ctx.Redis.TTL(key); });
   for (int i = 0; i < 200; i++) {
-    ctx.Equal(claim_probe(kTarget, "p-" + std::to_string(i), "prompt-injection").verdict, "ok", "probe %d of 200; the verdict", i + 1);
+    ctx.Equal(claim_probe(kStateTarget, "p-" + std::to_string(i), "prompt-injection").verdict, "ok", "probe %d of 200; the verdict", i + 1);
   }
-  ctx.Equal(claim_probe(kTarget, "p-200", "prompt-injection").verdict, "budget", "the 201st probe this hour; the verdict");
-  const std::string key = config::budget_key(kTarget, ctx.Clock.Now() / 1000 / config::kWindowSeconds);
+  ctx.Assert(at_first != -3, "the hour's counters belong in %s (budget_key(target, window)), the budget keys are %v", key, ctx.Redis.Keys("redteam:budget:*"));
+  ctx.Assert(at_first != -1, "right after the first claim %s existed with no expiry: the expiry is set by the same script that counts", key);
+  ctx.Equal(claim_probe(kStateTarget, "p-200", "prompt-injection").verdict, "budget", "the 201st probe this hour; the verdict");
   const auto probes = ctx.Redis.HGet(key, "probes");
   ctx.Assert(probes && *probes == "200", "the hour's counters belong in %s (budget_key(target, window)), the budget keys are %v", key, ctx.Redis.Keys("redteam:budget:*"));
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= config::kWindowSeconds, "%s has TTL %d: a window's counters expire within kWindowSeconds", key, ttl);
-  ctx.Clock.Advance(config::kWindowSeconds);
-  ctx.Equal(claim_probe(kTarget, "p-200", "prompt-injection").verdict, "ok", "an hour later the target has a fresh budget (the cap became permanent); the verdict");
+  ctx.Clock.Advance(config::kWindowSeconds - 10);
+  ctx.Equal(claim_probe(kStateTarget, "p-201", "prompt-injection").verdict, "budget", "10 s before the hour ends the target's budget is still spent (the counters expired inside their window; EXPIRE takes seconds); the verdict");
+  ctx.Clock.Advance(10);
+  ctx.Equal(claim_probe(kStateTarget, "p-200", "prompt-injection").verdict, "ok", "an hour later the target has a fresh budget (the cap became permanent); the verdict");
 }
 
 void CheckClaimTtl(harness::Ctx& ctx) {
-  ctx.Equal(claim_probe(kTarget, "h-1", "prompt-injection").verdict, "ok", "a fresh probe; the verdict");
-  const long long ttl = ctx.Redis.TTL(config::probe_key(kTarget, "h-1"));
+  const std::string key = config::probe_key(kStateTarget, "h-1");
+  long long at_claim = -3;
+  ctx.Redis.After(key, [&] { at_claim = ctx.Redis.TTL(key); });
+  ctx.Equal(claim_probe(kStateTarget, "h-1", "prompt-injection").verdict, "ok", "a fresh probe; the verdict");
+  ctx.Assert(at_claim != -3 && at_claim != -1, "right after the claim the probe key existed with no expiry: SET it with EX in the claiming script");
+  const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(0 < ttl && ttl <= config::kDedupeTtlSeconds, "the claimed probe key has TTL %d: it expires after kDedupeTtlSeconds (86400 s)", ttl);
-  ctx.Clock.Advance(config::kDedupeTtlSeconds + 1);
-  ctx.Equal(claim_probe(kTarget, "h-1", "prompt-injection").verdict, "ok", "a day later the probe may run again (the claim never expires); the verdict");
+  ctx.Clock.Advance(config::kDedupeTtlSeconds - 60);
+  ctx.Equal(claim_probe(kStateTarget, "h-1", "prompt-injection").verdict, "duplicate", "a minute short of a day the probe is still claimed (the claim lasts kDedupeTtlSeconds, 86400 s); the verdict");
+  ctx.Clock.Advance(61);
+  ctx.Equal(claim_probe(kStateTarget, "h-1", "prompt-injection").verdict, "ok", "a day later the probe may run again (the claim never expires); the verdict");
 }
 `,
   },

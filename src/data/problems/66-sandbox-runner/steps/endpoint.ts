@@ -104,7 +104,7 @@ same code twice.
       id: 'capabilities',
       title: 'Grants a need only when the profile does',
       detail:
-        "The profile must be in `ALLOWED_PROFILES` and every need in the profile's `PROFILE_CAPABILITIES` entry, else **400** and no job: `network` under `runc` or `gvisor` is refused, as are an unknown profile and an unknown need. The starter stores whatever the body declares.",
+        "The profile must be in `ALLOWED_PROFILES` and every need in the profile's `PROFILE_CAPABILITIES` entry, else **400** and no job: `network` under `runc` or `gvisor` is refused, as are `subprocess` under `runc`, a list where any one need is not granted, an unknown profile and an unknown need. The starter stores whatever the body declares.",
       match: {
         python: {all: [/ALLOWED_PROFILES/, /PROFILE_CAPABILITIES\[/, /\b400\b/]},
         typescript: {all: [/ALLOWED_PROFILES/, /PROFILE_CAPABILITIES\[/, /\b400\b/]},
@@ -117,7 +117,7 @@ same code twice.
       id: 'idempotency',
       title: 'Answers a replayed submit with the original job',
       detail:
-        "`Idempotency-Key` is required (400 without it) and looked up per tenant before `create`: a replay answers the first job id and creates nothing, a new key or another tenant's same key creates a job.",
+        "`Idempotency-Key` is required (400 without it) and looked up per tenant before `create`: a replay answers the first job (its id, profile and code digest, whatever body the replay carries) and creates nothing; a new key or another tenant's same key creates a job.",
       match: {
         python: {
           all: [/idempotency-key/i, /jobs\.lookup\(/, /jobs\.remember\(/],
@@ -621,6 +621,8 @@ async def check_capabilities(ctx):
         ("privileged", [], "an unknown profile"),
         ("runc", ["network"], "network under runc"),
         ("gvisor", ["network"], "network under gvisor"),
+        ("runc", ["subprocess"], "subprocess under runc"),
+        ("gvisor", ["filesystem", "network"], "network after a granted need"),
         ("kata", ["gpu"], "a capability no profile grants"),
     ]
     granted = [("kata", ["network"]), ("gvisor", ["filesystem", "subprocess"]), ("runc", [])]
@@ -640,7 +642,10 @@ async def check_idempotency(ctx):
         assert first.status_code == 202, f"the first submit answered {first.status_code}: {first.text}"
         replay = await _submit(c, key="k-1")
         assert replay.status_code == 202 and replay.json().get("job_id") == first.json().get("job_id"), f"a replay of Idempotency-Key k-1 answered {replay.text}, expected the original job {first.json().get('job_id')}"
-        assert _created(ctx) == 1, f"a submit and its replay created {_created(ctx)} jobs: the retry queued the code again"
+        retried = await _submit(c, {"code": "print('a retry with another body')", "profile": "kata", "needs": ["network"]}, key="k-1")
+        fields = ("job_id", "profile", "code_digest")
+        assert retried.status_code == 202 and [retried.json().get(f) for f in fields] == [first.json().get(f) for f in fields], f"a replay of k-1 with another body answered {retried.text}, expected the original job as first answered: {first.text}"
+        assert _created(ctx) == 1, f"a submit and its replays created {_created(ctx)} jobs: the retry queued the code again"
         other = await _submit(c, key="k-2")
         assert other.json().get("job_id") != first.json().get("job_id"), "a new Idempotency-Key must create a new job"
         foreign = await _submit(c, tenant="t2", key="k-1")
@@ -695,6 +700,8 @@ export async function check_capabilities(ctx) {
     ['privileged', [], 'an unknown profile'],
     ['runc', ['network'], 'network under runc'],
     ['gvisor', ['network'], 'network under gvisor'],
+    ['runc', ['subprocess'], 'subprocess under runc'],
+    ['gvisor', ['filesystem', 'network'], 'network after a granted need'],
     ['kata', ['gpu'], 'a capability no profile grants'],
   ];
   for (const [i, [profile, needs, why]] of refused.entries()) {
@@ -715,7 +722,10 @@ export async function check_idempotency(ctx) {
   assert.equal(first.status, 202, \`the first submit answered \${first.status}: \${first.text}\`);
   const replay = await submit(c, null, 't1', 'k-1');
   assert(replay.status === 202 && replay.json().job_id === first.json().job_id, \`a replay of Idempotency-Key k-1 answered \${replay.text}, expected the original job \${first.json().job_id}\`);
-  assert.equal(created(ctx), 1, \`a submit and its replay created \${created(ctx)} jobs: the retry queued the code again\`);
+  const retried = await submit(c, {code: "print('a retry with another body')", profile: 'kata', needs: ['network']}, 't1', 'k-1');
+  const same = ['job_id', 'profile', 'code_digest'].every(f => retried.json()[f] === first.json()[f]);
+  assert(retried.status === 202 && same, \`a replay of k-1 with another body answered \${retried.text}, expected the original job as first answered: \${first.text}\`);
+  assert.equal(created(ctx), 1, \`a submit and its replays created \${created(ctx)} jobs: the retry queued the code again\`);
   const other = await submit(c, null, 't1', 'k-2');
   assert.notEqual(other.json().job_id, first.json().job_id, 'a new Idempotency-Key must create a new job');
   const foreign = await submit(c, null, 't2', 'k-1');
@@ -739,23 +749,23 @@ import (
 	"leetbuild/harness"
 )
 
-const apiCode = "print('hello from the sandbox')"
+const hSubmitCode = "print('hello from the sandbox')"
 
-type submitted struct {
+type hSubmitted struct {
 	JobID      string \`json:"job_id"\`
 	Profile    string \`json:"profile"\`
 	CodeDigest string \`json:"code_digest"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hSubmitAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func submitJob(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
+func hSubmitJob(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
 	if body == nil {
-		body = map[string]any{"code": apiCode, "profile": "gvisor", "needs": []string{}}
+		body = map[string]any{"code": hSubmitCode, "profile": "gvisor", "needs": []string{}}
 	}
 	headers := []string{}
 	if tenant != "" {
@@ -767,45 +777,45 @@ func submitJob(c *harness.HTTP, body map[string]any, tenant, key string) *harnes
 	return c.Post("/v1/sandbox/jobs", body, headers...)
 }
 
-func jobOf(r *harness.Response) submitted {
-	var s submitted
+func hJobOf(r *harness.Response) hSubmitted {
+	var s hSubmitted
 	r.Decode(&s)
 	return s
 }
 
-func created(ctx *harness.Ctx) int {
+func hJobsCreated(ctx *harness.Ctx) int {
 	text, _ := ctx.Redis.Get("job:seq")
 	n, _ := strconv.Atoi(text)
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := submitJob(c, map[string]any{"code": apiCode, "profile": "gvisor", "needs": []string{"filesystem"}}, "t1", "k-1")
+	c := hSubmitAPI(ctx)
+	r := hSubmitJob(c, map[string]any{"code": hSubmitCode, "profile": "gvisor", "needs": []string{"filesystem"}}, "t1", "k-1")
 	ctx.Equal(r.Status, 202, "POST /v1/sandbox/jobs (%s)", r.Text())
-	body := jobOf(r)
+	body := hJobOf(r)
 	job := jobs.Get(context.Background(), body.JobID)
 	ctx.Assert(job != nil && job.Status == "queued", "the answered job_id %q is not a queued job in the store: %+v", body.JobID, job)
 	ctx.Equal(body.Profile, "gvisor", "the submit asked for gvisor; the answered profile")
-	ctx.Equal(body.CodeDigest, jobs.Digest(apiCode), "code_digest must be the SHA-256 of the code")
-	ctx.Assert(!strings.Contains(r.Text(), apiCode), "the response echoes the code: %s", r.Text())
+	ctx.Equal(body.CodeDigest, jobs.Digest(hSubmitCode), "code_digest must be the SHA-256 of the code")
+	ctx.Assert(!strings.Contains(r.Text(), hSubmitCode), "the response echoes the code: %s", r.Text())
 }
 
 func CheckLimits(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := submitJob(c, nil, "", "k-1")
+	c := hSubmitAPI(ctx)
+	r := hSubmitJob(c, nil, "", "k-1")
 	ctx.Equal(r.Status, 401, "a submit without X-Tenant-Id")
-	r = submitJob(c, map[string]any{"code": strings.Repeat("x", 1<<18+1), "profile": "gvisor", "needs": []string{}}, "t1", "k-1")
+	r = hSubmitJob(c, map[string]any{"code": strings.Repeat("x", 1<<18+1), "profile": "gvisor", "needs": []string{}}, "t1", "k-1")
 	ctx.Equal(r.Status, 413, "a submit of 256 KiB + 1 byte of code")
-	r = submitJob(c, map[string]any{"code": strings.Repeat("é", 1<<17+1), "profile": "gvisor", "needs": []string{}}, "t1", "k-1")
+	r = hSubmitJob(c, map[string]any{"code": strings.Repeat("é", 1<<17+1), "profile": "gvisor", "needs": []string{}}, "t1", "k-1")
 	ctx.Equal(r.Status, 413, "131073 two-byte characters (256 KiB + 2 bytes): count UTF-8 bytes, not characters")
-	ctx.Equal(created(ctx), 0, "check the tenant and the size before anything is stored; jobs created by refused submits")
-	r = submitJob(c, map[string]any{"code": strings.Repeat("x", 1<<18), "profile": "gvisor", "needs": []string{}}, "t1", "k-2")
+	ctx.Equal(hJobsCreated(ctx), 0, "check the tenant and the size before anything is stored; jobs created by refused submits")
+	r = hSubmitJob(c, map[string]any{"code": strings.Repeat("x", 1<<18), "profile": "gvisor", "needs": []string{}}, "t1", "k-2")
 	ctx.Equal(r.Status, 202, "exactly 256 KiB of code (%s)", r.Text())
 }
 
 func CheckCapabilities(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hSubmitAPI(ctx)
 	refused := []struct {
 		profile string
 		needs   []string
@@ -814,37 +824,41 @@ func CheckCapabilities(ctx *harness.Ctx) {
 		{"privileged", []string{}, "an unknown profile"},
 		{"runc", []string{"network"}, "network under runc"},
 		{"gvisor", []string{"network"}, "network under gvisor"},
+		{"runc", []string{"subprocess"}, "subprocess under runc"},
+		{"gvisor", []string{"filesystem", "network"}, "network after a granted need"},
 		{"kata", []string{"gpu"}, "a capability no profile grants"},
 	}
 	for i, tc := range refused {
-		r := submitJob(c, map[string]any{"code": apiCode, "profile": tc.profile, "needs": tc.needs}, "t1", fmt.Sprintf("r-%d", i))
+		r := hSubmitJob(c, map[string]any{"code": hSubmitCode, "profile": tc.profile, "needs": tc.needs}, "t1", fmt.Sprintf("r-%d", i))
 		ctx.Equal(r.Status, 400, "%s (%s, needs %v): a declared need is granted only by the profile", tc.why, tc.profile, tc.needs)
 	}
-	ctx.Equal(created(ctx), 0, "jobs created by refused submits")
+	ctx.Equal(hJobsCreated(ctx), 0, "jobs created by refused submits")
 	granted := []struct {
 		profile string
 		needs   []string
 	}{{"kata", []string{"network"}}, {"gvisor", []string{"filesystem", "subprocess"}}, {"runc", []string{}}}
 	for i, tc := range granted {
-		r := submitJob(c, map[string]any{"code": apiCode, "profile": tc.profile, "needs": tc.needs}, "t1", fmt.Sprintf("g-%d", i))
+		r := hSubmitJob(c, map[string]any{"code": hSubmitCode, "profile": tc.profile, "needs": tc.needs}, "t1", fmt.Sprintf("g-%d", i))
 		ctx.Equal(r.Status, 202, "%s with needs %v: the profile grants them (%s)", tc.profile, tc.needs, r.Text())
 	}
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := submitJob(c, nil, "t1", "k-1")
+	c := hSubmitAPI(ctx)
+	first := hSubmitJob(c, nil, "t1", "k-1")
 	ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text())
-	replay := submitJob(c, nil, "t1", "k-1")
-	ctx.Assert(replay.Status == 202 && jobOf(replay).JobID == jobOf(first).JobID, "a replay of Idempotency-Key k-1 answered %s, expected the original job %s", replay.Text(), jobOf(first).JobID)
-	ctx.Equal(created(ctx), 1, "a submit and its replay must create one job (the retry queued the code again); jobs created")
-	other := submitJob(c, nil, "t1", "k-2")
-	ctx.Assert(jobOf(other).JobID != jobOf(first).JobID, "a new Idempotency-Key must create a new job")
-	foreign := submitJob(c, nil, "t2", "k-1")
-	ctx.Assert(foreign.Status == 202 && jobOf(foreign).JobID != jobOf(first).JobID, "tenant t2's key k-1 answered t1's job (%s): a key belongs to its tenant", foreign.Text())
-	none := submitJob(c, nil, "t1", "")
+	replay := hSubmitJob(c, nil, "t1", "k-1")
+	ctx.Assert(replay.Status == 202 && hJobOf(replay).JobID == hJobOf(first).JobID, "a replay of Idempotency-Key k-1 answered %s, expected the original job %s", replay.Text(), hJobOf(first).JobID)
+	retried := hSubmitJob(c, map[string]any{"code": "print('a retry with another body')", "profile": "kata", "needs": []string{"network"}}, "t1", "k-1")
+	ctx.Assert(retried.Status == 202 && hJobOf(retried) == hJobOf(first), "a replay of k-1 with another body answered %s, expected the original job as first answered: %s", retried.Text(), first.Text())
+	ctx.Equal(hJobsCreated(ctx), 1, "a submit and its replays must create one job (the retry queued the code again); jobs created")
+	other := hSubmitJob(c, nil, "t1", "k-2")
+	ctx.Assert(hJobOf(other).JobID != hJobOf(first).JobID, "a new Idempotency-Key must create a new job")
+	foreign := hSubmitJob(c, nil, "t2", "k-1")
+	ctx.Assert(foreign.Status == 202 && hJobOf(foreign).JobID != hJobOf(first).JobID, "tenant t2's key k-1 answered t1's job (%s): a key belongs to its tenant", foreign.Text())
+	none := hSubmitJob(c, nil, "t1", "")
 	ctx.Equal(none.Status, 400, "a submit without Idempotency-Key")
-	ctx.Equal(created(ctx), 3, "three distinct submits; jobs created")
+	ctx.Equal(hJobsCreated(ctx), 3, "three distinct submits; jobs created")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -858,9 +872,9 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kCode = "print('hello from the sandbox')";
+const std::string kSubmitCode = "print('hello from the sandbox')";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hSubmitAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -868,23 +882,23 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json body(const std::string& code, const std::string& profile, const std::vector<std::string>& needs) {
+nlohmann::json hSubmitBody(const std::string& code, const std::string& profile, const std::vector<std::string>& needs) {
   return nlohmann::json{{"code", code}, {"profile", profile}, {"needs", needs}};
 }
 
-harness::Response submitJob(harness::HTTP& c, const nlohmann::json& b, const std::string& tenant, const std::string& key) {
+harness::Response hSubmitJob(harness::HTTP& c, const nlohmann::json& b, const std::string& tenant, const std::string& key) {
   std::vector<std::string> headers = {"Content-Type", "application/json"};
   if (!tenant.empty()) headers.insert(headers.end(), {"X-Tenant-Id", tenant});
   if (!key.empty()) headers.insert(headers.end(), {"Idempotency-Key", key});
   return c.Send("POST", "/v1/sandbox/jobs", b.dump(), headers);
 }
 
-std::string field(const harness::Response& r, const std::string& name) {
+std::string hSubmitField(const harness::Response& r, const std::string& name) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
-long created(harness::Ctx& ctx) {
+long hJobsCreated(harness::Ctx& ctx) {
   const auto text = ctx.Redis.Get("job:seq");
   return text ? std::stol(*text) : 0;
 }
@@ -892,33 +906,33 @@ long created(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = submitJob(c, body(kCode, "gvisor", {"filesystem"}), "t1", "k-1");
+  auto c = hSubmitAPI(ctx);
+  const auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, "gvisor", {"filesystem"}), "t1", "k-1");
   ctx.Equal(r.Status, 202, "POST /v1/sandbox/jobs (%s)", r.Text());
-  const auto job = jobs::get(field(r, "job_id"));
-  ctx.Assert(job && job->status == "queued", "the answered job_id %q is not a queued job in the store", field(r, "job_id"));
-  ctx.Equal(field(r, "profile"), "gvisor", "the submit asked for gvisor; the answered profile");
-  ctx.Equal(field(r, "code_digest"), jobs::digest(kCode), "code_digest must be the SHA-256 of the code");
-  ctx.Assert(r.Text().find(kCode) == std::string::npos, "the response echoes the code: %s", r.Text());
+  const auto job = jobs::get(hSubmitField(r, "job_id"));
+  ctx.Assert(job && job->status == "queued", "the answered job_id %q is not a queued job in the store", hSubmitField(r, "job_id"));
+  ctx.Equal(hSubmitField(r, "profile"), "gvisor", "the submit asked for gvisor; the answered profile");
+  ctx.Equal(hSubmitField(r, "code_digest"), jobs::digest(kSubmitCode), "code_digest must be the SHA-256 of the code");
+  ctx.Assert(r.Text().find(kSubmitCode) == std::string::npos, "the response echoes the code: %s", r.Text());
 }
 
 void CheckLimits(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = submitJob(c, body(kCode, "gvisor", {}), "", "k-1");
+  auto c = hSubmitAPI(ctx);
+  auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, "gvisor", {}), "", "k-1");
   ctx.Equal(r.Status, 401, "a submit without X-Tenant-Id");
-  r = submitJob(c, body(std::string((1 << 18) + 1, 'x'), "gvisor", {}), "t1", "k-1");
+  r = hSubmitJob(c, hSubmitBody(std::string((1 << 18) + 1, 'x'), "gvisor", {}), "t1", "k-1");
   ctx.Equal(r.Status, 413, "a submit of 256 KiB + 1 byte of code");
   std::string wide;
   for (int i = 0; i < (1 << 17) + 1; i++) wide += "\\xc3\\xa9";
-  r = submitJob(c, body(wide, "gvisor", {}), "t1", "k-1");
+  r = hSubmitJob(c, hSubmitBody(wide, "gvisor", {}), "t1", "k-1");
   ctx.Equal(r.Status, 413, "131073 two-byte characters (256 KiB + 2 bytes): count UTF-8 bytes, not characters");
-  ctx.Equal(created(ctx), 0, "check the tenant and the size before anything is stored; jobs created by refused submits");
-  r = submitJob(c, body(std::string(1 << 18, 'x'), "gvisor", {}), "t1", "k-2");
+  ctx.Equal(hJobsCreated(ctx), 0, "check the tenant and the size before anything is stored; jobs created by refused submits");
+  r = hSubmitJob(c, hSubmitBody(std::string(1 << 18, 'x'), "gvisor", {}), "t1", "k-2");
   ctx.Equal(r.Status, 202, "exactly 256 KiB of code (%s)", r.Text());
 }
 
 void CheckCapabilities(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hSubmitAPI(ctx);
   struct Refused {
     std::string profile;
     std::vector<std::string> needs;
@@ -927,35 +941,41 @@ void CheckCapabilities(harness::Ctx& ctx) {
   const std::vector<Refused> refused = {{"privileged", {}, "an unknown profile"},
                                         {"runc", {"network"}, "network under runc"},
                                         {"gvisor", {"network"}, "network under gvisor"},
+                                        {"runc", {"subprocess"}, "subprocess under runc"},
+                                        {"gvisor", {"filesystem", "network"}, "network after a granted need"},
                                         {"kata", {"gpu"}, "a capability no profile grants"}};
   for (size_t i = 0; i < refused.size(); i++) {
-    const auto r = submitJob(c, body(kCode, refused[i].profile, refused[i].needs), "t1", "r-" + std::to_string(i));
+    const auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, refused[i].profile, refused[i].needs), "t1", "r-" + std::to_string(i));
     ctx.Equal(r.Status, 400, "%s (%s): a declared need is granted only by the profile", refused[i].why, refused[i].profile);
   }
-  ctx.Equal(created(ctx), 0, "jobs created by refused submits");
+  ctx.Equal(hJobsCreated(ctx), 0, "jobs created by refused submits");
   const std::vector<std::pair<std::string, std::vector<std::string>>> granted = {
       {"kata", {"network"}}, {"gvisor", {"filesystem", "subprocess"}}, {"runc", {}}};
   for (size_t i = 0; i < granted.size(); i++) {
-    const auto r = submitJob(c, body(kCode, granted[i].first, granted[i].second), "t1", "g-" + std::to_string(i));
+    const auto r = hSubmitJob(c, hSubmitBody(kSubmitCode, granted[i].first, granted[i].second), "t1", "g-" + std::to_string(i));
     ctx.Equal(r.Status, 202, "%s with the needs its profile grants (%s)", granted[i].first, r.Text());
   }
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto plain = body(kCode, "gvisor", {});
-  const auto first = submitJob(c, plain, "t1", "k-1");
+  auto c = hSubmitAPI(ctx);
+  const auto plain = hSubmitBody(kSubmitCode, "gvisor", {});
+  const auto first = hSubmitJob(c, plain, "t1", "k-1");
   ctx.Equal(first.Status, 202, "the first submit (%s)", first.Text());
-  const auto replay = submitJob(c, plain, "t1", "k-1");
-  ctx.Assert(replay.Status == 202 && field(replay, "job_id") == field(first, "job_id"), "a replay of Idempotency-Key k-1 answered %s, expected the original job %s", replay.Text(), field(first, "job_id"));
-  ctx.Equal(created(ctx), 1, "a submit and its replay must create one job (the retry queued the code again); jobs created");
-  const auto other = submitJob(c, plain, "t1", "k-2");
-  ctx.Assert(field(other, "job_id") != field(first, "job_id"), "a new Idempotency-Key must create a new job");
-  const auto foreign = submitJob(c, plain, "t2", "k-1");
-  ctx.Assert(foreign.Status == 202 && field(foreign, "job_id") != field(first, "job_id"), "tenant t2's key k-1 answered t1's job (%s): a key belongs to its tenant", foreign.Text());
-  const auto none = submitJob(c, plain, "t1", "");
+  const auto replay = hSubmitJob(c, plain, "t1", "k-1");
+  ctx.Assert(replay.Status == 202 && hSubmitField(replay, "job_id") == hSubmitField(first, "job_id"), "a replay of Idempotency-Key k-1 answered %s, expected the original job %s", replay.Text(), hSubmitField(first, "job_id"));
+  const auto retried = hSubmitJob(c, hSubmitBody("print('a retry with another body')", "kata", {"network"}), "t1", "k-1");
+  bool same = retried.Status == 202;
+  for (const char* name : {"job_id", "profile", "code_digest"}) same = same && hSubmitField(retried, name) == hSubmitField(first, name);
+  ctx.Assert(same, "a replay of k-1 with another body answered %s, expected the original job as first answered: %s", retried.Text(), first.Text());
+  ctx.Equal(hJobsCreated(ctx), 1, "a submit and its replays must create one job (the retry queued the code again); jobs created");
+  const auto other = hSubmitJob(c, plain, "t1", "k-2");
+  ctx.Assert(hSubmitField(other, "job_id") != hSubmitField(first, "job_id"), "a new Idempotency-Key must create a new job");
+  const auto foreign = hSubmitJob(c, plain, "t2", "k-1");
+  ctx.Assert(foreign.Status == 202 && hSubmitField(foreign, "job_id") != hSubmitField(first, "job_id"), "tenant t2's key k-1 answered t1's job (%s): a key belongs to its tenant", foreign.Text());
+  const auto none = hSubmitJob(c, plain, "t1", "");
   ctx.Equal(none.Status, 400, "a submit without Idempotency-Key");
-  ctx.Equal(created(ctx), 3, "three distinct submits; jobs created");
+  ctx.Equal(hJobsCreated(ctx), 3, "three distinct submits; jobs created");
 }
 `,
   },

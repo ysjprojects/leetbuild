@@ -57,7 +57,7 @@ fails after the produce call returned leaves no trace.
       id: 'digest-payload',
       title: 'Carries digests and usage, never code or output',
       detail:
-        'The finished event carries `code_digest` and `output_digest` equal to the SHA-256 of the code and the output, the used profile, the exit code and the usage, and neither text appears anywhere in the record. The starter adds `output_tail`.',
+        'The finished event carries `code_digest` and `output_digest` equal to the SHA-256 of the code and the output, the used profile, the exit code and the usage, and no part of either text appears anywhere in the record, redacted excerpts included. The starter adds `output_tail`.',
       match: {
         python: {all: [/code_digest/, /output_digest/], none: [/output_tail|read_output\(/]},
         typescript: {all: [/code_digest/, /output_digest/], none: [/output_tail|readOutput\(/]},
@@ -83,7 +83,7 @@ fails after the produce call returned leaves no trace.
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the job id as key and the payload, and `publish` answers false. The starter only catches an error raised by the produce call itself, which a broker-side failure never is.',
+        'A delivered event answers true and leaves no outbox row. A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the job id as key and the payload, and `publish` answers false. The starter only catches an error raised by the produce call itself, which a broker-side failure never is.',
       match: {
         python: {
           all: [/on_delivery\s*=/, /\.flush\(\s*ACK_TIMEOUT_S\s*\)/, /insert_outbox\(/],
@@ -685,8 +685,8 @@ def check_digest_payload(ctx):
     assert value.get("output_digest") == jobs.digest(OUTPUT), f"output_digest is {value.get('output_digest')!r}, expected the SHA-256 of the output"
     assert value.get("profile") == "kata" and value.get("exit_code") == 0, f"the payload must carry the used profile (kata) and the exit code, got {value}"
     assert value.get("usage") == {"cpu_ms": 120, "mem_mb": 64}, f"the payload's usage is {value.get('usage')!r}, expected cpu_ms and mem_mb"
-    for secret in ("123-45-6789", "patients.csv"):
-        assert secret not in text, f"the event carries the job's {'output' if secret[0].isdigit() else 'code'} ({secret!r}) into a retained, replicated topic: {text}. Carry its digest"
+    for secret, what in (("123-45-6789", "output"), ("name,ssn", "output"), ("Ada", "output"), ("patients.csv", "code"), ("print(open", "code")):
+        assert secret not in text, f"the event carries the job's {what} ({secret!r}) into a retained, replicated topic: {text}. Carry its digest"
 
 
 def check_acks_idempotent(ctx):
@@ -702,7 +702,9 @@ def check_acks_idempotent(ctx):
 
 def check_outbox_on_failure(ctx):
     m = ctx.load("events")
-    j1, j2 = _job(), _job()
+    j0, j1, j2 = _job(), _job(), _job()
+    ok = m.publish(j0, "finished")
+    assert ok is True and _outbox(ctx) == [], f"a delivered event answered {ok!r} and left the outbox {_outbox(ctx)}, expected True and no row"
     ctx.kafka.fail_next(TOPIC, 1)
     ok = m.publish(j1, "finished")
     rows = _outbox(ctx)
@@ -713,7 +715,7 @@ def check_outbox_on_failure(ctx):
     before = ctx.clock.time()
     ok = m.publish(j2, "finished")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S (2 s), then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("job_id") == j2, f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish answered {ok!r} without a delivery report, expected False"
@@ -769,7 +771,8 @@ export async function check_digest_payload(ctx) {
   assert.equal(value.output_digest, digest(OUTPUT), \`output_digest is \${value.output_digest}, expected the SHA-256 of the output\`);
   assert(value.profile === 'kata' && value.exit_code === 0, \`the payload must carry the used profile (kata) and the exit code, got \${text}\`);
   assert.deepEqual(value.usage, {cpu_ms: 120, mem_mb: 64}, \`the payload's usage is \${JSON.stringify(value.usage)}, expected cpu_ms and mem_mb\`);
-  for (const [secret, what] of [['123-45-6789', 'output'], ['patients.csv', 'code']]) {
+  const secrets = [['123-45-6789', 'output'], ['name,ssn', 'output'], ['Ada', 'output'], ['patients.csv', 'code'], ['print(open', 'code']];
+  for (const [secret, what] of secrets) {
     assert(!text.includes(secret), \`the event carries the job's \${what} (\${secret}) into a retained, replicated topic: \${text}. Carry its digest\`);
   }
 }
@@ -790,10 +793,14 @@ export async function check_acks_idempotent(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = ctx.load('events');
+  const j0 = await job(ctx);
   const j1 = await job(ctx);
   const j2 = await job(ctx);
+  let ok = await m.publish(j0, 'finished');
+  await settle();
+  assert(ok === true && outboxRows(ctx).length === 0, \`a delivered event resolved \${JSON.stringify(ok)} and left the outbox \${JSON.stringify(outboxRows(ctx))}, expected true and no row\`);
   ctx.kafka.failNext(TOPIC, 1);
-  let ok = await m.publish(j1, 'finished');
+  ok = await m.publish(j1, 'finished');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the job vanishes from the audit trail\`);
@@ -803,7 +810,7 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.publish(j2, 'finished');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publish waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publish waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS (2 s), then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.job_id === j2, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publish resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -885,8 +892,9 @@ func CheckDigestPayload(ctx *harness.Ctx) {
 	ctx.Equal(value["output_digest"], jobs.Digest(eventsOutput), "output_digest must be the SHA-256 of the output")
 	ctx.Assert(value["profile"] == "kata" && value["exit_code"] == float64(0), "the payload must carry the used profile (kata) and the exit code, got %s", values[0])
 	ctx.Equal(value["usage"], map[string]any{"cpu_ms": 120, "mem_mb": 64}, "the payload's usage")
-	ctx.Assert(!strings.Contains(values[0], "123-45-6789"), "the event carries the job's output into a retained, replicated topic: %s. Carry its digest", values[0])
-	ctx.Assert(!strings.Contains(values[0], "patients.csv"), "the event carries the job's code into a retained, replicated topic: %s. Carry its digest", values[0])
+	for _, secret := range []string{"123-45-6789", "name,ssn", "Ada", "patients.csv", "print(open"} {
+		ctx.Assert(!strings.Contains(values[0], secret), "the event carries the job's code or output (%q) into a retained, replicated topic: %s. Carry its digest", secret, values[0])
+	}
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -902,9 +910,12 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 }
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
-	j1, j2 := eventsJob("gvisor", "gvisor"), eventsJob("gvisor", "gvisor")
+	j0, j1, j2 := eventsJob("gvisor", "gvisor"), eventsJob("gvisor", "gvisor"), eventsJob("gvisor", "gvisor")
+	ok := eventsPublish(ctx, j0)
+	ctx.Settle()
+	ctx.Assert(ok && len(eventsOutbox(ctx)) == 0, "a delivered event answered %v and left the outbox %v, expected true and no row", ok, eventsOutbox(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1)
-	ok := eventsPublish(ctx, j1)
+	ok = eventsPublish(ctx, j1)
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the job vanishes from the audit trail; the rows")
@@ -914,7 +925,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, j2)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout (2 s), then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["job_id"] == j2, "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publish's result without a delivery report")
@@ -984,8 +995,9 @@ void CheckDigestPayload(harness::Ctx& ctx) {
   ctx.Equal(eventsField(value, "output_digest"), jobs::digest(kEventsOutput), "output_digest must be the SHA-256 of the output");
   ctx.Assert(eventsField(value, "profile") == "kata" && value.value("exit_code", -1) == 0, "the payload must carry the used profile (kata) and the exit code, got %s", values[0]);
   ctx.Equal(value.is_object() && value.contains("usage") ? value["usage"] : nlohmann::json(), nlohmann::json{{"cpu_ms", 120}, {"mem_mb", 64}}, "the payload's usage");
-  ctx.Assert(values[0].find("123-45-6789") == std::string::npos, "the event carries the job's output into a retained, replicated topic: %s. Carry its digest", values[0]);
-  ctx.Assert(values[0].find("patients.csv") == std::string::npos, "the event carries the job's code into a retained, replicated topic: %s. Carry its digest", values[0]);
+  for (const char* secret : {"123-45-6789", "name,ssn", "Ada", "patients.csv", "print(open"}) {
+    ctx.Assert(values[0].find(secret) == std::string::npos, "the event carries the job's code or output (%s) into a retained, replicated topic: %s. Carry its digest", secret, values[0]);
+  }
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -1002,10 +1014,14 @@ void CheckAcksIdempotent(harness::Ctx& ctx) {
 }
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
+  const std::string j0 = eventsJob();
   const std::string j1 = eventsJob();
   const std::string j2 = eventsJob();
+  bool ok = publish(j0, "finished");
+  ctx.Settle();
+  ctx.Assert(ok && eventsOutbox(ctx).empty(), "a delivered event answered %v and left %d outbox rows, expected true and no row", ok, eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
-  bool ok = publish(j1, "finished");
+  ok = publish(j1, "finished");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the job vanishes from the audit trail; the rows");
@@ -1016,7 +1032,7 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = publish(j2, "finished");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publish waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publish waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs (2 s), then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "job_id") == j2, "no delivery report within the window and the outbox holds %d rows", rows.size());
   ctx.Equal(ok, false, "publish's result without a delivery report");

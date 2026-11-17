@@ -68,7 +68,7 @@ enqueue five items; and user text lands in the queue's retained records.
       id: 'source',
       title: 'Priority comes from the source type',
       detail:
-        "The priority is `SOURCE_PRIORITY[source_type]`, never the body's `priority`; an unknown `source_type` or a `source_id` that is empty or over `MAX_SOURCE_ID` is **400**.",
+        "The priority is `SOURCE_PRIORITY[source_type]`, never the body's `priority`; an unknown `source_type` or a `source_id` that is empty or over `MAX_SOURCE_ID` is **400**, and a `source_id` of exactly 128 characters is accepted.",
       match: {
         python: {
           all: [/SOURCE_PRIORITY\s*=/, /SOURCE_PRIORITY\[|SOURCE_PRIORITY\.get\(/, /MAX_SOURCE_ID/, /\b400\b/],
@@ -126,7 +126,7 @@ enqueue five items; and user text lands in the queue's retained records.
       id: 'payload-ref',
       title: 'Stores a payload reference, not the payload',
       detail:
-        'The item carries `payload_ref` (400 when it is missing) and no payload text: the payload store owns retention, and the queue must not be a second copy of user content.',
+        'The item carries `payload_ref` (400 when it is missing or empty) and no payload text from any body field: the payload store owns retention, and the queue must not be a second copy of user content. A rejected escalation leaves its source free for the corrected retry.',
       match: {
         python: {all: [/payload_ref/], none: [/payload_text/]},
         typescript: {all: [/payload_ref/], none: [/payload_text/]},
@@ -595,6 +595,10 @@ def _items(ctx):
     return sorted(ctx.redis.keys("review:item:*"))
 
 
+def _written(ctx):
+    return sorted(key for key in ctx.redis.keys("review:*") if key != "review:seq")
+
+
 async def check_route(ctx):
     async with _api(ctx) as c:
         r = await _enqueue(c, GOOD)
@@ -613,7 +617,7 @@ async def check_tenant(ctx):
         for headers in ({}, {"X-Tenant-Id": ""}):
             r = await _enqueue(c, GOOD, headers)
             assert r.status_code == 401, f"an escalation with X-Tenant-Id {headers.get('X-Tenant-Id', 'missing')!r} answered {r.status_code}, expected 401"
-        assert _items(ctx) == [], f"an escalation without a tenant was stored: {_items(ctx)}. Answer 401 before anything is written"
+        assert _written(ctx) == [], f"an escalation without a tenant wrote {_written(ctx)}. Answer 401 before anything is written"
         r = await _enqueue(c, GOOD)
     assert r.status_code == 201, f"with X-Tenant-Id t1 the escalation answered {r.status_code}: {r.text}"
 
@@ -627,14 +631,17 @@ async def check_source(ctx):
         assert r.json().get("priority") == "p2", f"the answer must carry the derived priority p2, got {r.json()}"
         r = await _enqueue(c, GOOD)
         assert store.get_item(r.json()["item_id"])["priority"] == "p1", "a guardrail_block must be queued at p1"
+        r = await _enqueue(c, {**GOOD, "source_type": "model_output", "source_id": "y" * 128})
+        assert r.status_code == 201, f"a 128-character source_id (the limit) answered {r.status_code}, expected 201"
         for bad, why in (
             ({**GOOD, "source_type": "rumor", "source_id": "x-1"}, "an unknown source_type"),
+            ({**GOOD, "source_type": "toString", "source_id": "x-2"}, "the unknown source_type toString"),
             ({**GOOD, "source_id": ""}, "an empty source_id"),
             ({**GOOD, "source_id": "x" * 129}, "a 129-character source_id"),
         ):
             r = await _enqueue(c, bad)
             assert r.status_code == 400, f"{why} answered {r.status_code}, expected 400"
-    assert len(_items(ctx)) == 2, f"rejected escalations were stored: the store holds {_items(ctx)}, expected the two valid items"
+    assert len(_items(ctx)) == 3, f"rejected escalations were stored: the store holds {_items(ctx)}, expected the three valid items"
 
 
 async def check_dedupe(ctx):
@@ -655,14 +662,21 @@ async def check_dedupe(ctx):
 
 async def check_payload_ref(ctx):
     async with _api(ctx) as c:
-        r = await _enqueue(c, {**GOOD, "payload_text": "my card is 4242 4242 4242 4242"})
+        r = await _enqueue(c, {**GOOD, "payload_text": "my card is 4242 4242 4242 4242", "excerpt": "card 4242"})
         assert r.status_code == 201, f"an escalation with payload_ref answered {r.status_code}: {r.text}"
         item = store.get_item(r.json()["item_id"])
         assert item.get("payload_ref") == "blob://t1/cmp-1", f"the item must carry payload_ref blob://t1/cmp-1, the store holds {item}"
         leaked = [name for name, value in item.items() if "4242" in value]
         assert not leaked, f"the item stores user text in {leaked}: the payload store owns the content, the queue keeps only the reference"
-        r = await _enqueue(c, {"source_type": "guardrail_block", "source_id": "cmp-2", "payload_text": "hello"})
-    assert r.status_code == 400, f"an escalation without payload_ref answered {r.status_code}, expected 400"
+        for body, why in (
+            ({"source_type": "guardrail_block", "source_id": "cmp-2", "payload_text": "hello"}, "without payload_ref"),
+            ({"source_type": "guardrail_block", "source_id": "cmp-2", "payload_ref": ""}, "with an empty payload_ref"),
+        ):
+            r = await _enqueue(c, body)
+            assert r.status_code == 400, f"an escalation {why} answered {r.status_code}, expected 400"
+        r = await _enqueue(c, {"source_type": "guardrail_block", "source_id": "cmp-2", "payload_ref": "blob://t1/cmp-2"})
+    assert r.status_code == 201 and r.json().get("deduped") is False, f"cmp-2 with its payload_ref, after two rejected tries, answered {r.status_code} {r.text}: a rejected escalation must not claim its source"
+    assert store.get_item(r.json()["item_id"]) is not None, f"cmp-2 answered {r.json()} but the store has no such item"
 `,
     typescript: `const GOOD = {source_type: 'guardrail_block', source_id: 'cmp-1', payload_ref: 'blob://t1/cmp-1'};
 const T1 = {'X-Tenant-Id': 't1'};
@@ -692,7 +706,8 @@ export async function check_tenant(ctx) {
     const r = await enqueue(c, GOOD, headers);
     assert.equal(r.status, 401, \`an escalation with X-Tenant-Id \${JSON.stringify(headers['X-Tenant-Id'] ?? 'missing')} answered \${r.status}, expected 401\`);
   }
-  assert.deepStrictEqual(items(ctx), [], \`an escalation without a tenant was stored: \${JSON.stringify(items(ctx))}. Answer 401 before anything is written\`);
+  const written = (ctx.redis.keys('review:*') as string[]).filter(key => key !== 'review:seq');
+  assert.deepStrictEqual(written, [], \`an escalation without a tenant wrote \${JSON.stringify(written)}. Answer 401 before anything is written\`);
   const r = await enqueue(c, GOOD);
   assert.equal(r.status, 201, \`with X-Tenant-Id t1 the escalation answered \${r.status}: \${r.text}\`);
 }
@@ -706,8 +721,11 @@ export async function check_source(ctx) {
   assert.equal(r.json().priority, 'p2', \`the answer must carry the derived priority p2, got \${r.text}\`);
   r = await enqueue(c, GOOD);
   assert.equal((await store.getItem(r.json().item_id)).priority, 'p1', 'a guardrail_block must be queued at p1');
+  r = await enqueue(c, {...GOOD, source_type: 'model_output', source_id: 'y'.repeat(128)});
+  assert.equal(r.status, 201, \`a 128-character source_id (the limit) answered \${r.status}, expected 201\`);
   const bad: [Record<string, string>, string][] = [
     [{...GOOD, source_type: 'rumor', source_id: 'x-1'}, 'an unknown source_type'],
+    [{...GOOD, source_type: 'toString', source_id: 'x-2'}, 'the unknown source_type toString'],
     [{...GOOD, source_id: ''}, 'an empty source_id'],
     [{...GOOD, source_id: 'x'.repeat(129)}, 'a 129-character source_id'],
   ];
@@ -715,7 +733,7 @@ export async function check_source(ctx) {
     const res = await enqueue(c, body);
     assert.equal(res.status, 400, \`\${why} answered \${res.status}, expected 400\`);
   }
-  assert.equal(items(ctx).length, 2, \`rejected escalations were stored: the store holds \${JSON.stringify(items(ctx))}, expected the two valid items\`);
+  assert.equal(items(ctx).length, 3, \`rejected escalations were stored: the store holds \${JSON.stringify(items(ctx))}, expected the three valid items\`);
 }
 
 export async function check_dedupe(ctx) {
@@ -736,14 +754,23 @@ export async function check_dedupe(ctx) {
 
 export async function check_payload_ref(ctx) {
   const {c, store} = api(ctx);
-  let r = await enqueue(c, {...GOOD, payload_text: 'my card is 4242 4242 4242 4242'});
+  let r = await enqueue(c, {...GOOD, payload_text: 'my card is 4242 4242 4242 4242', excerpt: 'card 4242'});
   assert.equal(r.status, 201, \`an escalation with payload_ref answered \${r.status}: \${r.text}\`);
   const item = await store.getItem(r.json().item_id);
   assert.equal(item.payload_ref, 'blob://t1/cmp-1', \`the item must carry payload_ref blob://t1/cmp-1, the store holds \${JSON.stringify(item)}\`);
   const leaked = Object.keys(item).filter(name => String(item[name]).includes('4242'));
   assert.deepStrictEqual(leaked, [], \`the item stores user text in \${JSON.stringify(leaked)}: the payload store owns the content, the queue keeps only the reference\`);
-  r = await enqueue(c, {source_type: 'guardrail_block', source_id: 'cmp-2', payload_text: 'hello'});
-  assert.equal(r.status, 400, \`an escalation without payload_ref answered \${r.status}, expected 400\`);
+  const rejected: [Record<string, string>, string][] = [
+    [{source_type: 'guardrail_block', source_id: 'cmp-2', payload_text: 'hello'}, 'without payload_ref'],
+    [{source_type: 'guardrail_block', source_id: 'cmp-2', payload_ref: ''}, 'with an empty payload_ref'],
+  ];
+  for (const [body, why] of rejected) {
+    r = await enqueue(c, body);
+    assert.equal(r.status, 400, \`an escalation \${why} answered \${r.status}, expected 400\`);
+  }
+  r = await enqueue(c, {source_type: 'guardrail_block', source_id: 'cmp-2', payload_ref: 'blob://t1/cmp-2'});
+  assert(r.status === 201 && r.json().deduped === false, \`cmp-2 with its payload_ref, after two rejected tries, answered \${r.status} \${r.text}: a rejected escalation must not claim its source\`);
+  assert.notEqual(await store.getItem(r.json().item_id), null, \`cmp-2 answered \${r.text} but the store has no such item\`);
 }
 `,
     go: `package main
@@ -759,13 +786,13 @@ import (
 	"leetbuild/harness"
 )
 
-var apiBg = context.Background()
+var hEndpointBg = context.Background()
 
-func good() map[string]any {
+func hGood() map[string]any {
 	return map[string]any{"source_type": "guardrail_block", "source_id": "cmp-1", "payload_ref": "blob://t1/cmp-1"}
 }
 
-func with(body map[string]any, key string, value any) map[string]any {
+func hWith(body map[string]any, key string, value any) map[string]any {
 	out := map[string]any{}
 	for k, v := range body {
 		out[k] = v
@@ -774,37 +801,37 @@ func with(body map[string]any, key string, value any) map[string]any {
 	return out
 }
 
-type answer struct {
+type hAnswer struct {
 	ItemID   string \`json:"item_id"\`
 	Priority string \`json:"priority"\`
 	Deduped  bool   \`json:"deduped"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func decode(r *harness.Response) answer {
-	var a answer
+func hDecode(r *harness.Response) hAnswer {
+	var a hAnswer
 	r.Decode(&a)
 	return a
 }
 
-func items(ctx *harness.Ctx) []string {
+func hItems(ctx *harness.Ctx) []string {
 	keys := ctx.Redis.Keys("review:item:*")
 	sort.Strings(keys)
 	return keys
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/review/items", good(), "X-Tenant-Id", "t1")
+	c := hAPI(ctx)
+	r := c.Post("/v1/review/items", hGood(), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/review/items (%s)", r.Text())
-	a := decode(r)
+	a := hDecode(r)
 	ctx.Assert(a.ItemID != "" && !a.Deduped && strings.Contains(r.Text(), "deduped"), "a new escalation must answer its item_id and deduped false, got %s", r.Text())
-	item := store.GetItem(apiBg, a.ItemID)
+	item := store.GetItem(hEndpointBg, a.ItemID)
 	ctx.Assert(item != nil && item["state"] == "queued" && item["tenant"] == "t1", "the store holds %v for %s, expected a queued item of tenant t1", item, a.ItemID)
 	queue := ctx.Redis.LRange("review:queue:t1:"+item["priority"], 0, -1)
 	found := false
@@ -815,68 +842,83 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckTenant(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/review/items", good())
+	c := hAPI(ctx)
+	r := c.Post("/v1/review/items", hGood())
 	ctx.Equal(r.Status, 401, "an escalation without X-Tenant-Id")
-	r = c.Post("/v1/review/items", good(), "X-Tenant-Id", "")
+	r = c.Post("/v1/review/items", hGood(), "X-Tenant-Id", "")
 	ctx.Equal(r.Status, 401, "an escalation with an empty X-Tenant-Id")
-	ctx.Equal(len(items(ctx)), 0, "an escalation without a tenant was stored (%v); answer 401 before anything is written. The items", items(ctx))
-	r = c.Post("/v1/review/items", good(), "X-Tenant-Id", "t1")
+	written := []string{}
+	for _, key := range ctx.Redis.Keys("review:*") {
+		if key != "review:seq" {
+			written = append(written, key)
+		}
+	}
+	ctx.Equal(len(written), 0, "an escalation without a tenant wrote %v; answer 401 before anything is written. The keys written", written)
+	r = c.Post("/v1/review/items", hGood(), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "with X-Tenant-Id t1 the escalation (%s)", r.Text())
 }
 
 func CheckSource(ctx *harness.Ctx) {
-	c := api(ctx)
-	report := with(with(with(good(), "source_type", "user_report"), "source_id", "rep-1"), "priority", "p1")
+	c := hAPI(ctx)
+	report := hWith(hWith(hWith(hGood(), "source_type", "user_report"), "source_id", "rep-1"), "priority", "p1")
 	r := c.Post("/v1/review/items", report, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "a user_report (%s)", r.Text())
-	a := decode(r)
-	ctx.Equal(store.GetItem(apiBg, a.ItemID)["priority"], "p2", "a user_report that asked for p1 must be queued at p2 (the priority comes from sourcePriority, not from the caller); the stored priority")
+	a := hDecode(r)
+	ctx.Equal(store.GetItem(hEndpointBg, a.ItemID)["priority"], "p2", "a user_report that asked for p1 must be queued at p2 (the priority comes from sourcePriority, not from the caller); the stored priority")
 	ctx.Equal(a.Priority, "p2", "the answer must carry the derived priority")
-	r = c.Post("/v1/review/items", good(), "X-Tenant-Id", "t1")
-	ctx.Equal(store.GetItem(apiBg, decode(r).ItemID)["priority"], "p1", "a guardrail_block's priority")
+	r = c.Post("/v1/review/items", hGood(), "X-Tenant-Id", "t1")
+	ctx.Equal(store.GetItem(hEndpointBg, hDecode(r).ItemID)["priority"], "p1", "a guardrail_block's priority")
+	r = c.Post("/v1/review/items", hWith(hWith(hGood(), "source_type", "model_output"), "source_id", strings.Repeat("y", 128)), "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 201, "a 128-character source_id (the limit)")
 	bad := []struct {
 		body map[string]any
 		why  string
 	}{
-		{with(with(good(), "source_type", "rumor"), "source_id", "x-1"), "an unknown source_type"},
-		{with(good(), "source_id", ""), "an empty source_id"},
-		{with(good(), "source_id", strings.Repeat("x", 129)), "a 129-character source_id"},
+		{hWith(hWith(hGood(), "source_type", "rumor"), "source_id", "x-1"), "an unknown source_type"},
+		{hWith(hWith(hGood(), "source_type", "toString"), "source_id", "x-2"), "the unknown source_type toString"},
+		{hWith(hGood(), "source_id", ""), "an empty source_id"},
+		{hWith(hGood(), "source_id", strings.Repeat("x", 129)), "a 129-character source_id"},
 	}
 	for _, b := range bad {
 		r := c.Post("/v1/review/items", b.body, "X-Tenant-Id", "t1")
 		ctx.Equal(r.Status, 400, "%s", b.why)
 	}
-	ctx.Equal(len(items(ctx)), 2, "rejected escalations were stored (%v); the items", items(ctx))
+	ctx.Equal(len(hItems(ctx)), 3, "rejected escalations were stored (%v); the items", hItems(ctx))
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := c.Post("/v1/review/items", good(), "X-Tenant-Id", "t1")
+	c := hAPI(ctx)
+	first := c.Post("/v1/review/items", hGood(), "X-Tenant-Id", "t1")
 	ctx.Equal(first.Status, 201, "the first escalation (%s)", first.Text())
-	again := c.Post("/v1/review/items", good(), "X-Tenant-Id", "t1")
+	again := c.Post("/v1/review/items", hGood(), "X-Tenant-Id", "t1")
 	ctx.Equal(again.Status, 200, "a second escalation of the same source must answer the existing item")
-	a := decode(again)
-	ctx.Assert(a.ItemID == decode(first).ItemID && a.Deduped, "the duplicate must answer the first item (%s) with deduped true, got %s", decode(first).ItemID, again.Text())
-	ctx.Equal(len(items(ctx)), 1, "two escalations of one source must leave one item (%v); the items", items(ctx))
-	otherType := c.Post("/v1/review/items", with(good(), "source_type", "user_report"), "X-Tenant-Id", "t1")
-	otherTenant := c.Post("/v1/review/items", good(), "X-Tenant-Id", "t2")
+	a := hDecode(again)
+	ctx.Assert(a.ItemID == hDecode(first).ItemID && a.Deduped, "the duplicate must answer the first item (%s) with deduped true, got %s", hDecode(first).ItemID, again.Text())
+	ctx.Equal(len(hItems(ctx)), 1, "two escalations of one source must leave one item (%v); the items", hItems(ctx))
+	otherType := c.Post("/v1/review/items", hWith(hGood(), "source_type", "user_report"), "X-Tenant-Id", "t1")
+	otherTenant := c.Post("/v1/review/items", hGood(), "X-Tenant-Id", "t2")
 	ctx.Equal(otherType.Status, 201, "the same source_id under another source_type is another source")
 	ctx.Equal(otherTenant.Status, 201, "the same source in another tenant is another source")
-	ctx.Equal(len(items(ctx)), 3, "the items in the store (%v)", items(ctx))
+	ctx.Equal(len(hItems(ctx)), 3, "the items in the store (%v)", hItems(ctx))
 }
 
 func CheckPayloadRef(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/review/items", with(good(), "payload_text", "my card is 4242 4242 4242 4242"), "X-Tenant-Id", "t1")
+	c := hAPI(ctx)
+	r := c.Post("/v1/review/items", hWith(hWith(hGood(), "payload_text", "my card is 4242 4242 4242 4242"), "excerpt", "card 4242"), "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 201, "an escalation with payload_ref (%s)", r.Text())
-	item := store.GetItem(apiBg, decode(r).ItemID)
+	item := store.GetItem(hEndpointBg, hDecode(r).ItemID)
 	ctx.Equal(item["payload_ref"], "blob://t1/cmp-1", "the item must carry payload_ref (the store holds %v)", item)
 	for name, value := range item {
 		ctx.Assert(!strings.Contains(value, "4242"), "the item stores user text in %s: the payload store owns the content, the queue keeps only the reference", name)
 	}
 	r = c.Post("/v1/review/items", map[string]any{"source_type": "guardrail_block", "source_id": "cmp-2", "payload_text": "hello"}, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 400, "an escalation without payload_ref")
+	r = c.Post("/v1/review/items", map[string]any{"source_type": "guardrail_block", "source_id": "cmp-2", "payload_ref": ""}, "X-Tenant-Id", "t1")
+	ctx.Equal(r.Status, 400, "an escalation with an empty payload_ref")
+	r = c.Post("/v1/review/items", map[string]any{"source_type": "guardrail_block", "source_id": "cmp-2", "payload_ref": "blob://t1/cmp-2"}, "X-Tenant-Id", "t1")
+	a := hDecode(r)
+	ctx.Assert(r.Status == 201 && !a.Deduped, "cmp-2 with its payload_ref, after two rejected tries, answered %d %s: a rejected escalation must not claim its source", r.Status, r.Text())
+	ctx.Assert(store.GetItem(hEndpointBg, a.ItemID) != nil, "cmp-2 answered %s but the store has no such item", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -893,7 +935,7 @@ namespace {
 
 const json kGood = {{"source_type", "guardrail_block"}, {"source_id", "cmp-1"}, {"payload_ref", "blob://t1/cmp-1"}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -901,16 +943,16 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json with(json body, const std::string& key, const json& value) {
+json hWith(json body, const std::string& key, const json& value) {
   body[key] = value;
   return body;
 }
 
-harness::Response enqueue(harness::HTTP& c, const json& body, const std::string& tenant = "t1") {
+harness::Response hEnqueue(harness::HTTP& c, const json& body, const std::string& tenant = "t1") {
   return c.Post("/v1/review/items", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
 }
 
-json answer(const harness::Response& r) {
+json hAnswer(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : json::object();
 }
@@ -918,10 +960,10 @@ json answer(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = enqueue(c, kGood);
+  auto c = hApi(ctx);
+  const auto r = hEnqueue(c, kGood);
   ctx.Equal(r.Status, 201, "POST /v1/review/items (%s)", r.Text());
-  const json a = answer(r);
+  const json a = hAnswer(r);
   const std::string item_id = a.value("item_id", "");
   ctx.Assert(!item_id.empty() && a.contains("deduped") && a["deduped"] == false, "a new escalation must answer its item_id and deduped false, got %s", r.Text());
   const auto item = store::getItem(item_id);
@@ -933,61 +975,75 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenant(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   auto r = c.Post("/v1/review/items", kGood.dump(), "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "an escalation without X-Tenant-Id");
-  r = enqueue(c, kGood, "");
+  r = hEnqueue(c, kGood, "");
   ctx.Equal(r.Status, 401, "an escalation with an empty X-Tenant-Id");
-  ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 0, "an escalation without a tenant was stored; answer 401 before anything is written. The items");
-  r = enqueue(c, kGood);
+  std::vector<std::string> written;
+  for (const auto& key : ctx.Redis.Keys("review:*")) {
+    if (key != "review:seq") written.push_back(key);
+  }
+  ctx.Equal(written.size(), 0, "an escalation without a tenant wrote %v; answer 401 before anything is written. The keys written", written);
+  r = hEnqueue(c, kGood);
   ctx.Equal(r.Status, 201, "with X-Tenant-Id t1 the escalation (%s)", r.Text());
 }
 
 void CheckSource(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = enqueue(c, with(with(with(kGood, "source_type", "user_report"), "source_id", "rep-1"), "priority", "p1"));
+  auto c = hApi(ctx);
+  auto r = hEnqueue(c, hWith(hWith(hWith(kGood, "source_type", "user_report"), "source_id", "rep-1"), "priority", "p1"));
   ctx.Equal(r.Status, 201, "a user_report (%s)", r.Text());
-  const json a = answer(r);
+  const json a = hAnswer(r);
   ctx.Equal(store::getItem(a.value("item_id", "")).value_or(store::Item{})["priority"], "p2",
             "a user_report that asked for p1 must be queued at p2 (the priority comes from kSourcePriority, not from the caller); the stored priority");
   ctx.Equal(a.value("priority", ""), "p2", "the answer must carry the derived priority");
-  r = enqueue(c, kGood);
-  ctx.Equal(store::getItem(answer(r).value("item_id", "")).value_or(store::Item{})["priority"], "p1", "a guardrail_block's priority");
+  r = hEnqueue(c, kGood);
+  ctx.Equal(store::getItem(hAnswer(r).value("item_id", "")).value_or(store::Item{})["priority"], "p1", "a guardrail_block's priority");
+  r = hEnqueue(c, hWith(hWith(kGood, "source_type", "model_output"), "source_id", std::string(128, 'y')));
+  ctx.Equal(r.Status, 201, "a 128-character source_id (the limit)");
   const std::vector<std::pair<json, std::string>> bad = {
-      {with(with(kGood, "source_type", "rumor"), "source_id", "x-1"), "an unknown source_type"},
-      {with(kGood, "source_id", ""), "an empty source_id"},
-      {with(kGood, "source_id", std::string(129, 'x')), "a 129-character source_id"},
+      {hWith(hWith(kGood, "source_type", "rumor"), "source_id", "x-1"), "an unknown source_type"},
+      {hWith(hWith(kGood, "source_type", "toString"), "source_id", "x-2"), "the unknown source_type toString"},
+      {hWith(kGood, "source_id", ""), "an empty source_id"},
+      {hWith(kGood, "source_id", std::string(129, 'x')), "a 129-character source_id"},
   };
-  for (const auto& [body, why] : bad) ctx.Equal(enqueue(c, body).Status, 400, "%s", why);
-  ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 2, "rejected escalations were stored; the items");
+  for (const auto& [body, why] : bad) ctx.Equal(hEnqueue(c, body).Status, 400, "%s", why);
+  ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 3, "rejected escalations were stored; the items");
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = enqueue(c, kGood);
+  auto c = hApi(ctx);
+  const auto first = hEnqueue(c, kGood);
   ctx.Equal(first.Status, 201, "the first escalation (%s)", first.Text());
-  const auto again = enqueue(c, kGood);
+  const auto again = hEnqueue(c, kGood);
   ctx.Equal(again.Status, 200, "a second escalation of the same source must answer the existing item");
-  const json a = answer(again);
-  ctx.Assert(a.value("item_id", "") == answer(first).value("item_id", "") && a.value("deduped", false),
+  const json a = hAnswer(again);
+  ctx.Assert(a.value("item_id", "") == hAnswer(first).value("item_id", "") && a.value("deduped", false),
              "the duplicate must answer the first item with deduped true, got %s", again.Text());
   ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 1, "two escalations of one source must leave one item; the items");
-  ctx.Equal(enqueue(c, with(kGood, "source_type", "user_report")).Status, 201, "the same source_id under another source_type is another source");
-  ctx.Equal(enqueue(c, kGood, "t2").Status, 201, "the same source in another tenant is another source");
+  ctx.Equal(hEnqueue(c, hWith(kGood, "source_type", "user_report")).Status, 201, "the same source_id under another source_type is another source");
+  ctx.Equal(hEnqueue(c, kGood, "t2").Status, 201, "the same source in another tenant is another source");
   ctx.Equal(ctx.Redis.Keys("review:item:*").size(), 3, "the items in the store");
 }
 
 void CheckPayloadRef(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = enqueue(c, with(kGood, "payload_text", "my card is 4242 4242 4242 4242"));
+  auto c = hApi(ctx);
+  auto r = hEnqueue(c, hWith(hWith(kGood, "payload_text", "my card is 4242 4242 4242 4242"), "excerpt", "card 4242"));
   ctx.Equal(r.Status, 201, "an escalation with payload_ref (%s)", r.Text());
-  const store::Item item = store::getItem(answer(r).value("item_id", "")).value_or(store::Item{});
+  const store::Item item = store::getItem(hAnswer(r).value("item_id", "")).value_or(store::Item{});
   ctx.Equal(item.count("payload_ref") ? item.at("payload_ref") : "", "blob://t1/cmp-1", "the item must carry payload_ref (the store holds %v)", item);
   for (const auto& [name, value] : item) {
     ctx.Assert(value.find("4242") == std::string::npos, "the item stores user text in %s: the payload store owns the content, the queue keeps only the reference", name);
   }
-  r = enqueue(c, json{{"source_type", "guardrail_block"}, {"source_id", "cmp-2"}, {"payload_text", "hello"}});
+  r = hEnqueue(c, json{{"source_type", "guardrail_block"}, {"source_id", "cmp-2"}, {"payload_text", "hello"}});
   ctx.Equal(r.Status, 400, "an escalation without payload_ref");
+  r = hEnqueue(c, json{{"source_type", "guardrail_block"}, {"source_id", "cmp-2"}, {"payload_ref", ""}});
+  ctx.Equal(r.Status, 400, "an escalation with an empty payload_ref");
+  r = hEnqueue(c, json{{"source_type", "guardrail_block"}, {"source_id", "cmp-2"}, {"payload_ref", "blob://t1/cmp-2"}});
+  const json a = hAnswer(r);
+  ctx.Assert(r.Status == 201 && a.value("deduped", true) == false,
+             "cmp-2 with its payload_ref, after two rejected tries, answered %d %s: a rejected escalation must not claim its source", r.Status, r.Text());
+  ctx.Assert(store::getItem(a.value("item_id", "")).has_value(), "cmp-2 answered %s but the store has no such item", r.Text());
 }
 `,
   },

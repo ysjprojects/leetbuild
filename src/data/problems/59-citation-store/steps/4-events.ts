@@ -22,7 +22,8 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
 
 - The record key is the **document id**.
 - **Every status** is published, \`broken\` and \`pending\` included.
-- **Commit first**: \`store.set_verification(result)\` before the produce.
+- **Commit first**: \`store.set_verification(result)\` before the produce; a commit that fails
+  reaches the caller, and nothing is produced or queued for it.
 - The producer is **idempotent** with **\`acks=all\`** (Go uses confluent-kafka-go, which has an
   idempotent producer; kafka-go has none).
 - **Wait for the delivery report**, at most \`ACK_TIMEOUT_S\` = 2 s; on a failed delivery or no
@@ -85,7 +86,7 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
       id: 'commit-first',
       title: 'Commits the result before producing its event',
       detail:
-        'When `citation:{id}` is written the topic is still empty: the event follows the commit, so a consumer that reads the store on an event finds the status it announces. The starter produces first.',
+        'When `citation:{id}` is written the topic is still empty: the event follows the commit and carries the committed result, so a consumer that reads the store on an event finds the status it announces. A commit that fails (a WRONGTYPE key) reaches the caller and nothing is produced or queued. The starter produces first.',
       match: {
         python: {order: [/store\.set_verification\(/, /producer\.produce\(/]},
         typescript: {order: [/await setVerification\(/, /producer\.send\(/]},
@@ -111,7 +112,7 @@ leader failover loses one; a broker that rejects or ignores the produce drops th
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload, and the call returns false. The starter fires and forgets.',
+        'A failed delivery, or no report within 2 s (not much longer), leaves an outbox row with the topic, the key and the event payload, and the call returns false. The starter fires and forgets.',
       match: {
         python: {all: [/store\.insert_outbox\(/, /producer\.flush\(/, /on_delivery\s*=|callback\s*=/]},
         typescript: {all: [/insertOutbox\(/, /await producer\.send\(/, /catch/]},
@@ -642,6 +643,11 @@ def _outbox(ctx):
     return [json.loads(row) for row in ctx.redis.lrange("outbox", 0, -1)]
 
 
+def _payload(citation_id, document_id="doc-7"):
+    """The event payload of a result _result made: the citation re-anchored into version 2, verified."""
+    return {"citation_id": citation_id, "tenant": "t1", "document_id": document_id, "version": 2, "start": 12, "end": 20, "status": "verified", "reason": ""}
+
+
 def check_document_key(ctx):
     m = ctx.load("events")
     m.publish_verification(_result("doc-7", "a-1"))
@@ -674,6 +680,17 @@ def check_commit_first(ctx):
     assert len(ctx.kafka.records(TOPIC)) == 1, "the event must still be produced after the commit"
     row = store.get("c-1")
     assert (row["status"], row["version"], row["start"]) == ("verified", 2, 12), f"the store holds {row} after the commit, expected the verified result at version 2 [12, 20)"
+    event = json.loads(ctx.kafka.values(TOPIC)[0])
+    assert event == _payload("c-1"), f"the event is {event}, expected the committed result {_payload('c-1')}"
+    failing = _result()
+    ctx.redis.delete("citation:c-2")
+    ctx.redis.set("citation:c-2", "not a hash")  # the commit answers WRONGTYPE
+    try:
+        ok = m.publish_verification(failing)
+    except Exception:
+        ok = None
+    assert ok is not True, "publish_verification returned True although its commit failed (WRONGTYPE on citation:c-2): the failure must reach the caller"
+    assert len(ctx.kafka.records(TOPIC)) == 1 and _outbox(ctx) == [], f"a result whose commit failed was announced anyway (records: {len(ctx.kafka.records(TOPIC))}, outbox: {_outbox(ctx)}): an event must never describe a status the store does not hold"
 
 
 def check_acks_idempotent(ctx):
@@ -692,19 +709,21 @@ def check_outbox_on_failure(ctx):
     ok = m.publish_verification(_result())
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the event is lost"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "doc-7" and rows[0].get("payload", {}).get("citation_id") == "c-1", f"the outbox row is {rows[0]}, expected the topic, the key doc-7 and the payload"
+    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "doc-7" and rows[0].get("payload") == _payload("c-1"), f"the outbox row is {rows[0]}, expected the topic, the key doc-7 and the event payload {_payload('c-1')}"
     assert ok is False, f"publish_verification returned {ok!r} after a failed delivery, expected False"
     assert store.get("c-1")["status"] == "verified", "the result must stay committed when only the produce failed"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     ok = m.publish_verification(_result())
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"publish_verification waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"publish_verification waited {waited:.1f} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_S = 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("citation_id") == "c-2", f"no delivery report within the window and the outbox holds {rows}"
     assert ok is False, f"publish_verification returned {ok!r} without a delivery report, expected False"
 `,
     typescript: `const TOPIC = 'citation.event';
+/** The event payload of the first result \`result()\` makes: c-1 re-anchored into version 2, verified. */
+const PAYLOAD_C1 = {citation_id: 'c-1', tenant: 't1', document_id: 'doc-7', version: 2, start: 12, end: 20, status: 'verified', reason: ''};
 
 /** A real macrotask: every pending promise continuation has run. */
 const settle = (): Promise<void> => {
@@ -762,6 +781,20 @@ export async function check_commit_first(ctx) {
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the event must still be produced after the commit');
   const row = await store.get('c-1');
   assert.deepStrictEqual([row.status, row.version, row.start], ['verified', 2, 12], \`the store holds \${JSON.stringify(row)} after the commit, expected the verified result at version 2 [12, 20)\`);
+  const event = JSON.parse(ctx.kafka.values(TOPIC)[0]);
+  assert.deepStrictEqual(event, PAYLOAD_C1, \`the event is \${JSON.stringify(event)}, expected the committed result \${JSON.stringify(PAYLOAD_C1)}\`);
+  const failing = await result();
+  ctx.redis.del('citation:c-2');
+  ctx.redis.set('citation:c-2', 'not a hash'); // the commit answers WRONGTYPE
+  let ok: unknown;
+  try {
+    ok = await m.publishVerification(failing);
+  } catch {
+    ok = null;
+  }
+  await settle();
+  assert.notEqual(ok, true, 'publishVerification resolved true although its commit failed (WRONGTYPE on citation:c-2): the failure must reach the caller');
+  assert(ctx.kafka.records(TOPIC).length === 1 && outboxRows(ctx).length === 0, \`a result whose commit failed was announced anyway (records: \${ctx.kafka.records(TOPIC).length}, outbox: \${JSON.stringify(outboxRows(ctx))}): an event must never describe a status the store does not hold\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -783,7 +816,8 @@ export async function check_outbox_on_failure(ctx) {
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the event is lost\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'doc-7' && rows[0].payload?.citation_id === 'c-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key doc-7 and the payload\`);
+  assert(rows[0].topic === TOPIC && rows[0].key === 'doc-7', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic and the key doc-7\`);
+  assert.deepStrictEqual(rows[0].payload, PAYLOAD_C1, \`the outbox row's payload is \${JSON.stringify(rows[0].payload)}, expected the event payload \${JSON.stringify(PAYLOAD_C1)}\`);
   assert.equal(ok, false, \`publishVerification resolved \${JSON.stringify(ok)} after a failed delivery, expected false\`);
   assert.equal((await store.get('c-1')).status, 'verified', 'the result must stay committed when only the produce failed');
   const next = await result();
@@ -791,7 +825,7 @@ export async function check_outbox_on_failure(ctx) {
   const before = ctx.clock.now();
   ok = await m.publishVerification(next);
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`publishVerification waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`publishVerification waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most ACK_TIMEOUT_MS = 2000, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.citation_id === 'c-2', \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
   assert.equal(ok, false, \`publishVerification resolved \${JSON.stringify(ok)} without a delivery report, expected false\`);
@@ -845,6 +879,9 @@ func eventsOutbox(ctx *harness.Ctx) []eventsRow {
 	return rows
 }
 
+// eventsPayloadC1 is the event payload of the first result eventsResult makes, decoded: c-1 re-anchored into version 2, verified.
+var eventsPayloadC1 = map[string]any{"citation_id": "c-1", "tenant": "t1", "document_id": "doc-7", "version": float64(2), "start": float64(12), "end": float64(20), "status": "verified", "reason": ""}
+
 func CheckDocumentKey(ctx *harness.Ctx) {
 	eventsPublish(ctx, eventsResult("doc-7", "a-1", "verified", ""))
 	eventsPublish(ctx, eventsResult("doc-9", "a-1", "verified", ""))
@@ -880,6 +917,16 @@ func CheckCommitFirst(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "the event must still be produced after the commit; the records")
 	row := store.Get(eventsBg, "c-1")
 	ctx.Assert(row.Status == "verified" && row.Version == 2 && row.Start == 12, "the store holds %+v after the commit, expected the verified result at version 2 [12, 20)", row)
+	var event map[string]any
+	ctx.NoError(json.Unmarshal([]byte(ctx.Kafka.Values(eventsTopic)[0]), &event), "the payload must be JSON")
+	ctx.Equal(event, eventsPayloadC1, "the event must carry the committed result; the payload")
+	failing := eventsResult("doc-7", "a-1", "verified", "")
+	ctx.Redis.Del("citation:c-2")
+	ctx.Redis.Set("citation:c-2", "not a hash") // the commit answers WRONGTYPE
+	ok, err := publishVerification(eventsBg, failing)
+	ctx.Settle()
+	ctx.Assert(err != nil || !ok, "publishVerification reported success although its commit failed (WRONGTYPE on citation:c-2): the failure must reach the caller")
+	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(eventsOutbox(ctx)) == 0, "a result whose commit failed was announced anyway (records: %d, outbox: %v): an event must never describe a status the store does not hold", len(ctx.Kafka.Records(eventsTopic)), eventsOutbox(ctx))
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
@@ -899,7 +946,8 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the event is lost; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "doc-7" && rows[0].Payload["citation_id"] == "c-1", "the outbox row is %v, expected the topic, the key doc-7 and the payload", rows[0])
+	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "doc-7", "the outbox row is %v, expected the topic and the key doc-7", rows[0])
+	ctx.Equal(rows[0].Payload, eventsPayloadC1, "the outbox row must carry the event payload; the payload")
 	ctx.Equal(ok, false, "publishVerification's result after a failed delivery")
 	ctx.Equal(store.Get(eventsBg, "c-1").Status, "verified", "the result must stay committed when only the produce failed; the stored status")
 	next := eventsResult("doc-7", "a-1", "verified", "")
@@ -907,7 +955,7 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	ok = eventsPublish(ctx, next)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "publishVerification waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "publishVerification waited %.1f s for a broker that does not answer: wait for the report at most ackTimeout = 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["citation_id"] == "c-2", "no delivery report within the window and the outbox holds %v", rows)
 	ctx.Equal(ok, false, "publishVerification's result without a delivery report")
@@ -951,6 +999,9 @@ std::string eventsField(const nlohmann::json& j, const std::string& field) {
   return j.is_object() && j.contains(field) && j[field].is_string() ? j[field].get<std::string>() : "";
 }
 
+// The event payload of the first result eventsResult makes: c-1 re-anchored into version 2, verified.
+const nlohmann::json kEventsPayloadC1 = {{"citation_id", "c-1"}, {"tenant", "t1"}, {"document_id", "doc-7"}, {"version", 2}, {"start", 12}, {"end", 20}, {"status", "verified"}, {"reason", ""}};
+
 }  // namespace
 
 void CheckDocumentKey(harness::Ctx& ctx) {
@@ -992,6 +1043,22 @@ void CheckCommitFirst(harness::Ctx& ctx) {
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "the event must still be produced after the commit; the records");
   const auto row = store::get("c-1");
   ctx.Assert(row && row->status == "verified" && row->version == 2 && row->start == 12, "the store holds %s after the commit, expected the verified result at version 2 [12, 20)", row ? store::toJson(*row).dump() : "nothing");
+  const auto event = nlohmann::json::parse(ctx.Kafka.Values(kEventsTopic)[0], nullptr, false);
+  ctx.Assert(event == kEventsPayloadC1, "the event is %s, expected the committed result %s", event.dump(), kEventsPayloadC1.dump());
+  const store::Citation failing = eventsResult("doc-7");
+  ctx.Redis.Del("citation:c-2");
+  ctx.Redis.Set("citation:c-2", "not a hash");  // the commit answers WRONGTYPE
+  bool ok = false;
+  try {
+    ok = publishVerification(failing);
+  } catch (...) {
+    ok = false;
+  }
+  ctx.Settle();
+  ctx.Assert(!ok, "publishVerification returned true although its commit failed (WRONGTYPE on citation:c-2): the failure must reach the caller");
+  ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && eventsOutbox(ctx).empty(),
+             "a result whose commit failed was announced anyway (records: %d, outbox rows: %d): an event must never describe a status the store does not hold", ctx.Kafka.Records(kEventsTopic).size(),
+             eventsOutbox(ctx).size());
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
@@ -1011,9 +1078,8 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the event is lost; the rows");
-  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "doc-7" && rows[0].contains("payload") &&
-                 eventsField(rows[0]["payload"], "citation_id") == "c-1",
-             "the outbox row is %s, expected the topic, the key doc-7 and the payload", rows[0].dump());
+  ctx.Assert(eventsField(rows[0], "topic") == kEventsTopic && eventsField(rows[0], "key") == "doc-7" && rows[0].contains("payload") && rows[0]["payload"] == kEventsPayloadC1,
+             "the outbox row is %s, expected the topic, the key doc-7 and the event payload %s", rows[0].dump(), kEventsPayloadC1.dump());
   ctx.Equal(ok, false, "publishVerification's result after a failed delivery");
   ctx.Equal(store::get("c-1")->status, "verified", "the result must stay committed when only the produce failed; the stored status");
   const store::Citation next = eventsResult("doc-7");
@@ -1021,7 +1087,7 @@ void CheckOutboxOnFailure(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   ok = publishVerification(next);
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "publishVerification waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "publishVerification waited %.1f s for a broker that does not answer: wait for the report at most kAckTimeoutMs = 2000, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && rows[1].contains("payload") && eventsField(rows[1]["payload"], "citation_id") == "c-2",
              "no delivery report within the window and the outbox holds %d rows", rows.size());

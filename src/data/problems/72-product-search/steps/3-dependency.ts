@@ -24,8 +24,9 @@ shards (a replica) appears twice.
 service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits: product_id, title, score
 \`\`\`
 
-- Every call carries \`SHARD_DEADLINE_S\` = 0.35 s.
-- A shard whose call fails or misses the deadline goes into \`missed\` and the page is \`partial\`.
+- Every call carries its own \`SHARD_DEADLINE_S\` = 0.35 s.
+- A shard whose call fails, with any status, or misses the deadline goes into \`missed\` and the
+  page is \`partial\`.
 - Fewer than a majority answering (\`len(SHARDS) // 2 + 1\`) raises \`SearchUnavailable\`.
 - Hits are deduplicated by \`product_id\`, keeping the highest score, ordered by score (highest
   first, ties by id), then cut to \`page_size\`.`,
@@ -46,7 +47,7 @@ service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits
       id: 'deadline',
       title: 'Every shard call carries a 350 ms deadline',
       detail:
-        'Each `Search` call is made with `SHARD_DEADLINE_S` (350 ms), so a slow shard misses its deadline instead of holding the search; the starter calls without one.',
+        'Each `Search` call is made with its own `SHARD_DEADLINE_S` (350 ms), so a slow shard misses its deadline instead of holding the search, and a page that lost it says so; three shards that each answer in 300 ms all make it. The starter calls without one.',
       match: {
         python: {all: [/SHARD_DEADLINE_S\s*=\s*0\.35\b/, /\.Search\([\s\S]{0,200}?timeout\s*=\s*SHARD_DEADLINE_S/]},
         typescript: {all: [/SHARD_DEADLINE_MS\s*=\s*350\b/, /deadline:\s*Date\.now\(\)\s*\+\s*SHARD_DEADLINE_MS/]},
@@ -64,7 +65,7 @@ service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits
       id: 'partial',
       title: 'A page that lost a shard says so',
       detail:
-        'A shard whose call failed is recorded in `missed` and the page is `partial`; the starter skips it and answers `partial: false`, so a shopper reads a short page as the whole catalog.',
+        'A shard whose call failed, with any status, is recorded in `missed` and the page is `partial`; the starter skips it and answers `partial: false`, so a shopper reads a short page as the whole catalog.',
       match: {
         python: {
           all: [/missed\.append\(/, /["']partial["']:\s*(bool\(missed\)|len\(missed\)\s*>\s*0)/],
@@ -93,7 +94,7 @@ service Shard { rpc Search(ShardQuery) returns (ShardPage); }  // ShardPage.hits
       id: 'dedupe',
       title: 'One product once, at its best score',
       detail:
-        'Hits are merged by `product_id`, keeping the highest score, and ordered by score before the page is cut; the starter concatenates the shards’ pages, so a replicated product appears twice and the cut keeps the wrong ones.',
+        'Hits are merged by `product_id`, keeping the highest score whichever shard reported it, and ordered by score (ties by id) before the page is cut; the starter concatenates the shards’ pages, so a replicated product appears twice and the cut keeps the wrong ones.',
       match: {
         python: {all: [/not in best|best\.get\(/, /-\s*\w+\[["']score["']\]|reverse\s*=\s*True/]},
         typescript: {all: [/best\.get\(/, /b\.score\s*-\s*a\.score/]},
@@ -612,13 +613,15 @@ Page fanOut(const std::string& tenant, const std::string& q, int page_size) {
     },
   },
   harness: {
-    python: `import product_search_pb2
+    python: `import grpc
+
+import product_search_pb2
 import product_search_pb2_grpc
 
 PAGES = {
     "shard-0:9000": [("p-1", "Steel Kettle", 0.9), ("p-2", "Glass Kettle", 0.7)],
     "shard-1:9000": [("p-1", "Steel Kettle", 0.8), ("p-3", "Kettle Descaler", 0.4)],
-    "shard-2:9000": [("p-4", "Travel Kettle", 0.6)],
+    "shard-2:9000": [("p-0", "Camp Kettle", 0.7), ("p-3", "Kettle Descaler", 0.6), ("p-4", "Travel Kettle", 0.6)],
 }
 
 
@@ -655,12 +658,28 @@ def check_deadline(ctx):
     ctx.grpc.set_latency("Search", 5.0, target="shard-2:9000")
     page = m.fan_out("t-1", "kettle", 10)
     assert "p-4" not in _ids(page), f"the search waited for a shard 5 s slow and answered {_ids(page)}: shard-2 must miss the 350 ms deadline"
+    assert page["partial"] is True and page["missed"] == ["shard-2:9000"], f"shard-2 missed its deadline and the page answered partial={page['partial']!r} missed={page['missed']!r}, expected partial=True missed=['shard-2:9000']"
+    # Every shard answers in 300 ms: each call has its own 350 ms, so the third shard is as welcome as the first.
+    for target in PAGES:
+        ctx.grpc.set_latency("Search", 0.3, target=target)
+    try:
+        page = m.fan_out("t-1", "kettle", 10)
+    except m.SearchUnavailable as exc:
+        raise AssertionError(f"with every shard answering in 300 ms fan_out raised SearchUnavailable ({exc}): each Search call carries its own SHARD_DEADLINE_S, not what is left of one budget shared by the three")
+    assert page["partial"] is False and "p-4" in _ids(page), f"with every shard answering in 300 ms the page answered {_ids(page)} partial={page['partial']!r} missed={page['missed']!r}: each Search call carries its own SHARD_DEADLINE_S, not what is left of one budget shared by the three"
 
 
 def check_partial(ctx):
     m = _shards(ctx)
     page = m.fan_out("t-1", "kettle", 10)
     assert page["partial"] is False and page["missed"] == [], f"with every shard healthy the page must not be partial, got partial={page['partial']!r} missed={page['missed']!r}"
+    for target, code in (("shard-1:9000", grpc.StatusCode.INTERNAL), ("shard-0:9000", grpc.StatusCode.RESOURCE_EXHAUSTED)):
+        ctx.grpc.fail("Search", code, "shard error", times=1, target=target)
+        try:
+            page = m.fan_out("t-1", "kettle", 10)
+        except Exception as exc:
+            raise AssertionError(f"{target} failing with {code.name} made fan_out raise {type(exc).__name__}: {exc}. A shard whose call fails goes into missed")
+        assert page["partial"] is True and page["missed"] == [target], f"{target} failed with {code.name} and the page answered partial={page['partial']!r} missed={page['missed']!r}, expected partial=True missed=[{target!r}]"
     ctx.grpc.stop("shard-2:9000")
     page = m.fan_out("t-1", "kettle", 10)
     assert page["partial"] is True, f"a page that lost shard-2 answered partial={page['partial']!r} with {_ids(page)}: a shopper reads a short page as the whole catalog"
@@ -684,15 +703,16 @@ def check_quorum(ctx):
 def check_dedupe(ctx):
     m = _shards(ctx)
     page = m.fan_out("t-1", "kettle", 10)
-    assert _ids(page) == ["p-1", "p-2", "p-4", "p-3"], f"the merged page is {_ids(page)}, expected [p-1, p-2, p-4, p-3]: one entry per product, highest score first"
+    assert _ids(page) == ["p-1", "p-0", "p-2", "p-3", "p-4"], f"the merged page is {_ids(page)}, expected [p-1, p-0, p-2, p-3, p-4]: one entry per product at its highest score, highest first, ties by product_id"
     assert abs(page["hits"][0]["score"] - 0.9) < 1e-9, f"p-1 kept score {page['hits'][0]['score']}, expected its best, 0.9"
+    assert abs(page["hits"][3]["score"] - 0.6) < 1e-6, f"p-3 kept score {page['hits'][3]['score']}, expected its best, 0.6 (shard-2's, not shard-1's 0.4)"
     page = m.fan_out("t-1", "kettle", 2)
-    assert _ids(page) == ["p-1", "p-2"], f"page_size 2 answered {_ids(page)}, expected the two best: [p-1, p-2]"
+    assert _ids(page) == ["p-1", "p-0"], f"page_size 2 answered {_ids(page)}, expected the two best: [p-1, p-0]"
 `,
     typescript: `const PAGES: Record<string, [string, string, number][]> = {
   'shard-0:9000': [['p-1', 'Steel Kettle', 0.9], ['p-2', 'Glass Kettle', 0.7]],
   'shard-1:9000': [['p-1', 'Steel Kettle', 0.8], ['p-3', 'Kettle Descaler', 0.4]],
-  'shard-2:9000': [['p-4', 'Travel Kettle', 0.6]],
+  'shard-2:9000': [['p-0', 'Camp Kettle', 0.7], ['p-3', 'Kettle Descaler', 0.6], ['p-4', 'Travel Kettle', 0.6]],
 };
 
 function shards(ctx) {
@@ -724,14 +744,32 @@ export async function check_deadline(ctx) {
     assert(call.timeout >= 0.3 && call.timeout <= 0.4, \`the Search call to \${call.target} carries a \${call.timeout} s deadline, expected SHARD_DEADLINE_MS = 350\`);
   }
   ctx.grpc.setLatency('Search', 5.0, 'shard-2:9000');
-  const page = await m.fanOut('t-1', 'kettle', 10);
+  let page = await m.fanOut('t-1', 'kettle', 10);
   assert(!ids(page).includes('p-4'), \`the search waited for a shard 5 s slow and answered \${ids(page)}: shard-2 must miss the 350 ms deadline\`);
+  assert(page.partial === true && JSON.stringify(page.missed) === '["shard-2:9000"]', \`shard-2 missed its deadline and the page answered partial=\${page.partial} missed=\${JSON.stringify(page.missed)}, expected partial=true missed=["shard-2:9000"]\`);
+  // Every shard answers in 300 ms: each call has its own 350 ms, so the third shard is as welcome as the first.
+  for (const target of Object.keys(PAGES)) ctx.grpc.setLatency('Search', 0.3, target);
+  try {
+    page = await m.fanOut('t-1', 'kettle', 10);
+  } catch (e) {
+    assert.fail(\`with every shard answering in 300 ms fanOut threw \${(e as Error).constructor.name} (\${(e as Error).message}): each Search call carries its own SHARD_DEADLINE_MS, not what is left of one budget shared by the three\`);
+  }
+  assert(page.partial === false && ids(page).includes('p-4'), \`with every shard answering in 300 ms the page answered \${ids(page)} partial=\${page.partial} missed=\${JSON.stringify(page.missed)}: each Search call carries its own SHARD_DEADLINE_MS, not what is left of one budget shared by the three\`);
 }
 
 export async function check_partial(ctx) {
   const m = shards(ctx);
   let page = await m.fanOut('t-1', 'kettle', 10);
   assert(page.partial === false && page.missed.length === 0, \`with every shard healthy the page must not be partial, got partial=\${page.partial} missed=\${JSON.stringify(page.missed)}\`);
+  for (const [target, code] of [['shard-1:9000', 'INTERNAL'], ['shard-0:9000', 'RESOURCE_EXHAUSTED']]) {
+    ctx.grpc.fail('Search', ctx.grpc.status[code], 'shard error', 1, target);
+    try {
+      page = await m.fanOut('t-1', 'kettle', 10);
+    } catch (e) {
+      assert.fail(\`\${target} failing with \${code} made fanOut throw \${(e as Error).constructor.name}: \${(e as Error).message}. A shard whose call fails goes into missed\`);
+    }
+    assert(page.partial === true && JSON.stringify(page.missed) === JSON.stringify([target]), \`\${target} failed with \${code} and the page answered partial=\${page.partial} missed=\${JSON.stringify(page.missed)}, expected partial=true missed=["\${target}"]\`);
+  }
   ctx.grpc.stop('shard-2:9000');
   page = await m.fanOut('t-1', 'kettle', 10);
   assert.equal(page.partial, true, \`a page that lost shard-2 answered partial=\${page.partial} with \${ids(page)}: a shopper reads a short page as the whole catalog\`);
@@ -757,10 +795,11 @@ export async function check_quorum(ctx) {
 export async function check_dedupe(ctx) {
   const m = shards(ctx);
   let page = await m.fanOut('t-1', 'kettle', 10);
-  assert.equal(ids(page), '["p-1","p-2","p-4","p-3"]', \`the merged page is \${ids(page)}, expected [p-1, p-2, p-4, p-3]: one entry per product, highest score first\`);
+  assert.equal(ids(page), '["p-1","p-0","p-2","p-3","p-4"]', \`the merged page is \${ids(page)}, expected [p-1, p-0, p-2, p-3, p-4]: one entry per product at its highest score, highest first, ties by product_id\`);
   assert(Math.abs(page.hits[0].score - 0.9) < 1e-9, \`p-1 kept score \${page.hits[0].score}, expected its best, 0.9\`);
+  assert(Math.abs(page.hits[3].score - 0.6) < 1e-6, \`p-3 kept score \${page.hits[3].score}, expected its best, 0.6 (shard-2's, not shard-1's 0.4)\`);
   page = await m.fanOut('t-1', 'kettle', 2);
-  assert.equal(ids(page), '["p-1","p-2"]', \`page size 2 answered \${ids(page)}, expected the two best: [p-1, p-2]\`);
+  assert.equal(ids(page), '["p-1","p-0"]', \`page size 2 answered \${ids(page)}, expected the two best: [p-1, p-0]\`);
 }
 `,
     go: `package main
@@ -771,12 +810,17 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+
 	pb "search/gen/product_search"
 
 	"leetbuild/harness"
 )
 
-var shardBg = context.Background()
+var (
+	shardBg      = context.Background()
+	shardTargets = []string{"shard-0:9000", "shard-1:9000", "shard-2:9000"}
+)
 
 // shardPeer is one shard: its fixed page for any query, cut to the requested size.
 type shardPeer struct {
@@ -796,16 +840,16 @@ func serveShards(ctx *harness.Ctx) {
 	// One peer per literal target: the harness keys a stand-in by the target string it is given here.
 	pb.RegisterShardServer(ctx.GRPC.Server("shard-0:9000"), &shardPeer{hits: []*pb.Hit{{ProductId: "p-1", Title: "Steel Kettle", Score: 0.9}, {ProductId: "p-2", Title: "Glass Kettle", Score: 0.7}}})
 	pb.RegisterShardServer(ctx.GRPC.Server("shard-1:9000"), &shardPeer{hits: []*pb.Hit{{ProductId: "p-1", Title: "Steel Kettle", Score: 0.8}, {ProductId: "p-3", Title: "Kettle Descaler", Score: 0.4}}})
-	pb.RegisterShardServer(ctx.GRPC.Server("shard-2:9000"), &shardPeer{hits: []*pb.Hit{{ProductId: "p-4", Title: "Travel Kettle", Score: 0.6}}})
+	pb.RegisterShardServer(ctx.GRPC.Server("shard-2:9000"), &shardPeer{hits: []*pb.Hit{{ProductId: "p-0", Title: "Camp Kettle", Score: 0.7}, {ProductId: "p-3", Title: "Kettle Descaler", Score: 0.6}, {ProductId: "p-4", Title: "Travel Kettle", Score: 0.6}}})
 }
 
-func merged(ctx *harness.Ctx, pageSize int) *Page {
+func hMerged(ctx *harness.Ctx, pageSize int) *Page {
 	page, err := fanOut(shardBg, "t-1", "kettle", pageSize)
 	ctx.NoError(err, "fanOut failed")
 	return page
 }
 
-func pageIDs(page *Page) string {
+func hPageIDs(page *Page) string {
 	ids := []string{}
 	for _, h := range page.Hits {
 		ids = append(ids, h.GetProductId())
@@ -815,7 +859,7 @@ func pageIDs(page *Page) string {
 
 func CheckDeadline(ctx *harness.Ctx) {
 	serveShards(ctx)
-	merged(ctx, 10)
+	hMerged(ctx, 10)
 	calls := ctx.GRPC.CallsTo("Search", "")
 	ctx.Equal(len(calls), 3, "fanOut must make one Search call per shard; the calls")
 	for _, call := range calls {
@@ -823,39 +867,57 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(300*time.Millisecond <= call.Timeout && call.Timeout <= 400*time.Millisecond, "a Search call carries a %v deadline, expected shardDeadline = 350 ms", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("Search", 5.0, "shard-2:9000")
-	page := merged(ctx, 10)
-	ctx.Assert(!strings.Contains(pageIDs(page), "p-4"), "the search waited for a shard 5 s slow and answered [%s]: shard-2 must miss the 350 ms deadline", pageIDs(page))
+	page := hMerged(ctx, 10)
+	ctx.Assert(!strings.Contains(hPageIDs(page), "p-4"), "the search waited for a shard 5 s slow and answered [%s]: shard-2 must miss the 350 ms deadline", hPageIDs(page))
+	ctx.Assert(page.Partial && len(page.Missed) == 1 && page.Missed[0] == "shard-2:9000", "shard-2 missed its deadline and the page answered Partial=%v Missed=%q, expected Partial=true Missed=[shard-2:9000]", page.Partial, page.Missed)
+	// Every shard answers in 300 ms: each call has its own 350 ms, so the third shard is as welcome as the first.
+	for _, target := range shardTargets {
+		ctx.GRPC.SetLatency("Search", 0.3, target)
+	}
+	page, err := fanOut(shardBg, "t-1", "kettle", 10)
+	ctx.NoError(err, "with every shard answering in 300 ms fanOut failed: each Search call carries its own shardDeadline, not what is left of one budget shared by the three")
+	ctx.Assert(!page.Partial && strings.Contains(hPageIDs(page), "p-4"), "with every shard answering in 300 ms the page answered [%s] Partial=%v Missed=%q: each Search call carries its own shardDeadline, not what is left of one budget shared by the three", hPageIDs(page), page.Partial, page.Missed)
 }
 
 func CheckPartial(ctx *harness.Ctx) {
 	serveShards(ctx)
-	page := merged(ctx, 10)
+	page := hMerged(ctx, 10)
 	ctx.Assert(!page.Partial && len(page.Missed) == 0, "with every shard healthy the page must not be partial, got Partial=%v Missed=%q", page.Partial, page.Missed)
+	for _, failure := range []struct {
+		target string
+		code   codes.Code
+	}{{"shard-1:9000", codes.Internal}, {"shard-0:9000", codes.ResourceExhausted}} {
+		ctx.GRPC.Fail("Search", failure.code, "shard error", 1, failure.target)
+		page, err := fanOut(shardBg, "t-1", "kettle", 10)
+		ctx.NoError(err, "%s failing with %v made fanOut fail: a shard whose call fails goes into missed", failure.target, failure.code)
+		ctx.Assert(page.Partial && len(page.Missed) == 1 && page.Missed[0] == failure.target, "%s failed with %v and the page answered Partial=%v Missed=%q, expected Partial=true Missed=[%s]", failure.target, failure.code, page.Partial, page.Missed, failure.target)
+	}
 	ctx.GRPC.Stop("shard-2:9000")
-	page = merged(ctx, 10)
-	ctx.Assert(page.Partial, "a page that lost shard-2 answered Partial=false with [%s]: a shopper reads a short page as the whole catalog", pageIDs(page))
+	page = hMerged(ctx, 10)
+	ctx.Assert(page.Partial, "a page that lost shard-2 answered Partial=false with [%s]: a shopper reads a short page as the whole catalog", hPageIDs(page))
 	ctx.Equal(page.Missed, []string{"shard-2:9000"}, "the missed shards")
-	ctx.Assert(strings.Contains(pageIDs(page), "p-1") && !strings.Contains(pageIDs(page), "p-4"), "the partial page holds [%s]", pageIDs(page))
+	ctx.Assert(strings.Contains(hPageIDs(page), "p-1") && !strings.Contains(hPageIDs(page), "p-4"), "the partial page holds [%s]", hPageIDs(page))
 }
 
 func CheckQuorum(ctx *harness.Ctx) {
 	serveShards(ctx)
 	ctx.GRPC.Stop("shard-2:9000")
-	ctx.Assert(pageIDs(merged(ctx, 10)) != "", "with two of three shards answering the search must answer a page")
+	ctx.Assert(hPageIDs(hMerged(ctx, 10)) != "", "with two of three shards answering the search must answer a page")
 	ctx.GRPC.Stop("shard-1:9000")
 	page, err := fanOut(shardBg, "t-1", "kettle", 10)
 	if err == nil {
-		ctx.Fatalf("with one shard of three answering fanOut returned [%s] (Partial=%v): below a majority it must return ErrSearchUnavailable", pageIDs(page), page.Partial)
+		ctx.Fatalf("with one shard of three answering fanOut returned [%s] (Partial=%v): below a majority it must return ErrSearchUnavailable", hPageIDs(page), page.Partial)
 	}
 	ctx.ErrorIs(err, ErrSearchUnavailable, "below a majority fanOut returned %v", err)
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
 	serveShards(ctx)
-	page := merged(ctx, 10)
-	ctx.Equal(pageIDs(page), "p-1,p-2,p-4,p-3", "the merged page must hold one entry per product, highest score first")
+	page := hMerged(ctx, 10)
+	ctx.Equal(hPageIDs(page), "p-1,p-0,p-2,p-3,p-4", "the merged page must hold one entry per product at its highest score, highest first, ties by product id")
 	ctx.Assert(math.Abs(page.Hits[0].GetScore()-0.9) < 1e-9, "p-1 kept score %v, expected its best, 0.9", page.Hits[0].GetScore())
-	ctx.Equal(pageIDs(merged(ctx, 2)), "p-1,p-2", "page size 2 must keep the two best")
+	ctx.Assert(math.Abs(page.Hits[3].GetScore()-0.6) < 1e-6, "p-3 kept score %v, expected its best, 0.6 (shard-2's, not shard-1's 0.4)", page.Hits[3].GetScore())
+	ctx.Equal(hPageIDs(hMerged(ctx, 2)), "p-1,p-0", "page size 2 must keep the two best")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -864,6 +926,7 @@ func CheckDedupe(ctx *harness.Ctx) {
 #include <map>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -889,21 +952,21 @@ void serveShards(harness::Ctx& ctx) {
   peers = new std::map<std::string, ShardPeer>;
   (*peers)["shard-0:9000"].hits = {{"p-1", "Steel Kettle", 0.9}, {"p-2", "Glass Kettle", 0.7}};
   (*peers)["shard-1:9000"].hits = {{"p-1", "Steel Kettle", 0.8}, {"p-3", "Kettle Descaler", 0.4}};
-  (*peers)["shard-2:9000"].hits = {{"p-4", "Travel Kettle", 0.6}};
+  (*peers)["shard-2:9000"].hits = {{"p-0", "Camp Kettle", 0.7}, {"p-3", "Kettle Descaler", 0.6}, {"p-4", "Travel Kettle", 0.6}};
   for (auto& [target, peer] : *peers) ctx.GRPC.Server(target)->RegisterService(&peer);
 }
 
-std::string pageIDs(const Page& page) {
+std::string hPageIDs(const Page& page) {
   std::string ids;
   for (const auto& hit : page.hits) ids += (ids.empty() ? "" : ",") + hit.product_id();
   return ids;
 }
 
-Page merged(harness::Ctx& ctx, int page_size) {
+Page hMerged(harness::Ctx& ctx, int page_size, const char* when = "") {
   try {
     return fanOut("t-1", "kettle", page_size);
   } catch (const std::exception& e) {
-    ctx.Fatalf("fanOut threw %s: %s", harness::CurrentExceptionType(), e.what());
+    ctx.Fatalf("%sfanOut threw %s: %s", when, harness::CurrentExceptionType(), e.what());
   }
   return Page{};
 }
@@ -912,7 +975,7 @@ Page merged(harness::Ctx& ctx, int page_size) {
 
 void CheckDeadline(harness::Ctx& ctx) {
   serveShards(ctx);
-  merged(ctx, 10);
+  hMerged(ctx, 10);
   const auto calls = ctx.GRPC.CallsTo("Search");
   ctx.Equal(calls.size(), 3, "fanOut must make one Search call per shard; the calls");
   for (const auto& call : calls) {
@@ -920,25 +983,36 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(0.3 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 0.4, "a Search call carries a %v s deadline, expected kShardDeadline = 350 ms", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("Search", 5.0, "shard-2:9000");
-  const Page page = merged(ctx, 10);
-  ctx.Assert(pageIDs(page).find("p-4") == std::string::npos, "the search waited for a shard 5 s slow and answered [%s]: shard-2 must miss the 350 ms deadline", pageIDs(page));
+  Page page = hMerged(ctx, 10);
+  ctx.Assert(hPageIDs(page).find("p-4") == std::string::npos, "the search waited for a shard 5 s slow and answered [%s]: shard-2 must miss the 350 ms deadline", hPageIDs(page));
+  ctx.Assert(page.partial && page.missed == std::vector<std::string>{"shard-2:9000"}, "shard-2 missed its deadline and the page answered partial=%t missed=%q, expected partial=true missed=[shard-2:9000]", page.partial, page.missed);
+  // Every shard answers in 300 ms: each call has its own 350 ms, so the third shard is as welcome as the first.
+  for (const std::string target : {"shard-0:9000", "shard-1:9000", "shard-2:9000"}) ctx.GRPC.SetLatency("Search", 0.3, target);
+  page = hMerged(ctx, 10, "with every shard answering in 300 ms (each Search call carries its own kShardDeadline, not what is left of one budget shared by the three) ");
+  ctx.Assert(!page.partial && hPageIDs(page).find("p-4") != std::string::npos, "with every shard answering in 300 ms the page answered [%s] partial=%t missed=%q: each Search call carries its own kShardDeadline, not what is left of one budget shared by the three", hPageIDs(page), page.partial, page.missed);
 }
 
 void CheckPartial(harness::Ctx& ctx) {
   serveShards(ctx);
-  Page page = merged(ctx, 10);
+  Page page = hMerged(ctx, 10);
   ctx.Assert(!page.partial && page.missed.empty(), "with every shard healthy the page must not be partial, got partial=%t missed=%q", page.partial, page.missed);
+  const std::vector<std::pair<std::string, grpc::StatusCode>> failures = {{"shard-1:9000", grpc::StatusCode::INTERNAL}, {"shard-0:9000", grpc::StatusCode::RESOURCE_EXHAUSTED}};
+  for (const auto& [target, code] : failures) {
+    ctx.GRPC.Fail("Search", code, "shard error", 1, target);
+    page = hMerged(ctx, 10, "a shard whose call fails goes into missed, but ");
+    ctx.Assert(page.partial && page.missed == std::vector<std::string>{target}, "%s failed with status %d and the page answered partial=%t missed=%q, expected partial=true missed=[%s]", target, static_cast<int>(code), page.partial, page.missed, target);
+  }
   ctx.GRPC.Stop("shard-2:9000");
-  page = merged(ctx, 10);
-  ctx.Assert(page.partial, "a page that lost shard-2 answered partial=false with [%s]: a shopper reads a short page as the whole catalog", pageIDs(page));
+  page = hMerged(ctx, 10);
+  ctx.Assert(page.partial, "a page that lost shard-2 answered partial=false with [%s]: a shopper reads a short page as the whole catalog", hPageIDs(page));
   ctx.Equal(page.missed, {"shard-2:9000"}, "the missed shards");
-  ctx.Assert(pageIDs(page).find("p-1") != std::string::npos && pageIDs(page).find("p-4") == std::string::npos, "the partial page holds [%s]", pageIDs(page));
+  ctx.Assert(hPageIDs(page).find("p-1") != std::string::npos && hPageIDs(page).find("p-4") == std::string::npos, "the partial page holds [%s]", hPageIDs(page));
 }
 
 void CheckQuorum(harness::Ctx& ctx) {
   serveShards(ctx);
   ctx.GRPC.Stop("shard-2:9000");
-  ctx.Assert(!pageIDs(merged(ctx, 10)).empty(), "with two of three shards answering the search must answer a page");
+  ctx.Assert(!hPageIDs(hMerged(ctx, 10)).empty(), "with two of three shards answering the search must answer a page");
   ctx.GRPC.Stop("shard-1:9000");
   Page page;
   try {
@@ -948,15 +1022,16 @@ void CheckQuorum(harness::Ctx& ctx) {
   } catch (const std::exception& e) {
     ctx.Fatalf("below a majority fanOut threw %s: %s, expected SearchUnavailable", harness::CurrentExceptionType(), e.what());
   }
-  ctx.Fatalf("with one shard of three answering fanOut returned [%s] (partial=%t): below a majority it must throw SearchUnavailable", pageIDs(page), page.partial);
+  ctx.Fatalf("with one shard of three answering fanOut returned [%s] (partial=%t): below a majority it must throw SearchUnavailable", hPageIDs(page), page.partial);
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
   serveShards(ctx);
-  const Page page = merged(ctx, 10);
-  ctx.Equal(pageIDs(page), "p-1,p-2,p-4,p-3", "the merged page must hold one entry per product, highest score first");
+  const Page page = hMerged(ctx, 10);
+  ctx.Equal(hPageIDs(page), "p-1,p-0,p-2,p-3,p-4", "the merged page must hold one entry per product at its highest score, highest first, ties by product id");
   ctx.Assert(!page.hits.empty() && std::fabs(page.hits.front().score() - 0.9) < 1e-9, "p-1 kept score %v, expected its best, 0.9", page.hits.empty() ? 0.0 : page.hits.front().score());
-  ctx.Equal(pageIDs(merged(ctx, 2)), "p-1,p-2", "page size 2 must keep the two best");
+  ctx.Assert(page.hits.size() > 3 && std::fabs(page.hits[3].score() - 0.6) < 1e-6, "p-3 kept score %v, expected its best, 0.6 (shard-2's, not shard-1's 0.4)", page.hits.size() > 3 ? page.hits[3].score() : 0.0);
+  ctx.Equal(hPageIDs(hMerged(ctx, 2)), "p-1,p-0", "page size 2 must keep the two best");
 }
 `,
   },

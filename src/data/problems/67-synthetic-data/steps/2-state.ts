@@ -60,7 +60,7 @@ Requirements, kept by **one Lua script** per operation:
       id: 'entity-limit',
       title: 'Throttles the sixth record of one entity in a window',
       detail:
-        'Five claims for one entity in one window are ok, the sixth is throttled, and another entity has its own counter at window_key(job, entity, window).',
+        'Five claims for one entity in one window are ok and answer counts 1 to 5, the sixth is throttled, and another entity has its own counter at window_key(job, entity, window).',
       match: {
         python: {all: [/ENTITY_LIMIT/, /window_key\(/]},
         typescript: {all: [/ENTITY_LIMIT/, /windowKey\(/]},
@@ -89,7 +89,7 @@ Requirements, kept by **one Lua script** per operation:
       id: 'throttle-spares-cap',
       title: 'A throttled claim leaves the record cap alone',
       detail:
-        'Throttled claims count as throttled and leave generated where it was, so the job still reaches max_records with other entities; generated never passes max_records. The starter increments generated before it tests the window.',
+        "Throttled claims count as throttled and leave generated where it was, so the job still reaches max_records with other entities. Generated never passes max_records, even when another worker takes the last record during a claim, and a claim answered cap takes no slot in its entity's window. The starter increments generated before it tests the window.",
       match: {
         python: {order: [/['"]throttled['"]\s*,\s*1\b/, /['"]generated['"]\s*,\s*1\b/]},
         typescript: {order: [/['"]throttled['"]\s*,\s*1\b/, /['"]generated['"]\s*,\s*1\b/]},
@@ -115,7 +115,7 @@ Requirements, kept by **one Lua script** per operation:
       id: 'key-ttl',
       title: 'Expires the window and the job keys, and stamps updated_at',
       detail:
-        'The window counter gets EXPIRE WINDOW_S, so the next window starts from zero and old counters leave Redis; progress, coverage and records get TTL_S, and the progress hash carries updated_at. The starter sets no expiry and no stamp.',
+        'Right after the claim script runs, the window counter already has EXPIRE WINDOW_S and the progress hash TTL_S and an updated_at in unix seconds. The next window starts from zero and old counters leave Redis; progress, coverage and records get TTL_S again on every move, and settle stamps updated_at too. The starter sets no expiry and no stamp.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /WINDOW_S/, /TTL_S/, /updated_at/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]|\.expire\(/, /WINDOW_S/, /TTL_S/, /updated_at/]},
@@ -729,8 +729,11 @@ def _verdicts(m, entity, n, cap=100):
 
 def check_entity_limit(ctx):
     m = ctx.load("state")
-    verdicts = _verdicts(m, "e-paris", 6)
+    answers = [m.claim(JOB, "e-paris", 100) for _ in range(6)]
+    verdicts = [a["verdict"] for a in answers]
     assert verdicts == ["ok"] * 5 + ["throttled"], f"six claims for one entity in one window answered {verdicts}: five are ok, the sixth is throttled"
+    counts = [int(a["count"]) for a in answers[:5]]
+    assert counts == [1, 2, 3, 4, 5], f"each ok claim answers the window count after its INCR, got {counts}"
     assert ctx.redis.get(_window("e-paris")) == "5", f"the window counter {_window('e-paris')} must read 5, it holds {ctx.redis.get(_window('e-paris'))!r} (keys {sorted(ctx.redis.keys('synth:*'))})"
     other = m.claim(JOB, "e-lima", 100)
     assert other["verdict"] == "ok" and other["count"] == 1, f"another entity has its own window and starts at 1, got {other}"
@@ -765,11 +768,24 @@ def check_throttle_spares_cap(ctx):
     assert verdicts == ["throttled"] * 3, f"three more claims for e-paris answered {verdicts}, expected throttled: a throttled claim generates nothing and must not spend the job's record cap"
     progress = _progress(ctx)
     assert progress.get("generated") == 5 and progress.get("throttled") == 3, f"five records generated, three throttled: progress holds {progress}"
+
+    def other_worker():
+        # another worker claiming the job's last record, landing during this worker's claim
+        if int(ctx.redis.hget(f"synth:progress:{JOB}", "generated") or 0) >= 6:
+            return "cap"
+        ctx.redis.hincrby(f"synth:progress:{JOB}", "generated", 1)
+        return "ok"
+
+    probe = ctx.redis_after(f"synth:progress:{JOB}", other_worker)
     other = m.claim(JOB, "e-lima", 6)
-    assert other["verdict"] == "ok", f"the job has generated 5 of 6 records, so e-lima gets the sixth; got {other}"
+    assert probe.fired, "claim never touched the progress hash"
+    raced = sorted([other["verdict"], probe.result])
+    assert raced == ["cap", "ok"], f"the job had generated 5 of 6 records and two workers raced for the sixth: the verdicts were {raced}, expected one ok and one cap (the cap test and HINCRBY generated must run in the same script)"
+    assert _progress(ctx).get("generated") == 6, f"generated must stop at max_records, it reads {_progress(ctx).get('generated')}"
     full = m.claim(JOB, "e-rome", 6)
     assert full["verdict"] == "cap", f"with 6 of 6 generated the next claim is cap, got {full}"
     assert _progress(ctx).get("generated") == 6, f"generated must stop at max_records, it reads {_progress(ctx).get('generated')}"
+    assert ctx.redis.get(_window("e-rome")) in (None, "0"), f"a claim answered cap generates nothing, yet it took a slot of e-rome's window: {_window('e-rome')} reads {ctx.redis.get(_window('e-rome'))}"
 
 
 def check_coverage_per_entity(ctx):
@@ -786,21 +802,48 @@ def check_coverage_per_entity(ctx):
     assert records == {"r-0": "digest-0", "r-1": "digest-1", "r-2": "digest-2"}, f"only admitted records keep a seed digest, synth:records:{JOB} holds {records}"
 
 
-def check_key_ttl(ctx):
-    m = ctx.load("state")
-    assert m.claim(JOB, "e-paris", 100)["verdict"] == "ok"
-    m.settle(JOB, "r-1", "e-paris", "admitted", "d-1")
-    window = _window("e-paris")
-    ttl = ctx.redis.ttl(window)
-    assert 0 < ttl <= 60, f"{window} has TTL {ttl}: the window counter expires after WINDOW_S (60 s), or a busy entity stays throttled and old windows pile up"
+def _job_keys_live(ctx, when):
     for key in (f"synth:progress:{JOB}", f"synth:coverage:{JOB}", f"synth:records:{JOB}"):
         ttl = ctx.redis.ttl(key)
-        assert ttl != -2, f"{key} does not exist after a claim and an admitted settle"
-        assert 0 < ttl <= 86_400, f"{key} has TTL {ttl}: every key the job owns expires TTL_S (86400 s) after its last move"
+        assert ttl != -2, f"{key} does not exist {when}"
+        assert 0 < ttl <= 86_400, f"{key} has TTL {ttl} {when}: every key the job owns expires TTL_S (86400 s) after its last move"
+
+
+def _stamp(ctx):
     stamp = ctx.redis.hget(f"synth:progress:{JOB}", "updated_at")
     assert stamp is not None and stamp.isdigit(), f"the progress hash must carry updated_at (unix seconds), it holds {ctx.redis.hgetall(f'synth:progress:{JOB}')}"
+    return int(stamp)
+
+
+def check_key_ttl(ctx):
+    m = ctx.load("state")
+    window = _window("e-paris")
+
+    def right_after_claim():
+        # what another reader sees the moment the claim's first command lands
+        return ctx.redis.ttl(window), ctx.redis.ttl(f"synth:progress:{JOB}"), ctx.redis.hget(f"synth:progress:{JOB}", "updated_at")
+
+    probe = ctx.redis_after(window, right_after_claim)
+    assert m.claim(JOB, "e-paris", 100)["verdict"] == "ok"
+    assert probe.fired, "claim never touched the window counter"
+    wttl, pttl, pstamp = probe.result
+    assert 0 < wttl <= 60, f"right after the claim's first command {window} had TTL {wttl}: the expiry is set in the same script as the INCR, or a crash between two commands leaves a counter that never expires"
+    assert 0 < pttl <= 86_400, f"right after the claim's first command synth:progress:{JOB} had TTL {pttl}: the claim script sets it"
+    assert pstamp is not None and pstamp.isdigit() and abs(int(pstamp) - int(time.time())) <= 1, f"right after the claim's first command updated_at read {pstamp!r}, expected the unix seconds of the claim ({int(time.time())}): every script stamps it"
+    m.settle(JOB, "r-1", "e-paris", "admitted", "d-1")
+    ttl = ctx.redis.ttl(window)
+    assert 0 < ttl <= 60, f"{window} has TTL {ttl}: the window counter expires after WINDOW_S (60 s), or a busy entity stays throttled and old windows pile up"
+    _job_keys_live(ctx, "after a claim and an admitted settle")
+    _stamp(ctx)
     ctx.clock.advance(61)
     assert ctx.redis.get(window) is None, f"a minute later the old window counter must be gone, it still reads {ctx.redis.get(window)}"
+    ctx.clock.advance(80_000)
+    assert m.claim(JOB, "e-lima", 100)["verdict"] == "ok"
+    ctx.clock.advance(5)
+    m.settle(JOB, "r-2", "e-lima", "admitted", "d-2")
+    assert _stamp(ctx) == int(time.time()), f"settle must stamp updated_at with its own time {int(time.time())}, the progress hash holds {ctx.redis.hgetall(f'synth:progress:{JOB}')}"
+    ctx.clock.advance(10_000)
+    _job_keys_live(ctx, "10000 s after the job's last move (a claim and an admitted settle 80000 s after the first): each move restarts TTL_S")
     ctx.clock.advance(86_400)
     assert ctx.redis.keys("synth:*") == [], f"a day after its last move the job must be gone, found {sorted(ctx.redis.keys('synth:*'))}"
 `,
@@ -817,8 +860,12 @@ async function verdicts(m, entity: string, n: number, cap = 100): Promise<string
 
 export async function check_entity_limit(ctx) {
   const m = ctx.load('state');
-  const got = await verdicts(m, 'e-paris', 6);
+  const answers = [];
+  for (let i = 0; i < 6; i += 1) answers.push(await m.claim(JOB, 'e-paris', 100));
+  const got = answers.map(a => a.verdict);
   assert.deepEqual(got, ['ok', 'ok', 'ok', 'ok', 'ok', 'throttled'], \`six claims for one entity in one window answered \${JSON.stringify(got)}: five are ok, the sixth is throttled\`);
+  const counts = answers.slice(0, 5).map(a => Number(a.count));
+  assert.deepEqual(counts, [1, 2, 3, 4, 5], \`each ok claim answers the window count after its INCR, got \${JSON.stringify(counts)}\`);
   assert.equal(ctx.redis.get(windowOf(ctx, 'e-paris')), '5', \`the window counter \${windowOf(ctx, 'e-paris')} must read 5 (keys \${JSON.stringify(ctx.redis.keys('synth:*').sort())})\`);
   const other = await m.claim(JOB, 'e-lima', 100);
   assert(other.verdict === 'ok' && other.count === 1, \`another entity has its own window and starts at 1, got \${JSON.stringify(other)}\`);
@@ -850,11 +897,22 @@ export async function check_throttle_spares_cap(ctx) {
   assert.deepEqual(got, ['throttled', 'throttled', 'throttled'], \`three more claims for e-paris answered \${JSON.stringify(got)}, expected throttled: a throttled claim generates nothing and must not spend the job's record cap\`);
   const p = progress(ctx);
   assert(p.generated === 5 && p.throttled === 3, \`five records generated, three throttled: progress holds \${JSON.stringify(p)}\`);
+  // another worker claiming the job's last record, landing during this worker's claim
+  const probe = ctx.redisAfter(\`synth:progress:\${JOB}\`, () => {
+    if (Number(ctx.redis.hget(\`synth:progress:\${JOB}\`, 'generated') ?? 0) >= 6) return 'cap';
+    ctx.redis.hincrby(\`synth:progress:\${JOB}\`, 'generated', 1);
+    return 'ok';
+  });
   const other = await m.claim(JOB, 'e-lima', 6);
-  assert.equal(other.verdict, 'ok', \`the job has generated 5 of 6 records, so e-lima gets the sixth; got \${JSON.stringify(other)}\`);
+  assert(probe.fired, 'claim never touched the progress hash');
+  const raced = [other.verdict, probe.result].sort();
+  assert.deepEqual(raced, ['cap', 'ok'], \`the job had generated 5 of 6 records and two workers raced for the sixth: the verdicts were \${JSON.stringify(raced)}, expected one ok and one cap (the cap test and HINCRBY generated must run in the same script)\`);
+  assert.equal(progress(ctx).generated, 6, \`generated must stop at max_records, it reads \${progress(ctx).generated}\`);
   const full = await m.claim(JOB, 'e-rome', 6);
   assert.equal(full.verdict, 'cap', \`with 6 of 6 generated the next claim is cap, got \${JSON.stringify(full)}\`);
   assert.equal(progress(ctx).generated, 6, \`generated must stop at max_records, it reads \${progress(ctx).generated}\`);
+  const rome = ctx.redis.get(windowOf(ctx, 'e-rome'));
+  assert(rome === null || rome === '0', \`a claim answered cap generates nothing, yet it took a slot of e-rome's window: \${windowOf(ctx, 'e-rome')} reads \${rome}\`);
 }
 
 export async function check_coverage_per_entity(ctx) {
@@ -872,22 +930,47 @@ export async function check_coverage_per_entity(ctx) {
   assert.deepEqual(records, {'r-0': 'digest-0', 'r-1': 'digest-1', 'r-2': 'digest-2'}, \`only admitted records keep a seed digest, synth:records:\${JOB} holds \${JSON.stringify(records)}\`);
 }
 
-export async function check_key_ttl(ctx) {
-  const m = ctx.load('state');
-  assert.equal((await m.claim(JOB, 'e-paris', 100)).verdict, 'ok');
-  await m.settle(JOB, 'r-1', 'e-paris', 'admitted', 'd-1');
-  const window = windowOf(ctx, 'e-paris');
-  const wttl = Number(ctx.redis.ttl(window));
-  assert(0 < wttl && wttl <= 60, \`\${window} has TTL \${wttl}: the window counter expires after WINDOW_S (60 s), or a busy entity stays throttled and old windows pile up\`);
+function jobKeysLive(ctx, when: string) {
   for (const key of [\`synth:progress:\${JOB}\`, \`synth:coverage:\${JOB}\`, \`synth:records:\${JOB}\`]) {
     const ttl = Number(ctx.redis.ttl(key));
-    assert(ttl !== -2, \`\${key} does not exist after a claim and an admitted settle\`);
-    assert(0 < ttl && ttl <= 86_400, \`\${key} has TTL \${ttl}: every key the job owns expires TTL_S (86400 s) after its last move\`);
+    assert(ttl !== -2, \`\${key} does not exist \${when}\`);
+    assert(0 < ttl && ttl <= 86_400, \`\${key} has TTL \${ttl} \${when}: every key the job owns expires TTL_S (86400 s) after its last move\`);
   }
+}
+
+function stampOf(ctx): number {
   const stamp = ctx.redis.hget(\`synth:progress:\${JOB}\`, 'updated_at');
   assert(typeof stamp === 'string' && /^\\d+$/.test(stamp), \`the progress hash must carry updated_at (unix seconds), it holds \${JSON.stringify(ctx.redis.hgetall(\`synth:progress:\${JOB}\`))}\`);
+  return Number(stamp);
+}
+
+const nowS = ctx => Math.floor(ctx.clock.now() / 1000);
+
+export async function check_key_ttl(ctx) {
+  const m = ctx.load('state');
+  const window = windowOf(ctx, 'e-paris');
+  // what another reader sees the moment the claim's first command lands
+  const probe = ctx.redisAfter(window, () => [Number(ctx.redis.ttl(window)), Number(ctx.redis.ttl(\`synth:progress:\${JOB}\`)), ctx.redis.hget(\`synth:progress:\${JOB}\`, 'updated_at')]);
+  assert.equal((await m.claim(JOB, 'e-paris', 100)).verdict, 'ok');
+  assert(probe.fired, 'claim never touched the window counter');
+  const [wttl0, pttl0, pstamp] = probe.result;
+  assert(0 < wttl0 && wttl0 <= 60, \`right after the claim's first command \${window} had TTL \${wttl0}: the expiry is set in the same script as the INCR, or a crash between two commands leaves a counter that never expires\`);
+  assert(0 < pttl0 && pttl0 <= 86_400, \`right after the claim's first command synth:progress:\${JOB} had TTL \${pttl0}: the claim script sets it\`);
+  assert(typeof pstamp === 'string' && /^\\d+$/.test(pstamp) && Math.abs(Number(pstamp) - nowS(ctx)) <= 1, \`right after the claim's first command updated_at read \${JSON.stringify(pstamp)}, expected the unix seconds of the claim (\${nowS(ctx)}): every script stamps it\`);
+  await m.settle(JOB, 'r-1', 'e-paris', 'admitted', 'd-1');
+  const wttl = Number(ctx.redis.ttl(window));
+  assert(0 < wttl && wttl <= 60, \`\${window} has TTL \${wttl}: the window counter expires after WINDOW_S (60 s), or a busy entity stays throttled and old windows pile up\`);
+  jobKeysLive(ctx, 'after a claim and an admitted settle');
+  stampOf(ctx);
   ctx.clock.advance(61);
   assert.equal(ctx.redis.get(window), null, \`a minute later the old window counter must be gone, it still reads \${ctx.redis.get(window)}\`);
+  ctx.clock.advance(80_000);
+  assert.equal((await m.claim(JOB, 'e-lima', 100)).verdict, 'ok');
+  ctx.clock.advance(5);
+  await m.settle(JOB, 'r-2', 'e-lima', 'admitted', 'd-2');
+  assert.equal(stampOf(ctx), nowS(ctx), \`settle must stamp updated_at with its own time \${nowS(ctx)}, the progress hash holds \${JSON.stringify(ctx.redis.hgetall(\`synth:progress:\${JOB}\`))}\`);
+  ctx.clock.advance(10_000);
+  jobKeysLive(ctx, "10000 s after the job's last move (a claim and an admitted settle 80000 s after the first): each move restarts TTL_S");
   ctx.clock.advance(86_400);
   assert.deepEqual(ctx.redis.keys('synth:*'), [], \`a day after its last move the job must be gone, found \${JSON.stringify(ctx.redis.keys('synth:*').sort())}\`);
 }
@@ -929,7 +1012,16 @@ func stateCount(ctx *harness.Ctx, field string) int64 {
 }
 
 func CheckEntityLimit(ctx *harness.Ctx) {
-	ctx.Equal(stateVerdicts(ctx, "e-paris", 6, 100), []string{"ok", "ok", "ok", "ok", "ok", "throttled"}, "six claims for one entity in one window: five are ok, the sixth is throttled")
+	verdicts, counts := []string{}, []int64{}
+	for i := 0; i < 6; i++ {
+		c := stateClaim(ctx, "e-paris", 100)
+		verdicts = append(verdicts, c.Verdict)
+		if i < 5 {
+			counts = append(counts, int64(c.Count))
+		}
+	}
+	ctx.Equal(verdicts, []string{"ok", "ok", "ok", "ok", "ok", "throttled"}, "six claims for one entity in one window: five are ok, the sixth is throttled")
+	ctx.Equal(counts, []int64{1, 2, 3, 4, 5}, "each ok claim answers the window count after its INCR")
 	got, _ := ctx.Redis.Get(stateWindow(ctx, "e-paris"))
 	ctx.Equal(got, "5", "the window counter %s (keys %v)", stateWindow(ctx, "e-paris"), ctx.Redis.Keys("synth:*"))
 	other := stateClaim(ctx, "e-lima", 100)
@@ -967,9 +1059,27 @@ func CheckThrottleSparesCap(ctx *harness.Ctx) {
 	ctx.Equal(stateVerdicts(ctx, "e-paris", 5, 6), []string{"ok", "ok", "ok", "ok", "ok"}, "the first five claims")
 	ctx.Equal(stateVerdicts(ctx, "e-paris", 3, 6), []string{"throttled", "throttled", "throttled"}, "three more claims for e-paris: a throttled claim generates nothing and must not spend the job's record cap")
 	ctx.Assert(stateCount(ctx, "generated") == 5 && stateCount(ctx, "throttled") == 3, "five records generated, three throttled: progress holds %v", ctx.Redis.HGetAll("synth:progress:"+stateJob))
-	ctx.Equal(stateClaim(ctx, "e-lima", 6).Verdict, "ok", "the job has generated 5 of 6 records, so e-lima gets the sixth")
+	raced := ""
+	// another worker claiming the job's last record, landing during this worker's claim
+	ctx.Redis.After("synth:progress:"+stateJob, func() any {
+		if stateCount(ctx, "generated") >= 6 {
+			raced = "cap"
+			return nil
+		}
+		ctx.Redis.Do("HINCRBY", "synth:progress:"+stateJob, "generated", 1)
+		raced = "ok"
+		return nil
+	})
+	mine := stateClaim(ctx, "e-lima", 6).Verdict
+	ctx.Assert(raced != "", "claim never touched the progress hash")
+	both := []string{mine, raced}
+	sort.Strings(both)
+	ctx.Equal(both, []string{"cap", "ok"}, "the job had generated 5 of 6 records and two workers raced for the sixth: expected one ok and one cap (the cap test and HINCRBY generated must run in the same script); the verdicts")
+	ctx.Equal(stateCount(ctx, "generated"), 6, "generated must stop at max_records")
 	ctx.Equal(stateClaim(ctx, "e-rome", 6).Verdict, "cap", "with 6 of 6 generated the next claim")
 	ctx.Equal(stateCount(ctx, "generated"), 6, "generated must stop at max_records")
+	rome, _ := ctx.Redis.Get(stateWindow(ctx, "e-rome"))
+	ctx.Assert(rome == "" || rome == "0", "a claim answered cap generates nothing, yet it took a slot of e-rome's window: %s reads %s", stateWindow(ctx, "e-rome"), rome)
 }
 
 func CheckCoveragePerEntity(ctx *harness.Ctx) {
@@ -983,22 +1093,57 @@ func CheckCoveragePerEntity(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Redis.HGetAll("synth:records:"+stateJob), map[string]string{"r-0": "digest-0", "r-1": "digest-1", "r-2": "digest-2"}, "only admitted records keep a seed digest in synth:records:%s", stateJob)
 }
 
-func CheckKeyTtl(ctx *harness.Ctx) {
-	ctx.Equal(stateClaim(ctx, "e-paris", 100).Verdict, "ok", "the claim")
-	ctx.NoError(settle(context.Background(), stateJob, "r-1", "e-paris", "admitted", "d-1"), "settle")
-	window := stateWindow(ctx, "e-paris")
-	wttl := ctx.Redis.TTL(window)
-	ctx.Assert(0 < wttl && wttl <= 60, "%s has TTL %d: the window counter expires after WindowSeconds (60 s), or a busy entity stays throttled and old windows pile up", window, wttl)
+func stateKeysLive(ctx *harness.Ctx, when string) {
 	for _, key := range []string{"synth:progress:" + stateJob, "synth:coverage:" + stateJob, "synth:records:" + stateJob} {
 		ttl := ctx.Redis.TTL(key)
-		ctx.Assert(ttl != -2, "%s does not exist after a claim and an admitted settle", key)
-		ctx.Assert(0 < ttl && ttl <= 86_400, "%s has TTL %d: every key the job owns expires TTLSeconds (86400 s) after its last move", key, ttl)
+		ctx.Assert(ttl != -2, "%s does not exist %s", key, when)
+		ctx.Assert(0 < ttl && ttl <= 86_400, "%s has TTL %d %s: every key the job owns expires TTLSeconds (86400 s) after its last move", key, ttl, when)
 	}
+}
+
+var stateDigits = regexp.MustCompile(\`^\\d+$\`)
+
+func stateStamp(ctx *harness.Ctx) int64 {
 	stamp, ok := ctx.Redis.HGet("synth:progress:"+stateJob, "updated_at")
-	ctx.Assert(ok && regexp.MustCompile(\`^\\d+$\`).MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("synth:progress:"+stateJob))
+	ctx.Assert(ok && stateDigits.MatchString(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("synth:progress:"+stateJob))
+	n, _ := strconv.ParseInt(stamp, 10, 64)
+	return n
+}
+
+func CheckKeyTtl(ctx *harness.Ctx) {
+	window := stateWindow(ctx, "e-paris")
+	fired := false
+	var wttl0, pttl0 int64
+	pstamp := ""
+	// what another reader sees the moment the claim's first command lands
+	ctx.Redis.After(window, func() any {
+		fired = true
+		wttl0, pttl0 = ctx.Redis.TTL(window), ctx.Redis.TTL("synth:progress:"+stateJob)
+		pstamp, _ = ctx.Redis.HGet("synth:progress:"+stateJob, "updated_at")
+		return nil
+	})
+	ctx.Equal(stateClaim(ctx, "e-paris", 100).Verdict, "ok", "the claim")
+	ctx.Assert(fired, "claim never touched the window counter")
+	ctx.Assert(0 < wttl0 && wttl0 <= 60, "right after the claim's first command %s had TTL %d: the expiry is set in the same script as the INCR, or a crash between two commands leaves a counter that never expires", window, wttl0)
+	ctx.Assert(0 < pttl0 && pttl0 <= 86_400, "right after the claim's first command synth:progress:%s had TTL %d: the claim script sets it", stateJob, pttl0)
+	stamp0, _ := strconv.ParseInt(pstamp, 10, 64)
+	now := ctx.Clock.Now() / 1000
+	ctx.Assert(stateDigits.MatchString(pstamp) && stamp0 >= now-1 && stamp0 <= now+1, "right after the claim's first command updated_at read %q, expected the unix seconds of the claim (%d): every script stamps it", pstamp, now)
+	ctx.NoError(settle(context.Background(), stateJob, "r-1", "e-paris", "admitted", "d-1"), "settle")
+	wttl := ctx.Redis.TTL(window)
+	ctx.Assert(0 < wttl && wttl <= 60, "%s has TTL %d: the window counter expires after WindowSeconds (60 s), or a busy entity stays throttled and old windows pile up", window, wttl)
+	stateKeysLive(ctx, "after a claim and an admitted settle")
+	stateStamp(ctx)
 	ctx.Clock.Advance(61)
 	_, still := ctx.Redis.Get(window)
 	ctx.Assert(!still, "a minute later the old window counter %s must be gone", window)
+	ctx.Clock.Advance(80_000)
+	ctx.Equal(stateClaim(ctx, "e-lima", 100).Verdict, "ok", "a claim 80000 s later")
+	ctx.Clock.Advance(5)
+	ctx.NoError(settle(context.Background(), stateJob, "r-2", "e-lima", "admitted", "d-2"), "settle")
+	ctx.Equal(stateStamp(ctx), ctx.Clock.Now()/1000, "settle must stamp updated_at with its own time (%v); updated_at", ctx.Redis.HGetAll("synth:progress:"+stateJob))
+	ctx.Clock.Advance(10_000)
+	stateKeysLive(ctx, "10000 s after the job's last move (a claim and an admitted settle 80000 s after the first): each move restarts TTLSeconds")
 	ctx.Clock.Advance(86_400)
 	ctx.Equal(len(ctx.Redis.Keys("synth:*")), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("synth:*"))
 }
@@ -1008,25 +1153,26 @@ func CheckKeyTtl(ctx *harness.Ctx) {
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace {
 
-const std::string kJob = "j1";
+const std::string hJob = "j1";
 
 std::string stateWindow(harness::Ctx& ctx, const std::string& entity) {
-  return "synth:window:" + kJob + ":" + entity + ":" + std::to_string(ctx.Clock.Now() / 1000 / 60);
+  return "synth:window:" + hJob + ":" + entity + ":" + std::to_string(ctx.Clock.Now() / 1000 / 60);
 }
 
 std::vector<std::string> stateVerdicts(const std::string& entity, int n, long long cap) {
   std::vector<std::string> out;
-  for (int i = 0; i < n; i++) out.push_back(claim(kJob, entity, cap).verdict);
+  for (int i = 0; i < n; i++) out.push_back(claim(hJob, entity, cap).verdict);
   return out;
 }
 
 long long stateCount(harness::Ctx& ctx, const std::string& field) {
-  const auto all = ctx.Redis.HGetAll("synth:progress:" + kJob);
+  const auto all = ctx.Redis.HGetAll("synth:progress:" + hJob);
   const auto it = all.find(field);
   return it == all.end() ? 0 : std::strtoll(it->second.c_str(), nullptr, 10);
 }
@@ -1034,9 +1180,17 @@ long long stateCount(harness::Ctx& ctx, const std::string& field) {
 }  // namespace
 
 void CheckEntityLimit(harness::Ctx& ctx) {
-  ctx.Equal(stateVerdicts("e-paris", 6, 100), {"ok", "ok", "ok", "ok", "ok", "throttled"}, "six claims for one entity in one window: five are ok, the sixth is throttled");
+  std::vector<std::string> verdicts;
+  std::vector<long long> counts;
+  for (int i = 0; i < 6; i++) {
+    const Claim c = claim(hJob, "e-paris", 100);
+    verdicts.push_back(c.verdict);
+    if (i < 5) counts.push_back(c.count);
+  }
+  ctx.Equal(verdicts, {"ok", "ok", "ok", "ok", "ok", "throttled"}, "six claims for one entity in one window: five are ok, the sixth is throttled");
+  ctx.Equal(counts, std::vector<long long>{1, 2, 3, 4, 5}, "each ok claim answers the window count after its INCR");
   ctx.Equal(ctx.Redis.Get(stateWindow(ctx, "e-paris")).value_or(""), "5", "the window counter %s (keys %v)", stateWindow(ctx, "e-paris"), ctx.Redis.Keys("synth:*"));
-  const Claim other = claim(kJob, "e-lima", 100);
+  const Claim other = claim(hJob, "e-lima", 100);
   ctx.Assert(other.verdict == "ok" && other.count == 1, "another entity has its own window and starts at 1, got %s %d", other.verdict, other.count);
 }
 
@@ -1052,10 +1206,10 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
       return;
     }
     ctx.Redis.Do("INCR", key);
-    ctx.Redis.Do("HINCRBY", "synth:progress:" + kJob, "generated", 1);
+    ctx.Redis.Do("HINCRBY", "synth:progress:" + hJob, "generated", 1);
     other = "ok";
   });
-  const Claim mine = claim(kJob, "e-paris", 100);
+  const Claim mine = claim(hJob, "e-paris", 100);
   ctx.Assert(!other.empty(), "claim never touched the window counter");
   std::vector<std::string> verdicts = {mine.verdict, other};
   std::sort(verdicts.begin(), verdicts.end());
@@ -1067,41 +1221,97 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
 void CheckThrottleSparesCap(harness::Ctx& ctx) {
   ctx.Equal(stateVerdicts("e-paris", 5, 6), {"ok", "ok", "ok", "ok", "ok"}, "the first five claims");
   ctx.Equal(stateVerdicts("e-paris", 3, 6), {"throttled", "throttled", "throttled"}, "three more claims for e-paris: a throttled claim generates nothing and must not spend the job's record cap");
-  ctx.Assert(stateCount(ctx, "generated") == 5 && stateCount(ctx, "throttled") == 3, "five records generated, three throttled: progress holds %v", ctx.Redis.HGetAll("synth:progress:" + kJob));
-  ctx.Equal(claim(kJob, "e-lima", 6).verdict, "ok", "the job has generated 5 of 6 records, so e-lima gets the sixth");
-  ctx.Equal(claim(kJob, "e-rome", 6).verdict, "cap", "with 6 of 6 generated the next claim");
+  ctx.Assert(stateCount(ctx, "generated") == 5 && stateCount(ctx, "throttled") == 3, "five records generated, three throttled: progress holds %v", ctx.Redis.HGetAll("synth:progress:" + hJob));
+  std::string raced;
+  // another worker claiming the job's last record, landing during this worker's claim
+  ctx.Redis.After("synth:progress:" + hJob, [&] {
+    if (stateCount(ctx, "generated") >= 6) {
+      raced = "cap";
+      return;
+    }
+    ctx.Redis.Do("HINCRBY", "synth:progress:" + hJob, "generated", 1);
+    raced = "ok";
+  });
+  const std::string mine = claim(hJob, "e-lima", 6).verdict;
+  ctx.Assert(!raced.empty(), "claim never touched the progress hash");
+  std::vector<std::string> both = {mine, raced};
+  std::sort(both.begin(), both.end());
+  ctx.Equal(both, {"cap", "ok"}, "the job had generated 5 of 6 records and two workers raced for the sixth: expected one ok and one cap (the cap test and HINCRBY generated must run in the same script); the verdicts");
   ctx.Equal(stateCount(ctx, "generated"), 6, "generated must stop at max_records");
+  ctx.Equal(claim(hJob, "e-rome", 6).verdict, "cap", "with 6 of 6 generated the next claim");
+  ctx.Equal(stateCount(ctx, "generated"), 6, "generated must stop at max_records");
+  const std::string rome = ctx.Redis.Get(stateWindow(ctx, "e-rome")).value_or("");
+  ctx.Assert(rome.empty() || rome == "0", "a claim answered cap generates nothing, yet it took a slot of e-rome's window: %s reads %s", stateWindow(ctx, "e-rome"), rome);
 }
 
 void CheckCoveragePerEntity(harness::Ctx& ctx) {
   const std::vector<std::pair<std::string, std::string>> plan = {{"e-paris", "admitted"}, {"e-paris", "admitted"}, {"e-lima", "admitted"}, {"e-lima", "parked"}, {"e-rome", "rejected"}};
   for (size_t i = 0; i < plan.size(); i++) {
-    ctx.Equal(claim(kJob, plan[i].first, 100).verdict, "ok", "claim %s", plan[i].first);
-    settle(kJob, "r-" + std::to_string(i), plan[i].first, plan[i].second, "digest-" + std::to_string(i));
+    ctx.Equal(claim(hJob, plan[i].first, 100).verdict, "ok", "claim %s", plan[i].first);
+    settle(hJob, "r-" + std::to_string(i), plan[i].first, plan[i].second, "digest-" + std::to_string(i));
   }
-  ctx.Equal(ctx.Redis.HGetAll("synth:coverage:" + kJob), std::map<std::string, std::string>{{"e-paris", "2"}, {"e-lima", "1"}}, "synth:coverage:%s must count admitted records per entity", kJob);
+  ctx.Equal(ctx.Redis.HGetAll("synth:coverage:" + hJob), std::map<std::string, std::string>{{"e-paris", "2"}, {"e-lima", "1"}}, "synth:coverage:%s must count admitted records per entity", hJob);
   ctx.Equal(std::vector<long long>{stateCount(ctx, "generated"), stateCount(ctx, "admitted"), stateCount(ctx, "parked"), stateCount(ctx, "rejected")}, std::vector<long long>{5, 3, 1, 1},
-            "five generated: three admitted, one parked, one rejected (%v)", ctx.Redis.HGetAll("synth:progress:" + kJob));
-  ctx.Equal(ctx.Redis.HGetAll("synth:records:" + kJob), std::map<std::string, std::string>{{"r-0", "digest-0"}, {"r-1", "digest-1"}, {"r-2", "digest-2"}},
-            "only admitted records keep a seed digest in synth:records:%s", kJob);
+            "five generated: three admitted, one parked, one rejected (%v)", ctx.Redis.HGetAll("synth:progress:" + hJob));
+  ctx.Equal(ctx.Redis.HGetAll("synth:records:" + hJob), std::map<std::string, std::string>{{"r-0", "digest-0"}, {"r-1", "digest-1"}, {"r-2", "digest-2"}},
+            "only admitted records keep a seed digest in synth:records:%s", hJob);
 }
 
+namespace {
+
+void stateKeysLive(harness::Ctx& ctx, const std::string& when) {
+  for (const std::string key : {"synth:progress:" + hJob, "synth:coverage:" + hJob, "synth:records:" + hJob}) {
+    const long long ttl = ctx.Redis.TTL(key);
+    ctx.Assert(ttl != -2, "%s does not exist %s", key, when);
+    ctx.Assert(0 < ttl && ttl <= 86400, "%s has TTL %d %s: every key the job owns expires kTtlSeconds (86400 s) after its last move", key, ttl, when);
+  }
+}
+
+bool stateDigits(const std::optional<std::string>& s) {
+  return s && !s->empty() && std::all_of(s->begin(), s->end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+long long stateStamp(harness::Ctx& ctx) {
+  const auto stamp = ctx.Redis.HGet("synth:progress:" + hJob, "updated_at");
+  ctx.Assert(stateDigits(stamp), "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("synth:progress:" + hJob));
+  return std::strtoll(stamp->c_str(), nullptr, 10);
+}
+
+}  // namespace
+
 void CheckKeyTtl(harness::Ctx& ctx) {
-  ctx.Equal(claim(kJob, "e-paris", 100).verdict, "ok", "the claim");
-  settle(kJob, "r-1", "e-paris", "admitted", "d-1");
   const std::string window = stateWindow(ctx, "e-paris");
+  bool fired = false;
+  long long wttl0 = 0, pttl0 = 0;
+  std::optional<std::string> pstamp;
+  // what another reader sees the moment the claim's first command lands
+  ctx.Redis.After(window, [&] {
+    fired = true;
+    wttl0 = ctx.Redis.TTL(window);
+    pttl0 = ctx.Redis.TTL("synth:progress:" + hJob);
+    pstamp = ctx.Redis.HGet("synth:progress:" + hJob, "updated_at");
+  });
+  ctx.Equal(claim(hJob, "e-paris", 100).verdict, "ok", "the claim");
+  ctx.Assert(fired, "claim never touched the window counter");
+  ctx.Assert(0 < wttl0 && wttl0 <= 60, "right after the claim's first command %s had TTL %d: the expiry is set in the same script as the INCR, or a crash between two commands leaves a counter that never expires", window, wttl0);
+  ctx.Assert(0 < pttl0 && pttl0 <= 86400, "right after the claim's first command synth:progress:%s had TTL %d: the claim script sets it", hJob, pttl0);
+  const long long now = ctx.Clock.Now() / 1000;
+  const long long stamp0 = stateDigits(pstamp) ? std::strtoll(pstamp->c_str(), nullptr, 10) : -1;
+  ctx.Assert(stamp0 >= now - 1 && stamp0 <= now + 1, "right after the claim's first command updated_at read %s, expected the unix seconds of the claim (%d): every script stamps it", pstamp.value_or("nothing"), now);
+  settle(hJob, "r-1", "e-paris", "admitted", "d-1");
   const long long wttl = ctx.Redis.TTL(window);
   ctx.Assert(0 < wttl && wttl <= 60, "%s has TTL %d: the window counter expires after kWindowSeconds (60 s), or a busy entity stays throttled and old windows pile up", window, wttl);
-  for (const std::string key : {"synth:progress:" + kJob, "synth:coverage:" + kJob, "synth:records:" + kJob}) {
-    const long long ttl = ctx.Redis.TTL(key);
-    ctx.Assert(ttl != -2, "%s does not exist after a claim and an admitted settle", key);
-    ctx.Assert(0 < ttl && ttl <= 86400, "%s has TTL %d: every key the job owns expires kTtlSeconds (86400 s) after its last move", key, ttl);
-  }
-  const auto stamp = ctx.Redis.HGet("synth:progress:" + kJob, "updated_at");
-  ctx.Assert(stamp && !stamp->empty() && std::all_of(stamp->begin(), stamp->end(), [](char c) { return c >= '0' && c <= '9'; }),
-             "the progress hash must carry updated_at (unix seconds), it holds %v", ctx.Redis.HGetAll("synth:progress:" + kJob));
+  stateKeysLive(ctx, "after a claim and an admitted settle");
+  stateStamp(ctx);
   ctx.Clock.Advance(61);
   ctx.Assert(!ctx.Redis.Get(window).has_value(), "a minute later the old window counter %s must be gone", window);
+  ctx.Clock.Advance(80000);
+  ctx.Equal(claim(hJob, "e-lima", 100).verdict, "ok", "a claim 80000 s later");
+  ctx.Clock.Advance(5);
+  settle(hJob, "r-2", "e-lima", "admitted", "d-2");
+  ctx.Equal(stateStamp(ctx), static_cast<long long>(ctx.Clock.Now() / 1000), "settle must stamp updated_at with its own time (%v); updated_at", ctx.Redis.HGetAll("synth:progress:" + hJob));
+  ctx.Clock.Advance(10000);
+  stateKeysLive(ctx, "10000 s after the job's last move (a claim and an admitted settle 80000 s after the first): each move restarts kTtlSeconds");
   ctx.Clock.Advance(86400);
   ctx.Equal(ctx.Redis.Keys("synth:*").size(), 0, "a day after its last move the job must be gone (%v); keys left", ctx.Redis.Keys("synth:*"));
 }

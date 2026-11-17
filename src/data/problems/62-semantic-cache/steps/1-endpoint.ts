@@ -85,7 +85,7 @@ to judge the hit.
       id: 'floor',
       title: 'Clamps the caller threshold into the service range',
       detail:
-        'The requested threshold is clamped into `[0.82, 0.99]` before the search, so a caller-sent 0 cannot make an unrelated entry a hit and a caller-sent 1.0 cannot reject every hit. The starter passes the value straight through.',
+        'The requested threshold is clamped into `[0.82, 0.99]` before the search, so a caller-sent 0 cannot make an unrelated entry a hit and a caller-sent 1.0 cannot reject every hit; a threshold inside the range is kept. The starter passes the value straight through.',
       match: {
         python: {all: [/SIMILARITY_FLOOR|0\.82/], none: [/,\s*body\.threshold\s*\)/]},
         typescript: {all: [/SIMILARITY_FLOOR|0\.82/], none: [/,\s*body\.threshold(\s*\?\?\s*[\d.]+)?\s*\)/]},
@@ -98,7 +98,7 @@ to judge the hit.
       id: 'expiry',
       title: 'An entry past its expiry is a miss',
       detail:
-        'An entry is served only while `expires_at > now` (`is_live`). The store hands back the nearest entry whatever its age, and a hash without a TTL (restored, migrated) outlives its expiry; the starter serves it.',
+        'An entry is served only while `expires_at > now` (`is_live`): at `expires_at` itself it is a miss, and the lookup still publishes its result event as a miss. The store hands back the nearest entry whatever its age, and a hash without a TTL (restored, migrated) outlives its expiry; the starter serves it.',
       match: {
         python: {all: [/\bexpires_at\b/]},
         typescript: {all: [/\bexpires_at\b/]},
@@ -111,7 +111,7 @@ to judge the hit.
       id: 'hit-shape',
       title: 'A hit reports its similarity and the entry age',
       detail:
-        'A hit is `{"hit": true, "answer", "entry_id", "similarity", "age_seconds", "policy_version"}`: the similarity and the age let the caller judge the hit. The starter answers only the text.',
+        'A hit is `{"hit": true, "answer", "entry_id", "similarity", "age_seconds", "policy_version"}`, with the similarity the store measured: the similarity and the age let the caller judge the hit. The starter answers only the text.',
       match: {
         python: {all: [/["']age_seconds["']/, /["']hit["']\s*:\s*True/]},
         typescript: {all: [/\bage_seconds\b/, /\bhit:\s*true\b/]},
@@ -773,8 +773,13 @@ void register_routes(httplib::Server& svr) { svr.Post("/v1/semantic-cache/lookup
 
 MV = "2024-06"
 V = [1.0, 0.0, 0.0, 0.0]
-NEAR = [0.9, 0.1, 0.0, 0.0]  # cosine 0.994 to V
+NEAR = [0.9, 0.1, 0.0, 0.0]  # cosine 0.99388 to V
 SO_SO = [0.6, 0.8, 0.0, 0.0]  # cosine 0.6 to V
+UNDER_FLOOR = [0.815, 0.5795, 0.0, 0.0]  # cosine 0.81498 to V
+OVER_FLOOR = [0.825, 0.5651, 0.0, 0.0]  # cosine 0.82502 to V
+UNDER_CAP = [0.9895, 0.1446, 0.0, 0.0]  # cosine 0.98949 to V
+OVER_CAP = [0.9905, 0.1375, 0.0, 0.0]  # cosine 0.99050 to V
+TOPIC = "semantic-cache.result"
 ANSWER = "Refunds take five business days."
 ACME = {"X-Tenant-Id": "acme"}
 
@@ -805,17 +810,31 @@ async def check_route(ctx):
 
 async def check_floor(ctx):
     m = ctx.load("api")
-    _seed(ctx, "e1", SO_SO)  # cosine 0.6 to the question
+    _seed(ctx, "e1", SO_SO, answer="answer at 0.6")
     async with ctx.client(m.app) as c:
-        r = await _lookup(c, V, threshold=0)
-        assert r.status_code == 200, f"lookup answered {r.status_code}: {r.text}"
-        body = r.json()
-        assert body.get("hit") is not True and body.get("answer") in (None, ""), f"with threshold 0 an entry at similarity 0.6 was served: {body}. The caller's threshold is a hint; clamp it to the floor (0.82)"
-        _seed(ctx, "e2", NEAR)  # cosine 0.994
-        r = await _lookup(c, V, threshold=0)
-        assert r.json().get("answer") == ANSWER, f"with threshold 0 an entry at similarity 0.994 must still hit (the floor is 0.82, not 1): {r.json()}"
-        r = await _lookup(c, V, threshold=0.9995)
-        assert r.json().get("answer") == ANSWER, f"with threshold 0.9995 an entry at similarity 0.994 must still hit (the ceiling is 0.99): {r.json()}"
+
+        async def served(threshold):
+            r = await _lookup(c, V, threshold=threshold)
+            assert r.status_code == 200, f"lookup answered {r.status_code}: {r.text}"
+            body = r.json()
+            return None if body.get("hit") is False or body.get("answer") in (None, "") else body.get("answer")
+
+        got = await served(0)
+        assert got is None, f"with threshold 0 an entry at similarity 0.6 was served ({got!r}). The caller's threshold is a hint; clamp it to the floor (0.82)"
+        _seed(ctx, "e2", UNDER_FLOOR, answer="answer at 0.815")
+        got = await served(0)
+        assert got is None, f"with threshold 0 an entry at similarity 0.815 was served ({got!r}): the floor is 0.82"
+        _seed(ctx, "e3", OVER_FLOOR, answer="answer at 0.825")
+        got = await served(0)
+        assert got == "answer at 0.825", f"with threshold 0 an entry at similarity 0.825 must hit (the floor is 0.82), got {got!r}"
+        got = await served(0.85)
+        assert got is None, f"with threshold 0.85 an entry at similarity 0.825 was served ({got!r}): a threshold inside [0.82, 0.99] is the caller's to keep"
+        _seed(ctx, "e4", UNDER_CAP, answer="answer at 0.9895")
+        got = await served(0.9995)
+        assert got is None, f"with threshold 0.9995 an entry at similarity 0.9895 was served ({got!r}): the ceiling is 0.99, so the threshold becomes 0.99"
+        _seed(ctx, "e5", OVER_CAP, answer="answer at 0.9905")
+        got = await served(0.9995)
+        assert got == "answer at 0.9905", f"with threshold 0.9995 an entry at similarity 0.9905 must hit (the ceiling is 0.99), got {got!r}"
 
 
 async def check_expiry(ctx):
@@ -824,24 +843,31 @@ async def check_expiry(ctx):
     async with ctx.client(m.app) as c:
         r = await _lookup(c, V)
         assert r.json().get("answer") == ANSWER, f"a live entry must be served: {r.json()}"
-        ctx.clock.advance(101)
+        ctx.clock.advance(100)
         assert ctx.redis.exists("entry:acme:2024-06:e1") == 1, "the hash is still there: nothing but expires_at says the entry is over"
         r = await _lookup(c, V)
         assert r.status_code == 200, f"lookup answered {r.status_code}: {r.text}"
         body = r.json()
+        assert body.get("hit") is not True and body.get("answer") in (None, ""), f"an entry whose expires_at is now was served: {body}. An entry is live only while expires_at > now"
+        ctx.clock.advance(1)
+        r = await _lookup(c, V)
+        body = r.json()
         assert body.get("hit") is not True and body.get("answer") in (None, ""), f"an entry whose expires_at passed one second ago was served: {body}. Compare expires_at to now before serving"
+    events = [json.loads(rec.value) for rec in ctx.kafka.records(TOPIC)]
+    assert len(events) == 3, f"three lookups published {len(events)} result events: every lookup publishes one, a miss on an expired entry too"
+    assert [e.get("outcome") for e in events] == ["hit", "miss", "miss"], f"the result events say {[e.get('outcome') for e in events]}, expected hit, miss, miss: the lookups on the expired entry are misses"
 
 
 async def check_hit_shape(ctx):
     m = ctx.load("api")
-    _seed(ctx, "e1", V, age=41)
+    _seed(ctx, "e1", NEAR, age=41)
     async with ctx.client(m.app) as c:
         r = await _lookup(c, V)
     assert r.status_code == 200, f"lookup answered {r.status_code}: {r.text}"
     body = r.json()
     assert body.get("hit") is True, f"a hit must say hit: true, got {body}"
     assert body.get("answer") == ANSWER and body.get("entry_id") == "e1", f"a hit carries the answer and its entry_id: {body}"
-    assert isinstance(body.get("similarity"), (int, float)) and 0.99 <= body["similarity"] <= 1.0, f"similarity is {body.get('similarity')!r}, expected the cosine (1.0) so the caller can judge the hit"
+    assert isinstance(body.get("similarity"), (int, float)) and abs(body["similarity"] - 0.9938837346736189) < 1e-9, f"similarity is {body.get('similarity')!r}, expected the cosine 0.9938837346736189 as the store measured it, so the caller can judge the hit"
     assert body.get("age_seconds") == 41, f"age_seconds is {body.get('age_seconds')!r}, expected 41 (now - created_at)"
     assert body.get("policy_version") == "2024-06-1", f"policy_version is {body.get('policy_version')!r}, expected the entry's 2024-06-1"
 
@@ -858,8 +884,13 @@ async def check_miss(ctx):
 `,
     typescript: `const MV = '2024-06';
 const V = [1, 0, 0, 0];
-const NEAR = [0.9, 0.1, 0, 0]; // cosine 0.994 to V
+const NEAR = [0.9, 0.1, 0, 0]; // cosine 0.99388 to V
 const SO_SO = [0.6, 0.8, 0, 0]; // cosine 0.6 to V
+const UNDER_FLOOR = [0.815, 0.5795, 0, 0]; // cosine 0.81498 to V
+const OVER_FLOOR = [0.825, 0.5651, 0, 0]; // cosine 0.82502 to V
+const UNDER_CAP = [0.9895, 0.1446, 0, 0]; // cosine 0.98949 to V
+const OVER_CAP = [0.9905, 0.1375, 0, 0]; // cosine 0.99050 to V
+const TOPIC = 'semantic-cache.result';
 const ANSWER = 'Refunds take five business days.';
 const ACME = {'X-Tenant-Id': 'acme'};
 
@@ -890,17 +921,29 @@ export async function check_route(ctx) {
 export async function check_floor(ctx) {
   const m = ctx.load('api');
   const c = ctx.client(m.app);
-  seed(ctx, 'e1', SO_SO); // cosine 0.6 to the question
-  let r = await lookup(c, V, 0);
-  assert.equal(r.status, 200, \`lookup answered \${r.status}: \${r.text}\`);
-  let body = r.json();
-  assert(body.hit !== true && (body.answer === undefined || body.answer === null || body.answer === ''), \`with threshold 0 an entry at similarity 0.6 was served: \${r.text}. The caller's threshold is a hint; clamp it to the floor (0.82)\`);
-  seed(ctx, 'e2', NEAR); // cosine 0.994
-  r = await lookup(c, V, 0);
-  assert.equal(r.json().answer, ANSWER, \`with threshold 0 an entry at similarity 0.994 must still hit (the floor is 0.82, not 1): \${r.text}\`);
-  r = await lookup(c, V, 0.9995);
-  body = r.json();
-  assert.equal(body.answer, ANSWER, \`with threshold 0.9995 an entry at similarity 0.994 must still hit (the ceiling is 0.99): \${r.text}\`);
+  const served = async (threshold: number) => {
+    const r = await lookup(c, V, threshold);
+    assert.equal(r.status, 200, \`lookup answered \${r.status}: \${r.text}\`);
+    const body = r.json();
+    return body.hit === false || body.answer === undefined || body.answer === null || body.answer === '' ? null : body.answer;
+  };
+  seed(ctx, 'e1', SO_SO, {answer: 'answer at 0.6'});
+  let got = await served(0);
+  assert.equal(got, null, \`with threshold 0 an entry at similarity 0.6 was served (\${JSON.stringify(got)}). The caller's threshold is a hint; clamp it to the floor (0.82)\`);
+  seed(ctx, 'e2', UNDER_FLOOR, {answer: 'answer at 0.815'});
+  got = await served(0);
+  assert.equal(got, null, \`with threshold 0 an entry at similarity 0.815 was served (\${JSON.stringify(got)}): the floor is 0.82\`);
+  seed(ctx, 'e3', OVER_FLOOR, {answer: 'answer at 0.825'});
+  got = await served(0);
+  assert.equal(got, 'answer at 0.825', \`with threshold 0 an entry at similarity 0.825 must hit (the floor is 0.82), got \${JSON.stringify(got)}\`);
+  got = await served(0.85);
+  assert.equal(got, null, \`with threshold 0.85 an entry at similarity 0.825 was served (\${JSON.stringify(got)}): a threshold inside [0.82, 0.99] is the caller's to keep\`);
+  seed(ctx, 'e4', UNDER_CAP, {answer: 'answer at 0.9895'});
+  got = await served(0.9995);
+  assert.equal(got, null, \`with threshold 0.9995 an entry at similarity 0.9895 was served (\${JSON.stringify(got)}): the ceiling is 0.99, so the threshold becomes 0.99\`);
+  seed(ctx, 'e5', OVER_CAP, {answer: 'answer at 0.9905'});
+  got = await served(0.9995);
+  assert.equal(got, 'answer at 0.9905', \`with threshold 0.9995 an entry at similarity 0.9905 must hit (the ceiling is 0.99), got \${JSON.stringify(got)}\`);
 }
 
 export async function check_expiry(ctx) {
@@ -909,24 +952,31 @@ export async function check_expiry(ctx) {
   seed(ctx, 'e1', V, {expiresIn: 100}); // restored from a dump: expires_at in 100 s, no TTL on the key
   let r = await lookup(c, V);
   assert.equal(r.json().answer, ANSWER, \`a live entry must be served: \${r.text}\`);
-  ctx.clock.advance(101);
+  ctx.clock.advance(100);
   assert.equal(ctx.redis.exists('entry:acme:2024-06:e1'), 1, 'the hash is still there: nothing but expires_at says the entry is over');
   r = await lookup(c, V);
   assert.equal(r.status, 200, \`lookup answered \${r.status}: \${r.text}\`);
-  const body = r.json();
+  let body = r.json();
+  assert(body.hit !== true && (body.answer === undefined || body.answer === null || body.answer === ''), \`an entry whose expires_at is now was served: \${r.text}. An entry is live only while expires_at > now\`);
+  ctx.clock.advance(1);
+  r = await lookup(c, V);
+  body = r.json();
   assert(body.hit !== true && (body.answer === undefined || body.answer === null || body.answer === ''), \`an entry whose expires_at passed one second ago was served: \${r.text}. Compare expires_at to now before serving\`);
+  const outcomes = ctx.kafka.records(TOPIC).map(rec => JSON.parse(rec.value.toString()).outcome);
+  assert.equal(outcomes.length, 3, \`three lookups published \${outcomes.length} result events: every lookup publishes one, a miss on an expired entry too\`);
+  assert.deepStrictEqual(outcomes, ['hit', 'miss', 'miss'], \`the result events say \${JSON.stringify(outcomes)}, expected hit, miss, miss: the lookups on the expired entry are misses\`);
 }
 
 export async function check_hit_shape(ctx) {
   const m = ctx.load('api');
   const c = ctx.client(m.app);
-  seed(ctx, 'e1', V, {age: 41});
+  seed(ctx, 'e1', NEAR, {age: 41});
   const r = await lookup(c, V);
   assert.equal(r.status, 200, \`lookup answered \${r.status}: \${r.text}\`);
   const body = r.json();
   assert.equal(body.hit, true, \`a hit must say hit: true, got \${r.text}\`);
   assert(body.answer === ANSWER && body.entry_id === 'e1', \`a hit carries the answer and its entry_id: \${r.text}\`);
-  assert(typeof body.similarity === 'number' && 0.99 <= body.similarity && body.similarity <= 1, \`similarity is \${JSON.stringify(body.similarity)}, expected the cosine (1.0) so the caller can judge the hit\`);
+  assert(typeof body.similarity === 'number' && Math.abs(body.similarity - 0.9938837346736189) < 1e-9, \`similarity is \${JSON.stringify(body.similarity)}, expected the cosine 0.9938837346736189 as the store measured it, so the caller can judge the hit\`);
   assert.equal(body.age_seconds, 41, \`age_seconds is \${JSON.stringify(body.age_seconds)}, expected 41 (now - created_at)\`);
   assert.equal(body.policy_version, '2024-06-1', \`policy_version is \${JSON.stringify(body.policy_version)}, expected the entry's 2024-06-1\`);
 }
@@ -962,24 +1012,34 @@ const (
 )
 
 var (
-	apiV    = []float64{1, 0, 0, 0}
-	apiNear = []float64{0.9, 0.1, 0, 0} // cosine 0.994 to apiV
-	apiSoSo = []float64{0.6, 0.8, 0, 0} // cosine 0.6 to apiV
+	apiV          = []float64{1, 0, 0, 0}
+	apiNear       = []float64{0.9, 0.1, 0, 0}       // cosine 0.99388 to apiV
+	apiSoSo       = []float64{0.6, 0.8, 0, 0}       // cosine 0.6 to apiV
+	apiUnderFloor = []float64{0.815, 0.5795, 0, 0}  // cosine 0.81498 to apiV
+	apiOverFloor  = []float64{0.825, 0.5651, 0, 0}  // cosine 0.82502 to apiV
+	apiUnderCap   = []float64{0.9895, 0.1446, 0, 0} // cosine 0.98949 to apiV
+	apiOverCap    = []float64{0.9905, 0.1375, 0, 0} // cosine 0.99050 to apiV
+	// apiEvents records every result the lookup published, in order.
+	apiEvents []ResultEvent
 )
 
-type seedOptions struct {
+type apiSeedOptions struct {
+	answer         string
 	age, expiresIn float64
 }
 
-// seedEntry writes an entry as the store writes it, from another worker: created age seconds ago, no TTL on the key.
-func seedEntry(ctx *harness.Ctx, entryID string, embedding []float64, o seedOptions) {
+// apiSeedEntry writes an entry as the store writes it, from another worker: created age seconds ago, no TTL on the key.
+func apiSeedEntry(ctx *harness.Ctx, entryID string, embedding []float64, o apiSeedOptions) {
 	if o.expiresIn == 0 {
 		o.expiresIn = 86400
+	}
+	if o.answer == "" {
+		o.answer = apiAnswer
 	}
 	key := fmt.Sprintf("entry:acme:%s:%s", apiMV, entryID)
 	now := float64(ctx.Clock.Now()) / 1000
 	vec, _ := json.Marshal(embedding)
-	ctx.Redis.Do("HSET", key, "embedding", string(vec), "answer", apiAnswer, "created_at", now-o.age, "expires_at", now+o.expiresIn, "policy_version", "2024-06-1")
+	ctx.Redis.Do("HSET", key, "embedding", string(vec), "answer", o.answer, "created_at", now-o.age, "expires_at", now+o.expiresIn, "policy_version", "2024-06-1")
 	ctx.Redis.Do("SADD", "semantic:acme:"+apiMV, key)
 }
 
@@ -1005,7 +1065,11 @@ func apiNeighbours(ctx *harness.Ctx) *harness.HTTP {
 		}
 		return best, nil
 	}
-	publishResult = func(_ context.Context, tenant string, result ResultEvent) error { return nil }
+	apiEvents = nil
+	publishResult = func(_ context.Context, tenant string, result ResultEvent) error {
+		apiEvents = append(apiEvents, result)
+		return nil
+	}
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
@@ -1021,9 +1085,21 @@ func apiBody(ctx *harness.Ctx, r *harness.Response) map[string]any {
 	return body
 }
 
+// apiServed is the answer a lookup of apiV served, or "" when it served nothing.
+func apiServed(ctx *harness.Ctx, c *harness.HTTP, threshold float64) string {
+	r := apiLookup(c, apiV, threshold, "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "lookup (%s)", r.Text())
+	body := apiBody(ctx, r)
+	answer, _ := body["answer"].(string)
+	if body["hit"] == false {
+		return ""
+	}
+	return answer
+}
+
 func CheckRoute(ctx *harness.Ctx) {
 	c := apiNeighbours(ctx)
-	seedEntry(ctx, "e1", apiV, seedOptions{})
+	apiSeedEntry(ctx, "e1", apiV, apiSeedOptions{})
 	r := apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "POST /v1/semantic-cache/lookup (%s)", r.Text())
 	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "application/json"), "the answer must be JSON, got Content-Type %q", r.Header.Get("Content-Type"))
@@ -1034,43 +1110,56 @@ func CheckRoute(ctx *harness.Ctx) {
 
 func CheckFloor(ctx *harness.Ctx) {
 	c := apiNeighbours(ctx)
-	seedEntry(ctx, "e1", apiSoSo, seedOptions{}) // cosine 0.6 to the question
-	r := apiLookup(c, apiV, 0, "X-Tenant-Id", "acme")
-	ctx.Equal(r.Status, 200, "lookup (%s)", r.Text())
-	body := apiBody(ctx, r)
-	answer, _ := body["answer"].(string)
-	ctx.Assert(body["hit"] != true && answer == "", "with threshold 0 an entry at similarity 0.6 was served: %s. The caller's threshold is a hint; clamp it to the floor (0.82)", r.Text())
-	seedEntry(ctx, "e2", apiNear, seedOptions{}) // cosine 0.994
-	r = apiLookup(c, apiV, 0, "X-Tenant-Id", "acme")
-	ctx.Equal(apiBody(ctx, r)["answer"], apiAnswer, "with threshold 0 an entry at similarity 0.994 must still hit (the floor is 0.82, not 1)")
-	r = apiLookup(c, apiV, 0.9995, "X-Tenant-Id", "acme")
-	ctx.Equal(apiBody(ctx, r)["answer"], apiAnswer, "with threshold 0.9995 an entry at similarity 0.994 must still hit (the ceiling is 0.99)")
+	apiSeedEntry(ctx, "e1", apiSoSo, apiSeedOptions{answer: "answer at 0.6"})
+	got := apiServed(ctx, c, 0)
+	ctx.Assert(got == "", "with threshold 0 an entry at similarity 0.6 was served (%q). The caller's threshold is a hint; clamp it to the floor (0.82)", got)
+	apiSeedEntry(ctx, "e2", apiUnderFloor, apiSeedOptions{answer: "answer at 0.815"})
+	got = apiServed(ctx, c, 0)
+	ctx.Assert(got == "", "with threshold 0 an entry at similarity 0.815 was served (%q): the floor is 0.82", got)
+	apiSeedEntry(ctx, "e3", apiOverFloor, apiSeedOptions{answer: "answer at 0.825"})
+	got = apiServed(ctx, c, 0)
+	ctx.Assert(got == "answer at 0.825", "with threshold 0 an entry at similarity 0.825 must hit (the floor is 0.82), got %q", got)
+	got = apiServed(ctx, c, 0.85)
+	ctx.Assert(got == "", "with threshold 0.85 an entry at similarity 0.825 was served (%q): a threshold inside [0.82, 0.99] is the caller's to keep", got)
+	apiSeedEntry(ctx, "e4", apiUnderCap, apiSeedOptions{answer: "answer at 0.9895"})
+	got = apiServed(ctx, c, 0.9995)
+	ctx.Assert(got == "", "with threshold 0.9995 an entry at similarity 0.9895 was served (%q): the ceiling is 0.99, so the threshold becomes 0.99", got)
+	apiSeedEntry(ctx, "e5", apiOverCap, apiSeedOptions{answer: "answer at 0.9905"})
+	got = apiServed(ctx, c, 0.9995)
+	ctx.Assert(got == "answer at 0.9905", "with threshold 0.9995 an entry at similarity 0.9905 must hit (the ceiling is 0.99), got %q", got)
 }
 
 func CheckExpiry(ctx *harness.Ctx) {
 	c := apiNeighbours(ctx)
-	seedEntry(ctx, "e1", apiV, seedOptions{expiresIn: 100}) // restored from a dump: expires_at in 100 s, no TTL on the key
+	apiSeedEntry(ctx, "e1", apiV, apiSeedOptions{expiresIn: 100}) // restored from a dump: expires_at in 100 s, no TTL on the key
 	r := apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
 	ctx.Equal(apiBody(ctx, r)["answer"], apiAnswer, "a live entry must be served")
-	ctx.Clock.Advance(101)
+	ctx.Clock.Advance(100)
 	ctx.Equal(ctx.Redis.Exists("entry:acme:2024-06:e1"), 1, "the hash is still there: nothing but expires_at says the entry is over; EXISTS")
-	r = apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
-	ctx.Equal(r.Status, 200, "lookup (%s)", r.Text())
-	body := apiBody(ctx, r)
-	answer, _ := body["answer"].(string)
-	ctx.Assert(body["hit"] != true && answer == "", "an entry whose expires_at passed one second ago was served: %s. Compare expires_at to now before serving", r.Text())
+	got := apiServed(ctx, c, 0.9)
+	ctx.Assert(got == "", "an entry whose expires_at is now was served (%q). An entry is live only while expires_at > now", got)
+	ctx.Clock.Advance(1)
+	got = apiServed(ctx, c, 0.9)
+	ctx.Assert(got == "", "an entry whose expires_at passed one second ago was served (%q). Compare expires_at to now before serving", got)
+	outcomes := make([]string, 0, len(apiEvents))
+	for _, e := range apiEvents {
+		outcomes = append(outcomes, e.Outcome)
+	}
+	ctx.Assert(len(outcomes) == 3, "three lookups published %d result events: every lookup publishes one, a miss on an expired entry too", len(outcomes))
+	ctx.Assert(strings.Join(outcomes, ",") == "hit,miss,miss", "the result events say %v, expected hit, miss, miss: the lookups on the expired entry are misses", outcomes)
 }
 
 func CheckHitShape(ctx *harness.Ctx) {
 	c := apiNeighbours(ctx)
-	seedEntry(ctx, "e1", apiV, seedOptions{age: 41})
+	apiSeedEntry(ctx, "e1", apiNear, apiSeedOptions{age: 41})
 	r := apiLookup(c, apiV, 0.9, "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "lookup (%s)", r.Text())
 	body := apiBody(ctx, r)
 	ctx.Equal(body["hit"], true, "a hit must say hit: true (%s)", r.Text())
 	ctx.Assert(body["answer"] == apiAnswer && body["entry_id"] == "e1", "a hit carries the answer and its entry_id: %s", r.Text())
 	similarity, ok := body["similarity"].(float64)
-	ctx.Assert(ok && 0.99 <= similarity && similarity <= 1, "similarity is %v, expected the cosine (1.0) so the caller can judge the hit", body["similarity"])
+	want := vectors.Cosine(apiV, apiNear)
+	ctx.Assert(ok && similarity-want < 1e-9 && want-similarity < 1e-9, "similarity is %v, expected the cosine %v as the store measured it, so the caller can judge the hit", body["similarity"], want)
 	ctx.Equal(body["age_seconds"], 41, "age_seconds (now - created_at)")
 	ctx.Equal(body["policy_version"], "2024-06-1", "policy_version must be the entry's")
 }
@@ -1091,6 +1180,7 @@ func CheckMiss(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <optional>
 #include <string>
 #include <vector>
@@ -1099,44 +1189,50 @@ func CheckMiss(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kMV = "2024-06";
-const std::string kAnswer = "Refunds take five business days.";
-const std::vector<double> kV = {1, 0, 0, 0};
-const std::vector<double> kNear = {0.9, 0.1, 0, 0};  // cosine 0.994 to kV
-const std::vector<double> kSoSo = {0.6, 0.8, 0, 0};  // cosine 0.6 to kV
+const std::string kHMV = "2024-06";
+const std::string kHAnswer = "Refunds take five business days.";
+const std::vector<double> kHV = {1, 0, 0, 0};
+const std::vector<double> kHNear = {0.9, 0.1, 0, 0};            // cosine 0.99388 to kHV
+const std::vector<double> kHSoSo = {0.6, 0.8, 0, 0};            // cosine 0.6 to kHV
+const std::vector<double> kHUnderFloor = {0.815, 0.5795, 0, 0};  // cosine 0.81498 to kHV
+const std::vector<double> kHOverFloor = {0.825, 0.5651, 0, 0};   // cosine 0.82502 to kHV
+const std::vector<double> kHUnderCap = {0.9895, 0.1446, 0, 0};   // cosine 0.98949 to kHV
+const std::vector<double> kHOverCap = {0.9905, 0.1375, 0, 0};    // cosine 0.99050 to kHV
 
-harness::Ctx* world = nullptr;
+harness::Ctx* hWorld = nullptr;
+std::vector<ResultEvent> hEvents;  // every result the lookup published, in order
 
 // An entry as the store writes it, from another worker: created age seconds ago, no TTL on the key.
-void seedEntry(harness::Ctx& ctx, const std::string& entryId, const std::vector<double>& embedding, double age = 0,
-               double expiresIn = 86400) {
-  const std::string key = "entry:acme:" + kMV + ":" + entryId;
+void hSeedEntry(harness::Ctx& ctx, const std::string& entryId, const std::vector<double>& embedding, double age = 0,
+                double expiresIn = 86400, const std::string& answer = kHAnswer) {
+  const std::string key = "entry:acme:" + kHMV + ":" + entryId;
   const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
-  ctx.Redis.Do("HSET", key, "embedding", nlohmann::json(embedding).dump(), "answer", kAnswer, "created_at", harness::Value(now - age),
+  ctx.Redis.Do("HSET", key, "embedding", nlohmann::json(embedding).dump(), "answer", answer, "created_at", harness::Value(now - age),
                "expires_at", harness::Value(now + expiresIn), "policy_version", "2024-06-1");
-  ctx.Redis.Do("SADD", "semantic:acme:" + kMV, key);
+  ctx.Redis.Do("SADD", "semantic:acme:" + kHMV, key);
 }
 
-struct ApiServer {
+struct HApiServer {
   httplib::Server svr;
 };
 
-harness::HTTP api(harness::Ctx& ctx) {
-  static ApiServer* server = nullptr;
+harness::HTTP hApi(harness::Ctx& ctx) {
+  static HApiServer* server = nullptr;
   delete server;
-  server = new ApiServer;
-  world = &ctx;
+  server = new HApiServer;
+  hWorld = &ctx;
+  hEvents.clear();
   register_routes(server->svr);
   return ctx.HTTP(server->svr);
 }
 
-harness::Response lookup(harness::HTTP& c, const std::vector<double>& embedding, double threshold = 0.9, bool tenant = true) {
-  const std::string body = nlohmann::json{{"query_embedding", embedding}, {"model_version", kMV}, {"threshold", threshold}}.dump();
+harness::Response hLookup(harness::HTTP& c, const std::vector<double>& embedding, double threshold = 0.9, bool tenant = true) {
+  const std::string body = nlohmann::json{{"query_embedding", embedding}, {"model_version", kHMV}, {"threshold", threshold}}.dump();
   if (!tenant) return c.Post("/v1/semantic-cache/lookup", body, "Content-Type", "application/json");
   return c.Post("/v1/semantic-cache/lookup", body, "Content-Type", "application/json", "X-Tenant-Id", "acme");
 }
 
-nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+nlohmann::json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   nlohmann::json body;
   try {
     body = nlohmann::json::parse(r.Text());
@@ -1146,21 +1242,24 @@ nlohmann::json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
   return body;
 }
 
-bool servedNothing(const nlohmann::json& body) {
-  const bool hit = body.contains("hit") && body["hit"].is_boolean() && body["hit"].get<bool>();
-  const bool answer = body.contains("answer") && body["answer"].is_string() && !body["answer"].get<std::string>().empty();
-  return !hit && !answer;
+// The answer a lookup of kHV served, or "" when it served nothing.
+std::string hServed(harness::Ctx& ctx, harness::HTTP& c, double threshold) {
+  const auto r = hLookup(c, kHV, threshold);
+  ctx.Equal(r.Status, 200, "lookup (%s)", r.Text());
+  const auto body = hBodyOf(ctx, r);
+  if (body.contains("hit") && body["hit"] == false) return "";
+  return body.contains("answer") && body["answer"].is_string() ? body["answer"].get<std::string>() : "";
 }
 
 }  // namespace
 
 // The stand-ins for the store (step 2) and the result stream (step 4): the nearest entry in the
-// tenant's set, expired or not, and a publish that records nothing.
+// tenant's set, expired or not, and a publish that records the event.
 std::optional<Entry> search_entries(const std::string& tenant, const std::string& model_version,
                                     const std::vector<double>& embedding, double threshold) {
   std::optional<Entry> best;
-  for (const std::string& key : world->Redis.SMembers("semantic:" + tenant + ":" + model_version)) {
-    const auto raw = world->Redis.HGetAll(key);
+  for (const std::string& key : hWorld->Redis.SMembers("semantic:" + tenant + ":" + model_version)) {
+    const auto raw = hWorld->Redis.HGetAll(key);
     if (raw.empty() || !raw.count("answer")) continue;
     const auto stored = nlohmann::json::parse(raw.at("embedding")).get<std::vector<double>>();
     const double similarity = semcache::cosine(embedding, stored);
@@ -1178,69 +1277,82 @@ std::optional<Entry> search_entries(const std::string& tenant, const std::string
   return best;
 }
 
-void publish_result(const std::string&, const ResultEvent&) {}
+void publish_result(const std::string&, const ResultEvent& result) { hEvents.push_back(result); }
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  seedEntry(ctx, "e1", kV);
-  auto r = lookup(c, kV);
+  auto c = hApi(ctx);
+  hSeedEntry(ctx, "e1", kHV);
+  auto r = hLookup(c, kHV);
   ctx.Equal(r.Status, 200, "POST /v1/semantic-cache/lookup (%s)", r.Text());
   ctx.Assert(r.HeaderValue("Content-Type").rfind("application/json", 0) == 0, "the answer must be JSON, got Content-Type %q",
              r.HeaderValue("Content-Type"));
-  ctx.Equal(bodyOf(ctx, r).value("answer", ""), kAnswer, "a lookup of the stored question must answer the stored answer");
-  r = lookup(c, kV, 0.9, false);
+  ctx.Equal(hBodyOf(ctx, r).value("answer", ""), kHAnswer, "a lookup of the stored question must answer the stored answer");
+  r = hLookup(c, kHV, 0.9, false);
   ctx.Equal(r.Status, 401, "a lookup without X-Tenant-Id");
 }
 
 void CheckFloor(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  seedEntry(ctx, "e1", kSoSo);  // cosine 0.6 to the question
-  auto r = lookup(c, kV, 0);
-  ctx.Equal(r.Status, 200, "lookup (%s)", r.Text());
-  ctx.Assert(servedNothing(bodyOf(ctx, r)),
-             "with threshold 0 an entry at similarity 0.6 was served: %s. The caller's threshold is a hint; clamp it to the floor (0.82)",
-             r.Text());
-  seedEntry(ctx, "e2", kNear);  // cosine 0.994
-  r = lookup(c, kV, 0);
-  ctx.Equal(bodyOf(ctx, r).value("answer", ""), kAnswer, "with threshold 0 an entry at similarity 0.994 must still hit (the floor is 0.82, not 1)");
-  r = lookup(c, kV, 0.9995);
-  ctx.Equal(bodyOf(ctx, r).value("answer", ""), kAnswer, "with threshold 0.9995 an entry at similarity 0.994 must still hit (the ceiling is 0.99)");
+  auto c = hApi(ctx);
+  hSeedEntry(ctx, "e1", kHSoSo, 0, 86400, "answer at 0.6");
+  std::string got = hServed(ctx, c, 0);
+  ctx.Assert(got.empty(), "with threshold 0 an entry at similarity 0.6 was served (%q). The caller's threshold is a hint; clamp it to the floor (0.82)", got);
+  hSeedEntry(ctx, "e2", kHUnderFloor, 0, 86400, "answer at 0.815");
+  got = hServed(ctx, c, 0);
+  ctx.Assert(got.empty(), "with threshold 0 an entry at similarity 0.815 was served (%q): the floor is 0.82", got);
+  hSeedEntry(ctx, "e3", kHOverFloor, 0, 86400, "answer at 0.825");
+  got = hServed(ctx, c, 0);
+  ctx.Assert(got == "answer at 0.825", "with threshold 0 an entry at similarity 0.825 must hit (the floor is 0.82), got %q", got);
+  got = hServed(ctx, c, 0.85);
+  ctx.Assert(got.empty(), "with threshold 0.85 an entry at similarity 0.825 was served (%q): a threshold inside [0.82, 0.99] is the caller's to keep", got);
+  hSeedEntry(ctx, "e4", kHUnderCap, 0, 86400, "answer at 0.9895");
+  got = hServed(ctx, c, 0.9995);
+  ctx.Assert(got.empty(), "with threshold 0.9995 an entry at similarity 0.9895 was served (%q): the ceiling is 0.99, so the threshold becomes 0.99", got);
+  hSeedEntry(ctx, "e5", kHOverCap, 0, 86400, "answer at 0.9905");
+  got = hServed(ctx, c, 0.9995);
+  ctx.Assert(got == "answer at 0.9905", "with threshold 0.9995 an entry at similarity 0.9905 must hit (the ceiling is 0.99), got %q", got);
 }
 
 void CheckExpiry(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  seedEntry(ctx, "e1", kV, 0, 100);  // restored from a dump: expires_at in 100 s, no TTL on the key
-  auto r = lookup(c, kV);
-  ctx.Equal(bodyOf(ctx, r).value("answer", ""), kAnswer, "a live entry must be served");
-  ctx.Clock.Advance(101);
+  auto c = hApi(ctx);
+  hSeedEntry(ctx, "e1", kHV, 0, 100);  // restored from a dump: expires_at in 100 s, no TTL on the key
+  auto r = hLookup(c, kHV);
+  ctx.Equal(hBodyOf(ctx, r).value("answer", ""), kHAnswer, "a live entry must be served");
+  ctx.Clock.Advance(100);
   ctx.Equal(ctx.Redis.Exists("entry:acme:2024-06:e1"), 1, "the hash is still there: nothing but expires_at says the entry is over; EXISTS");
-  r = lookup(c, kV);
-  ctx.Equal(r.Status, 200, "lookup (%s)", r.Text());
-  ctx.Assert(servedNothing(bodyOf(ctx, r)), "an entry whose expires_at passed one second ago was served: %s. Compare expires_at to now before serving",
-             r.Text());
+  std::string got = hServed(ctx, c, 0.9);
+  ctx.Assert(got.empty(), "an entry whose expires_at is now was served (%q). An entry is live only while expires_at > now", got);
+  ctx.Clock.Advance(1);
+  got = hServed(ctx, c, 0.9);
+  ctx.Assert(got.empty(), "an entry whose expires_at passed one second ago was served (%q). Compare expires_at to now before serving", got);
+  std::string outcomes;
+  for (const ResultEvent& e : hEvents) outcomes += (outcomes.empty() ? "" : ",") + e.outcome;
+  ctx.Assert(hEvents.size() == 3, "three lookups published %d result events: every lookup publishes one, a miss on an expired entry too",
+             static_cast<int>(hEvents.size()));
+  ctx.Assert(outcomes == "hit,miss,miss", "the result events say %s, expected hit, miss, miss: the lookups on the expired entry are misses", outcomes);
 }
 
 void CheckHitShape(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  seedEntry(ctx, "e1", kV, 41);
-  auto r = lookup(c, kV);
+  auto c = hApi(ctx);
+  hSeedEntry(ctx, "e1", kHNear, 41);
+  auto r = hLookup(c, kHV);
   ctx.Equal(r.Status, 200, "lookup (%s)", r.Text());
-  const auto body = bodyOf(ctx, r);
+  const auto body = hBodyOf(ctx, r);
   ctx.Assert(body.contains("hit") && body["hit"] == true, "a hit must say hit: true (%s)", r.Text());
-  ctx.Assert(body.value("answer", "") == kAnswer && body.value("entry_id", "") == "e1", "a hit carries the answer and its entry_id: %s", r.Text());
-  ctx.Assert(body.contains("similarity") && body["similarity"].is_number() && 0.99 <= body["similarity"].get<double>() &&
-                 body["similarity"].get<double>() <= 1,
-             "similarity is %s, expected the cosine (1.0) so the caller can judge the hit", body.value("similarity", nlohmann::json()).dump());
+  ctx.Assert(body.value("answer", "") == kHAnswer && body.value("entry_id", "") == "e1", "a hit carries the answer and its entry_id: %s", r.Text());
+  const double want = semcache::cosine(kHV, kHNear);
+  ctx.Assert(body.contains("similarity") && body["similarity"].is_number() && std::abs(body["similarity"].get<double>() - want) < 1e-9,
+             "similarity is %s, expected the cosine %s as the store measured it, so the caller can judge the hit",
+             body.value("similarity", nlohmann::json()).dump(), nlohmann::json(want).dump());
   ctx.Assert(body.contains("age_seconds") && body["age_seconds"] == 41, "age_seconds is %s, expected 41 (now - created_at)",
              body.value("age_seconds", nlohmann::json()).dump());
   ctx.Equal(body.value("policy_version", ""), "2024-06-1", "policy_version must be the entry's");
 }
 
 void CheckMiss(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = lookup(c, kV);
+  auto c = hApi(ctx);
+  auto r = hLookup(c, kHV);
   ctx.Equal(r.Status, 200, "a lookup with nothing stored (%s)", r.Text());
-  const auto body = bodyOf(ctx, r);
+  const auto body = hBodyOf(ctx, r);
   ctx.Assert(body.contains("hit") && body["hit"] == false, "a miss must say hit: false (%s)", r.Text());
   ctx.Assert(body.contains("similarity") && body["similarity"].is_null(), "a miss carries similarity: null, got %s", r.Text());
   ctx.Assert(!body.contains("answer"), "a miss carries no answer field, got %s: a client cannot tell an empty answer from a hit", r.Text());

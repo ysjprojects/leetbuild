@@ -24,7 +24,7 @@ Requirements:
 - \`target\` is a name resolved with \`targets.resolve\`: unknown is **400**; a target whose environment is
   \`targets.PRODUCTION\` is **403**. The run's \`endpoint\` comes from the registry.
 - \`probe_set\` must be in the catalog (\`catalog.plan\`); unknown is **400**. \`probes\` is the plan's total.
-- \`Idempotency-Key\` is required (**400**). The run is stored under \`(tenant, key)\` (\`store.put\`); a
+- \`Idempotency-Key\` is required (**400** when missing or empty). The run is stored under \`(tenant, key)\` (\`store.put\`); a
   replay answers **200** with the stored run (\`store.get\`).
 - A rejected request stores nothing. A new run answers **201** with \`{run_id, status: "queued",
   target, endpoint, probe_set, plan, probes}\`.`,
@@ -83,7 +83,7 @@ Requirements:
       id: 'idempotent-replay',
       title: 'Keys run starts by (tenant, Idempotency-Key)',
       detail:
-        'Idempotency-Key is required (400 without it); a replay of the same (tenant, key) answers 200 with the same run_id, and another tenant with the same key gets its own run. The starter stores the run under a fresh id, so every retry starts another run.',
+        'Idempotency-Key is required (400 when missing or empty); a replay of the same (tenant, key) answers 200 with the same run_id, and another tenant with the same key gets its own run. The starter stores the run under a fresh id, so every retry starts another run.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
@@ -757,6 +757,9 @@ async def check_refuse_production(ctx):
         r = await _post(c, {**GOOD, "target": "payments-prod"}, key="k-prod")
         assert r.status_code == 403, f"payments-prod is registered with environment production and answered {r.status_code}, expected 403"
         assert _runs(ctx) == [], f"a refused production target must store no run, found {[json.loads(ctx.redis.get(k)) for k in _runs(ctx)]}"
+        r = await _post(c, {**GOOD, "target": "ledger-primary"}, key="k-ledger")
+        assert r.status_code == 403, f"ledger-primary is registered with environment production and answered {r.status_code}, expected 403: the registry's environment decides, not the target's name"
+        assert _runs(ctx) == [], f"a refused production target must store no run, found {[json.loads(ctx.redis.get(k)) for k in _runs(ctx)]}"
         r = await _post(c, {**GOOD, "target": "checkout-shadow"}, key="k-shadow")
         assert r.status_code == 201, f"a shadow target is fine, got {r.status_code}: {r.text}"
 
@@ -765,6 +768,9 @@ async def check_idempotent_replay(ctx):
     async with _api(ctx) as c:
         r = await _post(c, GOOD, with_key=False)
         assert r.status_code == 400, f"a start without Idempotency-Key answered {r.status_code}, expected 400"
+        r = await _post(c, GOOD, key="")
+        assert r.status_code == 400, f"a start with an empty Idempotency-Key answered {r.status_code}, expected 400: an empty key is no key"
+        assert _runs(ctx) == [], f"a start without a usable Idempotency-Key must store no run, found {_runs(ctx)}"
         first = await _post(c, GOOD, key="k-7")
         assert first.status_code == 201, f"the first start answered {first.status_code}: {first.text}"
         replay = await _post(c, GOOD, key="k-7")
@@ -829,6 +835,9 @@ export async function check_refuse_production(ctx) {
   let r = await post(c, {...GOOD, target: 'payments-prod'}, {key: 'k-prod'});
   assert.equal(r.status, 403, \`payments-prod is registered with environment production and answered \${r.status}, expected 403\`);
   assert.deepEqual(runKeys(ctx), [], \`a refused production target must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
+  r = await post(c, {...GOOD, target: 'ledger-primary'}, {key: 'k-ledger'});
+  assert.equal(r.status, 403, \`ledger-primary is registered with environment production and answered \${r.status}, expected 403: the registry's environment decides, not the target's name\`);
+  assert.deepEqual(runKeys(ctx), [], \`a refused production target must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
   r = await post(c, {...GOOD, target: 'checkout-shadow'}, {key: 'k-shadow'});
   assert.equal(r.status, 201, \`a shadow target is fine, got \${r.status}: \${r.text}\`);
 }
@@ -837,6 +846,9 @@ export async function check_idempotent_replay(ctx) {
   const c = api(ctx);
   const noKey = await post(c, GOOD, {withKey: false});
   assert.equal(noKey.status, 400, \`a start without Idempotency-Key answered \${noKey.status}, expected 400\`);
+  const emptyKey = await post(c, GOOD, {key: ''});
+  assert.equal(emptyKey.status, 400, \`a start with an empty Idempotency-Key answered \${emptyKey.status}, expected 400: an empty key is no key\`);
+  assert.deepEqual(runKeys(ctx), [], \`a start without a usable Idempotency-Key must store no run, found \${JSON.stringify(runKeys(ctx))}\`);
   const first = await post(c, GOOD, {key: 'k-7'});
   assert.equal(first.status, 201, \`the first start answered \${first.status}: \${first.text}\`);
   const replay = await post(c, GOOD, {key: 'k-7'});
@@ -926,6 +938,9 @@ func CheckRefuseProduction(ctx *harness.Ctx) {
 	r := apiPost(c, apiWith("target", "payments-prod"), "k-prod", "t1")
 	ctx.Equal(r.Status, 403, "payments-prod is registered with environment production")
 	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused production target must store no run; runs stored")
+	r = apiPost(c, apiWith("target", "ledger-primary"), "k-ledger", "t1")
+	ctx.Equal(r.Status, 403, "ledger-primary is registered with environment production: the registry's environment decides, not the target's name")
+	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a refused production target must store no run; runs stored")
 	r = apiPost(c, apiWith("target", "checkout-shadow"), "k-shadow", "t1")
 	ctx.Equal(r.Status, 201, "a shadow target is fine (%s)", r.Text())
 }
@@ -934,6 +949,9 @@ func CheckIdempotentReplay(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	noKey := c.Post("/v1/redteam/runs", apiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key")
+	emptyKey := apiPost(c, apiGood, "", "t1")
+	ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key (an empty key is no key)")
+	ctx.Equal(len(ctx.Redis.Keys("redteam:run:*")), 0, "a start without a usable Idempotency-Key must store no run; runs stored")
 	first := apiPost(c, apiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 201, "the first start (%s)", first.Text())
 	replay := apiPost(c, apiGood, "k-7", "t1")
@@ -968,22 +986,22 @@ using json = nlohmann::json;
 
 const json kGood = {{"target", "checkout-shadow"}, {"probe_set", "baseline"}};
 
-struct Api {
+struct HarnessApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HarnessApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& key = "k-1", const std::string& tenant = "t1") {
     return http.Post("/v1/redteam/runs", body.dump(), "X-Tenant-Id", tenant, "Idempotency-Key", key);
   }
 };
 
-json with(json body, const std::string& field, const json& value) {
+json harnessWith(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
 }
 
-json runOf(harness::Ctx& ctx, const harness::Response& r) {
+json harnessRunOf(harness::Ctx& ctx, const harness::Response& r) {
   const json run = json::parse(r.Text(), nullptr, false);
   ctx.Assert(run.is_object(), "the body must be a JSON object: %s", r.Text());
   return run;
@@ -992,10 +1010,10 @@ json runOf(harness::Ctx& ctx, const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
+  HarnessApi api(ctx);
   const auto r = api.post(kGood);
   ctx.Equal(r.Status, 201, "a valid start (%s)", r.Text());
-  const json run = runOf(ctx, r);
+  const json run = harnessRunOf(ctx, r);
   for (const char* key : {"run_id", "status", "target", "endpoint", "probe_set", "plan", "probes"}) {
     ctx.Assert(run.contains(key), "the 201 body lacks %s: %s", key, r.Text());
   }
@@ -1008,46 +1026,52 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckResolveRegisteredTarget(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(with(kGood, "target", "billing-db.internal:5432"), "k-bad");
+  HarnessApi api(ctx);
+  auto r = api.post(harnessWith(kGood, "target", "billing-db.internal:5432"), "k-bad");
   ctx.Equal(r.Status, 400, "a target nobody registered (billing-db.internal:5432): the runner would point probes at whatever host the caller typed");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused start must store no run; runs stored");
-  r = api.post(with(kGood, "target", "search-staging"), "k-ok");
+  r = api.post(harnessWith(kGood, "target", "search-staging"), "k-ok");
   ctx.Equal(r.Status, 201, "search-staging is registered (%s)", r.Text());
-  ctx.Assert(runOf(ctx, r).value("endpoint", "") == "search-staging.sandbox.internal", "the run's endpoint must be the registry's (search-staging.sandbox.internal): the caller names a target, the registry says where it lives (%s)", r.Text());
+  ctx.Assert(harnessRunOf(ctx, r).value("endpoint", "") == "search-staging.sandbox.internal", "the run's endpoint must be the registry's (search-staging.sandbox.internal): the caller names a target, the registry says where it lives (%s)", r.Text());
 }
 
 void CheckRefuseProduction(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(with(kGood, "target", "payments-prod"), "k-prod");
+  HarnessApi api(ctx);
+  auto r = api.post(harnessWith(kGood, "target", "payments-prod"), "k-prod");
   ctx.Equal(r.Status, 403, "payments-prod is registered with environment production");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused production target must store no run; runs stored");
-  r = api.post(with(kGood, "target", "checkout-shadow"), "k-shadow");
+  r = api.post(harnessWith(kGood, "target", "ledger-primary"), "k-ledger");
+  ctx.Equal(r.Status, 403, "ledger-primary is registered with environment production: the registry's environment decides, not the target's name");
+  ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused production target must store no run; runs stored");
+  r = api.post(harnessWith(kGood, "target", "checkout-shadow"), "k-shadow");
   ctx.Equal(r.Status, 201, "a shadow target is fine (%s)", r.Text());
 }
 
 void CheckIdempotentReplay(harness::Ctx& ctx) {
-  Api api(ctx);
+  HarnessApi api(ctx);
   const auto noKey = api.http.Post("/v1/redteam/runs", kGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a start without Idempotency-Key");
+  const auto emptyKey = api.post(kGood, "");
+  ctx.Equal(emptyKey.Status, 400, "a start with an empty Idempotency-Key (an empty key is no key)");
+  ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a start without a usable Idempotency-Key must store no run; runs stored");
   const auto first = api.post(kGood, "k-7");
   ctx.Equal(first.Status, 201, "the first start (%s)", first.Text());
   const auto replay = api.post(kGood, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored run (the client retried; it must not start a second run against the target)");
-  ctx.Equal(runOf(ctx, replay)["run_id"], runOf(ctx, first)["run_id"], "the replay must answer the same run");
+  ctx.Equal(harnessRunOf(ctx, replay)["run_id"], harnessRunOf(ctx, first)["run_id"], "the replay must answer the same run");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 1, "one key, one run: runs stored after a start and its replay");
   const auto other = api.post(kGood, "k-7", "t2");
-  ctx.Assert(other.Status == 201 && runOf(ctx, other)["run_id"] != runOf(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)");
+  ctx.Assert(other.Status == 201 && harnessRunOf(ctx, other)["run_id"] != harnessRunOf(ctx, first)["run_id"], "another tenant reusing the key gets its own run (keys are per tenant)");
 }
 
 void CheckKnownProbeSet(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(with(kGood, "probe_set", "everything"), "k-bad");
+  HarnessApi api(ctx);
+  auto r = api.post(harnessWith(kGood, "probe_set", "everything"), "k-bad");
   ctx.Equal(r.Status, 400, "a probe set the catalog lacks (everything) must not turn into another set");
   ctx.Equal(ctx.Redis.Keys("redteam:run:*").size(), 0, "a refused probe set must store no run; runs stored");
-  r = api.post(with(kGood, "probe_set", "injection-only"), "k-inj");
+  r = api.post(harnessWith(kGood, "probe_set", "injection-only"), "k-inj");
   ctx.Equal(r.Status, 201, "injection-only is in the catalog (%s)", r.Text());
-  const json run = runOf(ctx, r);
+  const json run = harnessRunOf(ctx, r);
   ctx.Assert(run["plan"] == json::array({{{"category", "prompt-injection"}, {"probes", 6}}}) && run["probes"] == 6,
              "the run carries the catalog's plan for injection-only (6 prompt-injection probes): %s", r.Text());
 }

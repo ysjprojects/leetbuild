@@ -51,7 +51,7 @@ nobody can trace a single record to its seed. And any tenant can read any job.
       id: 'route',
       title: 'Handles GET /v1/synthetic/jobs/{id}',
       detail:
-        'The report route answers 401 without X-Tenant-Id, 404 for an unknown job, and 200 with the job and its counts.',
+        'The report route answers 401 without X-Tenant-Id, 404 for an unknown job, and 200 with the job (recipe and max_records included), its counts and updated_at from the progress hash.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/synthetic\/jobs\/\{job_id\}["']/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/synthetic\/jobs\/:job_id['"]/]},
@@ -64,7 +64,7 @@ nobody can trace a single record to its seed. And any tenant can read any job.
       id: 'tenant-scope',
       title: "Answers 404 for another tenant's job",
       detail:
-        'A job stored for tenant t1 is 404 for tenant t2, with nothing of the job in the body. The starter checks only that the job exists.',
+        'A job stored for tenant t1 is 404 for tenant t2 with the same body as a missing job, so nothing of the job and not even its existence shows. The starter checks only that the job exists.',
       match: {
         python: {all: [/\[["']tenant["']\]|get\(\s*["']tenant["']\s*\)/]},
         typescript: {all: [/\.tenant\s*!==?\s*tenant/]},
@@ -77,7 +77,7 @@ nobody can trace a single record to its seed. And any tenant can read any job.
       id: 'parked-apart',
       title: 'Reports parked records apart from admitted ones',
       detail:
-        'admitted, parked and rejected are the stored counters, so 10 generated with 6 admitted, 3 parked and 1 rejected reads that way. The starter computes admitted as generated - rejected and reports no parked count.',
+        'generated, admitted, parked and rejected are the stored counters, so 10 generated with 6 admitted, 3 parked and 1 rejected reads that way, and two more generated records not yet judged move only generated. The starter computes admitted as generated - rejected and reports no parked count.',
       match: {
         python: {all: [/["']parked["']/], none: [/generated\s*-\s*rejected/]},
         typescript: {all: [/\bparked\b/], none: [/generated\s*-\s*rejected/]},
@@ -737,6 +737,8 @@ async def check_route(ctx):
         body = r.json()
         assert body.get("job_id") == JOB and body.get("status") == "queued" and body.get("seed_dataset") == "wiki-qa", f"the report carries the job: {body}"
         assert body.get("generated") == 10 and body.get("throttled") == 4, f"the report carries the progress counts: {body}"
+        assert body.get("recipe") == "qa-pairs" and body.get("max_records") == 1000, f"the report carries the job's recipe and max_records: {body}"
+        assert body.get("updated_at") == 1_790_000_000, f"the report carries updated_at from the progress hash (1790000000), got {body.get('updated_at')!r}"
         r = await _get(c, job="j-missing")
         assert r.status_code == 404, f"an unknown job answered {r.status_code}, expected 404"
         r = await c.get(f"/v1/synthetic/jobs/{JOB}")
@@ -748,6 +750,8 @@ async def check_tenant_scope(ctx):
         r = await _get(c, tenant="t2")
         assert r.status_code == 404, f"tenant t2 read t1's job and got {r.status_code}, expected 404 (the same answer as a missing job)"
         assert "wiki-qa" not in r.text and "qa-pairs" not in r.text, f"the refusal leaks the job: {r.text}"
+        missing = await _get(c, job="j-missing", tenant="t2")
+        assert r.text.replace(JOB, "{id}") == missing.text.replace("j-missing", "{id}"), f"another tenant's job must answer exactly like a missing one, or the difference tells t2 the job exists: {r.text} against {missing.text}"
         assert (await _get(c)).status_code == 200, "the owner still reads its job"
 
 
@@ -756,6 +760,10 @@ async def check_parked_apart(ctx):
         body = (await _get(c)).json()
         counts = {k: body.get(k) for k in ("generated", "admitted", "parked", "rejected")}
         assert counts == {"generated": 10, "admitted": 6, "parked": 3, "rejected": 1}, f"the progress hash says 10 generated, 6 admitted, 3 parked, 1 rejected; the report says {counts}: a record the judge never scored is not admitted"
+        ctx.redis.hincrby(f"synth:progress:{JOB}", "generated", 2)  # two records generated, not judged yet
+        body = (await _get(c)).json()
+        counts = {k: body.get(k) for k in ("generated", "admitted", "parked", "rejected")}
+        assert counts == {"generated": 12, "admitted": 6, "parked": 3, "rejected": 1}, f"with two records generated and not yet judged the progress hash says 12 generated, 6 admitted, 3 parked, 1 rejected; the report says {counts}: every count is read as stored, none derived from the others"
 
 
 async def check_coverage(ctx):
@@ -795,6 +803,8 @@ export async function check_route(ctx) {
   const body = r.json();
   assert(body.job_id === JOB && body.status === 'queued' && body.seed_dataset === 'wiki-qa', \`the report carries the job: \${r.text}\`);
   assert(body.generated === 10 && body.throttled === 4, \`the report carries the progress counts: \${r.text}\`);
+  assert(body.recipe === 'qa-pairs' && body.max_records === 1000, \`the report carries the job's recipe and max_records: \${r.text}\`);
+  assert.equal(body.updated_at, 1_790_000_000, \`the report carries updated_at from the progress hash (1790000000), got \${JSON.stringify(body.updated_at)}\`);
   r = await get(c, 'j-missing');
   assert.equal(r.status, 404, \`an unknown job answered \${r.status}, expected 404\`);
   r = await c.get(\`/v1/synthetic/jobs/\${JOB}\`);
@@ -806,14 +816,20 @@ export async function check_tenant_scope(ctx) {
   const r = await get(c, JOB, 't2');
   assert.equal(r.status, 404, \`tenant t2 read t1's job and got \${r.status}, expected 404 (the same answer as a missing job)\`);
   assert(!r.text.includes('wiki-qa') && !r.text.includes('qa-pairs'), \`the refusal leaks the job: \${r.text}\`);
+  const missing = await get(c, 'j-missing', 't2');
+  assert.equal(r.text.replaceAll(JOB, '{id}'), missing.text.replaceAll('j-missing', '{id}'), \`another tenant's job must answer exactly like a missing one, or the difference tells t2 the job exists: \${r.text} against \${missing.text}\`);
   assert.equal((await get(c)).status, 200, 'the owner still reads its job');
 }
 
 export async function check_parked_apart(ctx) {
   const c = api(ctx);
-  const body = (await get(c)).json();
-  const counts = {generated: body.generated, admitted: body.admitted, parked: body.parked, rejected: body.rejected};
+  let body = (await get(c)).json();
+  let counts = {generated: body.generated, admitted: body.admitted, parked: body.parked, rejected: body.rejected};
   assert.deepEqual(counts, {generated: 10, admitted: 6, parked: 3, rejected: 1}, \`the progress hash says 10 generated, 6 admitted, 3 parked, 1 rejected; the report says \${JSON.stringify(counts)}: a record the judge never scored is not admitted\`);
+  ctx.redis.hincrby(\`synth:progress:\${JOB}\`, 'generated', 2); // two records generated, not judged yet
+  body = (await get(c)).json();
+  counts = {generated: body.generated, admitted: body.admitted, parked: body.parked, rejected: body.rejected};
+  assert.deepEqual(counts, {generated: 12, admitted: 6, parked: 3, rejected: 1}, \`with two records generated and not yet judged the progress hash says 12 generated, 6 admitted, 3 parked, 1 rejected; the report says \${JSON.stringify(counts)}: every count is read as stored, none derived from the others\`);
 }
 
 export async function check_coverage(ctx) {
@@ -882,6 +898,8 @@ func CheckRoute(ctx *harness.Ctx) {
 	body := readBody(ctx, r)
 	ctx.Assert(body["job_id"] == readJobID && body["status"] == "queued" && body["seed_dataset"] == "wiki-qa", "the report carries the job: %s", r.Text())
 	ctx.Assert(body["generated"] == float64(10) && body["throttled"] == float64(4), "the report carries the progress counts: %s", r.Text())
+	ctx.Assert(body["recipe"] == "qa-pairs" && body["max_records"] == float64(1000), "the report carries the job's recipe and max_records: %s", r.Text())
+	ctx.Equal(body["updated_at"], float64(1790000000), "the report carries updated_at from the progress hash; updated_at")
 	ctx.Equal(readGet(c, "j-missing", "t1").Status, 404, "an unknown job")
 	ctx.Equal(c.Get("/v1/synthetic/jobs/"+readJobID).Status, 401, "without X-Tenant-Id the report")
 }
@@ -891,6 +909,8 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	r := readGet(c, readJobID, "t2")
 	ctx.Equal(r.Status, 404, "tenant t2 reading t1's job (the same answer as a missing job)")
 	ctx.Assert(!strings.Contains(r.Text(), "wiki-qa") && !strings.Contains(r.Text(), "qa-pairs"), "the refusal leaks the job: %s", r.Text())
+	missing := readGet(c, "j-missing", "t2")
+	ctx.Equal(strings.ReplaceAll(r.Text(), readJobID, "{id}"), strings.ReplaceAll(missing.Text(), "j-missing", "{id}"), "another tenant's job must answer exactly like a missing one, or the difference tells t2 the job exists; the body")
 	ctx.Equal(readGet(c, readJobID, "t1").Status, 200, "the owner still reads its job")
 }
 
@@ -899,6 +919,10 @@ func CheckParkedApart(ctx *harness.Ctx) {
 	body := readBody(ctx, readGet(c, readJobID, "t1"))
 	got := []any{body["generated"], body["admitted"], body["parked"], body["rejected"]}
 	ctx.Equal(got, []any{float64(10), float64(6), float64(3), float64(1)}, "the progress hash says 10 generated, 6 admitted, 3 parked, 1 rejected (a record the judge never scored is not admitted); generated, admitted, parked, rejected")
+	ctx.Redis.Do("HINCRBY", "synth:progress:"+readJobID, "generated", 2) // two records generated, not judged yet
+	body = readBody(ctx, readGet(c, readJobID, "t1"))
+	got = []any{body["generated"], body["admitted"], body["parked"], body["rejected"]}
+	ctx.Equal(got, []any{float64(12), float64(6), float64(3), float64(1)}, "with two records generated and not yet judged the progress hash says 12 generated, 6 admitted, 3 parked, 1 rejected (every count is read as stored, none derived from the others); generated, admitted, parked, rejected")
 }
 
 func CheckCoverage(ctx *harness.Ctx) {
@@ -926,76 +950,89 @@ namespace {
 
 using json = nlohmann::json;
 
-const std::string kJob = "j1";
+const std::string hJob = "j1";
 
-struct Api {
+struct HarnessApi {
   httplib::Server svr;
   harness::HTTP http;
   json records = json::object();
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
-    const json row = {{"job_id", kJob}, {"status", "queued"}, {"seed_dataset", "wiki-qa"}, {"seed_version", "2026-04-01"}, {"recipe", "qa-pairs"}, {"max_records", 1000}, {"tenant", "t1"}};
-    ctx.Redis.Set("synth:job:" + kJob, row.dump());
-    ctx.Redis.Do("HSET", "synth:progress:" + kJob, "generated", 10, "admitted", 6, "parked", 3, "rejected", 1, "throttled", 4, "updated_at", 1790000000);
-    ctx.Redis.Do("HSET", "synth:coverage:" + kJob, "e-paris", 4, "e-lima", 2);
+  explicit HarnessApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    const json row = {{"job_id", hJob}, {"status", "queued"}, {"seed_dataset", "wiki-qa"}, {"seed_version", "2026-04-01"}, {"recipe", "qa-pairs"}, {"max_records", 1000}, {"tenant", "t1"}};
+    ctx.Redis.Set("synth:job:" + hJob, row.dump());
+    ctx.Redis.Do("HSET", "synth:progress:" + hJob, "generated", 10, "admitted", 6, "parked", 3, "rejected", 1, "throttled", 4, "updated_at", 1790000000);
+    ctx.Redis.Do("HSET", "synth:coverage:" + hJob, "e-paris", 4, "e-lima", 2);
     for (int i = 1; i <= 6; i++) {
       std::string digest;
       for (int k = 0; k < 32; k++) digest += "0" + std::to_string(i);
       records["r-" + std::to_string(i)] = digest;
-      ctx.Redis.Do("HSET", "synth:records:" + kJob, "r-" + std::to_string(i), digest);
+      ctx.Redis.Do("HSET", "synth:records:" + hJob, "r-" + std::to_string(i), digest);
     }
     register_routes(svr);
   }
-  harness::Response report(const std::string& job_id = kJob, const std::string& tenant = "t1") {
+  harness::Response report(const std::string& job_id = hJob, const std::string& tenant = "t1") {
     return http.Get("/v1/synthetic/jobs/" + job_id, "X-Tenant-Id", tenant);
   }
 };
 
-json bodyOf(harness::Ctx& ctx, const harness::Response& r) {
+json hBodyOf(harness::Ctx& ctx, const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   ctx.Assert(body.is_object(), "the report must be a JSON object: %s", r.Text());
   return body;
 }
 
+std::string hReplaceAll(std::string text, const std::string& from, const std::string& to) {
+  for (size_t at = text.find(from); at != std::string::npos; at = text.find(from, at + to.size())) text.replace(at, from.size(), to);
+  return text;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
+  HarnessApi api(ctx);
   const auto r = api.report();
   ctx.Equal(r.Status, 200, "the owner's report (%s)", r.Text());
-  const json body = bodyOf(ctx, r);
-  ctx.Assert(body.value("job_id", "") == kJob && body.value("status", "") == "queued" && body.value("seed_dataset", "") == "wiki-qa", "the report carries the job: %s", r.Text());
+  const json body = hBodyOf(ctx, r);
+  ctx.Assert(body.value("job_id", "") == hJob && body.value("status", "") == "queued" && body.value("seed_dataset", "") == "wiki-qa", "the report carries the job: %s", r.Text());
   ctx.Assert(body.value("generated", -1) == 10 && body.value("throttled", -1) == 4, "the report carries the progress counts: %s", r.Text());
+  ctx.Assert(body.value("recipe", "") == "qa-pairs" && body.value("max_records", -1) == 1000, "the report carries the job's recipe and max_records: %s", r.Text());
+  ctx.Equal(body.value("updated_at", json()), json(1790000000), "the report carries updated_at from the progress hash; updated_at");
   ctx.Equal(api.report("j-missing").Status, 404, "an unknown job");
-  ctx.Equal(api.http.Get("/v1/synthetic/jobs/" + kJob).Status, 401, "without X-Tenant-Id the report");
+  ctx.Equal(api.http.Get("/v1/synthetic/jobs/" + hJob).Status, 401, "without X-Tenant-Id the report");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.report(kJob, "t2");
+  HarnessApi api(ctx);
+  const auto r = api.report(hJob, "t2");
   ctx.Equal(r.Status, 404, "tenant t2 reading t1's job (the same answer as a missing job)");
   ctx.Assert(r.Text().find("wiki-qa") == std::string::npos && r.Text().find("qa-pairs") == std::string::npos, "the refusal leaks the job: %s", r.Text());
+  const auto missing = api.report("j-missing", "t2");
+  ctx.Equal(hReplaceAll(r.Text(), hJob, "{id}"), hReplaceAll(missing.Text(), "j-missing", "{id}"), "another tenant's job must answer exactly like a missing one, or the difference tells t2 the job exists; the body");
   ctx.Equal(api.report().Status, 200, "the owner still reads its job");
 }
 
 void CheckParkedApart(harness::Ctx& ctx) {
-  Api api(ctx);
-  const json body = bodyOf(ctx, api.report());
+  HarnessApi api(ctx);
+  const json body = hBodyOf(ctx, api.report());
   const json got = {body.value("generated", -1), body.value("admitted", -1), body.value("parked", -1), body.value("rejected", -1)};
   ctx.Equal(got, json({10, 6, 3, 1}), "the progress hash says 10 generated, 6 admitted, 3 parked, 1 rejected (a record the judge never scored is not admitted); generated, admitted, parked, rejected (-1: absent)");
+  ctx.Redis.Do("HINCRBY", "synth:progress:" + hJob, "generated", 2);  // two records generated, not judged yet
+  const json later = hBodyOf(ctx, api.report());
+  const json again = {later.value("generated", -1), later.value("admitted", -1), later.value("parked", -1), later.value("rejected", -1)};
+  ctx.Equal(again, json({12, 6, 3, 1}), "with two records generated and not yet judged the progress hash says 12 generated, 6 admitted, 3 parked, 1 rejected (every count is read as stored, none derived from the others); generated, admitted, parked, rejected (-1: absent)");
 }
 
 void CheckCoverage(harness::Ctx& ctx) {
-  Api api(ctx);
-  json body = bodyOf(ctx, api.report());
+  HarnessApi api(ctx);
+  json body = hBodyOf(ctx, api.report());
   ctx.Equal(body.value("coverage", json()), json({{"e-paris", 4}, {"e-lima", 2}}), "coverage must be the per-entity map");
-  ctx.Redis.Do("HINCRBY", "synth:coverage:" + kJob, "e-rome", 1);
-  body = bodyOf(ctx, api.report());
+  ctx.Redis.Do("HINCRBY", "synth:coverage:" + hJob, "e-rome", 1);
+  body = hBodyOf(ctx, api.report());
   ctx.Equal(body.value("coverage", json()), json({{"e-paris", 4}, {"e-lima", 2}, {"e-rome", 1}}), "an admission that lands between two reads shows in the second");
 }
 
 void CheckProvenance(harness::Ctx& ctx) {
-  Api api(ctx);
-  const json body = bodyOf(ctx, api.report());
+  HarnessApi api(ctx);
+  const json body = hBodyOf(ctx, api.report());
   ctx.Equal(body.value("records", json()), api.records, "records must map every admitted record id to its stored seed digest");
 }
 `,

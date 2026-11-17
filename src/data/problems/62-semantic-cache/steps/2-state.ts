@@ -63,7 +63,7 @@ long after its model version is gone.
       id: 'atomic-write',
       title: 'Writes the embedding and its answer in one atomic step',
       detail:
-        'The hash, its EXPIRE and the index membership are written by one Lua script (`EVAL`/`EVALSHA`): a client reading the entry right after the first command sees either nothing or a complete entry. Two client-side HSETs leave an embedding without an answer between them.',
+        'The hash, its EXPIRE and the index membership are written by one Lua script (`EVAL`/`EVALSHA`): a client reading right after the first command on the entry key, or on the index, sees a complete entry that already has its TTL and is already listed. Two client-side HSETs leave an embedding without an answer between them.',
       match: {
         python: {all: [/register_script\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]HSET['"]/]},
         typescript: {all: [/defineCommand\(|\.eval\(|\.evalsha\(/, /redis\.call\(\s*['"]HSET['"]/]},
@@ -89,7 +89,7 @@ long after its model version is gone.
       id: 'answer-required',
       title: 'An embedding without an answer is never a hit',
       detail:
-        'A hash with an `embedding` but no `answer` is an interrupted write: `search_entries` skips it and `get_entry` raises `IncompleteEntry`. The starter returns whatever the hash holds.',
+        'A hash with an `embedding` but no `answer` is an interrupted write: `search_entries` skips it and `get_entry` raises `IncompleteEntry`. A complete entry is returned, and an entry that was never written is `None`, not an error. The starter returns whatever the hash holds.',
       match: {
         python: {all: [/raise IncompleteEntry\(/]},
         typescript: {all: [/throw new IncompleteEntry\(/]},
@@ -115,7 +115,7 @@ long after its model version is gone.
       id: 'disjoint-search',
       title: "A search reads only the caller's tenant and model version index",
       detail:
-        "The scan takes its keys from `index_name(tenant, model_version)`, so a lookup can only return entries from the caller's own set. The starter scans the literal `semantic:all`.",
+        "The scan takes its keys from `index_name(tenant, model_version)`, so a lookup can only return entries from the caller's own set, and returns the nearest entry at or above the threshold with its cosine similarity. The starter scans the literal `semantic:all`.",
       match: {
         python: {all: [/smembers\(\s*index_name\(/], none: [/semantic:all/]},
         typescript: {all: [/smembers\(\s*indexName\(/], none: [/semantic:all/]},
@@ -952,25 +952,27 @@ def _seed(ctx, tenant, entry_id, embedding, answer, index=None, expires_in=86400
 def check_atomic_write(ctx):
     m = ctx.load("state")
     key = "entry:acme:2024-06:e1"
-    commands = []
-    original = m.r.execute_command
+    index = "semantic:acme:2024-06"
 
-    def recording(*args, **kwargs):
-        commands.append(str(args[0]).upper())
-        return original(*args, **kwargs)
+    def snapshot():
+        """Another worker reading the entry: its fields, its TTL, and whether the index lists it."""
+        return ctx.redis.hgetall(key), ctx.redis.ttl(key), ctx.redis.sismember(index, key)
 
-    m.r.execute_command = recording
+    on_entry = ctx.redis_after(key, snapshot)
+    on_index = ctx.redis_after(index, snapshot)
     m.put_entry("acme", MV, "e1", V, ANSWER, "2024-06-1")
     raw = ctx.redis.hgetall(key)
     assert raw, f"put_entry wrote no hash at {key} (keys: {sorted(ctx.redis.keys('*'))})"
     for field in ("embedding", "answer", "created_at", "expires_at", "policy_version"):
         assert field in raw, f"{key} has fields {sorted(raw)}, expected embedding, answer, created_at, expires_at and policy_version"
     assert json.loads(raw["embedding"]) == V and raw["answer"] == ANSWER and raw["policy_version"] == "2024-06-1", f"{key} holds {raw}"
-    scripted = [c for c in commands if c in ("EVAL", "EVALSHA")]
-    assert scripted, f"put_entry sent {commands} to Redis: the hash, its EXPIRE and the index membership must be written inside one EVAL/EVALSHA, or a write that dies between two commands leaves an embedding with no answer"
-    client_side = [c for c in commands if c.startswith("H") or c in ("SADD", "EXPIRE")]
-    assert not client_side, f"put_entry sent {commands} to Redis: {client_side} ran from the client, outside the script"
-    assert key in ctx.redis.smembers("semantic:acme:2024-06"), f"semantic:acme:2024-06 holds {sorted(ctx.redis.smembers('semantic:acme:2024-06'))}, expected the entry's key"
+    assert key in ctx.redis.smembers(index), f"{index} holds {sorted(ctx.redis.smembers(index))}, expected the entry's key"
+    for probe, first in ((on_entry, f"your first command on {key}"), (on_index, f"your first command on {index}")):
+        assert probe.fired and probe.error is None, f"nothing touched {key} and {index} ({probe.error!r})"
+        seen, ttl, listed = probe.result
+        assert "answer" in seen and "embedding" in seen, f"right after {first} another worker read fields {sorted(seen)}: an embedding with no answer behind it. Write the hash, its EXPIRE and the index membership inside one Lua script"
+        assert ttl > 0, f"right after {first} the entry had TTL {ttl}: a write that dies there leaves an entry that never expires. Write the hash, its EXPIRE and the index membership inside one Lua script"
+        assert listed, f"right after {first} the index did not list the entry: a write that dies there leaves an entry no lookup finds. Write the hash, its EXPIRE and the index membership inside one Lua script"
 
 
 def check_tenant_scope(ctx):
@@ -998,6 +1000,13 @@ def check_answer_required(ctx):
     hit = m.search_entries("acme", MV, V, 0.82)
     assert hit is not None and hit["entry_id"] == "e2", f"with a complete entry beside the incomplete one search_entries returned {hit}, expected e2"
     assert ctx.redis.exists(key) == 1, "the incomplete hash is the store's to clean up later; the search must only skip it"
+    got = m.get_entry("acme", MV, "e2")
+    assert got is not None and got["answer"] == ANSWER and got["entry_id"] == "e2", f"get_entry returned {got!r} for the complete entry e2"
+    try:
+        got = m.get_entry("acme", MV, "e9")
+    except Exception as e:  # noqa: BLE001
+        got = e
+    assert got is None, f"get_entry for an entry that was never written gave {got!r}, expected None: only a hash without an answer is incomplete"
 
 
 def check_ttl(ctx):
@@ -1022,7 +1031,9 @@ def check_disjoint_search(ctx):
     assert hit is None, f"acme's lookup returned {hit}, globex's entry: the search read an index that is not acme's"
     hit = m.search_entries("globex", MV, NEAR, 0.82)
     assert hit is not None and hit["entry_id"] == "g1", f"globex's lookup of a near question returned {hit}, expected g1"
-    assert 0.99 <= hit["similarity"] <= 1.0, f"similarity is {hit['similarity']}, expected the cosine of the two embeddings (0.994)"
+    assert abs(hit["similarity"] - 0.9938837346736189) < 1e-9, f"similarity is {hit['similarity']}, expected the cosine of the two embeddings (0.9938837346736189)"
+    hit = m.search_entries("globex", MV, V, 1.0)
+    assert hit is not None and hit["entry_id"] == "g1", f"a lookup of g1's own embedding at threshold 1.0 returned {hit}: similarity 1.0 is at the threshold, and the nearest entry at or above it is a hit"
     assert m.search_entries("globex", MV, FAR, 0.82) is None, "an orthogonal question must not hit"
 `,
     typescript: `const MV = '2024-06';
@@ -1045,20 +1056,27 @@ function seed(ctx, tenant: string, entryId: string, embedding: number[], answer:
 export async function check_atomic_write(ctx) {
   const m = ctx.load('state');
   const key = 'entry:acme:2024-06:e1';
-  // Another worker reads the entry right after the first command that touches it.
-  const probe = ctx.redisAfter(key, () => ctx.redis.hgetall(key));
+  const index = 'semantic:acme:2024-06';
+  // Another worker reading the entry right after the first command on its key, and on the index: its fields, its TTL, and whether the index lists it.
+  const snapshot = () => ({seen: Object.keys(ctx.redis.hgetall(key)), ttl: ctx.redis.ttl(key), listed: ctx.redis.smembers(index).includes(key)});
+  const onEntry = ctx.redisAfter(key, snapshot);
+  const onIndex = ctx.redisAfter(index, snapshot);
   await m.putEntry('acme', MV, 'e1', V, ANSWER, '2024-06-1');
   const raw = ctx.redis.hgetall(key);
   assert(Object.keys(raw).length > 0, \`putEntry wrote no hash at \${key} (keys: \${JSON.stringify(ctx.redis.keys('*'))})\`);
   for (const field of ['embedding', 'answer', 'created_at', 'expires_at', 'policy_version']) {
     assert(field in raw, \`\${key} has fields \${JSON.stringify(Object.keys(raw))}, expected embedding, answer, created_at, expires_at and policy_version\`);
   }
-  assert(probe.fired, 'nothing touched the entry key');
-  const seen = Object.keys(probe.result as Record<string, string>);
-  assert(seen.includes('answer') && seen.includes('embedding'), \`right after your first command on \${key} another worker read fields \${JSON.stringify(seen)}: an embedding with no answer behind it. Write the hash, its EXPIRE and the index membership inside one Lua script\`);
   assert.equal(raw.answer, ANSWER);
   assert.deepEqual(JSON.parse(raw.embedding), V);
-  assert(ctx.redis.smembers('semantic:acme:2024-06').includes(key), \`semantic:acme:2024-06 holds \${JSON.stringify(ctx.redis.smembers('semantic:acme:2024-06'))}, expected the entry's key\`);
+  assert(ctx.redis.smembers(index).includes(key), \`\${index} holds \${JSON.stringify(ctx.redis.smembers(index))}, expected the entry's key\`);
+  for (const [probe, first] of [[onEntry, \`your first command on \${key}\`], [onIndex, \`your first command on \${index}\`]] as const) {
+    assert(probe.fired && !probe.error, \`nothing touched \${key} and \${index} (\${probe.error})\`);
+    const {seen, ttl, listed} = probe.result as {seen: string[]; ttl: number; listed: boolean};
+    assert(seen.includes('answer') && seen.includes('embedding'), \`right after \${first} another worker read fields \${JSON.stringify(seen)}: an embedding with no answer behind it. Write the hash, its EXPIRE and the index membership inside one Lua script\`);
+    assert(ttl > 0, \`right after \${first} the entry had TTL \${ttl}: a write that dies there leaves an entry that never expires. Write the hash, its EXPIRE and the index membership inside one Lua script\`);
+    assert(listed, \`right after \${first} the index did not list the entry: a write that dies there leaves an entry no lookup finds. Write the hash, its EXPIRE and the index membership inside one Lua script\`);
+  }
 }
 
 export async function check_tenant_scope(ctx) {
@@ -1088,6 +1106,15 @@ export async function check_answer_required(ctx) {
   hit = await m.searchEntries('acme', MV, V, 0.82);
   assert(hit !== null && hit.entry_id === 'e2', \`with a complete entry beside the incomplete one searchEntries returned \${JSON.stringify(hit)}, expected e2\`);
   assert.equal(ctx.redis.exists(key), 1, "the incomplete hash is the store's to clean up later; the search must only skip it");
+  const complete = await m.getEntry('acme', MV, 'e2');
+  assert(complete && complete.answer === ANSWER && complete.entry_id === 'e2', \`getEntry gave \${JSON.stringify(complete)} for the complete entry e2\`);
+  let missing: unknown;
+  try {
+    missing = await m.getEntry('acme', MV, 'e9');
+  } catch (e) {
+    missing = e;
+  }
+  assert(missing === null || missing === undefined, \`getEntry for an entry that was never written gave \${missing instanceof Error ? missing.constructor.name : JSON.stringify(missing)}, expected null: only a hash without an answer is incomplete\`);
 }
 
 export async function check_ttl(ctx) {
@@ -1112,7 +1139,9 @@ export async function check_disjoint_search(ctx) {
   assert.equal(hit, null, \`acme's lookup returned \${JSON.stringify(hit)}, globex's entry: the search read an index that is not acme's\`);
   hit = await m.searchEntries('globex', MV, NEAR, 0.82);
   assert(hit !== null && hit.entry_id === 'g1', \`globex's lookup of a near question returned \${JSON.stringify(hit)}, expected g1\`);
-  assert(0.99 <= hit.similarity && hit.similarity <= 1, \`similarity is \${hit.similarity}, expected the cosine of the two embeddings (0.994)\`);
+  assert(Math.abs(hit.similarity - 0.9938837346736189) < 1e-9, \`similarity is \${hit.similarity}, expected the cosine of the two embeddings (0.9938837346736189)\`);
+  hit = await m.searchEntries('globex', MV, V, 1);
+  assert(hit !== null && hit.entry_id === 'g1', \`a lookup of g1's own embedding at threshold 1.0 returned \${JSON.stringify(hit)}: similarity 1.0 is at the threshold, and the nearest entry at or above it is a hit\`);
   assert.equal(await m.searchEntries('globex', MV, FAR, 0.82), null, 'an orthogonal question must not hit');
 }
 `,
@@ -1139,8 +1168,8 @@ var (
 	stateFar  = []float64{0, 1, 0, 0}     // cosine 0 to stateV
 )
 
-// seedEntry writes an entry as putEntry writes it (and every other step reads it), from another worker: no TTL.
-func seedEntry(ctx *harness.Ctx, tenant, entryID string, embedding []float64, answer *string, index string, expiresIn float64) string {
+// stateSeedEntry writes an entry as putEntry writes it (and every other step reads it), from another worker: no TTL.
+func stateSeedEntry(ctx *harness.Ctx, tenant, entryID string, embedding []float64, answer *string, index string, expiresIn float64) string {
 	key := fmt.Sprintf("entry:%s:%s:%s", tenant, stateMV, entryID)
 	now := float64(ctx.Clock.Now()) / 1000
 	vec, _ := json.Marshal(embedding)
@@ -1156,10 +1185,21 @@ func seedEntry(ctx *harness.Ctx, tenant, entryID string, embedding []float64, an
 	return key
 }
 
+// stateSnapshot is what another worker reads of an entry: its fields, its TTL, and whether the index lists it.
+type stateSnapshot struct {
+	seen   map[string]string
+	ttl    int64
+	listed bool
+}
+
 func CheckAtomicWrite(ctx *harness.Ctx) {
 	key := "entry:acme:2024-06:e1"
-	// Another worker reads the entry right after the first command that touches it.
-	probe := ctx.Redis.After(key, func() any { return ctx.Redis.HGetAll(key) })
+	index := "semantic:acme:2024-06"
+	snapshot := func() any {
+		return stateSnapshot{seen: ctx.Redis.HGetAll(key), ttl: ctx.Redis.TTL(key), listed: ctx.Redis.SIsMember(index, key)}
+	}
+	onEntry := ctx.Redis.After(key, snapshot)
+	onIndex := ctx.Redis.After(index, snapshot)
 	ctx.NoError(putEntry(context.Background(), "acme", stateMV, "e1", stateV, stateAnswer, "2024-06-1"), "putEntry")
 	raw := ctx.Redis.HGetAll(key)
 	ctx.Assert(len(raw) > 0, "putEntry wrote no hash at %s (keys: %v)", key, ctx.Redis.Keys("*"))
@@ -1167,13 +1207,21 @@ func CheckAtomicWrite(ctx *harness.Ctx) {
 		_, ok := raw[field]
 		ctx.Assert(ok, "%s has fields %v, expected embedding, answer, created_at, expires_at and policy_version", key, raw)
 	}
-	ctx.Assert(probe.Fired, "nothing touched the entry key")
-	seen, _ := probe.Result.(map[string]string)
-	_, hasAnswer := seen["answer"]
-	_, hasEmbedding := seen["embedding"]
-	ctx.Assert(hasAnswer && hasEmbedding, "right after your first command on %s another worker read fields %v: an embedding with no answer behind it. Write the hash, its EXPIRE and the index membership inside one Lua script", key, seen)
 	ctx.Equal(raw["answer"], stateAnswer, "answer")
-	ctx.Equal(ctx.Redis.SMembers("semantic:acme:2024-06"), []string{key}, "semantic:acme:2024-06 must hold the entry's key")
+	ctx.Equal(ctx.Redis.SMembers(index), []string{key}, "semantic:acme:2024-06 must hold the entry's key")
+	for i, first := range []string{"your first command on " + key, "your first command on " + index} {
+		fired, err, result := onEntry.Fired, onEntry.Err, onEntry.Result
+		if i == 1 {
+			fired, err, result = onIndex.Fired, onIndex.Err, onIndex.Result
+		}
+		ctx.Assert(fired && err == nil, "nothing touched %s and %s (%v)", key, index, err)
+		snap, _ := result.(stateSnapshot)
+		_, hasAnswer := snap.seen["answer"]
+		_, hasEmbedding := snap.seen["embedding"]
+		ctx.Assert(hasAnswer && hasEmbedding, "right after %s another worker read fields %v: an embedding with no answer behind it. Write the hash, its EXPIRE and the index membership inside one Lua script", first, snap.seen)
+		ctx.Assert(snap.ttl > 0, "right after %s the entry had TTL %d: a write that dies there leaves an entry that never expires. Write the hash, its EXPIRE and the index membership inside one Lua script", first, snap.ttl)
+		ctx.Assert(snap.listed, "right after %s the index did not list the entry: a write that dies there leaves an entry no lookup finds. Write the hash, its EXPIRE and the index membership inside one Lua script", first)
+	}
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
@@ -1189,18 +1237,22 @@ func CheckTenantScope(ctx *harness.Ctx) {
 
 func CheckAnswerRequired(ctx *harness.Ctx) {
 	bg := context.Background()
-	key := seedEntry(ctx, "acme", "e1", stateV, nil, "", 86400) // an interrupted write: embedding, no answer
+	key := stateSeedEntry(ctx, "acme", "e1", stateV, nil, "", 86400) // an interrupted write: embedding, no answer
 	got, err := getEntry(bg, "acme", stateMV, "e1")
 	ctx.Assert(errors.Is(err, ErrIncompleteEntry), "getEntry returned (%v, %v) for a hash with an embedding and no answer: return ErrIncompleteEntry, an interrupted write is not an entry", got, err)
 	hit, err := searchEntries(bg, "acme", stateMV, stateV, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit == nil, "searchEntries returned %v for an entry with no answer: a lookup would serve an empty answer", hit)
 	answer := stateAnswer
-	seedEntry(ctx, "acme", "e2", stateV, &answer, "", 86400)
+	stateSeedEntry(ctx, "acme", "e2", stateV, &answer, "", 86400)
 	hit, err = searchEntries(bg, "acme", stateMV, stateV, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit != nil && hit.EntryID == "e2", "with a complete entry beside the incomplete one searchEntries returned %v, expected e2", hit)
 	ctx.Equal(ctx.Redis.Exists(key), 1, "the incomplete hash is the store's to clean up later; the search must only skip it; EXISTS")
+	got, err = getEntry(bg, "acme", stateMV, "e2")
+	ctx.Assert(err == nil && got != nil && got.Answer == stateAnswer && got.EntryID == "e2", "getEntry returned (%v, %v) for the complete entry e2", got, err)
+	got, err = getEntry(bg, "acme", stateMV, "e9")
+	ctx.Assert(err == nil && got == nil, "getEntry for an entry that was never written returned (%v, %v), expected (nil, nil): only a hash without an answer is incomplete", got, err)
 }
 
 func CheckTtl(ctx *harness.Ctx) {
@@ -1223,7 +1275,7 @@ func CheckTtl(ctx *harness.Ctx) {
 func CheckDisjointSearch(ctx *harness.Ctx) {
 	bg := context.Background()
 	answer := "Globex does not refund."
-	key := seedEntry(ctx, "globex", "g1", stateV, &answer, "", 86400)
+	key := stateSeedEntry(ctx, "globex", "g1", stateV, &answer, "", 86400)
 	ctx.Redis.Do("SADD", "semantic:all", key) // an older build's global index, still around
 	hit, err := searchEntries(bg, "acme", stateMV, stateV, 0.82)
 	ctx.NoError(err, "searchEntries")
@@ -1231,7 +1283,10 @@ func CheckDisjointSearch(ctx *harness.Ctx) {
 	hit, err = searchEntries(bg, "globex", stateMV, stateNear, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit != nil && hit.EntryID == "g1", "globex's lookup of a near question returned %v, expected g1", hit)
-	ctx.Assert(0.99 <= hit.Similarity && hit.Similarity <= 1, "similarity is %v, expected the cosine of the two embeddings (0.994)", hit.Similarity)
+	ctx.Assert(hit.Similarity-0.9938837346736189 < 1e-9 && 0.9938837346736189-hit.Similarity < 1e-9, "similarity is %v, expected the cosine of the two embeddings (0.9938837346736189)", hit.Similarity)
+	hit, err = searchEntries(bg, "globex", stateMV, stateV, 1.0)
+	ctx.NoError(err, "searchEntries")
+	ctx.Assert(hit != nil && hit.EntryID == "g1", "a lookup of g1's own embedding at threshold 1.0 returned %v: similarity 1.0 is at the threshold, and the nearest entry at or above it is a hit", hit)
 	hit, err = searchEntries(bg, "globex", stateMV, stateFar, 0.82)
 	ctx.NoError(err, "searchEntries")
 	ctx.Assert(hit == nil, "an orthogonal question must not hit, got %v", hit)
@@ -1241,6 +1296,7 @@ func CheckDisjointSearch(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <map>
 #include <optional>
 #include <string>
@@ -1248,16 +1304,16 @@ func CheckDisjointSearch(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kMV = "2024-06";
-const std::string kAnswer = "Refunds take five business days.";
-const std::vector<double> kV = {1, 0, 0, 0};
-const std::vector<double> kNear = {0.9, 0.1, 0, 0};  // cosine 0.994 to kV
-const std::vector<double> kFar = {0, 1, 0, 0};       // cosine 0 to kV
+const std::string kHMV = "2024-06";
+const std::string kHAnswer = "Refunds take five business days.";
+const std::vector<double> kHV = {1, 0, 0, 0};
+const std::vector<double> kHNear = {0.9, 0.1, 0, 0};  // cosine 0.99388 to kHV
+const std::vector<double> kHFar = {0, 1, 0, 0};       // cosine 0 to kHV
 
 // An entry as put_entry writes it (and every other step reads it), from another worker: no TTL.
-std::string seedEntry(harness::Ctx& ctx, const std::string& tenant, const std::string& entryId, const std::vector<double>& embedding,
-                      const std::optional<std::string>& answer, std::string index = "", double expiresIn = 86400) {
-  const std::string key = "entry:" + tenant + ":" + kMV + ":" + entryId;
+std::string hSeedEntry(harness::Ctx& ctx, const std::string& tenant, const std::string& entryId, const std::vector<double>& embedding,
+                       const std::optional<std::string>& answer, std::string index = "", double expiresIn = 86400) {
+  const std::string key = "entry:" + tenant + ":" + kHMV + ":" + entryId;
   const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
   std::vector<std::string> args = {"HSET", key, "embedding", nlohmann::json(embedding).dump(), "created_at", harness::Value(now),
                                    "expires_at", harness::Value(now + expiresIn), "policy_version", "2024-06-1"};
@@ -1266,75 +1322,106 @@ std::string seedEntry(harness::Ctx& ctx, const std::string& tenant, const std::s
     args.push_back(*answer);
   }
   ctx.Redis.Must(args);
-  if (index.empty()) index = "semantic:" + tenant + ":" + kMV;
+  if (index.empty()) index = "semantic:" + tenant + ":" + kHMV;
   ctx.Redis.Do("SADD", index, key);
   return key;
 }
 
-std::string show(const std::optional<Entry>& e) {
+std::string hShow(const std::optional<Entry>& e) {
   if (!e) return "<nil>";
   return "{entry_id=" + e->entry_id + " answer=" + harness::Quote(e->answer) + " similarity=" + harness::FormatFloat(e->similarity) + "}";
 }
+
+// What another worker reads of an entry: its fields, its TTL, and whether the index lists it.
+struct HSnapshot {
+  bool fired = false;
+  std::map<std::string, std::string> seen;
+  long long ttl = 0;
+  bool listed = false;
+};
 
 }  // namespace
 
 void CheckAtomicWrite(harness::Ctx& ctx) {
   const std::string key = "entry:acme:2024-06:e1";
-  // Another worker reads the entry right after the first command that touches it.
-  bool fired = false;
-  std::map<std::string, std::string> seen;
-  ctx.Redis.After(key, [&] {
-    fired = true;
-    seen = ctx.Redis.HGetAll(key);
-  });
-  put_entry("acme", kMV, "e1", kV, kAnswer, "2024-06-1");
+  const std::string index = "semantic:acme:2024-06";
+  HSnapshot onEntry, onIndex;
+  for (HSnapshot* snap : {&onEntry, &onIndex}) {
+    ctx.Redis.After(snap == &onEntry ? key : index, [&ctx, &key, &index, snap] {
+      snap->fired = true;
+      snap->seen = ctx.Redis.HGetAll(key);
+      snap->ttl = ctx.Redis.TTL(key);
+      snap->listed = ctx.Redis.SIsMember(index, key);
+    });
+  }
+  put_entry("acme", kHMV, "e1", kHV, kHAnswer, "2024-06-1");
   const auto raw = ctx.Redis.HGetAll(key);
   ctx.Assert(!raw.empty(), "put_entry wrote no hash at %s (keys: %v)", key, ctx.Redis.Keys("*"));
   for (const std::string field : {"embedding", "answer", "created_at", "expires_at", "policy_version"}) {
     ctx.Assert(raw.count(field) > 0, "%s has fields %v, expected embedding, answer, created_at, expires_at and policy_version", key, raw);
   }
-  ctx.Assert(fired, "nothing touched the entry key");
-  ctx.Assert(seen.count("answer") > 0 && seen.count("embedding") > 0,
-             "right after your first command on %s another worker read fields %v: an embedding with no answer behind it. Write the "
-             "hash, its EXPIRE and the index membership inside one Lua script",
-             key, seen);
-  ctx.Equal(raw.at("answer"), kAnswer, "answer");
-  ctx.Equal(ctx.Redis.SMembers("semantic:acme:2024-06"), {key}, "semantic:acme:2024-06 must hold the entry's key");
+  ctx.Equal(raw.at("answer"), kHAnswer, "answer");
+  ctx.Equal(ctx.Redis.SMembers(index), {key}, "semantic:acme:2024-06 must hold the entry's key");
+  for (const HSnapshot* snap : {&onEntry, &onIndex}) {
+    const std::string first = "your first command on " + (snap == &onEntry ? key : index);
+    ctx.Assert(snap->fired, "nothing touched %s and %s", key, index);
+    ctx.Assert(snap->seen.count("answer") > 0 && snap->seen.count("embedding") > 0,
+               "right after %s another worker read fields %v: an embedding with no answer behind it. Write the hash, its EXPIRE and the "
+               "index membership inside one Lua script",
+               first, snap->seen);
+    ctx.Assert(snap->ttl > 0,
+               "right after %s the entry had TTL %d: a write that dies there leaves an entry that never expires. Write the hash, its "
+               "EXPIRE and the index membership inside one Lua script",
+               first, snap->ttl);
+    ctx.Assert(snap->listed,
+               "right after %s the index did not list the entry: a write that dies there leaves an entry no lookup finds. Write the "
+               "hash, its EXPIRE and the index membership inside one Lua script",
+               first);
+  }
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  put_entry("acme", kMV, "e1", kV, kAnswer, "2024-06-1");
-  put_entry("globex", kMV, "e2", kV, "Globex does not refund.", "2024-06-1");
+  put_entry("acme", kHMV, "e1", kHV, kHAnswer, "2024-06-1");
+  put_entry("globex", kHMV, "e2", kHV, "Globex does not refund.", "2024-06-1");
   ctx.Equal(ctx.Redis.Exists("semantic:all"), 0,
             "a global index semantic:all exists with %v: every tenant's entries share one vector space; its EXISTS",
             ctx.Redis.SMembers("semantic:all"));
   ctx.Equal(ctx.Redis.SMembers("semantic:acme:2024-06"), {"entry:acme:2024-06:e1"},
             "semantic:acme:2024-06 must hold only acme's entry key (keys: %v)", ctx.Redis.Keys("semantic:*"));
-  const auto hit = search_entries("acme", kMV, kV, 0.82);
-  ctx.Assert(hit && hit->answer == kAnswer, "acme's lookup of its own question returned %s, expected acme's answer", show(hit));
+  const auto hit = search_entries("acme", kHMV, kHV, 0.82);
+  ctx.Assert(hit && hit->answer == kHAnswer, "acme's lookup of its own question returned %s, expected acme's answer", hShow(hit));
 }
 
 void CheckAnswerRequired(harness::Ctx& ctx) {
-  const std::string key = seedEntry(ctx, "acme", "e1", kV, std::nullopt);  // an interrupted write: embedding, no answer
+  const std::string key = hSeedEntry(ctx, "acme", "e1", kHV, std::nullopt);  // an interrupted write: embedding, no answer
   std::string got = "returned";
   try {
-    const auto e = get_entry("acme", kMV, "e1");
-    got = "returned " + show(e);
+    const auto e = get_entry("acme", kHMV, "e1");
+    got = "returned " + hShow(e);
   } catch (const IncompleteEntry&) {
     got = "raised";
   }
   ctx.Equal(got, "raised", "get_entry on a hash with an embedding and no answer: throw IncompleteEntry, an interrupted write is not an entry");
-  auto hit = search_entries("acme", kMV, kV, 0.82);
-  ctx.Assert(!hit, "search_entries returned %s for an entry with no answer: a lookup would serve an empty answer", show(hit));
-  seedEntry(ctx, "acme", "e2", kV, kAnswer);
-  hit = search_entries("acme", kMV, kV, 0.82);
-  ctx.Assert(hit && hit->entry_id == "e2", "with a complete entry beside the incomplete one search_entries returned %s, expected e2", show(hit));
+  auto hit = search_entries("acme", kHMV, kHV, 0.82);
+  ctx.Assert(!hit, "search_entries returned %s for an entry with no answer: a lookup would serve an empty answer", hShow(hit));
+  hSeedEntry(ctx, "acme", "e2", kHV, kHAnswer);
+  hit = search_entries("acme", kHMV, kHV, 0.82);
+  ctx.Assert(hit && hit->entry_id == "e2", "with a complete entry beside the incomplete one search_entries returned %s, expected e2", hShow(hit));
   ctx.Equal(ctx.Redis.Exists(key), 1, "the incomplete hash is the store's to clean up later; the search must only skip it; EXISTS");
+  const auto complete = get_entry("acme", kHMV, "e2");
+  ctx.Assert(complete && complete->answer == kHAnswer && complete->entry_id == "e2", "get_entry returned %s for the complete entry e2",
+             hShow(complete));
+  try {
+    got = "returned " + hShow(get_entry("acme", kHMV, "e9"));
+  } catch (const std::exception& e) {
+    got = std::string("threw ") + e.what();
+  }
+  ctx.Equal(got, "returned <nil>", "get_entry for an entry that was never written: nullopt, only a hash without an answer is incomplete");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
   const std::string key = "entry:acme:2024-06:e1";
-  put_entry("acme", kMV, "e1", kV, kAnswer, "2024-06-1");
+  put_entry("acme", kHMV, "e1", kHV, kHAnswer, "2024-06-1");
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(86000 <= ttl && ttl <= 86400, "%s has TTL %d, expected kEntryTtlSeconds (86400) set by the write", key, ttl);
   const auto raw = ctx.Redis.HGetAll(key);
@@ -1342,21 +1429,26 @@ void CheckTtl(harness::Ctx& ctx) {
   ctx.Assert(span > 86399 && span < 86401, "expires_at - created_at is %v, expected 86400", span);
   ctx.Clock.Advance(86401);
   ctx.Equal(ctx.Redis.Exists(key), 0, "%s still exists 86401 s after the write; EXISTS", key);
-  const auto hit = search_entries("acme", kMV, kV, 0.82);
-  ctx.Assert(!hit, "search_entries returned %s after the entry expired: a key whose hash is gone must be skipped", show(hit));
+  const auto hit = search_entries("acme", kHMV, kHV, 0.82);
+  ctx.Assert(!hit, "search_entries returned %s after the entry expired: a key whose hash is gone must be skipped", hShow(hit));
 }
 
 void CheckDisjointSearch(harness::Ctx& ctx) {
-  const std::string key = seedEntry(ctx, "globex", "g1", kV, std::string("Globex does not refund."));
+  const std::string key = hSeedEntry(ctx, "globex", "g1", kHV, std::string("Globex does not refund."));
   ctx.Redis.Do("SADD", "semantic:all", key);  // an older build's global index, still around
-  auto hit = search_entries("acme", kMV, kV, 0.82);
-  ctx.Assert(!hit, "acme's lookup returned %s, globex's entry: the search read an index that is not acme's", show(hit));
-  hit = search_entries("globex", kMV, kNear, 0.82);
-  ctx.Assert(hit && hit->entry_id == "g1", "globex's lookup of a near question returned %s, expected g1", show(hit));
-  ctx.Assert(0.99 <= hit->similarity && hit->similarity <= 1, "similarity is %v, expected the cosine of the two embeddings (0.994)",
-             hit->similarity);
-  hit = search_entries("globex", kMV, kFar, 0.82);
-  ctx.Assert(!hit, "an orthogonal question must not hit, got %s", show(hit));
+  auto hit = search_entries("acme", kHMV, kHV, 0.82);
+  ctx.Assert(!hit, "acme's lookup returned %s, globex's entry: the search read an index that is not acme's", hShow(hit));
+  hit = search_entries("globex", kHMV, kHNear, 0.82);
+  ctx.Assert(hit && hit->entry_id == "g1", "globex's lookup of a near question returned %s, expected g1", hShow(hit));
+  ctx.Assert(std::abs(hit->similarity - 0.9938837346736189) < 1e-9,
+             "similarity is %v, expected the cosine of the two embeddings (0.9938837346736189)", hit->similarity);
+  hit = search_entries("globex", kHMV, kHV, 1.0);
+  ctx.Assert(hit && hit->entry_id == "g1",
+             "a lookup of g1's own embedding at threshold 1.0 returned %s: similarity 1.0 is at the threshold, and the nearest entry at "
+             "or above it is a hit",
+             hShow(hit));
+  hit = search_entries("globex", kHMV, kHFar, 0.82);
+  ctx.Assert(!hit, "an orthogonal question must not hit, got %s", hShow(hit));
 }
 `,
   },

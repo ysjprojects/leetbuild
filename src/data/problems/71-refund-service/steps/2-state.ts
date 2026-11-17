@@ -52,7 +52,7 @@ lost it.
       id: 'atomic',
       title: 'Claims and releases inside one script',
       detail:
-        'Another server’s claim landing between the read and the write still leaves the total within the cap, and a release retried on another server takes the amount off once. The starter reads with `HGET` and writes with `HINCRBY` from the client.',
+        'A refused claim writes nothing, another server’s claim landing between the read and the write still leaves the total within the cap, and a release retried on another server takes the amount off once. The starter reads with `HGET` and writes with `HINCRBY` from the client.',
       match: {
         python: {all: [/register_script\(|\.eval\(/, /HINCRBY/], none: [/\.hincrby\(/, /\.hdel\(/]},
         typescript: {all: [/defineCommand\(|\.eval\(/, /HINCRBY/], none: [/\.hincrby\(/, /\.hdel\(/]},
@@ -65,7 +65,7 @@ lost it.
       id: 'claim-once',
       title: 'A retried claim for the same refund counts once',
       detail:
-        'Claiming `rf-1` twice answers accepted both times and leaves 3000 held, not 6000. The starter adds the amount again on every call.',
+        'Claiming `rf-1` twice answers accepted both times and leaves 3000 held, not 6000; a retried claim answers accepted even once the payment is fully claimed. The starter adds the amount again on every call.',
       match: {
         python: {all: [/HEXISTS|HSETNX/]},
         typescript: {all: [/HEXISTS|HSETNX/]},
@@ -795,6 +795,8 @@ def check_atomic(ctx):
     assert got == (True, 6000, 4000), f"claiming 6000 of 10000 answered {got}, expected (True, 6000, 4000)"
     got = tuple(m.claim("pay_1", "rf-2", 5000, 10000))
     assert got == (False, 6000, 4000), f"claiming 5000 more answered {got}, expected (False, 6000, 4000)"
+    total, held = _held(ctx)
+    assert total == 6000 and held == {"rf-1": 6000}, f"a refused claim of rf-2 left total {total} over {held}, expected 6000 over rf-1: a refusal writes nothing"
     ctx.redis.delete(KEY)
     probe = ctx.redis_after(KEY, lambda: _other_claim(ctx, "rf-9", 6000, 10000))
     m.claim("pay_1", "rf-1", 6000, 10000)
@@ -817,6 +819,8 @@ def check_claim_once(ctx):
     assert again == (True, 3000, 7000) and total == 3000, f"a claim retried for rf-1 answered {again} and left total {total} over {held}, expected (True, 3000, 7000): the refund already holds its amount"
     got = tuple(m.claim("pay_1", "rf-2", 7000, 10000))
     assert got == (True, 10000, 0), f"with rf-1 counted once, 7000 more fits exactly; the claim answered {got}"
+    again = tuple(m.claim("pay_1", "rf-2", 7000, 10000))
+    assert again == (True, 10000, 0), f"a claim retried for rf-2 once the payment is fully claimed answered {again}, expected (True, 10000, 0): the refund already holds its amount, whatever room is left"
     m.release("pay_1", "rf-2")
     left = m.release("pay_1", "rf-2")
     assert left == 3000 and _held(ctx)[0] == 3000, f"releasing rf-2 twice left {_held(ctx)[0]}, expected 3000"
@@ -882,11 +886,13 @@ export async function check_atomic(ctx) {
   assert.deepEqual(got, [true, 6000, 4000], \`claiming 6000 of 10000 answered \${JSON.stringify(got)}, expected accepted, 6000, 4000\`);
   got = triple(await m.claim('pay_1', 'rf-2', 5000, 10000));
   assert.deepEqual(got, [false, 6000, 4000], \`claiming 5000 more answered \${JSON.stringify(got)}, expected refused, 6000, 4000\`);
+  let [total, fields] = held(ctx);
+  assert(total === 6000 && JSON.stringify(fields) === JSON.stringify({'rf-1': 6000}), \`a refused claim of rf-2 left total \${total} over \${JSON.stringify(fields)}, expected 6000 over rf-1: a refusal writes nothing\`);
   ctx.redis.del(KEY);
   let probe = ctx.redisAfter(KEY, () => otherClaim(ctx, 'rf-9', 6000, 10000));
   await m.claim('pay_1', 'rf-1', 6000, 10000);
   assert(probe.fired, 'claim sent no command touching refunded:pay_1');
-  let [total, fields] = held(ctx);
+  [total, fields] = held(ctx);
   assert(total <= 10000 && total === sum(fields), \`another server claimed 6000 between claim's read and its write: refunded:pay_1 holds total \${total} over \${JSON.stringify(fields)} on a 10000 payment. Read, compare and add inside one script\`);
   ctx.redis.del(KEY);
   ctx.redis.hset(KEY, 'total', 7000, 'rf-1', 3000, 'rf-2', 4000);
@@ -904,6 +910,8 @@ export async function check_claim_once(ctx) {
   assert(JSON.stringify(again) === JSON.stringify([true, 3000, 7000]) && total === 3000, \`a claim retried for rf-1 answered \${JSON.stringify(again)} and left total \${total} over \${JSON.stringify(fields)}, expected accepted, 3000, 7000: the refund already holds its amount\`);
   const got = triple(await m.claim('pay_1', 'rf-2', 7000, 10000));
   assert.deepEqual(got, [true, 10000, 0], \`with rf-1 counted once, 7000 more fits exactly; the claim answered \${JSON.stringify(got)}\`);
+  const retried = triple(await m.claim('pay_1', 'rf-2', 7000, 10000));
+  assert.deepEqual(retried, [true, 10000, 0], \`a claim retried for rf-2 once the payment is fully claimed answered \${JSON.stringify(retried)}, expected accepted, 10000, 0: the refund already holds its amount, whatever room is left\`);
   await m.release('pay_1', 'rf-2');
   const left = await m.release('pay_1', 'rf-2');
   assert(Number(left) === 3000 && held(ctx)[0] === 3000, \`releasing rf-2 twice left \${held(ctx)[0]}, expected 3000\`);
@@ -1005,11 +1013,13 @@ func stateClaim(ctx *harness.Ctx, refundID string, amount int64) ClaimResult {
 func CheckAtomic(ctx *harness.Ctx) {
 	ctx.Equal(stateClaim(ctx, "rf-1", 6000), ClaimResult{Accepted: true, RefundedMinor: 6000, RemainingMinor: 4000}, "claiming 6000 of 10000")
 	ctx.Equal(stateClaim(ctx, "rf-2", 5000), ClaimResult{Accepted: false, RefundedMinor: 6000, RemainingMinor: 4000}, "claiming 5000 more")
+	total, fields := stateHeld(ctx)
+	ctx.Assert(total == 6000 && len(fields) == 1 && fields["rf-1"] == 6000, "a refused claim of rf-2 left total %d over %v, expected 6000 over rf-1: a refusal writes nothing", total, fields)
 	ctx.Redis.Del(stateKey)
 	probe := ctx.Redis.After(stateKey, func() any { return stateOtherClaim(ctx, "rf-9", 6000, 10000) })
 	stateClaim(ctx, "rf-1", 6000)
 	ctx.Assert(probe.Fired, "claim sent no command touching refunded:pay_1")
-	total, fields := stateHeld(ctx)
+	total, fields = stateHeld(ctx)
 	ctx.Assert(total <= 10000 && total == stateSum(fields), "another server claimed 6000 between claim's read and its write: refunded:pay_1 holds total %d over %v on a 10000 payment. Read, compare and add inside one script", total, fields)
 	ctx.Redis.Del(stateKey)
 	ctx.Redis.Do("HSET", stateKey, "total", 7000, "rf-1", 3000, "rf-2", 4000)
@@ -1026,6 +1036,7 @@ func CheckClaimOnce(ctx *harness.Ctx) {
 	total, fields := stateHeld(ctx)
 	ctx.Assert(again.Accepted && again.RefundedMinor == 3000 && again.RemainingMinor == 7000 && total == 3000, "a claim retried for rf-1 answered %+v and left total %d over %v, expected accepted, 3000, 7000: the refund already holds its amount", again, total, fields)
 	ctx.Equal(stateClaim(ctx, "rf-2", 7000), ClaimResult{Accepted: true, RefundedMinor: 10000, RemainingMinor: 0}, "with rf-1 counted once, 7000 more fits exactly; the claim")
+	ctx.Equal(stateClaim(ctx, "rf-2", 7000), ClaimResult{Accepted: true, RefundedMinor: 10000, RemainingMinor: 0}, "a claim retried for rf-2 once the payment is fully claimed (the refund already holds its amount, whatever room is left)")
 	release(stateBg, "pay_1", "rf-2")
 	left, err := release(stateBg, "pay_1", "rf-2")
 	ctx.NoError(err, "release(pay_1, rf-2)")
@@ -1117,6 +1128,11 @@ void CheckAtomic(harness::Ctx& ctx) {
   ctx.Assert(sameClaim(got, true, 6000, 4000), "claiming 6000 of 10000 answered (%t, %d, %d), expected (true, 6000, 4000)", got.accepted, got.refunded_minor, got.remaining_minor);
   got = claim("pay_1", "rf-2", 5000, 10000);
   ctx.Assert(sameClaim(got, false, 6000, 4000), "claiming 5000 more answered (%t, %d, %d), expected (false, 6000, 4000)", got.accepted, got.refunded_minor, got.remaining_minor);
+  {
+    const auto [refused_total, refused_fields] = stateHeld(ctx);
+    ctx.Assert(refused_total == 6000 && refused_fields.size() == 1 && refused_fields.count("rf-1"),
+               "a refused claim of rf-2 left total %d over %s, expected 6000 over rf-1: a refusal writes nothing", refused_total, stateText(refused_fields));
+  }
   ctx.Redis.Do("DEL", kStateKey);
   bool fired = false;
   ctx.Redis.After(kStateKey, [&] {
@@ -1148,6 +1164,10 @@ void CheckClaimOnce(harness::Ctx& ctx) {
              again.accepted, again.refunded_minor, again.remaining_minor, total, stateText(fields));
   const ClaimResult got = claim("pay_1", "rf-2", 7000, 10000);
   ctx.Assert(sameClaim(got, true, 10000, 0), "with rf-1 counted once, 7000 more fits exactly; the claim answered (%t, %d, %d)", got.accepted, got.refunded_minor, got.remaining_minor);
+  const ClaimResult retried = claim("pay_1", "rf-2", 7000, 10000);
+  ctx.Assert(sameClaim(retried, true, 10000, 0),
+             "a claim retried for rf-2 once the payment is fully claimed answered (%t, %d, %d), expected (true, 10000, 0): the refund already holds its amount, whatever room is left",
+             retried.accepted, retried.refunded_minor, retried.remaining_minor);
   release("pay_1", "rf-2");
   ctx.Equal(release("pay_1", "rf-2"), 3000, "releasing rf-2 twice must take it off once; the total left");
 }

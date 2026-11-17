@@ -79,7 +79,7 @@ paid still shown as pending.
       id: 'drift',
       title: 'Reports how far the ledger drifted from the records',
       detail:
-        'With the ledger in step the response says drift_minor 0; after the ledger lost a 3000 claim it says 3000. The starter never compares the two.',
+        'With the ledger in step the response says drift_minor 0; after the ledger lost a 3000 claim it says 3000, and with a 2000 claim no record backs it says -2000. The read leaves the ledger as it found it. The starter never compares the two.',
       match: {
         python: {all: [/drift_minor/, /ledger\.refunded_total\(/]},
         typescript: {all: [/drift_minor/, /refundedTotal\(/]},
@@ -92,7 +92,7 @@ paid still shown as pending.
       id: 'pending-reconciled',
       title: 'Reconciles pending refunds with the PSP before answering',
       detail:
-        'A PENDING refund the PSP has paid is reported CONFIRMED with its reference and counted as refunded; one the PSP never saw stays pending. The starter reports whatever the records said.',
+        'A PENDING refund the PSP has paid is reported CONFIRMED with its reference and counted as refunded; one the PSP reports FAILED is reported REJECTED and counted nowhere; one the PSP never saw stays pending; drift_minor is 0 once the reconciliation settled. The starter reports whatever the records said.',
       match: {
         python: {all: [/psp\.reconcile\(/]},
         typescript: {all: [/\breconcile\(/]},
@@ -506,15 +506,18 @@ from refunds import ledger, records
 
 
 class Psp(refund_service_pb2_grpc.PspServicer):
-    """The PSP stand-in: it has paid the refunds in applied and never saw any other."""
+    """The PSP stand-in: it has paid the refunds in applied, failed the ones in failed and never saw any other."""
 
     def __init__(self):
         self.applied = {"rf-4": "re_4"}
+        self.failed = {"rf-5"}
 
     def Refund(self, request, context):
         context.abort(grpc.StatusCode.UNIMPLEMENTED, "the read path does not pay refunds out")
 
     def GetRefund(self, request, context):
+        if request.refund_id in self.failed:
+            return refund_service_pb2.RefundStatus(refund_id=request.refund_id, status="FAILED", psp_ref="")
         ref = self.applied.get(request.refund_id)
         if ref is None:
             context.abort(grpc.StatusCode.NOT_FOUND, f"no refund {request.refund_id}")
@@ -527,7 +530,7 @@ def _read(ctx, pending_paid=False):
     records.add_payment("pay_2", "t2", 8000)
     seeds = [("rf-1", 3000, "CONFIRMED"), ("rf-2", 2000, "REJECTED"), ("rf-3", 1000, "PENDING")]
     if pending_paid:
-        seeds.append(("rf-4", 2000, "PENDING"))
+        seeds += [("rf-4", 2000, "PENDING"), ("rf-5", 2000, "PENDING")]
     for refund_id, amount, status in seeds:
         ledger.claim("pay_1", refund_id, amount, 10000)
         records.insert_refund(refund_id, "t1", "pay_1", amount, "damaged", "")
@@ -579,6 +582,12 @@ async def check_drift(ctx):
         drifted = (await _get(c)).json()
     assert drifted.get("drift_minor") == 3000, f"the ledger holds 1000 against 4000 in the records and drift_minor is {drifted.get('drift_minor')!r}, expected 3000"
     assert drifted.get("refunded_minor") == 3000, f"refunded_minor followed the ledger to {drifted.get('refunded_minor')!r}; it comes from the records (3000)"
+    left = ctx.redis.hgetall("refunded:pay_1")
+    assert left == {"total": "1000", "rf-3": "1000"}, f"the read rewrote the ledger to {left}: drift is reported and left for a repair to act on"
+    ctx.redis.hset("refunded:pay_1", mapping={"total": 6000, "rf-1": 3000, "rf-9": 2000})  # a claim no record backs
+    async with ctx.client(ctx.load("read").app) as c:
+        over = (await _get(c)).json()
+    assert over.get("drift_minor") == -2000, f"the ledger holds 6000 against 4000 in the records and drift_minor is {over.get('drift_minor')!r}, expected -2000: records minus ledger, with its sign"
 
 
 async def check_pending_reconciled(ctx):
@@ -589,7 +598,10 @@ async def check_pending_reconciled(ctx):
     paid = rows.get("rf-4", {})
     assert paid.get("status") == "CONFIRMED" and paid.get("psp_ref") == "re_4", f"the PSP paid rf-4 as re_4 and the read reports it as {paid}: reconcile PENDING rows before reporting them"
     assert records.find_refund("rf-4")["status"] == "CONFIRMED", "the reconciled refund must be CONFIRMED in the records too"
-    assert body.get("refunded_minor") == 5000 and body.get("pending_minor") == 1000, f"refunded and pending are {body.get('refunded_minor')!r} and {body.get('pending_minor')!r}, expected 5000 (rf-1 and rf-4) and 1000 (rf-3, which the PSP never saw)"
+    failed = rows.get("rf-5", {})
+    assert failed.get("status") == "REJECTED" and records.find_refund("rf-5")["status"] == "REJECTED", f"the PSP reports rf-5 FAILED and the read reports it as {failed}, expected REJECTED as its record then stands"
+    got = (body.get("refunded_minor"), body.get("pending_minor"), body.get("remaining_minor"), body.get("drift_minor"))
+    assert got == (5000, 1000, 4000, 0), f"refunded, pending, remaining and drift are {got}, expected (5000, 1000, 4000, 0): rf-1 and rf-4 refunded, rf-3 (which the PSP never saw) pending, rf-5 released, and the ledger read after the reconciliation"
     for call in ctx.grpc.calls_to("GetRefund"):
         assert call.timeout is not None and call.timeout <= 5.5, f"a GetRefund call carries a {call.timeout} s deadline, expected 5"
 `,
@@ -601,6 +613,7 @@ async def check_pending_reconciled(ctx):
       callback({code: ctx.grpc.status.UNIMPLEMENTED, details: 'the read path does not pay refunds out'});
     },
     GetRefund(call, callback) {
+      if (call.request.refund_id === 'rf-5') return callback(null, {refund_id: 'rf-5', status: 'FAILED', psp_ref: ''});
       const ref = applied.get(call.request.refund_id);
       if (ref === undefined) return callback({code: ctx.grpc.status.NOT_FOUND, details: \`no refund \${call.request.refund_id}\`});
       callback(null, {refund_id: call.request.refund_id, status: 'SUCCEEDED', psp_ref: ref});
@@ -612,7 +625,7 @@ async def check_pending_reconciled(ctx):
     await records.addPayment('pay_1', 't1', 10000);
     await records.addPayment('pay_2', 't2', 8000);
     const seeds: [string, number, string][] = [['rf-1', 3000, 'CONFIRMED'], ['rf-2', 2000, 'REJECTED'], ['rf-3', 1000, 'PENDING']];
-    if (pendingPaid) seeds.push(['rf-4', 2000, 'PENDING']);
+    if (pendingPaid) seeds.push(['rf-4', 2000, 'PENDING'], ['rf-5', 2000, 'PENDING']);
     for (const [refundId, amount, status] of seeds) {
       await ledger.claim('pay_1', refundId, amount, 10000);
       await records.insertRefund(refundId, 't1', 'pay_1', amount, 'damaged', '');
@@ -669,6 +682,11 @@ export async function check_drift(ctx) {
   const drifted = (await get(c)).json();
   assert.equal(drifted.drift_minor, 3000, \`the ledger holds 1000 against 4000 in the records and drift_minor is \${drifted.drift_minor}, expected 3000\`);
   assert.equal(drifted.refunded_minor, 3000, \`refunded_minor followed the ledger to \${drifted.refunded_minor}; it comes from the records (3000)\`);
+  const left = ctx.redis.hgetall('refunded:pay_1');
+  assert.deepEqual(left, {total: '1000', 'rf-3': '1000'}, \`the read rewrote the ledger to \${JSON.stringify(left)}: drift is reported and left for a repair to act on\`);
+  ctx.redis.hset('refunded:pay_1', 'total', 6000, 'rf-1', 3000, 'rf-9', 2000); // a claim no record backs
+  const over = (await get(c)).json();
+  assert.equal(over.drift_minor, -2000, \`the ledger holds 6000 against 4000 in the records and drift_minor is \${over.drift_minor}, expected -2000: records minus ledger, with its sign\`);
 }
 
 export async function check_pending_reconciled(ctx) {
@@ -678,7 +696,10 @@ export async function check_pending_reconciled(ctx) {
   const paid = byId(body)['rf-4'] ?? {};
   assert(paid.status === 'CONFIRMED' && paid.psp_ref === 're_4', \`the PSP paid rf-4 as re_4 and the read reports it as \${JSON.stringify(paid)}: reconcile PENDING rows before reporting them\`);
   assert.equal((await records.findRefund('rf-4')).status, 'CONFIRMED', 'the reconciled refund must be CONFIRMED in the records too');
-  assert(body.refunded_minor === 5000 && body.pending_minor === 1000, \`refunded and pending are \${body.refunded_minor} and \${body.pending_minor}, expected 5000 (rf-1 and rf-4) and 1000 (rf-3, which the PSP never saw)\`);
+  const failed = byId(body)['rf-5'] ?? {};
+  assert(failed.status === 'REJECTED' && (await records.findRefund('rf-5')).status === 'REJECTED', \`the PSP reports rf-5 FAILED and the read reports it as \${JSON.stringify(failed)}, expected REJECTED as its record then stands\`);
+  const got = [body.refunded_minor, body.pending_minor, body.remaining_minor, body.drift_minor];
+  assert.deepEqual(got, [5000, 1000, 4000, 0], \`refunded, pending, remaining and drift are \${JSON.stringify(got)}, expected [5000, 1000, 4000, 0]: rf-1 and rf-4 refunded, rf-3 (which the PSP never saw) pending, rf-5 released, and the ledger read after the reconciliation\`);
   for (const call of ctx.grpc.callsTo('GetRefund')) {
     assert(call.timeout !== null && call.timeout <= 5.5, \`a GetRefund call carries a \${call.timeout} s deadline, expected 5\`);
   }
@@ -704,13 +725,16 @@ import (
 
 var readBg = context.Background()
 
-// readPsp has paid the refunds in applied and never saw any other.
+// readPsp has paid the refunds in applied, failed rf-5 and never saw any other.
 type readPsp struct {
 	pb.UnimplementedPspServer
 	applied map[string]string
 }
 
 func (p *readPsp) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
+	if req.GetRefundId() == "rf-5" {
+		return &pb.RefundStatus{RefundId: "rf-5", Status: "FAILED"}, nil
+	}
 	ref, ok := p.applied[req.GetRefundId()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no refund %s", req.GetRefundId())
@@ -745,7 +769,7 @@ func readServe(ctx *harness.Ctx, pendingPaid bool) *harness.HTTP {
 	}
 	seeds := []seed{{"rf-1", 3000, "CONFIRMED"}, {"rf-2", 2000, "REJECTED"}, {"rf-3", 1000, "PENDING"}}
 	if pendingPaid {
-		seeds = append(seeds, seed{"rf-4", 2000, "PENDING"})
+		seeds = append(seeds, seed{"rf-4", 2000, "PENDING"}, seed{"rf-5", 2000, "PENDING"})
 	}
 	for _, s := range seeds {
 		ledger.Claim(readBg, "pay_1", s.id, s.amount, 10000)
@@ -822,6 +846,11 @@ func CheckDrift(ctx *harness.Ctx) {
 	drifted := readDecode(readGet(c, "pay_1", "t1"))
 	ctx.Equal(readNum(drifted.DriftMinor), int64(3000), "the ledger holds 1000 against 4000 in the records; drift_minor")
 	ctx.Equal(readNum(drifted.RefundedMinor), int64(3000), "refunded_minor comes from the records, not the ledger")
+	left := ctx.Redis.HGetAll("refunded:pay_1")
+	ctx.Equal(left, map[string]string{"total": "1000", "rf-3": "1000"}, "drift is reported and left for a repair to act on; the ledger after the read")
+	ctx.Redis.Do("HSET", "refunded:pay_1", "total", 6000, "rf-1", 3000, "rf-9", 2000) // a claim no record backs
+	over := readDecode(readGet(c, "pay_1", "t1"))
+	ctx.Equal(readNum(over.DriftMinor), int64(-2000), "the ledger holds 6000 against 4000 in the records; drift_minor (records minus ledger, with its sign)")
 }
 
 func CheckPendingReconciled(ctx *harness.Ctx) {
@@ -830,7 +859,10 @@ func CheckPendingReconciled(ctx *harness.Ctx) {
 	paid := readRows(body)["rf-4"]
 	ctx.Assert(paid.Status == "CONFIRMED" && paid.PspRef == "re_4", "the PSP paid rf-4 as re_4 and the read reports it as %+v: reconcile PENDING rows before reporting them", paid)
 	ctx.Equal(records.FindRefund(readBg, "rf-4").Status, "CONFIRMED", "the reconciled refund's status in the records")
-	ctx.Assert(readNum(body.RefundedMinor) == int64(5000) && readNum(body.PendingMinor) == int64(1000), "refunded and pending are %v and %v, expected 5000 (rf-1 and rf-4) and 1000 (rf-3, which the PSP never saw)", readNum(body.RefundedMinor), readNum(body.PendingMinor))
+	failed := readRows(body)["rf-5"]
+	ctx.Assert(failed.Status == "REJECTED" && records.FindRefund(readBg, "rf-5").Status == "REJECTED", "the PSP reports rf-5 FAILED and the read reports it as %+v, expected REJECTED as its record then stands", failed)
+	got := []any{readNum(body.RefundedMinor), readNum(body.PendingMinor), readNum(body.RemainingMinor), readNum(body.DriftMinor)}
+	ctx.Equal(got, []any{int64(5000), int64(1000), int64(4000), int64(0)}, "refunded, pending, remaining and drift (rf-1 and rf-4 refunded, rf-3, which the PSP never saw, pending, rf-5 released, and the ledger read after the reconciliation)")
 	for _, call := range ctx.GRPC.CallsTo("GetRefund", "") {
 		ctx.Assert(call.HasDeadline() && call.Timeout <= 5500*time.Millisecond, "a GetRefund call carries a %v deadline, expected 5 s", call.Timeout)
 	}
@@ -851,12 +883,17 @@ func CheckPendingReconciled(ctx *harness.Ctx) {
 
 namespace {
 
-// Has paid the refunds in applied and never saw any other.
+// Has paid the refunds in applied, failed rf-5 and never saw any other.
 class ReadPsp final : public refundd::Psp::Service {
  public:
   std::map<std::string, std::string> applied{{"rf-4", "re_4"}};
 
   grpc::Status GetRefund(grpc::ServerContext*, const refundd::GetRefundRequest* req, refundd::RefundStatus* out) override {
+    if (req->refund_id() == "rf-5") {
+      out->set_refund_id("rf-5");
+      out->set_status("FAILED");
+      return grpc::Status::OK;
+    }
     if (!applied.count(req->refund_id())) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no refund " + req->refund_id());
     out->set_refund_id(req->refund_id());
     out->set_status("SUCCEEDED");
@@ -874,7 +911,10 @@ harness::HTTP readServe(harness::Ctx& ctx, bool pending_paid) {
   records::addPayment("pay_2", "t2", 8000);
   std::vector<std::tuple<std::string, long long, std::string>> seeds = {
       {"rf-1", 3000, "CONFIRMED"}, {"rf-2", 2000, "REJECTED"}, {"rf-3", 1000, "PENDING"}};
-  if (pending_paid) seeds.emplace_back("rf-4", 2000, "PENDING");
+  if (pending_paid) {
+    seeds.emplace_back("rf-4", 2000, "PENDING");
+    seeds.emplace_back("rf-5", 2000, "PENDING");
+  }
   for (const auto& [refund_id, amount, status] : seeds) {
     ledger::claim("pay_1", refund_id, amount, 10000);
     records::insertRefund(refund_id, "t1", "pay_1", amount, "damaged", "");
@@ -947,6 +987,12 @@ void CheckDrift(harness::Ctx& ctx) {
   const auto drifted = readBody(readGet(c, "pay_1", "t1"));
   ctx.Equal(drifted.value("drift_minor", -1LL), 3000, "the ledger holds 1000 against 4000 in the records; drift_minor");
   ctx.Equal(drifted.value("refunded_minor", -1LL), 3000, "refunded_minor comes from the records, not the ledger");
+  const auto left = ctx.Redis.HGetAll("refunded:pay_1");
+  ctx.Assert(left.size() == 2 && left.count("total") && left.at("total") == "1000" && left.count("rf-3"),
+             "the read rewrote the ledger to %d fields (total %s): drift is reported and left for a repair to act on", left.size(), left.count("total") ? left.at("total") : "absent");
+  ctx.Redis.Do("HSET", "refunded:pay_1", "total", 6000, "rf-1", 3000, "rf-9", 2000);  // a claim no record backs
+  const auto over = readBody(readGet(c, "pay_1", "t1"));
+  ctx.Equal(over.value("drift_minor", -1LL), -2000, "the ledger holds 6000 against 4000 in the records; drift_minor (records minus ledger, with its sign)");
 }
 
 void CheckPendingReconciled(harness::Ctx& ctx) {
@@ -957,9 +1003,16 @@ void CheckPendingReconciled(harness::Ctx& ctx) {
   ctx.Assert(paid.is_object() && paid.value("status", "") == "CONFIRMED" && paid.value("psp_ref", "") == "re_4",
              "the PSP paid rf-4 as re_4 and the read reports it as %s: reconcile PENDING rows before reporting them", paid.dump());
   ctx.Equal(records::findRefund("rf-4")->status, "CONFIRMED", "the reconciled refund's status in the records");
+  const auto failed = rows["rf-5"];
+  ctx.Assert(failed.is_object() && failed.value("status", "") == "REJECTED" && records::findRefund("rf-5")->status == "REJECTED",
+             "the PSP reports rf-5 FAILED and the read reports it as %s, expected REJECTED as its record then stands", failed.dump());
   const long long refunded = body.value("refunded_minor", -1LL);
   const long long pending = body.value("pending_minor", -1LL);
-  ctx.Assert(refunded == 5000 && pending == 1000, "refunded and pending are %d and %d, expected 5000 (rf-1 and rf-4) and 1000 (rf-3, which the PSP never saw)", refunded, pending);
+  const long long remaining = body.value("remaining_minor", -1LL);
+  const long long drift = body.value("drift_minor", -1LL);
+  ctx.Assert(refunded == 5000 && pending == 1000 && remaining == 4000 && drift == 0,
+             "refunded, pending, remaining and drift are %d, %d, %d, %d, expected 5000, 1000, 4000, 0: rf-1 and rf-4 refunded, rf-3 (which the PSP never saw) pending, rf-5 released, and the ledger read after the reconciliation",
+             refunded, pending, remaining, drift);
   for (const auto& call : ctx.GRPC.CallsTo("GetRefund")) {
     ctx.Assert(call.HasDeadline() && call.TimeoutSeconds() <= 5.5, "a GetRefund call carries a %v s deadline, expected 5", call.TimeoutSeconds());
   }

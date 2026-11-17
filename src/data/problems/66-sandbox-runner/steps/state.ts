@@ -75,7 +75,7 @@ after the deadline is published as the job's result.
       id: 'late-result',
       title: 'Discards a result that arrives after the lease',
       detail:
-        'A `finish` 301 s after `acquire` answers false and stores no output; one inside the lease stores the result and releases the lease. The starter stores every result, then deletes the lease.',
+        'A `finish` 301 s after `acquire` answers false and stores no output; one inside the lease stores the result and releases the lease; and when a sweeper deletes the lease right after `finish` first touches it, either the sweeper or `finish` wins, never both. The starter stores every result, then deletes the lease.',
       match: {
         python: {order: [/def finish\(/, /\.(delete|exists|ttl)\(\s*lease_key\(/, /jobs\.put_result\(/]},
         typescript: {order: [/function finish\(/, /\.(del|exists|ttl)\(\s*leaseKey\(/, /putResult\(/]},
@@ -524,6 +524,16 @@ def check_late_result(ctx):
     assert ok, f"finish 10 s into the lease answered {ok!r}, expected True"
     assert jobs.get(on_time)["status"] == "finished" and jobs.read_output(on_time) == "on time", f"a result inside the lease must be stored, the store holds {jobs.get(on_time)}"
     assert ctx.redis.exists(f"lease:{on_time}") == 0, "a finished job must release its lease"
+    raced = jobs.create("t1", "gvisor", [], "print(3)")["job_id"]
+    assert m.acquire(raced), f"the first acquire of {raced} must take the lease"
+    ctx.clock.advance(10)
+    # A sweeper reclaims the lease right after finish's first command on it: one of the two must lose.
+    sweeper = ctx.redis_after(f"lease:{raced}", lambda: ctx.redis.delete(f"lease:{raced}"))
+    m.finish(raced, 0, "raced", 120, 64)
+    assert sweeper.fired, f"finish never touched lease:{raced}"
+    stored = jobs.read_output(raced) is not None
+    assert not (sweeper.result == 1 and stored), f"a sweeper deleted lease:{raced} right after finish first touched it, and finish still stored the result: the check and the claim must be one command"
+    assert sweeper.result == 1 or stored, f"finish inside the lease stored nothing although no one else claimed lease:{raced}"
 `,
     typescript: `const KEY = 'lease:j-1';
 
@@ -573,6 +583,16 @@ export async function check_late_result(ctx) {
   const done = await jobs.get(onTime);
   assert(done.status === 'finished' && (await jobs.readOutput(onTime)) === 'on time', \`a result inside the lease must be stored, the store holds \${JSON.stringify(done)}\`);
   assert.equal(ctx.redis.exists(\`lease:\${onTime}\`), 0, 'a finished job must release its lease');
+  const raced = (await jobs.create('t1', 'gvisor', [], 'print(3)')).job_id;
+  assert(await m.acquire(raced), \`the first acquire of \${raced} must take the lease\`);
+  ctx.clock.advance(10);
+  // A sweeper reclaims the lease right after finish's first command on it: one of the two must lose.
+  const sweeper = ctx.redisAfter(\`lease:\${raced}\`, () => ctx.redis.del(\`lease:\${raced}\`));
+  await m.finish(raced, 0, 'raced', 120, 64);
+  assert(sweeper.fired, \`finish never touched lease:\${raced}\`);
+  const kept = (await jobs.readOutput(raced)) !== null;
+  assert(!(Number(sweeper.result) === 1 && kept), \`a sweeper deleted lease:\${raced} right after finish first touched it, and finish still stored the result: the check and the claim must be one command\`);
+  assert(Number(sweeper.result) === 1 || kept, \`finish inside the lease stored nothing although no one else claimed lease:\${raced}\`);
 }
 `,
     go: `package main
@@ -645,6 +665,17 @@ func CheckLateResult(ctx *harness.Ctx) {
 	output, _ := jobs.ReadOutput(stateBg, onTime)
 	ctx.Assert(jobs.Get(stateBg, onTime).Status == "finished" && output == "on time", "a result inside the lease must be stored, the store holds %+v", jobs.Get(stateBg, onTime))
 	ctx.Equal(ctx.Redis.Exists("lease:"+onTime), int64(0), "a finished job must release its lease")
+	raced := jobs.Create(stateBg, "t1", "gvisor", nil, "print(3)").JobID
+	ctx.Assert(mustAcquire(ctx, raced), "the first acquire of %s must take the lease", raced)
+	ctx.Clock.Advance(10)
+	// A sweeper reclaims the lease right after finish's first command on it: one of the two must lose.
+	sweeper := ctx.Redis.After("lease:"+raced, func() any { return ctx.Redis.Del("lease:" + raced) })
+	mustFinish(ctx, raced, "raced")
+	ctx.Assert(sweeper.Fired, "finish never touched lease:%s", raced)
+	swept, _ := sweeper.Result.(int64)
+	_, stored = jobs.ReadOutput(stateBg, raced)
+	ctx.Assert(!(swept == 1 && stored), "a sweeper deleted lease:%s right after finish first touched it, and finish still stored the result: the check and the claim must be one command", raced)
+	ctx.Assert(swept == 1 || stored, "finish inside the lease stored nothing although no one else claimed lease:%s", raced)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -701,6 +732,21 @@ void CheckLateResult(harness::Ctx& ctx) {
   ctx.Assert(finish(on_time, 0, "on time", 120, 64), "finish 10 s into the lease answered false, expected true");
   ctx.Assert(jobs::get(on_time)->status == "finished" && jobs::readOutput(on_time).value_or("") == "on time", "a result inside the lease must be stored, the store holds status %s", jobs::get(on_time)->status);
   ctx.Equal(ctx.Redis.Exists("lease:" + on_time), 0LL, "a finished job must release its lease");
+  const std::string raced = jobs::create("t1", "gvisor", {}, "print(3)").job_id;
+  ctx.Assert(acquire(raced), "the first acquire of %s must take the lease", raced);
+  ctx.Clock.Advance(10);
+  // A sweeper reclaims the lease right after finish's first command on it: one of the two must lose.
+  bool fired = false;
+  long long swept = 0;
+  ctx.Redis.After("lease:" + raced, [&] {
+    fired = true;
+    swept = ctx.Redis.Del("lease:" + raced);
+  });
+  finish(raced, 0, "raced", 120, 64);
+  ctx.Assert(fired, "finish never touched lease:%s", raced);
+  const bool stored = jobs::readOutput(raced).has_value();
+  ctx.Assert(!(swept == 1 && stored), "a sweeper deleted lease:%s right after finish first touched it, and finish still stored the result: the check and the claim must be one command", raced);
+  ctx.Assert(swept == 1 || stored, "finish inside the lease stored nothing although no one else claimed lease:%s", raced);
 }
 `,
   },

@@ -603,6 +603,8 @@ async def check_query_cap(ctx):
         long = "kettle " + "x" * 300
         r = await _search(c, q=long)
         assert r.status_code == 400, f"a {len(long)}-byte query answered {r.status_code}: q is capped at 256 bytes"
+        r = await _search(c, q="k" * 257)
+        assert r.status_code == 400, f"a query of exactly 257 bytes answered {r.status_code}: q is capped at 256 bytes"
         r = await _search(c, q="é" * 129)
         assert r.status_code == 400, f"a query of 129 characters and 258 bytes (é is two bytes in UTF-8) answered {r.status_code}: the cap counts bytes, not characters"
         r = await _search(c, q="é" * 128)
@@ -613,7 +615,7 @@ async def check_query_cap(ctx):
 
 async def check_page_cap(ctx):
     async with _api(ctx) as c:
-        for size in ("10000", "101", "0"):
+        for size in ("10000", "101", "0", "2.5"):
             r = await _search(c, q="kettle", page_size=size)
             assert r.status_code == 400, f"page_size={size} answered {r.status_code}: page_size is an integer from 1 to 100"
         r = await _search(c, q="kettle", page_size="ten")
@@ -631,6 +633,8 @@ async def check_filter_allowlist(ctx):
         assert "cost_cents" in r.text, f"the 400 must name the unknown field (cost_cents), got {r.text}"
         allowed = r.json().get("allowed")
         assert isinstance(allowed, list) and sorted(allowed) == sorted(ALLOWED), f"the 400 must carry the allowed list {list(ALLOWED)}, got {allowed!r}"
+        r = await _search(c, q="kettle", filters='{"brand": "acme", "price_cents": "899"}')
+        assert r.status_code == 400 and "price_cents" in r.text, f"a filter on brand and price_cents answered {r.status_code} {r.text}: every field outside ALLOWED_FILTER_FIELDS is 400 naming it, not only cost_cents"
         r = await _search(c, q="kettle", filters='{"brand": "acme", "max_price": "1000"}')
         assert r.status_code == 200 and _ids(r) == ["p-3"], f"brand=acme and max_price=1000 answered {r.status_code} {r.text}, expected [p-3]"
         r = await _search(c, q="kettle", filters='{"in_stock": "true"}')
@@ -639,7 +643,7 @@ async def check_filter_allowlist(ctx):
 
 async def check_filter_shape(ctx):
     async with _api(ctx) as c:
-        for raw in ('{"in_stock": true}', '["brand"]', "brand=acme"):
+        for raw in ('{"in_stock": true}', '{"min_price": 1000}', '["brand"]', "brand=acme"):
             r = await _search(c, q="kettle", filters=raw)
             assert r.status_code == 400, f"filters={raw} answered {r.status_code}: filters must be a JSON object of strings, anything else is 400"
         r = await _search(c, q="kettle", filters='{"category": "kitchen"}')
@@ -690,6 +694,8 @@ export async function check_query_cap(ctx) {
   const long = 'kettle ' + 'x'.repeat(300);
   let r = await search(c, {q: long});
   assert.equal(r.status, 400, \`a \${long.length}-byte query answered \${r.status}: q is capped at 256 bytes\`);
+  r = await search(c, {q: 'k'.repeat(257)});
+  assert.equal(r.status, 400, \`a query of exactly 257 bytes answered \${r.status}: q is capped at 256 bytes\`);
   r = await search(c, {q: 'é'.repeat(129)});
   assert.equal(r.status, 400, \`a query of 129 characters and 258 bytes (é is two bytes in UTF-8) answered \${r.status}: the cap counts bytes, not characters\`);
   r = await search(c, {q: 'é'.repeat(128)});
@@ -700,7 +706,7 @@ export async function check_query_cap(ctx) {
 
 export async function check_page_cap(ctx) {
   const c = await api(ctx);
-  for (const size of ['10000', '101', '0', 'ten']) {
+  for (const size of ['10000', '101', '0', 'ten', '2.5']) {
     const r = await search(c, {q: 'kettle', page_size: size});
     assert.equal(r.status, 400, \`page_size=\${size} answered \${r.status}: page_size is an integer from 1 to 100\`);
   }
@@ -717,6 +723,8 @@ export async function check_filter_allowlist(ctx) {
   assert(r.text.includes('cost_cents'), \`the 400 must name the unknown field (cost_cents), got \${r.text}\`);
   const allowed = r.json().allowed;
   assert(Array.isArray(allowed) && JSON.stringify([...allowed].sort()) === JSON.stringify([...ALLOWED].sort()), \`the 400 must carry the allowed list \${JSON.stringify(ALLOWED)}, got \${JSON.stringify(allowed)}\`);
+  r = await search(c, {q: 'kettle', filters: '{"brand": "acme", "price_cents": "899"}'});
+  assert(r.status === 400 && r.text.includes('price_cents'), \`a filter on brand and price_cents answered \${r.status} \${r.text}: every field outside ALLOWED_FILTER_FIELDS is 400 naming it, not only cost_cents\`);
   r = await search(c, {q: 'kettle', filters: '{"brand": "acme", "max_price": "1000"}'});
   assert(r.status === 200 && JSON.stringify(ids(r)) === '["p-3"]', \`brand=acme and max_price=1000 answered \${r.status} \${r.text}, expected [p-3]\`);
   r = await search(c, {q: 'kettle', filters: '{"in_stock": "true"}'});
@@ -725,7 +733,7 @@ export async function check_filter_allowlist(ctx) {
 
 export async function check_filter_shape(ctx) {
   const c = await api(ctx);
-  for (const raw of ['{"in_stock": true}', '["brand"]', 'brand=acme']) {
+  for (const raw of ['{"in_stock": true}', '{"min_price": 1000}', '["brand"]', 'brand=acme']) {
     const r = await search(c, {q: 'kettle', filters: raw});
     assert.equal(r.status, 400, \`filters=\${raw} answered \${r.status}: filters must be a JSON object of strings, anything else is 400\`);
   }
@@ -759,7 +767,7 @@ var (
 	apiAllowed = []string{"brand", "category", "in_stock", "max_price", "min_price"}
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	for _, p := range apiProducts {
 		catalog.PutProduct(context.Background(), apiTenant, p)
 	}
@@ -769,7 +777,7 @@ func api(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func searchFor(c *harness.HTTP, params map[string]string) *harness.Response {
+func hSearchFor(c *harness.HTTP, params map[string]string) *harness.Response {
 	values := url.Values{}
 	for k, v := range params {
 		values.Set(k, v)
@@ -777,7 +785,7 @@ func searchFor(c *harness.HTTP, params map[string]string) *harness.Response {
 	return c.Get("/v1/search?"+values.Encode(), "X-Tenant-Id", apiTenant)
 }
 
-func hitIDs(r *harness.Response) []string {
+func hHitIDs(r *harness.Response) []string {
 	var body struct {
 		Results []struct {
 			ID string \`json:"id"\`
@@ -792,10 +800,10 @@ func hitIDs(r *harness.Response) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := searchFor(c, map[string]string{"q": "kettle"})
+	c := hAPI(ctx)
+	r := hSearchFor(c, map[string]string{"q": "kettle"})
 	ctx.Equal(r.Status, 200, "GET /v1/search?q=kettle (%s)", r.Text())
-	ctx.Equal(hitIDs(r), []string{"p-3", "p-2", "p-1"}, "the search must answer the tenant's three kettles, cheapest first")
+	ctx.Equal(hHitIDs(r), []string{"p-3", "p-2", "p-1"}, "the search must answer the tenant's three kettles, cheapest first")
 	var body struct {
 		PageSize int \`json:"page_size"\`
 	}
@@ -804,33 +812,35 @@ func CheckRoute(ctx *harness.Ctx) {
 }
 
 func CheckQueryCap(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	long := "kettle " + strings.Repeat("x", 300)
-	r := searchFor(c, map[string]string{"q": long})
+	r := hSearchFor(c, map[string]string{"q": long})
 	ctx.Equal(r.Status, 400, "a %d-byte query must be refused: q is capped at 256 bytes; the status", len(long))
-	r = searchFor(c, map[string]string{"q": strings.Repeat("é", 129)})
+	r = hSearchFor(c, map[string]string{"q": strings.Repeat("k", 257)})
+	ctx.Equal(r.Status, 400, "a query of exactly 257 bytes must be refused: q is capped at 256 bytes; the status")
+	r = hSearchFor(c, map[string]string{"q": strings.Repeat("é", 129)})
 	ctx.Equal(r.Status, 400, "a query of 129 characters and 258 bytes (é is two bytes in UTF-8): the cap counts bytes, not characters; the status")
-	r = searchFor(c, map[string]string{"q": strings.Repeat("é", 128)})
+	r = hSearchFor(c, map[string]string{"q": strings.Repeat("é", 128)})
 	ctx.Equal(r.Status, 200, "a query of exactly 256 bytes is within the cap; the status")
-	r = searchFor(c, map[string]string{"q": "   "})
+	r = hSearchFor(c, map[string]string{"q": "   "})
 	ctx.Equal(r.Status, 400, "a blank query matches the whole catalog and must be refused (%s); the status", r.Text())
 }
 
 func CheckPageCap(ctx *harness.Ctx) {
-	c := api(ctx)
-	for _, size := range []string{"10000", "101", "0", "ten"} {
-		r := searchFor(c, map[string]string{"q": "kettle", "page_size": size})
+	c := hAPI(ctx)
+	for _, size := range []string{"10000", "101", "0", "ten", "2.5"} {
+		r := hSearchFor(c, map[string]string{"q": "kettle", "page_size": size})
 		ctx.Equal(r.Status, 400, "page_size=%s must be refused (an integer from 1 to 100); the status", size)
 	}
-	r := searchFor(c, map[string]string{"q": "kettle", "page_size": "1"})
-	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-3", "page_size=1 answered %d %s, expected the cheapest kettle", r.Status, r.Text())
-	r = searchFor(c, map[string]string{"q": "kettle", "page_size": "100"})
+	r := hSearchFor(c, map[string]string{"q": "kettle", "page_size": "1"})
+	ctx.Assert(r.Status == 200 && strings.Join(hHitIDs(r), ",") == "p-3", "page_size=1 answered %d %s, expected the cheapest kettle", r.Status, r.Text())
+	r = hSearchFor(c, map[string]string{"q": "kettle", "page_size": "100"})
 	ctx.Equal(r.Status, 200, "page_size=100 is within the cap; the status")
 }
 
 func CheckFilterAllowlist(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := searchFor(c, map[string]string{"q": "kettle", "filters": \`{"cost_cents": "1200"}\`})
+	c := hAPI(ctx)
+	r := hSearchFor(c, map[string]string{"q": "kettle", "filters": \`{"cost_cents": "1200"}\`})
 	ctx.Equal(r.Status, 400, "a filter on cost_cents answered %s: the wholesale cost is one guess away. Check filter fields against allowedFilterFields; the status", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), "cost_cents"), "the 400 must name the unknown field (cost_cents), got %s", r.Text())
 	var body struct {
@@ -839,20 +849,22 @@ func CheckFilterAllowlist(ctx *harness.Ctx) {
 	r.Decode(&body)
 	sort.Strings(body.Allowed)
 	ctx.Equal(body.Allowed, apiAllowed, "the 400 must carry the allowed list")
-	r = searchFor(c, map[string]string{"q": "kettle", "filters": \`{"brand": "acme", "max_price": "1000"}\`})
-	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-3", "brand=acme and max_price=1000 answered %d %s, expected [p-3]", r.Status, r.Text())
-	r = searchFor(c, map[string]string{"q": "kettle", "filters": \`{"in_stock": "true"}\`})
-	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-3,p-1", "in_stock=true answered %d %s, expected [p-3, p-1]", r.Status, r.Text())
+	r = hSearchFor(c, map[string]string{"q": "kettle", "filters": \`{"brand": "acme", "price_cents": "899"}\`})
+	ctx.Assert(r.Status == 400 && strings.Contains(r.Text(), "price_cents"), "a filter on brand and price_cents answered %d %s: every field outside allowedFilterFields is 400 naming it, not only cost_cents", r.Status, r.Text())
+	r = hSearchFor(c, map[string]string{"q": "kettle", "filters": \`{"brand": "acme", "max_price": "1000"}\`})
+	ctx.Assert(r.Status == 200 && strings.Join(hHitIDs(r), ",") == "p-3", "brand=acme and max_price=1000 answered %d %s, expected [p-3]", r.Status, r.Text())
+	r = hSearchFor(c, map[string]string{"q": "kettle", "filters": \`{"in_stock": "true"}\`})
+	ctx.Assert(r.Status == 200 && strings.Join(hHitIDs(r), ",") == "p-3,p-1", "in_stock=true answered %d %s, expected [p-3, p-1]", r.Status, r.Text())
 }
 
 func CheckFilterShape(ctx *harness.Ctx) {
-	c := api(ctx)
-	for _, raw := range []string{\`{"in_stock": true}\`, \`["brand"]\`, "brand=acme"} {
-		r := searchFor(c, map[string]string{"q": "kettle", "filters": raw})
+	c := hAPI(ctx)
+	for _, raw := range []string{\`{"in_stock": true}\`, \`{"min_price": 1000}\`, \`["brand"]\`, "brand=acme"} {
+		r := hSearchFor(c, map[string]string{"q": "kettle", "filters": raw})
 		ctx.Equal(r.Status, 400, "filters=%s must be refused: filters is a JSON object of strings (%s); the status", raw, r.Text())
 	}
-	r := searchFor(c, map[string]string{"q": "kettle", "filters": \`{"category": "kitchen"}\`})
-	ctx.Assert(r.Status == 200 && strings.Join(hitIDs(r), ",") == "p-2,p-1", "category=kitchen answered %d %s, expected [p-2, p-1]", r.Status, r.Text())
+	r := hSearchFor(c, map[string]string{"q": "kettle", "filters": \`{"category": "kitchen"}\`})
+	ctx.Assert(r.Status == 200 && strings.Join(hHitIDs(r), ",") == "p-2,p-1", "category=kitchen answered %d %s, expected [p-2, p-1]", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -869,16 +881,16 @@ func CheckFilterShape(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTenant = "t-1";
+const std::string hTenant = "t-1";
 
-std::vector<catalog::Product> products() {
+std::vector<catalog::Product> hProducts() {
   return {{"p-1", "Steel Kettle", "acme", "kitchen", 3499, true, 1200, 0},
           {"p-2", "Glass Kettle", "brew", "kitchen", 2999, false, 900, 0},
           {"p-3", "Kettle Descaler", "acme", "cleaning", 899, true, 150, 0}};
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
-  for (const auto& p : products()) catalog::putProduct(kTenant, p);
+harness::HTTP hApi(harness::Ctx& ctx) {
+  for (const auto& p : hProducts()) catalog::putProduct(hTenant, p);
   catalog::putProduct("t-2", {"p-9", "Copper Kettle", "acme", "kitchen", 5999, true, 3000, 0});
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -887,7 +899,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string encode(const std::string& text) {
+std::string hEncode(const std::string& text) {
   std::string out;
   for (unsigned char c : text) {
     if (std::isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
@@ -901,17 +913,17 @@ std::string encode(const std::string& text) {
   return out;
 }
 
-harness::Response searchFor(harness::HTTP& c, const std::vector<std::pair<std::string, std::string>>& params) {
+harness::Response hSearchFor(harness::HTTP& c, const std::vector<std::pair<std::string, std::string>>& params) {
   std::string path = "/v1/search";
   char sep = '?';
   for (const auto& [name, value] : params) {
-    path += sep + name + "=" + encode(value);
+    path += sep + name + "=" + hEncode(value);
     sep = '&';
   }
-  return c.Get(path, "X-Tenant-Id", kTenant);
+  return c.Get(path, "X-Tenant-Id", hTenant);
 }
 
-std::string ids(const harness::Response& r) {
+std::string hIds(const harness::Response& r) {
   std::string out;
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   if (!body.is_object() || !body.contains("results") || !body["results"].is_array()) return out;
@@ -919,7 +931,7 @@ std::string ids(const harness::Response& r) {
   return out;
 }
 
-std::string repeat(const std::string& s, int n) {
+std::string hRepeat(const std::string& s, int n) {
   std::string out;
   for (int i = 0; i < n; ++i) out += s;
   return out;
@@ -928,41 +940,43 @@ std::string repeat(const std::string& s, int n) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = searchFor(c, {{"q", "kettle"}});
+  auto c = hApi(ctx);
+  const auto r = hSearchFor(c, {{"q", "kettle"}});
   ctx.Equal(r.Status, 200, "GET /v1/search?q=kettle (%s)", r.Text());
-  ctx.Equal(ids(r), "p-3,p-2,p-1", "the search must answer the tenant's three kettles, cheapest first");
+  ctx.Equal(hIds(r), "p-3,p-2,p-1", "the search must answer the tenant's three kettles, cheapest first");
   ctx.Equal(nlohmann::json::parse(r.Text()).value("page_size", 0), 20, "without page_size the response's page_size");
 }
 
 void CheckQueryCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const std::string longer = "kettle " + repeat("x", 300);
-  auto r = searchFor(c, {{"q", longer}});
+  auto c = hApi(ctx);
+  const std::string longer = "kettle " + hRepeat("x", 300);
+  auto r = hSearchFor(c, {{"q", longer}});
   ctx.Equal(r.Status, 400, "a %d-byte query must be refused: q is capped at 256 bytes; the status", longer.size());
-  r = searchFor(c, {{"q", repeat("é", 129)}});
+  r = hSearchFor(c, {{"q", hRepeat("k", 257)}});
+  ctx.Equal(r.Status, 400, "a query of exactly 257 bytes must be refused: q is capped at 256 bytes; the status");
+  r = hSearchFor(c, {{"q", hRepeat("é", 129)}});
   ctx.Equal(r.Status, 400, "a query of 129 characters and 258 bytes (é is two bytes in UTF-8): the cap counts bytes, not characters; the status");
-  r = searchFor(c, {{"q", repeat("é", 128)}});
+  r = hSearchFor(c, {{"q", hRepeat("é", 128)}});
   ctx.Equal(r.Status, 200, "a query of exactly 256 bytes is within the cap; the status");
-  r = searchFor(c, {{"q", "   "}});
+  r = hSearchFor(c, {{"q", "   "}});
   ctx.Equal(r.Status, 400, "a blank query matches the whole catalog and must be refused (%s); the status", r.Text());
 }
 
 void CheckPageCap(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  for (const std::string size : {"10000", "101", "0", "ten"}) {
-    const auto r = searchFor(c, {{"q", "kettle"}, {"page_size", size}});
+  auto c = hApi(ctx);
+  for (const std::string size : {"10000", "101", "0", "ten", "2.5"}) {
+    const auto r = hSearchFor(c, {{"q", "kettle"}, {"page_size", size}});
     ctx.Equal(r.Status, 400, "page_size=%s must be refused (an integer from 1 to 100); the status", size);
   }
-  auto r = searchFor(c, {{"q", "kettle"}, {"page_size", "1"}});
-  ctx.Assert(r.Status == 200 && ids(r) == "p-3", "page_size=1 answered %d %s, expected the cheapest kettle", r.Status, r.Text());
-  r = searchFor(c, {{"q", "kettle"}, {"page_size", "100"}});
+  auto r = hSearchFor(c, {{"q", "kettle"}, {"page_size", "1"}});
+  ctx.Assert(r.Status == 200 && hIds(r) == "p-3", "page_size=1 answered %d %s, expected the cheapest kettle", r.Status, r.Text());
+  r = hSearchFor(c, {{"q", "kettle"}, {"page_size", "100"}});
   ctx.Equal(r.Status, 200, "page_size=100 is within the cap; the status");
 }
 
 void CheckFilterAllowlist(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  auto r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"cost_cents": "1200"})"}});
+  auto c = hApi(ctx);
+  auto r = hSearchFor(c, {{"q", "kettle"}, {"filters", R"({"cost_cents": "1200"})"}});
   ctx.Equal(r.Status, 400, "a filter on cost_cents answered %s: the wholesale cost is one guess away. Check filter fields against kAllowedFilterFields; the status", r.Text());
   ctx.Assert(r.Text().find("cost_cents") != std::string::npos, "the 400 must name the unknown field (cost_cents), got %s", r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -972,20 +986,22 @@ void CheckFilterAllowlist(harness::Ctx& ctx) {
   }
   std::sort(allowed.begin(), allowed.end());
   ctx.Equal(allowed, {"brand", "category", "in_stock", "max_price", "min_price"}, "the 400 must carry the allowed list");
-  r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"brand": "acme", "max_price": "1000"})"}});
-  ctx.Assert(r.Status == 200 && ids(r) == "p-3", "brand=acme and max_price=1000 answered %d %s, expected [p-3]", r.Status, r.Text());
-  r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"in_stock": "true"})"}});
-  ctx.Assert(r.Status == 200 && ids(r) == "p-3,p-1", "in_stock=true answered %d %s, expected [p-3, p-1]", r.Status, r.Text());
+  r = hSearchFor(c, {{"q", "kettle"}, {"filters", R"({"brand": "acme", "price_cents": "899"})"}});
+  ctx.Assert(r.Status == 400 && r.Text().find("price_cents") != std::string::npos, "a filter on brand and price_cents answered %d %s: every field outside kAllowedFilterFields is 400 naming it, not only cost_cents", r.Status, r.Text());
+  r = hSearchFor(c, {{"q", "kettle"}, {"filters", R"({"brand": "acme", "max_price": "1000"})"}});
+  ctx.Assert(r.Status == 200 && hIds(r) == "p-3", "brand=acme and max_price=1000 answered %d %s, expected [p-3]", r.Status, r.Text());
+  r = hSearchFor(c, {{"q", "kettle"}, {"filters", R"({"in_stock": "true"})"}});
+  ctx.Assert(r.Status == 200 && hIds(r) == "p-3,p-1", "in_stock=true answered %d %s, expected [p-3, p-1]", r.Status, r.Text());
 }
 
 void CheckFilterShape(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  for (const std::string raw : {R"({"in_stock": true})", R"(["brand"])", "brand=acme"}) {
-    const auto r = searchFor(c, {{"q", "kettle"}, {"filters", raw}});
+  auto c = hApi(ctx);
+  for (const std::string raw : {R"({"in_stock": true})", R"({"min_price": 1000})", R"(["brand"])", "brand=acme"}) {
+    const auto r = hSearchFor(c, {{"q", "kettle"}, {"filters", raw}});
     ctx.Equal(r.Status, 400, "filters=%s must be refused: filters is a JSON object of strings (%s); the status", raw, r.Text());
   }
-  const auto r = searchFor(c, {{"q", "kettle"}, {"filters", R"({"category": "kitchen"})"}});
-  ctx.Assert(r.Status == 200 && ids(r) == "p-2,p-1", "category=kitchen answered %d %s, expected [p-2, p-1]", r.Status, r.Text());
+  const auto r = hSearchFor(c, {{"q", "kettle"}, {"filters", R"({"category": "kitchen"})"}});
+  ctx.Assert(r.Status == 200 && hIds(r) == "p-2,p-1", "category=kitchen answered %d %s, expected [p-2, p-1]", r.Status, r.Text());
 }
 `,
   },

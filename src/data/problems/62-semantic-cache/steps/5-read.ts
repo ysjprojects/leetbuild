@@ -121,7 +121,7 @@ re-asking the same question.
       id: 'scope',
       title: 'Counts per tenant and model version',
       detail:
-        'The counters come from `stats:{tenant}:{model_version}`, the hash the consumer maintains, so no tenant and no model version shares a number; a missing `model_version` is 400 and a hash with no traffic reports 0.0 everywhere. The starter reads one `stats:all` hash.',
+        'The counters come from `stats:{tenant}:{model_version}`, the hash the consumer maintains, so no tenant and no model version shares a number; a missing `model_version` is 400, and a hash with no traffic, or with misses and no hits, reports 0.0 for every rate. The starter reads one `stats:all` hash.',
       match: {
         python: {all: [/stats:\{tenant\}:\{model_version\}/], none: [/stats:all/]},
         typescript: {all: [/stats:\$\{tenant\}:\$\{modelVersion\}/], none: [/stats:all/]},
@@ -614,7 +614,7 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/semantic-cache/([^/]
   },
   harness: {
     python: `ACME = {"X-Tenant-Id": "acme"}
-FULL = {"hits_total": 10, "misses_total": 10, "similarity_sum": 9.1, "automated_total": 10, "automated_hits": 9, "hits_older_than_1h": 3}
+FULL = {"hits_total": 8, "misses_total": 12, "similarity_sum": 7.2, "automated_total": 5, "automated_hits": 3, "hits_older_than_1h": 2}
 
 
 def _counters(ctx, key, **fields):
@@ -641,7 +641,7 @@ async def check_route(ctx):
     assert r.headers.get("content-type", "").startswith("application/json"), f"the report must be JSON, got Content-Type {r.headers.get('content-type')!r}"
     body = r.json()
     assert body.get("tenant") == "acme" and body.get("model_version") == "2024-06", f"the report names its tenant and model version: {body}"
-    assert _near(body.get("hit_rate"), 0.5), f"hit_rate is {body.get('hit_rate')!r}, expected 10 hits / 20 lookups = 0.5"
+    assert _near(body.get("hit_rate"), 0.4), f"hit_rate is {body.get('hit_rate')!r}, expected 8 hits / 20 lookups = 0.4"
 
 
 async def check_tenant_authz(ctx):
@@ -664,8 +664,8 @@ async def check_age(ctx):
         r = await _get(c)
     assert r.status_code == 200, f"stats answered {r.status_code}: {r.text}"
     body = r.json()
-    assert body.get("aging_hits") == 3, f"aging_hits is {body.get('aging_hits')!r}, expected the consumer's hits_older_than_1h count, 3"
-    assert _near(body.get("hits_older_than_1h_share"), 0.3), f"hits_older_than_1h_share is {body.get('hits_older_than_1h_share')!r}, expected 3 / 10 hits = 0.3"
+    assert body.get("aging_hits") == 2, f"aging_hits is {body.get('aging_hits')!r}, expected the consumer's hits_older_than_1h count, 2"
+    assert _near(body.get("hits_older_than_1h_share"), 0.25), f"hits_older_than_1h_share is {body.get('hits_older_than_1h_share')!r}, expected 2 / 8 hits = 0.25"
 
 
 async def check_automated(ctx):
@@ -675,10 +675,10 @@ async def check_automated(ctx):
         r = await _get(c)
     assert r.status_code == 200, f"stats answered {r.status_code}: {r.text}"
     body = r.json()
-    assert _near(body.get("hit_rate"), 0.5), f"hit_rate is {body.get('hit_rate')!r}, expected 0.5"
-    assert _near(body.get("hit_rate_automated"), 0.9), f"hit_rate_automated is {body.get('hit_rate_automated')!r}, expected 9 automated hits / 10 automated lookups = 0.9"
-    assert _near(body.get("automated_share"), 0.5), f"automated_share is {body.get('automated_share')!r}, expected 10 automated lookups / 20 lookups = 0.5"
-    assert _near(body.get("avg_similarity"), 0.91), f"avg_similarity is {body.get('avg_similarity')!r}, expected 9.1 / 10 hits = 0.91"
+    assert _near(body.get("hit_rate"), 0.4), f"hit_rate is {body.get('hit_rate')!r}, expected 8 hits / 20 lookups = 0.4"
+    assert _near(body.get("hit_rate_automated"), 0.6), f"hit_rate_automated is {body.get('hit_rate_automated')!r}, expected 3 automated hits / 5 automated lookups = 0.6"
+    assert _near(body.get("automated_share"), 0.25), f"automated_share is {body.get('automated_share')!r}, expected 5 automated lookups / 20 lookups = 0.25"
+    assert _near(body.get("avg_similarity"), 0.9), f"avg_similarity is {body.get('avg_similarity')!r}, expected 7.2 / 8 hits = 0.9"
 
 
 async def check_scope(ctx):
@@ -686,11 +686,17 @@ async def check_scope(ctx):
     _counters(ctx, "stats:all", hits_total=99, misses_total=1, similarity_sum=90)
     _counters(ctx, "stats:acme:2024-06", **FULL)
     _counters(ctx, "stats:acme:2024-07", hits_total=1, misses_total=9, similarity_sum=0.9)
+    _counters(ctx, "stats:acme:2024-08", misses_total=4)
     async with ctx.client(m.app) as c:
         r = await _get(c)
-        assert _near(r.json().get("hit_rate"), 0.5), f"acme 2024-06 reports hit_rate {r.json().get('hit_rate')!r}, expected 0.5 from stats:acme:2024-06 (not another hash's numbers)"
+        assert _near(r.json().get("hit_rate"), 0.4), f"acme 2024-06 reports hit_rate {r.json().get('hit_rate')!r}, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)"
         r = await _get(c, model_version="2024-07")
         assert _near(r.json().get("hit_rate"), 0.1), f"acme 2024-07 reports hit_rate {r.json().get('hit_rate')!r}, expected 0.1 from stats:acme:2024-07"
+        r = await _get(c, model_version="2024-08")
+        assert r.status_code == 200, f"acme 2024-08 (four misses, no hits) answered {r.status_code}: {r.text}"
+        body = r.json()
+        for field in ("hit_rate", "hit_rate_automated", "automated_share", "avg_similarity", "hits_older_than_1h_share"):
+            assert _near(body.get(field), 0.0), f"{field} is {body.get(field)!r} for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups"
         r = await _get(c, model_version="")
         assert r.status_code == 400, f"a request without model_version answered {r.status_code}, expected 400"
         r = await _get(c, tenant="globex", headers={"X-Tenant-Id": "globex"})
@@ -700,7 +706,7 @@ async def check_scope(ctx):
             assert _near(body.get(field), 0.0), f"{field} is {body.get(field)!r} for a tenant with no traffic, expected 0.0 (no NaN, no division error)"
 `,
     typescript: `const ACME = {'X-Tenant-Id': 'acme'};
-const FULL = {hits_total: 10, misses_total: 10, similarity_sum: 9.1, automated_total: 10, automated_hits: 9, hits_older_than_1h: 3};
+const FULL = {hits_total: 8, misses_total: 12, similarity_sum: 7.2, automated_total: 5, automated_hits: 3, hits_older_than_1h: 2};
 
 /** The hash the stats consumer (step 4) maintains, as it would stand after the traffic. */
 function counters(ctx, key: string, fields: Record<string, number>) {
@@ -722,7 +728,7 @@ export async function check_route(ctx) {
   assert((r.headers['content-type'] ?? '').startsWith('application/json'), \`the report must be JSON, got Content-Type \${JSON.stringify(r.headers['content-type'])}\`);
   const body = r.json();
   assert(body.tenant === 'acme' && body.model_version === '2024-06', \`the report names its tenant and model version: \${r.text}\`);
-  assert(near(body.hit_rate, 0.5), \`hit_rate is \${JSON.stringify(body.hit_rate)}, expected 10 hits / 20 lookups = 0.5\`);
+  assert(near(body.hit_rate, 0.4), \`hit_rate is \${JSON.stringify(body.hit_rate)}, expected 8 hits / 20 lookups = 0.4\`);
 }
 
 export async function check_tenant_authz(ctx) {
@@ -744,8 +750,8 @@ export async function check_age(ctx) {
   const r = await get(ctx.client(m.app));
   assert.equal(r.status, 200, \`stats answered \${r.status}: \${r.text}\`);
   const body = r.json();
-  assert.equal(body.aging_hits, 3, \`aging_hits is \${JSON.stringify(body.aging_hits)}, expected the consumer's hits_older_than_1h count, 3\`);
-  assert(near(body.hits_older_than_1h_share, 0.3), \`hits_older_than_1h_share is \${JSON.stringify(body.hits_older_than_1h_share)}, expected 3 / 10 hits = 0.3\`);
+  assert.equal(body.aging_hits, 2, \`aging_hits is \${JSON.stringify(body.aging_hits)}, expected the consumer's hits_older_than_1h count, 2\`);
+  assert(near(body.hits_older_than_1h_share, 0.25), \`hits_older_than_1h_share is \${JSON.stringify(body.hits_older_than_1h_share)}, expected 2 / 8 hits = 0.25\`);
 }
 
 export async function check_automated(ctx) {
@@ -754,10 +760,10 @@ export async function check_automated(ctx) {
   const r = await get(ctx.client(m.app));
   assert.equal(r.status, 200, \`stats answered \${r.status}: \${r.text}\`);
   const body = r.json();
-  assert(near(body.hit_rate, 0.5), \`hit_rate is \${JSON.stringify(body.hit_rate)}, expected 0.5\`);
-  assert(near(body.hit_rate_automated, 0.9), \`hit_rate_automated is \${JSON.stringify(body.hit_rate_automated)}, expected 9 automated hits / 10 automated lookups = 0.9\`);
-  assert(near(body.automated_share, 0.5), \`automated_share is \${JSON.stringify(body.automated_share)}, expected 10 automated lookups / 20 lookups = 0.5\`);
-  assert(near(body.avg_similarity, 0.91), \`avg_similarity is \${JSON.stringify(body.avg_similarity)}, expected 9.1 / 10 hits = 0.91\`);
+  assert(near(body.hit_rate, 0.4), \`hit_rate is \${JSON.stringify(body.hit_rate)}, expected 8 hits / 20 lookups = 0.4\`);
+  assert(near(body.hit_rate_automated, 0.6), \`hit_rate_automated is \${JSON.stringify(body.hit_rate_automated)}, expected 3 automated hits / 5 automated lookups = 0.6\`);
+  assert(near(body.automated_share, 0.25), \`automated_share is \${JSON.stringify(body.automated_share)}, expected 5 automated lookups / 20 lookups = 0.25\`);
+  assert(near(body.avg_similarity, 0.9), \`avg_similarity is \${JSON.stringify(body.avg_similarity)}, expected 7.2 / 8 hits = 0.9\`);
 }
 
 export async function check_scope(ctx) {
@@ -765,11 +771,18 @@ export async function check_scope(ctx) {
   counters(ctx, 'stats:all', {hits_total: 99, misses_total: 1, similarity_sum: 90});
   counters(ctx, 'stats:acme:2024-06', FULL);
   counters(ctx, 'stats:acme:2024-07', {hits_total: 1, misses_total: 9, similarity_sum: 0.9});
+  counters(ctx, 'stats:acme:2024-08', {misses_total: 4});
   const c = ctx.client(m.app);
   let r = await get(c);
-  assert(near(r.json().hit_rate, 0.5), \`acme 2024-06 reports hit_rate \${JSON.stringify(r.json().hit_rate)}, expected 0.5 from stats:acme:2024-06 (not another hash's numbers)\`);
+  assert(near(r.json().hit_rate, 0.4), \`acme 2024-06 reports hit_rate \${JSON.stringify(r.json().hit_rate)}, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)\`);
   r = await get(c, {modelVersion: '2024-07'});
   assert(near(r.json().hit_rate, 0.1), \`acme 2024-07 reports hit_rate \${JSON.stringify(r.json().hit_rate)}, expected 0.1 from stats:acme:2024-07\`);
+  r = await get(c, {modelVersion: '2024-08'});
+  assert.equal(r.status, 200, \`acme 2024-08 (four misses, no hits) answered \${r.status}: \${r.text}\`);
+  const noHits = r.json();
+  for (const field of ['hit_rate', 'hit_rate_automated', 'automated_share', 'avg_similarity', 'hits_older_than_1h_share']) {
+    assert(near(noHits[field], 0), \`\${field} is \${JSON.stringify(noHits[field])} for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups\`);
+  }
   r = await get(c, {modelVersion: ''});
   assert.equal(r.status, 400, \`a request without model_version answered \${r.status}, expected 400\`);
   r = await get(c, {tenant: 'globex', headers: {'X-Tenant-Id': 'globex'}});
@@ -790,7 +803,7 @@ import (
 	"leetbuild/harness"
 )
 
-var readFull = map[string]any{"hits_total": 10, "misses_total": 10, "similarity_sum": 9.1, "automated_total": 10, "automated_hits": 9, "hits_older_than_1h": 3}
+var readFull = map[string]any{"hits_total": 8, "misses_total": 12, "similarity_sum": 7.2, "automated_total": 5, "automated_hits": 3, "hits_older_than_1h": 2}
 
 // readCounters writes the hash the stats consumer (step 4) maintains, as it would stand after the traffic.
 func readCounters(ctx *harness.Ctx, key string, fields map[string]any) {
@@ -837,7 +850,7 @@ func CheckRoute(ctx *harness.Ctx) {
 	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "application/json"), "the report must be JSON, got Content-Type %q", r.Header.Get("Content-Type"))
 	body := readBody(ctx, r)
 	ctx.Assert(body["tenant"] == "acme" && body["model_version"] == "2024-06", "the report names its tenant and model version: %s", r.Text())
-	ctx.Assert(readNear(body["hit_rate"], 0.5), "hit_rate is %v, expected 10 hits / 20 lookups = 0.5", body["hit_rate"])
+	ctx.Assert(readNear(body["hit_rate"], 0.4), "hit_rate is %v, expected 8 hits / 20 lookups = 0.4", body["hit_rate"])
 }
 
 func CheckTenantAuthz(ctx *harness.Ctx) {
@@ -858,8 +871,8 @@ func CheckAge(ctx *harness.Ctx) {
 	r := readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "stats (%s)", r.Text())
 	body := readBody(ctx, r)
-	ctx.Equal(body["aging_hits"], 3, "aging_hits must be the consumer's hits_older_than_1h count")
-	ctx.Assert(readNear(body["hits_older_than_1h_share"], 0.3), "hits_older_than_1h_share is %v, expected 3 / 10 hits = 0.3", body["hits_older_than_1h_share"])
+	ctx.Equal(body["aging_hits"], 2, "aging_hits must be the consumer's hits_older_than_1h count")
+	ctx.Assert(readNear(body["hits_older_than_1h_share"], 0.25), "hits_older_than_1h_share is %v, expected 2 / 8 hits = 0.25", body["hits_older_than_1h_share"])
 }
 
 func CheckAutomated(ctx *harness.Ctx) {
@@ -868,10 +881,10 @@ func CheckAutomated(ctx *harness.Ctx) {
 	r := readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 200, "stats (%s)", r.Text())
 	body := readBody(ctx, r)
-	ctx.Assert(readNear(body["hit_rate"], 0.5), "hit_rate is %v, expected 0.5", body["hit_rate"])
-	ctx.Assert(readNear(body["hit_rate_automated"], 0.9), "hit_rate_automated is %v, expected 9 automated hits / 10 automated lookups = 0.9", body["hit_rate_automated"])
-	ctx.Assert(readNear(body["automated_share"], 0.5), "automated_share is %v, expected 10 automated lookups / 20 lookups = 0.5", body["automated_share"])
-	ctx.Assert(readNear(body["avg_similarity"], 0.91), "avg_similarity is %v, expected 9.1 / 10 hits = 0.91", body["avg_similarity"])
+	ctx.Assert(readNear(body["hit_rate"], 0.4), "hit_rate is %v, expected 8 hits / 20 lookups = 0.4", body["hit_rate"])
+	ctx.Assert(readNear(body["hit_rate_automated"], 0.6), "hit_rate_automated is %v, expected 3 automated hits / 5 automated lookups = 0.6", body["hit_rate_automated"])
+	ctx.Assert(readNear(body["automated_share"], 0.25), "automated_share is %v, expected 5 automated lookups / 20 lookups = 0.25", body["automated_share"])
+	ctx.Assert(readNear(body["avg_similarity"], 0.9), "avg_similarity is %v, expected 7.2 / 8 hits = 0.9", body["avg_similarity"])
 }
 
 func CheckScope(ctx *harness.Ctx) {
@@ -879,10 +892,17 @@ func CheckScope(ctx *harness.Ctx) {
 	readCounters(ctx, "stats:all", map[string]any{"hits_total": 99, "misses_total": 1, "similarity_sum": 90})
 	readCounters(ctx, "stats:acme:2024-06", readFull)
 	readCounters(ctx, "stats:acme:2024-07", map[string]any{"hits_total": 1, "misses_total": 9, "similarity_sum": 0.9})
+	readCounters(ctx, "stats:acme:2024-08", map[string]any{"misses_total": 4})
 	r := readGet(c, "acme", "2024-06", "X-Tenant-Id", "acme")
-	ctx.Assert(readNear(readBody(ctx, r)["hit_rate"], 0.5), "acme 2024-06 reports hit_rate %v, expected 0.5 from stats:acme:2024-06 (not another hash's numbers)", readBody(ctx, r)["hit_rate"])
+	ctx.Assert(readNear(readBody(ctx, r)["hit_rate"], 0.4), "acme 2024-06 reports hit_rate %v, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)", readBody(ctx, r)["hit_rate"])
 	r = readGet(c, "acme", "2024-07", "X-Tenant-Id", "acme")
 	ctx.Assert(readNear(readBody(ctx, r)["hit_rate"], 0.1), "acme 2024-07 reports hit_rate %v, expected 0.1 from stats:acme:2024-07", readBody(ctx, r)["hit_rate"])
+	r = readGet(c, "acme", "2024-08", "X-Tenant-Id", "acme")
+	ctx.Equal(r.Status, 200, "acme 2024-08 (four misses, no hits) (%s)", r.Text())
+	noHits := readBody(ctx, r)
+	for _, field := range []string{"hit_rate", "hit_rate_automated", "automated_share", "avg_similarity", "hits_older_than_1h_share"} {
+		ctx.Assert(readNear(noHits[field], 0), "%s is %v for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups", field, noHits[field])
+	}
 	r = readGet(c, "acme", "", "X-Tenant-Id", "acme")
 	ctx.Equal(r.Status, 400, "a request without model_version")
 	r = readGet(c, "globex", "2024-06", "X-Tenant-Id", "globex")
@@ -903,8 +923,8 @@ func CheckScope(ctx *harness.Ctx) {
 
 namespace {
 
-const std::map<std::string, double> kFull = {{"hits_total", 10}, {"misses_total", 10}, {"similarity_sum", 9.1},
-                                              {"automated_total", 10}, {"automated_hits", 9}, {"hits_older_than_1h", 3}};
+const std::map<std::string, double> kFull = {{"hits_total", 8}, {"misses_total", 12}, {"similarity_sum", 7.2},
+                                              {"automated_total", 5}, {"automated_hits", 3}, {"hits_older_than_1h", 2}};
 
 // The hash the stats consumer (step 4) maintains, as it would stand after the traffic.
 void readCounters(harness::Ctx& ctx, const std::string& key, const std::map<std::string, double>& fields) {
@@ -964,7 +984,7 @@ void CheckRoute(harness::Ctx& ctx) {
   const auto body = readBody(ctx, r);
   ctx.Assert(body.value("tenant", "") == "acme" && body.value("model_version", "") == "2024-06", "the report names its tenant and model version: %s",
              r.Text());
-  ctx.Assert(readNear(body, "hit_rate", 0.5), "hit_rate is %s, expected 10 hits / 20 lookups = 0.5", shown(body, "hit_rate"));
+  ctx.Assert(readNear(body, "hit_rate", 0.4), "hit_rate is %s, expected 8 hits / 20 lookups = 0.4", shown(body, "hit_rate"));
 }
 
 void CheckTenantAuthz(harness::Ctx& ctx) {
@@ -985,9 +1005,9 @@ void CheckAge(harness::Ctx& ctx) {
   auto r = readGet(c, "acme", "2024-06", "acme");
   ctx.Equal(r.Status, 200, "stats (%s)", r.Text());
   const auto body = readBody(ctx, r);
-  ctx.Assert(body.contains("aging_hits") && body["aging_hits"] == 3, "aging_hits is %s, expected the consumer's hits_older_than_1h count, 3",
+  ctx.Assert(body.contains("aging_hits") && body["aging_hits"] == 2, "aging_hits is %s, expected the consumer's hits_older_than_1h count, 2",
              shown(body, "aging_hits"));
-  ctx.Assert(readNear(body, "hits_older_than_1h_share", 0.3), "hits_older_than_1h_share is %s, expected 3 / 10 hits = 0.3",
+  ctx.Assert(readNear(body, "hits_older_than_1h_share", 0.25), "hits_older_than_1h_share is %s, expected 2 / 8 hits = 0.25",
              shown(body, "hits_older_than_1h_share"));
 }
 
@@ -997,12 +1017,12 @@ void CheckAutomated(harness::Ctx& ctx) {
   auto r = readGet(c, "acme", "2024-06", "acme");
   ctx.Equal(r.Status, 200, "stats (%s)", r.Text());
   const auto body = readBody(ctx, r);
-  ctx.Assert(readNear(body, "hit_rate", 0.5), "hit_rate is %s, expected 0.5", shown(body, "hit_rate"));
-  ctx.Assert(readNear(body, "hit_rate_automated", 0.9), "hit_rate_automated is %s, expected 9 automated hits / 10 automated lookups = 0.9",
+  ctx.Assert(readNear(body, "hit_rate", 0.4), "hit_rate is %s, expected 8 hits / 20 lookups = 0.4", shown(body, "hit_rate"));
+  ctx.Assert(readNear(body, "hit_rate_automated", 0.6), "hit_rate_automated is %s, expected 3 automated hits / 5 automated lookups = 0.6",
              shown(body, "hit_rate_automated"));
-  ctx.Assert(readNear(body, "automated_share", 0.5), "automated_share is %s, expected 10 automated lookups / 20 lookups = 0.5",
+  ctx.Assert(readNear(body, "automated_share", 0.25), "automated_share is %s, expected 5 automated lookups / 20 lookups = 0.25",
              shown(body, "automated_share"));
-  ctx.Assert(readNear(body, "avg_similarity", 0.91), "avg_similarity is %s, expected 9.1 / 10 hits = 0.91", shown(body, "avg_similarity"));
+  ctx.Assert(readNear(body, "avg_similarity", 0.9), "avg_similarity is %s, expected 7.2 / 8 hits = 0.9", shown(body, "avg_similarity"));
 }
 
 void CheckScope(harness::Ctx& ctx) {
@@ -1010,13 +1030,21 @@ void CheckScope(harness::Ctx& ctx) {
   readCounters(ctx, "stats:all", {{"hits_total", 99}, {"misses_total", 1}, {"similarity_sum", 90}});
   readCounters(ctx, "stats:acme:2024-06", kFull);
   readCounters(ctx, "stats:acme:2024-07", {{"hits_total", 1}, {"misses_total", 9}, {"similarity_sum", 0.9}});
+  readCounters(ctx, "stats:acme:2024-08", {{"misses_total", 4}});
   auto r = readGet(c, "acme", "2024-06", "acme");
   auto body = readBody(ctx, r);
-  ctx.Assert(readNear(body, "hit_rate", 0.5), "acme 2024-06 reports hit_rate %s, expected 0.5 from stats:acme:2024-06 (not another hash's numbers)",
+  ctx.Assert(readNear(body, "hit_rate", 0.4), "acme 2024-06 reports hit_rate %s, expected 0.4 from stats:acme:2024-06 (not another hash's numbers)",
              shown(body, "hit_rate"));
   r = readGet(c, "acme", "2024-07", "acme");
   body = readBody(ctx, r);
   ctx.Assert(readNear(body, "hit_rate", 0.1), "acme 2024-07 reports hit_rate %s, expected 0.1 from stats:acme:2024-07", shown(body, "hit_rate"));
+  r = readGet(c, "acme", "2024-08", "acme");
+  ctx.Equal(r.Status, 200, "acme 2024-08 (four misses, no hits) (%s)", r.Text());
+  body = readBody(ctx, r);
+  for (const std::string field : {"hit_rate", "hit_rate_automated", "automated_share", "avg_similarity", "hits_older_than_1h_share"}) {
+    ctx.Assert(readNear(body, field, 0), "%s is %s for four misses and no hits, expected 0.0: every division is guarded, not only the one by lookups",
+               field, shown(body, field));
+  }
   r = readGet(c, "acme", "", "acme");
   ctx.Equal(r.Status, 400, "a request without model_version");
   r = readGet(c, "globex", "2024-06", "globex");

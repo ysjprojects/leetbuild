@@ -79,7 +79,7 @@ records a client's retry as a second citation.
       id: 'validate',
       title: 'Rejects a missing tenant and a malformed span',
       detail:
-        'A missing `X-Tenant-Id` is **401**; `version < 1`, `start < 0`, `end <= start`, an empty id and a quote over `MAX_QUOTE_CHARS` are **400**, and nothing is stored. The starter stores whatever arrives.',
+        'A missing `X-Tenant-Id` is **401**; `version < 1`, `start < 0`, `end <= start`, an empty `document_id`, `answer_id` or quote, and a quote over `MAX_QUOTE_CHARS` are **400**, and nothing is stored; a quote of exactly `MAX_QUOTE_CHARS` is accepted. The starter stores whatever arrives.',
       match: {
         python: {
           all: [
@@ -145,7 +145,7 @@ records a client's retry as a second citation.
       id: 'version-scope',
       title: 'Resolves the span in the named version',
       detail:
-        'The text comes from `get_version(document_id, version)`, the immutable version the request names, so a citation of version 1 keeps version 1’s quote after version 2 is published. The starter reads `latest`.',
+        'The text comes from `get_version(document_id, version)`, the immutable version the request names, so a citation of version 1 keeps version 1’s quote after version 2 is published; a version the document does not have is **404** and nothing is stored. The starter reads `latest`.',
       match: {
         python: {all: [/documents\.get_version\(/], none: [/documents\.latest\(/]},
         typescript: {all: [/getVersion\(/], none: [/\blatest\(/]},
@@ -731,12 +731,18 @@ async def check_validate(ctx):
             ("start -1", _body(start=-1)),
             ("end equal to start", _body(end=13, quote="3")),
             ("an empty document_id", _body(document_id="")),
+            ("an empty answer_id", _body(answer_id="")),
+            ("an empty quote", _body(quote="")),
             ("a quote over 16 KiB", _body(start=0, end=16385, quote="x" * 16385)),
         ]
         for n, (what, body) in enumerate(cases):
             r = await _cite(c, body, key=f"k-{n}")
             assert r.status_code == 400, f"a request with {what} answered {r.status_code} {r.text[:160]}, expected 400"
     assert store.get("c-1") is None, f"a rejected request stored a citation: {store.get('c-1')}"
+    documents.add_version("doc-big", "x" * 16384)
+    async with _api(ctx) as c:
+        r = await _cite(c, _body(document_id="doc-big", start=0, end=16384, quote="x" * 16384), key="k-max")
+    assert r.status_code == 201, f"a quote of exactly MAX_QUOTE_CHARS (16384) characters answered {r.status_code} {r.text[:160]}, expected 201: only a longer one is 400"
 
 
 async def check_span_match(ctx):
@@ -760,7 +766,10 @@ async def check_version_scope(ctx):
         r = await _cite(c, _body(version=2, quote="330"), key="k-2")
         assert r.status_code == 201, f"citing version 2 with its own text (330) answered {r.status_code} {r.text}"
         r = await _cite(c, _body(quote="330"), key="k-3")
-    assert r.status_code == 422, f"quoting version 2's text (330) as version 1 answered {r.status_code}, expected 422: version 1 says 300"
+        assert r.status_code == 422, f"quoting version 2's text (330) as version 1 answered {r.status_code}, expected 422: version 1 says 300"
+        r = await _cite(c, _body(version=3), key="k-4")
+    assert r.status_code == 404, f"citing version 3 of a document that has 2 versions answered {r.status_code} {r.text}, expected 404"
+    assert len(store.for_answer("a-1")) == 2, f"a citation of an unknown version was stored: {store.for_answer('a-1')}"
 
 
 async def check_idempotent(ctx):
@@ -817,6 +826,8 @@ export async function check_validate(ctx) {
     ['start -1', body({start: -1})],
     ['end equal to start', body({end: 13, quote: '3'})],
     ['an empty document_id', body({document_id: ''})],
+    ['an empty answer_id', body({answer_id: ''})],
+    ['an empty quote', body({quote: ''})],
     ['a quote over 16 KiB', body({start: 0, end: 16385, quote: 'x'.repeat(16385)})],
   ];
   for (const [n, [what, json]] of cases.entries()) {
@@ -824,6 +835,9 @@ export async function check_validate(ctx) {
     assert.equal(r.status, 400, \`a request with \${what} answered \${r.status} \${r.text.slice(0, 160)}, expected 400\`);
   }
   assert.equal(await store.get('c-1'), null, 'a rejected request stored a citation');
+  await documents.addVersion('doc-big', 'x'.repeat(16384));
+  r = await cite(c, body({document_id: 'doc-big', start: 0, end: 16384, quote: 'x'.repeat(16384)}), 't1', 'k-max');
+  assert.equal(r.status, 201, \`a quote of exactly MAX_QUOTE_CHARS (16384) characters answered \${r.status} \${r.text.slice(0, 160)}, expected 201: only a longer one is 400\`);
 }
 
 export async function check_span_match(ctx) {
@@ -848,6 +862,9 @@ export async function check_version_scope(ctx) {
   assert.equal(r.status, 201, \`citing version 2 with its own text (330) answered \${r.status} \${r.text}\`);
   r = await cite(c, body({quote: '330'}), 't1', 'k-3');
   assert.equal(r.status, 422, \`quoting version 2's text (330) as version 1 answered \${r.status}, expected 422: version 1 says 300\`);
+  r = await cite(c, body({version: 3}), 't1', 'k-4');
+  assert.equal(r.status, 404, \`citing version 3 of a document that has 2 versions answered \${r.status} \${r.text}, expected 404\`);
+  assert.equal((await store.forAnswer('a-1')).length, 2, 'a citation of an unknown version was stored');
 }
 
 export async function check_idempotent(ctx) {
@@ -880,19 +897,19 @@ import (
 )
 
 const (
-	apiV1 = "The tower is 300 metres tall and opened in 1889."
-	apiV2 = "The tower is 330 metres tall and opened in 1889."
+	hEndpointV1 = "The tower is 300 metres tall and opened in 1889."
+	hEndpointV2 = "The tower is 330 metres tall and opened in 1889."
 )
 
-var apiBg = context.Background()
+var hEndpointBg = context.Background()
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hEndpointAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func citeBody(over map[string]any) map[string]any {
+func hCiteBody(over map[string]any) map[string]any {
 	body := map[string]any{"answer_id": "a-1", "document_id": "doc-7", "version": 1, "start": 13, "end": 16, "quote": "300"}
 	for k, v := range over {
 		body[k] = v
@@ -900,7 +917,7 @@ func citeBody(over map[string]any) map[string]any {
 	return body
 }
 
-func cite(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
+func hCite(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Response {
 	header := []string{}
 	if tenant != "" {
 		header = append(header, "X-Tenant-Id", tenant)
@@ -911,24 +928,24 @@ func cite(c *harness.HTTP, body map[string]any, tenant, key string) *harness.Res
 	return c.Post("/v1/citations", body, header...)
 }
 
-func idOf(r *harness.Response) string {
+func hIDOf(r *harness.Response) string {
 	m, _ := r.JSON().(map[string]any)
 	id, _ := m["id"].(string)
 	return id
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	documents.AddVersion(apiBg, "doc-7", apiV1)
-	r := cite(api(ctx), citeBody(nil), "t1", "k-1")
+	documents.AddVersion(hEndpointBg, "doc-7", hEndpointV1)
+	r := hCite(hEndpointAPI(ctx), hCiteBody(nil), "t1", "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/citations (%s)", r.Text())
-	row := store.Get(apiBg, idOf(r))
+	row := store.Get(hEndpointBg, hIDOf(r))
 	ctx.Assert(row != nil && row.DocumentID == "doc-7" && row.Quote == "300", "the answer %s names no stored citation of doc-7 quoting 300 (stored: %+v)", r.Text(), row)
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	documents.AddVersion(apiBg, "doc-7", apiV1)
-	c := api(ctx)
-	r := cite(c, citeBody(nil), "", "k-1")
+	documents.AddVersion(hEndpointBg, "doc-7", hEndpointV1)
+	c := hEndpointAPI(ctx)
+	r := hCite(c, hCiteBody(nil), "", "k-1")
 	ctx.Equal(r.Status, 401, "a citation without X-Tenant-Id (a citation belongs to an authenticated tenant)")
 	cases := []struct {
 		what string
@@ -938,49 +955,57 @@ func CheckValidate(ctx *harness.Ctx) {
 		{"start -1", map[string]any{"start": -1}},
 		{"end equal to start", map[string]any{"end": 13, "quote": "3"}},
 		{"an empty document_id", map[string]any{"document_id": ""}},
+		{"an empty answer_id", map[string]any{"answer_id": ""}},
+		{"an empty quote", map[string]any{"quote": ""}},
 		{"a quote over 16 KiB", map[string]any{"start": 0, "end": 16385, "quote": strings.Repeat("x", 16385)}},
 	}
 	for n, tc := range cases {
-		r = cite(c, citeBody(tc.over), "t1", fmt.Sprintf("k-%d", n))
+		r = hCite(c, hCiteBody(tc.over), "t1", fmt.Sprintf("k-%d", n))
 		ctx.Equal(r.Status, 400, "a request with %s", tc.what)
 	}
-	ctx.Assert(store.Get(apiBg, "c-1") == nil, "a rejected request stored a citation: %+v", store.Get(apiBg, "c-1"))
+	ctx.Assert(store.Get(hEndpointBg, "c-1") == nil, "a rejected request stored a citation: %+v", store.Get(hEndpointBg, "c-1"))
+	documents.AddVersion(hEndpointBg, "doc-big", strings.Repeat("x", 16384))
+	r = hCite(c, hCiteBody(map[string]any{"document_id": "doc-big", "start": 0, "end": 16384, "quote": strings.Repeat("x", 16384)}), "t1", "k-max")
+	ctx.Equal(r.Status, 201, "a quote of exactly maxQuoteChars (16384) characters must be accepted, only a longer one is 400 (%.160s)", r.Text())
 }
 
 func CheckSpanMatch(ctx *harness.Ctx) {
-	documents.AddVersion(apiBg, "doc-7", apiV1)
-	r := cite(api(ctx), citeBody(map[string]any{"quote": "301"}), "t1", "k-1")
+	documents.AddVersion(hEndpointBg, "doc-7", hEndpointV1)
+	r := hCite(hEndpointAPI(ctx), hCiteBody(map[string]any{"quote": "301"}), "t1", "k-1")
 	ctx.Equal(r.Status, 422, "quoting 301 where version 1 says 300 (%s)", r.Text())
 	b, _ := r.JSON().(map[string]any)
 	ctx.Assert(b["stored"] == "300" && b["supplied"] == "301", "the 422 must carry both texts, stored 300 and supplied 301, got %s", r.Text())
-	ctx.Assert(store.Get(apiBg, "c-1") == nil, "a quote that is not the text at its offsets was stored: %+v", store.Get(apiBg, "c-1"))
+	ctx.Assert(store.Get(hEndpointBg, "c-1") == nil, "a quote that is not the text at its offsets was stored: %+v", store.Get(hEndpointBg, "c-1"))
 }
 
 func CheckVersionScope(ctx *harness.Ctx) {
-	documents.AddVersion(apiBg, "doc-7", apiV1)
-	documents.AddVersion(apiBg, "doc-7", apiV2)
-	c := api(ctx)
-	r := cite(c, citeBody(nil), "t1", "k-1")
+	documents.AddVersion(hEndpointBg, "doc-7", hEndpointV1)
+	documents.AddVersion(hEndpointBg, "doc-7", hEndpointV2)
+	c := hEndpointAPI(ctx)
+	r := hCite(c, hCiteBody(nil), "t1", "k-1")
 	ctx.Equal(r.Status, 201, "citing version 1 with its own text (300) must succeed: the span resolves in the version the request names, not the newest one (%s)", r.Text())
-	row := store.Get(apiBg, idOf(r))
+	row := store.Get(hEndpointBg, hIDOf(r))
 	ctx.Assert(row != nil && row.Version == 1 && row.Quote == "300", "the citation of version 1 was stored as %+v: version 1 says 300, version 2 says 330", row)
-	r = cite(c, citeBody(map[string]any{"version": 2, "quote": "330"}), "t1", "k-2")
+	r = hCite(c, hCiteBody(map[string]any{"version": 2, "quote": "330"}), "t1", "k-2")
 	ctx.Equal(r.Status, 201, "citing version 2 with its own text (330) (%s)", r.Text())
-	r = cite(c, citeBody(map[string]any{"quote": "330"}), "t1", "k-3")
+	r = hCite(c, hCiteBody(map[string]any{"quote": "330"}), "t1", "k-3")
 	ctx.Equal(r.Status, 422, "quoting version 2's text (330) as version 1 (version 1 says 300)")
+	r = hCite(c, hCiteBody(map[string]any{"version": 3}), "t1", "k-4")
+	ctx.Equal(r.Status, 404, "citing version 3 of a document that has 2 versions (%s)", r.Text())
+	ctx.Equal(len(store.ForAnswer(hEndpointBg, "a-1")), 2, "a citation of an unknown version must not be stored; the citations stored")
 }
 
 func CheckIdempotent(ctx *harness.Ctx) {
-	documents.AddVersion(apiBg, "doc-7", apiV1)
-	c := api(ctx)
-	first := cite(c, citeBody(nil), "t1", "k-1")
-	retry := cite(c, citeBody(nil), "t1", "k-1")
+	documents.AddVersion(hEndpointBg, "doc-7", hEndpointV1)
+	c := hEndpointAPI(ctx)
+	first := hCite(c, hCiteBody(nil), "t1", "k-1")
+	retry := hCite(c, hCiteBody(nil), "t1", "k-1")
 	ctx.Assert(first.Status == 201 && retry.Status == 201, "the first attempt answered %d, the retry %d: %s", first.Status, retry.Status, retry.Text())
-	ctx.Equal(idOf(retry), idOf(first), "a retry with the same Idempotency-Key must answer the citation the first attempt created; the id")
-	ctx.Equal(len(store.ForAnswer(apiBg, "a-1")), 1, "two attempts with one Idempotency-Key; the citations stored")
-	other := cite(c, citeBody(nil), "t2", "k-1")
-	ctx.Assert(other.Status == 201 && idOf(other) != idOf(first), "another tenant's request with the same key answered %d %s: keys are scoped by tenant", other.Status, other.Text())
-	none := cite(c, citeBody(nil), "t1", "")
+	ctx.Equal(hIDOf(retry), hIDOf(first), "a retry with the same Idempotency-Key must answer the citation the first attempt created; the id")
+	ctx.Equal(len(store.ForAnswer(hEndpointBg, "a-1")), 1, "two attempts with one Idempotency-Key; the citations stored")
+	other := hCite(c, hCiteBody(nil), "t2", "k-1")
+	ctx.Assert(other.Status == 201 && hIDOf(other) != hIDOf(first), "another tenant's request with the same key answered %d %s: keys are scoped by tenant", other.Status, other.Text())
+	none := hCite(c, hCiteBody(nil), "t1", "")
 	ctx.Equal(none.Status, 400, "a citation without Idempotency-Key")
 }
 `,
@@ -998,10 +1023,10 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kV1 = "The tower is 300 metres tall and opened in 1889.";
-const std::string kV2 = "The tower is 330 metres tall and opened in 1889.";
+const std::string hEndpointV1 = "The tower is 300 metres tall and opened in 1889.";
+const std::string hEndpointV2 = "The tower is 330 metres tall and opened in 1889.";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hEndpointAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1009,19 +1034,19 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json citeBody(const json& over = json::object()) {
+json hCiteBody(const json& over = json::object()) {
   json body = {{"answer_id", "a-1"}, {"document_id", "doc-7"}, {"version", 1}, {"start", 13}, {"end", 16}, {"quote", "300"}};
   body.update(over);
   return body;
 }
 
-harness::Response cite(harness::HTTP& c, const json& body, const std::string& tenant, const std::string& key) {
+harness::Response hCite(harness::HTTP& c, const json& body, const std::string& tenant, const std::string& key) {
   if (tenant.empty()) return c.Post("/v1/citations", body.dump(), "Content-Type", "application/json", "Idempotency-Key", key);
   if (key.empty()) return c.Post("/v1/citations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant);
   return c.Post("/v1/citations", body.dump(), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-json bodyOf(const harness::Response& r) {
+json hBodyOf(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : json::object();
 }
@@ -1029,70 +1054,78 @@ json bodyOf(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kV1);
-  auto c = api(ctx);
-  const auto r = cite(c, citeBody(), "t1", "k-1");
+  documents::addVersion("doc-7", hEndpointV1);
+  auto c = hEndpointAPI(ctx);
+  const auto r = hCite(c, hCiteBody(), "t1", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/citations (%s)", r.Text());
-  const auto row = store::get(bodyOf(r).value("id", ""));
+  const auto row = store::get(hBodyOf(r).value("id", ""));
   ctx.Assert(row && row->document_id == "doc-7" && row->quote == "300", "the answer %s names no stored citation of doc-7 quoting 300", r.Text());
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kV1);
-  auto c = api(ctx);
-  auto r = cite(c, citeBody(), "", "k-1");
+  documents::addVersion("doc-7", hEndpointV1);
+  auto c = hEndpointAPI(ctx);
+  auto r = hCite(c, hCiteBody(), "", "k-1");
   ctx.Equal(r.Status, 401, "a citation without X-Tenant-Id (a citation belongs to an authenticated tenant)");
   const std::vector<std::pair<std::string, json>> cases = {
       {"version 0", json{{"version", 0}}},
       {"start -1", json{{"start", -1}}},
       {"end equal to start", json{{"end", 13}, {"quote", "3"}}},
       {"an empty document_id", json{{"document_id", ""}}},
+      {"an empty answer_id", json{{"answer_id", ""}}},
+      {"an empty quote", json{{"quote", ""}}},
       {"a quote over 16 KiB", json{{"start", 0}, {"end", 16385}, {"quote", std::string(16385, 'x')}}},
   };
   for (size_t n = 0; n < cases.size(); n++) {
-    r = cite(c, citeBody(cases[n].second), "t1", "k-" + std::to_string(n));
+    r = hCite(c, hCiteBody(cases[n].second), "t1", "k-" + std::to_string(n));
     ctx.Equal(r.Status, 400, "a request with %s", cases[n].first);
   }
   ctx.Assert(!store::get("c-1"), "a rejected request stored a citation");
+  documents::addVersion("doc-big", std::string(16384, 'x'));
+  r = hCite(c, hCiteBody(json{{"document_id", "doc-big"}, {"start", 0}, {"end", 16384}, {"quote", std::string(16384, 'x')}}), "t1", "k-max");
+  ctx.Equal(r.Status, 201, "a quote of exactly kMaxQuoteChars (16384) characters must be accepted, only a longer one is 400 (%s)", r.Text().substr(0, 160));
 }
 
 void CheckSpanMatch(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kV1);
-  auto c = api(ctx);
-  const auto r = cite(c, citeBody(json{{"quote", "301"}}), "t1", "k-1");
+  documents::addVersion("doc-7", hEndpointV1);
+  auto c = hEndpointAPI(ctx);
+  const auto r = hCite(c, hCiteBody(json{{"quote", "301"}}), "t1", "k-1");
   ctx.Equal(r.Status, 422, "quoting 301 where version 1 says 300 (%s)", r.Text());
-  const json b = bodyOf(r);
+  const json b = hBodyOf(r);
   ctx.Assert(b.value("stored", "") == "300" && b.value("supplied", "") == "301", "the 422 must carry both texts, stored 300 and supplied 301, got %s", r.Text());
   ctx.Assert(!store::get("c-1"), "a quote that is not the text at its offsets was stored");
 }
 
 void CheckVersionScope(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kV1);
-  documents::addVersion("doc-7", kV2);
-  auto c = api(ctx);
-  auto r = cite(c, citeBody(), "t1", "k-1");
+  documents::addVersion("doc-7", hEndpointV1);
+  documents::addVersion("doc-7", hEndpointV2);
+  auto c = hEndpointAPI(ctx);
+  auto r = hCite(c, hCiteBody(), "t1", "k-1");
   ctx.Equal(r.Status, 201, "citing version 1 with its own text (300) must succeed: the span resolves in the version the request names, not the newest one (%s)", r.Text());
-  const auto row = store::get(bodyOf(r).value("id", ""));
+  const auto row = store::get(hBodyOf(r).value("id", ""));
   ctx.Assert(row && row->version == 1 && row->quote == "300", "the citation of version 1 was stored as version %d quoting %q: version 1 says 300, version 2 says 330",
              row ? row->version : 0L, row ? row->quote : "");
-  r = cite(c, citeBody(json{{"version", 2}, {"quote", "330"}}), "t1", "k-2");
+  r = hCite(c, hCiteBody(json{{"version", 2}, {"quote", "330"}}), "t1", "k-2");
   ctx.Equal(r.Status, 201, "citing version 2 with its own text (330) (%s)", r.Text());
-  r = cite(c, citeBody(json{{"quote", "330"}}), "t1", "k-3");
+  r = hCite(c, hCiteBody(json{{"quote", "330"}}), "t1", "k-3");
   ctx.Equal(r.Status, 422, "quoting version 2's text (330) as version 1 (version 1 says 300)");
+  r = hCite(c, hCiteBody(json{{"version", 3}}), "t1", "k-4");
+  ctx.Equal(r.Status, 404, "citing version 3 of a document that has 2 versions (%s)", r.Text());
+  ctx.Equal(store::forAnswer("a-1").size(), 2, "a citation of an unknown version must not be stored; the citations stored");
 }
 
 void CheckIdempotent(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kV1);
-  auto c = api(ctx);
-  const auto first = cite(c, citeBody(), "t1", "k-1");
-  const auto retry = cite(c, citeBody(), "t1", "k-1");
+  documents::addVersion("doc-7", hEndpointV1);
+  auto c = hEndpointAPI(ctx);
+  const auto first = hCite(c, hCiteBody(), "t1", "k-1");
+  const auto retry = hCite(c, hCiteBody(), "t1", "k-1");
   ctx.Assert(first.Status == 201 && retry.Status == 201, "the first attempt answered %d, the retry %d: %s", first.Status, retry.Status, retry.Text());
-  ctx.Equal(bodyOf(retry).value("id", ""), bodyOf(first).value("id", ""), "a retry with the same Idempotency-Key must answer the citation the first attempt created; the id");
+  ctx.Equal(hBodyOf(retry).value("id", ""), hBodyOf(first).value("id", ""), "a retry with the same Idempotency-Key must answer the citation the first attempt created; the id");
   ctx.Equal(store::forAnswer("a-1").size(), 1, "two attempts with one Idempotency-Key; the citations stored");
-  const auto other = cite(c, citeBody(), "t2", "k-1");
-  ctx.Assert(other.Status == 201 && bodyOf(other).value("id", "") != bodyOf(first).value("id", ""), "another tenant's request with the same key answered %d %s: keys are scoped by tenant",
+  const auto other = hCite(c, hCiteBody(), "t2", "k-1");
+  ctx.Assert(other.Status == 201 && hBodyOf(other).value("id", "") != hBodyOf(first).value("id", ""), "another tenant's request with the same key answered %d %s: keys are scoped by tenant",
              other.Status, other.Text());
-  const auto none = cite(c, citeBody(), "t1", "");
+  const auto none = hCite(c, hCiteBody(), "t1", "");
   ctx.Equal(none.Status, 400, "a citation without Idempotency-Key");
 }
 `,

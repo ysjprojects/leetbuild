@@ -23,13 +23,14 @@ from the batch; and a quote that moved by one sentence in the new version is rep
 service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }  // NOT_FOUND: deleted
 \`\`\`
 
-- Every call carries a **\`DEADLINE_S\` = 1 s** deadline.
+- Every call, each retry included, carries its own **\`DEADLINE_S\` = 1 s** deadline.
 - Only \`UNAVAILABLE\` and \`DEADLINE_EXCEEDED\` (\`RETRYABLE\`) are retried, at most
-  \`MAX_ATTEMPTS\` = 3 calls; \`NOT_FOUND\` is answered at once.
+  \`MAX_ATTEMPTS\` = 3 calls; \`NOT_FOUND\` and every other code are answered at once.
 - A citation that cannot be checked comes back: \`NOT_FOUND\` is \`broken\` with reason
-  \`document_gone\`, a store that did not answer leaves it \`pending\` with \`docstore_unavailable\`.
-- \`reanchor\`: a quote still at its offsets, or found elsewhere in the current text, is \`verified\`
-  with the current version and its offsets; a quote that is gone is \`broken\`, \`span_moved\`.`,
+  \`document_gone\`, any other failure leaves it \`pending\` with \`docstore_unavailable\`.
+- \`reanchor\`: a quote still at its offsets (they win, even when the quote also appears earlier),
+  or else found elsewhere in the current text, is \`verified\` with the current version and its
+  offsets; a quote that is gone is \`broken\`, \`span_moved\`.`,
   sequence: {
     participants: ['Verifier', 'Document store'],
     messages: [
@@ -61,7 +62,7 @@ service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }
       id: 'deadline',
       title: 'Every fetch carries a 1-second deadline',
       detail:
-        'Each `GetCurrent` call is made with `DEADLINE_S` (1 s), so a store that does not answer costs at most three seconds and leaves the citation pending. The starter calls with no deadline.',
+        'Each `GetCurrent` call, each retry included, is made with its own `DEADLINE_S` (1 s), so a store that does not answer is asked three times, costs about three seconds and leaves the citation pending. The starter calls with no deadline.',
       match: {
         python: {all: [/DEADLINE_S\s*=\s*1(\.0)?\b/, /GetCurrent\([\s\S]{0,160}?timeout\s*=\s*DEADLINE_S/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*1_?000\b/, /GetCurrent\([\s\S]{0,200}?deadline:[^\n]*DEADLINE_MS/]},
@@ -74,7 +75,7 @@ service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }
       id: 'not-found-terminal',
       title: 'Only retryable codes are retried, three calls at most',
       detail:
-        '`UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried up to `MAX_ATTEMPTS` = 3 calls; `NOT_FOUND` is answered after one call, since asking again cannot bring a deleted document back. The starter retries everything five times.',
+        '`UNAVAILABLE` and `DEADLINE_EXCEEDED` are retried up to `MAX_ATTEMPTS` = 3 calls; `NOT_FOUND`, `INTERNAL`, `PERMISSION_DENIED` and every other code are answered after one call, since asking again cannot change them. The starter retries everything five times.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /\bin RETRYABLE\b/], none: [/range\(\s*5\s*\)/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /RETRYABLE\.(has|includes)\(/], none: [/attempt\s*<\s*5\b/]},
@@ -100,7 +101,7 @@ service DocumentStore { rpc GetCurrent(DocumentRef) returns (DocumentVersion); }
       id: 'reanchor',
       title: 'A moved quote is re-anchored in the current version',
       detail:
-        '`reanchor` keeps the offsets when the quote is still there, else searches the current text for it: found, the citation is `verified` at the new offsets and version; gone, it is `broken` with `span_moved`. The starter only looks at the old offsets.',
+        '`reanchor` keeps the offsets when the quote is still there, even if it also appears earlier, else searches the current text for it: found, the citation is `verified` at the new offsets and version; gone, it is `broken` with `span_moved`. The starter only looks at the old offsets.',
       match: {
         python: {all: [/def reanchor\(/, /\.find\(/, /["']span_moved["']/]},
         typescript: {all: [/function reanchor\(/, /\.indexOf\(/, /['"]span_moved['"]/]},
@@ -791,11 +792,17 @@ def check_deadline(ctx):
         assert call.timeout is not None, "a GetCurrent call carries no deadline: a document store that stops answering holds the verifier forever"
         assert 0.5 <= call.timeout <= 1.5, f"a GetCurrent call carries a {call.timeout} s deadline, expected DEADLINE_S = 1"
     ctx.grpc.set_latency("GetCurrent", 30.0)
+    healthy = _calls(ctx)
     before = ctx.clock.time()
     result = m.verify(_citation())
     waited = ctx.clock.time() - before
     assert waited <= 4, f"verify waited {waited:.0f} s for a document store that does not answer: each of the 3 attempts has a 1 s deadline"
     assert result is not None and result["status"] == "pending" and result["reason"] == "docstore_unavailable", f"a document store that does not answer must leave the citation pending with reason docstore_unavailable, got {result}"
+    slow = ctx.grpc.calls_to("GetCurrent")[healthy:]
+    assert len(slow) == 3, f"a document store that never answers within the deadline was asked {len(slow)} times, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retryable"
+    timeouts = [call.timeout for call in slow]
+    assert all(t is not None and 0.5 <= t <= 1.5 for t in timeouts), f"the 3 attempts carried deadlines of {timeouts} s: every attempt gets its own DEADLINE_S, not what is left of the first one's"
+    assert waited >= 2.5, f"3 attempts that each time out after 1 s took {waited:.1f} s in total, expected about 3: every attempt waits its own full deadline"
 
 
 def check_not_found_terminal(ctx):
@@ -809,6 +816,13 @@ def check_not_found_terminal(ctx):
     ctx.grpc.fail("GetCurrent", grpc.StatusCode.UNAVAILABLE, times=10)
     m.verify(_citation())
     assert _calls(ctx) == 7, f"a document store that stays UNAVAILABLE was asked {_calls(ctx) - 4} times for one citation, expected MAX_ATTEMPTS = 3"
+    ctx.grpc.failures.clear()
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.PERMISSION_DENIED, grpc.StatusCode.INVALID_ARGUMENT):
+        before = _calls(ctx)
+        ctx.grpc.fail("GetCurrent", code, times=1)
+        result = m.verify(_citation())
+        assert _calls(ctx) - before == 1, f"one {code.name} answer took {_calls(ctx) - before} calls: only UNAVAILABLE and DEADLINE_EXCEEDED are retried"
+        assert result["status"] == "pending" and result["reason"] == "docstore_unavailable", f"a {code.name} answer must leave the citation pending with reason docstore_unavailable, got {result}"
 
 
 def check_broken_kept(ctx):
@@ -833,6 +847,10 @@ def check_reanchor(ctx):
     gone = m.verify(_citation())
     assert gone is not None and gone["status"] == "broken" and gone["reason"] == "span_moved", f"the quote is gone from version 3 and verify gave {gone}, expected broken with reason span_moved"
     assert (gone["version"], gone["start"], gone["end"]) == (1, 4, 12), f"a broken citation keeps the version and offsets it was recorded at, got {gone}"
+    docs.docs["doc-7"] = (4, "Ada wrote; a wrote the first program.")
+    twice = m.verify({**_citation(), "start": 13, "end": 18, "quote": "wrote"})
+    got = (twice["version"], twice["start"], twice["end"], twice["status"])
+    assert got == (4, 13, 18, "verified"), f"'wrote' is still at [13, 18) in version 4 and also earlier at 4, and verify gave version {got[0]} [{got[1]}, {got[2]}) {got[3]}: the old offsets win when they still hold, so a repeated quote does not jump"
 `,
     typescript: `const TEXT = 'Ada Lovelace wrote the first program.';
 
@@ -876,11 +894,17 @@ export async function check_deadline(ctx) {
     assert(0.5 <= call.timeout && call.timeout <= 1.5, \`a GetCurrent call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 1000\`);
   }
   ctx.grpc.setLatency('GetCurrent', 30.0);
+  const healthy = calls(ctx);
   const before = ctx.clock.now();
   result = await m.verify(citation());
   const waited = (ctx.clock.now() - before) / 1000;
   assert(waited <= 4, \`verify waited \${waited.toFixed(0)} s for a document store that does not answer: each of the 3 attempts has a 1 s deadline\`);
   assert(result !== null && result.status === 'pending' && result.reason === 'docstore_unavailable', \`a document store that does not answer must leave the citation pending with reason docstore_unavailable, got \${JSON.stringify(result)}\`);
+  const slow = ctx.grpc.callsTo('GetCurrent').slice(healthy);
+  assert.equal(slow.length, 3, \`a document store that never answers within the deadline was asked \${slow.length} times, expected MAX_ATTEMPTS = 3: DEADLINE_EXCEEDED is retryable\`);
+  const timeouts = slow.map(call => call.timeout);
+  assert(timeouts.every(t => t !== null && 0.5 <= t && t <= 1.5), \`the 3 attempts carried deadlines of \${JSON.stringify(timeouts)} s: every attempt gets its own DEADLINE_MS, not what is left of the first one's\`);
+  assert(waited >= 2.5, \`3 attempts that each time out after 1 s took \${waited.toFixed(1)} s in total, expected about 3: every attempt waits its own full deadline\`);
 }
 
 export async function check_not_found_terminal(ctx) {
@@ -894,6 +918,14 @@ export async function check_not_found_terminal(ctx) {
   ctx.grpc.fail('GetCurrent', ctx.grpc.status.UNAVAILABLE, '', 10);
   await m.verify(citation());
   assert.equal(calls(ctx), 7, \`a document store that stays UNAVAILABLE was asked \${calls(ctx) - 4} times for one citation, expected MAX_ATTEMPTS = 3\`);
+  ctx.grpc.clearFailures();
+  for (const name of ['INTERNAL', 'PERMISSION_DENIED', 'INVALID_ARGUMENT']) {
+    const start = calls(ctx);
+    ctx.grpc.fail('GetCurrent', ctx.grpc.status[name], '', 1);
+    const failed = await m.verify(citation());
+    assert.equal(calls(ctx) - start, 1, \`one \${name} answer took \${calls(ctx) - start} calls: only UNAVAILABLE and DEADLINE_EXCEEDED are retried\`);
+    assert(failed.status === 'pending' && failed.reason === 'docstore_unavailable', \`a \${name} answer must leave the citation pending with reason docstore_unavailable, got \${JSON.stringify(failed)}\`);
+  }
 }
 
 export async function check_broken_kept(ctx) {
@@ -917,6 +949,10 @@ export async function check_reanchor(ctx) {
   const gone = await m.verify(citation());
   assert(gone !== null && gone.status === 'broken' && gone.reason === 'span_moved', \`the quote is gone from version 3 and verify gave \${JSON.stringify(gone)}, expected broken with reason span_moved\`);
   assert.deepStrictEqual([gone.version, gone.start, gone.end], [1, 4, 12], \`a broken citation keeps the version and offsets it was recorded at, got \${JSON.stringify(gone)}\`);
+  docs.set('doc-7', [4, 'Ada wrote; a wrote the first program.']);
+  const twice = await m.verify({...citation(), start: 13, end: 18, quote: 'wrote'});
+  const got = [twice.version, twice.start, twice.end, twice.status];
+  assert.deepStrictEqual(got, [4, 13, 18, 'verified'], \`'wrote' is still at [13, 18) in version 4 and also earlier at 4, and verify gave \${JSON.stringify(got)}: the old offsets win when they still hold, so a repeated quote does not jump\`);
 }
 `,
     go: `package main
@@ -935,21 +971,21 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-type docEntry struct {
+type hDocEntry struct {
 	version int64
 	text    string
 	down    bool
 }
 
-// docPeer answers the current version of each document in docs; a down entry is a shard that does not answer, a missing id was deleted.
-type docPeer struct {
+// hDocPeer answers the current version of each document in docs; a down entry is a shard that does not answer, a missing id was deleted.
+type hDocPeer struct {
 	pb.UnimplementedDocumentStoreServer
-	docs map[string]docEntry
+	docs map[string]hDocEntry
 }
 
-func (p *docPeer) GetCurrent(_ context.Context, req *pb.DocumentRef) (*pb.DocumentVersion, error) {
+func (p *hDocPeer) GetCurrent(_ context.Context, req *pb.DocumentRef) (*pb.DocumentVersion, error) {
 	entry, ok := p.docs[req.GetDocumentId()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "document %s was deleted", req.GetDocumentId())
@@ -960,51 +996,70 @@ func (p *docPeer) GetCurrent(_ context.Context, req *pb.DocumentRef) (*pb.Docume
 	return &pb.DocumentVersion{DocumentId: req.GetDocumentId(), Version: entry.version, Text: entry.text}, nil
 }
 
-func docClient(ctx *harness.Ctx) *docPeer {
-	peer := &docPeer{docs: map[string]docEntry{"doc-7": {version: 1, text: "Ada Lovelace wrote the first program."}}}
+func hDocClient(ctx *harness.Ctx) *hDocPeer {
+	peer := &hDocPeer{docs: map[string]hDocEntry{"doc-7": {version: 1, text: "Ada Lovelace wrote the first program."}}}
 	pb.RegisterDocumentStoreServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func citationOf(n int, documentID string) store.Citation {
+func hCitationOf(n int, documentID string) store.Citation {
 	return store.Citation{ID: fmt.Sprintf("c-%d", n), Tenant: "t1", AnswerID: "a-1", DocumentID: documentID, Version: 1, Start: 4, End: 12, Quote: "Lovelace", Status: "pending"}
 }
 
-func docCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("GetCurrent", "")) }
+func hDocCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("GetCurrent", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	docClient(ctx)
-	result := verify(clientBg, citationOf(1, "doc-7"))
+	hDocClient(ctx)
+	result := verify(hClientBg, hCitationOf(1, "doc-7"))
 	ctx.Assert(result != nil && result.Status == "verified", "with the document store healthy verify gave %+v", result)
 	for _, call := range ctx.GRPC.CallsTo("GetCurrent", "") {
 		ctx.Assert(call.HasDeadline(), "a GetCurrent call carries no deadline: a document store that stops answering holds the verifier forever")
 		ctx.Assert(500*time.Millisecond <= call.Timeout && call.Timeout <= 1500*time.Millisecond, "a GetCurrent call carries a %v deadline, expected 1 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("GetCurrent", 30.0, "")
+	healthy := hDocCalls(ctx)
 	before := ctx.Clock.Now()
-	result = verify(clientBg, citationOf(1, "doc-7"))
+	result = verify(hClientBg, hCitationOf(1, "doc-7"))
 	waited := float64(ctx.Clock.Now()-before) / 1000
 	ctx.Assert(waited <= 4, "verify waited %.0f s for a document store that does not answer: each of the 3 attempts has a 1 s deadline", waited)
 	ctx.Assert(result != nil && result.Status == "pending" && result.Reason == "docstore_unavailable", "a document store that does not answer must leave the citation pending with reason docstore_unavailable, got %+v", result)
+	slow := ctx.GRPC.CallsTo("GetCurrent", "")[healthy:]
+	ctx.Equal(len(slow), 3, "a document store that never answers within the deadline must be asked maxAttempts = 3 times (DEADLINE_EXCEEDED is retryable); the calls")
+	timeouts := []time.Duration{}
+	for _, call := range slow {
+		timeouts = append(timeouts, call.Timeout)
+	}
+	for _, call := range slow {
+		ctx.Assert(call.HasDeadline() && 500*time.Millisecond <= call.Timeout && call.Timeout <= 1500*time.Millisecond, "the 3 attempts carried deadlines of %v: every attempt gets its own 1 s deadline, not what is left of the first one's", timeouts)
+	}
+	ctx.Assert(waited >= 2.5, "3 attempts that each time out after 1 s took %.1f s in total, expected about 3: every attempt waits its own full deadline", waited)
 }
 
 func CheckNotFoundTerminal(ctx *harness.Ctx) {
-	docClient(ctx)
-	verify(clientBg, citationOf(1, "doc-gone"))
-	ctx.Equal(docCalls(ctx), 1, "a deleted document (NOT_FOUND) must be asked for once: NOT_FOUND is terminal, asking again cannot bring it back; the calls")
+	hDocClient(ctx)
+	verify(hClientBg, hCitationOf(1, "doc-gone"))
+	ctx.Equal(hDocCalls(ctx), 1, "a deleted document (NOT_FOUND) must be asked for once: NOT_FOUND is terminal, asking again cannot bring it back; the calls")
 	ctx.GRPC.Fail("GetCurrent", codes.Unavailable, "", 2, "")
-	result := verify(clientBg, citationOf(1, "doc-7"))
-	ctx.Equal(docCalls(ctx)-1, 3, "two UNAVAILABLE answers then a healthy one must take 3 calls (UNAVAILABLE is retried up to maxAttempts); the calls")
+	result := verify(hClientBg, hCitationOf(1, "doc-7"))
+	ctx.Equal(hDocCalls(ctx)-1, 3, "two UNAVAILABLE answers then a healthy one must take 3 calls (UNAVAILABLE is retried up to maxAttempts); the calls")
 	ctx.Assert(result != nil && result.Status == "verified", "the third attempt answered and verify gave %+v", result)
 	ctx.GRPC.Fail("GetCurrent", codes.Unavailable, "", 10, "")
-	verify(clientBg, citationOf(1, "doc-7"))
-	ctx.Equal(docCalls(ctx)-4, 3, "a document store that stays UNAVAILABLE must be asked maxAttempts = 3 times for one citation; the calls")
+	verify(hClientBg, hCitationOf(1, "doc-7"))
+	ctx.Equal(hDocCalls(ctx)-4, 3, "a document store that stays UNAVAILABLE must be asked maxAttempts = 3 times for one citation; the calls")
+	ctx.GRPC.ClearFailures()
+	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.InvalidArgument} {
+		start := hDocCalls(ctx)
+		ctx.GRPC.Fail("GetCurrent", code, "", 1, "")
+		failed := verify(hClientBg, hCitationOf(1, "doc-7"))
+		ctx.Equal(hDocCalls(ctx)-start, 1, "one %v answer must take one call (only UNAVAILABLE and DEADLINE_EXCEEDED are retried); the calls", code)
+		ctx.Assert(failed != nil && failed.Status == "pending" && failed.Reason == "docstore_unavailable", "a %v answer must leave the citation pending with reason docstore_unavailable, got %+v", code, failed)
+	}
 }
 
 func CheckBrokenKept(ctx *harness.Ctx) {
-	peer := docClient(ctx)
-	peer.docs["doc-9"] = docEntry{down: true}
-	results := verifyBatch(clientBg, []store.Citation{citationOf(1, "doc-7"), citationOf(2, "doc-gone"), citationOf(3, "doc-9")})
+	peer := hDocClient(ctx)
+	peer.docs["doc-9"] = hDocEntry{down: true}
+	results := verifyBatch(hClientBg, []store.Citation{hCitationOf(1, "doc-7"), hCitationOf(2, "doc-gone"), hCitationOf(3, "doc-9")})
 	ids := []string{}
 	for _, r := range results {
 		ids = append(ids, r.ID)
@@ -1016,15 +1071,21 @@ func CheckBrokenKept(ctx *harness.Ctx) {
 }
 
 func CheckReanchor(ctx *harness.Ctx) {
-	peer := docClient(ctx)
-	peer.docs["doc-7"] = docEntry{version: 2, text: "In 1843 Ada Lovelace wrote the first program."}
-	moved := verify(clientBg, citationOf(1, "doc-7"))
+	peer := hDocClient(ctx)
+	peer.docs["doc-7"] = hDocEntry{version: 2, text: "In 1843 Ada Lovelace wrote the first program."}
+	moved := verify(hClientBg, hCitationOf(1, "doc-7"))
 	ctx.Assert(moved != nil && moved.Status == "verified", "Lovelace moved to offset 12 in version 2 and verify gave %+v: search the current text for the quote", moved)
 	ctx.Equal([]int{moved.Version, moved.Start, moved.End}, []int{2, 12, 20}, "the re-anchored citation's version, start and end")
-	peer.docs["doc-7"] = docEntry{version: 3, text: "Ada wrote the first program."}
-	gone := verify(clientBg, citationOf(1, "doc-7"))
+	peer.docs["doc-7"] = hDocEntry{version: 3, text: "Ada wrote the first program."}
+	gone := verify(hClientBg, hCitationOf(1, "doc-7"))
 	ctx.Assert(gone != nil && gone.Status == "broken" && gone.Reason == "span_moved", "the quote is gone from version 3 and verify gave %+v, expected broken with reason span_moved", gone)
 	ctx.Equal([]int{gone.Version, gone.Start, gone.End}, []int{1, 4, 12}, "a broken citation keeps the version and offsets it was recorded at; its version, start and end")
+	peer.docs["doc-7"] = hDocEntry{version: 4, text: "Ada wrote; a wrote the first program."}
+	repeated := hCitationOf(1, "doc-7")
+	repeated.Start, repeated.End, repeated.Quote = 13, 18, "wrote"
+	twice := verify(hClientBg, repeated)
+	ctx.Assert(twice != nil && twice.Status == "verified", "'wrote' is still at [13, 18) in version 4 and verify gave %+v", twice)
+	ctx.Equal([]int{twice.Version, twice.Start, twice.End}, []int{4, 13, 18}, "'wrote' is still at [13, 18) in version 4 and also earlier at 4: the old offsets win when they still hold, so a repeated quote does not jump; the version, start and end")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1038,16 +1099,16 @@ func CheckReanchor(ctx *harness.Ctx) {
 
 namespace {
 
-struct DocEntry {
+struct HDocEntry {
   long version = 0;
   std::string text;
   bool down = false;
 };
 
 // The current version of each document in docs; a down entry is a shard that does not answer, a missing id was deleted.
-class DocPeer final : public citationstore::DocumentStore::Service {
+class HDocPeer final : public citationstore::DocumentStore::Service {
  public:
-  std::map<std::string, DocEntry> docs;
+  std::map<std::string, HDocEntry> docs;
   grpc::Status GetCurrent(grpc::ServerContext*, const citationstore::DocumentRef* req, citationstore::DocumentVersion* out) override {
     const auto it = docs.find(req->document_id());
     if (it == docs.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "document " + req->document_id() + " was deleted");
@@ -1059,60 +1120,81 @@ class DocPeer final : public citationstore::DocumentStore::Service {
   }
 };
 
-DocPeer& docClient(harness::Ctx& ctx) {
-  static DocPeer* peer = nullptr;
+HDocPeer& hDocClient(harness::Ctx& ctx) {
+  static HDocPeer* peer = nullptr;
   delete peer;
-  peer = new DocPeer;
-  peer->docs["doc-7"] = DocEntry{1, "Ada Lovelace wrote the first program.", false};
+  peer = new HDocPeer;
+  peer->docs["doc-7"] = HDocEntry{1, "Ada Lovelace wrote the first program.", false};
   ctx.GRPC.Server("")->RegisterService(peer);
   return *peer;
 }
 
-store::Citation citationOf(int n, const std::string& document_id) {
+store::Citation hCitationOf(int n, const std::string& document_id) {
   return store::Citation{"c-" + std::to_string(n), "t1", "a-1", document_id, 1, 4, 12, "Lovelace", "pending", ""};
 }
 
-size_t docCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetCurrent").size(); }
+size_t hDocCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetCurrent").size(); }
 
-std::string show(const std::optional<store::Citation>& c) {
+std::string hShow(const std::optional<store::Citation>& c) {
   return c ? store::toJson(*c).dump() : std::string("none");
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  docClient(ctx);
-  auto result = verify(citationOf(1, "doc-7"));
-  ctx.Assert(result && result->status == "verified", "with the document store healthy verify gave %s", show(result));
+  hDocClient(ctx);
+  auto result = verify(hCitationOf(1, "doc-7"));
+  ctx.Assert(result && result->status == "verified", "with the document store healthy verify gave %s", hShow(result));
   for (const auto& call : ctx.GRPC.CallsTo("GetCurrent")) {
     ctx.Assert(call.HasDeadline(), "a GetCurrent call carries no deadline: a document store that stops answering holds the verifier forever");
     ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.5, "a GetCurrent call carries a %v s deadline, expected kDeadline = 1 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("GetCurrent", 30.0);
+  const size_t healthy = hDocCalls(ctx);
   const int64_t before = ctx.Clock.Now();
-  result = verify(citationOf(1, "doc-7"));
+  result = verify(hCitationOf(1, "doc-7"));
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
   ctx.Assert(waited <= 4, "verify waited %.0f s for a document store that does not answer: each of the 3 attempts has a 1 s deadline", waited);
-  ctx.Assert(result && result->status == "pending" && result->reason == "docstore_unavailable", "a document store that does not answer must leave the citation pending with reason docstore_unavailable, got %s", show(result));
+  ctx.Assert(result && result->status == "pending" && result->reason == "docstore_unavailable", "a document store that does not answer must leave the citation pending with reason docstore_unavailable, got %s", hShow(result));
+  const auto all = ctx.GRPC.CallsTo("GetCurrent");
+  ctx.Equal(all.size() - healthy, 3, "a document store that never answers within the deadline must be asked kMaxAttempts = 3 times (DEADLINE_EXCEEDED is retryable); the calls");
+  std::string timeouts;
+  bool own = true;
+  for (size_t i = healthy; i < all.size(); i++) {
+    timeouts += (timeouts.empty() ? "" : ", ") + (all[i].HasDeadline() ? std::to_string(all[i].TimeoutSeconds()) : std::string("none"));
+    own = own && all[i].HasDeadline() && 0.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 1.5;
+  }
+  ctx.Assert(own, "the 3 attempts carried deadlines of [%s] s: every attempt gets its own kDeadline, not what is left of the first one's", timeouts);
+  ctx.Assert(waited >= 2.5, "3 attempts that each time out after 1 s took %.1f s in total, expected about 3: every attempt waits its own full deadline", waited);
 }
 
 void CheckNotFoundTerminal(harness::Ctx& ctx) {
-  docClient(ctx);
-  verify(citationOf(1, "doc-gone"));
-  ctx.Equal(docCalls(ctx), 1, "a deleted document (NOT_FOUND) must be asked for once: NOT_FOUND is terminal, asking again cannot bring it back; the calls");
+  hDocClient(ctx);
+  verify(hCitationOf(1, "doc-gone"));
+  ctx.Equal(hDocCalls(ctx), 1, "a deleted document (NOT_FOUND) must be asked for once: NOT_FOUND is terminal, asking again cannot bring it back; the calls");
   ctx.GRPC.Fail("GetCurrent", grpc::StatusCode::UNAVAILABLE, "", 2);
-  const auto result = verify(citationOf(1, "doc-7"));
-  ctx.Equal(docCalls(ctx) - 1, 3, "two UNAVAILABLE answers then a healthy one must take 3 calls (UNAVAILABLE is retried up to kMaxAttempts); the calls");
-  ctx.Assert(result && result->status == "verified", "the third attempt answered and verify gave %s", show(result));
+  const auto result = verify(hCitationOf(1, "doc-7"));
+  ctx.Equal(hDocCalls(ctx) - 1, 3, "two UNAVAILABLE answers then a healthy one must take 3 calls (UNAVAILABLE is retried up to kMaxAttempts); the calls");
+  ctx.Assert(result && result->status == "verified", "the third attempt answered and verify gave %s", hShow(result));
   ctx.GRPC.Fail("GetCurrent", grpc::StatusCode::UNAVAILABLE, "", 10);
-  verify(citationOf(1, "doc-7"));
-  ctx.Equal(docCalls(ctx) - 4, 3, "a document store that stays UNAVAILABLE must be asked kMaxAttempts = 3 times for one citation; the calls");
+  verify(hCitationOf(1, "doc-7"));
+  ctx.Equal(hDocCalls(ctx) - 4, 3, "a document store that stays UNAVAILABLE must be asked kMaxAttempts = 3 times for one citation; the calls");
+  ctx.GRPC.ClearFailures();
+  const std::vector<std::pair<std::string, grpc::StatusCode>> terminal = {
+      {"INTERNAL", grpc::StatusCode::INTERNAL}, {"PERMISSION_DENIED", grpc::StatusCode::PERMISSION_DENIED}, {"INVALID_ARGUMENT", grpc::StatusCode::INVALID_ARGUMENT}};
+  for (const auto& [name, code] : terminal) {
+    const size_t start = hDocCalls(ctx);
+    ctx.GRPC.Fail("GetCurrent", code, "", 1);
+    const auto failed = verify(hCitationOf(1, "doc-7"));
+    ctx.Equal(hDocCalls(ctx) - start, 1, "one %s answer must take one call (only UNAVAILABLE and DEADLINE_EXCEEDED are retried); the calls", name);
+    ctx.Assert(failed && failed->status == "pending" && failed->reason == "docstore_unavailable", "a %s answer must leave the citation pending with reason docstore_unavailable, got %s", name, hShow(failed));
+  }
 }
 
 void CheckBrokenKept(harness::Ctx& ctx) {
-  DocPeer& peer = docClient(ctx);
-  peer.docs["doc-9"] = DocEntry{0, "", true};
-  const auto results = verifyBatch({citationOf(1, "doc-7"), citationOf(2, "doc-gone"), citationOf(3, "doc-9")});
+  HDocPeer& peer = hDocClient(ctx);
+  peer.docs["doc-9"] = HDocEntry{0, "", true};
+  const auto results = verifyBatch({hCitationOf(1, "doc-7"), hCitationOf(2, "doc-gone"), hCitationOf(3, "doc-9")});
   std::vector<std::string> ids;
   for (const auto& r : results) ids.push_back(r.id);
   ctx.Equal(ids, {"c-1", "c-2", "c-3"}, "verifyBatch of c-1, c-2, c-3: a citation that could not be checked is still one of the answer's citations and must come back saying why; the ids");
@@ -1122,15 +1204,24 @@ void CheckBrokenKept(harness::Ctx& ctx) {
 }
 
 void CheckReanchor(harness::Ctx& ctx) {
-  DocPeer& peer = docClient(ctx);
-  peer.docs["doc-7"] = DocEntry{2, "In 1843 Ada Lovelace wrote the first program.", false};
-  const auto moved = verify(citationOf(1, "doc-7"));
-  ctx.Assert(moved && moved->status == "verified", "Lovelace moved to offset 12 in version 2 and verify gave %s: search the current text for the quote", show(moved));
+  HDocPeer& peer = hDocClient(ctx);
+  peer.docs["doc-7"] = HDocEntry{2, "In 1843 Ada Lovelace wrote the first program.", false};
+  const auto moved = verify(hCitationOf(1, "doc-7"));
+  ctx.Assert(moved && moved->status == "verified", "Lovelace moved to offset 12 in version 2 and verify gave %s: search the current text for the quote", hShow(moved));
   ctx.Equal(std::vector<long>{moved->version, moved->start, moved->end}, std::vector<long>{2, 12, 20}, "the re-anchored citation's version, start and end");
-  peer.docs["doc-7"] = DocEntry{3, "Ada wrote the first program.", false};
-  const auto gone = verify(citationOf(1, "doc-7"));
-  ctx.Assert(gone && gone->status == "broken" && gone->reason == "span_moved", "the quote is gone from version 3 and verify gave %s, expected broken with reason span_moved", show(gone));
+  peer.docs["doc-7"] = HDocEntry{3, "Ada wrote the first program.", false};
+  const auto gone = verify(hCitationOf(1, "doc-7"));
+  ctx.Assert(gone && gone->status == "broken" && gone->reason == "span_moved", "the quote is gone from version 3 and verify gave %s, expected broken with reason span_moved", hShow(gone));
   ctx.Equal(std::vector<long>{gone->version, gone->start, gone->end}, std::vector<long>{1, 4, 12}, "a broken citation keeps the version and offsets it was recorded at; its version, start and end");
+  peer.docs["doc-7"] = HDocEntry{4, "Ada wrote; a wrote the first program.", false};
+  store::Citation repeated = hCitationOf(1, "doc-7");
+  repeated.start = 13;
+  repeated.end = 18;
+  repeated.quote = "wrote";
+  const auto twice = verify(repeated);
+  ctx.Assert(twice && twice->status == "verified", "'wrote' is still at [13, 18) in version 4 and verify gave %s", hShow(twice));
+  ctx.Equal(std::vector<long>{twice->version, twice->start, twice->end}, std::vector<long>{4, 13, 18},
+            "'wrote' is still at [13, 18) in version 4 and also earlier at 4: the old offsets win when they still hold, so a repeated quote does not jump; the version, start and end");
 }
 `,
   },

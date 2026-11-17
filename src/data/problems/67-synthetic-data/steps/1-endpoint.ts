@@ -95,7 +95,7 @@ key a client retry starts a second expansion.
       id: 'idempotency-key',
       title: 'Keys job submits by (tenant, Idempotency-Key)',
       detail:
-        'Idempotency-Key is required (400 without it); a replay of the same (tenant, key) answers 200 with the same job_id and queues nothing new; another tenant with the same key gets its own job. The starter stores the job under its own fresh id, so every retry starts another expansion.',
+        'Idempotency-Key is required (400 without it or with an empty one, nothing queued or stored); a replay of the same (tenant, key) answers 200 with the stored job and queues nothing new; another tenant with the same key gets its own job. The starter stores the job under its own fresh id, so every retry starts another expansion.',
       match: {
         python: {all: [/Idempotency-Key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
         typescript: {all: [/idempotency-key/, /store\.get\(\s*tenant\s*,/, /store\.put\(\s*tenant\s*,\s*idem/]},
@@ -802,11 +802,15 @@ async def check_idempotency_key(ctx):
     async with _api(ctx) as c:
         r = await _post(c, GOOD, with_key=False)
         assert r.status_code == 400, f"a submit without Idempotency-Key answered {r.status_code}, expected 400"
+        r = await _post(c, GOOD, key="")
+        assert r.status_code == 400, f"a submit with an empty Idempotency-Key answered {r.status_code}, expected 400: an empty key is no key"
+        _nothing_left(ctx, "the submits without a usable Idempotency-Key were refused")
         first = await _post(c, GOOD, key="k-7")
         assert first.status_code == 201, f"the first submit answered {first.status_code}: {first.text}"
         replay = await _post(c, GOOD, key="k-7")
         assert replay.status_code == 200, f"a replay of the same (tenant, Idempotency-Key) answered {replay.status_code}, expected 200 with the stored job (the client retried; it must not start a second expansion)"
         assert replay.json()["job_id"] == first.json()["job_id"], f"the replay must resume the same job: got {replay.json()['job_id']}, the first submit made {first.json()['job_id']}"
+        assert {k: replay.json().get(k) for k in FIELDS} == {k: first.json()[k] for k in FIELDS}, f"the replay answers the stored job: {replay.json()}, the first submit answered {first.json()}"
         assert len(_jobs(ctx)) == 1 and len(_queued(ctx)) == 1, f"one key, one job: after a submit and its replay the store holds {len(_jobs(ctx))} jobs and the queue {len(_queued(ctx))}"
         other = await _post(c, GOOD, key="k-7", tenant="t2")
         assert other.status_code == 201 and other.json()["job_id"] != first.json()["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)"
@@ -886,11 +890,15 @@ export async function check_idempotency_key(ctx) {
   const c = api(ctx);
   const noKey = await post(c, GOOD, {withKey: false});
   assert.equal(noKey.status, 400, \`a submit without Idempotency-Key answered \${noKey.status}, expected 400\`);
+  const emptyKey = await post(c, GOOD, {key: ''});
+  assert.equal(emptyKey.status, 400, \`a submit with an empty Idempotency-Key answered \${emptyKey.status}, expected 400: an empty key is no key\`);
+  nothingLeft(ctx, 'the submits without a usable Idempotency-Key were refused');
   const first = await post(c, GOOD, {key: 'k-7'});
   assert.equal(first.status, 201, \`the first submit answered \${first.status}: \${first.text}\`);
   const replay = await post(c, GOOD, {key: 'k-7'});
   assert.equal(replay.status, 200, \`a replay of the same (tenant, Idempotency-Key) answered \${replay.status}, expected 200 with the stored job (the client retried; it must not start a second expansion)\`);
   assert.equal(replay.json().job_id, first.json().job_id, \`the replay must resume the same job: got \${replay.json().job_id}, the first submit made \${first.json().job_id}\`);
+  assert.deepEqual(Object.fromEntries(FIELDS.map(k => [k, replay.json()[k]])), Object.fromEntries(FIELDS.map(k => [k, first.json()[k]])), \`the replay answers the stored job: \${replay.text}, the first submit answered \${first.text}\`);
   assert(jobKeys(ctx).length === 1 && queued(ctx).length === 1, \`one key, one job: after a submit and its replay the store holds \${jobKeys(ctx).length} jobs and the queue \${queued(ctx).length}\`);
   const other = await post(c, GOOD, {key: 'k-7', tenant: 't2'});
   assert(other.status === 201 && other.json().job_id !== first.json().job_id, 'another tenant reusing the key gets its own job (keys are per tenant)');
@@ -1000,11 +1008,17 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	c := apiClient(ctx)
 	noKey := c.Post("/v1/synthetic/jobs", apiGood, "X-Tenant-Id", "t1")
 	ctx.Equal(noKey.Status, 400, "a submit without Idempotency-Key")
+	emptyKey := apiPost(c, apiGood, "", "t1")
+	ctx.Equal(emptyKey.Status, 400, "a submit with an empty Idempotency-Key (an empty key is no key)")
+	apiNothingLeft(ctx, "the submits without a usable Idempotency-Key were refused")
 	first := apiPost(c, apiGood, "k-7", "t1")
 	ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text())
 	replay := apiPost(c, apiGood, "k-7", "t1")
 	ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored job (the client retried; it must not start a second expansion)")
 	ctx.Equal(apiJob(ctx, replay)["job_id"], apiJob(ctx, first)["job_id"], "the replay must resume the same job")
+	for _, k := range []string{"job_id", "status", "seed_dataset", "seed_version", "recipe", "max_records"} {
+		ctx.Equal(apiJob(ctx, replay)[k], apiJob(ctx, first)[k], "the replay answers the stored job (%s); its %s", replay.Text(), k)
+	}
 	ctx.Assert(len(ctx.Redis.Keys("synth:job:*")) == 1 && len(ctx.Redis.LRange("synth:queue", 0, -1)) == 1, "one key, one job: after a submit and its replay the store holds %d jobs and the queue %d", len(ctx.Redis.Keys("synth:job:*")), len(ctx.Redis.LRange("synth:queue", 0, -1)))
 	other := apiPost(c, apiGood, "k-7", "t2")
 	ctx.Assert(other.Status == 201 && apiJob(ctx, other)["job_id"] != apiJob(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)")
@@ -1031,30 +1045,30 @@ namespace {
 
 using json = nlohmann::json;
 
-const json kGood = {{"seed_dataset", "wiki-qa"}, {"seed_version", "2026-04-01"}, {"recipe", "qa-pairs"}, {"max_records", 1000}};
+const json hGood = {{"seed_dataset", "wiki-qa"}, {"seed_version", "2026-04-01"}, {"recipe", "qa-pairs"}, {"max_records", 1000}};
 
-struct Api {
+struct HarnessApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit Api(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HarnessApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   harness::Response post(const json& body, const std::string& key = "k-1", const std::string& tenant = "t1") {
     return http.Post("/v1/synthetic/jobs", body.dump(), "X-Tenant-Id", tenant, "Idempotency-Key", key);
   }
 };
 
-json with(json body, const std::string& field, const json& value) {
+json hWith(json body, const std::string& field, const json& value) {
   body[field] = value;
   return body;
 }
 
-json jobOf(harness::Ctx& ctx, const harness::Response& r) {
+json hJobOf(harness::Ctx& ctx, const harness::Response& r) {
   const json job = json::parse(r.Text(), nullptr, false);
   ctx.Assert(job.is_object(), "the body must be a JSON object: %s", r.Text());
   return job;
 }
 
-void nothingLeft(harness::Ctx& ctx, const std::string& what) {
+void hNothingLeft(harness::Ctx& ctx, const std::string& what) {
   ctx.Equal(ctx.Redis.LLen("synth:queue"), 0, "%s, yet the generation queue holds %v (the workers will expand it); queued jobs", what, ctx.Redis.LRange("synth:queue", 0, -1));
   ctx.Equal(ctx.Redis.Keys("synth:job:*").size(), 0, "%s, yet the job store holds %v; stored jobs", what, ctx.Redis.Keys("synth:job:*"));
 }
@@ -1062,44 +1076,44 @@ void nothingLeft(harness::Ctx& ctx, const std::string& what) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto r = api.post(kGood);
+  HarnessApi api(ctx);
+  const auto r = api.post(hGood);
   ctx.Equal(r.Status, 201, "a valid submit (%s)", r.Text());
-  const json job = jobOf(ctx, r);
+  const json job = hJobOf(ctx, r);
   for (const char* key : {"job_id", "status", "seed_dataset", "seed_version", "recipe", "max_records"}) {
     ctx.Assert(job.contains(key), "the 201 body lacks %s: %s", key, r.Text());
   }
   ctx.Assert(job["status"] == "queued" && job["seed_dataset"] == "wiki-qa" && job["seed_version"] == "2026-04-01" && job["recipe"] == "qa-pairs" && job["max_records"] == 1000,
-             "the job echoes the request with status queued: %s", r.Text());
+             "the job echoes the request hWith status queued: %s", r.Text());
   const std::string id = job["job_id"].is_string() ? job["job_id"].get<std::string>() : "";
   ctx.Assert(ctx.Redis.Get("synth:job:" + id).has_value(), "the job %s must be in the job store (synth:job:{id}): keys %v", id, ctx.Redis.Keys("synth:*"));
   ctx.Equal(ctx.Redis.LRange("synth:queue", 0, -1), std::vector<std::string>{id}, "the accepted job must be handed to the workers once; the queue");
-  const auto noTenant = api.http.Post("/v1/synthetic/jobs", kGood.dump(), "Idempotency-Key", "k-2");
+  const auto noTenant = api.http.Post("/v1/synthetic/jobs", hGood.dump(), "Idempotency-Key", "k-2");
   ctx.Equal(noTenant.Status, 401, "without X-Tenant-Id the submit");
 }
 
 void CheckDerivativeLicense(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(with(with(kGood, "seed_dataset", "news-crawl"), "seed_version", "2026-02-15"), "k-nd");
-  ctx.Equal(r.Status, 422, "news-crawl@2026-02-15 is registered with a no-derivatives license (synthetic records are derivatives of their seed)");
-  nothingLeft(ctx, "a seed whose license forbids derivatives was refused");
-  r = api.post(kGood, "k-ok");
+  HarnessApi api(ctx);
+  auto r = api.post(hWith(hWith(hGood, "seed_dataset", "news-crawl"), "seed_version", "2026-02-15"), "k-nd");
+  ctx.Equal(r.Status, 422, "news-crawl@2026-02-15 is registered hWith a no-derivatives license (synthetic records are derivatives of their seed)");
+  hNothingLeft(ctx, "a seed whose license forbids derivatives was refused");
+  r = api.post(hGood, "k-ok");
   ctx.Equal(r.Status, 201, "wiki-qa@2026-04-01 allows derivatives (%s)", r.Text());
 }
 
 void CheckRecordCap(harness::Ctx& ctx) {
-  Api api(ctx);
+  HarnessApi api(ctx);
   for (long long cap : {0LL, -5LL, 100001LL, 10000000LL}) {
-    const auto r = api.post(with(kGood, "max_records", cap), "k-" + std::to_string(cap));
+    const auto r = api.post(hWith(hGood, "max_records", cap), "k-" + std::to_string(cap));
     ctx.Equal(r.Status, 400, "max_records=%d (the service bounds a job to 1..100000 records)", cap);
   }
-  const auto noRecipe = api.post(with(kGood, "recipe", ""), "k-recipe");
+  const auto noRecipe = api.post(hWith(hGood, "recipe", ""), "k-recipe");
   ctx.Equal(noRecipe.Status, 400, "an empty recipe");
-  nothingLeft(ctx, "every one of those submits was refused");
+  hNothingLeft(ctx, "every one of those submits was refused");
   for (long long cap : {1LL, 100000LL}) {
-    const auto r = api.post(with(kGood, "max_records", cap), "k-ok-" + std::to_string(cap));
+    const auto r = api.post(hWith(hGood, "max_records", cap), "k-ok-" + std::to_string(cap));
     ctx.Equal(r.Status, 201, "max_records=%d is within 1..100000 inclusive (%s)", cap, r.Text());
-    const json job = jobOf(ctx, r);
+    const json job = hJobOf(ctx, r);
     const std::string id = job.value("job_id", std::string());
     const json stored = json::parse(ctx.Redis.Get("synth:job:" + id).value_or("{}"), nullptr, false);
     ctx.Assert(stored.is_object() && stored.value("max_records", 0LL) == cap, "the stored job must carry the cap the workers enforce, got %s", stored.dump());
@@ -1107,28 +1121,34 @@ void CheckRecordCap(harness::Ctx& ctx) {
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  Api api(ctx);
-  const auto noKey = api.http.Post("/v1/synthetic/jobs", kGood.dump(), "X-Tenant-Id", "t1");
+  HarnessApi api(ctx);
+  const auto noKey = api.http.Post("/v1/synthetic/jobs", hGood.dump(), "X-Tenant-Id", "t1");
   ctx.Equal(noKey.Status, 400, "a submit without Idempotency-Key");
-  const auto first = api.post(kGood, "k-7");
+  const auto emptyKey = api.post(hGood, "");
+  ctx.Equal(emptyKey.Status, 400, "a submit with an empty Idempotency-Key (an empty key is no key)");
+  hNothingLeft(ctx, "the submits without a usable Idempotency-Key were refused");
+  const auto first = api.post(hGood, "k-7");
   ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text());
-  const auto replay = api.post(kGood, "k-7");
+  const auto replay = api.post(hGood, "k-7");
   ctx.Equal(replay.Status, 200, "a replay of the same (tenant, Idempotency-Key) must answer the stored job (the client retried; it must not start a second expansion)");
-  ctx.Equal(jobOf(ctx, replay)["job_id"], jobOf(ctx, first)["job_id"], "the replay must resume the same job");
+  ctx.Equal(hJobOf(ctx, replay)["job_id"], hJobOf(ctx, first)["job_id"], "the replay must resume the same job");
+  for (const char* k : {"job_id", "status", "seed_dataset", "seed_version", "recipe", "max_records"}) {
+    ctx.Equal(hJobOf(ctx, replay).value(k, json()), hJobOf(ctx, first).value(k, json()), "the replay answers the stored job (%s); its %s", replay.Text(), k);
+  }
   ctx.Assert(ctx.Redis.Keys("synth:job:*").size() == 1 && ctx.Redis.LLen("synth:queue") == 1, "one key, one job: after a submit and its replay the store holds %d jobs and the queue %d",
              ctx.Redis.Keys("synth:job:*").size(), ctx.Redis.LLen("synth:queue"));
-  const auto other = api.post(kGood, "k-7", "t2");
-  ctx.Assert(other.Status == 201 && jobOf(ctx, other)["job_id"] != jobOf(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)");
+  const auto other = api.post(hGood, "k-7", "t2");
+  ctx.Assert(other.Status == 201 && hJobOf(ctx, other)["job_id"] != hJobOf(ctx, first)["job_id"], "another tenant reusing the key gets its own job (keys are per tenant)");
 }
 
 void CheckGateBeforeEnqueue(harness::Ctx& ctx) {
-  Api api(ctx);
-  auto r = api.post(with(kGood, "seed_version", "2027-01-01"), "k-unknown");
+  HarnessApi api(ctx);
+  auto r = api.post(hWith(hGood, "seed_version", "2027-01-01"), "k-unknown");
   ctx.Equal(r.Status, 422, "an unregistered seed version");
-  nothingLeft(ctx, "an unregistered seed was refused with 422");
-  r = api.post(with(kGood, "seed_dataset", "forum-scrape"), "k-unknown-2");
+  hNothingLeft(ctx, "an unregistered seed was refused hWith 422");
+  r = api.post(hWith(hGood, "seed_dataset", "forum-scrape"), "k-unknown-2");
   ctx.Equal(r.Status, 422, "an unregistered dataset");
-  nothingLeft(ctx, "an unregistered dataset was refused with 422");
+  hNothingLeft(ctx, "an unregistered dataset was refused hWith 422");
 }
 `,
   },

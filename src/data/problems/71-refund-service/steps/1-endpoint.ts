@@ -94,7 +94,7 @@ client that retries after a timeout is refunded twice.
       id: 'cap',
       title: 'Claims the amount against the payment total, 422 above it',
       detail:
-        'The amount is claimed through `ledger.claim` with `paid_minor` as the cap; a refused claim answers **422** with `remaining_minor` and writes no row. The starter does not ask the ledger.',
+        'The amount is claimed through `ledger.claim` with `paid_minor` as the cap; a refused claim answers **422** with `remaining_minor` and writes no row, also when another server claims between two of your ledger commands. The starter does not ask the ledger.',
       match: {
         python: {all: [/ledger\.claim\(/, /\b422\b/]},
         typescript: {all: [/\bclaim\(/, /\b422\b/]},
@@ -107,7 +107,7 @@ client that retries after a timeout is refunded twice.
       id: 'idempotency-key',
       title: 'Requires Idempotency-Key and answers the first refund on a replay',
       detail:
-        'A request without `Idempotency-Key` is **400**; `refund_for_key(tenant, key)` is read before the claim and a replay answers the first refund without claiming again. The starter ignores the header.',
+        'A request without `Idempotency-Key` is **400**; `refund_for_key(tenant, key)` is read before the claim and a replay answers the first refund without claiming again, not even for a moment, also once the payment is fully refunded; a key the tenant reuses on another of its payments refunds nothing new. The starter ignores the header.',
       match: {
         python: {all: [/idempotency-key/i], order: [/records\.refund_for_key\(/, /ledger\.claim\(/]},
         typescript: {all: [/idempotency-key/i], order: [/refundForKey\(/, /\bclaim\(/]},
@@ -661,7 +661,7 @@ async def check_tenant_scope(ctx):
 
 async def check_amount_valid(ctx):
     async with _api(ctx) as c:
-        for n, (amount, reason) in enumerate([(0, "damaged"), (-2500, "damaged"), (2500, "because")]):
+        for n, (amount, reason) in enumerate([(0, "damaged"), (-2500, "damaged"), (2500, "because"), (2500, "damage"), (2500, "")]):
             r = await _post(c, amount=amount, reason=reason, key=f"k-{n}")
             assert r.status_code == 400, f"amount_minor={amount}, reason_code={reason!r} answered {r.status_code}, expected 400"
         assert records.list_refunds("pay_1") == [], f"refused requests wrote {records.list_refunds('pay_1')}"
@@ -681,6 +681,16 @@ async def check_cap(ctx):
     assert rest.status_code == 201 and rest.json().get("remaining_minor") == 0, f"the last 4000 answered {rest.status_code} {rest.text}, expected 201 with remaining_minor 0"
     assert ledger.refunded_total("pay_1") == 10000, f"the ledger of pay_1 holds {ledger.refunded_total('pay_1')} after 6000 and 4000 were accepted: claim each amount with ledger.claim"
     assert len(records.list_refunds("pay_1")) == 2, f"the records hold {len(records.list_refunds('pay_1'))} refunds, expected 2: a refused claim writes no row"
+    # Another server claims 8000 of pay_3 between this request's first ledger command and the next.
+    records.add_payment("pay_3", "t1", 10000)
+    raced = []
+    ctx.redis_after("refunded:pay_3", lambda: raced.append(ledger.claim("pay_3", "rf-other", 8000, 10000)[0]))
+    async with _api(ctx) as c:
+        r = await _post(c, 2500, payment="pay_3", key="k-4")
+    assert raced, "a refund of pay_3 never touched its ledger refunded:pay_3"
+    held = sum(row["amount_minor"] for row in records.list_refunds("pay_3")) + (8000 if raced[0] else 0)
+    total = ledger.refunded_total("pay_3")
+    assert held == total <= 10000 and (r.status_code == 201) == bool(records.list_refunds("pay_3")), f"while another server claimed 8000 of the 10000 payment pay_3, 2500 answered {r.status_code} {r.text}, the ledger holds {total} and the rows plus that claim {held}: the claim's answer is the only cap"
 
 
 async def check_idempotency_key(ctx):
@@ -688,15 +698,25 @@ async def check_idempotency_key(ctx):
         none = await _post(c, key="")
         assert none.status_code == 400, f"a refund without Idempotency-Key answered {none.status_code}, expected 400"
         first = await _post(c, 2500, key="k-1")
+        ledger_seen = []
+        ctx.redis_after("refunded:pay_1", lambda: ledger_seen.append(ledger.refunded_total("pay_1")))
         retry = await _post(c, 2500, key="k-1")
+        retry_saw = list(ledger_seen)
         other = await _post(c, 2500, key="k-2")
         t2 = await _post(c, 2500, payment="pay_2", tenant="t2", key="k-1")
+        records.add_payment("pay_3", "t1", 10000)
+        moved = await _post(c, 2500, payment="pay_3", key="k-1")
+        last = await _post(c, 5000, key="k-3")
+        last_retry = await _post(c, 5000, key="k-3")
     assert first.status_code == 201, f"the first refund answered {first.status_code}: {first.text}"
     assert retry.status_code in (200, 201) and retry.json().get("refund_id") == first.json().get("refund_id"), f"a retry with the same key answered {retry.text}, expected the first refund {first.json().get('refund_id')}"
-    rows = records.list_refunds("pay_1")
-    assert len(rows) == 2 and ledger.refunded_total("pay_1") == 5000, f"keys k-1 (twice) and k-2 left {len(rows)} refunds and a ledger of {ledger.refunded_total('pay_1')}, expected 2 refunds and 5000: a replay is not a second refund"
+    assert all(total == 2500 for total in retry_saw), f"while the retry of k-1 was answered, the ledger of pay_1 held {retry_saw[0] if retry_saw else 0}, expected 2500: a replay reserves nothing, not even for a moment"
     assert other.json().get("refund_id") != first.json().get("refund_id"), "a new key must create a new refund"
     assert t2.status_code == 201 and t2.json().get("refund_id") not in (first.json().get("refund_id"), other.json().get("refund_id")), f"tenant t2 using key k-1 answered {t2.text}: keys belong to a tenant"
+    assert records.list_refunds("pay_3") == [] and ledger.refunded_total("pay_3") == 0, f"tenant t1 reusing key k-1 on its payment pay_3 answered {moved.status_code} {moved.text} and refunded pay_3: the key belongs to (tenant, key), and k-1 already names {first.json().get('refund_id')}"
+    assert last.status_code == 201 and last_retry.status_code in (200, 201) and last_retry.json().get("refund_id") == last.json().get("refund_id"), f"the retry of the refund that used pay_1's last 5000 answered {last_retry.status_code} {last_retry.text}, expected the refund {last.json().get('refund_id')}: look the key up before claiming"
+    total = ledger.refunded_total("pay_1")
+    assert len(records.list_refunds("pay_1")) == 3 and total == 10000, f"keys k-1 and k-3 (each sent twice) and k-2 left {len(records.list_refunds('pay_1'))} refunds and a ledger of {total}, expected 3 refunds and 10000: a replay is not a second refund"
 `,
     typescript: `function api(ctx) {
   const records = ctx.load('/support/refunds/records.ts');
@@ -745,7 +765,7 @@ export async function check_tenant_scope(ctx) {
 export async function check_amount_valid(ctx) {
   const {c, records, ledger} = api(ctx);
   await seed(records);
-  const cases: [number, string][] = [[0, 'damaged'], [-2500, 'damaged'], [2500, 'because']];
+  const cases: [number, string][] = [[0, 'damaged'], [-2500, 'damaged'], [2500, 'because'], [2500, 'damage'], [2500, '']];
   for (const [n, [amount, reason]] of cases.entries()) {
     const r = await post(c, amount, 'pay_1', reason, 't1', \`k-\${n}\`);
     assert.equal(r.status, 400, \`amount_minor=\${amount}, reason_code=\${reason} answered \${r.status}, expected 400\`);
@@ -769,6 +789,24 @@ export async function check_cap(ctx) {
   const total = await ledger.refundedTotal('pay_1');
   assert.equal(total, 10000, \`the ledger of pay_1 holds \${total} after 6000 and 4000 were accepted: claim each amount with claim()\`);
   assert.equal((await records.listRefunds('pay_1')).length, 2, 'a refused claim writes no row: expected 2 refunds');
+  // Another server claims 8000 of pay_3 between this request's first ledger command and the next.
+  await records.addPayment('pay_3', 't1', 10000);
+  const raced: boolean[] = [];
+  ctx.redisAfter('refunded:pay_3', () => {
+    const held = Number(ctx.redis.hget('refunded:pay_3', 'total') ?? 0);
+    const fits = held + 8000 <= 10000;
+    if (fits) {
+      ctx.redis.hset('refunded:pay_3', 'rf-other', 8000);
+      ctx.redis.hincrby('refunded:pay_3', 'total', 8000);
+    }
+    raced.push(fits);
+  });
+  const r = await post(c, 2500, 'pay_3', 'damaged', 't1', 'k-4');
+  assert(raced.length > 0, 'a refund of pay_3 never touched its ledger refunded:pay_3');
+  const rows = await records.listRefunds('pay_3');
+  const claimed = rows.reduce((s, row) => s + row.amount_minor, 0) + (raced[0] ? 8000 : 0);
+  const held = await ledger.refundedTotal('pay_3');
+  assert(claimed === held && held <= 10000 && (r.status === 201) === rows.length > 0, \`while another server claimed 8000 of the 10000 payment pay_3, 2500 answered \${r.status} \${r.text}, the ledger holds \${held} and the rows plus that claim \${claimed}: the claim's answer is the only cap\`);
 }
 
 export async function check_idempotency_key(ctx) {
@@ -777,16 +815,26 @@ export async function check_idempotency_key(ctx) {
   const none = await post(c, 2500, 'pay_1', 'damaged', 't1', '');
   assert.equal(none.status, 400, \`a refund without Idempotency-Key answered \${none.status}, expected 400\`);
   const first = await post(c, 2500, 'pay_1', 'damaged', 't1', 'k-1');
+  const ledgerSeen: number[] = [];
+  ctx.redisAfter('refunded:pay_1', () => ledgerSeen.push(Number(ctx.redis.hget('refunded:pay_1', 'total') ?? 0)));
   const retry = await post(c, 2500, 'pay_1', 'damaged', 't1', 'k-1');
+  const retrySaw = [...ledgerSeen];
   const other = await post(c, 2500, 'pay_1', 'damaged', 't1', 'k-2');
   const t2 = await post(c, 2500, 'pay_2', 'damaged', 't2', 'k-1');
+  await records.addPayment('pay_3', 't1', 10000);
+  const moved = await post(c, 2500, 'pay_3', 'damaged', 't1', 'k-1');
+  const last = await post(c, 5000, 'pay_1', 'damaged', 't1', 'k-3');
+  const lastRetry = await post(c, 5000, 'pay_1', 'damaged', 't1', 'k-3');
   assert.equal(first.status, 201, \`the first refund answered \${first.status}: \${first.text}\`);
   assert((retry.status === 200 || retry.status === 201) && retry.json().refund_id === first.json().refund_id, \`a retry with the same key answered \${retry.text}, expected the first refund \${first.json().refund_id}\`);
-  const rows = await records.listRefunds('pay_1');
-  const total = await ledger.refundedTotal('pay_1');
-  assert(rows.length === 2 && total === 5000, \`keys k-1 (twice) and k-2 left \${rows.length} refunds and a ledger of \${total}, expected 2 refunds and 5000: a replay is not a second refund\`);
+  assert(retrySaw.every(total => total === 2500), \`while the retry of k-1 was answered, the ledger of pay_1 held \${retrySaw[0]}, expected 2500: a replay reserves nothing, not even for a moment\`);
   assert.notEqual(other.json().refund_id, first.json().refund_id, 'a new key must create a new refund');
   assert(t2.status === 201 && ![first.json().refund_id, other.json().refund_id].includes(t2.json().refund_id), \`tenant t2 using key k-1 answered \${t2.text}: keys belong to a tenant\`);
+  assert((await records.listRefunds('pay_3')).length === 0 && (await ledger.refundedTotal('pay_3')) === 0, \`tenant t1 reusing key k-1 on its payment pay_3 answered \${moved.status} \${moved.text} and refunded pay_3: the key belongs to (tenant, key), and k-1 already names \${first.json().refund_id}\`);
+  assert(last.status === 201 && (lastRetry.status === 200 || lastRetry.status === 201) && lastRetry.json().refund_id === last.json().refund_id, \`the retry of the refund that used pay_1's last 5000 answered \${lastRetry.status} \${lastRetry.text}, expected the refund \${last.json().refund_id}: look the key up before claiming\`);
+  const rows = await records.listRefunds('pay_1');
+  const total = await ledger.refundedTotal('pay_1');
+  assert(rows.length === 3 && total === 10000, \`keys k-1 and k-3 (each sent twice) and k-2 left \${rows.length} refunds and a ledger of \${total}, expected 3 refunds and 10000: a replay is not a second refund\`);
 }
 `,
     go: `package main
@@ -796,6 +844,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 
 	"refunds/ledger"
 	"refunds/records"
@@ -838,6 +887,13 @@ func apiDecode(r *harness.Response) apiReply {
 	return body
 }
 
+// apiLedgerTotal reads the ledger's total straight from the server (inside a probe).
+func apiLedgerTotal(ctx *harness.Ctx, paymentID string) int64 {
+	raw, _ := ctx.Redis.HGet("refunded:"+paymentID, "total")
+	n, _ := strconv.ParseInt(raw, 10, 64)
+	return n
+}
+
 func CheckRoute(ctx *harness.Ctx) {
 	c := apiServer(ctx)
 	r := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
@@ -866,7 +922,7 @@ func CheckAmountValid(ctx *harness.Ctx) {
 	cases := []struct {
 		amount int64
 		reason string
-	}{{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}}
+	}{{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}, {2500, "damage"}, {2500, ""}}
 	for n, tc := range cases {
 		r := apiPost(c, tc.amount, "pay_1", tc.reason, "t1", fmt.Sprintf("k-%d", n))
 		ctx.Equal(r.Status, 400, "amount_minor=%d, reason_code=%q", tc.amount, tc.reason)
@@ -888,6 +944,30 @@ func CheckCap(ctx *harness.Ctx) {
 	ctx.Assert(rest.Status == 201 && apiDecode(rest).RemainingMinor == 0, "the last 4000 answered %d %s, expected 201 with remaining_minor 0", rest.Status, rest.Text())
 	ctx.Equal(ledger.RefundedTotal(apiBg, "pay_1"), 10000, "after 6000 and 4000 were accepted the ledger of pay_1 must hold both (claim each amount with ledger.Claim)")
 	ctx.Equal(len(records.ListRefunds(apiBg, "pay_1")), 2, "a refused claim writes no row; the refunds")
+	// Another server claims 8000 of pay_3 between this request's first ledger command and the next.
+	records.AddPayment(apiBg, "pay_3", "t1", 10000)
+	var raced []bool
+	ctx.Redis.After("refunded:pay_3", func() any {
+		fits := apiLedgerTotal(ctx, "pay_3")+8000 <= 10000
+		if fits {
+			ctx.Redis.Do("HSET", "refunded:pay_3", "rf-other", 8000)
+			ctx.Redis.Do("HINCRBY", "refunded:pay_3", "total", 8000)
+		}
+		raced = append(raced, fits)
+		return nil
+	})
+	r := apiPost(c, 2500, "pay_3", "damaged", "t1", "k-4")
+	ctx.Assert(len(raced) > 0, "a refund of pay_3 never touched its ledger refunded:pay_3")
+	rows := records.ListRefunds(apiBg, "pay_3")
+	var claimed int64
+	for _, row := range rows {
+		claimed += row.AmountMinor
+	}
+	if len(raced) > 0 && raced[0] {
+		claimed += 8000
+	}
+	held := ledger.RefundedTotal(apiBg, "pay_3")
+	ctx.Assert(claimed == held && held <= 10000 && (r.Status == 201) == (len(rows) > 0), "while another server claimed 8000 of the 10000 payment pay_3, 2500 answered %d %s, the ledger holds %d and the rows plus that claim %d: the claim's answer is the only cap", r.Status, r.Text(), held, claimed)
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
@@ -895,17 +975,29 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 	none := apiPost(c, 2500, "pay_1", "damaged", "t1", "")
 	ctx.Equal(none.Status, 400, "a refund without Idempotency-Key")
 	first := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	var ledgerSeen []int64
+	ctx.Redis.After("refunded:pay_1", func() any { ledgerSeen = append(ledgerSeen, apiLedgerTotal(ctx, "pay_1")); return nil })
 	retry := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1")
+	retrySaw := append([]int64(nil), ledgerSeen...)
 	other := apiPost(c, 2500, "pay_1", "damaged", "t1", "k-2")
 	t2 := apiPost(c, 2500, "pay_2", "damaged", "t2", "k-1")
+	records.AddPayment(apiBg, "pay_3", "t1", 10000)
+	moved := apiPost(c, 2500, "pay_3", "damaged", "t1", "k-1")
+	last := apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3")
+	lastRetry := apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3")
 	ctx.Equal(first.Status, 201, "the first refund (%s)", first.Text())
 	ctx.Assert((retry.Status == 200 || retry.Status == 201) && apiDecode(retry).RefundID == apiDecode(first).RefundID, "a retry with the same key answered %s, expected the first refund %s", retry.Text(), apiDecode(first).RefundID)
-	rows := records.ListRefunds(apiBg, "pay_1")
-	total := ledger.RefundedTotal(apiBg, "pay_1")
-	ctx.Assert(len(rows) == 2 && total == 5000, "keys k-1 (twice) and k-2 left %d refunds and a ledger of %d, expected 2 refunds and 5000: a replay is not a second refund", len(rows), total)
+	for _, seen := range retrySaw {
+		ctx.Assert(seen == 2500, "while the retry of k-1 was answered, the ledger of pay_1 held %d, expected 2500: a replay reserves nothing, not even for a moment", seen)
+	}
 	ctx.Assert(apiDecode(other).RefundID != apiDecode(first).RefundID, "a new key must create a new refund")
 	id := apiDecode(t2).RefundID
 	ctx.Assert(t2.Status == 201 && id != apiDecode(first).RefundID && id != apiDecode(other).RefundID, "tenant t2 using key k-1 answered %s: keys belong to a tenant", t2.Text())
+	ctx.Assert(len(records.ListRefunds(apiBg, "pay_3")) == 0 && ledger.RefundedTotal(apiBg, "pay_3") == 0, "tenant t1 reusing key k-1 on its payment pay_3 answered %d %s and refunded pay_3: the key belongs to (tenant, key), and k-1 already names %s", moved.Status, moved.Text(), apiDecode(first).RefundID)
+	ctx.Assert(last.Status == 201 && (lastRetry.Status == 200 || lastRetry.Status == 201) && apiDecode(lastRetry).RefundID == apiDecode(last).RefundID, "the retry of the refund that used pay_1's last 5000 answered %d %s, expected the refund %s: look the key up before claiming", lastRetry.Status, lastRetry.Text(), apiDecode(last).RefundID)
+	rows := records.ListRefunds(apiBg, "pay_1")
+	total := ledger.RefundedTotal(apiBg, "pay_1")
+	ctx.Assert(len(rows) == 3 && total == 10000, "keys k-1 and k-3 (each sent twice) and k-2 left %d refunds and a ledger of %d, expected 3 refunds and 10000: a replay is not a second refund", len(rows), total)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -944,6 +1036,12 @@ nlohmann::json apiBody(const harness::Response& r) {
   return body.is_object() ? body : nlohmann::json::object();
 }
 
+// The ledger's total straight from the server (inside a probe).
+long long apiLedgerTotal(harness::Ctx& ctx, const std::string& payment_id) {
+  const auto raw = ctx.Redis.HGet("refunded:" + payment_id, "total");
+  return raw ? std::stoll(*raw) : 0;
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
@@ -973,7 +1071,7 @@ void CheckTenantScope(harness::Ctx& ctx) {
 
 void CheckAmountValid(harness::Ctx& ctx) {
   auto c = apiServer(ctx);
-  const std::vector<std::pair<long long, std::string>> cases = {{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}};
+  const std::vector<std::pair<long long, std::string>> cases = {{0, "damaged"}, {-2500, "damaged"}, {2500, "because"}, {2500, "damage"}, {2500, ""}};
   for (size_t n = 0; n < cases.size(); n++) {
     const auto r = apiPost(c, cases[n].first, "pay_1", cases[n].second, "t1", "k-" + std::to_string(n));
     ctx.Equal(r.Status, 400, "amount_minor=%d, reason_code=%q", cases[n].first, cases[n].second);
@@ -998,6 +1096,26 @@ void CheckCap(harness::Ctx& ctx) {
   ctx.Equal(ledger::refundedTotal("pay_1"), 10000,
             "after 6000 and 4000 were accepted the ledger of pay_1 must hold both (claim each amount with ledger::claim)");
   ctx.Equal(records::listRefunds("pay_1").size(), 2, "a refused claim writes no row; the refunds");
+  // Another server claims 8000 of pay_3 between this request's first ledger command and the next.
+  records::addPayment("pay_3", "t1", 10000);
+  std::vector<bool> raced;
+  ctx.Redis.After("refunded:pay_3", [&] {
+    const bool fits = apiLedgerTotal(ctx, "pay_3") + 8000 <= 10000;
+    if (fits) {
+      ctx.Redis.Do("HSET", "refunded:pay_3", "rf-other", 8000);
+      ctx.Redis.Do("HINCRBY", "refunded:pay_3", "total", 8000);
+    }
+    raced.push_back(fits);
+  });
+  const auto r = apiPost(c, 2500, "pay_3", "damaged", "t1", "k-4");
+  ctx.Assert(!raced.empty(), "a refund of pay_3 never touched its ledger refunded:pay_3");
+  const auto rows = records::listRefunds("pay_3");
+  long long claimed = !raced.empty() && raced[0] ? 8000 : 0;
+  for (const auto& row : rows) claimed += row.amount_minor;
+  const long long held = ledger::refundedTotal("pay_3");
+  ctx.Assert(claimed == held && held <= 10000 && (r.Status == 201) == !rows.empty(),
+             "while another server claimed 8000 of the 10000 payment pay_3, 2500 answered %d %s, the ledger holds %d and the rows plus that claim %d: the claim's answer is the only cap",
+             r.Status, r.Text(), held, claimed);
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
@@ -1005,21 +1123,38 @@ void CheckIdempotencyKey(harness::Ctx& ctx) {
   const auto none = apiPost(c, 2500, "pay_1", "damaged", "t1", "");
   ctx.Equal(none.Status, 400, "a refund without Idempotency-Key");
   const auto first = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  std::vector<long long> ledger_seen;
+  ctx.Redis.After("refunded:pay_1", [&] { ledger_seen.push_back(apiLedgerTotal(ctx, "pay_1")); });
   const auto retry = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-1");
+  const std::vector<long long> retry_saw = ledger_seen;
   const auto other = apiPost(c, 2500, "pay_1", "damaged", "t1", "k-2");
   const auto t2 = apiPost(c, 2500, "pay_2", "damaged", "t2", "k-1");
+  records::addPayment("pay_3", "t1", 10000);
+  const auto moved = apiPost(c, 2500, "pay_3", "damaged", "t1", "k-1");
+  const auto last = apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3");
+  const auto last_retry = apiPost(c, 5000, "pay_1", "damaged", "t1", "k-3");
   const std::string first_id = apiBody(first).value("refund_id", "");
   const std::string other_id = apiBody(other).value("refund_id", "");
+  const std::string last_id = apiBody(last).value("refund_id", "");
   ctx.Equal(first.Status, 201, "the first refund (%s)", first.Text());
   ctx.Assert((retry.Status == 200 || retry.Status == 201) && apiBody(retry).value("refund_id", "") == first_id,
              "a retry with the same key answered %s, expected the first refund %s", retry.Text(), first_id);
-  const size_t rows = records::listRefunds("pay_1").size();
-  const long long total = ledger::refundedTotal("pay_1");
-  ctx.Assert(rows == 2 && total == 5000,
-             "keys k-1 (twice) and k-2 left %d refunds and a ledger of %d, expected 2 refunds and 5000: a replay is not a second refund", rows, total);
+  for (const long long seen : retry_saw) {
+    ctx.Assert(seen == 2500, "while the retry of k-1 was answered, the ledger of pay_1 held %d, expected 2500: a replay reserves nothing, not even for a moment", seen);
+  }
   ctx.Assert(other_id != first_id, "a new key must create a new refund");
   const std::string t2_id = apiBody(t2).value("refund_id", "");
   ctx.Assert(t2.Status == 201 && t2_id != first_id && t2_id != other_id, "tenant t2 using key k-1 answered %s: keys belong to a tenant", t2.Text());
+  ctx.Assert(records::listRefunds("pay_3").empty() && ledger::refundedTotal("pay_3") == 0,
+             "tenant t1 reusing key k-1 on its payment pay_3 answered %d %s and refunded pay_3: the key belongs to (tenant, key), and k-1 already names %s",
+             moved.Status, moved.Text(), first_id);
+  ctx.Assert(last.Status == 201 && (last_retry.Status == 200 || last_retry.Status == 201) && apiBody(last_retry).value("refund_id", "") == last_id,
+             "the retry of the refund that used pay_1's last 5000 answered %d %s, expected the refund %s: look the key up before claiming",
+             last_retry.Status, last_retry.Text(), last_id);
+  const size_t rows = records::listRefunds("pay_1").size();
+  const long long total = ledger::refundedTotal("pay_1");
+  ctx.Assert(rows == 3 && total == 10000,
+             "keys k-1 and k-3 (each sent twice) and k-2 left %d refunds and a ledger of %d, expected 3 refunds and 10000: a replay is not a second refund", rows, total);
 }
 `,
   },

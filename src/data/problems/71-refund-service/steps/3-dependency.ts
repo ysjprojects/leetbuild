@@ -49,7 +49,7 @@ service Psp {
       id: 'deadline',
       title: 'Every PSP call carries a 5-second deadline',
       detail:
-        'With the PSP slower than the deadline every `Refund` and `GetRefund` call carries 5 s and the refund ends `PENDING`. The starter waits as long as the PSP takes.',
+        'With the PSP slower than the deadline every `Refund` and `GetRefund` call carries 5 s, `Refund` is tried three times and the refund ends `PENDING`. The starter waits as long as the PSP takes.',
       match: {
         python: {all: [/PSP_DEADLINE_S\s*=\s*5\b/, /timeout\s*=\s*PSP_DEADLINE_S/]},
         typescript: {all: [/PSP_DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*PSP_DEADLINE_MS/]},
@@ -75,7 +75,7 @@ service Psp {
       id: 'retry-policy',
       title: 'Retries the two unknown-outcome codes, three attempts',
       detail:
-        'Two `UNAVAILABLE` answers then a success is `CONFIRMED` after three calls; an `INVALID_ARGUMENT` is one call. The starter makes one attempt.',
+        'Two `UNAVAILABLE` answers then a success is `CONFIRMED` after three calls; an `INVALID_ARGUMENT` is one call, and so is an `INTERNAL` or a `RESOURCE_EXHAUSTED`, which leave the refund `PENDING`. The starter makes one attempt.',
       match: {
         python: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_ATTEMPTS\s*=\s*3\b/, /DEADLINE_EXCEEDED/, /UNAVAILABLE/]},
@@ -88,7 +88,7 @@ service Psp {
       id: 'pending-reconcile',
       title: 'Keeps an unknown outcome PENDING and reconciles it',
       detail:
-        'A refund the PSP paid while every answer was lost ends `CONFIRMED` with the reference `GetRefund` reports; a PSP that stays down leaves it `PENDING` with its reservation. The starter writes both off as `REJECTED`.',
+        'A refund the PSP paid while every answer was lost ends `CONFIRMED` with the reference `GetRefund` reports; a PSP that stays down, or a `GetRefund` answering `PROCESSING`, leaves it `PENDING` with its reservation. The starter writes both off as `REJECTED`.',
       match: {
         python: {all: [/GetRefund\(/], order: [/psp\.Refund\(/, /return reconcile\(/]},
         typescript: {all: [/GetRefund\(/], order: [/psp\.Refund\(/, /return reconcile\(/]},
@@ -101,7 +101,7 @@ service Psp {
       id: 'terminal-release',
       title: 'A refusal releases exactly its reservation',
       detail:
-        'The PSP refuses a refund on a disputed charge: the row is `REJECTED`, its 4000 leaves the ledger and the confirmed 3000 stays. The starter keeps the 4000 reserved for a refund that will not happen.',
+        'The PSP refuses a refund on a disputed charge: the row is `REJECTED`, its 4000 leaves the ledger and the confirmed 3000 stays. A refund `GetRefund` reports `FAILED` is released the same way. The starter keeps the 4000 reserved for a refund that will not happen.',
       match: {
         python: {all: [/FAILED_PRECONDITION/, /ledger\.release\(/]},
         typescript: {all: [/FAILED_PRECONDITION/, /\brelease\(/]},
@@ -633,7 +633,8 @@ from refunds import ledger, records
 
 class Psp(refund_service_pb2_grpc.PspServicer):
     """The PSP stand-in: Refund is idempotent on the idempotency-key metadata, refuses a disputed
-    charge, and while drop > 0 pays the refund out but loses the answer (UNAVAILABLE)."""
+    charge, and while drop > 0 pays the refund out but loses the answer (UNAVAILABLE). GetRefund
+    answers statuses[refund_id] when set (FAILED, PROCESSING)."""
 
     def __init__(self):
         self.by_key = {}
@@ -641,6 +642,7 @@ class Psp(refund_service_pb2_grpc.PspServicer):
         self.payouts = []
         self.keys = []
         self.drop = 0
+        self.statuses = {}
 
     def Refund(self, request, context):
         key = dict(context.invocation_metadata()).get("idempotency-key", "")
@@ -660,6 +662,8 @@ class Psp(refund_service_pb2_grpc.PspServicer):
         return refund_service_pb2.RefundReply(psp_ref=ref, status="SUCCEEDED")
 
     def GetRefund(self, request, context):
+        if request.refund_id in self.statuses:
+            return refund_service_pb2.RefundStatus(refund_id=request.refund_id, status=self.statuses[request.refund_id], psp_ref="")
         ref = self.applied.get(request.refund_id)
         if ref is None:
             context.abort(grpc.StatusCode.NOT_FOUND, f"no refund {request.refund_id}")
@@ -682,7 +686,7 @@ def check_deadline(ctx):
     before = ctx.clock.time()
     status = m.refund_via_psp("rf-1")
     calls = ctx.grpc.calls_to("Refund") + ctx.grpc.calls_to("GetRefund")
-    assert ctx.grpc.calls_to("Refund"), "refund_via_psp made no Refund call"
+    assert len(ctx.grpc.calls_to("Refund")) == 3, f"with the PSP slower than the deadline refund_via_psp sent {len(ctx.grpc.calls_to('Refund'))} Refund calls, expected 3: DEADLINE_EXCEEDED leaves the outcome unknown and is retried"
     for call in calls:
         assert call.timeout is not None, f"a {call.method} call carries no deadline: a PSP that hangs holds the refund open"
         assert 4.5 <= call.timeout <= 5.5, f"a {call.method} call carries a {call.timeout} s deadline, expected PSP_DEADLINE_S = 5"
@@ -703,7 +707,7 @@ def check_stable_key(ctx):
 
 
 def check_retry_policy(ctx):
-    m, psp = _client(ctx, refunds=(("rf-1", 3000), ("rf-2", 2000)))
+    m, psp = _client(ctx, refunds=(("rf-1", 3000), ("rf-2", 2000), ("rf-3", 1000), ("rf-4", 1000)))
     ctx.grpc.fail("Refund", grpc.StatusCode.UNAVAILABLE, times=2)
     status = m.refund_via_psp("rf-1")
     calls = len(ctx.grpc.calls_to("Refund"))
@@ -712,6 +716,13 @@ def check_retry_policy(ctx):
     status = m.refund_via_psp("rf-2")
     calls = len(ctx.grpc.calls_to("Refund")) - 3
     assert status == "REJECTED" and calls == 1, f"an INVALID_ARGUMENT answered {status!r} after {calls} calls, expected REJECTED after 1: a refusal is not retried"
+    for n, (refund_id, code) in enumerate((("rf-3", grpc.StatusCode.INTERNAL), ("rf-4", grpc.StatusCode.RESOURCE_EXHAUSTED))):
+        ctx.grpc.fail("Refund", code, "the PSP broke", times=1)
+        status = m.refund_via_psp(refund_id)
+        calls = len(ctx.grpc.calls_to("Refund")) - 4 - n
+        row = records.find_refund(refund_id)
+        assert calls == 1 and status == "PENDING" and row["status"] == "PENDING", f"{code.name} answered {status!r} after {calls} Refund calls and left the row {row['status']}, expected PENDING after 1: only DEADLINE_EXCEEDED and UNAVAILABLE are retried, and another code is no refusal"
+    assert ledger.refunded_total("pay_1") == 5000, f"the ledger holds {ledger.refunded_total('pay_1')}, expected 5000: only the refusal of rf-2 gives its reservation back"
 
 
 def check_pending_reconcile(ctx):
@@ -725,6 +736,14 @@ def check_pending_reconcile(ctx):
     row = records.find_refund("rf-2")
     assert status == "PENDING" and row["status"] == "PENDING", f"with the PSP down for every attempt and GetRefund answering NOT_FOUND, refund_via_psp answered {status!r} and the record holds {row['status']}, expected PENDING"
     assert ledger.refunded_total("pay_1") == 5000, f"the ledger holds {ledger.refunded_total('pay_1')}, expected 5000: an unknown outcome keeps its reservation"
+    records.insert_refund("rf-3", "t1", "pay_1", 1000, "damaged", "")
+    ledger.claim("pay_1", "rf-3", 1000, 10000)
+    psp.statuses["rf-3"] = "PROCESSING"
+    ctx.grpc.fail("Refund", grpc.StatusCode.UNAVAILABLE, times=3)
+    status = m.refund_via_psp("rf-3")
+    row = records.find_refund("rf-3")
+    assert ctx.grpc.calls_to("GetRefund") and status == "PENDING" and row["status"] == "PENDING", f"with the PSP down and GetRefund answering PROCESSING, refund_via_psp answered {status!r} and the record holds {row['status']}, expected PENDING: only SUCCEEDED and FAILED settle a refund"
+    assert ledger.refunded_total("pay_1") == 6000, f"the ledger holds {ledger.refunded_total('pay_1')}, expected 6000: a refund still PROCESSING keeps its reservation"
 
 
 def check_terminal_release(ctx):
@@ -736,9 +755,20 @@ def check_terminal_release(ctx):
     held = ctx.redis.hgetall("refunded:pay_disputed")
     assert total == 3000 and "rf-2" not in held and "rf-1" in held, f"after the refusal the ledger holds {total} over {held}, expected 3000 over rf-1: release exactly the refused refund's reservation"
     assert len(ctx.grpc.calls_to("Refund")) == 1, f"a refusal was sent {len(ctx.grpc.calls_to('Refund'))} times: it is not retried"
+    # The PSP's answers are lost, and GetRefund reports the refund FAILED: a refusal too.
+    records.insert_refund("rf-3", "t1", "pay_disputed", 1000, "damaged", "")
+    ledger.claim("pay_disputed", "rf-3", 1000, 10000)
+    psp.statuses["rf-3"] = "FAILED"
+    ctx.grpc.fail("Refund", grpc.StatusCode.UNAVAILABLE, times=3)
+    status = m.refund_via_psp("rf-3")
+    row = records.find_refund("rf-3")
+    total = ledger.refunded_total("pay_disputed")
+    held = ctx.redis.hgetall("refunded:pay_disputed")
+    assert status == "REJECTED" and row["status"] == "REJECTED", f"GetRefund reported rf-3 FAILED; refund_via_psp answered {status!r} and the record holds {row['status']}, expected REJECTED"
+    assert total == 3000 and "rf-3" not in held and "rf-1" in held, f"after GetRefund reported rf-3 FAILED the ledger holds {total} over {held}, expected 3000 over rf-1: a FAILED refund gives its reservation back"
 `,
     typescript: `function client(ctx, payment = 'pay_1', refunds: [string, number][] = [['rf-1', 3000]]) {
-  const peer = {byKey: new Map<string, string>(), applied: new Map<string, string>(), payouts: [] as string[], keys: [] as string[], drop: 0};
+  const peer = {byKey: new Map<string, string>(), applied: new Map<string, string>(), payouts: [] as string[], keys: [] as string[], drop: 0, statuses: new Map<string, string>()};
   const pkg = ctx.proto('refund_service.proto');
   ctx.grpc.serve(pkg.refundd.Psp.service, {
     Refund(call, callback) {
@@ -760,6 +790,8 @@ def check_terminal_release(ctx):
       callback(null, {psp_ref: ref, status: 'SUCCEEDED'});
     },
     GetRefund(call, callback) {
+      const forced = peer.statuses.get(call.request.refund_id);
+      if (forced !== undefined) return callback(null, {refund_id: call.request.refund_id, status: forced, psp_ref: ''});
       const ref = peer.applied.get(call.request.refund_id);
       if (ref === undefined) return callback({code: ctx.grpc.status.NOT_FOUND, details: \`no refund \${call.request.refund_id}\`});
       callback(null, {refund_id: call.request.refund_id, status: 'SUCCEEDED', psp_ref: ref});
@@ -784,6 +816,7 @@ export async function check_deadline(ctx) {
   const before = ctx.clock.now();
   const status = await m.refundViaPsp('rf-1');
   assert(ctx.grpc.callsTo('Refund').length > 0, 'refundViaPsp made no Refund call');
+  assert.equal(ctx.grpc.callsTo('Refund').length, 3, \`with the PSP slower than the deadline refundViaPsp sent \${ctx.grpc.callsTo('Refund').length} Refund calls, expected 3: DEADLINE_EXCEEDED leaves the outcome unknown and is retried\`);
   for (const call of [...ctx.grpc.callsTo('Refund'), ...ctx.grpc.callsTo('GetRefund')]) {
     assert(call.timeout !== null, \`a \${call.method} call carries no deadline: a PSP that hangs holds the refund open\`);
     assert(4.5 <= call.timeout && call.timeout <= 5.5, \`a \${call.method} call carries a \${call.timeout} s deadline, expected PSP_DEADLINE_MS = 5000\`);
@@ -807,7 +840,7 @@ export async function check_stable_key(ctx) {
 }
 
 export async function check_retry_policy(ctx) {
-  const {m, seed} = client(ctx, 'pay_1', [['rf-1', 3000], ['rf-2', 2000]]);
+  const {m, records, ledger, seed} = client(ctx, 'pay_1', [['rf-1', 3000], ['rf-2', 2000], ['rf-3', 1000], ['rf-4', 1000]]);
   await seed();
   ctx.grpc.fail('Refund', ctx.grpc.status.UNAVAILABLE, '', 2);
   let status = await m.refundViaPsp('rf-1');
@@ -817,6 +850,16 @@ export async function check_retry_policy(ctx) {
   status = await m.refundViaPsp('rf-2');
   calls = ctx.grpc.callsTo('Refund').length - 3;
   assert(status === 'REJECTED' && calls === 1, \`an INVALID_ARGUMENT resolved \${status} after \${calls} calls, expected REJECTED after 1: a refusal is not retried\`);
+  const others: [string, string][] = [['rf-3', 'INTERNAL'], ['rf-4', 'RESOURCE_EXHAUSTED']];
+  for (const [n, [refundId, code]] of others.entries()) {
+    ctx.grpc.fail('Refund', ctx.grpc.status[code], 'the PSP broke', 1);
+    status = await m.refundViaPsp(refundId);
+    calls = ctx.grpc.callsTo('Refund').length - 4 - n;
+    const row = await records.findRefund(refundId);
+    assert(calls === 1 && status === 'PENDING' && row.status === 'PENDING', \`\${code} resolved \${status} after \${calls} Refund calls and left the row \${row.status}, expected PENDING after 1: only DEADLINE_EXCEEDED and UNAVAILABLE are retried, and another code is no refusal\`);
+  }
+  const total = await ledger.refundedTotal('pay_1');
+  assert.equal(total, 5000, \`the ledger holds \${total}, expected 5000: only the refusal of rf-2 gives its reservation back\`);
 }
 
 export async function check_pending_reconcile(ctx) {
@@ -832,10 +875,19 @@ export async function check_pending_reconcile(ctx) {
   assert(status === 'PENDING' && row.status === 'PENDING', \`with the PSP down for every attempt and GetRefund answering NOT_FOUND, refundViaPsp resolved \${status} and the record holds \${row.status}, expected PENDING\`);
   const total = await ledger.refundedTotal('pay_1');
   assert.equal(total, 5000, \`the ledger holds \${total}, expected 5000: an unknown outcome keeps its reservation\`);
+  await records.insertRefund('rf-3', 't1', 'pay_1', 1000, 'damaged', '');
+  await ledger.claim('pay_1', 'rf-3', 1000, 10000);
+  peer.statuses.set('rf-3', 'PROCESSING');
+  ctx.grpc.fail('Refund', ctx.grpc.status.UNAVAILABLE, '', 3);
+  status = await m.refundViaPsp('rf-3');
+  row = await records.findRefund('rf-3');
+  assert(ctx.grpc.callsTo('GetRefund').length > 0 && status === 'PENDING' && row.status === 'PENDING', \`with the PSP down and GetRefund answering PROCESSING, refundViaPsp resolved \${status} and the record holds \${row.status}, expected PENDING: only SUCCEEDED and FAILED settle a refund\`);
+  const kept = await ledger.refundedTotal('pay_1');
+  assert.equal(kept, 6000, \`the ledger holds \${kept}, expected 6000: a refund still PROCESSING keeps its reservation\`);
 }
 
 export async function check_terminal_release(ctx) {
-  const {m, records, ledger, seed} = client(ctx, 'pay_disputed', [['rf-1', 3000], ['rf-2', 4000]]);
+  const {m, peer, records, ledger, seed} = client(ctx, 'pay_disputed', [['rf-1', 3000], ['rf-2', 4000]]);
   await seed();
   await records.markConfirmed('rf-1', 're_0');
   const status = await m.refundViaPsp('rf-2');
@@ -845,6 +897,17 @@ export async function check_terminal_release(ctx) {
   const held = ctx.redis.hgetall('refunded:pay_disputed');
   assert(total === 3000 && !('rf-2' in held) && 'rf-1' in held, \`after the refusal the ledger holds \${total} over \${JSON.stringify(held)}, expected 3000 over rf-1: release exactly the refused refund's reservation\`);
   assert.equal(ctx.grpc.callsTo('Refund').length, 1, 'a refusal is not retried');
+  // The PSP's answers are lost, and GetRefund reports the refund FAILED: a refusal too.
+  await records.insertRefund('rf-3', 't1', 'pay_disputed', 1000, 'damaged', '');
+  await ledger.claim('pay_disputed', 'rf-3', 1000, 10000);
+  peer.statuses.set('rf-3', 'FAILED');
+  ctx.grpc.fail('Refund', ctx.grpc.status.UNAVAILABLE, '', 3);
+  const failed = await m.refundViaPsp('rf-3');
+  const failedRow = await records.findRefund('rf-3');
+  assert(failed === 'REJECTED' && failedRow.status === 'REJECTED', \`GetRefund reported rf-3 FAILED; refundViaPsp resolved \${failed} and the record holds \${failedRow.status}, expected REJECTED\`);
+  const left = await ledger.refundedTotal('pay_disputed');
+  const after = ctx.redis.hgetall('refunded:pay_disputed');
+  assert(left === 3000 && !('rf-3' in after) && 'rf-1' in after, \`after GetRefund reported rf-3 FAILED the ledger holds \${left} over \${JSON.stringify(after)}, expected 3000 over rf-1: a FAILED refund gives its reservation back\`);
 }
 `,
     go: `package main
@@ -869,13 +932,15 @@ var clientBg = context.Background()
 
 // pspPeer is the PSP stand-in: Refund is idempotent on the idempotency-key metadata, refuses a
 // disputed charge, and while drop > 0 pays the refund out but loses the answer (UNAVAILABLE).
+// GetRefund answers statuses[refundID] when set (FAILED, PROCESSING).
 type pspPeer struct {
 	pb.UnimplementedPspServer
-	byKey   map[string]string
-	applied map[string]string
-	payouts []string
-	keys    []string
-	drop    int
+	byKey    map[string]string
+	applied  map[string]string
+	statuses map[string]string
+	payouts  []string
+	keys     []string
+	drop     int
 }
 
 func (p *pspPeer) Refund(ctx context.Context, req *pb.RefundRequest) (*pb.RefundReply, error) {
@@ -909,6 +974,9 @@ func (p *pspPeer) Refund(ctx context.Context, req *pb.RefundRequest) (*pb.Refund
 }
 
 func (p *pspPeer) GetRefund(_ context.Context, req *pb.GetRefundRequest) (*pb.RefundStatus, error) {
+	if forced, ok := p.statuses[req.GetRefundId()]; ok {
+		return &pb.RefundStatus{RefundId: req.GetRefundId(), Status: forced}, nil
+	}
 	ref, ok := p.applied[req.GetRefundId()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no refund %s", req.GetRefundId())
@@ -922,7 +990,7 @@ type clientSeed struct {
 }
 
 func clientServe(ctx *harness.Ctx, payment string, refunds ...clientSeed) *pspPeer {
-	peer := &pspPeer{byKey: map[string]string{}, applied: map[string]string{}}
+	peer := &pspPeer{byKey: map[string]string{}, applied: map[string]string{}, statuses: map[string]string{}}
 	pb.RegisterPspServer(ctx.GRPC.Server(""), peer)
 	records.AddPayment(clientBg, payment, "t1", 10000)
 	for _, r := range refunds {
@@ -944,6 +1012,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 	before := ctx.Clock.Now()
 	got := clientPay(ctx, "rf-1")
 	ctx.Assert(len(ctx.GRPC.CallsTo("Refund", "")) > 0, "refundViaPSP made no Refund call")
+	ctx.Equal(len(ctx.GRPC.CallsTo("Refund", "")), 3, "with the PSP slower than the deadline (DEADLINE_EXCEEDED leaves the outcome unknown and is retried) the Refund calls")
 	for _, method := range []string{"Refund", "GetRefund"} {
 		for _, call := range ctx.GRPC.CallsTo(method, "") {
 			ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a PSP that hangs holds the refund open", method)
@@ -970,7 +1039,7 @@ func CheckStableKey(ctx *harness.Ctx) {
 }
 
 func CheckRetryPolicy(ctx *harness.Ctx) {
-	clientServe(ctx, "pay_1", clientSeed{"rf-1", 3000}, clientSeed{"rf-2", 2000})
+	clientServe(ctx, "pay_1", clientSeed{"rf-1", 3000}, clientSeed{"rf-2", 2000}, clientSeed{"rf-3", 1000}, clientSeed{"rf-4", 1000})
 	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 2, "")
 	got := clientPay(ctx, "rf-1")
 	calls := len(ctx.GRPC.CallsTo("Refund", ""))
@@ -979,6 +1048,19 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 	got = clientPay(ctx, "rf-2")
 	calls = len(ctx.GRPC.CallsTo("Refund", "")) - 3
 	ctx.Assert(got == "REJECTED" && calls == 1, "an INVALID_ARGUMENT answered %q after %d calls, expected REJECTED after 1: a refusal is not retried", got, calls)
+	others := []struct {
+		id   string
+		code codes.Code
+		name string
+	}{{"rf-3", codes.Internal, "INTERNAL"}, {"rf-4", codes.ResourceExhausted, "RESOURCE_EXHAUSTED"}}
+	for n, other := range others {
+		ctx.GRPC.Fail("Refund", other.code, "the PSP broke", 1, "")
+		got = clientPay(ctx, other.id)
+		calls = len(ctx.GRPC.CallsTo("Refund", "")) - 4 - n
+		row := records.FindRefund(clientBg, other.id)
+		ctx.Assert(calls == 1 && got == "PENDING" && row.Status == "PENDING", "%s answered %q after %d Refund calls and left the row %s, expected PENDING after 1: only DEADLINE_EXCEEDED and UNAVAILABLE are retried, and another code is no refusal", other.name, got, calls, row.Status)
+	}
+	ctx.Equal(ledger.RefundedTotal(clientBg, "pay_1"), 5000, "only the refusal of rf-2 gives its reservation back; the ledger")
 }
 
 func CheckPendingReconcile(ctx *harness.Ctx) {
@@ -992,10 +1074,18 @@ func CheckPendingReconcile(ctx *harness.Ctx) {
 	row = records.FindRefund(clientBg, "rf-2")
 	ctx.Assert(got == "PENDING" && row.Status == "PENDING", "with the PSP down for every attempt and GetRefund answering NOT_FOUND, refundViaPSP answered %q and the record holds %s, expected PENDING", got, row.Status)
 	ctx.Equal(ledger.RefundedTotal(clientBg, "pay_1"), 5000, "an unknown outcome keeps its reservation; the ledger")
+	records.InsertRefund(clientBg, "rf-3", "t1", "pay_1", 1000, "damaged", "")
+	ledger.Claim(clientBg, "pay_1", "rf-3", 1000, 10000)
+	peer.statuses["rf-3"] = "PROCESSING"
+	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 3, "")
+	got = clientPay(ctx, "rf-3")
+	row = records.FindRefund(clientBg, "rf-3")
+	ctx.Assert(len(ctx.GRPC.CallsTo("GetRefund", "")) > 0 && got == "PENDING" && row.Status == "PENDING", "with the PSP down and GetRefund answering PROCESSING, refundViaPSP answered %q and the record holds %s, expected PENDING: only SUCCEEDED and FAILED settle a refund", got, row.Status)
+	ctx.Equal(ledger.RefundedTotal(clientBg, "pay_1"), 6000, "a refund still PROCESSING keeps its reservation; the ledger")
 }
 
 func CheckTerminalRelease(ctx *harness.Ctx) {
-	clientServe(ctx, "pay_disputed", clientSeed{"rf-1", 3000}, clientSeed{"rf-2", 4000})
+	peer := clientServe(ctx, "pay_disputed", clientSeed{"rf-1", 3000}, clientSeed{"rf-2", 4000})
 	records.MarkConfirmed(clientBg, "rf-1", "re_0")
 	got := clientPay(ctx, "rf-2")
 	ctx.Assert(got == "REJECTED" && records.FindRefund(clientBg, "rf-2").Status == "REJECTED", "the PSP refused rf-2 with FAILED_PRECONDITION; refundViaPSP answered %q, expected REJECTED", got)
@@ -1005,12 +1095,26 @@ func CheckTerminalRelease(ctx *harness.Ctx) {
 	_, kept := held["rf-1"]
 	ctx.Assert(total == 3000 && !stillHeld && kept, "after the refusal the ledger holds %d over %v, expected 3000 over rf-1: release exactly the refused refund's reservation", total, held)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Refund", "")), 1, "a refusal is not retried; the Refund calls")
+	// The PSP's answers are lost, and GetRefund reports the refund FAILED: a refusal too.
+	records.InsertRefund(clientBg, "rf-3", "t1", "pay_disputed", 1000, "damaged", "")
+	ledger.Claim(clientBg, "pay_disputed", "rf-3", 1000, 10000)
+	peer.statuses["rf-3"] = "FAILED"
+	ctx.GRPC.Fail("Refund", codes.Unavailable, "", 3, "")
+	got = clientPay(ctx, "rf-3")
+	row := records.FindRefund(clientBg, "rf-3")
+	ctx.Assert(got == "REJECTED" && row.Status == "REJECTED", "GetRefund reported rf-3 FAILED; refundViaPSP answered %q and the record holds %s, expected REJECTED", got, row.Status)
+	total = ledger.RefundedTotal(clientBg, "pay_disputed")
+	held = ctx.Redis.HGetAll("refunded:pay_disputed")
+	_, failedHeld := held["rf-3"]
+	_, kept = held["rf-1"]
+	ctx.Assert(total == 3000 && !failedHeld && kept, "after GetRefund reported rf-3 FAILED the ledger holds %d over %v, expected 3000 over rf-1: a FAILED refund gives its reservation back", total, held)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1021,11 +1125,13 @@ func CheckTerminalRelease(ctx *harness.Ctx) {
 namespace {
 
 // The PSP stand-in: Refund is idempotent on the idempotency-key metadata, refuses a disputed charge,
-// and while drop > 0 pays the refund out but loses the answer (UNAVAILABLE).
+// and while drop > 0 pays the refund out but loses the answer (UNAVAILABLE). GetRefund answers
+// statuses[refund_id] when set (FAILED, PROCESSING).
 class PspPeer final : public refundd::Psp::Service {
  public:
   std::map<std::string, std::string> by_key;
   std::map<std::string, std::string> applied;
+  std::map<std::string, std::string> statuses;
   std::vector<std::string> payouts;
   std::vector<std::string> keys;
   int drop = 0;
@@ -1053,6 +1159,11 @@ class PspPeer final : public refundd::Psp::Service {
   }
 
   grpc::Status GetRefund(grpc::ServerContext*, const refundd::GetRefundRequest* req, refundd::RefundStatus* out) override {
+    if (statuses.count(req->refund_id())) {
+      out->set_refund_id(req->refund_id());
+      out->set_status(statuses[req->refund_id()]);
+      return grpc::Status::OK;
+    }
     if (!applied.count(req->refund_id())) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no refund " + req->refund_id());
     out->set_refund_id(req->refund_id());
     out->set_status("SUCCEEDED");
@@ -1088,6 +1199,7 @@ void CheckDeadline(harness::Ctx& ctx) {
   const int64_t before = ctx.Clock.Now();
   const std::string got = refundViaPsp("rf-1");
   ctx.Assert(!ctx.GRPC.CallsTo("Refund").empty(), "refundViaPsp made no Refund call");
+  ctx.Equal(ctx.GRPC.CallsTo("Refund").size(), 3, "with the PSP slower than the deadline (DEADLINE_EXCEEDED leaves the outcome unknown and is retried) the Refund calls");
   for (const std::string method : {"Refund", "GetRefund"}) {
     for (const auto& call : ctx.GRPC.CallsTo(method)) {
       ctx.Assert(call.HasDeadline(), "a %s call carries no deadline: a PSP that hangs holds the refund open", method);
@@ -1114,7 +1226,7 @@ void CheckStableKey(harness::Ctx& ctx) {
 }
 
 void CheckRetryPolicy(harness::Ctx& ctx) {
-  clientServe(ctx, "pay_1", {{"rf-1", 3000}, {"rf-2", 2000}});
+  clientServe(ctx, "pay_1", {{"rf-1", 3000}, {"rf-2", 2000}, {"rf-3", 1000}, {"rf-4", 1000}});
   ctx.GRPC.Fail("Refund", grpc::StatusCode::UNAVAILABLE, "", 2);
   std::string got = refundViaPsp("rf-1");
   size_t calls = ctx.GRPC.CallsTo("Refund").size();
@@ -1123,6 +1235,19 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
   got = refundViaPsp("rf-2");
   calls = ctx.GRPC.CallsTo("Refund").size() - 3;
   ctx.Assert(got == "REJECTED" && calls == 1, "an INVALID_ARGUMENT answered %q after %d calls, expected REJECTED after 1: a refusal is not retried", got, calls);
+  const std::vector<std::tuple<std::string, grpc::StatusCode, std::string>> others = {
+      {"rf-3", grpc::StatusCode::INTERNAL, "INTERNAL"}, {"rf-4", grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}};
+  for (size_t n = 0; n < others.size(); n++) {
+    const auto& [refund_id, code, name] = others[n];
+    ctx.GRPC.Fail("Refund", code, "the PSP broke", 1);
+    got = refundViaPsp(refund_id);
+    calls = ctx.GRPC.CallsTo("Refund").size() - 4 - n;
+    const std::string row_status = records::findRefund(refund_id)->status;
+    ctx.Assert(calls == 1 && got == "PENDING" && row_status == "PENDING",
+               "%s answered %q after %d Refund calls and left the row %s, expected PENDING after 1: only DEADLINE_EXCEEDED and UNAVAILABLE are retried, and another code is no refusal",
+               name, got, calls, row_status);
+  }
+  ctx.Equal(ledger::refundedTotal("pay_1"), 5000, "only the refusal of rf-2 gives its reservation back; the ledger");
 }
 
 void CheckPendingReconcile(harness::Ctx& ctx) {
@@ -1139,10 +1264,20 @@ void CheckPendingReconcile(harness::Ctx& ctx) {
   ctx.Assert(got == "PENDING" && row.status == "PENDING",
              "with the PSP down for every attempt and GetRefund answering NOT_FOUND, refundViaPsp answered %q and the record holds %s, expected PENDING", got, row.status);
   ctx.Equal(ledger::refundedTotal("pay_1"), 5000, "an unknown outcome keeps its reservation; the ledger");
+  records::insertRefund("rf-3", "t1", "pay_1", 1000, "damaged", "");
+  ledger::claim("pay_1", "rf-3", 1000, 10000);
+  peer.statuses["rf-3"] = "PROCESSING";
+  ctx.GRPC.Fail("Refund", grpc::StatusCode::UNAVAILABLE, "", 3);
+  got = refundViaPsp("rf-3");
+  row = *records::findRefund("rf-3");
+  ctx.Assert(!ctx.GRPC.CallsTo("GetRefund").empty() && got == "PENDING" && row.status == "PENDING",
+             "with the PSP down and GetRefund answering PROCESSING, refundViaPsp answered %q and the record holds %s, expected PENDING: only SUCCEEDED and FAILED settle a refund",
+             got, row.status);
+  ctx.Equal(ledger::refundedTotal("pay_1"), 6000, "a refund still PROCESSING keeps its reservation; the ledger");
 }
 
 void CheckTerminalRelease(harness::Ctx& ctx) {
-  clientServe(ctx, "pay_disputed", {{"rf-1", 3000}, {"rf-2", 4000}});
+  PspPeer& peer = clientServe(ctx, "pay_disputed", {{"rf-1", 3000}, {"rf-2", 4000}});
   records::markConfirmed("rf-1", "re_0");
   const std::string got = refundViaPsp("rf-2");
   ctx.Assert(got == "REJECTED" && records::findRefund("rf-2")->status == "REJECTED",
@@ -1152,6 +1287,18 @@ void CheckTerminalRelease(harness::Ctx& ctx) {
   ctx.Assert(total == 3000 && !held.count("rf-2") && held.count("rf-1"),
              "after the refusal the ledger holds %d, expected 3000 over rf-1: release exactly the refused refund's reservation", total);
   ctx.Equal(ctx.GRPC.CallsTo("Refund").size(), 1, "a refusal is not retried; the Refund calls");
+  // The PSP's answers are lost, and GetRefund reports the refund FAILED: a refusal too.
+  records::insertRefund("rf-3", "t1", "pay_disputed", 1000, "damaged", "");
+  ledger::claim("pay_disputed", "rf-3", 1000, 10000);
+  peer.statuses["rf-3"] = "FAILED";
+  ctx.GRPC.Fail("Refund", grpc::StatusCode::UNAVAILABLE, "", 3);
+  const std::string failed = refundViaPsp("rf-3");
+  const std::string failed_status = records::findRefund("rf-3")->status;
+  ctx.Assert(failed == "REJECTED" && failed_status == "REJECTED", "GetRefund reported rf-3 FAILED; refundViaPsp answered %q and the record holds %s, expected REJECTED", failed, failed_status);
+  const long long left = ledger::refundedTotal("pay_disputed");
+  const auto after = ctx.Redis.HGetAll("refunded:pay_disputed");
+  ctx.Assert(left == 3000 && !after.count("rf-3") && after.count("rf-1"),
+             "after GetRefund reported rf-3 FAILED the ledger holds %d, expected 3000 over rf-1: a FAILED refund gives its reservation back", left);
 }
 `,
   },

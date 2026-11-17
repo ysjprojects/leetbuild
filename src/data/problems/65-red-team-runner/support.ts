@@ -47,6 +47,7 @@ TARGETS = {
     "checkout-shadow": {"name": "checkout-shadow", "endpoint": "checkout-shadow.sandbox.internal", "environment": "shadow"},
     "search-staging": {"name": "search-staging", "endpoint": "search-staging.sandbox.internal", "environment": "staging"},
     "payments-prod": {"name": "payments-prod", "endpoint": "payments.prod.internal", "environment": PRODUCTION},
+    "ledger-primary": {"name": "ledger-primary", "endpoint": "ledger.core.internal", "environment": PRODUCTION},
 }
 
 
@@ -229,6 +230,7 @@ const TARGETS: Record<string, Target> = {
   'checkout-shadow': {name: 'checkout-shadow', endpoint: 'checkout-shadow.sandbox.internal', environment: 'shadow'},
   'search-staging': {name: 'search-staging', endpoint: 'search-staging.sandbox.internal', environment: 'staging'},
   'payments-prod': {name: 'payments-prod', endpoint: 'payments.prod.internal', environment: PRODUCTION},
+  'ledger-primary': {name: 'ledger-primary', endpoint: 'ledger.core.internal', environment: PRODUCTION},
 };
 
 /** The registered target, null for a name nobody registered. */
@@ -450,6 +452,7 @@ var registry = map[string]Target{
 	"checkout-shadow": {Name: "checkout-shadow", Endpoint: "checkout-shadow.sandbox.internal", Environment: "shadow"},
 	"search-staging":  {Name: "search-staging", Endpoint: "search-staging.sandbox.internal", Environment: "staging"},
 	"payments-prod":   {Name: "payments-prod", Endpoint: "payments.prod.internal", Environment: Production},
+	"ledger-primary":  {Name: "ledger-primary", Endpoint: "ledger.core.internal", Environment: Production},
 }
 
 // Resolve is the registered target; ok is false for a name nobody registered.
@@ -782,6 +785,7 @@ inline const std::map<std::string, Target>& registry() {
       {"checkout-shadow", {"checkout-shadow", "checkout-shadow.sandbox.internal", "shadow"}},
       {"search-staging", {"search-staging", "search-staging.sandbox.internal", "staging"}},
       {"payments-prod", {"payments-prod", "payments.prod.internal", kProduction}},
+      {"ledger-primary", {"ledger-primary", "ledger.core.internal", kProduction}},
   };
   return targets;
 }
@@ -1044,7 +1048,8 @@ object Targets {
   private val registry = Map(
     "checkout-shadow" -> Target("checkout-shadow", "checkout-shadow.sandbox.internal", "shadow"),
     "search-staging" -> Target("search-staging", "search-staging.sandbox.internal", "staging"),
-    "payments-prod" -> Target("payments-prod", "payments.prod.internal", Production)
+    "payments-prod" -> Target("payments-prod", "payments.prod.internal", Production),
+    "ledger-primary" -> Target("ledger-primary", "ledger.core.internal", Production)
   )
 
   /** The registered target, None for a name nobody registered. */

@@ -46,7 +46,7 @@ Requirements, each kept by **one Lua script**:
       id: 'reserve-at-submit',
       title: 'Queues a job only once its hours are reserved',
       detail:
-        'A job the pool cannot cover is not queued and gets no reservation; a covered one is queued with reserved = amount and the pool drawn by that much. The starter pushes onto the queue before it looks at the pool.',
+        'A job the pool cannot cover is not queued and gets no reservation; a covered one is queued with reserved = amount and the pool drawn by that much. A pool holding exactly the amount covers it, and an empty pool cannot cover even 1 hour. The starter pushes onto the queue before it looks at the pool.',
       match: {
         python: {order: [/DECRBY/, /RPUSH/], none: [/\.rpush\(/]},
         typescript: {order: [/DECRBY/, /RPUSH/], none: [/\.rpush\(/]},
@@ -78,7 +78,7 @@ Requirements, each kept by **one Lua script**:
       id: 'start-guard',
       title: 'Starts only a queued reservation',
       detail:
-        'A job that never got a reservation, a cancelled one and one already running do not start and nothing is written for them; a queued one becomes running and leaves the queue. The starter marks any job running.',
+        'A job that never got a reservation, a cancelled one and one already running do not start and nothing is written for them; a queued one becomes running and leaves the queue. A cancel landing between start\u2019s commands is not overwritten. The starter marks any job running.',
       match: {
         python: {all: [/(~=|==)\s*['"]queued['"]/]},
         typescript: {all: [/(~=|==)\s*['"]queued['"]/]},
@@ -91,7 +91,7 @@ Requirements, each kept by **one Lua script**:
       id: 'release-once',
       title: 'Returns the remainder once, and never more than was reserved',
       detail:
-        'complete(600 reserved, 450 spent) returns 150 and the retry returns 0; a run that overspent returns 0 and takes nothing more from the pool. The starter adds reserved - spent to the pool on every call.',
+        'complete(600 reserved, 450 spent) returns 150 and the retry returns 0; a run that overspent returns 0 and takes nothing more from the pool. A job that never started, or was cancelled, completes nothing, and a duplicate callback landing between a completion\u2019s commands returns nothing more. The starter adds reserved - spent to the pool on every call.',
       match: {
         python: {all: [/(~=|==)\s*['"]running['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
         typescript: {all: [/(~=|==)\s*['"]running['"]/, /redis\.call\(\s*['"]INCRBY['"]/], none: [/\.incrby\(/]},
@@ -104,7 +104,7 @@ Requirements, each kept by **one Lua script**:
       id: 'cancel-frees',
       title: 'Cancelling frees the whole unspent reservation',
       detail:
-        'Cancelling a queued job returns all 600 hours, takes it off the queue and marks it cancelled; a second cancel, or a cancel after completion, returns 0. The starter returns the job\u2019s spent figure, which is 0 before it ran.',
+        'Cancelling a queued job returns all 600 hours, takes it off the queue and marks it cancelled; a second cancel, or a cancel after completion, returns 0. Cancelling a running job frees its reservation too, and a job with no reservation frees 0 and writes nothing. The starter returns the job\u2019s spent figure, which is 0 before it ran.',
       match: {
         python: {all: [/redis\.call\(\s*['"]HSET['"][^\n]*['"]cancelled['"]/]},
         typescript: {all: [/redis\.call\(\s*['"]HSET['"][^\n]*['"]cancelled['"]/]},
@@ -785,6 +785,9 @@ def check_reserve_at_submit(ctx):
     res = _reservation(ctx, "job-ok")
     assert res.get("reserved") == "60" and res.get("state") == "queued" and res.get("team") == TEAM, f"the reservation must read team, reserved 60, state queued: {res}"
     assert _pool(ctx) == 40, f"the pool must be drawn by 60, it holds {_pool(ctx)}"
+    assert m.submit(TEAM, "job-exact", 40) is True, "a pool of 40 hours covers a job of exactly 40: submit must answer True"
+    assert _pool(ctx) == 0 and _queue(ctx) == ["job-ok", "job-exact"], f"the exact fit draws the pool to 0 and is queued: pool {_pool(ctx)}, queue {_queue(ctx)}"
+    assert m.submit(TEAM, "job-one", 1) is False and _pool(ctx) == 0 and _reservation(ctx, "job-one") == {}, f"an empty pool cannot cover 1 hour: pool {_pool(ctx)}, reservation {_reservation(ctx, 'job-one')}"
 
 
 def check_atomic_reserve(ctx):
@@ -818,6 +821,20 @@ def check_start_guard(ctx):
     m.cancel(TEAM, "job-b")
     assert m.start(TEAM, "job-b") is False, "a cancelled job must not start: its reservation is gone"
     assert _reservation(ctx, "job-b").get("state") == "cancelled", f"start overwrote a cancelled reservation: {_reservation(ctx, 'job-b')}"
+    assert m.submit(TEAM, "job-c", 20) is True
+
+    def cancel_lands():
+        # the team cancels job-c from another replica, landing right after start's first command on the reservation
+        res = ctx.redis.hgetall("ft:reservation:job-c")
+        if res.get("state") in ("queued", "running"):
+            ctx.redis.incrby(POOL, int(res["reserved"]) - int(res["spent"]))
+            ctx.redis.lrem(QUEUE, 0, "job-c")
+            ctx.redis.hset("ft:reservation:job-c", "state", "cancelled")
+
+    probe = ctx.redis_after("ft:reservation:job-c", cancel_lands)
+    m.start(TEAM, "job-c")
+    assert probe.fired, "start never touched job-c's reservation"
+    assert _reservation(ctx, "job-c").get("state") == "cancelled", f"a cancel landed between start's commands and start overwrote it: job-c reads {_reservation(ctx, 'job-c')} though its hours went back to the pool. Check and move the state in one script"
 
 
 def check_release_once(ctx):
@@ -832,6 +849,25 @@ def check_release_once(ctx):
     assert m.submit(TEAM, "job-b", 300) is True and m.start(TEAM, "job-b") is True
     over = m.complete(TEAM, "job-b", 500)
     assert over == 0 and _pool(ctx) == 250, f"a run that spent 500 of 300 reserved hours returned {over} and left the pool at {_pool(ctx)}, expected 0 and 250: a release never takes more from the pool"
+    assert m.submit(TEAM, "job-c", 100) is True and m.start(TEAM, "job-c") is True
+
+    def duplicate_callback():
+        # the same completion delivered again, landing right after this one's first command on the reservation
+        res = ctx.redis.hgetall("ft:reservation:job-c")
+        if res.get("state") == "running":
+            ctx.redis.incrby(POOL, int(res["reserved"]) - 60)
+            ctx.redis.hset("ft:reservation:job-c", mapping={"spent": 60, "state": "completed"})
+
+    probe = ctx.redis_after("ft:reservation:job-c", duplicate_callback)
+    m.complete(TEAM, "job-c", 60)
+    assert probe.fired, "complete never touched job-c's reservation"
+    assert _pool(ctx) == 190, f"a duplicate completion landed between this completion's commands and the pool holds {_pool(ctx)}, expected 190: the 40-hour remainder went back twice. Check the state and release in one script"
+    assert m.submit(TEAM, "job-d", 50) is True
+    early = m.complete(TEAM, "job-d", 0)
+    assert early == 0 and _pool(ctx) == 140 and _reservation(ctx, "job-d").get("state") == "queued", f"job-d never started, yet complete returned {early}: pool {_pool(ctx)}, {_reservation(ctx, 'job-d')}; only a running reservation completes"
+    assert m.cancel(TEAM, "job-d") == 50
+    late = m.complete(TEAM, "job-d", 0)
+    assert late == 0 and _pool(ctx) == 190 and _reservation(ctx, "job-d").get("state") == "cancelled", f"a completion after the cancel returned {late}: pool {_pool(ctx)}, {_reservation(ctx, 'job-d')}; a cancelled job's hours went back already"
 
 
 def check_cancel_frees(ctx):
@@ -845,6 +881,11 @@ def check_cancel_frees(ctx):
     assert m.complete(TEAM, "job-b", 150) == 50
     late = m.cancel(TEAM, "job-b")
     assert late == 0 and _pool(ctx) == 850, f"a cancel after completion freed {late} and left the pool at {_pool(ctx)}, expected 0 and 850"
+    assert m.submit(TEAM, "job-c", 300) is True and m.start(TEAM, "job-c") is True
+    freed = m.cancel(TEAM, "job-c")
+    assert freed == 300 and _pool(ctx) == 850 and _reservation(ctx, "job-c").get("state") == "cancelled", f"cancelling a running job freed {freed} and left the pool at {_pool(ctx)}, expected 300 and 850: {_reservation(ctx, 'job-c')}"
+    ghost = m.cancel(TEAM, "job-ghost")
+    assert ghost == 0 and _pool(ctx) == 850 and _reservation(ctx, "job-ghost") == {}, f"cancelling a job with no reservation freed {ghost}, pool {_pool(ctx)}, wrote {_reservation(ctx, 'job-ghost')}"
 `,
     typescript: `const TEAM = 'ml-search';
 const POOL = \`ft:pool:\${TEAM}\`;
@@ -870,6 +911,10 @@ export async function check_reserve_at_submit(ctx) {
   const res = reservation(ctx, 'job-ok');
   assert(res.reserved === '60' && res.state === 'queued' && res.team === TEAM, \`the reservation must read team, reserved 60, state queued: \${JSON.stringify(res)}\`);
   assert.equal(poolOf(ctx), 40, \`the pool must be drawn by 60, it holds \${poolOf(ctx)}\`);
+  assert.equal(await m.submit(TEAM, 'job-exact', 40), true, 'a pool of 40 hours covers a job of exactly 40: submit must resolve true');
+  assert(poolOf(ctx) === 0 && JSON.stringify(queueOf(ctx)) === '["job-ok","job-exact"]', \`the exact fit draws the pool to 0 and is queued: pool \${poolOf(ctx)}, queue \${JSON.stringify(queueOf(ctx))}\`);
+  const one = await m.submit(TEAM, 'job-one', 1);
+  assert(one === false && poolOf(ctx) === 0 && Object.keys(reservation(ctx, 'job-one')).length === 0, \`an empty pool cannot cover 1 hour: submit resolved \${one}, pool \${poolOf(ctx)}, reservation \${JSON.stringify(reservation(ctx, 'job-one'))}\`);
 }
 
 export async function check_atomic_reserve(ctx) {
@@ -902,6 +947,19 @@ export async function check_start_guard(ctx) {
   await m.cancel(TEAM, 'job-b');
   assert.equal(await m.start(TEAM, 'job-b'), false, 'a cancelled job must not start: its reservation is gone');
   assert.equal(reservation(ctx, 'job-b').state, 'cancelled', \`start overwrote a cancelled reservation: \${JSON.stringify(reservation(ctx, 'job-b'))}\`);
+  assert.equal(await m.submit(TEAM, 'job-c', 20), true);
+  // the team cancels job-c from another replica, landing right after start's first command on the reservation
+  const probe = ctx.redisAfter('ft:reservation:job-c', () => {
+    const res = reservation(ctx, 'job-c');
+    if (res.state === 'queued' || res.state === 'running') {
+      ctx.redis.incrby(POOL, Number(res.reserved) - Number(res.spent));
+      ctx.redis.lrem(QUEUE, 0, 'job-c');
+      ctx.redis.hset('ft:reservation:job-c', 'state', 'cancelled');
+    }
+  });
+  await m.start(TEAM, 'job-c');
+  assert(probe.fired, "start never touched job-c's reservation");
+  assert.equal(reservation(ctx, 'job-c').state, 'cancelled', \`a cancel landed between start's commands and start overwrote it: job-c reads \${JSON.stringify(reservation(ctx, 'job-c'))} though its hours went back to the pool. Check and move the state in one script\`);
 }
 
 export async function check_release_once(ctx) {
@@ -916,6 +974,24 @@ export async function check_release_once(ctx) {
   assert((await m.submit(TEAM, 'job-b', 300)) && (await m.start(TEAM, 'job-b')), 'job-b must be reserved and started');
   const over = await m.complete(TEAM, 'job-b', 500);
   assert(over === 0 && poolOf(ctx) === 250, \`a run that spent 500 of 300 reserved hours returned \${over} and left the pool at \${poolOf(ctx)}, expected 0 and 250: a release never takes more from the pool\`);
+  assert((await m.submit(TEAM, 'job-c', 100)) && (await m.start(TEAM, 'job-c')), 'job-c must be reserved and started');
+  // the same completion delivered again, landing right after this one's first command on the reservation
+  const probe = ctx.redisAfter('ft:reservation:job-c', () => {
+    const r = reservation(ctx, 'job-c');
+    if (r.state === 'running') {
+      ctx.redis.incrby(POOL, Number(r.reserved) - 60);
+      ctx.redis.hset('ft:reservation:job-c', {spent: 60, state: 'completed'});
+    }
+  });
+  await m.complete(TEAM, 'job-c', 60);
+  assert(probe.fired, "complete never touched job-c's reservation");
+  assert.equal(poolOf(ctx), 190, \`a duplicate completion landed between this completion's commands and the pool holds \${poolOf(ctx)}, expected 190: the 40-hour remainder went back twice. Check the state and release in one script\`);
+  assert.equal(await m.submit(TEAM, 'job-d', 50), true);
+  const early = await m.complete(TEAM, 'job-d', 0);
+  assert(early === 0 && poolOf(ctx) === 140 && reservation(ctx, 'job-d').state === 'queued', \`job-d never started, yet complete returned \${early}: pool \${poolOf(ctx)}, \${JSON.stringify(reservation(ctx, 'job-d'))}; only a running reservation completes\`);
+  assert.equal(await m.cancel(TEAM, 'job-d'), 50);
+  const late = await m.complete(TEAM, 'job-d', 0);
+  assert(late === 0 && poolOf(ctx) === 190 && reservation(ctx, 'job-d').state === 'cancelled', \`a completion after the cancel returned \${late}: pool \${poolOf(ctx)}, \${JSON.stringify(reservation(ctx, 'job-d'))}; a cancelled job's hours went back already\`);
 }
 
 export async function check_cancel_frees(ctx) {
@@ -929,6 +1005,11 @@ export async function check_cancel_frees(ctx) {
   assert.equal(await m.complete(TEAM, 'job-b', 150), 50);
   const late = await m.cancel(TEAM, 'job-b');
   assert(late === 0 && poolOf(ctx) === 850, \`a cancel after completion freed \${late} and left the pool at \${poolOf(ctx)}, expected 0 and 850\`);
+  assert((await m.submit(TEAM, 'job-c', 300)) && (await m.start(TEAM, 'job-c')), 'job-c must be reserved and started');
+  const running = await m.cancel(TEAM, 'job-c');
+  assert(running === 300 && poolOf(ctx) === 850 && reservation(ctx, 'job-c').state === 'cancelled', \`cancelling a running job freed \${running} and left the pool at \${poolOf(ctx)}, expected 300 and 850: \${JSON.stringify(reservation(ctx, 'job-c'))}\`);
+  const ghost = await m.cancel(TEAM, 'job-ghost');
+  assert(ghost === 0 && poolOf(ctx) === 850 && Object.keys(reservation(ctx, 'job-ghost')).length === 0, \`cancelling a job with no reservation freed \${ghost}, pool \${poolOf(ctx)}, wrote \${JSON.stringify(reservation(ctx, 'job-ghost'))}\`);
 }
 `,
     go: `package main
@@ -941,75 +1022,79 @@ import (
 )
 
 const (
-	budgetTeam  = "ml-search"
-	budgetPool  = "ft:pool:ml-search"
-	budgetQueue = "ft:queue:ml-search"
+	harnessBudgetTeam  = "ml-search"
+	harnessBudgetPool  = "ft:pool:ml-search"
+	harnessBudgetQueue = "ft:queue:ml-search"
 )
 
-var budgetCtx = context.Background()
+var harnessBudgetCtx = context.Background()
 
-func budgetSeed(ctx *harness.Ctx, pool int64) { ctx.Redis.Set(budgetPool, pool) }
+func harnessBudgetSeed(ctx *harness.Ctx, pool int64) { ctx.Redis.Set(harnessBudgetPool, pool) }
 
-func budgetBalance(ctx *harness.Ctx) int64 {
-	raw, _ := ctx.Redis.Get(budgetPool)
+func harnessBudgetBalance(ctx *harness.Ctx) int64 {
+	raw, _ := ctx.Redis.Get(harnessBudgetPool)
 	n, _ := strconv.ParseInt(raw, 10, 64)
 	return n
 }
 
-func budgetReservation(ctx *harness.Ctx, jobID string) map[string]string {
+func harnessBudgetReservation(ctx *harness.Ctx, jobID string) map[string]string {
 	return ctx.Redis.HGetAll("ft:reservation:" + jobID)
 }
 
-func budgetSubmit(ctx *harness.Ctx, jobID string, amount int64) bool {
-	ok, err := submit(budgetCtx, budgetTeam, jobID, amount)
+func harnessBudgetSubmit(ctx *harness.Ctx, jobID string, amount int64) bool {
+	ok, err := submit(harnessBudgetCtx, harnessBudgetTeam, jobID, amount)
 	ctx.NoError(err, "submit(%s, %d)", jobID, amount)
 	return ok
 }
 
-func budgetStart(ctx *harness.Ctx, jobID string) bool {
-	ok, err := start(budgetCtx, budgetTeam, jobID)
+func harnessBudgetStart(ctx *harness.Ctx, jobID string) bool {
+	ok, err := start(harnessBudgetCtx, harnessBudgetTeam, jobID)
 	ctx.NoError(err, "start(%s)", jobID)
 	return ok
 }
 
-func budgetComplete(ctx *harness.Ctx, jobID string, spent int64) int64 {
-	n, err := complete(budgetCtx, budgetTeam, jobID, spent)
+func harnessBudgetComplete(ctx *harness.Ctx, jobID string, spent int64) int64 {
+	n, err := complete(harnessBudgetCtx, harnessBudgetTeam, jobID, spent)
 	ctx.NoError(err, "complete(%s, %d)", jobID, spent)
 	return n
 }
 
-func budgetCancel(ctx *harness.Ctx, jobID string) int64 {
-	n, err := cancel(budgetCtx, budgetTeam, jobID)
+func harnessBudgetCancel(ctx *harness.Ctx, jobID string) int64 {
+	n, err := cancel(harnessBudgetCtx, harnessBudgetTeam, jobID)
 	ctx.NoError(err, "cancel(%s)", jobID)
 	return n
 }
 
 func CheckReserveAtSubmit(ctx *harness.Ctx) {
-	budgetSeed(ctx, 100)
-	ctx.Assert(!budgetSubmit(ctx, "job-big", 150), "a pool of 100 hours cannot cover 150: submit must answer false")
-	ctx.Equal(len(ctx.Redis.LRange(budgetQueue, 0, -1)), 0, "a job the pool cannot cover was queued anyway (%v): the queue must hold only jobs whose hours are reserved; queued jobs", ctx.Redis.LRange(budgetQueue, 0, -1))
-	ctx.Equal(len(budgetReservation(ctx, "job-big")), 0, "a refused submit wrote a reservation (%v); fields", budgetReservation(ctx, "job-big"))
-	ctx.Equal(budgetBalance(ctx), 100, "a refused submit moved the pool")
-	ctx.Assert(budgetSubmit(ctx, "job-ok", 60), "60 of 100 hours must be reserved")
-	ctx.Equal(ctx.Redis.LRange(budgetQueue, 0, -1), []string{"job-ok"}, "the covered job must be queued once")
-	res := budgetReservation(ctx, "job-ok")
-	ctx.Assert(res["reserved"] == "60" && res["state"] == "queued" && res["team"] == budgetTeam, "the reservation must read team, reserved 60, state queued: %v", res)
-	ctx.Equal(budgetBalance(ctx), 40, "the pool must be drawn by 60")
+	harnessBudgetSeed(ctx, 100)
+	ctx.Assert(!harnessBudgetSubmit(ctx, "job-big", 150), "a pool of 100 hours cannot cover 150: submit must answer false")
+	ctx.Equal(len(ctx.Redis.LRange(harnessBudgetQueue, 0, -1)), 0, "a job the pool cannot cover was queued anyway (%v): the queue must hold only jobs whose hours are reserved; queued jobs", ctx.Redis.LRange(harnessBudgetQueue, 0, -1))
+	ctx.Equal(len(harnessBudgetReservation(ctx, "job-big")), 0, "a refused submit wrote a reservation (%v); fields", harnessBudgetReservation(ctx, "job-big"))
+	ctx.Equal(harnessBudgetBalance(ctx), 100, "a refused submit moved the pool")
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-ok", 60), "60 of 100 hours must be reserved")
+	ctx.Equal(ctx.Redis.LRange(harnessBudgetQueue, 0, -1), []string{"job-ok"}, "the covered job must be queued once")
+	res := harnessBudgetReservation(ctx, "job-ok")
+	ctx.Assert(res["reserved"] == "60" && res["state"] == "queued" && res["team"] == harnessBudgetTeam, "the reservation must read team, reserved 60, state queued: %v", res)
+	ctx.Equal(harnessBudgetBalance(ctx), 40, "the pool must be drawn by 60")
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-exact", 40), "a pool of 40 hours covers a job of exactly 40: submit must answer true")
+	ctx.Assert(harnessBudgetBalance(ctx) == 0 && len(ctx.Redis.LRange(harnessBudgetQueue, 0, -1)) == 2, "the exact fit draws the pool to 0 and is queued: pool %d, queue %v", harnessBudgetBalance(ctx), ctx.Redis.LRange(harnessBudgetQueue, 0, -1))
+	one := harnessBudgetSubmit(ctx, "job-one", 1)
+	ctx.Assert(!one && harnessBudgetBalance(ctx) == 0 && len(harnessBudgetReservation(ctx, "job-one")) == 0, "an empty pool cannot cover 1 hour: submit answered %v, pool %d, reservation %v", one, harnessBudgetBalance(ctx), harnessBudgetReservation(ctx, "job-one"))
 }
 
 func CheckAtomicReserve(ctx *harness.Ctx) {
-	budgetSeed(ctx, 100)
+	harnessBudgetSeed(ctx, 100)
 	fired, other := false, false
 	// another API replica submitting job-b for 80 hours, landing between this submit's commands
-	ctx.Redis.After(budgetPool, func() any {
+	ctx.Redis.After(harnessBudgetPool, func() any {
 		fired = true
-		if budgetBalance(ctx) >= 80 {
-			ctx.Redis.Do("DECRBY", budgetPool, 80)
+		if harnessBudgetBalance(ctx) >= 80 {
+			ctx.Redis.Do("DECRBY", harnessBudgetPool, 80)
 			other = true
 		}
 		return nil
 	})
-	mine := budgetSubmit(ctx, "job-a", 60)
+	mine := harnessBudgetSubmit(ctx, "job-a", 60)
 	ctx.Assert(fired, "submit never touched the pool")
 	drawn := int64(0)
 	if mine {
@@ -1018,50 +1103,91 @@ func CheckAtomicReserve(ctx *harness.Ctx) {
 	if other {
 		drawn += 80
 	}
-	ctx.Assert(budgetBalance(ctx) >= 0, "two submissions of 60 and 80 hours against a pool of 100 left it at %d: both passed the balance check before either drew, so the cluster is oversubscribed. Test and draw in one script", budgetBalance(ctx))
-	ctx.Equal(budgetBalance(ctx), 100-drawn, "the pool against what the successful submissions drew")
+	ctx.Assert(harnessBudgetBalance(ctx) >= 0, "two submissions of 60 and 80 hours against a pool of 100 left it at %d: both passed the balance check before either drew, so the cluster is oversubscribed. Test and draw in one script", harnessBudgetBalance(ctx))
+	ctx.Equal(harnessBudgetBalance(ctx), 100-drawn, "the pool against what the successful submissions drew")
 	ctx.Assert(mine || other, "one of the two submissions fits the pool and must succeed")
 }
 
 func CheckStartGuard(ctx *harness.Ctx) {
-	budgetSeed(ctx, 100)
-	ctx.Assert(!budgetStart(ctx, "job-ghost"), "job-ghost has no reservation: start must answer false, a job cannot run on hours nobody reserved")
-	ctx.Equal(len(budgetReservation(ctx, "job-ghost")), 0, "start wrote a reservation for a job that never had one (%v); fields", budgetReservation(ctx, "job-ghost"))
-	ctx.Assert(budgetSubmit(ctx, "job-a", 60), "job-a must be reserved")
-	ctx.Assert(budgetStart(ctx, "job-a"), "a queued job with a reservation must start")
-	ctx.Assert(budgetReservation(ctx, "job-a")["state"] == "running" && len(ctx.Redis.LRange(budgetQueue, 0, -1)) == 0, "a started job is running and off the queue: %v, queue %v", budgetReservation(ctx, "job-a"), ctx.Redis.LRange(budgetQueue, 0, -1))
-	ctx.Assert(!budgetStart(ctx, "job-a"), "a running job must not start a second time")
-	ctx.Assert(budgetSubmit(ctx, "job-b", 30), "job-b must be reserved")
-	budgetCancel(ctx, "job-b")
-	ctx.Assert(!budgetStart(ctx, "job-b"), "a cancelled job must not start: its reservation is gone")
-	ctx.Equal(budgetReservation(ctx, "job-b")["state"], "cancelled", "start overwrote a cancelled reservation; its state")
+	harnessBudgetSeed(ctx, 100)
+	ctx.Assert(!harnessBudgetStart(ctx, "job-ghost"), "job-ghost has no reservation: start must answer false, a job cannot run on hours nobody reserved")
+	ctx.Equal(len(harnessBudgetReservation(ctx, "job-ghost")), 0, "start wrote a reservation for a job that never had one (%v); fields", harnessBudgetReservation(ctx, "job-ghost"))
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-a", 60), "job-a must be reserved")
+	ctx.Assert(harnessBudgetStart(ctx, "job-a"), "a queued job with a reservation must start")
+	ctx.Assert(harnessBudgetReservation(ctx, "job-a")["state"] == "running" && len(ctx.Redis.LRange(harnessBudgetQueue, 0, -1)) == 0, "a started job is running and off the queue: %v, queue %v", harnessBudgetReservation(ctx, "job-a"), ctx.Redis.LRange(harnessBudgetQueue, 0, -1))
+	ctx.Assert(!harnessBudgetStart(ctx, "job-a"), "a running job must not start a second time")
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-b", 30), "job-b must be reserved")
+	harnessBudgetCancel(ctx, "job-b")
+	ctx.Assert(!harnessBudgetStart(ctx, "job-b"), "a cancelled job must not start: its reservation is gone")
+	ctx.Equal(harnessBudgetReservation(ctx, "job-b")["state"], "cancelled", "start overwrote a cancelled reservation; its state")
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-c", 20), "job-c must be reserved")
+	// the team cancels job-c from another replica, landing right after start's first command on the reservation
+	probe := ctx.Redis.After("ft:reservation:job-c", func() any {
+		res := harnessBudgetReservation(ctx, "job-c")
+		if res["state"] == "queued" || res["state"] == "running" {
+			reserved, _ := strconv.ParseInt(res["reserved"], 10, 64)
+			spent, _ := strconv.ParseInt(res["spent"], 10, 64)
+			ctx.Redis.Do("INCRBY", harnessBudgetPool, reserved-spent)
+			ctx.Redis.Do("LREM", harnessBudgetQueue, 0, "job-c")
+			ctx.Redis.Do("HSET", "ft:reservation:job-c", "state", "cancelled")
+		}
+		return nil
+	})
+	harnessBudgetStart(ctx, "job-c")
+	ctx.Assert(probe.Fired, "start never touched job-c's reservation")
+	ctx.Equal(harnessBudgetReservation(ctx, "job-c")["state"], "cancelled", "a cancel landed between start's commands and start overwrote it, though job-c's hours went back to the pool: check and move the state in one script; job-c's state")
 }
 
 func CheckReleaseOnce(ctx *harness.Ctx) {
-	budgetSeed(ctx, 1000)
-	ctx.Assert(budgetSubmit(ctx, "job-a", 600) && budgetStart(ctx, "job-a"), "job-a must be reserved and started")
-	ctx.Equal(budgetComplete(ctx, "job-a", 450), 150, "600 reserved, 450 spent: complete returns")
-	ctx.Equal(budgetBalance(ctx), 550, "the pool after the remainder came back")
-	again := budgetComplete(ctx, "job-a", 450)
-	ctx.Assert(again == 0 && budgetBalance(ctx) == 550, "the trainer's completion callback arrived twice and the second returned %d, leaving the pool at %d: the remainder goes back once", again, budgetBalance(ctx))
-	res := budgetReservation(ctx, "job-a")
+	harnessBudgetSeed(ctx, 1000)
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-a", 600) && harnessBudgetStart(ctx, "job-a"), "job-a must be reserved and started")
+	ctx.Equal(harnessBudgetComplete(ctx, "job-a", 450), 150, "600 reserved, 450 spent: complete returns")
+	ctx.Equal(harnessBudgetBalance(ctx), 550, "the pool after the remainder came back")
+	again := harnessBudgetComplete(ctx, "job-a", 450)
+	ctx.Assert(again == 0 && harnessBudgetBalance(ctx) == 550, "the trainer's completion callback arrived twice and the second returned %d, leaving the pool at %d: the remainder goes back once", again, harnessBudgetBalance(ctx))
+	res := harnessBudgetReservation(ctx, "job-a")
 	ctx.Assert(res["spent"] == "450" && res["state"] == "completed", "the reservation must read spent 450, state completed: %v", res)
-	ctx.Assert(budgetSubmit(ctx, "job-b", 300) && budgetStart(ctx, "job-b"), "job-b must be reserved and started")
-	over := budgetComplete(ctx, "job-b", 500)
-	ctx.Assert(over == 0 && budgetBalance(ctx) == 250, "a run that spent 500 of 300 reserved hours returned %d and left the pool at %d, expected 0 and 250: a release never takes more from the pool", over, budgetBalance(ctx))
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-b", 300) && harnessBudgetStart(ctx, "job-b"), "job-b must be reserved and started")
+	over := harnessBudgetComplete(ctx, "job-b", 500)
+	ctx.Assert(over == 0 && harnessBudgetBalance(ctx) == 250, "a run that spent 500 of 300 reserved hours returned %d and left the pool at %d, expected 0 and 250: a release never takes more from the pool", over, harnessBudgetBalance(ctx))
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-c", 100) && harnessBudgetStart(ctx, "job-c"), "job-c must be reserved and started")
+	// the same completion delivered again, landing right after this one's first command on the reservation
+	probe := ctx.Redis.After("ft:reservation:job-c", func() any {
+		res := harnessBudgetReservation(ctx, "job-c")
+		if res["state"] == "running" {
+			reserved, _ := strconv.ParseInt(res["reserved"], 10, 64)
+			ctx.Redis.Do("INCRBY", harnessBudgetPool, reserved-60)
+			ctx.Redis.Do("HSET", "ft:reservation:job-c", "spent", 60, "state", "completed")
+		}
+		return nil
+	})
+	harnessBudgetComplete(ctx, "job-c", 60)
+	ctx.Assert(probe.Fired, "complete never touched job-c's reservation")
+	ctx.Equal(harnessBudgetBalance(ctx), 190, "a duplicate completion landed between this completion's commands: the 40-hour remainder went back twice. Check the state and release in one script; the pool")
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-d", 50), "job-d must be reserved")
+	early := harnessBudgetComplete(ctx, "job-d", 0)
+	ctx.Assert(early == 0 && harnessBudgetBalance(ctx) == 140 && harnessBudgetReservation(ctx, "job-d")["state"] == "queued", "job-d never started, yet complete returned %d: pool %d, %v; only a running reservation completes", early, harnessBudgetBalance(ctx), harnessBudgetReservation(ctx, "job-d"))
+	ctx.Equal(harnessBudgetCancel(ctx, "job-d"), 50, "cancelling queued job-d frees")
+	late := harnessBudgetComplete(ctx, "job-d", 0)
+	ctx.Assert(late == 0 && harnessBudgetBalance(ctx) == 190 && harnessBudgetReservation(ctx, "job-d")["state"] == "cancelled", "a completion after the cancel returned %d: pool %d, %v; a cancelled job's hours went back already", late, harnessBudgetBalance(ctx), harnessBudgetReservation(ctx, "job-d"))
 }
 
 func CheckCancelFrees(ctx *harness.Ctx) {
-	budgetSeed(ctx, 1000)
-	ctx.Assert(budgetSubmit(ctx, "job-a", 600), "job-a must be reserved")
-	freed := budgetCancel(ctx, "job-a")
-	ctx.Assert(freed == 600 && budgetBalance(ctx) == 1000, "cancelling a queued job freed %d hours and left the pool at %d, expected 600 and 1000: a cancelled job keeps nothing", freed, budgetBalance(ctx))
-	ctx.Assert(len(ctx.Redis.LRange(budgetQueue, 0, -1)) == 0 && budgetReservation(ctx, "job-a")["state"] == "cancelled", "a cancelled job leaves the queue and reads cancelled: queue %v, %v", ctx.Redis.LRange(budgetQueue, 0, -1), budgetReservation(ctx, "job-a"))
-	ctx.Assert(budgetCancel(ctx, "job-a") == 0 && budgetBalance(ctx) == 1000, "a second cancel must free nothing, the pool holds %d", budgetBalance(ctx))
-	ctx.Assert(budgetSubmit(ctx, "job-b", 200) && budgetStart(ctx, "job-b"), "job-b must be reserved and started")
-	ctx.Equal(budgetComplete(ctx, "job-b", 150), 50, "200 reserved, 150 spent: complete returns")
-	late := budgetCancel(ctx, "job-b")
-	ctx.Assert(late == 0 && budgetBalance(ctx) == 850, "a cancel after completion freed %d and left the pool at %d, expected 0 and 850", late, budgetBalance(ctx))
+	harnessBudgetSeed(ctx, 1000)
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-a", 600), "job-a must be reserved")
+	freed := harnessBudgetCancel(ctx, "job-a")
+	ctx.Assert(freed == 600 && harnessBudgetBalance(ctx) == 1000, "cancelling a queued job freed %d hours and left the pool at %d, expected 600 and 1000: a cancelled job keeps nothing", freed, harnessBudgetBalance(ctx))
+	ctx.Assert(len(ctx.Redis.LRange(harnessBudgetQueue, 0, -1)) == 0 && harnessBudgetReservation(ctx, "job-a")["state"] == "cancelled", "a cancelled job leaves the queue and reads cancelled: queue %v, %v", ctx.Redis.LRange(harnessBudgetQueue, 0, -1), harnessBudgetReservation(ctx, "job-a"))
+	ctx.Assert(harnessBudgetCancel(ctx, "job-a") == 0 && harnessBudgetBalance(ctx) == 1000, "a second cancel must free nothing, the pool holds %d", harnessBudgetBalance(ctx))
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-b", 200) && harnessBudgetStart(ctx, "job-b"), "job-b must be reserved and started")
+	ctx.Equal(harnessBudgetComplete(ctx, "job-b", 150), 50, "200 reserved, 150 spent: complete returns")
+	late := harnessBudgetCancel(ctx, "job-b")
+	ctx.Assert(late == 0 && harnessBudgetBalance(ctx) == 850, "a cancel after completion freed %d and left the pool at %d, expected 0 and 850", late, harnessBudgetBalance(ctx))
+	ctx.Assert(harnessBudgetSubmit(ctx, "job-c", 300) && harnessBudgetStart(ctx, "job-c"), "job-c must be reserved and started")
+	running := harnessBudgetCancel(ctx, "job-c")
+	ctx.Assert(running == 300 && harnessBudgetBalance(ctx) == 850 && harnessBudgetReservation(ctx, "job-c")["state"] == "cancelled", "cancelling a running job freed %d and left the pool at %d, expected 300 and 850: %v", running, harnessBudgetBalance(ctx), harnessBudgetReservation(ctx, "job-c"))
+	ghost := harnessBudgetCancel(ctx, "job-ghost")
+	ctx.Assert(ghost == 0 && harnessBudgetBalance(ctx) == 850 && len(harnessBudgetReservation(ctx, "job-ghost")) == 0, "cancelling a job with no reservation freed %d, pool %d, wrote %v", ghost, harnessBudgetBalance(ctx), harnessBudgetReservation(ctx, "job-ghost"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1071,16 +1197,16 @@ func CheckCancelFrees(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTeam = "ml-search";
-const std::string kPool = "ft:pool:ml-search";
-const std::string kQueue = "ft:queue:ml-search";
+const std::string kHarnessTeam = "ml-search";
+const std::string kHarnessPool = "ft:pool:ml-search";
+const std::string kHarnessQueue = "ft:queue:ml-search";
 
-long long balance(harness::Ctx& ctx) {
-  const auto raw = ctx.Redis.Get(kPool);
+long long harnessBalance(harness::Ctx& ctx) {
+  const auto raw = ctx.Redis.Get(kHarnessPool);
   return raw ? std::strtoll(raw->c_str(), nullptr, 10) : 0;
 }
 
-std::string field(harness::Ctx& ctx, const std::string& job_id, const std::string& name) {
+std::string harnessField(harness::Ctx& ctx, const std::string& job_id, const std::string& name) {
   const auto all = ctx.Redis.HGetAll("ft:reservation:" + job_id);
   const auto it = all.find(name);
   return it == all.end() ? "" : it->second;
@@ -1089,78 +1215,122 @@ std::string field(harness::Ctx& ctx, const std::string& job_id, const std::strin
 }  // namespace
 
 void CheckReserveAtSubmit(harness::Ctx& ctx) {
-  ctx.Redis.Set(kPool, 100);
-  ctx.Assert(!submit(kTeam, "job-big", 150), "a pool of 100 hours cannot cover 150: submit must answer false");
-  ctx.Equal(ctx.Redis.LRange(kQueue, 0, -1).size(), 0, "a job the pool cannot cover was queued anyway (%v): the queue must hold only jobs whose hours are reserved; queued jobs", ctx.Redis.LRange(kQueue, 0, -1));
+  ctx.Redis.Set(kHarnessPool, 100);
+  ctx.Assert(!submit(kHarnessTeam, "job-big", 150), "a pool of 100 hours cannot cover 150: submit must answer false");
+  ctx.Equal(ctx.Redis.LRange(kHarnessQueue, 0, -1).size(), 0, "a job the pool cannot cover was queued anyway (%v): the queue must hold only jobs whose hours are reserved; queued jobs", ctx.Redis.LRange(kHarnessQueue, 0, -1));
   ctx.Equal(ctx.Redis.HGetAll("ft:reservation:job-big").size(), 0, "a refused submit wrote a reservation; fields");
-  ctx.Equal(balance(ctx), 100, "a refused submit moved the pool");
-  ctx.Assert(submit(kTeam, "job-ok", 60), "60 of 100 hours must be reserved");
-  ctx.Equal(ctx.Redis.LRange(kQueue, 0, -1), {"job-ok"}, "the covered job must be queued once");
-  ctx.Assert(field(ctx, "job-ok", "reserved") == "60" && field(ctx, "job-ok", "state") == "queued" && field(ctx, "job-ok", "team") == kTeam,
+  ctx.Equal(harnessBalance(ctx), 100, "a refused submit moved the pool");
+  ctx.Assert(submit(kHarnessTeam, "job-ok", 60), "60 of 100 hours must be reserved");
+  ctx.Equal(ctx.Redis.LRange(kHarnessQueue, 0, -1), {"job-ok"}, "the covered job must be queued once");
+  ctx.Assert(harnessField(ctx, "job-ok", "reserved") == "60" && harnessField(ctx, "job-ok", "state") == "queued" && harnessField(ctx, "job-ok", "team") == kHarnessTeam,
              "the reservation must read team, reserved 60, state queued: %v", ctx.Redis.HGetAll("ft:reservation:job-ok"));
-  ctx.Equal(balance(ctx), 40, "the pool must be drawn by 60");
+  ctx.Equal(harnessBalance(ctx), 40, "the pool must be drawn by 60");
+  ctx.Assert(submit(kHarnessTeam, "job-exact", 40), "a pool of 40 hours covers a job of exactly 40: submit must answer true");
+  ctx.Assert(harnessBalance(ctx) == 0 && ctx.Redis.LRange(kHarnessQueue, 0, -1).size() == 2, "the exact fit draws the pool to 0 and is queued: pool %d, queue %v", harnessBalance(ctx), ctx.Redis.LRange(kHarnessQueue, 0, -1));
+  const bool one = submit(kHarnessTeam, "job-one", 1);
+  ctx.Assert(!one && harnessBalance(ctx) == 0 && ctx.Redis.HGetAll("ft:reservation:job-one").empty(), "an empty pool cannot cover 1 hour: submit answered %v, pool %d, reservation %v", one, harnessBalance(ctx), ctx.Redis.HGetAll("ft:reservation:job-one"));
 }
 
 void CheckAtomicReserve(harness::Ctx& ctx) {
-  ctx.Redis.Set(kPool, 100);
+  ctx.Redis.Set(kHarnessPool, 100);
   bool fired = false;
   bool other = false;
   // another API replica submitting job-b for 80 hours, landing between this submit's commands
-  ctx.Redis.After(kPool, [&] {
+  ctx.Redis.After(kHarnessPool, [&] {
     fired = true;
-    if (balance(ctx) >= 80) {
-      ctx.Redis.Do("DECRBY", kPool, 80);
+    if (harnessBalance(ctx) >= 80) {
+      ctx.Redis.Do("DECRBY", kHarnessPool, 80);
       other = true;
     }
   });
-  const bool mine = submit(kTeam, "job-a", 60);
+  const bool mine = submit(kHarnessTeam, "job-a", 60);
   ctx.Assert(fired, "submit never touched the pool");
   const long long drawn = (mine ? 60 : 0) + (other ? 80 : 0);
-  ctx.Assert(balance(ctx) >= 0, "two submissions of 60 and 80 hours against a pool of 100 left it at %d: both passed the balance check before either drew, so the cluster is oversubscribed. Test and draw in one script", balance(ctx));
-  ctx.Equal(balance(ctx), 100 - drawn, "the pool against what the successful submissions drew");
+  ctx.Assert(harnessBalance(ctx) >= 0, "two submissions of 60 and 80 hours against a pool of 100 left it at %d: both passed the balance check before either drew, so the cluster is oversubscribed. Test and draw in one script", harnessBalance(ctx));
+  ctx.Equal(harnessBalance(ctx), 100 - drawn, "the pool against what the successful submissions drew");
   ctx.Assert(mine || other, "one of the two submissions fits the pool and must succeed");
 }
 
 void CheckStartGuard(harness::Ctx& ctx) {
-  ctx.Redis.Set(kPool, 100);
-  ctx.Assert(!start(kTeam, "job-ghost"), "job-ghost has no reservation: start must answer false, a job cannot run on hours nobody reserved");
+  ctx.Redis.Set(kHarnessPool, 100);
+  ctx.Assert(!start(kHarnessTeam, "job-ghost"), "job-ghost has no reservation: start must answer false, a job cannot run on hours nobody reserved");
   ctx.Equal(ctx.Redis.HGetAll("ft:reservation:job-ghost").size(), 0, "start wrote a reservation for a job that never had one; fields");
-  ctx.Assert(submit(kTeam, "job-a", 60), "job-a must be reserved");
-  ctx.Assert(start(kTeam, "job-a"), "a queued job with a reservation must start");
-  ctx.Assert(field(ctx, "job-a", "state") == "running" && ctx.Redis.LRange(kQueue, 0, -1).empty(), "a started job is running and off the queue: %v, queue %v",
-             ctx.Redis.HGetAll("ft:reservation:job-a"), ctx.Redis.LRange(kQueue, 0, -1));
-  ctx.Assert(!start(kTeam, "job-a"), "a running job must not start a second time");
-  ctx.Assert(submit(kTeam, "job-b", 30), "job-b must be reserved");
-  cancel(kTeam, "job-b");
-  ctx.Assert(!start(kTeam, "job-b"), "a cancelled job must not start: its reservation is gone");
-  ctx.Equal(field(ctx, "job-b", "state"), "cancelled", "start overwrote a cancelled reservation; its state");
+  ctx.Assert(submit(kHarnessTeam, "job-a", 60), "job-a must be reserved");
+  ctx.Assert(start(kHarnessTeam, "job-a"), "a queued job with a reservation must start");
+  ctx.Assert(harnessField(ctx, "job-a", "state") == "running" && ctx.Redis.LRange(kHarnessQueue, 0, -1).empty(), "a started job is running and off the queue: %v, queue %v",
+             ctx.Redis.HGetAll("ft:reservation:job-a"), ctx.Redis.LRange(kHarnessQueue, 0, -1));
+  ctx.Assert(!start(kHarnessTeam, "job-a"), "a running job must not start a second time");
+  ctx.Assert(submit(kHarnessTeam, "job-b", 30), "job-b must be reserved");
+  cancel(kHarnessTeam, "job-b");
+  ctx.Assert(!start(kHarnessTeam, "job-b"), "a cancelled job must not start: its reservation is gone");
+  ctx.Equal(harnessField(ctx, "job-b", "state"), "cancelled", "start overwrote a cancelled reservation; its state");
+  ctx.Assert(submit(kHarnessTeam, "job-c", 20), "job-c must be reserved");
+  bool fired = false;
+  // the team cancels job-c from another replica, landing right after start's first command on the reservation
+  ctx.Redis.After("ft:reservation:job-c", [&] {
+    fired = true;
+    const std::string state = harnessField(ctx, "job-c", "state");
+    if (state == "queued" || state == "running") {
+      const long long back = std::strtoll(harnessField(ctx, "job-c", "reserved").c_str(), nullptr, 10) - std::strtoll(harnessField(ctx, "job-c", "spent").c_str(), nullptr, 10);
+      ctx.Redis.Do("INCRBY", kHarnessPool, back);
+      ctx.Redis.Do("LREM", kHarnessQueue, 0, "job-c");
+      ctx.Redis.Do("HSET", "ft:reservation:job-c", "state", "cancelled");
+    }
+  });
+  start(kHarnessTeam, "job-c");
+  ctx.Assert(fired, "start never touched job-c's reservation");
+  ctx.Equal(harnessField(ctx, "job-c", "state"), "cancelled", "a cancel landed between start's commands and start overwrote it, though job-c's hours went back to the pool: check and move the state in one script; job-c's state");
 }
 
 void CheckReleaseOnce(harness::Ctx& ctx) {
-  ctx.Redis.Set(kPool, 1000);
-  ctx.Assert(submit(kTeam, "job-a", 600) && start(kTeam, "job-a"), "job-a must be reserved and started");
-  ctx.Equal(complete(kTeam, "job-a", 450), 150, "600 reserved, 450 spent: complete returns");
-  ctx.Equal(balance(ctx), 550, "the pool after the remainder came back");
-  const long long again = complete(kTeam, "job-a", 450);
-  ctx.Assert(again == 0 && balance(ctx) == 550, "the trainer's completion callback arrived twice and the second returned %d, leaving the pool at %d: the remainder goes back once", again, balance(ctx));
-  ctx.Assert(field(ctx, "job-a", "spent") == "450" && field(ctx, "job-a", "state") == "completed", "the reservation must read spent 450, state completed: %v", ctx.Redis.HGetAll("ft:reservation:job-a"));
-  ctx.Assert(submit(kTeam, "job-b", 300) && start(kTeam, "job-b"), "job-b must be reserved and started");
-  const long long over = complete(kTeam, "job-b", 500);
-  ctx.Assert(over == 0 && balance(ctx) == 250, "a run that spent 500 of 300 reserved hours returned %d and left the pool at %d, expected 0 and 250: a release never takes more from the pool", over, balance(ctx));
+  ctx.Redis.Set(kHarnessPool, 1000);
+  ctx.Assert(submit(kHarnessTeam, "job-a", 600) && start(kHarnessTeam, "job-a"), "job-a must be reserved and started");
+  ctx.Equal(complete(kHarnessTeam, "job-a", 450), 150, "600 reserved, 450 spent: complete returns");
+  ctx.Equal(harnessBalance(ctx), 550, "the pool after the remainder came back");
+  const long long again = complete(kHarnessTeam, "job-a", 450);
+  ctx.Assert(again == 0 && harnessBalance(ctx) == 550, "the trainer's completion callback arrived twice and the second returned %d, leaving the pool at %d: the remainder goes back once", again, harnessBalance(ctx));
+  ctx.Assert(harnessField(ctx, "job-a", "spent") == "450" && harnessField(ctx, "job-a", "state") == "completed", "the reservation must read spent 450, state completed: %v", ctx.Redis.HGetAll("ft:reservation:job-a"));
+  ctx.Assert(submit(kHarnessTeam, "job-b", 300) && start(kHarnessTeam, "job-b"), "job-b must be reserved and started");
+  const long long over = complete(kHarnessTeam, "job-b", 500);
+  ctx.Assert(over == 0 && harnessBalance(ctx) == 250, "a run that spent 500 of 300 reserved hours returned %d and left the pool at %d, expected 0 and 250: a release never takes more from the pool", over, harnessBalance(ctx));
+  ctx.Assert(submit(kHarnessTeam, "job-c", 100) && start(kHarnessTeam, "job-c"), "job-c must be reserved and started");
+  bool fired = false;
+  // the same completion delivered again, landing right after this one's first command on the reservation
+  ctx.Redis.After("ft:reservation:job-c", [&] {
+    fired = true;
+    if (harnessField(ctx, "job-c", "state") == "running") {
+      ctx.Redis.Do("INCRBY", kHarnessPool, std::strtoll(harnessField(ctx, "job-c", "reserved").c_str(), nullptr, 10) - 60);
+      ctx.Redis.Do("HSET", "ft:reservation:job-c", "spent", 60, "state", "completed");
+    }
+  });
+  complete(kHarnessTeam, "job-c", 60);
+  ctx.Assert(fired, "complete never touched job-c's reservation");
+  ctx.Equal(harnessBalance(ctx), 190, "a duplicate completion landed between this completion's commands: the 40-hour remainder went back twice. Check the state and release in one script; the pool");
+  ctx.Assert(submit(kHarnessTeam, "job-d", 50), "job-d must be reserved");
+  const long long early = complete(kHarnessTeam, "job-d", 0);
+  ctx.Assert(early == 0 && harnessBalance(ctx) == 140 && harnessField(ctx, "job-d", "state") == "queued", "job-d never started, yet complete returned %d: pool %d, %v; only a running reservation completes", early, harnessBalance(ctx), ctx.Redis.HGetAll("ft:reservation:job-d"));
+  ctx.Equal(cancel(kHarnessTeam, "job-d"), 50, "cancelling queued job-d frees");
+  const long long late = complete(kHarnessTeam, "job-d", 0);
+  ctx.Assert(late == 0 && harnessBalance(ctx) == 190 && harnessField(ctx, "job-d", "state") == "cancelled", "a completion after the cancel returned %d: pool %d, %v; a cancelled job's hours went back already", late, harnessBalance(ctx), ctx.Redis.HGetAll("ft:reservation:job-d"));
 }
 
 void CheckCancelFrees(harness::Ctx& ctx) {
-  ctx.Redis.Set(kPool, 1000);
-  ctx.Assert(submit(kTeam, "job-a", 600), "job-a must be reserved");
-  const long long freed = cancel(kTeam, "job-a");
-  ctx.Assert(freed == 600 && balance(ctx) == 1000, "cancelling a queued job freed %d hours and left the pool at %d, expected 600 and 1000: a cancelled job keeps nothing", freed, balance(ctx));
-  ctx.Assert(ctx.Redis.LRange(kQueue, 0, -1).empty() && field(ctx, "job-a", "state") == "cancelled", "a cancelled job leaves the queue and reads cancelled: queue %v, %v",
-             ctx.Redis.LRange(kQueue, 0, -1), ctx.Redis.HGetAll("ft:reservation:job-a"));
-  ctx.Assert(cancel(kTeam, "job-a") == 0 && balance(ctx) == 1000, "a second cancel must free nothing, the pool holds %d", balance(ctx));
-  ctx.Assert(submit(kTeam, "job-b", 200) && start(kTeam, "job-b"), "job-b must be reserved and started");
-  ctx.Equal(complete(kTeam, "job-b", 150), 50, "200 reserved, 150 spent: complete returns");
-  const long long late = cancel(kTeam, "job-b");
-  ctx.Assert(late == 0 && balance(ctx) == 850, "a cancel after completion freed %d and left the pool at %d, expected 0 and 850", late, balance(ctx));
+  ctx.Redis.Set(kHarnessPool, 1000);
+  ctx.Assert(submit(kHarnessTeam, "job-a", 600), "job-a must be reserved");
+  const long long freed = cancel(kHarnessTeam, "job-a");
+  ctx.Assert(freed == 600 && harnessBalance(ctx) == 1000, "cancelling a queued job freed %d hours and left the pool at %d, expected 600 and 1000: a cancelled job keeps nothing", freed, harnessBalance(ctx));
+  ctx.Assert(ctx.Redis.LRange(kHarnessQueue, 0, -1).empty() && harnessField(ctx, "job-a", "state") == "cancelled", "a cancelled job leaves the queue and reads cancelled: queue %v, %v",
+             ctx.Redis.LRange(kHarnessQueue, 0, -1), ctx.Redis.HGetAll("ft:reservation:job-a"));
+  ctx.Assert(cancel(kHarnessTeam, "job-a") == 0 && harnessBalance(ctx) == 1000, "a second cancel must free nothing, the pool holds %d", harnessBalance(ctx));
+  ctx.Assert(submit(kHarnessTeam, "job-b", 200) && start(kHarnessTeam, "job-b"), "job-b must be reserved and started");
+  ctx.Equal(complete(kHarnessTeam, "job-b", 150), 50, "200 reserved, 150 spent: complete returns");
+  const long long late = cancel(kHarnessTeam, "job-b");
+  ctx.Assert(late == 0 && harnessBalance(ctx) == 850, "a cancel after completion freed %d and left the pool at %d, expected 0 and 850", late, harnessBalance(ctx));
+  ctx.Assert(submit(kHarnessTeam, "job-c", 300) && start(kHarnessTeam, "job-c"), "job-c must be reserved and started");
+  const long long running = cancel(kHarnessTeam, "job-c");
+  ctx.Assert(running == 300 && harnessBalance(ctx) == 850 && harnessField(ctx, "job-c", "state") == "cancelled", "cancelling a running job freed %d and left the pool at %d, expected 300 and 850: %v", running, harnessBalance(ctx), ctx.Redis.HGetAll("ft:reservation:job-c"));
+  const long long ghost = cancel(kHarnessTeam, "job-ghost");
+  ctx.Assert(ghost == 0 && harnessBalance(ctx) == 850 && ctx.Redis.HGetAll("ft:reservation:job-ghost").empty(), "cancelling a job with no reservation freed %d, pool %d, wrote %v", ghost, harnessBalance(ctx), ctx.Redis.HGetAll("ft:reservation:job-ghost"));
 }
 `,
   },

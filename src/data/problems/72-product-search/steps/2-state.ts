@@ -22,8 +22,11 @@ indexed after the first search stays invisible to that query.
   query (\`normalize_query\`), the filters as \`field=value\` pairs sorted by field and joined by
   \`&\`, and the page size, joined by newlines.
 - The index version is read on every call (\`index_version(tenant)\`): \`put_product\` bumps it, so
-  the next search misses instead of serving the old page for a minute.
-- An entry lives \`CACHE_TTL_S\` = 60 seconds (\`SET … EX\`).`,
+  the next search misses instead of serving the old page for a minute. A page is stored under the
+  version read before \`run_query\` ran, so a write that lands while the engine runs makes the next
+  search miss too.
+- A hit answers from Redis without running the engine.
+- An entry lives \`CACHE_TTL_S\` = 60 seconds, set by the command that stores it (\`SET … EX\`).`,
   sequence: {
     participants: ['searchd', 'Redis', 'Catalog index'],
     messages: [
@@ -39,7 +42,7 @@ indexed after the first search stays invisible to that query.
       id: 'key-inputs',
       title: 'The key names the tenant, the filters and the page size',
       detail:
-        'The key starts `search:{tenant}:` and its digest covers the filters, sorted by field, and the page size; the starter keys by `q` alone, so another tenant or another filter set gets the first caller’s page.',
+        'The key starts `search:{tenant}:` and its digest covers the filters (each field with its value, sorted by field) and the page size; the starter keys by `q` alone, so another tenant or another filter set gets the first caller’s page.',
       match: {
         python: {all: [/search:\{tenant\}:/, /sorted\(\s*filters/], none: [/f["']search:\{q\}["']/]},
         typescript: {
@@ -71,7 +74,7 @@ indexed after the first search stays invisible to that query.
       id: 'ttl',
       title: 'Entries expire after 60 seconds',
       detail:
-        'Every entry is written with `CACHE_TTL_S` = 60 (`SET … EX`, `setex`); the starter’s plain `SET` keeps a page forever.',
+        'Every entry is written with `CACHE_TTL_S` = 60 by the command that stores it (`SET … EX`, `setex`), so no crash leaves an entry without its expiry; the starter’s plain `SET` keeps a page forever.',
       match: {
         python: {all: [/CACHE_TTL_S\s*=\s*60\b/, /ex\s*=\s*CACHE_TTL_S|setex\([^\n]*CACHE_TTL_S/]},
         typescript: {all: [/CACHE_TTL_S\s*=\s*60\b/, /'EX',\s*CACHE_TTL_S|setex\([^\n]*CACHE_TTL_S/]},
@@ -84,7 +87,7 @@ indexed after the first search stays invisible to that query.
       id: 'index-version',
       title: 'A catalog write makes the next search miss',
       detail:
-        'The key carries `index_version(tenant)`, read on every call; `put_product` bumps it, so a newly indexed product shows up on the next search rather than after the TTL.',
+        'The key carries `index_version(tenant)`, read on every call; `put_product` bumps it, so a newly indexed product shows up on the next search rather than after the TTL, a product indexed while the engine runs included. A repeated search with no write in between is answered from the cache.',
       match: {
         python: {all: [/catalog\.index_version\(\s*tenant\s*\)/]},
         typescript: {all: [/indexVersion\(\s*tenant\s*\)/]},
@@ -408,6 +411,7 @@ KETTLES = [
 ]
 COPPER = {"id": "p-9", "title": "Copper Kettle", "brand": "acme", "category": "kitchen", "price_cents": 5999, "in_stock": True, "cost_cents": 3000}
 TRAVEL = {"id": "p-4", "title": "Travel Kettle", "brand": "acme", "category": "kitchen", "price_cents": 1999, "in_stock": True, "cost_cents": 700}
+CAMP = {"id": "p-5", "title": "Camp Kettle", "brand": "acme", "category": "kitchen", "price_cents": "1499", "in_stock": "true", "cost_cents": "500", "price_version": "1"}
 
 
 def _cache(ctx):
@@ -428,6 +432,8 @@ def check_key_inputs(ctx):
     assert other == ["p-9"], f"tenant t-2 searching kettle got {other}, expected its own [p-9]: the cache served t-1's page to another tenant"
     acme = _ids(m.cached_search("t-1", "kettle", {"brand": "acme"}, 10))
     assert acme == ["p-1"], f"t-1 searching kettle with brand=acme got {acme}, expected [p-1]: the cache answered the unfiltered page"
+    by_category = _ids(m.cached_search("t-1", "kettle", {"category": "acme"}, 10))
+    assert by_category == [], f"t-1 searching kettle with category=acme got {by_category}, expected []: the cache answered the brand=acme page, so the digest must name each filter's field as well as its value"
     one = _ids(m.cached_search("t-1", "kettle", {}, 1))
     assert one == ["p-2"], f"t-1 searching kettle with page_size 1 got {one}, expected [p-2]: the cache answered a page of another size"
     keys = sorted(ctx.redis.keys("search:*"))
@@ -448,17 +454,47 @@ def check_ttl(ctx):
     m.cached_search("t-1", "kettle", {}, 10)
     keys = ctx.redis.keys("search:*")
     assert len(keys) == 1, f"one search left {len(keys)} cache entries {sorted(keys)}, expected 1"
-    ttl = ctx.redis.ttl(keys[0])
-    assert 0 < ttl <= 60, f"the cache entry {keys[0]} has TTL {ttl}: {'it never expires' if ttl == -1 else 'expected at most 60 s'}. Write it with CACHE_TTL_S = 60"
+    key = keys[0]
+    ttl = ctx.redis.ttl(key)
+    assert 55 <= ttl <= 60, f"the cache entry {key} has TTL {ttl}: {'it never expires' if ttl == -1 else 'expected 60 s'}. Write it with CACHE_TTL_S = 60"
+    # The same search again, after the entry is gone: the TTL the entry has the moment the command that wrote it returns.
+    ctx.redis.delete(key)
+    created = []
+
+    def ttl_at_creation():
+        if not ctx.redis.exists(key):  # the lookup came first: watch the write
+            created.append(ctx.redis_after(key, ttl_at_creation))
+            return None
+        return ctx.redis.ttl(key)
+
+    created.append(ctx.redis_after(key, ttl_at_creation))
+    m.cached_search("t-1", "kettle", {}, 10)
+    born = created[-1].result
+    assert born is not None and born > 0, f"right after the command that wrote {key} its TTL was {born}: the page and its expiry go in one command (SET … EX), so a crash in between never leaves an entry that lives forever"
 
 
 def check_index_version(ctx):
     m = _cache(ctx)
     assert _ids(m.cached_search("t-1", "kettle", {}, 10)) == ["p-2", "p-1"], "t-1's first search for kettle must answer its two kettles"
-    assert _ids(m.cached_search("t-1", "kettle", {}, 10)) == ["p-2", "p-1"], "the repeated search must answer the same page"
+    # Retitled without a version bump: a hit still shows the stored page, a search that skips the cache shows the new title.
+    ctx.redis.hset("catalog:t-1:product:p-1", "title", "Steel Kettle Mk2")
+    again = m.cached_search("t-1", "kettle", {}, 10)
+    assert _ids(again) == ["p-2", "p-1"], f"the repeated search answered {_ids(again)}, expected the same page [p-2, p-1]"
+    assert again[1]["title"] == "Steel Kettle", f"the repeated search showed p-1 as {again[1]['title']!r}: it ran the engine again instead of answering from the cache entry the first search stored"
     catalog.put_product("t-1", TRAVEL)
     after = _ids(m.cached_search("t-1", "kettle", {}, 10))
     assert after == ["p-4", "p-2", "p-1"], f"after put_product indexed p-4 the search answered {after}, expected [p-4, p-2, p-1]: the key must carry index_version(tenant), read on every call"
+
+    def index_camp():  # another writer indexes p-5 while this search runs the engine
+        ctx.redis.hset("catalog:t-1:product:p-5", mapping=CAMP)
+        ctx.redis.sadd("catalog:t-1:ids", "p-5")
+        ctx.redis.incr("catalog:t-1:version")
+
+    write = ctx.redis_after("catalog:t-1:ids", index_camp)
+    m.cached_search("t-1", "kettle", {}, 5)
+    assert write.fired, "a search with a new page size never ran the engine"
+    latest = _ids(m.cached_search("t-1", "kettle", {}, 5))
+    assert latest == ["p-5", "p-4", "p-2", "p-1"], f"p-5 was indexed while a search ran the engine; the next search answered {latest}, expected [p-5, p-4, p-2, p-1]: a page is stored under the index version read before run_query, so the write that landed during it makes the next search miss"
 `,
     typescript: `const KETTLES = [
   {id: 'p-1', title: 'Steel Kettle', brand: 'acme', category: 'kitchen', price_cents: 3499, in_stock: true, cost_cents: 1200},
@@ -466,6 +502,7 @@ def check_index_version(ctx):
 ];
 const COPPER = {id: 'p-9', title: 'Copper Kettle', brand: 'acme', category: 'kitchen', price_cents: 5999, in_stock: true, cost_cents: 3000};
 const TRAVEL = {id: 'p-4', title: 'Travel Kettle', brand: 'acme', category: 'kitchen', price_cents: 1999, in_stock: true, cost_cents: 700};
+const CAMP = {id: 'p-5', title: 'Camp Kettle', brand: 'acme', category: 'kitchen', price_cents: '1499', in_stock: 'true', cost_cents: '500', price_version: '1'};
 
 async function cache(ctx) {
   const catalog = ctx.load('/support/search/catalog.ts');
@@ -483,6 +520,8 @@ export async function check_key_inputs(ctx) {
   assert.equal(other, '["p-9"]', \`tenant t-2 searching kettle got \${other}, expected its own [p-9]: the cache served t-1's page to another tenant\`);
   const acme = ids(await m.cachedSearch('t-1', 'kettle', {brand: 'acme'}, 10));
   assert.equal(acme, '["p-1"]', \`t-1 searching kettle with brand=acme got \${acme}, expected [p-1]: the cache answered the unfiltered page\`);
+  const byCategory = ids(await m.cachedSearch('t-1', 'kettle', {category: 'acme'}, 10));
+  assert.equal(byCategory, '[]', \`t-1 searching kettle with category=acme got \${byCategory}, expected []: the cache answered the brand=acme page, so the digest must name each filter's field as well as its value\`);
   const one = ids(await m.cachedSearch('t-1', 'kettle', {}, 1));
   assert.equal(one, '["p-2"]', \`t-1 searching kettle with page_size 1 got \${one}, expected [p-2]: the cache answered a page of another size\`);
   const keys = ctx.redis.keys('search:*').sort();
@@ -503,17 +542,46 @@ export async function check_ttl(ctx) {
   await m.cachedSearch('t-1', 'kettle', {}, 10);
   const keys = ctx.redis.keys('search:*');
   assert.equal(keys.length, 1, \`one search left \${keys.length} cache entries \${JSON.stringify(keys)}, expected 1\`);
-  const ttl = Number(ctx.redis.ttl(keys[0]));
-  assert(ttl > 0 && ttl <= 60, \`the cache entry \${keys[0]} has TTL \${ttl}: \${ttl === -1 ? 'it never expires' : 'expected at most 60 s'}. Write it with CACHE_TTL_S = 60\`);
+  const key = keys[0];
+  const ttl = Number(ctx.redis.ttl(key));
+  assert(ttl >= 55 && ttl <= 60, \`the cache entry \${key} has TTL \${ttl}: \${ttl === -1 ? 'it never expires' : 'expected 60 s'}. Write it with CACHE_TTL_S = 60\`);
+  // The same search again, after the entry is gone: the TTL the entry has the moment the command that wrote it returns.
+  ctx.redis.del(key);
+  const created: {result: unknown}[] = [];
+  const ttlAtCreation = () => {
+    if (ctx.redis.exists(key) === 0) {
+      created.push(ctx.redisAfter(key, ttlAtCreation)); // the lookup came first: watch the write
+      return null;
+    }
+    return ctx.redis.ttl(key);
+  };
+  created.push(ctx.redisAfter(key, ttlAtCreation));
+  await m.cachedSearch('t-1', 'kettle', {}, 10);
+  const born = created[created.length - 1].result as number | null | undefined;
+  assert(born !== null && born !== undefined && born > 0, \`right after the command that wrote \${key} its TTL was \${born}: the page and its expiry go in one command (SET … EX), so a crash in between never leaves an entry that lives forever\`);
 }
 
 export async function check_index_version(ctx) {
   const {m, catalog} = await cache(ctx);
   assert.equal(ids(await m.cachedSearch('t-1', 'kettle', {}, 10)), '["p-2","p-1"]', "t-1's first search for kettle must answer its two kettles");
-  assert.equal(ids(await m.cachedSearch('t-1', 'kettle', {}, 10)), '["p-2","p-1"]', 'the repeated search must answer the same page');
+  // Retitled without a version bump: a hit still shows the stored page, a search that skips the cache shows the new title.
+  ctx.redis.hset('catalog:t-1:product:p-1', 'title', 'Steel Kettle Mk2');
+  const again = await m.cachedSearch('t-1', 'kettle', {}, 10);
+  assert.equal(ids(again), '["p-2","p-1"]', \`the repeated search answered \${ids(again)}, expected the same page [p-2, p-1]\`);
+  assert.equal(again[1].title, 'Steel Kettle', \`the repeated search showed p-1 as \${JSON.stringify(again[1].title)}: it ran the engine again instead of answering from the cache entry the first search stored\`);
   await catalog.putProduct('t-1', TRAVEL);
   const after = ids(await m.cachedSearch('t-1', 'kettle', {}, 10));
   assert.equal(after, '["p-4","p-2","p-1"]', \`after putProduct indexed p-4 the search answered \${after}, expected [p-4, p-2, p-1]: the key must carry indexVersion(tenant), read on every call\`);
+  // Another writer indexes p-5 while this search runs the engine.
+  const write = ctx.redisAfter('catalog:t-1:ids', () => {
+    ctx.redis.hset('catalog:t-1:product:p-5', CAMP);
+    ctx.redis.sadd('catalog:t-1:ids', 'p-5');
+    ctx.redis.incr('catalog:t-1:version');
+  });
+  await m.cachedSearch('t-1', 'kettle', {}, 5);
+  assert(write.fired, 'a search with a new page size never ran the engine');
+  const latest = ids(await m.cachedSearch('t-1', 'kettle', {}, 5));
+  assert.equal(latest, '["p-5","p-4","p-2","p-1"]', \`p-5 was indexed while a search ran the engine; the next search answered \${latest}, expected [p-5, p-4, p-2, p-1]: a page is stored under the index version read before runQuery, so the write that landed during it makes the next search miss\`);
 }
 `,
     go: `package main
@@ -537,64 +605,102 @@ var (
 	cacheTravel = catalog.Product{ID: "p-4", Title: "Travel Kettle", Brand: "acme", Category: "kitchen", PriceCents: 1999, InStock: true, CostCents: 700}
 )
 
-func seedCache() {
+func hSeedCache() {
 	for _, p := range cacheKettles {
 		catalog.PutProduct(cacheBg, "t-1", p)
 	}
 	catalog.PutProduct(cacheBg, "t-2", cacheCopper)
 }
 
-func page(ctx *harness.Ctx, tenant, q string, filters map[string]string, pageSize int) string {
+func hHits(ctx *harness.Ctx, tenant, q string, filters map[string]string, pageSize int) []catalog.Hit {
 	hits, err := cachedSearch(cacheBg, tenant, q, filters, pageSize)
 	ctx.NoError(err, "cachedSearch(%s, %q) failed", tenant, q)
+	return hits
+}
+
+func hPage(ctx *harness.Ctx, tenant, q string, filters map[string]string, pageSize int) string {
 	ids := []string{}
-	for _, h := range hits {
+	for _, h := range hHits(ctx, tenant, q, filters, pageSize) {
 		ids = append(ids, h.ID)
 	}
 	return strings.Join(ids, ",")
 }
 
 func CheckKeyInputs(ctx *harness.Ctx) {
-	seedCache()
-	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "t-1's search for kettle")
-	ctx.Equal(page(ctx, "t-2", "kettle", nil, 10), "p-9", "tenant t-2 searching kettle must get its own page, not t-1's")
-	ctx.Equal(page(ctx, "t-1", "kettle", map[string]string{"brand": "acme"}, 10), "p-1", "t-1 searching kettle with brand=acme must not get the unfiltered page")
-	ctx.Equal(page(ctx, "t-1", "kettle", nil, 1), "p-2", "t-1 searching kettle with page size 1 must not get a page of another size")
+	hSeedCache()
+	ctx.Equal(hPage(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "t-1's search for kettle")
+	ctx.Equal(hPage(ctx, "t-2", "kettle", nil, 10), "p-9", "tenant t-2 searching kettle must get its own page, not t-1's")
+	ctx.Equal(hPage(ctx, "t-1", "kettle", map[string]string{"brand": "acme"}, 10), "p-1", "t-1 searching kettle with brand=acme must not get the unfiltered page")
+	ctx.Equal(hPage(ctx, "t-1", "kettle", map[string]string{"category": "acme"}, 10), "", "t-1 searching kettle with category=acme must not get the brand=acme page (the digest names each filter's field as well as its value)")
+	ctx.Equal(hPage(ctx, "t-1", "kettle", nil, 1), "p-2", "t-1 searching kettle with page size 1 must not get a page of another size")
 	for _, k := range ctx.Redis.Keys("search:*") {
 		ctx.Assert(strings.HasPrefix(k, "search:t-1:") || strings.HasPrefix(k, "search:t-2:"), "the cache key %q must start search:{tenant}:", k)
 	}
 }
 
 func CheckNormalizedKey(ctx *harness.Ctx) {
-	seedCache()
-	first := page(ctx, "t-1", "Steel Kettle", map[string]string{"brand": "acme", "in_stock": "true"}, 10)
-	second := page(ctx, "t-1", "  steel   KETTLE ", map[string]string{"in_stock": "true", "brand": "acme"}, 10)
+	hSeedCache()
+	first := hPage(ctx, "t-1", "Steel Kettle", map[string]string{"brand": "acme", "in_stock": "true"}, 10)
+	second := hPage(ctx, "t-1", "  steel   KETTLE ", map[string]string{"in_stock": "true", "brand": "acme"}, 10)
 	ctx.Assert(first == "p-1" && second == "p-1", "the two spellings answered [%s] and [%s], expected [p-1] for both", first, second)
 	keys := ctx.Redis.Keys("search:*")
 	ctx.Equal(len(keys), 1, "one search spelled two ways must share one cache entry (digest the normalized query and the filters sorted by field); the entries %q", keys)
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	seedCache()
-	page(ctx, "t-1", "kettle", nil, 10)
+	hSeedCache()
+	hPage(ctx, "t-1", "kettle", nil, 10)
 	keys := ctx.Redis.Keys("search:*")
 	ctx.Equal(len(keys), 1, "one search must leave one cache entry; the entries %q", keys)
-	ttl := ctx.Redis.TTL(keys[0])
-	ctx.Assert(ttl > 0 && ttl <= 60, "the cache entry %s has TTL %d (-1: it never expires): write it with cacheTTL = 60 s", keys[0], ttl)
+	key := keys[0]
+	ttl := ctx.Redis.TTL(key)
+	ctx.Assert(ttl >= 55 && ttl <= 60, "the cache entry %s has TTL %d (-1: it never expires): write it with cacheTTL = 60 s", key, ttl)
+	// The same search again, after the entry is gone: the TTL the entry has the moment the command that wrote it returns.
+	ctx.Redis.Del(key)
+	born, bornSeen := int64(0), false
+	var ttlAtCreation func() any
+	ttlAtCreation = func() any {
+		if ctx.Redis.Exists(key) == 0 {
+			ctx.Redis.After(key, ttlAtCreation) // the lookup came first: watch the write
+			return nil
+		}
+		born, bornSeen = int64(ctx.Redis.TTL(key)), true
+		return nil
+	}
+	ctx.Redis.After(key, ttlAtCreation)
+	hPage(ctx, "t-1", "kettle", nil, 10)
+	ctx.Assert(bornSeen && born > 0, "right after the command that wrote %s its TTL was %d: the page and its expiry go in one command (SET … EX), so a crash in between never leaves an entry that lives forever", key, born)
 }
 
 func CheckIndexVersion(ctx *harness.Ctx) {
-	seedCache()
-	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "t-1's first search for kettle")
-	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "the repeated search")
+	hSeedCache()
+	ctx.Equal(hPage(ctx, "t-1", "kettle", nil, 10), "p-2,p-1", "t-1's first search for kettle")
+	// Retitled without a version bump: a hit still shows the stored page, a search that skips the cache shows the new title.
+	ctx.Redis.Do("HSET", "catalog:t-1:product:p-1", "title", "Steel Kettle Mk2")
+	again := hHits(ctx, "t-1", "kettle", nil, 10)
+	ctx.Assert(len(again) == 2 && again[0].ID == "p-2" && again[1].ID == "p-1", "the repeated search must answer the same page [p-2, p-1], got %v", again)
+	if len(again) == 2 {
+		ctx.Equal(again[1].Title, "Steel Kettle", "the repeated search must answer from the cache entry the first search stored, not run the engine again; p-1's title")
+	}
 	catalog.PutProduct(cacheBg, "t-1", cacheTravel)
-	ctx.Equal(page(ctx, "t-1", "kettle", nil, 10), "p-4,p-2,p-1", "after PutProduct indexed p-4 the next search must miss (the key carries catalog.IndexVersion, read on every call); the page")
+	ctx.Equal(hPage(ctx, "t-1", "kettle", nil, 10), "p-4,p-2,p-1", "after PutProduct indexed p-4 the next search must miss (the key carries catalog.IndexVersion, read on every call); the page")
+	// Another writer indexes p-5 while this search runs the engine.
+	write := ctx.Redis.After("catalog:t-1:ids", func() any {
+		ctx.Redis.Do("HSET", "catalog:t-1:product:p-5", "id", "p-5", "title", "Camp Kettle", "brand", "acme", "category", "kitchen", "price_cents", "1499", "in_stock", "true", "cost_cents", "500", "price_version", "1")
+		ctx.Redis.Do("SADD", "catalog:t-1:ids", "p-5")
+		ctx.Redis.Do("INCR", "catalog:t-1:version")
+		return nil
+	})
+	hPage(ctx, "t-1", "kettle", nil, 5)
+	ctx.Assert(write.Fired, "a search with a new page size never ran the engine")
+	ctx.Equal(hPage(ctx, "t-1", "kettle", nil, 5), "p-5,p-4,p-2,p-1", "p-5 was indexed while a search ran the engine: a page is stored under the index version read before RunQuery, so the write that landed during it makes the next search miss; the next page")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <map>
 #include <string>
 
@@ -602,13 +708,13 @@ func CheckIndexVersion(ctx *harness.Ctx) {
 
 namespace {
 
-void seedCache() {
+void hSeedCache() {
   catalog::putProduct("t-1", {"p-1", "Steel Kettle", "acme", "kitchen", 3499, true, 1200, 0});
   catalog::putProduct("t-1", {"p-2", "Glass Kettle", "brew", "kitchen", 2999, true, 900, 0});
   catalog::putProduct("t-2", {"p-9", "Copper Kettle", "acme", "kitchen", 5999, true, 3000, 0});
 }
 
-std::string page(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int page_size) {
+std::string hPage(const std::string& tenant, const std::string& q, const std::map<std::string, std::string>& filters, int page_size) {
   std::string ids;
   for (const auto& hit : cachedSearch(tenant, q, filters, page_size)) ids += (ids.empty() ? "" : ",") + hit.value("id", "");
   return ids;
@@ -617,40 +723,77 @@ std::string page(const std::string& tenant, const std::string& q, const std::map
 }  // namespace
 
 void CheckKeyInputs(harness::Ctx& ctx) {
-  seedCache();
-  ctx.Equal(page("t-1", "kettle", {}, 10), "p-2,p-1", "t-1's search for kettle");
-  ctx.Equal(page("t-2", "kettle", {}, 10), "p-9", "tenant t-2 searching kettle must get its own page, not t-1's");
-  ctx.Equal(page("t-1", "kettle", {{"brand", "acme"}}, 10), "p-1", "t-1 searching kettle with brand=acme must not get the unfiltered page");
-  ctx.Equal(page("t-1", "kettle", {}, 1), "p-2", "t-1 searching kettle with page size 1 must not get a page of another size");
+  hSeedCache();
+  ctx.Equal(hPage("t-1", "kettle", {}, 10), "p-2,p-1", "t-1's search for kettle");
+  ctx.Equal(hPage("t-2", "kettle", {}, 10), "p-9", "tenant t-2 searching kettle must get its own page, not t-1's");
+  ctx.Equal(hPage("t-1", "kettle", {{"brand", "acme"}}, 10), "p-1", "t-1 searching kettle with brand=acme must not get the unfiltered page");
+  ctx.Equal(hPage("t-1", "kettle", {{"category", "acme"}}, 10), "", "t-1 searching kettle with category=acme must not get the brand=acme page (the digest names each filter's field as well as its value)");
+  ctx.Equal(hPage("t-1", "kettle", {}, 1), "p-2", "t-1 searching kettle with page size 1 must not get a page of another size");
   for (const auto& k : ctx.Redis.Keys("search:*")) {
     ctx.Assert(k.rfind("search:t-1:", 0) == 0 || k.rfind("search:t-2:", 0) == 0, "the cache key %q must start search:{tenant}:", k);
   }
 }
 
 void CheckNormalizedKey(harness::Ctx& ctx) {
-  seedCache();
-  const std::string first = page("t-1", "Steel Kettle", {{"brand", "acme"}, {"in_stock", "true"}}, 10);
-  const std::string second = page("t-1", "  steel   KETTLE ", {{"in_stock", "true"}, {"brand", "acme"}}, 10);
+  hSeedCache();
+  const std::string first = hPage("t-1", "Steel Kettle", {{"brand", "acme"}, {"in_stock", "true"}}, 10);
+  const std::string second = hPage("t-1", "  steel   KETTLE ", {{"in_stock", "true"}, {"brand", "acme"}}, 10);
   ctx.Assert(first == "p-1" && second == "p-1", "the two spellings answered [%s] and [%s], expected [p-1] for both", first, second);
   const auto keys = ctx.Redis.Keys("search:*");
   ctx.Equal(keys.size(), 1, "one search spelled two ways must share one cache entry (digest the normalized query and the filters sorted by field); the entries %q", keys);
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  seedCache();
-  page("t-1", "kettle", {}, 10);
+  hSeedCache();
+  hPage("t-1", "kettle", {}, 10);
   const auto keys = ctx.Redis.Keys("search:*");
   ctx.Equal(keys.size(), 1, "one search must leave one cache entry; the entries %q", keys);
-  const long long ttl = ctx.Redis.TTL(keys.front());
-  ctx.Assert(ttl > 0 && ttl <= 60, "the cache entry %s has TTL %d (-1: it never expires): write it with kCacheTtlSeconds = 60", keys.front(), ttl);
+  const std::string key = keys.front();
+  const long long ttl = ctx.Redis.TTL(key);
+  ctx.Assert(ttl >= 55 && ttl <= 60, "the cache entry %s has TTL %d (-1: it never expires): write it with kCacheTtlSeconds = 60", key, ttl);
+  // The same search again, after the entry is gone: the TTL the entry has the moment the command that wrote it returns.
+  ctx.Redis.Del(key);
+  bool bornSeen = false;
+  long long born = 0;
+  std::function<void()> ttlAtCreation = [&] {
+    if (ctx.Redis.Exists(key) == 0) {
+      ctx.Redis.After(key, ttlAtCreation);  // the lookup came first: watch the write
+      return;
+    }
+    bornSeen = true;
+    born = ctx.Redis.TTL(key);
+  };
+  ctx.Redis.After(key, ttlAtCreation);
+  hPage("t-1", "kettle", {}, 10);
+  ctx.Assert(bornSeen && born > 0, "right after the command that wrote %s its TTL was %d: the page and its expiry go in one command (SET … EX), so a crash in between never leaves an entry that lives forever", key, born);
 }
 
 void CheckIndexVersion(harness::Ctx& ctx) {
-  seedCache();
-  ctx.Equal(page("t-1", "kettle", {}, 10), "p-2,p-1", "t-1's first search for kettle");
-  ctx.Equal(page("t-1", "kettle", {}, 10), "p-2,p-1", "the repeated search");
+  hSeedCache();
+  ctx.Equal(hPage("t-1", "kettle", {}, 10), "p-2,p-1", "t-1's first search for kettle");
+  // Retitled without a version bump: a hit still shows the stored page, a search that skips the cache shows the new title.
+  ctx.Redis.Do("HSET", "catalog:t-1:product:p-1", "title", "Steel Kettle Mk2");
+  const auto again = cachedSearch("t-1", "kettle", {}, 10);
+  std::string againIds, title;
+  for (const auto& hit : again) {
+    againIds += (againIds.empty() ? "" : ",") + hit.value("id", "");
+    if (hit.value("id", "") == "p-1") title = hit.value("title", "");
+  }
+  ctx.Equal(againIds, "p-2,p-1", "the repeated search must answer the same page");
+  ctx.Equal(title, "Steel Kettle", "the repeated search must answer from the cache entry the first search stored, not run the engine again; p-1's title");
   catalog::putProduct("t-1", {"p-4", "Travel Kettle", "acme", "kitchen", 1999, true, 700, 0});
-  ctx.Equal(page("t-1", "kettle", {}, 10), "p-4,p-2,p-1", "after putProduct indexed p-4 the next search must miss (the key carries catalog::indexVersion, read on every call); the page");
+  ctx.Equal(hPage("t-1", "kettle", {}, 10), "p-4,p-2,p-1", "after putProduct indexed p-4 the next search must miss (the key carries catalog::indexVersion, read on every call); the page");
+  // Another writer indexes p-5 while this search runs the engine.
+  bool wrote = false;
+  ctx.Redis.After("catalog:t-1:ids", [&] {
+    ctx.Redis.Do("HSET", "catalog:t-1:product:p-5", "id", "p-5", "title", "Camp Kettle", "brand", "acme", "category", "kitchen", "price_cents", "1499", "in_stock", "true", "cost_cents", "500", "price_version", "1");
+    ctx.Redis.Do("SADD", "catalog:t-1:ids", "p-5");
+    ctx.Redis.Do("INCR", "catalog:t-1:version");
+    wrote = true;
+  });
+  hPage("t-1", "kettle", {}, 5);
+  ctx.Assert(wrote, "a search with a new page size never ran the engine");
+  ctx.Equal(hPage("t-1", "kettle", {}, 5), "p-5,p-4,p-2,p-1", "p-5 was indexed while a search ran the engine: a page is stored under the index version read before runQuery, so the write that landed during it makes the next search miss; the next page");
 }
 `,
   },

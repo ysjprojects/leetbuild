@@ -21,9 +21,10 @@ cache only ever grows; and a version that does not exist yet answers an empty sp
 served after the version appears.
 
 - The key names the **immutable version**: \`span:{document_id}:{version}:{start}:{end}\`.
-- The offsets in the key are **integers** parsed from the query, so \`010\` and \`10\` are one key.
-- An entry is written with a **long TTL**, \`SPAN_TTL_S\` = 7 days: the version never changes, so
-  the TTL only bounds memory.
+- The version and the offsets in the key are **integers** parsed from the query, so \`010\` and
+  \`10\` are one key.
+- An entry is written with a **long TTL** in the same command, \`SPAN_TTL_S\` = 7 days: the version
+  never changes, so the TTL only bounds memory.
 - An **unknown version is 404** and nothing is cached for it.`,
   sequence: {
     participants: ['Citation UI', 'Citation API', 'Redis', 'documents'],
@@ -59,7 +60,7 @@ served after the version appears.
       id: 'version-key',
       title: 'The cache key names the immutable version',
       detail:
-        'The key is `span:{document_id}:{version}:{start}:{end}`, so version 2’s span is never answered from version 1’s entry. The starter keys by document id and offsets only.',
+        'The key is `span:{document_id}:{version}:{start}:{end}` with the version as the integer it parses to, so version 2’s span is never answered from version 1’s entry and `version=02` reads version 2’s. The starter keys by document id and offsets only.',
       match: {
         python: {all: [/span:\{document_id\}:\{version\}:\{start\}:\{end\}/]},
         typescript: {all: [/span:\$\{documentId\}:\$\{version\}:\$\{start\}:\$\{end\}/]},
@@ -72,7 +73,7 @@ served after the version appears.
       id: 'numeric-offsets',
       title: 'Offsets are integers in the key',
       detail:
-        'The offsets are parsed from the query before they are keyed, so `start=010` and `start=10` are one entry. The starter pastes the raw query strings into the key.',
+        'The offsets are parsed from the query before they are keyed, so `start=010` and `start=10` are one entry and `start=00` is keyed `0`. The starter pastes the raw query strings into the key.',
       match: {
         python: {
           all: [/int\(\s*q\[["']start["']\]\s*\)/, /int\(\s*q\[["']end["']\]\s*\)/],
@@ -100,7 +101,7 @@ served after the version appears.
       id: 'long-ttl',
       title: 'Span entries carry a long TTL',
       detail:
-        'The entry is written with `SPAN_TTL_S` (7 days), long because the version is immutable, finite so the cache does not hold every span ever read. The starter writes with no expiry.',
+        'The entry is written with `SPAN_TTL_S` (7 days) in the same command, long because the version is immutable, finite so the cache does not hold every span ever read; an expiry set by a second command leaves an entry that never expires if the service dies in between. The starter writes with no expiry.',
       match: {
         python: {all: [/SPAN_TTL_S\s*=/, /ex\s*=\s*SPAN_TTL_S|setex\(/]},
         typescript: {all: [/SPAN_TTL_S\s*=/, /['"]EX['"],\s*SPAN_TTL_S|setex\(/]},
@@ -627,6 +628,24 @@ def _spans(ctx):
     return sorted(ctx.redis.keys("span:*"))
 
 
+def _ttl_when_written(ctx, key):
+    """The key's TTL right after the command that first creates it (a read that misses touches it first)."""
+    seen = {}
+
+    def arm():
+        ctx.redis_after(key, snapshot)
+
+    def snapshot():
+        ttl = ctx.redis.ttl(key)
+        if ttl == -2:
+            arm()
+        else:
+            seen["ttl"] = ttl
+
+    arm()
+    return seen
+
+
 async def check_route(ctx):
     documents.add_version("doc-7", V1)
     async with _api(ctx) as c:
@@ -642,9 +661,11 @@ async def check_version_key(ctx):
     async with _api(ctx) as c:
         await _span(c, 1, 13, 18)
         r = await _span(c, 2, 13, 18)
+        padded = await _span(c, "02", 13, 18)
     body = r.json()
     assert body.get("text") == "publi", f"[13, 18) of version 2 answered {body.get('text')!r} (cached={body.get('cached')}), expected 'publi': version 1's entry answered a request for version 2"
     assert ctx.redis.exists("span:doc-7:2:13:18"), f"no entry span:doc-7:2:13:18; the cache holds {_spans(ctx)}"
+    assert padded.json().get("text") == "publi" and padded.json().get("cached") is True, f"version=02 after version=2 answered {padded.text}: the version in the key is the integer, so it is one entry ({_spans(ctx)})"
 
 
 async def check_numeric_offsets(ctx):
@@ -652,20 +673,29 @@ async def check_numeric_offsets(ctx):
     async with _api(ctx) as c:
         padded = await _span(c, 1, "013", "018")
         plain = await _span(c, 1, 13, 18)
+        zero = await _span(c, 1, "00", "012")
     assert padded.json().get("text") == "wrote" and plain.json().get("text") == "wrote", f"start=013&end=018 answered {padded.text}, start=13&end=18 answered {plain.text}"
     assert plain.json().get("cached") is True, f"start=13 after start=013 was a miss: one span is cached twice ({_spans(ctx)})"
-    assert len(_spans(ctx)) == 1, f"one span is cached under {_spans(ctx)}, expected one key"
+    keys = _spans(ctx)
+    assert len(keys) == 2, f"[13, 18) and [0, 12) are cached under {keys}, expected one key each"
+    want = [k for k in keys if k.endswith(":13:18")]
+    assert zero.json().get("text") == "Ada Lovelace" and want and want[0][: -len(":13:18")] + ":0:12" in keys, f"start=00&end=012 answered {zero.text} and the cache holds {keys}: the offsets in the key are the integers 0 and 12"
 
 
 async def check_long_ttl(ctx):
     documents.add_version("doc-7", V1)
     async with _api(ctx) as c:
         await _span(c, 1, 13, 18)
-    keys = _spans(ctx)
-    assert len(keys) == 1, f"one read cached {keys}"
-    ttl = ctx.redis.ttl(keys[0])
-    assert ttl > 0, f"{keys[0]} has no expiry (TTL {ttl}): every span ever read stays in Redis"
-    assert WEEK - 60 <= ttl <= WEEK, f"{keys[0]} expires in {ttl} s, expected SPAN_TTL_S = 7 days ({WEEK} s)"
+        keys = _spans(ctx)
+        assert len(keys) == 1, f"one read cached {keys}"
+        ttl = ctx.redis.ttl(keys[0])
+        assert ttl > 0, f"{keys[0]} has no expiry (TTL {ttl}): every span ever read stays in Redis"
+        assert WEEK - 60 <= ttl <= WEEK, f"{keys[0]} expires in {ttl} s, expected SPAN_TTL_S = 7 days ({WEEK} s)"
+        ctx.redis.delete(keys[0])
+        seen = _ttl_when_written(ctx, keys[0])
+        await _span(c, 1, 13, 18)
+    assert "ttl" in seen, f"reading [13, 18) again after its entry was evicted never wrote {keys[0]}"
+    assert WEEK - 60 <= seen["ttl"] <= WEEK, f"right after {keys[0]} was written its TTL was {seen['ttl']}: the entry and its expiry are one command (SET … EX), or a crash between two leaves an entry that never expires"
 
 
 async def check_unknown_version(ctx):
@@ -690,6 +720,19 @@ const span = (c, version, start, end) => c.get(\`/v1/spans?document_id=doc-7&ver
 
 const spans = ctx => (ctx.redis.keys('span:*') as string[]).sort();
 
+/** The key's TTL right after the command that first creates it (a read that misses touches it first). */
+function ttlWhenWritten(ctx, key: string): {ttl?: number} {
+  const seen: {ttl?: number} = {};
+  const arm = () =>
+    ctx.redisAfter(key, () => {
+      const ttl = ctx.redis.ttl(key);
+      if (ttl === -2) arm();
+      else seen.ttl = ttl;
+    });
+  arm();
+  return seen;
+}
+
 export async function check_route(ctx) {
   const {c, documents} = api(ctx);
   await documents.addVersion('doc-7', V1);
@@ -705,8 +748,10 @@ export async function check_version_key(ctx) {
   await documents.addVersion('doc-7', V2);
   await span(c, 1, 13, 18);
   const r = await span(c, 2, 13, 18);
+  const padded = await span(c, '02', 13, 18);
   assert.equal(r.json().text, 'publi', \`[13, 18) of version 2 answered \${r.text}, expected 'publi': version 1's entry answered a request for version 2\`);
   assert.equal(ctx.redis.exists('span:doc-7:2:13:18'), 1, \`no entry span:doc-7:2:13:18; the cache holds \${JSON.stringify(spans(ctx))}\`);
+  assert(padded.json().text === 'publi' && padded.json().cached === true, \`version=02 after version=2 answered \${padded.text}: the version in the key is the integer, so it is one entry (\${JSON.stringify(spans(ctx))})\`);
 }
 
 export async function check_numeric_offsets(ctx) {
@@ -714,9 +759,13 @@ export async function check_numeric_offsets(ctx) {
   await documents.addVersion('doc-7', V1);
   const padded = await span(c, 1, '013', '018');
   const plain = await span(c, 1, 13, 18);
+  const zero = await span(c, 1, '00', '012');
   assert(padded.json().text === 'wrote' && plain.json().text === 'wrote', \`start=013&end=018 answered \${padded.text}, start=13&end=18 answered \${plain.text}\`);
   assert.equal(plain.json().cached, true, \`start=13 after start=013 was a miss: one span is cached twice (\${JSON.stringify(spans(ctx))})\`);
-  assert.equal(spans(ctx).length, 1, \`one span is cached under \${JSON.stringify(spans(ctx))}, expected one key\`);
+  const keys = spans(ctx);
+  assert.equal(keys.length, 2, \`[13, 18) and [0, 12) are cached under \${JSON.stringify(keys)}, expected one key each\`);
+  const want = keys.find(k => k.endsWith(':13:18'));
+  assert(zero.json().text === 'Ada Lovelace' && want !== undefined && keys.includes(want.slice(0, -':13:18'.length) + ':0:12'), \`start=00&end=012 answered \${zero.text} and the cache holds \${JSON.stringify(keys)}: the offsets in the key are the integers 0 and 12\`);
 }
 
 export async function check_long_ttl(ctx) {
@@ -728,6 +777,11 @@ export async function check_long_ttl(ctx) {
   const ttl = ctx.redis.ttl(keys[0]);
   assert(ttl > 0, \`\${keys[0]} has no expiry (TTL \${ttl}): every span ever read stays in Redis\`);
   assert(WEEK - 60 <= ttl && ttl <= WEEK, \`\${keys[0]} expires in \${ttl} s, expected SPAN_TTL_S = 7 days (\${WEEK} s)\`);
+  ctx.redis.del(keys[0]);
+  const seen = ttlWhenWritten(ctx, keys[0]);
+  await span(c, 1, 13, 18);
+  assert(seen.ttl !== undefined, \`reading [13, 18) again after its entry was evicted never wrote \${keys[0]}\`);
+  assert(WEEK - 60 <= seen.ttl && seen.ttl <= WEEK, \`right after \${keys[0]} was written its TTL was \${seen.ttl}: the entry and its expiry are one command (SET … EX), or a crash between two leaves an entry that never expires\`);
 }
 
 export async function check_unknown_version(ctx) {
@@ -747,6 +801,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"citations/documents"
 
@@ -754,72 +809,113 @@ import (
 )
 
 const (
-	stateV1 = "Ada Lovelace wrote the first program in 1843."
-	stateV2 = "Ada Lovelace published the first program in 1843."
-	week    = 7 * 24 * 3600
+	hStateV1 = "Ada Lovelace wrote the first program in 1843."
+	hStateV2 = "Ada Lovelace published the first program in 1843."
+	hWeek    = 7 * 24 * 3600
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func spansAPI(ctx *harness.Ctx) *harness.HTTP {
+func hSpansAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readSpan(c *harness.HTTP, version int, start, end string) (*harness.Response, map[string]any) {
-	r := c.Get(fmt.Sprintf("/v1/spans?document_id=doc-7&version=%d&start=%s&end=%s", version, start, end))
+func hReadSpan(c *harness.HTTP, version, start, end string) (*harness.Response, map[string]any) {
+	r := c.Get(fmt.Sprintf("/v1/spans?document_id=doc-7&version=%s&start=%s&end=%s", version, start, end))
 	body, _ := r.JSON().(map[string]any)
 	return r, body
 }
 
+// hTTLSeen is a key's TTL right after the command that first created it.
+type hTTLSeen struct {
+	written bool
+	ttl     int64
+}
+
+// hTTLWhenWritten records the key's TTL right after the command that first creates it (a read that misses touches it first).
+func hTTLWhenWritten(ctx *harness.Ctx, key string) *hTTLSeen {
+	seen := &hTTLSeen{}
+	var arm func()
+	arm = func() {
+		ctx.Redis.After(key, func() any {
+			if ttl := ctx.Redis.TTL(key); ttl == -2 {
+				arm()
+			} else {
+				seen.written, seen.ttl = true, ttl
+			}
+			return nil
+		})
+	}
+	arm()
+	return seen
+}
+
 func CheckRoute(ctx *harness.Ctx) {
-	documents.AddVersion(stateBg, "doc-7", stateV1)
-	c := spansAPI(ctx)
-	first, fb := readSpan(c, 1, "0", "12")
-	_, ab := readSpan(c, 1, "0", "12")
+	documents.AddVersion(hStateBg, "doc-7", hStateV1)
+	c := hSpansAPI(ctx)
+	first, fb := hReadSpan(c, "1", "0", "12")
+	_, ab := hReadSpan(c, "1", "0", "12")
 	ctx.Assert(first.Status == 200 && fb["text"] == "Ada Lovelace", "GET /v1/spans for [0, 12) of version 1 answered %d %s, expected the text Ada Lovelace", first.Status, first.Text())
 	ctx.Assert(fb["cached"] == false && ab["cached"] == true, "the first read must be a miss and the second a hit, got cached=%v then %v", fb["cached"], ab["cached"])
 }
 
 func CheckVersionKey(ctx *harness.Ctx) {
-	documents.AddVersion(stateBg, "doc-7", stateV1)
-	documents.AddVersion(stateBg, "doc-7", stateV2)
-	c := spansAPI(ctx)
-	readSpan(c, 1, "13", "18")
-	r, b := readSpan(c, 2, "13", "18")
+	documents.AddVersion(hStateBg, "doc-7", hStateV1)
+	documents.AddVersion(hStateBg, "doc-7", hStateV2)
+	c := hSpansAPI(ctx)
+	hReadSpan(c, "1", "13", "18")
+	r, b := hReadSpan(c, "2", "13", "18")
+	padded, pb := hReadSpan(c, "02", "13", "18")
 	ctx.Assert(b["text"] == "publi", "[13, 18) of version 2 answered %s, expected 'publi': version 1's entry answered a request for version 2", r.Text())
 	ctx.Equal(ctx.Redis.Exists("span:doc-7:2:13:18"), int64(1), "the entry span:doc-7:2:13:18 (the cache holds %q)", ctx.Redis.Keys("span:*"))
+	ctx.Assert(pb["text"] == "publi" && pb["cached"] == true, "version=02 after version=2 answered %s: the version in the key is the integer, so it is one entry (%q)", padded.Text(), ctx.Redis.Keys("span:*"))
 }
 
 func CheckNumericOffsets(ctx *harness.Ctx) {
-	documents.AddVersion(stateBg, "doc-7", stateV1)
-	c := spansAPI(ctx)
-	padded, pb := readSpan(c, 1, "013", "018")
-	plain, b := readSpan(c, 1, "13", "18")
+	documents.AddVersion(hStateBg, "doc-7", hStateV1)
+	c := hSpansAPI(ctx)
+	padded, pb := hReadSpan(c, "1", "013", "018")
+	plain, b := hReadSpan(c, "1", "13", "18")
+	zero, zb := hReadSpan(c, "1", "00", "012")
 	ctx.Assert(pb["text"] == "wrote" && b["text"] == "wrote", "start=013&end=018 answered %s, start=13&end=18 answered %s", padded.Text(), plain.Text())
 	ctx.Assert(b["cached"] == true, "start=13 after start=013 was a miss: one span is cached twice (%q)", ctx.Redis.Keys("span:*"))
-	ctx.Equal(len(ctx.Redis.Keys("span:*")), 1, "one span must be cached under one key (%q); the keys", ctx.Redis.Keys("span:*"))
+	keys := ctx.Redis.Keys("span:*")
+	ctx.Equal(len(keys), 2, "[13, 18) and [0, 12) must be cached under one key each (%q); the keys", keys)
+	found := false
+	for _, k := range keys {
+		for _, other := range keys {
+			found = found || (strings.HasSuffix(k, ":13:18") && other == strings.TrimSuffix(k, ":13:18")+":0:12")
+		}
+	}
+	ctx.Assert(zb["text"] == "Ada Lovelace" && found, "start=00&end=012 answered %s and the cache holds %q: the offsets in the key are the integers 0 and 12", zero.Text(), keys)
 }
 
 func CheckLongTtl(ctx *harness.Ctx) {
-	documents.AddVersion(stateBg, "doc-7", stateV1)
-	readSpan(spansAPI(ctx), 1, "13", "18")
+	documents.AddVersion(hStateBg, "doc-7", hStateV1)
+	c := hSpansAPI(ctx)
+	hReadSpan(c, "1", "13", "18")
 	keys := ctx.Redis.Keys("span:*")
 	ctx.Equal(len(keys), 1, "one read must cache one key (%q); the keys", keys)
 	ttl := ctx.Redis.TTL(keys[0])
 	ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): every span ever read stays in Redis", keys[0], ttl)
-	ctx.Assert(week-60 <= ttl && ttl <= week, "%s expires in %d s, expected SPAN_TTL_S = 7 days (%d s)", keys[0], ttl, week)
+	ctx.Assert(hWeek-60 <= ttl && ttl <= hWeek, "%s expires in %d s, expected SPAN_TTL_S = 7 days (%d s)", keys[0], ttl, hWeek)
+	ctx.Redis.Del(keys[0])
+	seen := hTTLWhenWritten(ctx, keys[0])
+	hReadSpan(c, "1", "13", "18")
+	ctx.Assert(seen.written, "reading [13, 18) again after its entry was evicted never wrote %s", keys[0])
+	ctx.Assert(hWeek-60 <= seen.ttl && seen.ttl <= hWeek, "right after %s was written its TTL was %d: the entry and its expiry are one command (SET … EX), or a crash between two leaves an entry that never expires", keys[0], seen.ttl)
 }
 
 func CheckUnknownVersion(ctx *harness.Ctx) {
-	documents.AddVersion(stateBg, "doc-7", stateV1)
-	c := spansAPI(ctx)
-	r, _ := readSpan(c, 2, "13", "18")
+	documents.AddVersion(hStateBg, "doc-7", hStateV1)
+	c := hSpansAPI(ctx)
+	r, _ := hReadSpan(c, "2", "13", "18")
 	ctx.Equal(r.Status, 404, "version 2 does not exist yet (%s)", r.Text())
 	ctx.Equal(len(ctx.Redis.Keys("span:*")), 0, "a read of a missing version must cache nothing (%q); the keys", ctx.Redis.Keys("span:*"))
-	documents.AddVersion(stateBg, "doc-7", stateV2)
-	r, b := readSpan(c, 2, "13", "18")
+	documents.AddVersion(hStateBg, "doc-7", hStateV2)
+	r, b := hReadSpan(c, "2", "13", "18")
 	ctx.Assert(r.Status == 200 && b["text"] == "publi", "once version 2 is published the read answered %d %s, expected 'publi'", r.Status, r.Text())
 }
 `,
@@ -827,6 +923,8 @@ func CheckUnknownVersion(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <functional>
+#include <memory>
 #include <string>
 
 #include "citations/documents.h"
@@ -835,11 +933,11 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kStateV1 = "Ada Lovelace wrote the first program in 1843.";
-const std::string kStateV2 = "Ada Lovelace published the first program in 1843.";
-constexpr long long kWeek = 7LL * 24 * 3600;
+const std::string hStateV1 = "Ada Lovelace wrote the first program in 1843.";
+const std::string hStateV2 = "Ada Lovelace published the first program in 1843.";
+constexpr long long hWeek = 7LL * 24 * 3600;
 
-harness::HTTP spansAPI(harness::Ctx& ctx) {
+harness::HTTP hSpansAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -847,66 +945,110 @@ harness::HTTP spansAPI(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response readSpan(harness::HTTP& c, int version, const std::string& start, const std::string& end) {
-  return c.Get("/v1/spans?document_id=doc-7&version=" + std::to_string(version) + "&start=" + start + "&end=" + end);
+harness::Response hReadSpan(harness::HTTP& c, const std::string& version, const std::string& start, const std::string& end) {
+  return c.Get("/v1/spans?document_id=doc-7&version=" + version + "&start=" + start + "&end=" + end);
 }
 
-json bodyOf(const harness::Response& r) {
+json hBodyOf(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : json::object();
+}
+
+// A key's TTL right after the command that first created it.
+struct HTTLSeen {
+  bool written = false;
+  long long ttl = 0;
+};
+
+// Records the key's TTL right after the command that first creates it (a read that misses touches it first).
+std::shared_ptr<HTTLSeen> hTTLWhenWritten(harness::Ctx& ctx, const std::string& key) {
+  auto seen = std::make_shared<HTTLSeen>();
+  auto arm = std::make_shared<std::function<void()>>();
+  *arm = [&ctx, key, seen, arm] {
+    ctx.Redis.After(key, [&ctx, key, seen, arm] {
+      const long long ttl = ctx.Redis.TTL(key);
+      if (ttl == -2) {
+        (*arm)();
+      } else {
+        seen->written = true;
+        seen->ttl = ttl;
+      }
+    });
+  };
+  (*arm)();
+  return seen;
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kStateV1);
-  auto c = spansAPI(ctx);
-  const auto first = readSpan(c, 1, "0", "12");
-  const auto again = readSpan(c, 1, "0", "12");
-  ctx.Assert(first.Status == 200 && bodyOf(first).value("text", "") == "Ada Lovelace", "GET /v1/spans for [0, 12) of version 1 answered %d %s, expected the text Ada Lovelace", first.Status, first.Text());
-  ctx.Assert(bodyOf(first).value("cached", true) == false && bodyOf(again).value("cached", false) == true, "the first read must be a miss and the second a hit, got %s then %s", first.Text(), again.Text());
+  documents::addVersion("doc-7", hStateV1);
+  auto c = hSpansAPI(ctx);
+  const auto first = hReadSpan(c, "1", "0", "12");
+  const auto again = hReadSpan(c, "1", "0", "12");
+  ctx.Assert(first.Status == 200 && hBodyOf(first).value("text", "") == "Ada Lovelace", "GET /v1/spans for [0, 12) of version 1 answered %d %s, expected the text Ada Lovelace", first.Status, first.Text());
+  ctx.Assert(hBodyOf(first).value("cached", true) == false && hBodyOf(again).value("cached", false) == true, "the first read must be a miss and the second a hit, got %s then %s", first.Text(), again.Text());
 }
 
 void CheckVersionKey(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kStateV1);
-  documents::addVersion("doc-7", kStateV2);
-  auto c = spansAPI(ctx);
-  readSpan(c, 1, "13", "18");
-  const auto r = readSpan(c, 2, "13", "18");
-  ctx.Assert(bodyOf(r).value("text", "") == "publi", "[13, 18) of version 2 answered %s, expected 'publi': version 1's entry answered a request for version 2", r.Text());
+  documents::addVersion("doc-7", hStateV1);
+  documents::addVersion("doc-7", hStateV2);
+  auto c = hSpansAPI(ctx);
+  hReadSpan(c, "1", "13", "18");
+  const auto r = hReadSpan(c, "2", "13", "18");
+  const auto padded = hReadSpan(c, "02", "13", "18");
+  ctx.Assert(hBodyOf(r).value("text", "") == "publi", "[13, 18) of version 2 answered %s, expected 'publi': version 1's entry answered a request for version 2", r.Text());
   ctx.Equal(ctx.Redis.Exists("span:doc-7:2:13:18"), 1, "the entry span:doc-7:2:13:18 (the cache holds %q)", ctx.Redis.Keys("span:*"));
+  ctx.Assert(hBodyOf(padded).value("text", "") == "publi" && hBodyOf(padded).value("cached", false) == true,
+             "version=02 after version=2 answered %s: the version in the key is the integer, so it is one entry (%q)", padded.Text(), ctx.Redis.Keys("span:*"));
 }
 
 void CheckNumericOffsets(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kStateV1);
-  auto c = spansAPI(ctx);
-  const auto padded = readSpan(c, 1, "013", "018");
-  const auto plain = readSpan(c, 1, "13", "18");
-  ctx.Assert(bodyOf(padded).value("text", "") == "wrote" && bodyOf(plain).value("text", "") == "wrote", "start=013&end=018 answered %s, start=13&end=18 answered %s", padded.Text(), plain.Text());
-  ctx.Assert(bodyOf(plain).value("cached", false) == true, "start=13 after start=013 was a miss: one span is cached twice (%q)", ctx.Redis.Keys("span:*"));
-  ctx.Equal(ctx.Redis.Keys("span:*").size(), 1, "one span must be cached under one key (%q); the keys", ctx.Redis.Keys("span:*"));
+  documents::addVersion("doc-7", hStateV1);
+  auto c = hSpansAPI(ctx);
+  const auto padded = hReadSpan(c, "1", "013", "018");
+  const auto plain = hReadSpan(c, "1", "13", "18");
+  const auto zero = hReadSpan(c, "1", "00", "012");
+  ctx.Assert(hBodyOf(padded).value("text", "") == "wrote" && hBodyOf(plain).value("text", "") == "wrote", "start=013&end=018 answered %s, start=13&end=18 answered %s", padded.Text(), plain.Text());
+  ctx.Assert(hBodyOf(plain).value("cached", false) == true, "start=13 after start=013 was a miss: one span is cached twice (%q)", ctx.Redis.Keys("span:*"));
+  const auto keys = ctx.Redis.Keys("span:*");
+  ctx.Equal(keys.size(), 2, "[13, 18) and [0, 12) must be cached under one key each (%q); the keys", keys);
+  const std::string suffix = ":13:18";
+  bool found = false;
+  for (const auto& k : keys) {
+    if (k.size() < suffix.size() || k.compare(k.size() - suffix.size(), suffix.size(), suffix) != 0) continue;
+    const std::string want = k.substr(0, k.size() - suffix.size()) + ":0:12";
+    for (const auto& other : keys) found = found || other == want;
+  }
+  ctx.Assert(hBodyOf(zero).value("text", "") == "Ada Lovelace" && found, "start=00&end=012 answered %s and the cache holds %q: the offsets in the key are the integers 0 and 12", zero.Text(), keys);
 }
 
 void CheckLongTtl(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kStateV1);
-  auto c = spansAPI(ctx);
-  readSpan(c, 1, "13", "18");
+  documents::addVersion("doc-7", hStateV1);
+  auto c = hSpansAPI(ctx);
+  hReadSpan(c, "1", "13", "18");
   const auto keys = ctx.Redis.Keys("span:*");
   ctx.Equal(keys.size(), 1, "one read must cache one key (%q); the keys", keys);
   const long long ttl = ctx.Redis.TTL(keys[0]);
   ctx.Assert(ttl > 0, "%s has no expiry (TTL %d): every span ever read stays in Redis", keys[0], ttl);
-  ctx.Assert(kWeek - 60 <= ttl && ttl <= kWeek, "%s expires in %d s, expected SPAN_TTL_S = 7 days (%d s)", keys[0], ttl, kWeek);
+  ctx.Assert(hWeek - 60 <= ttl && ttl <= hWeek, "%s expires in %d s, expected SPAN_TTL_S = 7 days (%d s)", keys[0], ttl, hWeek);
+  ctx.Redis.Del(keys[0]);
+  const auto seen = hTTLWhenWritten(ctx, keys[0]);
+  hReadSpan(c, "1", "13", "18");
+  ctx.Assert(seen->written, "reading [13, 18) again after its entry was evicted never wrote %s", keys[0]);
+  ctx.Assert(hWeek - 60 <= seen->ttl && seen->ttl <= hWeek,
+             "right after %s was written its TTL was %d: the entry and its expiry are one command (SET … EX), or a crash between two leaves an entry that never expires", keys[0], seen->ttl);
 }
 
 void CheckUnknownVersion(harness::Ctx& ctx) {
-  documents::addVersion("doc-7", kStateV1);
-  auto c = spansAPI(ctx);
-  auto r = readSpan(c, 2, "13", "18");
+  documents::addVersion("doc-7", hStateV1);
+  auto c = hSpansAPI(ctx);
+  auto r = hReadSpan(c, "2", "13", "18");
   ctx.Equal(r.Status, 404, "version 2 does not exist yet (%s)", r.Text());
   ctx.Equal(ctx.Redis.Keys("span:*").size(), 0, "a read of a missing version must cache nothing (%q); the keys", ctx.Redis.Keys("span:*"));
-  documents::addVersion("doc-7", kStateV2);
-  r = readSpan(c, 2, "13", "18");
-  ctx.Assert(r.Status == 200 && bodyOf(r).value("text", "") == "publi", "once version 2 is published the read answered %d %s, expected 'publi'", r.Status, r.Text());
+  documents::addVersion("doc-7", hStateV2);
+  r = hReadSpan(c, "2", "13", "18");
+  ctx.Assert(r.Status == 200 && hBodyOf(r).value("text", "") == "publi", "once version 2 is published the read answered %d %s, expected 'publi'", r.Status, r.Text());
 }
 `,
   },

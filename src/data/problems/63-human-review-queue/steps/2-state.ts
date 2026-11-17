@@ -21,9 +21,9 @@ the item stays assigned forever; every reassignment restarts the SLA, so nothing
 an item that did breach goes to the back of the line, unmarked.
 
 - Take the item in one atomic command (\`LPOP\`, or a Lua script).
-- The lease expires after \`LEASE_SECONDS\` (120): \`SET … EX\`.
+- The lease expires after \`LEASE_SECONDS\` (120), set in the command that writes it: \`SET … EX\`.
 - The SLA clock started at the enqueue: \`take_next\` keeps the item's \`sla_deadline\`.
-- \`reclaim_expired\` puts an item past its \`sla_deadline\` at the **front** of its queue with
+- \`reclaim_expired\` puts an item at or past its \`sla_deadline\` at the **front** of its queue with
   \`breached\` = \`"1"\`; one inside its SLA goes to the back.`,
   sequence: {
     participants: ['Reviewer', 'Review Queue', 'Redis'],
@@ -54,7 +54,7 @@ an item that did breach goes to the back of the line, unmarked.
       id: 'lease-ttl',
       title: 'A lease expires after LEASE_SECONDS',
       detail:
-        'The lease key is written with an expiry of `LEASE_SECONDS`, so an abandoned item comes back through `reclaim_expired`; the starter writes it with no TTL.',
+        'The lease key is written with an expiry of `LEASE_SECONDS` in the same command, so an abandoned item comes back through `reclaim_expired` after exactly that long; the starter writes it with no TTL.',
       match: {
         python: {all: [/\b(ex|px)\s*=\s*(LEASE_SECONDS|int\(LEASE_SECONDS)/]},
         typescript: {all: [/['"](EX|PX)['"],\s*LEASE_SECONDS/i]},
@@ -80,7 +80,7 @@ an item that did breach goes to the back of the line, unmarked.
       id: 'breach-requeue',
       title: 'A breached item comes back first, marked',
       detail:
-        '`reclaim_expired` pushes an item past its `sla_deadline` to the front of its queue (`LPUSH`) with `breached` = `"1"`, and one inside its SLA to the back; the starter sends every item to the back.',
+        '`reclaim_expired` pushes an item at or past its `sla_deadline` to the front of its queue (`LPUSH`) with `breached` = `"1"`, and one inside its SLA to the back, once however often it runs; the starter sends every item to the back.',
       match: {
         python: {all: [/["']breached["']\s*[:,]\s*["']1["']/, /\.lpush\(/, /\.rpush\(/]},
         typescript: {all: [/breached:\s*['"]1['"]|['"]breached['"],\s*['"]1['"]/, /\.lpush\(/, /\.rpush\(/]},
@@ -680,11 +680,18 @@ def check_atomic_take(ctx):
 def check_lease_ttl(ctx):
     m = ctx.load("state")
     _enqueue("t1", 1)
+    # The lease's TTL right after the command that wrote it: an expiry set by a later command comes too late.
+    written = ctx.redis_after("review:lease:r-1", lambda: ctx.redis.ttl("review:lease:r-1"))
     assert _id(m.take_next("t1", "alice")) == "r-1", "alice must be handed r-1"
+    assert written.fired, "take_next never wrote the lease review:lease:r-1"
+    assert written.result > 0, f"right after the command that wrote review:lease:r-1 its TTL was {written.result}: a take that stops there leaves a lease that never ends. Write the lease and its expiry in one command"
     ttl = ctx.redis.ttl("review:lease:r-1")
-    assert 0 < ttl <= m.LEASE_SECONDS, f"the lease review:lease:r-1 has TTL {ttl}: a reviewer who closes the tab holds the item forever. Write it with an expiry of LEASE_SECONDS"
+    assert m.LEASE_SECONDS - 1 <= ttl <= m.LEASE_SECONDS, f"the lease review:lease:r-1 has TTL {ttl}: a reviewer who closes the tab must get the item back after LEASE_SECONDS ({m.LEASE_SECONDS} s), no sooner and no later"
     assert m.take_next("t1", "bob") is None, "while alice's lease holds, r-1 must not be handed out again"
-    ctx.clock.advance(m.LEASE_SECONDS + 1)
+    ctx.clock.advance(m.LEASE_SECONDS - 1)
+    early = m.take_next("t1", "bob")
+    assert early is None, f"one second before alice's lease ends bob was handed {_id(early)}: the lease lasts LEASE_SECONDS"
+    ctx.clock.advance(2)
     again = m.take_next("t1", "bob")
     assert _id(again) == "r-1", f"alice's lease on r-1 ran out, yet bob was handed {_id(again)}: an abandoned item must come back"
     assert ctx.redis.get("review:lease:r-1") == "bob", f"the lease on r-1 names {ctx.redis.get('review:lease:r-1')!r}, expected bob"
@@ -716,6 +723,25 @@ def check_breach_requeue(ctx):
     got = m.take_next("t2", "erin")
     assert _id(got) == "r-4", f"erin was handed {_id(got)}: an item reclaimed inside its SLA waits behind r-4, queued before it came back"
     assert store.get_item("r-3")["breached"] == "0", "r-3 is inside its SLA and must not be marked breached"
+    # Reclaimed exactly at its sla_deadline: breached. Reclaimed twice: queued once.
+    _enqueue("t3", 5)
+    assert _id(m.take_next("t3", "fay")) == "r-5", "fay must be handed r-5"
+    _enqueue("t3", 6)
+    ctx.clock.advance(300)
+    m.reclaim_expired("t3")
+    m.reclaim_expired("t3")
+    queue = ctx.redis.lrange("review:queue:t3:p1", 0, -1)
+    assert queue == ["r-5", "r-6"], f"r-5 was reclaimed (twice) exactly at its sla_deadline and review:queue:t3:p1 holds {queue}, expected ['r-5', 'r-6']: at the deadline the item is breached and goes first, once"
+    assert store.get_item("r-5")["breached"] == "1", "r-5 was reclaimed at its sla_deadline and must be marked breached"
+    # Reclaimed one second inside its SLA: the back, unmarked.
+    _enqueue("t4", 7)
+    assert _id(m.take_next("t4", "gus")) == "r-7", "gus must be handed r-7"
+    _enqueue("t4", 8)
+    ctx.clock.advance(299)
+    m.reclaim_expired("t4")
+    queue = ctx.redis.lrange("review:queue:t4:p1", 0, -1)
+    assert queue == ["r-8", "r-7"], f"r-7 was reclaimed one second before its sla_deadline and review:queue:t4:p1 holds {queue}, expected ['r-8', 'r-7']"
+    assert store.get_item("r-7")["breached"] == "0", "r-7 was reclaimed inside its SLA and must not be marked breached"
 `,
     typescript: `function state(ctx) {
   return {m: ctx.load('state'), store: ctx.load('/support/review/store.ts')};
@@ -745,11 +771,18 @@ export async function check_atomic_take(ctx) {
 export async function check_lease_ttl(ctx) {
   const {m, store} = state(ctx);
   await enqueue(store, 't1', 1);
+  // The lease's TTL right after the command that wrote it: an expiry set by a later command comes too late.
+  const written = ctx.redisAfter('review:lease:r-1', () => ctx.redis.ttl('review:lease:r-1'));
   assert.equal(idOf(await m.takeNext('t1', 'alice')), 'r-1', 'alice must be handed r-1');
+  assert(written.fired, 'takeNext never wrote the lease review:lease:r-1');
+  assert(written.result > 0, \`right after the command that wrote review:lease:r-1 its TTL was \${written.result}: a take that stops there leaves a lease that never ends. Write the lease and its expiry in one command\`);
   const ttl = ctx.redis.ttl('review:lease:r-1');
-  assert(ttl > 0 && ttl <= m.LEASE_SECONDS, \`the lease review:lease:r-1 has TTL \${ttl}: a reviewer who closes the tab holds the item forever. Write it with an expiry of LEASE_SECONDS\`);
+  assert(ttl >= m.LEASE_SECONDS - 1 && ttl <= m.LEASE_SECONDS, \`the lease review:lease:r-1 has TTL \${ttl}: a reviewer who closes the tab must get the item back after LEASE_SECONDS (\${m.LEASE_SECONDS} s), no sooner and no later\`);
   assert.equal(await m.takeNext('t1', 'bob'), null, "while alice's lease holds, r-1 must not be handed out again");
-  ctx.clock.advance(m.LEASE_SECONDS + 1);
+  ctx.clock.advance(m.LEASE_SECONDS - 1);
+  const early = await m.takeNext('t1', 'bob');
+  assert.equal(early, null, \`one second before alice's lease ends bob was handed \${idOf(early)}: the lease lasts LEASE_SECONDS\`);
+  ctx.clock.advance(2);
   const again = await m.takeNext('t1', 'bob');
   assert.equal(idOf(again), 'r-1', \`alice's lease on r-1 ran out, yet bob was handed \${idOf(again)}: an abandoned item must come back\`);
   assert.equal(ctx.redis.get('review:lease:r-1'), 'bob', 'the lease on r-1 must name bob');
@@ -781,6 +814,25 @@ export async function check_breach_requeue(ctx) {
   got = await m.takeNext('t2', 'erin');
   assert.equal(idOf(got), 'r-4', \`erin was handed \${idOf(got)}: an item reclaimed inside its SLA waits behind r-4, queued before it came back\`);
   assert.equal((await store.getItem('r-3')).breached, '0', 'r-3 is inside its SLA and must not be marked breached');
+  // Reclaimed exactly at its sla_deadline: breached. Reclaimed twice: queued once.
+  await enqueue(store, 't3', 5);
+  assert.equal(idOf(await m.takeNext('t3', 'fay')), 'r-5', 'fay must be handed r-5');
+  await enqueue(store, 't3', 6);
+  ctx.clock.advance(300);
+  await m.reclaimExpired('t3');
+  await m.reclaimExpired('t3');
+  let queue = ctx.redis.lrange('review:queue:t3:p1', 0, -1);
+  assert.deepStrictEqual(queue, ['r-5', 'r-6'], \`r-5 was reclaimed (twice) exactly at its sla_deadline and review:queue:t3:p1 holds \${JSON.stringify(queue)}, expected ["r-5","r-6"]: at the deadline the item is breached and goes first, once\`);
+  assert.equal((await store.getItem('r-5')).breached, '1', 'r-5 was reclaimed at its sla_deadline and must be marked breached');
+  // Reclaimed one second inside its SLA: the back, unmarked.
+  await enqueue(store, 't4', 7);
+  assert.equal(idOf(await m.takeNext('t4', 'gus')), 'r-7', 'gus must be handed r-7');
+  await enqueue(store, 't4', 8);
+  ctx.clock.advance(299);
+  await m.reclaimExpired('t4');
+  queue = ctx.redis.lrange('review:queue:t4:p1', 0, -1);
+  assert.deepStrictEqual(queue, ['r-8', 'r-7'], \`r-7 was reclaimed one second before its sla_deadline and review:queue:t4:p1 holds \${JSON.stringify(queue)}, expected ["r-8","r-7"]\`);
+  assert.equal((await store.getItem('r-7')).breached, '0', 'r-7 was reclaimed inside its SLA and must not be marked breached');
 }
 `,
     go: `package main
@@ -794,24 +846,29 @@ import (
 	"leetbuild/harness"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-func enqueueItem(tenant string, n int, priority string) map[string]string {
-	return store.CreateItem(stateBg, map[string]string{
+func hEnqueueItem(tenant string, n int, priority string) map[string]string {
+	return store.CreateItem(hStateBg, map[string]string{
 		"item_id": fmt.Sprintf("r-%d", n), "tenant": tenant, "source_type": "guardrail_block",
 		"source_id": fmt.Sprintf("s-%d", n), "priority": priority, "payload_ref": fmt.Sprintf("blob://%d", n),
 	})
 }
 
-func take(ctx *harness.Ctx, tenant, reviewer string) string {
-	item, err := takeNext(stateBg, tenant, reviewer)
+func hTake(ctx *harness.Ctx, tenant, reviewer string) string {
+	item, err := takeNext(hStateBg, tenant, reviewer)
 	ctx.NoError(err, "takeNext(%s, %s) failed", tenant, reviewer)
 	return item["item_id"]
 }
 
+func hReclaim(ctx *harness.Ctx, tenant string) {
+	_, err := reclaimExpired(hStateBg, tenant)
+	ctx.NoError(err, "reclaimExpired(%s) failed", tenant)
+}
+
 func CheckAtomicTake(ctx *harness.Ctx) {
-	enqueueItem("t1", 1, "p1")
-	enqueueItem("t1", 2, "p1")
+	hEnqueueItem("t1", 1, "p1")
+	hEnqueueItem("t1", 2, "p1")
 	// Another reviewer's take lands right after takeNext's first command on the queue.
 	rival := ""
 	fired := false
@@ -820,52 +877,82 @@ func CheckAtomicTake(ctx *harness.Ctx) {
 		rival = fmt.Sprint(ctx.Redis.Do("LPOP", "review:queue:t1:p1"))
 		return nil
 	})
-	got := take(ctx, "t1", "alice")
+	got := hTake(ctx, "t1", "alice")
 	ctx.Assert(fired, "takeNext never touched review:queue:t1:p1")
 	ctx.Assert(got != "", "with two items queued takeNext answered nothing")
 	ctx.Assert(got != rival, "another reviewer took %s between takeNext's read of the queue and its remove, and alice was handed %s too: two reviewers on one item. Take the item out in one command", rival, got)
 	lease, _ := ctx.Redis.Get("review:lease:" + got)
 	ctx.Equal(lease, "alice", "the lease on %s", got)
-	enqueueItem("t1", 3, "p3")
-	enqueueItem("t1", 4, "p2")
-	ctx.Equal(take(ctx, "t1", "bob"), "r-4", "with a p3 and a p2 item queued the p2 item comes first; bob's item")
+	hEnqueueItem("t1", 3, "p3")
+	hEnqueueItem("t1", 4, "p2")
+	ctx.Equal(hTake(ctx, "t1", "bob"), "r-4", "with a p3 and a p2 item queued the p2 item comes first; bob's item")
 }
 
 func CheckLeaseTtl(ctx *harness.Ctx) {
-	enqueueItem("t1", 1, "p1")
-	ctx.Equal(take(ctx, "t1", "alice"), "r-1", "alice's item")
+	hEnqueueItem("t1", 1, "p1")
+	// The lease's TTL right after the command that wrote it: an expiry set by a later command comes too late.
+	written := int64(0)
+	fired := false
+	ctx.Redis.After("review:lease:r-1", func() any {
+		fired = true
+		written = ctx.Redis.TTL("review:lease:r-1")
+		return nil
+	})
+	ctx.Equal(hTake(ctx, "t1", "alice"), "r-1", "alice's item")
+	ctx.Assert(fired, "takeNext never wrote the lease review:lease:r-1")
+	ctx.Assert(written > 0, "right after the command that wrote review:lease:r-1 its TTL was %d: a take that stops there leaves a lease that never ends. Write the lease and its expiry in one command", written)
 	ttl := ctx.Redis.TTL("review:lease:r-1")
-	ctx.Assert(ttl > 0 && ttl <= int64(leaseTTL.Seconds()), "the lease review:lease:r-1 has TTL %d: a reviewer who closes the tab holds the item forever. Write it with an expiry of leaseTTL", ttl)
-	ctx.Equal(take(ctx, "t1", "bob"), "", "while alice's lease holds, r-1 must not be handed out again; bob's item")
-	ctx.Clock.Advance(leaseTTL.Seconds() + 1)
-	ctx.Equal(take(ctx, "t1", "bob"), "r-1", "alice's lease on r-1 ran out: an abandoned item must come back; bob's item")
-	lease, _ := ctx.Redis.Get("review:lease:r-1")
-	ctx.Equal(lease, "bob", "the lease on r-1")
+	lease := int64(leaseTTL.Seconds())
+	ctx.Assert(ttl >= lease-1 && ttl <= lease, "the lease review:lease:r-1 has TTL %d: a reviewer who closes the tab must get the item back after leaseTTL (%d s), no sooner and no later", ttl, lease)
+	ctx.Equal(hTake(ctx, "t1", "bob"), "", "while alice's lease holds, r-1 must not be handed out again; bob's item")
+	ctx.Clock.Advance(leaseTTL.Seconds() - 1)
+	ctx.Equal(hTake(ctx, "t1", "bob"), "", "one second before alice's lease ends r-1 must not be handed out again; bob's item")
+	ctx.Clock.Advance(2)
+	ctx.Equal(hTake(ctx, "t1", "bob"), "r-1", "alice's lease on r-1 ran out: an abandoned item must come back; bob's item")
+	held, _ := ctx.Redis.Get("review:lease:r-1")
+	ctx.Equal(held, "bob", "the lease on r-1")
 }
 
 func CheckSlaClock(ctx *harness.Ctx) {
-	created := enqueueItem("t1", 1, "p1")
+	created := hEnqueueItem("t1", 1, "p1")
 	ctx.Clock.Advance(200)
-	got, err := takeNext(stateBg, "t1", "alice")
+	got, err := takeNext(hStateBg, "t1", "alice")
 	ctx.NoError(err, "takeNext failed")
 	ctx.Equal(got["sla_deadline"], created["sla_deadline"], "the SLA clock started at the enqueue, an assignment must not restart it; r-1's sla_deadline after the take")
-	ctx.Equal(store.GetItem(stateBg, "r-1")["sla_deadline"], created["sla_deadline"], "the stored sla_deadline of r-1")
+	ctx.Equal(store.GetItem(hStateBg, "r-1")["sla_deadline"], created["sla_deadline"], "the stored sla_deadline of r-1")
 }
 
 func CheckBreachRequeue(ctx *harness.Ctx) {
-	enqueueItem("t1", 1, "p1")
-	ctx.Equal(take(ctx, "t1", "alice"), "r-1", "alice's item")
+	hEnqueueItem("t1", 1, "p1")
+	ctx.Equal(hTake(ctx, "t1", "alice"), "r-1", "alice's item")
 	ctx.Clock.Advance(10)
-	enqueueItem("t1", 2, "p1")
+	hEnqueueItem("t1", 2, "p1")
 	ctx.Clock.Advance(400) // alice's lease is gone, and r-1 is past its 300 s SLA
-	ctx.Equal(take(ctx, "t1", "bob"), "r-1", "r-1 came back after its SLA ran out and must go first, ahead of r-2; bob's item")
-	ctx.Equal(store.GetItem(stateBg, "r-1")["breached"], "1", "r-1 came back past its SLA and must be marked; its breached field")
-	enqueueItem("t2", 3, "p2")
-	ctx.Equal(take(ctx, "t2", "dave"), "r-3", "dave's item")
-	enqueueItem("t2", 4, "p2")
+	ctx.Equal(hTake(ctx, "t1", "bob"), "r-1", "r-1 came back after its SLA ran out and must go first, ahead of r-2; bob's item")
+	ctx.Equal(store.GetItem(hStateBg, "r-1")["breached"], "1", "r-1 came back past its SLA and must be marked; its breached field")
+	hEnqueueItem("t2", 3, "p2")
+	ctx.Equal(hTake(ctx, "t2", "dave"), "r-3", "dave's item")
+	hEnqueueItem("t2", 4, "p2")
 	ctx.Clock.Advance(130) // dave's lease is gone; r-3 is well inside its 1800 s SLA
-	ctx.Equal(take(ctx, "t2", "erin"), "r-4", "an item reclaimed inside its SLA waits behind r-4, queued before it came back; erin's item")
-	ctx.Equal(store.GetItem(stateBg, "r-3")["breached"], "0", "r-3 is inside its SLA; its breached field")
+	ctx.Equal(hTake(ctx, "t2", "erin"), "r-4", "an item reclaimed inside its SLA waits behind r-4, queued before it came back; erin's item")
+	ctx.Equal(store.GetItem(hStateBg, "r-3")["breached"], "0", "r-3 is inside its SLA; its breached field")
+	// Reclaimed exactly at its sla_deadline: breached. Reclaimed twice: queued once.
+	hEnqueueItem("t3", 5, "p1")
+	ctx.Equal(hTake(ctx, "t3", "fay"), "r-5", "fay's item")
+	hEnqueueItem("t3", 6, "p1")
+	ctx.Clock.Advance(300)
+	hReclaim(ctx, "t3")
+	hReclaim(ctx, "t3")
+	ctx.Equal(fmt.Sprint(ctx.Redis.LRange("review:queue:t3:p1", 0, -1)), "[r-5 r-6]", "r-5 was reclaimed (twice) exactly at its sla_deadline: at the deadline the item is breached and goes first, once; review:queue:t3:p1")
+	ctx.Equal(store.GetItem(hStateBg, "r-5")["breached"], "1", "r-5 was reclaimed at its sla_deadline; its breached field")
+	// Reclaimed one second inside its SLA: the back, unmarked.
+	hEnqueueItem("t4", 7, "p1")
+	ctx.Equal(hTake(ctx, "t4", "gus"), "r-7", "gus's item")
+	hEnqueueItem("t4", 8, "p1")
+	ctx.Clock.Advance(299)
+	hReclaim(ctx, "t4")
+	ctx.Equal(fmt.Sprint(ctx.Redis.LRange("review:queue:t4:p1", 0, -1)), "[r-8 r-7]", "r-7 was reclaimed one second before its sla_deadline; review:queue:t4:p1")
+	ctx.Equal(store.GetItem(hStateBg, "r-7")["breached"], "0", "r-7 was reclaimed inside its SLA; its breached field")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -876,27 +963,33 @@ func CheckBreachRequeue(ctx *harness.Ctx) {
 
 namespace {
 
-store::Item enqueueItem(const std::string& tenant, int n, const std::string& priority = "p1") {
+store::Item hEnqueueItem(const std::string& tenant, int n, const std::string& priority = "p1") {
   const std::string id = std::to_string(n);
   return store::createItem({{"item_id", "r-" + id}, {"tenant", tenant}, {"source_type", "guardrail_block"}, {"source_id", "s-" + id},
                             {"priority", priority}, {"payload_ref", "blob://" + id}});
 }
 
-std::string take(const std::string& tenant, const std::string& reviewer) {
+std::string hTake(const std::string& tenant, const std::string& reviewer) {
   const auto item = takeNext(tenant, reviewer);
   return item && item->count("item_id") ? item->at("item_id") : "";
 }
 
-std::string field(const std::string& item_id, const std::string& name) {
+std::string hField(const std::string& item_id, const std::string& name) {
   const auto item = store::getItem(item_id);
   return item && item->count(name) ? item->at(name) : "";
+}
+
+std::string hQueue(harness::Ctx& ctx, const std::string& key) {
+  std::string out;
+  for (const auto& id : ctx.Redis.LRange(key, 0, -1)) out += (out.empty() ? "" : " ") + id;
+  return "[" + out + "]";
 }
 
 }  // namespace
 
 void CheckAtomicTake(harness::Ctx& ctx) {
-  enqueueItem("t1", 1);
-  enqueueItem("t1", 2);
+  hEnqueueItem("t1", 1);
+  hEnqueueItem("t1", 2);
   // Another reviewer's take lands right after takeNext's first command on the queue.
   bool fired = false;
   std::string rival;
@@ -904,57 +997,85 @@ void CheckAtomicTake(harness::Ctx& ctx) {
     fired = true;
     rival = ctx.Redis.Do("LPOP", "review:queue:t1:p1").String();
   });
-  const std::string got = take("t1", "alice");
+  const std::string got = hTake("t1", "alice");
   ctx.Assert(fired, "takeNext never touched review:queue:t1:p1");
   ctx.Assert(!got.empty(), "with two items queued takeNext answered nothing");
   ctx.Assert(got != rival, "another reviewer took %s between takeNext's read of the queue and its remove, and alice was handed %s too: two reviewers on one item. Take the item out in one command", rival, got);
   ctx.Equal(ctx.Redis.Get("review:lease:" + got).value_or(""), "alice", "the lease on %s", got);
-  enqueueItem("t1", 3, "p3");
-  enqueueItem("t1", 4, "p2");
-  ctx.Equal(take("t1", "bob"), "r-4", "with a p3 and a p2 item queued the p2 item comes first; bob's item");
+  hEnqueueItem("t1", 3, "p3");
+  hEnqueueItem("t1", 4, "p2");
+  ctx.Equal(hTake("t1", "bob"), "r-4", "with a p3 and a p2 item queued the p2 item comes first; bob's item");
 }
 
 void CheckLeaseTtl(harness::Ctx& ctx) {
-  enqueueItem("t1", 1);
-  ctx.Equal(take("t1", "alice"), "r-1", "alice's item");
+  hEnqueueItem("t1", 1);
+  // The lease's TTL right after the command that wrote it: an expiry set by a later command comes too late.
+  bool fired = false;
+  long long written = 0;
+  ctx.Redis.After("review:lease:r-1", [&] {
+    fired = true;
+    written = ctx.Redis.TTL("review:lease:r-1");
+  });
+  ctx.Equal(hTake("t1", "alice"), "r-1", "alice's item");
+  ctx.Assert(fired, "takeNext never wrote the lease review:lease:r-1");
+  ctx.Assert(written > 0, "right after the command that wrote review:lease:r-1 its TTL was %d: a take that stops there leaves a lease that never ends. Write the lease and its expiry in one command", written);
   const long long ttl = ctx.Redis.TTL("review:lease:r-1");
-  ctx.Assert(ttl > 0 && ttl <= kLeaseSeconds, "the lease review:lease:r-1 has TTL %d: a reviewer who closes the tab holds the item forever. Write it with an expiry of kLeaseSeconds", ttl);
-  ctx.Equal(take("t1", "bob"), "", "while alice's lease holds, r-1 must not be handed out again; bob's item");
-  ctx.Clock.Advance(static_cast<double>(kLeaseSeconds) + 1);
-  ctx.Equal(take("t1", "bob"), "r-1", "alice's lease on r-1 ran out: an abandoned item must come back; bob's item");
+  ctx.Assert(ttl >= kLeaseSeconds - 1 && ttl <= kLeaseSeconds, "the lease review:lease:r-1 has TTL %d: a reviewer who closes the tab must get the item back after kLeaseSeconds (%d s), no sooner and no later", ttl, kLeaseSeconds);
+  ctx.Equal(hTake("t1", "bob"), "", "while alice's lease holds, r-1 must not be handed out again; bob's item");
+  ctx.Clock.Advance(static_cast<double>(kLeaseSeconds) - 1);
+  ctx.Equal(hTake("t1", "bob"), "", "one second before alice's lease ends r-1 must not be handed out again; bob's item");
+  ctx.Clock.Advance(2);
+  ctx.Equal(hTake("t1", "bob"), "r-1", "alice's lease on r-1 ran out: an abandoned item must come back; bob's item");
   ctx.Equal(ctx.Redis.Get("review:lease:r-1").value_or(""), "bob", "the lease on r-1");
 }
 
 void CheckSlaClock(harness::Ctx& ctx) {
-  const store::Item created = enqueueItem("t1", 1);
+  const store::Item created = hEnqueueItem("t1", 1);
   ctx.Clock.Advance(200);
   const auto got = takeNext("t1", "alice");
   ctx.Equal(got && got->count("sla_deadline") ? got->at("sla_deadline") : "", created.at("sla_deadline"),
             "the SLA clock started at the enqueue, an assignment must not restart it; r-1's sla_deadline after the take");
-  ctx.Equal(field("r-1", "sla_deadline"), created.at("sla_deadline"), "the stored sla_deadline of r-1");
+  ctx.Equal(hField("r-1", "sla_deadline"), created.at("sla_deadline"), "the stored sla_deadline of r-1");
 }
 
 void CheckBreachRequeue(harness::Ctx& ctx) {
-  enqueueItem("t1", 1);
-  ctx.Equal(take("t1", "alice"), "r-1", "alice's item");
+  hEnqueueItem("t1", 1);
+  ctx.Equal(hTake("t1", "alice"), "r-1", "alice's item");
   ctx.Clock.Advance(10);
-  enqueueItem("t1", 2);
+  hEnqueueItem("t1", 2);
   ctx.Clock.Advance(400);  // alice's lease is gone, and r-1 is past its 300 s SLA
-  ctx.Equal(take("t1", "bob"), "r-1", "r-1 came back after its SLA ran out and must go first, ahead of r-2; bob's item");
-  ctx.Equal(field("r-1", "breached"), "1", "r-1 came back past its SLA and must be marked; its breached field");
-  enqueueItem("t2", 3, "p2");
-  ctx.Equal(take("t2", "dave"), "r-3", "dave's item");
-  enqueueItem("t2", 4, "p2");
+  ctx.Equal(hTake("t1", "bob"), "r-1", "r-1 came back after its SLA ran out and must go first, ahead of r-2; bob's item");
+  ctx.Equal(hField("r-1", "breached"), "1", "r-1 came back past its SLA and must be marked; its breached field");
+  hEnqueueItem("t2", 3, "p2");
+  ctx.Equal(hTake("t2", "dave"), "r-3", "dave's item");
+  hEnqueueItem("t2", 4, "p2");
   ctx.Clock.Advance(130);  // dave's lease is gone; r-3 is well inside its 1800 s SLA
-  ctx.Equal(take("t2", "erin"), "r-4", "an item reclaimed inside its SLA waits behind r-4, queued before it came back; erin's item");
-  ctx.Equal(field("r-3", "breached"), "0", "r-3 is inside its SLA; its breached field");
+  ctx.Equal(hTake("t2", "erin"), "r-4", "an item reclaimed inside its SLA waits behind r-4, queued before it came back; erin's item");
+  ctx.Equal(hField("r-3", "breached"), "0", "r-3 is inside its SLA; its breached field");
+  // Reclaimed exactly at its sla_deadline: breached. Reclaimed twice: queued once.
+  hEnqueueItem("t3", 5);
+  ctx.Equal(hTake("t3", "fay"), "r-5", "fay's item");
+  hEnqueueItem("t3", 6);
+  ctx.Clock.Advance(300);
+  reclaimExpired("t3");
+  reclaimExpired("t3");
+  ctx.Equal(hQueue(ctx, "review:queue:t3:p1"), "[r-5 r-6]", "r-5 was reclaimed (twice) exactly at its sla_deadline: at the deadline the item is breached and goes first, once; review:queue:t3:p1");
+  ctx.Equal(hField("r-5", "breached"), "1", "r-5 was reclaimed at its sla_deadline; its breached field");
+  // Reclaimed one second inside its SLA: the back, unmarked.
+  hEnqueueItem("t4", 7);
+  ctx.Equal(hTake("t4", "gus"), "r-7", "gus's item");
+  hEnqueueItem("t4", 8);
+  ctx.Clock.Advance(299);
+  reclaimExpired("t4");
+  ctx.Equal(hQueue(ctx, "review:queue:t4:p1"), "[r-8 r-7]", "r-7 was reclaimed one second before its sla_deadline; review:queue:t4:p1");
+  ctx.Equal(hField("r-7", "breached"), "0", "r-7 was reclaimed inside its SLA; its breached field");
 }
 `,
   },
   hints: [
     'Open the same queue in two tabs: both reviewers can get one item. Close a tab mid-item and it never comes back; an item reassigned three times never shows as late.',
     '`LINDEX` and `LREM` are two commands, so a second take can read the same head between them. The lease has no expiry, and every take rewrites `sla_deadline` from now.',
-    'Use `LPOP` for the take, `SET lease reviewer EX LEASE_SECONDS`, drop the `sla_deadline` write, and in `reclaim_expired` `LPUSH` with `breached` "1" when now is past `sla_deadline`, else `RPUSH`.',
+    'Use `LPOP` for the take, `SET lease reviewer EX LEASE_SECONDS`, drop the `sla_deadline` write, and in `reclaim_expired` `LPUSH` with `breached` "1" when now is at or past `sla_deadline`, else `RPUSH`.',
   ],
   debrief: `Every part of the fix leans on Redis doing the coordination: one \`LPOP\` is the only moment an item changes hands, and the lease's TTL is the only clock deciding a reviewer is gone, so no process has to notice anything. The SLA belongs to the item, not to the assignment, which is why the deadline is written once at the enqueue and only read afterwards; a breach then stays visible however often the item moves. Production queues keep a separate set of leased items scored by expiry so the sweep reads only what expired, and let a reviewer extend a lease while the item is open.`,
 };

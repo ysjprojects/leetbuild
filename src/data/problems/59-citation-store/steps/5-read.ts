@@ -20,9 +20,11 @@ quote that comes without its version and offsets; a citation the verifier marked
 verified because its document still exists; and an answer with one broken citation reports itself
 verified.
 
-- \`X-Tenant-Id\` is required (**401**). Another tenant's citation is **404**, the same answer as a
-  missing one; the answer list holds only the caller's citations (none: **404**).
-- \`evidence\` is \`{id, document_id, version, start, end, quote, status, reason}\` as stored.
+- \`X-Tenant-Id\` is required (**401**) on both routes. Another tenant's citation is **404**, the
+  same answer, body included, as a missing one; the answer list holds only the caller's citations,
+  and its status is theirs alone (none: **404**).
+- \`evidence\` is exactly \`{id, document_id, version, start, end, quote, status, reason}\` as
+  stored, on both routes.
 - The status is the **stored verification** (step 4 commits it), never a guess.
 - \`answer_status(citations)\` is the worst status by \`STATUS_RANK\` (\`verified\` < \`pending\` <
   \`broken\`), and any broken citation makes the answer \`ANSWER_DEGRADED\` (\`degraded\`).`,
@@ -90,7 +92,7 @@ verified.
       id: 'tenant-404',
       title: 'Another tenant’s citation is 404',
       detail:
-        'A missing `X-Tenant-Id` is **401**; a citation whose row belongs to another tenant answers **404** like a missing one (a 403 would confirm it exists), and an answer list holds only the caller’s citations. The starter serves any tenant anything.',
+        'A missing `X-Tenant-Id` is **401** on both routes; a citation whose row belongs to another tenant answers **404** with the same body as a missing one (a 403 would confirm it exists), and an answer list holds only the caller’s citations, its status computed from them alone, and is **404** when the caller has none. The starter serves any tenant anything.',
       match: {
         python: {all: [/\b401\b/, /\[["']tenant["']\]\s*[!=]=\s*tenant/, /\b404\b/]},
         typescript: {all: [/code\(\s*401\s*\)/, /\.tenant\s*[!=]==?\s*tenant/, /code\(\s*404\s*\)/]},
@@ -103,7 +105,7 @@ verified.
       id: 'evidence-shape',
       title: 'The citation names its evidence in full',
       detail:
-        'The evidence carries `document_id`, `version`, `start`, `end`, `quote`, `status` and `reason` as stored, so a reader can check the quote against the bytes. The starter answers a quote and a status only.',
+        'The evidence carries exactly `id`, `document_id`, `version`, `start`, `end`, `quote`, `status` and `reason` as stored, on the citation route and in the answer list, so a reader can check the quote against the bytes and nothing else leaks. The starter answers a quote and a status only.',
       match: {
         python: {all: [/["']version["']/, /["']start["']/, /["']end["']/, /["']reason["']/]},
         typescript: {all: [/\bversion:/, /\bstart:/, /\bend:/, /\breason:/]},
@@ -129,7 +131,7 @@ verified.
       id: 'worst-status',
       title: 'The answer reports its worst citation',
       detail:
-        '`answer_status` ranks the statuses with `STATUS_RANK` and returns the worst; a broken citation makes the answer `ANSWER_DEGRADED`. The starter copies the first citation’s status, so a broken one further down disappears.',
+        '`answer_status` ranks the statuses with `STATUS_RANK` and returns the worst wherever it sits in the list; a broken citation makes the answer `ANSWER_DEGRADED`. The starter copies the first citation’s status, so a broken one further down disappears.',
       match: {
         python: {all: [/STATUS_RANK/, /def answer_status\(/, /ANSWER_DEGRADED/], none: [/\[0\]\[["']status["']\]/]},
         typescript: {all: [/STATUS_RANK/, /function answerStatus\(/, /ANSWER_DEGRADED/], none: [/\[0\]\.status/]},
@@ -715,13 +717,20 @@ async def check_route(ctx):
 async def check_tenant_404(ctx):
     async with _api(ctx) as c:
         mine = _seed("t1", status="verified")
-        theirs = _seed("t2", status="verified")
+        theirs = _seed("t2", status="broken", reason="span_moved")
         r = await _get(c, f"/v1/citations/{theirs['id']}")
         assert r.status_code == 404 and "Lovelace" not in r.text, f"tenant t1 read tenant t2's citation {theirs['id']}: {r.status_code} {r.text}. Another tenant's citation is 404, as if it did not exist"
+        missing = await _get(c, "/v1/citations/c-404")
+        assert (r.status_code, r.text) == (missing.status_code, missing.text), f"another tenant's citation answered {r.status_code} {r.text}, a missing one {missing.status_code} {missing.text}: the two must be indistinguishable, or the endpoint confirms which ids exist"
         r = await _get(c, f"/v1/citations/{mine['id']}", tenant="")
         assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
+        r = await _get(c, "/v1/answers/a-1/citations", tenant="")
+        assert r.status_code == 401, f"an answer read without X-Tenant-Id answered {r.status_code}, expected 401"
+        none = await _get(c, "/v1/answers/a-1/citations", tenant="t3")
+        assert none.status_code == 404, f"tenant t3, which owns no citation of answer a-1, read it and got {none.status_code} {none.text}, expected 404"
         r = await _get(c, "/v1/answers/a-1/citations")
     assert _ids(r) == [mine["id"]], f"tenant t1's answer a-1 lists {_ids(r)}: tenant t2's citation under the same answer id must not appear"
+    assert r.json().get("status") == "verified", f"tenant t1's answer a-1 reports {r.json().get('status')!r}: tenant t2's broken citation under the same answer id must not degrade it"
 
 
 async def check_evidence_shape(ctx):
@@ -729,10 +738,15 @@ async def check_evidence_shape(ctx):
         row = _seed()
         store.set_verification({**row, "version": 2, "start": 12, "end": 20, "status": "verified", "reason": ""})
         r = await _get(c, f"/v1/citations/{row['id']}")
+        listed = await _get(c, "/v1/answers/a-1/citations")
     body = r.json()
     want = {"id": row["id"], "document_id": "doc-7", "version": 2, "start": 12, "end": 20, "quote": "Lovelace", "status": "verified", "reason": ""}
     wrong = sorted(k for k in want if body.get(k) != want[k])
     assert not wrong, f"the citation answered {body}: {wrong} differ from the stored {want}. Without the version and offsets nobody can check the quote against the document"
+    extra = sorted(set(body) - set(want))
+    assert not extra, f"the citation answered {body}: {extra} are not evidence. The evidence is exactly id, document_id, version, start, end, quote, status and reason"
+    items = listed.json().get("citations") if listed.status_code == 200 else None
+    assert items == [want], f"the answer lists {items}, expected each citation as the same evidence {want}"
 
 
 async def check_stored_status(ctx):
@@ -757,7 +771,12 @@ async def check_worst_status(ctx):
         _seed(answer_id="a-2", status="verified")
         _seed(answer_id="a-2", status="verified")
         r = await _get(c, "/v1/answers/a-2/citations")
-    assert r.json().get("status") == "verified", f"an answer whose citations are all verified reports {r.json().get('status')!r}"
+        assert r.json().get("status") == "verified", f"an answer whose citations are all verified reports {r.json().get('status')!r}"
+        _seed(answer_id="a-3", status="broken", reason="span_moved")
+        _seed(answer_id="a-3")
+        _seed(answer_id="a-3", status="verified")
+        r = await _get(c, "/v1/answers/a-3/citations")
+    assert r.json().get("status") == "degraded", f"an answer whose first citation is broken, then pending, then verified reports {r.json().get('status')!r}, expected degraded: the worst status wins wherever it sits"
 `,
     typescript: `const FIELDS = {answer_id: 'a-1', document_id: 'doc-7', version: 1, start: 4, end: 12, quote: 'Lovelace'};
 
@@ -790,13 +809,20 @@ export async function check_route(ctx) {
 export async function check_tenant_404(ctx) {
   const {c, seed} = await api(ctx);
   const mine = await seed('t1', 'verified');
-  const theirs = await seed('t2', 'verified');
+  const theirs = await seed('t2', 'broken', 'span_moved');
   let r = await read(c, \`/v1/citations/\${theirs.id}\`);
   assert(r.status === 404 && !r.text.includes('Lovelace'), \`tenant t1 read tenant t2's citation \${theirs.id}: \${r.status} \${r.text}. Another tenant's citation is 404, as if it did not exist\`);
+  const missing = await read(c, '/v1/citations/c-404');
+  assert(r.status === missing.status && r.text === missing.text, \`another tenant's citation answered \${r.status} \${r.text}, a missing one \${missing.status} \${missing.text}: the two must be indistinguishable, or the endpoint confirms which ids exist\`);
   r = await read(c, \`/v1/citations/\${mine.id}\`, '');
   assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
+  r = await read(c, '/v1/answers/a-1/citations', '');
+  assert.equal(r.status, 401, \`an answer read without X-Tenant-Id answered \${r.status}, expected 401\`);
+  const none = await read(c, '/v1/answers/a-1/citations', 't3');
+  assert.equal(none.status, 404, \`tenant t3, which owns no citation of answer a-1, read it and got \${none.status} \${none.text}, expected 404\`);
   r = await read(c, '/v1/answers/a-1/citations');
   assert.deepStrictEqual(ids(r), [mine.id], \`tenant t1's answer a-1 lists \${JSON.stringify(ids(r))}: tenant t2's citation under the same answer id must not appear\`);
+  assert.equal(r.json().status, 'verified', \`tenant t1's answer a-1 reports \${JSON.stringify(r.json().status)}: tenant t2's broken citation under the same answer id must not degrade it\`);
 }
 
 export async function check_evidence_shape(ctx) {
@@ -804,10 +830,15 @@ export async function check_evidence_shape(ctx) {
   const row = await seed();
   await store.setVerification({...row, version: 2, start: 12, end: 20, status: 'verified', reason: ''});
   const r = await read(c, \`/v1/citations/\${row.id}\`);
+  const listed = await read(c, '/v1/answers/a-1/citations');
   const body = r.json();
   const want = {id: row.id, document_id: 'doc-7', version: 2, start: 12, end: 20, quote: 'Lovelace', status: 'verified', reason: ''};
   const wrong = Object.keys(want).filter(k => body[k] !== want[k]);
   assert.equal(wrong.length, 0, \`the citation answered \${r.text}: \${JSON.stringify(wrong)} differ from the stored \${JSON.stringify(want)}. Without the version and offsets nobody can check the quote against the document\`);
+  const extra = Object.keys(body).filter(k => !(k in want));
+  assert.equal(extra.length, 0, \`the citation answered \${r.text}: \${JSON.stringify(extra)} are not evidence. The evidence is exactly id, document_id, version, start, end, quote, status and reason\`);
+  const items = listed.status === 200 ? listed.json().citations : null;
+  assert.deepStrictEqual(items, [want], \`the answer lists \${JSON.stringify(items)}, expected each citation as the same evidence \${JSON.stringify(want)}\`);
 }
 
 export async function check_stored_status(ctx) {
@@ -833,6 +864,11 @@ export async function check_worst_status(ctx) {
   await seed('t1', 'verified', '', {answer_id: 'a-2'});
   r = await read(c, '/v1/answers/a-2/citations');
   assert.equal(r.json().status, 'verified', \`an answer whose citations are all verified reports \${JSON.stringify(r.json().status)}\`);
+  await seed('t1', 'broken', 'span_moved', {answer_id: 'a-3'});
+  await seed('t1', null, '', {answer_id: 'a-3'});
+  await seed('t1', 'verified', '', {answer_id: 'a-3'});
+  r = await read(c, '/v1/answers/a-3/citations');
+  assert.equal(r.json().status, 'degraded', \`an answer whose first citation is broken, then pending, then verified reports \${JSON.stringify(r.json().status)}, expected degraded: the worst status wins wherever it sits\`);
 }
 `,
     go: `package main
@@ -848,27 +884,27 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
-	documents.AddVersion(readBg, "doc-7", "Ada Lovelace wrote the first program.")
+func hReadAPI(ctx *harness.Ctx) *harness.HTTP {
+	documents.AddVersion(hReadBg, "doc-7", "Ada Lovelace wrote the first program.")
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-// seed stores a citation; with a status, what the verifier committed for it.
-func seed(tenant, answerID, documentID, status, reason string) store.Citation {
-	row := store.Create(readBg, tenant, store.Citation{AnswerID: answerID, DocumentID: documentID, Version: 1, Start: 4, End: 12, Quote: "Lovelace"})
+// hSeed stores a citation; with a status, what the verifier committed for it.
+func hSeed(tenant, answerID, documentID, status, reason string) store.Citation {
+	row := store.Create(hReadBg, tenant, store.Citation{AnswerID: answerID, DocumentID: documentID, Version: 1, Start: 4, End: 12, Quote: "Lovelace"})
 	if status != "" {
 		row.Status = status
 		row.Reason = reason
-		store.SetVerification(readBg, row)
+		store.SetVerification(hReadBg, row)
 	}
-	return *store.Get(readBg, row.ID)
+	return *store.Get(hReadBg, row.ID)
 }
 
-func readAs(c *harness.HTTP, path, tenant string) (*harness.Response, map[string]any) {
+func hReadAs(c *harness.HTTP, path, tenant string) (*harness.Response, map[string]any) {
 	var r *harness.Response
 	if tenant == "" {
 		r = c.Get(path)
@@ -879,7 +915,7 @@ func readAs(c *harness.HTTP, path, tenant string) (*harness.Response, map[string
 	return r, body
 }
 
-func listed(r *harness.Response, body map[string]any) []string {
+func hListed(r *harness.Response, body map[string]any) []string {
 	ids := []string{}
 	if r.Status != 200 {
 		return ids
@@ -894,35 +930,43 @@ func listed(r *harness.Response, body map[string]any) []string {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	row := seed("t1", "a-1", "doc-7", "verified", "")
-	r, b := readAs(c, "/v1/citations/"+row.ID, "t1")
+	c := hReadAPI(ctx)
+	row := hSeed("t1", "a-1", "doc-7", "verified", "")
+	r, b := hReadAs(c, "/v1/citations/"+row.ID, "t1")
 	ctx.Assert(r.Status == 200 && b["id"] == row.ID && b["quote"] == "Lovelace", "GET /v1/citations/%s answered %d %s", row.ID, r.Status, r.Text())
-	r, b = readAs(c, "/v1/answers/a-1/citations", "t1")
-	ctx.Equal(listed(r, b), []string{row.ID}, "GET /v1/answers/a-1/citations (%d %s); the citations", r.Status, r.Text())
+	r, b = hReadAs(c, "/v1/answers/a-1/citations", "t1")
+	ctx.Equal(hListed(r, b), []string{row.ID}, "GET /v1/answers/a-1/citations (%d %s); the citations", r.Status, r.Text())
 }
 
 func CheckTenant404(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	mine := seed("t1", "a-1", "doc-7", "verified", "")
-	theirs := seed("t2", "a-1", "doc-7", "verified", "")
-	r, _ := readAs(c, "/v1/citations/"+theirs.ID, "t1")
+	c := hReadAPI(ctx)
+	mine := hSeed("t1", "a-1", "doc-7", "verified", "")
+	theirs := hSeed("t2", "a-1", "doc-7", "broken", "span_moved")
+	r, _ := hReadAs(c, "/v1/citations/"+theirs.ID, "t1")
 	ctx.Assert(r.Status == 404 && !strings.Contains(r.Text(), "Lovelace"), "tenant t1 read tenant t2's citation %s: %d %s. Another tenant's citation is 404, as if it did not exist", theirs.ID, r.Status, r.Text())
-	r, _ = readAs(c, "/v1/citations/"+mine.ID, "")
+	missing, _ := hReadAs(c, "/v1/citations/c-404", "t1")
+	ctx.Assert(r.Status == missing.Status && r.Text() == missing.Text(), "another tenant's citation answered %d %s, a missing one %d %s: the two must be indistinguishable, or the endpoint confirms which ids exist", r.Status, r.Text(), missing.Status, missing.Text())
+	r, _ = hReadAs(c, "/v1/citations/"+mine.ID, "")
 	ctx.Equal(r.Status, 401, "a read without X-Tenant-Id")
-	r, b := readAs(c, "/v1/answers/a-1/citations", "t1")
-	ctx.Equal(listed(r, b), []string{mine.ID}, "tenant t1's answer a-1 must not list tenant t2's citation under the same answer id; the citations")
+	r, _ = hReadAs(c, "/v1/answers/a-1/citations", "")
+	ctx.Equal(r.Status, 401, "an answer read without X-Tenant-Id")
+	none, _ := hReadAs(c, "/v1/answers/a-1/citations", "t3")
+	ctx.Equal(none.Status, 404, "tenant t3, which owns no citation of answer a-1, reading it (%s)", none.Text())
+	r, b := hReadAs(c, "/v1/answers/a-1/citations", "t1")
+	ctx.Equal(hListed(r, b), []string{mine.ID}, "tenant t1's answer a-1 must not list tenant t2's citation under the same answer id; the citations")
+	ctx.Equal(b["status"], "verified", "tenant t2's broken citation under the same answer id must not degrade tenant t1's answer a-1; its status")
 }
 
 func CheckEvidenceShape(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	row := seed("t1", "a-1", "doc-7", "", "")
+	c := hReadAPI(ctx)
+	row := hSeed("t1", "a-1", "doc-7", "", "")
 	row.Version = 2
 	row.Start = 12
 	row.End = 20
 	row.Status = "verified"
-	store.SetVerification(readBg, row)
-	r, b := readAs(c, "/v1/citations/"+row.ID, "t1")
+	store.SetVerification(hReadBg, row)
+	r, b := hReadAs(c, "/v1/citations/"+row.ID, "t1")
+	listed, lb := hReadAs(c, "/v1/answers/a-1/citations", "t1")
 	want := map[string]any{"id": row.ID, "document_id": "doc-7", "version": float64(2), "start": float64(12), "end": float64(20), "quote": "Lovelace", "status": "verified", "reason": ""}
 	wrong := []string{}
 	for k, v := range want {
@@ -931,31 +975,48 @@ func CheckEvidenceShape(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Assert(len(wrong) == 0, "the citation answered %s: %q differ from the stored %v. Without the version and offsets nobody can check the quote against the document", r.Text(), wrong, want)
+	extra := []string{}
+	for k := range b {
+		if _, ok := want[k]; !ok {
+			extra = append(extra, k)
+		}
+	}
+	ctx.Assert(len(extra) == 0, "the citation answered %s: %q are not evidence. The evidence is exactly id, document_id, version, start, end, quote, status and reason", r.Text(), extra)
+	var items any
+	if listed.Status == 200 {
+		items = lb["citations"]
+	}
+	ctx.Equal(items, []any{want}, "each citation the answer lists must be the same evidence (%s); the citations", listed.Text())
 }
 
 func CheckStoredStatus(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	broken := seed("t1", "a-1", "doc-7", "broken", "span_moved")
-	pending := seed("t1", "a-1", "doc-9", "", "")
-	r, b := readAs(c, "/v1/citations/"+broken.ID, "t1")
+	c := hReadAPI(ctx)
+	broken := hSeed("t1", "a-1", "doc-7", "broken", "span_moved")
+	pending := hSeed("t1", "a-1", "doc-9", "", "")
+	r, b := hReadAs(c, "/v1/citations/"+broken.ID, "t1")
 	ctx.Assert(b["status"] == "broken" && b["reason"] == "span_moved", "a citation the verifier marked broken (span_moved) reads %s: its document still exists, which says nothing about whether the quote is in it", r.Text())
-	r, b = readAs(c, "/v1/citations/"+pending.ID, "t1")
+	r, b = hReadAs(c, "/v1/citations/"+pending.ID, "t1")
 	ctx.Assert(b["status"] == "pending", "a citation the verifier has not checked yet reads %s, expected status pending", r.Text())
 }
 
 func CheckWorstStatus(ctx *harness.Ctx) {
-	c := readAPI(ctx)
-	seed("t1", "a-1", "doc-7", "verified", "")
-	seed("t1", "a-1", "doc-7", "", "")
-	_, b := readAs(c, "/v1/answers/a-1/citations", "t1")
+	c := hReadAPI(ctx)
+	hSeed("t1", "a-1", "doc-7", "verified", "")
+	hSeed("t1", "a-1", "doc-7", "", "")
+	_, b := hReadAs(c, "/v1/answers/a-1/citations", "t1")
 	ctx.Equal(b["status"], "pending", "an answer with a verified and a pending citation; its status")
-	seed("t1", "a-1", "doc-7", "broken", "span_moved")
-	_, b = readAs(c, "/v1/answers/a-1/citations", "t1")
+	hSeed("t1", "a-1", "doc-7", "broken", "span_moved")
+	_, b = hReadAs(c, "/v1/answers/a-1/citations", "t1")
 	ctx.Equal(b["status"], "degraded", "an answer whose third citation is broken; its status")
-	seed("t1", "a-2", "doc-7", "verified", "")
-	seed("t1", "a-2", "doc-7", "verified", "")
-	_, b = readAs(c, "/v1/answers/a-2/citations", "t1")
+	hSeed("t1", "a-2", "doc-7", "verified", "")
+	hSeed("t1", "a-2", "doc-7", "verified", "")
+	_, b = hReadAs(c, "/v1/answers/a-2/citations", "t1")
 	ctx.Equal(b["status"], "verified", "an answer whose citations are all verified; its status")
+	hSeed("t1", "a-3", "doc-7", "broken", "span_moved")
+	hSeed("t1", "a-3", "doc-7", "", "")
+	hSeed("t1", "a-3", "doc-7", "verified", "")
+	_, b = hReadAs(c, "/v1/answers/a-3/citations", "t1")
+	ctx.Equal(b["status"], "degraded", "an answer whose first citation is broken, then pending, then verified (the worst status wins wherever it sits); its status")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -972,7 +1033,7 @@ using json = nlohmann::json;
 
 namespace {
 
-harness::HTTP readAPI(harness::Ctx& ctx) {
+harness::HTTP hReadAPI(harness::Ctx& ctx) {
   documents::addVersion("doc-7", "Ada Lovelace wrote the first program.");
   static httplib::Server* svr = nullptr;
   delete svr;
@@ -982,8 +1043,8 @@ harness::HTTP readAPI(harness::Ctx& ctx) {
 }
 
 // A stored citation; with a status, what the verifier committed for it.
-store::Citation seed(const std::string& tenant, const std::string& answer_id = "a-1", const std::string& document_id = "doc-7", const std::string& status = "",
-                     const std::string& reason = "") {
+store::Citation hSeed(const std::string& tenant, const std::string& answer_id = "a-1", const std::string& document_id = "doc-7", const std::string& status = "",
+                      const std::string& reason = "") {
   store::Citation row = store::create(tenant, store::Citation{"", "", answer_id, document_id, 1, 4, 12, "Lovelace", "", ""});
   if (!status.empty()) {
     row.status = status;
@@ -993,18 +1054,18 @@ store::Citation seed(const std::string& tenant, const std::string& answer_id = "
   return *store::get(row.id);
 }
 
-harness::Response readAs(harness::HTTP& c, const std::string& path, const std::string& tenant = "t1") {
+harness::Response hReadAs(harness::HTTP& c, const std::string& path, const std::string& tenant = "t1") {
   return tenant.empty() ? c.Get(path) : c.Get(path, "X-Tenant-Id", tenant);
 }
 
-json bodyOf(const harness::Response& r) {
+json hBodyOf(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body : json::object();
 }
 
-std::vector<std::string> listed(const harness::Response& r) {
+std::vector<std::string> hListed(const harness::Response& r) {
   std::vector<std::string> ids;
-  const json body = bodyOf(r);
+  const json body = hBodyOf(r);
   if (r.Status != 200 || !body.contains("citations") || !body["citations"].is_array()) return ids;
   for (const auto& item : body["citations"]) ids.push_back(item.is_object() ? item.value("id", "") : "");
   return ids;
@@ -1013,67 +1074,88 @@ std::vector<std::string> listed(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const store::Citation row = seed("t1", "a-1", "doc-7", "verified");
-  auto r = readAs(c, "/v1/citations/" + row.id);
-  ctx.Assert(r.Status == 200 && bodyOf(r).value("id", "") == row.id && bodyOf(r).value("quote", "") == "Lovelace", "GET /v1/citations/%s answered %d %s", row.id, r.Status, r.Text());
-  r = readAs(c, "/v1/answers/a-1/citations");
-  ctx.Equal(listed(r), {row.id}, "GET /v1/answers/a-1/citations (%d %s); the citations", r.Status, r.Text());
+  auto c = hReadAPI(ctx);
+  const store::Citation row = hSeed("t1", "a-1", "doc-7", "verified");
+  auto r = hReadAs(c, "/v1/citations/" + row.id);
+  ctx.Assert(r.Status == 200 && hBodyOf(r).value("id", "") == row.id && hBodyOf(r).value("quote", "") == "Lovelace", "GET /v1/citations/%s answered %d %s", row.id, r.Status, r.Text());
+  r = hReadAs(c, "/v1/answers/a-1/citations");
+  ctx.Equal(hListed(r), {row.id}, "GET /v1/answers/a-1/citations (%d %s); the citations", r.Status, r.Text());
 }
 
 void CheckTenant404(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const store::Citation mine = seed("t1", "a-1", "doc-7", "verified");
-  const store::Citation theirs = seed("t2", "a-1", "doc-7", "verified");
-  auto r = readAs(c, "/v1/citations/" + theirs.id);
+  auto c = hReadAPI(ctx);
+  const store::Citation mine = hSeed("t1", "a-1", "doc-7", "verified");
+  const store::Citation theirs = hSeed("t2", "a-1", "doc-7", "broken", "span_moved");
+  auto r = hReadAs(c, "/v1/citations/" + theirs.id);
   ctx.Assert(r.Status == 404 && r.Text().find("Lovelace") == std::string::npos, "tenant t1 read tenant t2's citation %s: %d %s. Another tenant's citation is 404, as if it did not exist", theirs.id, r.Status, r.Text());
-  r = readAs(c, "/v1/citations/" + mine.id, "");
+  const auto missing = hReadAs(c, "/v1/citations/c-404");
+  ctx.Assert(r.Status == missing.Status && r.Text() == missing.Text(), "another tenant's citation answered %d %s, a missing one %d %s: the two must be indistinguishable, or the endpoint confirms which ids exist", r.Status,
+             r.Text(), missing.Status, missing.Text());
+  r = hReadAs(c, "/v1/citations/" + mine.id, "");
   ctx.Equal(r.Status, 401, "a read without X-Tenant-Id");
-  r = readAs(c, "/v1/answers/a-1/citations");
-  ctx.Equal(listed(r), {mine.id}, "tenant t1's answer a-1 must not list tenant t2's citation under the same answer id; the citations");
+  r = hReadAs(c, "/v1/answers/a-1/citations", "");
+  ctx.Equal(r.Status, 401, "an answer read without X-Tenant-Id");
+  const auto none = hReadAs(c, "/v1/answers/a-1/citations", "t3");
+  ctx.Equal(none.Status, 404, "tenant t3, which owns no citation of answer a-1, reading it (%s)", none.Text());
+  r = hReadAs(c, "/v1/answers/a-1/citations");
+  ctx.Equal(hListed(r), {mine.id}, "tenant t1's answer a-1 must not list tenant t2's citation under the same answer id; the citations");
+  ctx.Equal(hBodyOf(r).value("status", ""), "verified", "tenant t2's broken citation under the same answer id must not degrade tenant t1's answer a-1; its status");
 }
 
 void CheckEvidenceShape(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  store::Citation row = seed("t1");
+  auto c = hReadAPI(ctx);
+  store::Citation row = hSeed("t1");
   row.version = 2;
   row.start = 12;
   row.end = 20;
   row.status = "verified";
   store::setVerification(row);
-  const auto r = readAs(c, "/v1/citations/" + row.id);
+  const auto r = hReadAs(c, "/v1/citations/" + row.id);
+  const auto listed = hReadAs(c, "/v1/answers/a-1/citations");
   const json want = {{"id", row.id}, {"document_id", "doc-7"}, {"version", 2}, {"start", 12}, {"end", 20}, {"quote", "Lovelace"}, {"status", "verified"}, {"reason", ""}};
-  const json body = bodyOf(r);
+  const json body = hBodyOf(r);
   std::vector<std::string> wrong;
   for (const auto& [k, v] : want.items()) {
     if (!body.contains(k) || body[k] != v) wrong.push_back(k);
   }
   ctx.Assert(wrong.empty(), "the citation answered %s: %q differ from the stored %s. Without the version and offsets nobody can check the quote against the document", r.Text(), wrong, want.dump());
+  std::vector<std::string> extra;
+  for (const auto& [k, v] : body.items()) {
+    if (!want.contains(k)) extra.push_back(k);
+  }
+  ctx.Assert(extra.empty(), "the citation answered %s: %q are not evidence. The evidence is exactly id, document_id, version, start, end, quote, status and reason", r.Text(), extra);
+  const json items = listed.Status == 200 ? hBodyOf(listed).value("citations", json()) : json();
+  ctx.Assert(items == json::array({want}), "the answer lists %s, expected each citation as the same evidence %s", items.dump(), want.dump());
 }
 
 void CheckStoredStatus(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  const store::Citation broken = seed("t1", "a-1", "doc-7", "broken", "span_moved");
-  const store::Citation pending = seed("t1", "a-1", "doc-9");
-  auto r = readAs(c, "/v1/citations/" + broken.id);
-  ctx.Assert(bodyOf(r).value("status", "") == "broken" && bodyOf(r).value("reason", "") == "span_moved", "a citation the verifier marked broken (span_moved) reads %s: its document still exists, which says nothing about whether the quote is in it", r.Text());
-  r = readAs(c, "/v1/citations/" + pending.id);
-  ctx.Assert(bodyOf(r).value("status", "") == "pending", "a citation the verifier has not checked yet reads %s, expected status pending", r.Text());
+  auto c = hReadAPI(ctx);
+  const store::Citation broken = hSeed("t1", "a-1", "doc-7", "broken", "span_moved");
+  const store::Citation pending = hSeed("t1", "a-1", "doc-9");
+  auto r = hReadAs(c, "/v1/citations/" + broken.id);
+  ctx.Assert(hBodyOf(r).value("status", "") == "broken" && hBodyOf(r).value("reason", "") == "span_moved", "a citation the verifier marked broken (span_moved) reads %s: its document still exists, which says nothing about whether the quote is in it", r.Text());
+  r = hReadAs(c, "/v1/citations/" + pending.id);
+  ctx.Assert(hBodyOf(r).value("status", "") == "pending", "a citation the verifier has not checked yet reads %s, expected status pending", r.Text());
 }
 
 void CheckWorstStatus(harness::Ctx& ctx) {
-  auto c = readAPI(ctx);
-  seed("t1", "a-1", "doc-7", "verified");
-  seed("t1", "a-1", "doc-7");
-  auto r = readAs(c, "/v1/answers/a-1/citations");
-  ctx.Equal(bodyOf(r).value("status", ""), "pending", "an answer with a verified and a pending citation; its status");
-  seed("t1", "a-1", "doc-7", "broken", "span_moved");
-  r = readAs(c, "/v1/answers/a-1/citations");
-  ctx.Equal(bodyOf(r).value("status", ""), "degraded", "an answer whose third citation is broken; its status");
-  seed("t1", "a-2", "doc-7", "verified");
-  seed("t1", "a-2", "doc-7", "verified");
-  r = readAs(c, "/v1/answers/a-2/citations");
-  ctx.Equal(bodyOf(r).value("status", ""), "verified", "an answer whose citations are all verified; its status");
+  auto c = hReadAPI(ctx);
+  hSeed("t1", "a-1", "doc-7", "verified");
+  hSeed("t1", "a-1", "doc-7");
+  auto r = hReadAs(c, "/v1/answers/a-1/citations");
+  ctx.Equal(hBodyOf(r).value("status", ""), "pending", "an answer with a verified and a pending citation; its status");
+  hSeed("t1", "a-1", "doc-7", "broken", "span_moved");
+  r = hReadAs(c, "/v1/answers/a-1/citations");
+  ctx.Equal(hBodyOf(r).value("status", ""), "degraded", "an answer whose third citation is broken; its status");
+  hSeed("t1", "a-2", "doc-7", "verified");
+  hSeed("t1", "a-2", "doc-7", "verified");
+  r = hReadAs(c, "/v1/answers/a-2/citations");
+  ctx.Equal(hBodyOf(r).value("status", ""), "verified", "an answer whose citations are all verified; its status");
+  hSeed("t1", "a-3", "doc-7", "broken", "span_moved");
+  hSeed("t1", "a-3", "doc-7");
+  hSeed("t1", "a-3", "doc-7", "verified");
+  r = hReadAs(c, "/v1/answers/a-3/citations");
+  ctx.Equal(hBodyOf(r).value("status", ""), "degraded", "an answer whose first citation is broken, then pending, then verified (the worst status wins wherever it sits); its status");
 }
 `,
   },

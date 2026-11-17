@@ -71,7 +71,7 @@ sampled model and an answer built from a tool call made for one caller.
       id: 'deadline',
       title: 'One attempt under a 4-second deadline',
       detail:
-        'The single `Answer` call carries a deadline of about 4 s and is not retried: a stuck model fails the miss with DEADLINE_EXCEEDED after four seconds, once. The starter calls with no bound and tries three times.',
+        'The single `Answer` call carries a deadline of about 4 s and is not retried: a stuck model fails the miss with DEADLINE_EXCEEDED after four seconds, once, and a call that fails UNAVAILABLE fails the miss with that code after one attempt. The starter calls with no bound and tries three times.',
       match: {
         python: {all: [/timeout\s*=/], none: [/for\s+\w+\s+in\s+range\(/, /while\s+True/]},
         typescript: {all: [/deadline:\s*Date\.now\(\)\s*\+/], none: [/for\s*\(\s*let\s+\w+\s*=/, /while\s*\(/]},
@@ -818,6 +818,12 @@ def check_deadline(ctx):
     code = raised.code() if isinstance(raised, grpc.RpcError) else None
     assert code == grpc.StatusCode.DEADLINE_EXCEEDED, f"a model slower than the deadline must fail the miss with DEADLINE_EXCEEDED, got {raised!r} (answer {out})"
     assert len(ctx.grpc.calls_to("Answer")) == 2, f"a timed-out call must not be retried: {len(ctx.grpc.calls_to('Answer'))} Answer calls after two misses"
+    ctx.grpc.set_latency("Answer", 0.0)
+    ctx.grpc.fail("Answer", grpc.StatusCode.UNAVAILABLE)
+    out, raised = _miss(m, QUESTION)
+    code = raised.code() if isinstance(raised, grpc.RpcError) else None
+    assert code == grpc.StatusCode.UNAVAILABLE, f"a model call that failed UNAVAILABLE must fail the miss with UNAVAILABLE (its caller owns the retry budget), got {raised!r} (answer {out})"
+    assert len(ctx.grpc.calls_to("Answer")) == 3, f"a failed call must not be retried: {len(ctx.grpc.calls_to('Answer'))} Answer calls after three misses"
 
 
 def check_refusal_terminal(ctx):
@@ -910,6 +916,12 @@ export async function check_deadline(ctx) {
   const code = (raised as {code?: number} | null)?.code ?? null;
   assert.equal(code, ctx.grpc.status.DEADLINE_EXCEEDED, \`a model slower than the deadline must fail the miss with DEADLINE_EXCEEDED, got \${raised} (answer \${JSON.stringify(out)})\`);
   assert.equal(ctx.grpc.callsTo('Answer').length, 2, \`a timed-out call must not be retried: \${ctx.grpc.callsTo('Answer').length} Answer calls after two misses\`);
+  ctx.grpc.setLatency('Answer', 0);
+  ctx.grpc.fail('Answer', ctx.grpc.status.UNAVAILABLE);
+  ({out, raised} = await miss(m, QUESTION));
+  const unavailable = (raised as {code?: number} | null)?.code ?? null;
+  assert.equal(unavailable, ctx.grpc.status.UNAVAILABLE, \`a model call that failed UNAVAILABLE must fail the miss with UNAVAILABLE (its caller owns the retry budget), got \${raised} (answer \${JSON.stringify(out)})\`);
+  assert.equal(ctx.grpc.callsTo('Answer').length, 3, \`a failed call must not be retried: \${ctx.grpc.callsTo('Answer').length} Answer calls after three misses\`);
 }
 
 export async function check_refusal_terminal(ctx) {
@@ -1042,6 +1054,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 	out, err = clientMiss(clientQuestion)
 	ctx.Assert(status.Code(err) == codes.DeadlineExceeded, "a model slower than the deadline must fail the miss with DeadlineExceeded, got %v (answer %v)", err, out)
 	ctx.Equal(len(ctx.GRPC.CallsTo("Answer", "")), 2, "a timed-out call must not be retried; Answer calls after two misses")
+	ctx.GRPC.SetLatency("Answer", 0, "")
+	ctx.GRPC.Fail("Answer", codes.Unavailable, "", 1, "")
+	out, err = clientMiss(clientQuestion)
+	ctx.Assert(status.Code(err) == codes.Unavailable, "a model call that failed Unavailable must fail the miss with Unavailable (its caller owns the retry budget), got %v (answer %v)", err, out)
+	ctx.Equal(len(ctx.GRPC.CallsTo("Answer", "")), 3, "a failed call must not be retried; Answer calls after three misses")
 }
 
 func CheckRefusalTerminal(ctx *harness.Ctx) {
@@ -1110,7 +1127,7 @@ const std::string kMV = "2024-06";
 const std::string kQuestion = "What is the refund window?";
 const std::vector<double> kV = {1, 0, 0, 0};
 
-harness::Ctx* world = nullptr;
+harness::Ctx* hWorld = nullptr;
 
 // The model: answers every question; a prefix picks the reply's shape: refuse:, tool:, sample:, partial:, nocache:.
 class ModelPeer final : public semcache::Model::Service {
@@ -1136,7 +1153,7 @@ void clientWorld(harness::Ctx& ctx) {
   static ModelPeer* peer = nullptr;
   delete peer;
   peer = new ModelPeer;
-  world = &ctx;
+  hWorld = &ctx;
   ctx.GRPC.Server("")->RegisterService(peer);
 }
 
@@ -1159,7 +1176,7 @@ Missed clientMiss(const std::string& question) {
   }
 }
 
-std::string show(const std::optional<Answered>& a) {
+std::string hShow(const std::optional<Answered>& a) {
   if (!a) return "<nil>";
   return "{answer=" + harness::Quote(a->answer) + " entry_id=" + a->entry_id + " cached=" + (a->cached ? "true" : "false") + "}";
 }
@@ -1170,11 +1187,11 @@ std::string show(const std::optional<Answered>& a) {
 void put_entry(const std::string& tenant, const std::string& model_version, const std::string& entry_id,
                const std::vector<double>& embedding, const std::string& answer, const std::string& policy_version) {
   const std::string key = "entry:" + tenant + ":" + model_version + ":" + entry_id;
-  const double now = static_cast<double>(world->Clock.Now()) / 1000;
-  world->Redis.Do("HSET", key, "embedding", nlohmann::json(embedding).dump(), "answer", answer, "created_at", harness::Value(now),
+  const double now = static_cast<double>(hWorld->Clock.Now()) / 1000;
+  hWorld->Redis.Do("HSET", key, "embedding", nlohmann::json(embedding).dump(), "answer", answer, "created_at", harness::Value(now),
                   "expires_at", harness::Value(now + 86400), "policy_version", policy_version);
-  world->Redis.Do("EXPIRE", key, 86400);
-  world->Redis.Do("SADD", "semantic:" + tenant + ":" + model_version, key);
+  hWorld->Redis.Do("EXPIRE", key, 86400);
+  hWorld->Redis.Do("SADD", "semantic:" + tenant + ":" + model_version, key);
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
@@ -1192,14 +1209,22 @@ void CheckDeadline(harness::Ctx& ctx) {
   const auto after = ctx.GRPC.CallsTo("Answer");
   ctx.Assert(!m.raised.empty() && after.back().Code == grpc::StatusCode::DEADLINE_EXCEEDED,
              "a model slower than the deadline must fail the miss with DEADLINE_EXCEEDED, got %s (%s, answer %s)", m.raised, m.message,
-             show(m.out));
+             hShow(m.out));
   ctx.Equal(after.size(), 2, "a timed-out call must not be retried; Answer calls after two misses");
+  ctx.GRPC.SetLatency("Answer", 0);
+  ctx.GRPC.Fail("Answer", grpc::StatusCode::UNAVAILABLE);
+  m = clientMiss(kQuestion);
+  const auto last = ctx.GRPC.CallsTo("Answer");
+  ctx.Assert(!m.raised.empty() && last.size() >= 3 && last[2].Code == grpc::StatusCode::UNAVAILABLE,
+             "a model call that failed UNAVAILABLE must fail the miss (its caller owns the retry budget), got %s (%s, answer %s)", m.raised,
+             m.message, hShow(m.out));
+  ctx.Equal(last.size(), 3, "a failed call must not be retried; Answer calls after three misses");
 }
 
 void CheckRefusalTerminal(harness::Ctx& ctx) {
   clientWorld(ctx);
   const auto m = clientMiss("refuse: how do I pick a lock?");
-  ctx.Assert(!m.raised.empty(), "a refused reply must throw RefusalError, answer_on_miss returned %s", show(m.out));
+  ctx.Assert(!m.raised.empty(), "a refused reply must throw RefusalError, answer_on_miss returned %s", hShow(m.out));
   ctx.Equal(m.raised, "RefusalError", "a refused reply must throw RefusalError (%s); it threw", m.message);
   ctx.Equal(ctx.GRPC.CallsTo("Answer").size(), 1, "a refusal was asked again (the model already decided); Answer calls");
   ctx.Equal(clientEntries(ctx).size(), 0, "a refusal was written back (%v): the next near-duplicate question would be answered with it; entries",
@@ -1215,12 +1240,12 @@ void CheckCacheableGate(harness::Ctx& ctx) {
   for (const auto& [prefix, why] : cases) {
     const auto m = clientMiss(prefix + " " + kQuestion);
     ctx.Equal(m.raised, "", "%s must be answered to its caller (%s); it threw", why, m.message);
-    ctx.Assert(!m.out->cached && m.out->entry_id.empty(), "%s must be answered with cached false and no entry_id, got %s", why, show(m.out));
+    ctx.Assert(!m.out->cached && m.out->entry_id.empty(), "%s must be answered with cached false and no entry_id, got %s", why, hShow(m.out));
     ctx.Equal(clientEntries(ctx).size(), 0, "%s was written back (%v); entries", why, clientEntries(ctx));
   }
   const auto m = clientMiss(kQuestion);
   ctx.Equal(m.raised, "", "a cacheable reply threw (%s);", m.message);
-  ctx.Assert(m.out->cached && !m.out->entry_id.empty(), "a self-contained, deterministic, cacheable reply must be cached, got %s", show(m.out));
+  ctx.Assert(m.out->cached && !m.out->entry_id.empty(), "a self-contained, deterministic, cacheable reply must be cached, got %s", hShow(m.out));
   const std::string key = "entry:acme:" + kMV + ":" + m.out->entry_id;
   ctx.Equal(ctx.Redis.Exists(key), 1, "the cached reply's entry %s must be in the store (keys: %v); EXISTS", key, clientEntries(ctx));
   ctx.Equal(ctx.Redis.HGet(key, "answer"), "Answer to: " + kQuestion, "the entry's answer");
@@ -1231,7 +1256,7 @@ void CheckNoToolCache(harness::Ctx& ctx) {
   const auto m = clientMiss("tool: where is my order?");
   ctx.Equal(m.raised, "", "a tool-built reply must be answered to its caller (%s); it threw", m.message);
   ctx.Assert(m.out->answer == "Answer to: tool: where is my order?" && !m.out->cached, "a tool-built reply is answered with cached false, got %s",
-             show(m.out));
+             hShow(m.out));
   ctx.Equal(clientEntries(ctx).size(), 0, "a reply built from a tool call was written back (%v): the tool ran for this caller's order; entries",
             clientEntries(ctx));
 }
@@ -1240,7 +1265,7 @@ void CheckPolicyVersion(harness::Ctx& ctx) {
   clientWorld(ctx);
   const auto m = clientMiss(kQuestion);
   ctx.Equal(m.raised, "", "a cacheable reply threw (%s);", m.message);
-  ctx.Assert(!m.out->entry_id.empty(), "a cacheable reply must be cached, got %s", show(m.out));
+  ctx.Assert(!m.out->entry_id.empty(), "a cacheable reply must be cached, got %s", hShow(m.out));
   const std::string key = "entry:acme:" + kMV + ":" + m.out->entry_id;
   const auto raw = ctx.Redis.HGetAll(key);
   ctx.Assert(!raw.empty(), "no entry at %s (keys: %v)", key, clientEntries(ctx));

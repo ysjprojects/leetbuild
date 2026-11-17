@@ -83,7 +83,7 @@ Requirements:
       id: 'commit-before-produce',
       title: 'Produces only after the store accepted the move',
       detail:
-        'A job the team cancelled cannot move from running to succeeded: record_transition answers false, the topic stays empty and the job stays cancelled. The starter produces first and commits after.',
+        'A job the team cancelled cannot move from running to succeeded: record_transition answers false, the topic stays empty and the job stays cancelled. A cancel landing right after record_transition first touches the job never leaves an event for a refused move. The starter produces first and commits after.',
       match: {
         python: {order: [/store\.transition\(/, /producer\.produce\(/]},
         typescript: {order: [/store\.transition\(/, /producer\.send\(/]},
@@ -109,7 +109,7 @@ Requirements:
       id: 'outbox-on-refusal',
       title: 'Keeps a refused event in the outbox from the delivery report',
       detail:
-        'When the broker refuses the produce, the event lands in the outbox (ft:outbox) where the broker answers (the delivery callback, the rejected send, the report\u2019s error); record_transition does not raise and the move stays committed. The starter never looks at the result.',
+        'When the broker refuses the produce, the event itself (config_hash, no hyperparameters) lands in the outbox (ft:outbox) where the broker answers (the delivery callback, the rejected send, the report\u2019s error); record_transition does not raise and the move stays committed. The starter never looks at the result.',
       match: {
         python: {all: [/on_delivery\s*=|callback\s*=/, /outbox\.insert_outbox\(/], none: [/except\s+KafkaException/]},
         typescript: {all: [/outbox\.insertOutbox\(/, /catch\s*\(|\.catch\(/]},
@@ -668,6 +668,14 @@ def check_commit_before_produce(ctx):
     assert m.record_transition("job-8", "running", "succeeded") is True
     _settle(m)
     assert [e.get("job_id") for e in _events(ctx)] == ["job-8"] and _status(ctx, "job-8") == "succeeded", f"an accepted move is committed and announced once: {_events(ctx)}, status {_status(ctx, 'job-8')}"
+    _seed(ctx, "job-9", "running")
+    # the team cancels job-9 right after record_transition's first command on the job
+    probe = ctx.redis_after("ft:job:job-9", lambda: ctx.redis.hset("ft:job:job-9", "status", "cancelled"))
+    moved = m.record_transition("job-9", "running", "succeeded")
+    _settle(m)
+    assert probe.fired, "record_transition never touched job-9"
+    announced = [e for e in _events(ctx) if e.get("job_id") == "job-9"]
+    assert (moved is True and len(announced) == 1) or (moved is False and announced == []), f"a cancel landed right after record_transition first touched job-9: it answered {moved!r} and the topic announced {announced}. An event goes out only for a move the store accepted"
 
 
 def check_idempotent_producer(ctx):
@@ -692,6 +700,7 @@ def check_outbox_on_refusal(ctx):
     rows = [json.loads(row) for row in ctx.redis.lrange("ft:outbox", 0, -1)]
     assert len(rows) == 1, f"the broker refused one produce and the outbox holds {len(rows)} rows: a refused event must be kept for the relay"
     assert rows[0].get("job_id") == "job-7" and rows[0].get("status") == "succeeded", f"the outbox row must be the event itself, got {rows[0]}"
+    assert rows[0].get("config_hash") == CONFIG_HASH and "hyperparameters" not in rows[0] and "learning_rate" not in json.dumps(rows[0]), f"the outbox row carries the event's payload (config_hash, not the hyperparameters): {rows[0]}"
     assert ctx.kafka.records(TOPIC) == [], "nothing reached the topic for the refused produce"
     assert _status(ctx, "job-7") == "succeeded", f"the committed move stands, the job reads {_status(ctx, 'job-7')}"
     _seed(ctx, "job-8", "running")
@@ -762,6 +771,14 @@ export async function check_commit_before_produce(ctx) {
   assert.equal(await m.recordTransition('job-8', 'running', 'succeeded'), true);
   await settle();
   assert(JSON.stringify(events(ctx).map(e => e.job_id)) === '["job-8"]' && statusOf(ctx, 'job-8') === 'succeeded', \`an accepted move is committed and announced once: \${JSON.stringify(events(ctx))}, status \${statusOf(ctx, 'job-8')}\`);
+  seed(ctx, 'job-9', 'running');
+  // the team cancels job-9 right after recordTransition's first command on the job
+  const probe = ctx.redisAfter('ft:job:job-9', () => ctx.redis.hset('ft:job:job-9', 'status', 'cancelled'));
+  const raced = await m.recordTransition('job-9', 'running', 'succeeded');
+  await settle();
+  assert(probe.fired, 'recordTransition never touched job-9');
+  const announced = events(ctx).filter(e => e.job_id === 'job-9');
+  assert((raced === true && announced.length === 1) || (raced === false && announced.length === 0), \`a cancel landed right after recordTransition first touched job-9: it resolved \${raced} and the topic announced \${JSON.stringify(announced)}. An event goes out only for a move the store accepted\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -787,6 +804,7 @@ export async function check_outbox_on_refusal(ctx) {
   const rows = ctx.redis.lrange('ft:outbox', 0, -1).map(row => JSON.parse(row));
   assert.equal(rows.length, 1, \`the broker refused one produce and the outbox holds \${rows.length} rows: a refused event must be kept for the relay\`);
   assert(rows[0].job_id === 'job-7' && rows[0].status === 'succeeded', \`the outbox row must be the event itself, got \${JSON.stringify(rows[0])}\`);
+  assert(rows[0].config_hash === CONFIG_HASH && !('hyperparameters' in rows[0]) && !JSON.stringify(rows[0]).includes('learning_rate'), \`the outbox row carries the event's payload (config_hash, not the hyperparameters): \${JSON.stringify(rows[0])}\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'nothing reached the topic for the refused produce');
   assert.equal(statusOf(ctx, 'job-7'), 'succeeded', \`the committed move stands, the job reads \${statusOf(ctx, 'job-7')}\`);
   seed(ctx, 'job-8', 'running');
@@ -807,26 +825,26 @@ import (
 )
 
 const (
-	eventsTopic      = "finetune.job"
-	eventsConfigHash = "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
+	harnessEventsTopic      = "finetune.job"
+	harnessEventsConfigHash = "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e"
 )
 
-func eventsSeed(ctx *harness.Ctx, jobID, status string) {
+func harnessEventsSeed(ctx *harness.Ctx, jobID, status string) {
 	ctx.Redis.Do("HSET", "ft:job:"+jobID, "job_id", jobID, "team", "ml-search", "status", status, "base_model", "llama-3.1-8b",
-		"dataset_version", "support-tickets@v3", "dataset_sha256", strings.Repeat("b1", 32), "config_hash", eventsConfigHash,
+		"dataset_version", "support-tickets@v3", "dataset_sha256", strings.Repeat("b1", 32), "config_hash", harnessEventsConfigHash,
 		"compute_budget", "400", "hyperparameters", \`{"learning_rate":0.0002,"lora_rank":16,"epochs":3}\`,
 		"checkpoint_ids", \`["ckpt-\`+jobID+\`-1"]\`)
 }
 
-func eventsMove(ctx *harness.Ctx, jobID, from, to string) bool {
+func harnessEventsMove(ctx *harness.Ctx, jobID, from, to string) bool {
 	moved, err := recordTransition(context.Background(), jobID, from, to)
 	ctx.NoError(err, "recordTransition(%s, %s, %s)", jobID, from, to)
 	return moved
 }
 
-func eventsAll(ctx *harness.Ctx) []map[string]any {
+func harnessEventsAll(ctx *harness.Ctx) []map[string]any {
 	out := []map[string]any{}
-	for _, value := range ctx.Kafka.Values(eventsTopic) {
+	for _, value := range ctx.Kafka.Values(harnessEventsTopic) {
 		var e map[string]any
 		ctx.NoError(json.Unmarshal([]byte(value), &e), "the event is JSON: %s", value)
 		out = append(out, e)
@@ -834,21 +852,21 @@ func eventsAll(ctx *harness.Ctx) []map[string]any {
 	return out
 }
 
-func eventsStatus(ctx *harness.Ctx, jobID string) string {
+func harnessEventsStatus(ctx *harness.Ctx, jobID string) string {
 	status, _ := ctx.Redis.HGet("ft:job:"+jobID, "status")
 	return status
 }
 
 func CheckJobKey(ctx *harness.Ctx) {
-	eventsSeed(ctx, "job-7", "queued")
-	eventsSeed(ctx, "job-8", "queued")
-	ctx.Assert(eventsMove(ctx, "job-7", "queued", "running"), "job-7 queued -> running must be accepted")
-	ctx.Assert(eventsMove(ctx, "job-8", "queued", "running"), "job-8 queued -> running must be accepted")
-	ctx.Assert(eventsMove(ctx, "job-7", "running", "succeeded"), "job-7 running -> succeeded must be accepted")
+	harnessEventsSeed(ctx, "job-7", "queued")
+	harnessEventsSeed(ctx, "job-8", "queued")
+	ctx.Assert(harnessEventsMove(ctx, "job-7", "queued", "running"), "job-7 queued -> running must be accepted")
+	ctx.Assert(harnessEventsMove(ctx, "job-8", "queued", "running"), "job-8 queued -> running must be accepted")
+	ctx.Assert(harnessEventsMove(ctx, "job-7", "running", "succeeded"), "job-7 running -> succeeded must be accepted")
 	ctx.Settle()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three moves; records on %s", eventsTopic)
-	keys := ctx.Kafka.Keys(eventsTopic)
+	records := ctx.Kafka.Records(harnessEventsTopic)
+	ctx.Equal(len(records), 3, "three moves; records on %s", harnessEventsTopic)
+	keys := ctx.Kafka.Keys(harnessEventsTopic)
 	sort.Strings(keys)
 	ctx.Equal(keys, []string{"job-7", "job-7", "job-8"}, "events must be keyed by job id (keyed by team, a compacted topic keeps one job per team and the other jobs' final statuses are gone)")
 	partitions := map[int32]bool{}
@@ -861,49 +879,62 @@ func CheckJobKey(ctx *harness.Ctx) {
 }
 
 func CheckReferencePayload(ctx *harness.Ctx) {
-	eventsSeed(ctx, "job-7", "running")
-	ctx.Assert(eventsMove(ctx, "job-7", "running", "succeeded"), "running -> succeeded must be accepted")
+	harnessEventsSeed(ctx, "job-7", "running")
+	ctx.Assert(harnessEventsMove(ctx, "job-7", "running", "succeeded"), "running -> succeeded must be accepted")
 	ctx.Settle()
-	values := ctx.Kafka.Values(eventsTopic)
+	values := ctx.Kafka.Values(harnessEventsTopic)
 	ctx.Equal(len(values), 1, "one move; records")
-	all := eventsAll(ctx)
-	ctx.Equal(all[0], map[string]any{"job_id": "job-7", "team": "ml-search", "status": "succeeded", "config_hash": eventsConfigHash, "dataset_version": "support-tickets@v3", "checkpoint_ids": []any{"ckpt-job-7-1"}},
+	all := harnessEventsAll(ctx)
+	ctx.Equal(all[0], map[string]any{"job_id": "job-7", "team": "ml-search", "status": "succeeded", "config_hash": harnessEventsConfigHash, "dataset_version": "support-tickets@v3", "checkpoint_ids": []any{"ckpt-job-7-1"}},
 		"the event must be the reference {job_id, team, status, config_hash, dataset_version, checkpoint_ids}, not the recipe")
 	ctx.Assert(!strings.Contains(values[0], "learning_rate"), "the event copies the hyperparameter block into a retained, replicated topic: %s; config_hash is the reference", values[0])
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
-	eventsSeed(ctx, "job-7", "cancelled") // the team cancelled the run a second before the trainer reported success
-	moved := eventsMove(ctx, "job-7", "running", "succeeded")
+	harnessEventsSeed(ctx, "job-7", "cancelled") // the team cancelled the run a second before the trainer reported success
+	moved := harnessEventsMove(ctx, "job-7", "running", "succeeded")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "the store refused running -> succeeded for a cancelled job, yet the topic says %v: produce only after the commit; records", eventsAll(ctx))
+	ctx.Equal(len(ctx.Kafka.Records(harnessEventsTopic)), 0, "the store refused running -> succeeded for a cancelled job, yet the topic says %v: produce only after the commit; records", harnessEventsAll(ctx))
 	ctx.Assert(!moved, "recordTransition must answer false when the store refuses the move")
-	ctx.Equal(eventsStatus(ctx, "job-7"), "cancelled", "the job must stay cancelled")
-	eventsSeed(ctx, "job-8", "running")
-	ctx.Assert(eventsMove(ctx, "job-8", "running", "succeeded"), "job-8 running -> succeeded must be accepted")
+	ctx.Equal(harnessEventsStatus(ctx, "job-7"), "cancelled", "the job must stay cancelled")
+	harnessEventsSeed(ctx, "job-8", "running")
+	ctx.Assert(harnessEventsMove(ctx, "job-8", "running", "succeeded"), "job-8 running -> succeeded must be accepted")
 	ctx.Settle()
-	all := eventsAll(ctx)
-	ctx.Assert(len(all) == 1 && all[0]["job_id"] == "job-8" && eventsStatus(ctx, "job-8") == "succeeded", "an accepted move is committed and announced once: %v, status %s", all, eventsStatus(ctx, "job-8"))
+	all := harnessEventsAll(ctx)
+	ctx.Assert(len(all) == 1 && all[0]["job_id"] == "job-8" && harnessEventsStatus(ctx, "job-8") == "succeeded", "an accepted move is committed and announced once: %v, status %s", all, harnessEventsStatus(ctx, "job-8"))
+	harnessEventsSeed(ctx, "job-9", "running")
+	// the team cancels job-9 right after recordTransition's first command on the job
+	probe := ctx.Redis.After("ft:job:job-9", func() any { return ctx.Redis.Do("HSET", "ft:job:job-9", "status", "cancelled") })
+	raced := harnessEventsMove(ctx, "job-9", "running", "succeeded")
+	ctx.Settle()
+	ctx.Assert(probe.Fired, "recordTransition never touched job-9")
+	announced := 0
+	for _, e := range harnessEventsAll(ctx) {
+		if e["job_id"] == "job-9" {
+			announced++
+		}
+	}
+	ctx.Assert((raced && announced == 1) || (!raced && announced == 0), "a cancel landed right after recordTransition first touched job-9: it answered %v and the topic announced %d event(s) for it. An event goes out only for a move the store accepted", raced, announced)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	eventsSeed(ctx, "job-7", "running")
-	ctx.Kafka.LoseAcks(eventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
-	eventsMove(ctx, "job-7", "running", "succeeded")
+	harnessEventsSeed(ctx, "job-7", "running")
+	ctx.Kafka.LoseAcks(harnessEventsTopic, 1) // the broker wrote it, the acknowledgement never arrived
+	harnessEventsMove(ctx, "job-7", "running", "succeeded")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 1, "one move whose acknowledgement was lost: the producer's retry must not write the event again (enable.idempotence with acks=all); the records")
+	ctx.Equal(len(ctx.Kafka.Records(harnessEventsTopic)), 1, "one move whose acknowledgement was lost: the producer's retry must not write the event again (enable.idempotence with acks=all); the records")
 }
 
 func CheckOutboxOnRefusal(ctx *harness.Ctx) {
-	eventsSeed(ctx, "job-7", "running")
-	ctx.Kafka.FailNext(eventsTopic, 1)
+	harnessEventsSeed(ctx, "job-7", "running")
+	ctx.Kafka.FailNext(harnessEventsTopic, 1)
 	func() {
 		defer func() {
 			if e := recover(); e != nil {
 				ctx.Fatalf("recordTransition panicked when the broker refused the produce: %v; the event goes to the outbox, the move stays committed", e)
 			}
 		}()
-		eventsMove(ctx, "job-7", "running", "succeeded")
+		harnessEventsMove(ctx, "job-7", "running", "succeeded")
 	}()
 	ctx.Settle()
 	rows := ctx.Redis.LRange("ft:outbox", 0, -1)
@@ -911,12 +942,14 @@ func CheckOutboxOnRefusal(ctx *harness.Ctx) {
 	var row map[string]any
 	json.Unmarshal([]byte(rows[0]), &row)
 	ctx.Assert(row["job_id"] == "job-7" && row["status"] == "succeeded", "the outbox row must be the event itself, got %s", rows[0])
-	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "nothing reached the topic for the refused produce; records")
-	ctx.Equal(eventsStatus(ctx, "job-7"), "succeeded", "the committed move stands; the job's status")
-	eventsSeed(ctx, "job-8", "running")
-	eventsMove(ctx, "job-8", "running", "succeeded")
+	_, leaked := row["hyperparameters"]
+	ctx.Assert(row["config_hash"] == harnessEventsConfigHash && !leaked && !strings.Contains(rows[0], "learning_rate"), "the outbox row carries the event's payload (config_hash, not the hyperparameters): %s", rows[0])
+	ctx.Equal(len(ctx.Kafka.Records(harnessEventsTopic)), 0, "nothing reached the topic for the refused produce; records")
+	ctx.Equal(harnessEventsStatus(ctx, "job-7"), "succeeded", "the committed move stands; the job's status")
+	harnessEventsSeed(ctx, "job-8", "running")
+	harnessEventsMove(ctx, "job-8", "running", "succeeded")
 	ctx.Settle()
-	ctx.Assert(len(ctx.Kafka.Records(eventsTopic)) == 1 && len(ctx.Redis.LRange("ft:outbox", 0, -1)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row")
+	ctx.Assert(len(ctx.Kafka.Records(harnessEventsTopic)) == 1 && len(ctx.Redis.LRange("ft:outbox", 0, -1)) == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -932,37 +965,37 @@ func CheckOutboxOnRefusal(ctx *harness.Ctx) {
 namespace {
 
 const std::string kEventsTopic = "finetune.job";
-const std::string kConfigHash = "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e";
+const std::string kHarnessConfigHash = "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e";
 
-void seedJob(harness::Ctx& ctx, const std::string& job_id, const std::string& status) {
+void harnessSeedJob(harness::Ctx& ctx, const std::string& job_id, const std::string& status) {
   ctx.Redis.Do("HSET", "ft:job:" + job_id, "job_id", job_id, "team", "ml-search", "status", status, "base_model", "llama-3.1-8b", "dataset_version",
-               "support-tickets@v3", "dataset_sha256", "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1", "config_hash", kConfigHash,
+               "support-tickets@v3", "dataset_sha256", "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1", "config_hash", kHarnessConfigHash,
                "compute_budget", "400", "hyperparameters", R"({"learning_rate":0.0002,"lora_rank":16,"epochs":3})", "checkpoint_ids",
                "[\\"ckpt-" + job_id + "-1\\"]");
 }
 
-void settle(harness::Ctx& ctx) {
+void harnessSettle(harness::Ctx& ctx) {
   ctx.Settle();
   producer->poll(0);  // the worker's loop serves delivery reports between moves
 }
 
-std::vector<nlohmann::json> eventsAll(harness::Ctx& ctx) {
+std::vector<nlohmann::json> harnessEvents(harness::Ctx& ctx) {
   std::vector<nlohmann::json> out;
   for (const auto& value : ctx.Kafka.Values(kEventsTopic)) out.push_back(nlohmann::json::parse(value, nullptr, false));
   return out;
 }
 
-std::string statusOf(harness::Ctx& ctx, const std::string& job_id) { return ctx.Redis.HGet("ft:job:" + job_id, "status").value_or(""); }
+std::string harnessStatusOf(harness::Ctx& ctx, const std::string& job_id) { return ctx.Redis.HGet("ft:job:" + job_id, "status").value_or(""); }
 
 }  // namespace
 
 void CheckJobKey(harness::Ctx& ctx) {
-  seedJob(ctx, "job-7", "queued");
-  seedJob(ctx, "job-8", "queued");
+  harnessSeedJob(ctx, "job-7", "queued");
+  harnessSeedJob(ctx, "job-8", "queued");
   ctx.Assert(record_transition("job-7", "queued", "running"), "job-7 queued -> running must be accepted");
   ctx.Assert(record_transition("job-8", "queued", "running"), "job-8 queued -> running must be accepted");
   ctx.Assert(record_transition("job-7", "running", "succeeded"), "job-7 running -> succeeded must be accepted");
-  settle(ctx);
+  harnessSettle(ctx);
   const auto records = ctx.Kafka.Records(kEventsTopic);
   ctx.Equal(records.size(), 3, "three moves; records on %s", kEventsTopic);
   auto keys = ctx.Kafka.Keys(kEventsTopic);
@@ -976,58 +1009,75 @@ void CheckJobKey(harness::Ctx& ctx) {
 }
 
 void CheckReferencePayload(harness::Ctx& ctx) {
-  seedJob(ctx, "job-7", "running");
+  harnessSeedJob(ctx, "job-7", "running");
   ctx.Assert(record_transition("job-7", "running", "succeeded"), "running -> succeeded must be accepted");
-  settle(ctx);
+  harnessSettle(ctx);
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 1, "one move; records");
-  const auto all = eventsAll(ctx);
+  const auto all = harnessEvents(ctx);
   ctx.Equal(all[0],
-            nlohmann::json({{"job_id", "job-7"}, {"team", "ml-search"}, {"status", "succeeded"}, {"config_hash", kConfigHash}, {"dataset_version", "support-tickets@v3"}, {"checkpoint_ids", {"ckpt-job-7-1"}}}),
+            nlohmann::json({{"job_id", "job-7"}, {"team", "ml-search"}, {"status", "succeeded"}, {"config_hash", kHarnessConfigHash}, {"dataset_version", "support-tickets@v3"}, {"checkpoint_ids", {"ckpt-job-7-1"}}}),
             "the event must be the reference {job_id, team, status, config_hash, dataset_version, checkpoint_ids}, not the recipe");
   ctx.Assert(values[0].find("learning_rate") == std::string::npos, "the event copies the hyperparameter block into a retained, replicated topic: %s; config_hash is the reference", values[0]);
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
-  seedJob(ctx, "job-7", "cancelled");  // the team cancelled the run a second before the trainer reported success
+  harnessSeedJob(ctx, "job-7", "cancelled");  // the team cancelled the run a second before the trainer reported success
   const bool moved = record_transition("job-7", "running", "succeeded");
-  settle(ctx);
-  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "the store refused running -> succeeded for a cancelled job, yet the topic says %v: produce only after the commit; records", eventsAll(ctx));
+  harnessSettle(ctx);
+  ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "the store refused running -> succeeded for a cancelled job, yet the topic says %v: produce only after the commit; records", harnessEvents(ctx));
   ctx.Assert(!moved, "record_transition must answer false when the store refuses the move");
-  ctx.Equal(statusOf(ctx, "job-7"), "cancelled", "the job must stay cancelled");
-  seedJob(ctx, "job-8", "running");
+  ctx.Equal(harnessStatusOf(ctx, "job-7"), "cancelled", "the job must stay cancelled");
+  harnessSeedJob(ctx, "job-8", "running");
   ctx.Assert(record_transition("job-8", "running", "succeeded"), "job-8 running -> succeeded must be accepted");
-  settle(ctx);
-  const auto all = eventsAll(ctx);
-  ctx.Assert(all.size() == 1 && all[0].value("job_id", "") == "job-8" && statusOf(ctx, "job-8") == "succeeded", "an accepted move is committed and announced once: %v, status %s", all, statusOf(ctx, "job-8"));
+  harnessSettle(ctx);
+  const auto all = harnessEvents(ctx);
+  ctx.Assert(all.size() == 1 && all[0].value("job_id", "") == "job-8" && harnessStatusOf(ctx, "job-8") == "succeeded", "an accepted move is committed and announced once: %v, status %s", all, harnessStatusOf(ctx, "job-8"));
+  harnessSeedJob(ctx, "job-9", "running");
+  bool fired = false;
+  // the team cancels job-9 right after record_transition's first command on the job
+  ctx.Redis.After("ft:job:job-9", [&] {
+    fired = true;
+    ctx.Redis.Do("HSET", "ft:job:job-9", "status", "cancelled");
+  });
+  const bool raced = record_transition("job-9", "running", "succeeded");
+  harnessSettle(ctx);
+  ctx.Assert(fired, "record_transition never touched job-9");
+  size_t announced = 0;
+  for (const auto& e : harnessEvents(ctx)) {
+    if (e.is_object() && e.value("job_id", "") == "job-9") ++announced;
+  }
+  ctx.Assert((raced && announced == 1) || (!raced && announced == 0), "a cancel landed right after record_transition first touched job-9: it answered %v and the topic announced %d event(s) for it. An event goes out only for a move the store accepted", raced, announced);
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  seedJob(ctx, "job-7", "running");
+  harnessSeedJob(ctx, "job-7", "running");
   ctx.Kafka.LoseAcks(kEventsTopic, 1);  // the broker wrote it, the acknowledgement never arrived
   record_transition("job-7", "running", "succeeded");
-  settle(ctx);
+  harnessSettle(ctx);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 1, "one move whose acknowledgement was lost: the producer's retry must not write the event again (enable.idempotence with acks=all); the records");
 }
 
 void CheckOutboxOnRefusal(harness::Ctx& ctx) {
-  seedJob(ctx, "job-7", "running");
+  harnessSeedJob(ctx, "job-7", "running");
   ctx.Kafka.FailNext(kEventsTopic, 1);
   try {
     record_transition("job-7", "running", "succeeded");
   } catch (const std::exception& e) {
     ctx.Fatalf("record_transition threw when the broker refused the produce: %s; the event goes to the outbox, the move stays committed", e.what());
   }
-  settle(ctx);
+  harnessSettle(ctx);
   const auto rows = ctx.Redis.LRange("ft:outbox", 0, -1);
   ctx.Equal(rows.size(), 1, "the broker refused one produce: a refused event must be kept for the relay; outbox rows");
   const auto row = nlohmann::json::parse(rows.empty() ? std::string("{}") : rows[0], nullptr, false);
   ctx.Assert(row.is_object() && row.value("job_id", "") == "job-7" && row.value("status", "") == "succeeded", "the outbox row must be the event itself, got %v", row);
+  ctx.Assert(row.is_object() && row.value("config_hash", "") == kHarnessConfigHash && !row.contains("hyperparameters") && rows[0].find("learning_rate") == std::string::npos,
+             "the outbox row carries the event's payload (config_hash, not the hyperparameters): %v", row);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "nothing reached the topic for the refused produce; records");
-  ctx.Equal(statusOf(ctx, "job-7"), "succeeded", "the committed move stands; the job's status");
-  seedJob(ctx, "job-8", "running");
+  ctx.Equal(harnessStatusOf(ctx, "job-7"), "succeeded", "the committed move stands; the job's status");
+  harnessSeedJob(ctx, "job-8", "running");
   record_transition("job-8", "running", "succeeded");
-  settle(ctx);
+  harnessSettle(ctx);
   ctx.Assert(ctx.Kafka.Records(kEventsTopic).size() == 1 && ctx.Redis.LRange("ft:outbox", 0, -1).size() == 1, "a healthy produce after the refusal reaches the topic and adds no outbox row");
 }
 `,

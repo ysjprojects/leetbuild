@@ -37,8 +37,8 @@ Requirements:
   returned id; every id goes into \`checkpoint_ids\`, in order.
 - A checkpoint call that fails or returns an empty id ends the run: \`{status: "failed", reason:
   "checkpoint_failed"}\`, no restart.
-- The **third** failed heartbeat of a run (\`MAX_HEARTBEAT_FAILURES\`) ends it as \`failed\` with
-  reason \`heartbeat_lost\`.`,
+- The **third** failed heartbeat of a run (\`MAX_HEARTBEAT_FAILURES\`), counted over the whole run, ends
+  it as \`failed\` with reason \`heartbeat_lost\`.`,
   sequence: {
     participants: ['Supervisor', 'Trainer'],
     messages: [
@@ -75,7 +75,7 @@ Requirements:
       id: 'checkpoint-first',
       title: 'Asks for a checkpoint before any restart',
       detail:
-        'After one missed heartbeat the supervisor calls RequestCheckpoint, then Restart, and the run finishes with one restart. The starter restarts blind.',
+        'After one heartbeat that timed out the supervisor calls RequestCheckpoint, then Restart, each under the same 60 s deadline, and the run finishes with one restart. The starter restarts blind.',
       match: {
         python: {order: [/stub\.RequestCheckpoint\(/, /stub\.Restart\(/]},
         typescript: {order: [/stub\.RequestCheckpoint\(/, /stub\.Restart\(/]},
@@ -101,7 +101,7 @@ Requirements:
       id: 'checkpoint-failure',
       title: 'Fails the run when the trainer cannot checkpoint',
       detail:
-        'A missed heartbeat followed by a failed RequestCheckpoint ends as failed with reason checkpoint_failed and no Restart call. The starter restarts anyway and reports success.',
+        'A missed heartbeat followed by a failed RequestCheckpoint, or by one that answers an empty checkpoint_id, ends as failed with reason checkpoint_failed and no Restart call. The starter restarts anyway and reports success.',
       match: {
         python: {all: [/["']checkpoint_failed["']/]},
         typescript: {all: [/["']checkpoint_failed["']/]},
@@ -114,7 +114,7 @@ Requirements:
       id: 'stop-on-repeated',
       title: 'Stops after the third failed heartbeat',
       detail:
-        'A trainer whose heartbeat keeps failing gets three Heartbeat calls and two restarts, then the run ends as failed with reason heartbeat_lost. The starter restarts on every failure until the trainer answers.',
+        'A trainer whose heartbeat keeps failing gets three Heartbeat calls and two restarts, then the run ends as failed with reason heartbeat_lost. A trainer that misses every other heartbeat ends the same way on its third miss: failures count over the whole run. The starter restarts on every failure until the trainer answers.',
       match: {
         python: {all: [/MAX_HEARTBEAT_FAILURES/, /["']heartbeat_lost["']/]},
         typescript: {all: [/MAX_HEARTBEAT_FAILURES/, /["']heartbeat_lost["']/]},
@@ -702,7 +702,8 @@ JOB = "job-7"
 
 
 class TrainerServicer(finetuned_pb2_grpc.TrainerServicer):
-    """The stand-in trainer: done on its third answered heartbeat; a restarted run answers promptly."""
+    """The stand-in trainer: done on its third answered heartbeat; a restarted run answers promptly.
+    job-blank's checkpoints come back with no id; job-flaky misses the heartbeat after every one it answers."""
 
     def __init__(self, ctx):
         self.ctx = ctx
@@ -713,10 +714,14 @@ class TrainerServicer(finetuned_pb2_grpc.TrainerServicer):
     def Heartbeat(self, request, context):
         self.beats[request.job_id] = self.beats.get(request.job_id, 0) + 1
         n = self.beats[request.job_id]
+        if request.job_id == "job-flaky":
+            self.ctx.grpc.fail("Heartbeat", grpc.StatusCode.UNAVAILABLE, "trainer node flapping", times=1, target=config.TRAINER)
         return finetuned_pb2.HeartbeatReply(step=n * 100, done=n >= 3)
 
     def RequestCheckpoint(self, request, context):
         self.checkpoints[request.job_id] = self.checkpoints.get(request.job_id, 0) + 1
+        if request.job_id == "job-blank":
+            return finetuned_pb2.CheckpointReply(checkpoint_id="")
         return finetuned_pb2.CheckpointReply(checkpoint_id=f"ckpt-{request.job_id}-{self.checkpoints[request.job_id]}")
 
     def Restart(self, request, context):
@@ -757,12 +762,14 @@ def check_heartbeat_deadline(ctx):
 
 def check_checkpoint_first(ctx):
     m = _world(ctx)
-    ctx.grpc.fail("Heartbeat", grpc.StatusCode.UNAVAILABLE, "trainer node rebooting", times=1, target=config.TRAINER)
+    ctx.grpc.fail("Heartbeat", grpc.StatusCode.DEADLINE_EXCEEDED, "trainer did not answer in time", times=1, target=config.TRAINER)
     result = m.supervise(JOB)
     order = [c.path.rsplit("/", 1)[-1] for c in ctx.grpc.calls if c.path.endswith(("/RequestCheckpoint", "/Restart"))]
     assert order == ["RequestCheckpoint", "Restart"], f"after one missed heartbeat the calls were {order}: ask the trainer for a checkpoint, then restart from it. A blind restart throws away every hour since the last checkpoint"
     _expect(result, "succeeded")
     assert result.get("restarts") == 1, f"one missed heartbeat, one restart: {result}"
+    for call in _calls(ctx, "RequestCheckpoint") + _calls(ctx, "Restart"):
+        assert call.timeout is not None and 55 <= call.timeout <= 65, f"every call carries the 60 s deadline (HEARTBEAT_DEADLINE_S): {call.path.rsplit('/', 1)[-1]} carried {call.timeout}"
 
 
 def check_resume_from(ctx):
@@ -785,13 +792,23 @@ def check_checkpoint_failure(ctx):
     assert restarts == [], f"the trainer could not checkpoint and the supervisor restarted it anyway ({len(restarts)} Restart calls): the run must fail with a reason instead"
     _expect(result, "failed", "checkpoint_failed")
     assert len(_calls(ctx, "Heartbeat")) == 1, f"a failed run is not watched further: saw {len(_calls(ctx, 'Heartbeat'))} Heartbeat calls"
+    ctx.grpc.fail("Heartbeat", grpc.StatusCode.UNAVAILABLE, "trainer node rebooting", times=1, target=config.TRAINER)
+    result = m.supervise("job-blank")
+    assert _calls(ctx, "Restart") == [], "the trainer answered RequestCheckpoint with an empty checkpoint_id and the supervisor restarted it anyway: a restart that names no checkpoint cannot be reproduced"
+    _expect(result, "failed", "checkpoint_failed")
 
 
 def check_stop_on_repeated(ctx):
     m = _world(ctx)
+    ctx.grpc.fail("Heartbeat", grpc.StatusCode.UNAVAILABLE, "trainer node flapping", times=1, target=config.TRAINER)
+    result = m.supervise("job-flaky")
+    flaky = len([c for c in _calls(ctx, "Heartbeat") if c.request.job_id == "job-flaky"])
+    assert flaky == 5, f"job-flaky missed every other heartbeat: its third failure is its fifth Heartbeat call, saw {flaky}. Failures count over the whole run, not since the last answer"
+    _expect(result, "failed", "heartbeat_lost")
     ctx.grpc.fail("Heartbeat", grpc.StatusCode.UNAVAILABLE, "trainer wedged", times=10, target=config.TRAINER)
     result = m.supervise(JOB)
-    beats, restarts = len(_calls(ctx, "Heartbeat")), len(_calls(ctx, "Restart"))
+    beats = len([c for c in _calls(ctx, "Heartbeat") if c.request.job_id == JOB])
+    restarts = len([c for c in _calls(ctx, "Restart") if c.request.job_id == JOB])
     assert beats == 3 and restarts == 2, f"a heartbeat that keeps failing got {beats} Heartbeat calls and {restarts} restarts, expected 3 and 2: the third failure (MAX_HEARTBEAT_FAILURES) ends the run"
     _expect(result, "failed", "heartbeat_lost")
 `,
@@ -810,13 +827,16 @@ function world(ctx) {
     Heartbeat(call, callback) {
       const id = call.request.job_id;
       beats[id] = (beats[id] ?? 0) + 1;
+      // job-flaky misses the heartbeat after every one it answers
+      if (id === 'job-flaky') ctx.grpc.fail('Heartbeat', ctx.grpc.status.UNAVAILABLE, 'trainer node flapping', 1, config.TRAINER);
       callback(null, {step: beats[id] * 100, done: beats[id] >= 3});
     },
     RequestCheckpoint(call, callback) {
       const id = call.request.job_id;
       served.push('RequestCheckpoint');
       checkpoints[id] = (checkpoints[id] ?? 0) + 1;
-      callback(null, {checkpoint_id: \`ckpt-\${id}-\${checkpoints[id]}\`});
+      // job-blank's checkpoints come back with no id
+      callback(null, {checkpoint_id: id === 'job-blank' ? '' : \`ckpt-\${id}-\${checkpoints[id]}\`});
     },
     Restart(call, callback) {
       const id = call.request.job_id;
@@ -853,12 +873,15 @@ export async function check_heartbeat_deadline(ctx) {
 
 export async function check_checkpoint_first(ctx) {
   const {m, config, served} = world(ctx);
-  ctx.grpc.fail('Heartbeat', ctx.grpc.status.UNAVAILABLE, 'trainer node rebooting', 1, config.TRAINER);
+  ctx.grpc.fail('Heartbeat', ctx.grpc.status.DEADLINE_EXCEEDED, 'trainer did not answer in time', 1, config.TRAINER);
   const result = await m.supervise(JOB);
   const order = [...served];
   assert.deepEqual(order, ['RequestCheckpoint', 'Restart'], \`after one missed heartbeat the calls were \${JSON.stringify(order)}: ask the trainer for a checkpoint, then restart from it. A blind restart throws away every hour since the last checkpoint\`);
   expect(result, 'succeeded');
   assert.equal(result.restarts, 1, \`one missed heartbeat, one restart: \${JSON.stringify(result)}\`);
+  for (const method of ['RequestCheckpoint', 'Restart'])
+    for (const call of calls(ctx, method))
+      assert(call.timeout !== null && call.timeout >= 55 && call.timeout <= 65, \`every call carries the 60 s deadline (HEARTBEAT_DEADLINE_MS): \${method} carried \${call.timeout}\`);
 }
 
 export async function check_resume_from(ctx) {
@@ -881,14 +904,23 @@ export async function check_checkpoint_failure(ctx) {
   assert.equal(restarts.length, 0, \`the trainer could not checkpoint and the supervisor restarted it anyway (\${restarts.length} Restart calls): the run must fail with a reason instead\`);
   expect(result, 'failed', 'checkpoint_failed');
   assert.equal(calls(ctx, 'Heartbeat').length, 1, \`a failed run is not watched further: saw \${calls(ctx, 'Heartbeat').length} Heartbeat calls\`);
+  ctx.grpc.fail('Heartbeat', ctx.grpc.status.UNAVAILABLE, 'trainer node rebooting', 1, config.TRAINER);
+  const blank = await m.supervise('job-blank');
+  assert.equal(calls(ctx, 'Restart').length, 0, 'the trainer answered RequestCheckpoint with an empty checkpoint_id and the supervisor restarted it anyway: a restart that names no checkpoint cannot be reproduced');
+  expect(blank, 'failed', 'checkpoint_failed');
 }
 
 export async function check_stop_on_repeated(ctx) {
   const {m, config} = world(ctx);
+  ctx.grpc.fail('Heartbeat', ctx.grpc.status.UNAVAILABLE, 'trainer node flapping', 1, config.TRAINER);
+  const flakyResult = await m.supervise('job-flaky');
+  const flaky = calls(ctx, 'Heartbeat').filter(c => c.request.job_id === 'job-flaky').length;
+  assert.equal(flaky, 5, \`job-flaky missed every other heartbeat: its third failure is its fifth Heartbeat call, saw \${flaky}. Failures count over the whole run, not since the last answer\`);
+  expect(flakyResult, 'failed', 'heartbeat_lost');
   ctx.grpc.fail('Heartbeat', ctx.grpc.status.UNAVAILABLE, 'trainer wedged', 10, config.TRAINER);
   const result = await m.supervise(JOB);
-  const beats = calls(ctx, 'Heartbeat').length;
-  const restarts = calls(ctx, 'Restart').length;
+  const beats = calls(ctx, 'Heartbeat').filter(c => c.request.job_id === JOB).length;
+  const restarts = calls(ctx, 'Restart').filter(c => c.request.job_id === JOB).length;
   assert(beats === 3 && restarts === 2, \`a heartbeat that keeps failing got \${beats} Heartbeat calls and \${restarts} restarts, expected 3 and 2: the third failure (MAX_HEARTBEAT_FAILURES) ends the run\`);
   expect(result, 'failed', 'heartbeat_lost');
 }
@@ -898,6 +930,7 @@ export async function check_stop_on_repeated(ctx) {
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -909,10 +942,11 @@ import (
 	"leetbuild/harness"
 )
 
-const supervisedJob = "job-7"
+const harnessJob = "job-7"
 
-// trainerPeer is the stand-in trainer: done on its third answered heartbeat; a restarted run answers promptly.
-type trainerPeer struct {
+// harnessTrainer is the stand-in trainer: done on its third answered heartbeat; a restarted run answers promptly.
+// job-blank's checkpoints come back with no id; job-flaky misses the heartbeat after every one it answers.
+type harnessTrainer struct {
 	pb.UnimplementedTrainerServer
 	ctx         *harness.Ctx
 	beats       map[string]int64
@@ -920,39 +954,56 @@ type trainerPeer struct {
 	restarts    map[string]int32
 }
 
-func (p *trainerPeer) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatReply, error) {
+func (p *harnessTrainer) Heartbeat(_ context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatReply, error) {
 	p.beats[req.GetJobId()]++
 	n := p.beats[req.GetJobId()]
+	if req.GetJobId() == "job-flaky" {
+		p.ctx.GRPC.Fail("Heartbeat", codes.Unavailable, "trainer node flapping", 1, config.Trainer)
+	}
 	return &pb.HeartbeatReply{Step: n * 100, Done: n >= 3}, nil
 }
 
-func (p *trainerPeer) RequestCheckpoint(_ context.Context, req *pb.CheckpointRequest) (*pb.CheckpointReply, error) {
+func (p *harnessTrainer) RequestCheckpoint(_ context.Context, req *pb.CheckpointRequest) (*pb.CheckpointReply, error) {
 	p.checkpoints[req.GetJobId()]++
+	if req.GetJobId() == "job-blank" {
+		return &pb.CheckpointReply{}, nil
+	}
 	return &pb.CheckpointReply{CheckpointId: fmt.Sprintf("ckpt-%s-%d", req.GetJobId(), p.checkpoints[req.GetJobId()])}, nil
 }
 
-func (p *trainerPeer) Restart(_ context.Context, req *pb.RestartRequest) (*pb.RestartReply, error) {
+func (p *harnessTrainer) Restart(_ context.Context, req *pb.RestartRequest) (*pb.RestartReply, error) {
 	p.restarts[req.GetJobId()]++
 	p.ctx.GRPC.SetLatency("Heartbeat", 0, config.Trainer)
 	return &pb.RestartReply{Attempt: p.restarts[req.GetJobId()]}, nil
 }
 
-func supervisorWorld(ctx *harness.Ctx) {
-	peer := &trainerPeer{ctx: ctx, beats: map[string]int64{}, checkpoints: map[string]int{}, restarts: map[string]int32{}}
+func harnessTrainerWorld(ctx *harness.Ctx) {
+	peer := &harnessTrainer{ctx: ctx, beats: map[string]int64{}, checkpoints: map[string]int{}, restarts: map[string]int32{}}
 	pb.RegisterTrainerServer(ctx.GRPC.Server(config.Trainer), peer)
 }
 
-func supervisorRun(ctx *harness.Ctx) Supervision {
-	result, err := supervise(context.Background(), supervisedJob)
-	ctx.NoError(err, "supervise(%s)", supervisedJob)
+func harnessSupervise(ctx *harness.Ctx, jobID string) Supervision {
+	result, err := supervise(context.Background(), jobID)
+	ctx.NoError(err, "supervise(%s)", jobID)
 	return result
 }
 
-func supervisorCalls(ctx *harness.Ctx, method string) []harness.Call {
+func harnessJobCalls(ctx *harness.Ctx, method, jobID string) int {
+	n := 0
+	for _, call := range harnessCalls(ctx, method) {
+		// a call that failed before reaching the trainer logs a plain copy of its request
+		if req := reflect.ValueOf(call.Request); req.Kind() == reflect.Pointer && req.Elem().FieldByName("JobId").String() == jobID {
+			n++
+		}
+	}
+	return n
+}
+
+func harnessCalls(ctx *harness.Ctx, method string) []harness.Call {
 	return ctx.GRPC.CallsTo(method, "")
 }
 
-func supervisorExpect(ctx *harness.Ctx, result Supervision, status, reason string) {
+func harnessExpect(ctx *harness.Ctx, result Supervision, status, reason string) {
 	ctx.Equal(result.Status, status, "the run's status (%+v)", result)
 	if reason != "" {
 		ctx.Equal(result.Reason, reason, "the run's reason (%+v)", result)
@@ -960,14 +1011,14 @@ func supervisorExpect(ctx *harness.Ctx, result Supervision, status, reason strin
 }
 
 func CheckHeartbeatDeadline(ctx *harness.Ctx) {
-	supervisorWorld(ctx)
+	harnessTrainerWorld(ctx)
 	ctx.GRPC.SetLatency("Heartbeat", 45, config.Trainer)
-	result := supervisorRun(ctx)
-	restarts := len(supervisorCalls(ctx, "Restart"))
+	result := harnessSupervise(ctx, harnessJob)
+	restarts := len(harnessCalls(ctx, "Restart"))
 	ctx.Equal(restarts, 0, "a trainer answering heartbeats in 45 s (busy writing a checkpoint shard) was restarted: a deadline under 60 s threw away a healthy run's progress; Restart calls")
-	supervisorExpect(ctx, result, "succeeded", "")
+	harnessExpect(ctx, result, "succeeded", "")
 	ctx.Equal(result.Restarts, 0, "a healthy run has no restarts")
-	beats := supervisorCalls(ctx, "Heartbeat")
+	beats := harnessCalls(ctx, "Heartbeat")
 	ctx.Equal(len(beats), 3, "the run finishes on its third heartbeat; Heartbeat calls")
 	for _, call := range beats {
 		ctx.Assert(call.HasDeadline() && call.Timeout >= 55*time.Second && call.Timeout <= 65*time.Second, "every Heartbeat carries a 60 s deadline (heartbeatDeadline), one carried %v", call.Timeout)
@@ -975,9 +1026,9 @@ func CheckHeartbeatDeadline(ctx *harness.Ctx) {
 }
 
 func CheckCheckpointFirst(ctx *harness.Ctx) {
-	supervisorWorld(ctx)
-	ctx.GRPC.Fail("Heartbeat", codes.Unavailable, "trainer node rebooting", 1, config.Trainer)
-	result := supervisorRun(ctx)
+	harnessTrainerWorld(ctx)
+	ctx.GRPC.Fail("Heartbeat", codes.DeadlineExceeded, "trainer did not answer in time", 1, config.Trainer)
+	result := harnessSupervise(ctx, harnessJob)
 	order := []string{}
 	for _, call := range ctx.GRPC.Calls() {
 		name := call.Method[strings.LastIndex(call.Method, "/")+1:]
@@ -986,42 +1037,54 @@ func CheckCheckpointFirst(ctx *harness.Ctx) {
 		}
 	}
 	ctx.Equal(order, []string{"RequestCheckpoint", "Restart"}, "after one missed heartbeat: ask the trainer for a checkpoint, then restart from it. A blind restart throws away every hour since the last checkpoint; the calls")
-	supervisorExpect(ctx, result, "succeeded", "")
+	harnessExpect(ctx, result, "succeeded", "")
 	ctx.Equal(result.Restarts, 1, "one missed heartbeat, one restart")
+	for _, call := range append(harnessCalls(ctx, "RequestCheckpoint"), harnessCalls(ctx, "Restart")...) {
+		ctx.Assert(call.HasDeadline() && call.Timeout >= 55*time.Second && call.Timeout <= 65*time.Second, "every call carries the 60 s deadline (heartbeatDeadline): %s carried %v", call.Method, call.Timeout)
+	}
 }
 
 func CheckResumeFrom(ctx *harness.Ctx) {
-	supervisorWorld(ctx)
+	harnessTrainerWorld(ctx)
 	ctx.GRPC.Fail("Heartbeat", codes.Unavailable, "trainer node rebooting", 2, config.Trainer)
-	result := supervisorRun(ctx)
+	result := harnessSupervise(ctx, harnessJob)
 	resumed := []string{}
-	for _, call := range supervisorCalls(ctx, "Restart") {
+	for _, call := range harnessCalls(ctx, "Restart") {
 		req, _ := call.Request.(*pb.RestartRequest)
 		resumed = append(resumed, req.GetResumeFrom())
 	}
 	ctx.Equal(resumed, []string{"ckpt-job-7-1", "ckpt-job-7-2"}, "each Restart names the checkpoint RequestCheckpoint just returned, or the run cannot be reproduced; the restarts resumed from")
-	supervisorExpect(ctx, result, "succeeded", "")
+	harnessExpect(ctx, result, "succeeded", "")
 	ctx.Equal(result.CheckpointIDs, []string{"ckpt-job-7-1", "ckpt-job-7-2"}, "the result must carry the checkpoint lineage in order")
 	ctx.Equal(result.Restarts, 2, "two missed heartbeats, two restarts")
 }
 
 func CheckCheckpointFailure(ctx *harness.Ctx) {
-	supervisorWorld(ctx)
+	harnessTrainerWorld(ctx)
 	ctx.GRPC.Fail("Heartbeat", codes.Unavailable, "trainer node rebooting", 1, config.Trainer)
 	ctx.GRPC.Fail("RequestCheckpoint", codes.FailedPrecondition, "checkpoint volume full", 1, config.Trainer)
-	result := supervisorRun(ctx)
-	ctx.Equal(len(supervisorCalls(ctx, "Restart")), 0, "the trainer could not checkpoint and the supervisor restarted it anyway: the run must fail with a reason instead; Restart calls")
-	supervisorExpect(ctx, result, "failed", "checkpoint_failed")
-	ctx.Equal(len(supervisorCalls(ctx, "Heartbeat")), 1, "a failed run is not watched further; Heartbeat calls")
+	result := harnessSupervise(ctx, harnessJob)
+	ctx.Equal(len(harnessCalls(ctx, "Restart")), 0, "the trainer could not checkpoint and the supervisor restarted it anyway: the run must fail with a reason instead; Restart calls")
+	harnessExpect(ctx, result, "failed", "checkpoint_failed")
+	ctx.Equal(len(harnessCalls(ctx, "Heartbeat")), 1, "a failed run is not watched further; Heartbeat calls")
+	ctx.GRPC.Fail("Heartbeat", codes.Unavailable, "trainer node rebooting", 1, config.Trainer)
+	blank := harnessSupervise(ctx, "job-blank")
+	ctx.Equal(len(harnessCalls(ctx, "Restart")), 0, "the trainer answered RequestCheckpoint with an empty checkpoint_id and the supervisor restarted it anyway: a restart that names no checkpoint cannot be reproduced; Restart calls")
+	harnessExpect(ctx, blank, "failed", "checkpoint_failed")
 }
 
 func CheckStopOnRepeated(ctx *harness.Ctx) {
-	supervisorWorld(ctx)
+	harnessTrainerWorld(ctx)
+	ctx.GRPC.Fail("Heartbeat", codes.Unavailable, "trainer node flapping", 1, config.Trainer)
+	flakyResult := harnessSupervise(ctx, "job-flaky")
+	flaky := harnessJobCalls(ctx, "Heartbeat", "job-flaky")
+	ctx.Equal(flaky, 5, "job-flaky missed every other heartbeat: its third failure is its fifth Heartbeat call. Failures count over the whole run, not since the last answer; job-flaky's Heartbeat calls")
+	harnessExpect(ctx, flakyResult, "failed", "heartbeat_lost")
 	ctx.GRPC.Fail("Heartbeat", codes.Unavailable, "trainer wedged", 10, config.Trainer)
-	result := supervisorRun(ctx)
-	beats, restarts := len(supervisorCalls(ctx, "Heartbeat")), len(supervisorCalls(ctx, "Restart"))
+	result := harnessSupervise(ctx, harnessJob)
+	beats, restarts := harnessJobCalls(ctx, "Heartbeat", harnessJob), harnessJobCalls(ctx, "Restart", harnessJob)
 	ctx.Assert(beats == 3 && restarts == 2, "a heartbeat that keeps failing got %d Heartbeat calls and %d restarts, expected 3 and 2: the third failure (maxHeartbeatFailures) ends the run", beats, restarts)
-	supervisorExpect(ctx, result, "failed", "heartbeat_lost")
+	harnessExpect(ctx, result, "failed", "heartbeat_lost")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1034,15 +1097,17 @@ func CheckStopOnRepeated(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kJob = "job-7";
+const std::string kHarnessJob = "job-7";
 
 // The stand-in trainer: done on its third answered heartbeat; a restarted run answers promptly.
-class TrainerPeer final : public finetuned::Trainer::Service {
+// job-blank's checkpoints come back with no id; job-flaky misses the heartbeat after every one it answers.
+class HarnessTrainer final : public finetuned::Trainer::Service {
  public:
-  explicit TrainerPeer(harness::Ctx& ctx) : ctx_(ctx) {}
+  explicit HarnessTrainer(harness::Ctx& ctx) : ctx_(ctx) {}
 
   grpc::Status Heartbeat(grpc::ServerContext*, const finetuned::HeartbeatRequest* req, finetuned::HeartbeatReply* reply) override {
     const long long n = ++beats_[req->job_id()];
+    if (req->job_id() == "job-flaky") ctx_.GRPC.Fail("Heartbeat", grpc::StatusCode::UNAVAILABLE, "trainer node flapping", 1, config::kTrainer);
     reply->set_step(n * 100);
     reply->set_done(n >= 3);
     return grpc::Status::OK;
@@ -1050,7 +1115,7 @@ class TrainerPeer final : public finetuned::Trainer::Service {
 
   grpc::Status RequestCheckpoint(grpc::ServerContext*, const finetuned::CheckpointRequest* req, finetuned::CheckpointReply* reply) override {
     const int n = ++checkpoints_[req->job_id()];
-    reply->set_checkpoint_id("ckpt-" + req->job_id() + "-" + std::to_string(n));
+    if (req->job_id() != "job-blank") reply->set_checkpoint_id("ckpt-" + req->job_id() + "-" + std::to_string(n));
     return grpc::Status::OK;
   }
 
@@ -1067,14 +1132,23 @@ class TrainerPeer final : public finetuned::Trainer::Service {
   std::map<std::string, int> restarts_;
 };
 
-void supervisorWorld(harness::Ctx& ctx) {
-  static TrainerPeer* peer = nullptr;
+void harnessTrainerWorld(harness::Ctx& ctx) {
+  static HarnessTrainer* peer = nullptr;
   delete peer;
-  peer = new TrainerPeer(ctx);
+  peer = new HarnessTrainer(ctx);
   ctx.GRPC.Server(config::kTrainer)->RegisterService(peer);
 }
 
-void expectRun(harness::Ctx& ctx, const Supervision& result, const std::string& status, const std::string& reason = "") {
+size_t harnessJobCalls(harness::Ctx& ctx, const std::string& method, const std::string& job_id) {
+  size_t n = 0;
+  for (const auto& call : ctx.GRPC.CallsTo(method)) {
+    const std::string id = method == "Heartbeat" ? call.Request<finetuned::HeartbeatRequest>().job_id() : call.Request<finetuned::RestartRequest>().job_id();
+    if (id == job_id) ++n;
+  }
+  return n;
+}
+
+void harnessExpectRun(harness::Ctx& ctx, const Supervision& result, const std::string& status, const std::string& reason = "") {
   ctx.Equal(result.status, status, "the run's status (reason %q, restarts %d)", result.reason, result.restarts);
   if (!reason.empty()) ctx.Equal(result.reason, reason, "the run's reason");
 }
@@ -1082,11 +1156,11 @@ void expectRun(harness::Ctx& ctx, const Supervision& result, const std::string& 
 }  // namespace
 
 void CheckHeartbeatDeadline(harness::Ctx& ctx) {
-  supervisorWorld(ctx);
+  harnessTrainerWorld(ctx);
   ctx.GRPC.SetLatency("Heartbeat", 45, config::kTrainer);
-  const Supervision result = supervise(kJob);
+  const Supervision result = supervise(kHarnessJob);
   ctx.Equal(ctx.GRPC.CallsTo("Restart").size(), 0, "a trainer answering heartbeats in 45 s (busy writing a checkpoint shard) was restarted: a deadline under 60 s threw away a healthy run's progress; Restart calls");
-  expectRun(ctx, result, "succeeded");
+  harnessExpectRun(ctx, result, "succeeded");
   ctx.Equal(result.restarts, 0, "a healthy run has no restarts");
   const auto beats = ctx.GRPC.CallsTo("Heartbeat");
   ctx.Equal(beats.size(), 3, "the run finishes on its third heartbeat; Heartbeat calls");
@@ -1096,49 +1170,62 @@ void CheckHeartbeatDeadline(harness::Ctx& ctx) {
 }
 
 void CheckCheckpointFirst(harness::Ctx& ctx) {
-  supervisorWorld(ctx);
-  ctx.GRPC.Fail("Heartbeat", grpc::StatusCode::UNAVAILABLE, "trainer node rebooting", 1, config::kTrainer);
-  const Supervision result = supervise(kJob);
+  harnessTrainerWorld(ctx);
+  ctx.GRPC.Fail("Heartbeat", grpc::StatusCode::DEADLINE_EXCEEDED, "trainer did not answer in time", 1, config::kTrainer);
+  const Supervision result = supervise(kHarnessJob);
   std::vector<std::string> order;
   for (const auto& call : ctx.GRPC.Calls()) {
     const std::string name = call.Method.substr(call.Method.rfind('/') + 1);
     if (name == "RequestCheckpoint" || name == "Restart") order.push_back(name);
   }
   ctx.Equal(order, {"RequestCheckpoint", "Restart"}, "after one missed heartbeat: ask the trainer for a checkpoint, then restart from it. A blind restart throws away every hour since the last checkpoint; the calls");
-  expectRun(ctx, result, "succeeded");
+  harnessExpectRun(ctx, result, "succeeded");
   ctx.Equal(result.restarts, 1, "one missed heartbeat, one restart");
+  for (const std::string method : {"RequestCheckpoint", "Restart"}) {
+    for (const auto& call : ctx.GRPC.CallsTo(method)) {
+      ctx.Assert(call.HasDeadline() && call.TimeoutSeconds() >= 55 && call.TimeoutSeconds() <= 65, "every call carries the 60 s deadline (kHeartbeatDeadline): %s carried %vs", method, call.TimeoutSeconds());
+    }
+  }
 }
 
 void CheckResumeFrom(harness::Ctx& ctx) {
-  supervisorWorld(ctx);
+  harnessTrainerWorld(ctx);
   ctx.GRPC.Fail("Heartbeat", grpc::StatusCode::UNAVAILABLE, "trainer node rebooting", 2, config::kTrainer);
-  const Supervision result = supervise(kJob);
+  const Supervision result = supervise(kHarnessJob);
   std::vector<std::string> resumed;
   for (const auto& call : ctx.GRPC.CallsTo("Restart")) resumed.push_back(call.Request<finetuned::RestartRequest>().resume_from());
   ctx.Equal(resumed, {"ckpt-job-7-1", "ckpt-job-7-2"}, "each Restart names the checkpoint RequestCheckpoint just returned, or the run cannot be reproduced; the restarts resumed from");
-  expectRun(ctx, result, "succeeded");
+  harnessExpectRun(ctx, result, "succeeded");
   ctx.Equal(result.checkpoint_ids, {"ckpt-job-7-1", "ckpt-job-7-2"}, "the result must carry the checkpoint lineage in order");
   ctx.Equal(result.restarts, 2, "two missed heartbeats, two restarts");
 }
 
 void CheckCheckpointFailure(harness::Ctx& ctx) {
-  supervisorWorld(ctx);
+  harnessTrainerWorld(ctx);
   ctx.GRPC.Fail("Heartbeat", grpc::StatusCode::UNAVAILABLE, "trainer node rebooting", 1, config::kTrainer);
   ctx.GRPC.Fail("RequestCheckpoint", grpc::StatusCode::FAILED_PRECONDITION, "checkpoint volume full", 1, config::kTrainer);
-  const Supervision result = supervise(kJob);
+  const Supervision result = supervise(kHarnessJob);
   ctx.Equal(ctx.GRPC.CallsTo("Restart").size(), 0, "the trainer could not checkpoint and the supervisor restarted it anyway: the run must fail with a reason instead; Restart calls");
-  expectRun(ctx, result, "failed", "checkpoint_failed");
+  harnessExpectRun(ctx, result, "failed", "checkpoint_failed");
   ctx.Equal(ctx.GRPC.CallsTo("Heartbeat").size(), 1, "a failed run is not watched further; Heartbeat calls");
+  ctx.GRPC.Fail("Heartbeat", grpc::StatusCode::UNAVAILABLE, "trainer node rebooting", 1, config::kTrainer);
+  const Supervision blank = supervise("job-blank");
+  ctx.Equal(ctx.GRPC.CallsTo("Restart").size(), 0, "the trainer answered RequestCheckpoint with an empty checkpoint_id and the supervisor restarted it anyway: a restart that names no checkpoint cannot be reproduced; Restart calls");
+  harnessExpectRun(ctx, blank, "failed", "checkpoint_failed");
 }
 
 void CheckStopOnRepeated(harness::Ctx& ctx) {
-  supervisorWorld(ctx);
+  harnessTrainerWorld(ctx);
+  ctx.GRPC.Fail("Heartbeat", grpc::StatusCode::UNAVAILABLE, "trainer node flapping", 1, config::kTrainer);
+  const Supervision flaky_result = supervise("job-flaky");
+  ctx.Equal(harnessJobCalls(ctx, "Heartbeat", "job-flaky"), 5, "job-flaky missed every other heartbeat: its third failure is its fifth Heartbeat call. Failures count over the whole run, not since the last answer; job-flaky's Heartbeat calls");
+  harnessExpectRun(ctx, flaky_result, "failed", "heartbeat_lost");
   ctx.GRPC.Fail("Heartbeat", grpc::StatusCode::UNAVAILABLE, "trainer wedged", 10, config::kTrainer);
-  const Supervision result = supervise(kJob);
-  const size_t beats = ctx.GRPC.CallsTo("Heartbeat").size();
-  const size_t restarts = ctx.GRPC.CallsTo("Restart").size();
+  const Supervision result = supervise(kHarnessJob);
+  const size_t beats = harnessJobCalls(ctx, "Heartbeat", kHarnessJob);
+  const size_t restarts = harnessJobCalls(ctx, "Restart", kHarnessJob);
   ctx.Assert(beats == 3 && restarts == 2, "a heartbeat that keeps failing got %d Heartbeat calls and %d restarts, expected 3 and 2: the third failure (kMaxHeartbeatFailures) ends the run", beats, restarts);
-  expectRun(ctx, result, "failed", "heartbeat_lost");
+  harnessExpectRun(ctx, result, "failed", "heartbeat_lost");
 }
 `,
   },

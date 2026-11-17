@@ -57,7 +57,7 @@ service Enforcement { rpc AutoResolve(AutoResolveRequest) returns (Grant); }  //
       id: 'safe-class',
       title: 'Only the safe categories auto-resolve',
       detail:
-        'Auto-resolve is gated on `SAFE_CATEGORIES` (`spam_duplicate`, `known_safe_false_positive`) as well as the threshold; any other category is `human_review` and the enforcement service is not called. The starter gates on confidence alone.',
+        'Auto-resolve is gated on `SAFE_CATEGORIES` (`spam_duplicate`, `known_safe_false_positive`) as well as the threshold (a confidence of exactly 0.5 qualifies); any other category, or a confidence under the threshold, is `human_review` and the enforcement service is not called. The starter gates on confidence alone.',
       match: {
         python: {all: [/SAFE_CATEGORIES\s*=/, /category (not )?in SAFE_CATEGORIES/]},
         typescript: {all: [/SAFE_CATEGORIES\s*[:=]/, /SAFE_CATEGORIES,\s*category\)|SAFE_CATEGORIES\[category\]/]},
@@ -83,7 +83,7 @@ service Enforcement { rpc AutoResolve(AutoResolveRequest) returns (Grant); }  //
       id: 'fail-closed',
       title: 'No grant sends the item to a person',
       detail:
-        'A failed or timed-out call escalates the item (`escalate`, reason `enforcement_unavailable`) and answers `escalated`; the starter resolves it anyway with a `fallback` grant.',
+        'A failed or timed-out call, whatever its status other than `PERMISSION_DENIED`, escalates the item (`escalate`, reason `enforcement_unavailable`) after one call and answers `escalated`; the starter resolves it anyway with a `fallback` grant.',
       match: {
         python: {all: [/store\.escalate\(/, /enforcement_unavailable/], none: [/["']fallback["']/]},
         typescript: {all: [/escalate\(/, /enforcement_unavailable/], none: [/['"]fallback['"]/]},
@@ -496,10 +496,14 @@ class Enforcement(reviewq_pb2_grpc.EnforcementServicer):
         return reviewq_pb2.Grant(grant_id=f"g-{request.item_id}")
 
 
+def _item(n):
+    store.create_item({"item_id": f"r-{n}", "tenant": "t1", "source_type": "model_output", "source_id": f"s-{n}", "priority": "p3", "payload_ref": f"blob://{n}"})
+
+
 def _client(ctx):
     ctx.grpc.serve(reviewq_pb2_grpc.add_EnforcementServicer_to_server, Enforcement())
     m = ctx.load("client")
-    store.create_item({"item_id": "r-1", "tenant": "t1", "source_type": "model_output", "source_id": "s-1", "priority": "p3", "payload_ref": "blob://1"})
+    _item(1)
     return m
 
 
@@ -524,6 +528,12 @@ def check_safe_class(ctx):
     assert _calls(ctx) == 0, "enforcement was asked to clear a category outside SAFE_CATEGORIES"
     assert store.get_item("r-1")["state"] == "queued", f"the self_harm item is {store.get_item('r-1')['state']}, it must stay queued for a reviewer"
     assert m.try_auto_resolve("r-1", "known_safe_false_positive", 0.8) == "auto_resolved", "a known_safe_false_positive at 0.8 with a grant must auto-resolve"
+    _item(2)
+    _item(3)
+    outcome = m.try_auto_resolve("r-2", "spam_duplicate", 0.49)
+    assert outcome == "human_review" and _calls(ctx) == 1, f"a spam_duplicate at 0.49, under CONFIDENCE_THRESHOLD, answered {outcome!r} after {_calls(ctx) - 1} AutoResolve call(s): expected human_review and no call"
+    outcome = m.try_auto_resolve("r-3", "spam_duplicate", 0.5)
+    assert outcome == "auto_resolved", f"a spam_duplicate at exactly CONFIDENCE_THRESHOLD (0.5) answered {outcome!r}: at or above the threshold a safe category may auto-resolve"
 
 
 def check_deadline(ctx):
@@ -535,7 +545,7 @@ def check_deadline(ctx):
     assert calls, "no AutoResolve call was made"
     timeout = calls[0].timeout
     assert timeout is not None, f"AutoResolve carries no deadline: with enforcement taking 5 s the call held on for {ctx.clock.time() - start:.1f} s"
-    assert 0.5 <= timeout <= 1.5, f"AutoResolve carries a {timeout} s deadline, expected DEADLINE_S = 1"
+    assert 0.9 <= timeout <= 1.1, f"AutoResolve carries a {timeout} s deadline, expected DEADLINE_S = 1"
     assert outcome == "escalated", f"with enforcement slower than the deadline the outcome is {outcome!r}, expected escalated"
     item = store.get_item("r-1")
     assert item["state"] == "escalated" and item.get("reason") == "enforcement_unavailable", f"a timed-out call must escalate with reason enforcement_unavailable, the store holds {item}"
@@ -543,12 +553,21 @@ def check_deadline(ctx):
 
 def check_fail_closed(ctx):
     m = _client(ctx)
-    ctx.grpc.fail("AutoResolve", grpc.StatusCode.UNAVAILABLE, "enforcement is down", times=3)
+    ctx.grpc.fail("AutoResolve", grpc.StatusCode.UNAVAILABLE, "enforcement is down", times=1)
     outcome = m.try_auto_resolve("r-1", "spam_duplicate", 0.9)
     item = store.get_item("r-1")
     assert outcome == "escalated", f"with enforcement down the outcome is {outcome!r} and the item holds grant {item.get('grant_id')!r}: no grant, no auto-resolve. Escalate it"
     assert item["state"] == "escalated" and item.get("reason") == "enforcement_unavailable", f"the item must be escalated with reason enforcement_unavailable, the store holds {item}"
     assert "grant_id" not in item, f"an item nobody granted carries grant {item.get('grant_id')!r}"
+    assert _calls(ctx) == 1, f"enforcement was asked {_calls(ctx)} times: a failed call escalates after one call"
+    # Every failure but a refusal is an outage: one call each, reason enforcement_unavailable.
+    for n, code in ((2, grpc.StatusCode.INTERNAL), (3, grpc.StatusCode.RESOURCE_EXHAUSTED), (4, grpc.StatusCode.UNAUTHENTICATED)):
+        _item(n)
+        ctx.grpc.fail("AutoResolve", code, f"enforcement answered {code.name}", times=1)
+        outcome = m.try_auto_resolve(f"r-{n}", "spam_duplicate", 0.9)
+        item = store.get_item(f"r-{n}")
+        assert outcome == "escalated" and item["state"] == "escalated" and item.get("reason") == "enforcement_unavailable", f"enforcement failing with {code.name} gave {outcome!r} and the store holds {item}: any failure but PERMISSION_DENIED escalates with reason enforcement_unavailable"
+        assert _calls(ctx) == n, f"after the {code.name} failure enforcement was asked {_calls(ctx) - n + 1} times for r-{n}: a failed call escalates after one call"
 
 
 def check_rejection_terminal(ctx):
@@ -572,8 +591,12 @@ def check_rejection_terminal(ctx):
 
 async function seeded(ctx) {
   const {m, store} = client(ctx);
-  await store.createItem({item_id: 'r-1', tenant: 't1', source_type: 'model_output', source_id: 's-1', priority: 'p3', payload_ref: 'blob://1'});
+  await seed(store, 1);
   return {m, store};
+}
+
+function seed(store, n: number) {
+  return store.createItem({item_id: \`r-\${n}\`, tenant: 't1', source_type: 'model_output', source_id: \`s-\${n}\`, priority: 'p3', payload_ref: \`blob://\${n}\`});
 }
 
 const calls = ctx => ctx.grpc.callsTo('AutoResolve').length;
@@ -595,6 +618,12 @@ export async function check_safe_class(ctx) {
   assert.equal(calls(ctx), 0, 'enforcement was asked to clear a category outside SAFE_CATEGORIES');
   assert.equal((await store.getItem('r-1')).state, 'queued', 'the self_harm item must stay queued for a reviewer');
   assert.equal(await m.tryAutoResolve('r-1', 'known_safe_false_positive', 0.8), 'auto_resolved', 'a known_safe_false_positive at 0.8 with a grant must auto-resolve');
+  await seed(store, 2);
+  await seed(store, 3);
+  let edge = await m.tryAutoResolve('r-2', 'spam_duplicate', 0.49);
+  assert(edge === 'human_review' && calls(ctx) === 1, \`a spam_duplicate at 0.49, under CONFIDENCE_THRESHOLD, answered \${edge} after \${calls(ctx) - 1} AutoResolve call(s): expected human_review and no call\`);
+  edge = await m.tryAutoResolve('r-3', 'spam_duplicate', 0.5);
+  assert.equal(edge, 'auto_resolved', \`a spam_duplicate at exactly CONFIDENCE_THRESHOLD (0.5) answered \${edge}: at or above the threshold a safe category may auto-resolve\`);
 }
 
 export async function check_deadline(ctx) {
@@ -606,7 +635,7 @@ export async function check_deadline(ctx) {
   assert(made.length > 0, 'no AutoResolve call was made');
   const {timeout} = made[0];
   assert(timeout !== null, \`AutoResolve carries no deadline: with enforcement taking 5 s the call held on for \${(ctx.clock.now() - start) / 1000} s\`);
-  assert(timeout >= 0.5 && timeout <= 1.5, \`AutoResolve carries a \${timeout} s deadline, expected DEADLINE_MS = 1000\`);
+  assert(timeout >= 0.9 && timeout <= 1.1, \`AutoResolve carries a \${timeout} s deadline, expected DEADLINE_MS = 1000\`);
   assert.equal(outcome, 'escalated', \`with enforcement slower than the deadline the outcome is \${outcome}, expected escalated\`);
   const item = await store.getItem('r-1');
   assert(item.state === 'escalated' && item.reason === 'enforcement_unavailable', \`a timed-out call must escalate with reason enforcement_unavailable, the store holds \${JSON.stringify(item)}\`);
@@ -614,12 +643,27 @@ export async function check_deadline(ctx) {
 
 export async function check_fail_closed(ctx) {
   const {m, store} = await seeded(ctx);
-  ctx.grpc.fail('AutoResolve', ctx.grpc.status.UNAVAILABLE, 'enforcement is down', 3);
+  ctx.grpc.fail('AutoResolve', ctx.grpc.status.UNAVAILABLE, 'enforcement is down', 1);
   const outcome = await m.tryAutoResolve('r-1', 'spam_duplicate', 0.9);
   const item = await store.getItem('r-1');
   assert.equal(outcome, 'escalated', \`with enforcement down the outcome is \${outcome} and the item holds grant \${item.grant_id}: no grant, no auto-resolve. Escalate it\`);
   assert(item.state === 'escalated' && item.reason === 'enforcement_unavailable', \`the item must be escalated with reason enforcement_unavailable, the store holds \${JSON.stringify(item)}\`);
   assert(!('grant_id' in item), \`an item nobody granted carries grant \${item.grant_id}\`);
+  assert.equal(calls(ctx), 1, \`enforcement was asked \${calls(ctx)} times: a failed call escalates after one call\`);
+  // Every failure but a refusal is an outage: one call each, reason enforcement_unavailable.
+  const outages: [number, string][] = [
+    [2, 'INTERNAL'],
+    [3, 'RESOURCE_EXHAUSTED'],
+    [4, 'UNAUTHENTICATED'],
+  ];
+  for (const [n, name] of outages) {
+    await seed(store, n);
+    ctx.grpc.fail('AutoResolve', ctx.grpc.status[name], \`enforcement answered \${name}\`, 1);
+    const got = await m.tryAutoResolve(\`r-\${n}\`, 'spam_duplicate', 0.9);
+    const stored = await store.getItem(\`r-\${n}\`);
+    assert(got === 'escalated' && stored.state === 'escalated' && stored.reason === 'enforcement_unavailable', \`enforcement failing with \${name} gave \${got} and the store holds \${JSON.stringify(stored)}: any failure but PERMISSION_DENIED escalates with reason enforcement_unavailable\`);
+    assert.equal(calls(ctx), n, \`after the \${name} failure enforcement was asked \${calls(ctx) - n + 1} times for r-\${n}: a failed call escalates after one call\`);
+  }
 }
 
 export async function check_rejection_terminal(ctx) {
@@ -636,6 +680,7 @@ export async function check_rejection_terminal(ctx) {
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -646,73 +691,96 @@ import (
 	"leetbuild/harness"
 )
 
-var clientBg = context.Background()
+var hClientBg = context.Background()
 
-// enforcementPeer grants every request it answers: grant g-{item_id}.
-type enforcementPeer struct {
+// hEnforcementPeer grants every request it answers: grant g-{item_id}.
+type hEnforcementPeer struct {
 	pb.UnimplementedEnforcementServer
 }
 
-func (enforcementPeer) AutoResolve(_ context.Context, req *pb.AutoResolveRequest) (*pb.Grant, error) {
+func (hEnforcementPeer) AutoResolve(_ context.Context, req *pb.AutoResolveRequest) (*pb.Grant, error) {
 	return &pb.Grant{GrantId: "g-" + req.GetItemId()}, nil
 }
 
-func seeded(ctx *harness.Ctx) {
-	pb.RegisterEnforcementServer(ctx.GRPC.Server(""), enforcementPeer{})
-	store.CreateItem(clientBg, map[string]string{"item_id": "r-1", "tenant": "t1", "source_type": "model_output", "source_id": "s-1", "priority": "p3", "payload_ref": "blob://1"})
+func hSeed(n int) {
+	id := fmt.Sprint(n)
+	store.CreateItem(hClientBg, map[string]string{"item_id": "r-" + id, "tenant": "t1", "source_type": "model_output", "source_id": "s-" + id, "priority": "p3", "payload_ref": "blob://" + id})
 }
 
-func calls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("AutoResolve", "")) }
+func hSeeded(ctx *harness.Ctx) {
+	pb.RegisterEnforcementServer(ctx.GRPC.Server(""), hEnforcementPeer{})
+	hSeed(1)
+}
+
+func hCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("AutoResolve", "")) }
 
 func CheckGrant(ctx *harness.Ctx) {
-	seeded(ctx)
-	ctx.Equal(tryAutoResolve(clientBg, "r-1", "spam_duplicate", 0.9), "auto_resolved", "a spam_duplicate at 0.9 with enforcement granting it; the outcome")
-	item := store.GetItem(clientBg, "r-1")
+	hSeeded(ctx)
+	ctx.Equal(tryAutoResolve(hClientBg, "r-1", "spam_duplicate", 0.9), "auto_resolved", "a spam_duplicate at 0.9 with enforcement granting it; the outcome")
+	item := store.GetItem(hClientBg, "r-1")
 	ctx.Assert(item["state"] == "resolved" && item["grant_id"] == "g-r-1", "the item must be resolved with the grant g-r-1 recorded, the store holds %v", item)
 	req := ctx.GRPC.CallsTo("AutoResolve", "")[0].Request.(*pb.AutoResolveRequest)
 	ctx.Equal([]string{req.GetTenant(), req.GetItemId(), req.GetCategory()}, []string{"t1", "r-1", "spam_duplicate"}, "the AutoResolve request")
 }
 
 func CheckSafeClass(ctx *harness.Ctx) {
-	seeded(ctx)
-	ctx.Equal(tryAutoResolve(clientBg, "r-1", "self_harm", 0.97), "human_review", "only safeCategories may clear without a person, whatever the confidence; a self_harm item at 0.97")
-	ctx.Equal(calls(ctx), 0, "enforcement must not be asked to clear a category outside safeCategories; the calls")
-	ctx.Equal(store.GetItem(clientBg, "r-1")["state"], "queued", "the self_harm item must stay queued for a reviewer; its state")
-	ctx.Equal(tryAutoResolve(clientBg, "r-1", "known_safe_false_positive", 0.8), "auto_resolved", "a known_safe_false_positive at 0.8 with a grant")
+	hSeeded(ctx)
+	ctx.Equal(tryAutoResolve(hClientBg, "r-1", "self_harm", 0.97), "human_review", "only safeCategories may clear without a person, whatever the confidence; a self_harm item at 0.97")
+	ctx.Equal(hCalls(ctx), 0, "enforcement must not be asked to clear a category outside safeCategories; the calls")
+	ctx.Equal(store.GetItem(hClientBg, "r-1")["state"], "queued", "the self_harm item must stay queued for a reviewer; its state")
+	ctx.Equal(tryAutoResolve(hClientBg, "r-1", "known_safe_false_positive", 0.8), "auto_resolved", "a known_safe_false_positive at 0.8 with a grant")
+	hSeed(2)
+	hSeed(3)
+	ctx.Equal(tryAutoResolve(hClientBg, "r-2", "spam_duplicate", 0.49), "human_review", "a spam_duplicate at 0.49 is under confidenceThreshold; the outcome")
+	ctx.Equal(hCalls(ctx), 1, "a spam_duplicate under confidenceThreshold must not call enforcement; the calls")
+	ctx.Equal(tryAutoResolve(hClientBg, "r-3", "spam_duplicate", 0.5), "auto_resolved", "at or above the threshold a safe category may auto-resolve; a spam_duplicate at exactly confidenceThreshold (0.5)")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	seeded(ctx)
+	hSeeded(ctx)
 	ctx.GRPC.SetLatency("AutoResolve", 5.0, "")
 	start := ctx.Clock.Time()
-	outcome := tryAutoResolve(clientBg, "r-1", "spam_duplicate", 0.9)
+	outcome := tryAutoResolve(hClientBg, "r-1", "spam_duplicate", 0.9)
 	made := ctx.GRPC.CallsTo("AutoResolve", "")
 	ctx.Assert(len(made) > 0, "no AutoResolve call was made")
 	ctx.Assert(made[0].HasDeadline(), "AutoResolve carries no deadline: with enforcement taking 5 s the call held on for %v", ctx.Clock.Time().Sub(start))
-	ctx.Assert(500*time.Millisecond <= made[0].Timeout && made[0].Timeout <= 1500*time.Millisecond, "AutoResolve carries a %v deadline, expected 1 s", made[0].Timeout)
+	ctx.Assert(900*time.Millisecond <= made[0].Timeout && made[0].Timeout <= 1100*time.Millisecond, "AutoResolve carries a %v deadline, expected 1 s", made[0].Timeout)
 	ctx.Equal(outcome, "escalated", "with enforcement slower than the deadline; the outcome")
-	item := store.GetItem(clientBg, "r-1")
+	item := store.GetItem(hClientBg, "r-1")
 	ctx.Assert(item["state"] == "escalated" && item["reason"] == "enforcement_unavailable", "a timed-out call must escalate with reason enforcement_unavailable, the store holds %v", item)
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
-	seeded(ctx)
-	ctx.GRPC.Fail("AutoResolve", codes.Unavailable, "enforcement is down", 3, "")
-	outcome := tryAutoResolve(clientBg, "r-1", "spam_duplicate", 0.9)
-	item := store.GetItem(clientBg, "r-1")
+	hSeeded(ctx)
+	ctx.GRPC.Fail("AutoResolve", codes.Unavailable, "enforcement is down", 1, "")
+	outcome := tryAutoResolve(hClientBg, "r-1", "spam_duplicate", 0.9)
+	item := store.GetItem(hClientBg, "r-1")
 	ctx.Assert(outcome == "escalated", "with enforcement down the outcome is %q and the item holds grant %q: no grant, no auto-resolve. Escalate it", outcome, item["grant_id"])
 	ctx.Assert(item["state"] == "escalated" && item["reason"] == "enforcement_unavailable", "the item must be escalated with reason enforcement_unavailable, the store holds %v", item)
 	_, granted := item["grant_id"]
 	ctx.Assert(!granted, "an item nobody granted carries grant %q", item["grant_id"])
+	ctx.Equal(hCalls(ctx), 1, "a failed call escalates after one call; the calls")
+	// Every failure but a refusal is an outage: one call each, reason enforcement_unavailable.
+	outages := []codes.Code{codes.Internal, codes.ResourceExhausted, codes.Unauthenticated}
+	for i, code := range outages {
+		n := i + 2
+		id := fmt.Sprintf("r-%d", n)
+		hSeed(n)
+		ctx.GRPC.Fail("AutoResolve", code, "enforcement answered "+code.String(), 1, "")
+		got := tryAutoResolve(hClientBg, id, "spam_duplicate", 0.9)
+		stored := store.GetItem(hClientBg, id)
+		ctx.Assert(got == "escalated" && stored["state"] == "escalated" && stored["reason"] == "enforcement_unavailable", "enforcement failing with %v gave %q and the store holds %v: any failure but PERMISSION_DENIED escalates with reason enforcement_unavailable", code, got, stored)
+		ctx.Equal(hCalls(ctx), n, "after the %v failure for %s a failed call escalates after one call; the calls so far", code, id)
+	}
 }
 
 func CheckRejectionTerminal(ctx *harness.Ctx) {
-	seeded(ctx)
+	hSeeded(ctx)
 	ctx.GRPC.Fail("AutoResolve", codes.PermissionDenied, "policy refuses spam_duplicate for this tenant", 5, "")
-	outcome := tryAutoResolve(clientBg, "r-1", "spam_duplicate", 0.9)
-	ctx.Equal(calls(ctx), 1, "PERMISSION_DENIED is the policy's answer, not a glitch to retry; the calls")
+	outcome := tryAutoResolve(hClientBg, "r-1", "spam_duplicate", 0.9)
+	ctx.Equal(hCalls(ctx), 1, "PERMISSION_DENIED is the policy's answer, not a glitch to retry; the calls")
 	ctx.Equal(outcome, "escalated", "a refused auto-resolve; the outcome")
-	item := store.GetItem(clientBg, "r-1")
+	item := store.GetItem(hClientBg, "r-1")
 	ctx.Assert(item["state"] == "escalated" && item["reason"] == "policy_denied", "a refusal must escalate with reason policy_denied, the store holds %v", item)
 }
 `,
@@ -727,7 +795,7 @@ func CheckRejectionTerminal(ctx *harness.Ctx) {
 namespace {
 
 // Grants every request it answers: grant g-{item_id}.
-class EnforcementPeer final : public reviewq::Enforcement::Service {
+class HEnforcementPeer final : public reviewq::Enforcement::Service {
  public:
   grpc::Status AutoResolve(grpc::ServerContext*, const reviewq::AutoResolveRequest* req, reviewq::Grant* out) override {
     out->set_grant_id("g-" + req->item_id());
@@ -735,69 +803,95 @@ class EnforcementPeer final : public reviewq::Enforcement::Service {
   }
 };
 
-void seeded(harness::Ctx& ctx) {
-  static EnforcementPeer* peer = nullptr;
-  delete peer;
-  peer = new EnforcementPeer;
-  ctx.GRPC.Server("")->RegisterService(peer);
-  store::createItem({{"item_id", "r-1"}, {"tenant", "t1"}, {"source_type", "model_output"}, {"source_id", "s-1"}, {"priority", "p3"}, {"payload_ref", "blob://1"}});
+void hSeed(int n) {
+  const std::string id = std::to_string(n);
+  store::createItem({{"item_id", "r-" + id}, {"tenant", "t1"}, {"source_type", "model_output"}, {"source_id", "s-" + id}, {"priority", "p3"}, {"payload_ref", "blob://" + id}});
 }
 
-store::Item item1() { return store::getItem("r-1").value_or(store::Item{}); }
+void hSeeded(harness::Ctx& ctx) {
+  static HEnforcementPeer* peer = nullptr;
+  delete peer;
+  peer = new HEnforcementPeer;
+  ctx.GRPC.Server("")->RegisterService(peer);
+  hSeed(1);
+}
 
-std::string field(const store::Item& item, const std::string& name) { return item.count(name) ? item.at(name) : ""; }
+store::Item hItem(const std::string& id = "r-1") { return store::getItem(id).value_or(store::Item{}); }
+
+std::string hField(const store::Item& item, const std::string& name) { return item.count(name) ? item.at(name) : ""; }
 
 }  // namespace
 
 void CheckGrant(harness::Ctx& ctx) {
-  seeded(ctx);
+  hSeeded(ctx);
   ctx.Equal(tryAutoResolve("r-1", "spam_duplicate", 0.9), "auto_resolved", "a spam_duplicate at 0.9 with enforcement granting it; the outcome");
-  const store::Item item = item1();
-  ctx.Assert(field(item, "state") == "resolved" && field(item, "grant_id") == "g-r-1", "the item must be resolved with the grant g-r-1 recorded, the store holds %v", item);
+  const store::Item item = hItem();
+  ctx.Assert(hField(item, "state") == "resolved" && hField(item, "grant_id") == "g-r-1", "the item must be resolved with the grant g-r-1 recorded, the store holds %v", item);
   const auto req = ctx.GRPC.CallsTo("AutoResolve")[0].Request<reviewq::AutoResolveRequest>();
   ctx.Equal(std::vector<std::string>{req.tenant(), req.item_id(), req.category()}, {"t1", "r-1", "spam_duplicate"}, "the AutoResolve request");
 }
 
 void CheckSafeClass(harness::Ctx& ctx) {
-  seeded(ctx);
+  hSeeded(ctx);
   ctx.Equal(tryAutoResolve("r-1", "self_harm", 0.97), "human_review", "only kSafeCategories may clear without a person, whatever the confidence; a self_harm item at 0.97");
   ctx.Equal(ctx.GRPC.CallsTo("AutoResolve").size(), 0, "enforcement must not be asked to clear a category outside kSafeCategories; the calls");
-  ctx.Equal(field(item1(), "state"), "queued", "the self_harm item must stay queued for a reviewer; its state");
+  ctx.Equal(hField(hItem(), "state"), "queued", "the self_harm item must stay queued for a reviewer; its state");
   ctx.Equal(tryAutoResolve("r-1", "known_safe_false_positive", 0.8), "auto_resolved", "a known_safe_false_positive at 0.8 with a grant");
+  hSeed(2);
+  hSeed(3);
+  ctx.Equal(tryAutoResolve("r-2", "spam_duplicate", 0.49), "human_review", "a spam_duplicate at 0.49 is under kConfidenceThreshold; the outcome");
+  ctx.Equal(ctx.GRPC.CallsTo("AutoResolve").size(), 1, "a spam_duplicate under kConfidenceThreshold must not call enforcement; the calls");
+  ctx.Equal(tryAutoResolve("r-3", "spam_duplicate", 0.5), "auto_resolved", "at or above the threshold a safe category may auto-resolve; a spam_duplicate at exactly kConfidenceThreshold (0.5)");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  seeded(ctx);
+  hSeeded(ctx);
   ctx.GRPC.SetLatency("AutoResolve", 5.0);
   const int64_t start = ctx.Clock.Now();
   const std::string outcome = tryAutoResolve("r-1", "spam_duplicate", 0.9);
   const auto made = ctx.GRPC.CallsTo("AutoResolve");
   ctx.Assert(!made.empty(), "no AutoResolve call was made");
   ctx.Assert(made[0].HasDeadline(), "AutoResolve carries no deadline: with enforcement taking 5 s the call held on for %d ms", ctx.Clock.Now() - start);
-  ctx.Assert(0.5 <= made[0].TimeoutSeconds() && made[0].TimeoutSeconds() <= 1.5, "AutoResolve carries a %v s deadline, expected kDeadline = 1 s", made[0].TimeoutSeconds());
+  ctx.Assert(0.9 <= made[0].TimeoutSeconds() && made[0].TimeoutSeconds() <= 1.1, "AutoResolve carries a %v s deadline, expected kDeadline = 1 s", made[0].TimeoutSeconds());
   ctx.Equal(outcome, "escalated", "with enforcement slower than the deadline; the outcome");
-  const store::Item item = item1();
-  ctx.Assert(field(item, "state") == "escalated" && field(item, "reason") == "enforcement_unavailable", "a timed-out call must escalate with reason enforcement_unavailable, the store holds %v", item);
+  const store::Item item = hItem();
+  ctx.Assert(hField(item, "state") == "escalated" && hField(item, "reason") == "enforcement_unavailable", "a timed-out call must escalate with reason enforcement_unavailable, the store holds %v", item);
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
-  seeded(ctx);
-  ctx.GRPC.Fail("AutoResolve", grpc::StatusCode::UNAVAILABLE, "enforcement is down", 3);
+  hSeeded(ctx);
+  ctx.GRPC.Fail("AutoResolve", grpc::StatusCode::UNAVAILABLE, "enforcement is down", 1);
   const std::string outcome = tryAutoResolve("r-1", "spam_duplicate", 0.9);
-  const store::Item item = item1();
-  ctx.Assert(outcome == "escalated", "with enforcement down the outcome is %q and the item holds grant %q: no grant, no auto-resolve. Escalate it", outcome, field(item, "grant_id"));
-  ctx.Assert(field(item, "state") == "escalated" && field(item, "reason") == "enforcement_unavailable", "the item must be escalated with reason enforcement_unavailable, the store holds %v", item);
-  ctx.Assert(item.count("grant_id") == 0, "an item nobody granted carries grant %q", field(item, "grant_id"));
+  const store::Item item = hItem();
+  ctx.Assert(outcome == "escalated", "with enforcement down the outcome is %q and the item holds grant %q: no grant, no auto-resolve. Escalate it", outcome, hField(item, "grant_id"));
+  ctx.Assert(hField(item, "state") == "escalated" && hField(item, "reason") == "enforcement_unavailable", "the item must be escalated with reason enforcement_unavailable, the store holds %v", item);
+  ctx.Assert(item.count("grant_id") == 0, "an item nobody granted carries grant %q", hField(item, "grant_id"));
+  ctx.Equal(ctx.GRPC.CallsTo("AutoResolve").size(), 1, "a failed call escalates after one call; the calls");
+  // Every failure but a refusal is an outage: one call each, reason enforcement_unavailable.
+  const std::vector<std::pair<grpc::StatusCode, std::string>> outages = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::UNAUTHENTICATED, "UNAUTHENTICATED"}};
+  int n = 1;
+  for (const auto& [code, name] : outages) {
+    ++n;
+    const std::string id = "r-" + std::to_string(n);
+    hSeed(n);
+    ctx.GRPC.Fail("AutoResolve", code, "enforcement answered " + name, 1);
+    const std::string got = tryAutoResolve(id, "spam_duplicate", 0.9);
+    const store::Item stored = hItem(id);
+    ctx.Assert(got == "escalated" && hField(stored, "state") == "escalated" && hField(stored, "reason") == "enforcement_unavailable",
+               "enforcement failing with %s gave %q and the store holds %v: any failure but PERMISSION_DENIED escalates with reason enforcement_unavailable", name, got, stored);
+    ctx.Equal(ctx.GRPC.CallsTo("AutoResolve").size(), static_cast<size_t>(n), "after the %s failure for %s a failed call escalates after one call; the calls so far", name, id);
+  }
 }
 
 void CheckRejectionTerminal(harness::Ctx& ctx) {
-  seeded(ctx);
+  hSeeded(ctx);
   ctx.GRPC.Fail("AutoResolve", grpc::StatusCode::PERMISSION_DENIED, "policy refuses spam_duplicate for this tenant", 5);
   const std::string outcome = tryAutoResolve("r-1", "spam_duplicate", 0.9);
   ctx.Equal(ctx.GRPC.CallsTo("AutoResolve").size(), 1, "PERMISSION_DENIED is the policy's answer, not a glitch to retry; the calls");
   ctx.Equal(outcome, "escalated", "a refused auto-resolve; the outcome");
-  const store::Item item = item1();
-  ctx.Assert(field(item, "state") == "escalated" && field(item, "reason") == "policy_denied", "a refusal must escalate with reason policy_denied, the store holds %v", item);
+  const store::Item item = hItem();
+  ctx.Assert(hField(item, "state") == "escalated" && hField(item, "reason") == "policy_denied", "a refusal must escalate with reason policy_denied, the store holds %v", item);
 }
 `,
   },

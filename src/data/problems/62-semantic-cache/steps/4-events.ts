@@ -73,7 +73,7 @@ produce the broker rejects is logged and forgotten, so a miss wave leaves no tra
       id: 'tenant-key',
       title: 'Publishes semantic-cache.result keyed by tenant',
       detail:
-        "One event per lookup, keyed by the tenant, so one tenant's hits and misses land on one partition and the consumer's two counters describe one prefix of its history. The starter keys by similarity band.",
+        "One event per lookup, keyed by the tenant, so one tenant's hits and misses land on one partition and the consumer's two counters describe one prefix of its history. The consumer's counters are checked too: `automated_hits` counts only automated hits, and `hits_older_than_1h` only hits over 3600 s old. The starter keys by similarity band.",
       match: {
         python: {all: [/key\s*=\s*tenant(\.encode\([^)]*\))?\s*[,)]/]},
         typescript: {all: [/key:\s*tenant\b/]},
@@ -99,7 +99,7 @@ produce the broker rejects is logged and forgotten, so a miss wave leaves no tra
       id: 'outbox',
       title: 'A rejected produce leaves an outbox row',
       detail:
-        'When the broker rejects the produce, `{"key", "payload"}` is appended to the Redis list `outbox:semantic-cache.result` so a relay can republish it. The starter logs the delivery error and drops the event.',
+        'When the broker rejects the produce, `{"key", "payload"}` is appended to the Redis list `outbox:semantic-cache.result` so a relay can republish it; the payload is the event itself, with no answer text. The starter logs the delivery error and drops the event.',
       match: {
         python: {all: [/outbox/, /\.rpush\(/]},
         typescript: {all: [/outbox/, /\.rpush\(/]},
@@ -1146,22 +1146,23 @@ def _publish(m, tenant, result):
 def check_tenant_key(ctx):
     m = ctx.load("events")
     _entry(ctx, "acme", "e1")
-    for tenant, result in (("acme", _hit()), ("globex", _miss()), ("acme", _hit(similarity=0.88, age=4000, cls="automated"))):
+    for tenant, result in (("acme", _hit()), ("globex", _miss()), ("acme", _hit(similarity=0.88, age=4000, cls="automated")), ("acme", _hit(similarity=0.9, age=3600)), ("globex", _miss(cls="automated"))):
         raised = _publish(m, tenant, result)
         assert raised is None, f"publish_result raised {raised!r} on a healthy broker"
     records = ctx.kafka.records(TOPIC)
-    assert len(records) == 3, f"three lookups produced {len(records)} records on {TOPIC} (topics: {sorted(ctx.kafka.topics)})"
+    assert len(records) == 5, f"five lookups produced {len(records)} records on {TOPIC} (topics: {sorted(ctx.kafka.topics)})"
     keys = [r.key for r in records]
-    assert keys == [b"acme", b"globex", b"acme"], f"records must be keyed by the tenant, got {keys}"
-    assert records[0].partition == records[2].partition, "the same tenant must land on the same partition so its hits and misses are read as one stream"
+    assert keys == [b"acme", b"globex", b"acme", b"acme", b"globex"], f"records must be keyed by the tenant, got {keys}"
+    assert records[0].partition == records[2].partition == records[3].partition and records[1].partition == records[4].partition, "the same tenant must land on the same partition so its hits and misses are read as one stream"
     ctx.drain(m.consume_results)
     acme = ctx.redis.hgetall("stats:acme:2024-06")
-    assert acme.get("hits_total") == "2" and acme.get("misses_total", "0") == "0", f"stats:acme:2024-06 holds {acme}, expected hits_total 2 and no misses"
-    assert abs(float(acme.get("similarity_sum", 0)) - 1.81) < 1e-6, f"similarity_sum is {acme.get('similarity_sum')!r}, expected 0.93 + 0.88 = 1.81"
+    assert acme.get("hits_total") == "3" and acme.get("misses_total", "0") == "0", f"stats:acme:2024-06 holds {acme}, expected hits_total 3 and no misses"
+    assert abs(float(acme.get("similarity_sum", 0)) - 2.71) < 1e-6, f"similarity_sum is {acme.get('similarity_sum')!r}, expected 0.93 + 0.88 + 0.9 = 2.71"
     assert acme.get("automated_total") == "1" and acme.get("automated_hits") == "1", f"stats:acme:2024-06 holds {acme}, expected automated_total 1 and automated_hits 1 for the automated hit"
-    assert acme.get("hits_older_than_1h") == "1", f"stats:acme:2024-06 holds {acme}, expected hits_older_than_1h 1 for the hit on a 4000 s old entry"
+    assert acme.get("hits_older_than_1h") == "1", f"stats:acme:2024-06 holds {acme}, expected hits_older_than_1h 1: the hit on a 4000 s old entry counts, the one on a 3600 s old entry is not over an hour"
     globex = ctx.redis.hgetall("stats:globex:2024-06")
-    assert globex.get("misses_total") == "1" and globex.get("hits_total", "0") == "0", f"stats:globex:2024-06 holds {globex}, expected misses_total 1"
+    assert globex.get("misses_total") == "2" and globex.get("hits_total", "0") == "0", f"stats:globex:2024-06 holds {globex}, expected misses_total 2"
+    assert globex.get("automated_total") == "1" and globex.get("automated_hits", "0") == "0", f"stats:globex:2024-06 holds {globex}, expected automated_total 1 and no automated_hits: the automated lookup was a miss"
     assert ctx.kafka.lag(GROUP, TOPIC) == 0, f"the consumer left {ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted"
 
 
@@ -1183,6 +1184,7 @@ def check_no_text(ctx):
 
 def check_outbox(ctx):
     m = ctx.load("events")
+    _entry(ctx, "acme", "e1")
     ctx.kafka.fail_next(TOPIC, 1)
     _publish(m, "acme", _hit())
     rows = ctx.redis.lrange(OUTBOX, 0, -1)
@@ -1191,6 +1193,7 @@ def check_outbox(ctx):
     assert row.get("key") == "acme", f"the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition: {row}"
     payload = json.loads(row.get("payload", "{}")) if isinstance(row.get("payload"), str) else row.get("payload")
     assert isinstance(payload, dict) and payload.get("outcome") == "hit" and payload.get("entry_id") == "e1", f"the outbox row must carry the event payload: {row}"
+    assert WIRE <= set(payload) and "answer" not in payload and ANSWER not in rows[0], f"the outbox row's payload must be the event, its seven fields and no answer text: {rows[0]}. The relay republishes it to the same retained topic"
     assert ctx.kafka.records(TOPIC) == [], "a rejected produce cannot be on the topic"
     raised = _publish(m, "globex", _miss())
     assert raised is None, f"after the broker recovered publish_result raised {raised!r}"
@@ -1257,23 +1260,24 @@ async function publish(m, tenant: string, result): Promise<unknown> {
 export async function check_tenant_key(ctx) {
   const m = ctx.load('events');
   entry(ctx, 'acme', 'e1');
-  for (const [tenant, result] of [['acme', hit()], ['globex', miss()], ['acme', hit({similarity: 0.88, age: 4000, cls: 'automated'})]] as const) {
+  for (const [tenant, result] of [['acme', hit()], ['globex', miss()], ['acme', hit({similarity: 0.88, age: 4000, cls: 'automated'})], ['acme', hit({similarity: 0.9, age: 3600})], ['globex', miss('automated')]] as const) {
     const raised = await publish(m, tenant, result);
     assert.equal(raised, null, \`publishResult threw \${raised} on a healthy broker\`);
   }
   const records = ctx.kafka.records(TOPIC);
-  assert.equal(records.length, 3, \`three lookups produced \${records.length} records on \${TOPIC}\`);
+  assert.equal(records.length, 5, \`five lookups produced \${records.length} records on \${TOPIC}\`);
   const keys = records.map(r => r.key?.toString() ?? null);
-  assert.deepStrictEqual(keys, ['acme', 'globex', 'acme'], \`records must be keyed by the tenant, got \${JSON.stringify(keys)}\`);
-  assert.equal(records[0].partition, records[2].partition, 'the same tenant must land on the same partition so its hits and misses are read as one stream');
+  assert.deepStrictEqual(keys, ['acme', 'globex', 'acme', 'acme', 'globex'], \`records must be keyed by the tenant, got \${JSON.stringify(keys)}\`);
+  assert(records[0].partition === records[2].partition && records[0].partition === records[3].partition && records[1].partition === records[4].partition, 'the same tenant must land on the same partition so its hits and misses are read as one stream');
   await ctx.drain(m.consumeResults());
   const acme = ctx.redis.hgetall('stats:acme:2024-06');
-  assert(acme.hits_total === '2' && (acme.misses_total ?? '0') === '0', \`stats:acme:2024-06 holds \${JSON.stringify(acme)}, expected hits_total 2 and no misses\`);
-  assert(Math.abs(Number(acme.similarity_sum ?? 0) - 1.81) < 1e-6, \`similarity_sum is \${JSON.stringify(acme.similarity_sum)}, expected 0.93 + 0.88 = 1.81\`);
+  assert(acme.hits_total === '3' && (acme.misses_total ?? '0') === '0', \`stats:acme:2024-06 holds \${JSON.stringify(acme)}, expected hits_total 3 and no misses\`);
+  assert(Math.abs(Number(acme.similarity_sum ?? 0) - 2.71) < 1e-6, \`similarity_sum is \${JSON.stringify(acme.similarity_sum)}, expected 0.93 + 0.88 + 0.9 = 2.71\`);
   assert(acme.automated_total === '1' && acme.automated_hits === '1', \`stats:acme:2024-06 holds \${JSON.stringify(acme)}, expected automated_total 1 and automated_hits 1 for the automated hit\`);
-  assert.equal(acme.hits_older_than_1h, '1', \`stats:acme:2024-06 holds \${JSON.stringify(acme)}, expected hits_older_than_1h 1 for the hit on a 4000 s old entry\`);
+  assert.equal(acme.hits_older_than_1h, '1', \`stats:acme:2024-06 holds \${JSON.stringify(acme)}, expected hits_older_than_1h 1: the hit on a 4000 s old entry counts, the one on a 3600 s old entry is not over an hour\`);
   const globex = ctx.redis.hgetall('stats:globex:2024-06');
-  assert(globex.misses_total === '1' && (globex.hits_total ?? '0') === '0', \`stats:globex:2024-06 holds \${JSON.stringify(globex)}, expected misses_total 1\`);
+  assert(globex.misses_total === '2' && (globex.hits_total ?? '0') === '0', \`stats:globex:2024-06 holds \${JSON.stringify(globex)}, expected misses_total 2\`);
+  assert(globex.automated_total === '1' && (globex.automated_hits ?? '0') === '0', \`stats:globex:2024-06 holds \${JSON.stringify(globex)}, expected automated_total 1 and no automated_hits: the automated lookup was a miss\`);
   assert.equal(ctx.kafka.lag(GROUP, TOPIC), 0, \`the consumer left \${ctx.kafka.lag(GROUP, TOPIC)} record(s) uncommitted\`);
 }
 
@@ -1295,6 +1299,7 @@ export async function check_no_text(ctx) {
 
 export async function check_outbox(ctx) {
   const m = ctx.load('events');
+  entry(ctx, 'acme', 'e1');
   ctx.kafka.failNext(TOPIC, 1);
   await publish(m, 'acme', hit());
   const rows = ctx.redis.lrange(OUTBOX, 0, -1);
@@ -1303,6 +1308,7 @@ export async function check_outbox(ctx) {
   assert.equal(row.key, 'acme', \`the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition: \${rows[0]}\`);
   const payload = typeof row.payload === 'string' ? JSON.parse(row.payload) : row.payload;
   assert(payload !== null && typeof payload === 'object' && payload.outcome === 'hit' && payload.entry_id === 'e1', \`the outbox row must carry the event payload: \${rows[0]}\`);
+  assert(WIRE.every(f => f in payload) && !('answer' in payload) && !rows[0].includes(ANSWER), \`the outbox row's payload must be the event, its seven fields and no answer text: \${rows[0]}. The relay republishes it to the same retained topic\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 0, 'a rejected produce cannot be on the topic');
   const raised = await publish(m, 'globex', miss());
   assert.equal(raised, null, \`after the broker recovered publishResult threw \${raised}\`);
@@ -1354,7 +1360,7 @@ const (
 	eventsAnswer = "Refunds take five business days."
 )
 
-var wireFields = []string{"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"}
+var eventsWireFields = []string{"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"}
 
 func eventsHit(similarity float64, age int64, class string) ResultEvent {
 	return ResultEvent{Outcome: "hit", EntryID: "e1", Similarity: &similarity, PolicyVersion: "2024-06-1", ModelVersion: "2024-06", ClientClass: class, EntryAgeSeconds: age}
@@ -1389,22 +1395,23 @@ func CheckTenantKey(ctx *harness.Ctx) {
 	for _, in := range []struct {
 		tenant string
 		result ResultEvent
-	}{{"acme", eventsHit(0.93, 41, "human")}, {"globex", eventsMiss("human")}, {"acme", eventsHit(0.88, 4000, "automated")}} {
+	}{{"acme", eventsHit(0.93, 41, "human")}, {"globex", eventsMiss("human")}, {"acme", eventsHit(0.88, 4000, "automated")}, {"acme", eventsHit(0.9, 3600, "human")}, {"globex", eventsMiss("automated")}} {
 		ctx.NoError(eventsPublish(in.tenant, in.result), "publishResult on a healthy broker")
 	}
 	ctx.Settle()
 	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 3, "three lookups must produce three records on %s; the records", eventsTopic)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"acme", "globex", "acme"}, "records must be keyed by the tenant")
-	ctx.Equal(records[0].Partition, records[2].Partition, "the same tenant must land on the same partition so its hits and misses are read as one stream; acme's partitions")
+	ctx.Equal(len(records), 5, "five lookups must produce five records on %s; the records", eventsTopic)
+	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"acme", "globex", "acme", "acme", "globex"}, "records must be keyed by the tenant")
+	ctx.Assert(records[0].Partition == records[2].Partition && records[0].Partition == records[3].Partition && records[1].Partition == records[4].Partition, "the same tenant must land on the same partition so its hits and misses are read as one stream")
 	ctx.Drain(func() { consumeResults(context.Background()) })
 	acme := ctx.Redis.HGetAll("stats:acme:2024-06")
-	ctx.Assert(acme["hits_total"] == "2" && (acme["misses_total"] == "" || acme["misses_total"] == "0"), "stats:acme:2024-06 holds %v, expected hits_total 2 and no misses", acme)
-	ctx.Assert(eventsFloat(acme["similarity_sum"]) > 1.8099 && eventsFloat(acme["similarity_sum"]) < 1.8101, "similarity_sum is %q, expected 0.93 + 0.88 = 1.81", acme["similarity_sum"])
+	ctx.Assert(acme["hits_total"] == "3" && (acme["misses_total"] == "" || acme["misses_total"] == "0"), "stats:acme:2024-06 holds %v, expected hits_total 3 and no misses", acme)
+	ctx.Assert(eventsFloat(acme["similarity_sum"]) > 2.7099 && eventsFloat(acme["similarity_sum"]) < 2.7101, "similarity_sum is %q, expected 0.93 + 0.88 + 0.9 = 2.71", acme["similarity_sum"])
 	ctx.Assert(acme["automated_total"] == "1" && acme["automated_hits"] == "1", "stats:acme:2024-06 holds %v, expected automated_total 1 and automated_hits 1 for the automated hit", acme)
-	ctx.Equal(acme["hits_older_than_1h"], "1", "hits_older_than_1h for the hit on a 4000 s old entry (stats:acme:2024-06 holds %v)", acme)
+	ctx.Equal(acme["hits_older_than_1h"], "1", "hits_older_than_1h: the hit on a 4000 s old entry counts, the one on a 3600 s old entry is not over an hour (stats:acme:2024-06 holds %v)", acme)
 	globex := ctx.Redis.HGetAll("stats:globex:2024-06")
-	ctx.Assert(globex["misses_total"] == "1" && (globex["hits_total"] == "" || globex["hits_total"] == "0"), "stats:globex:2024-06 holds %v, expected misses_total 1", globex)
+	ctx.Assert(globex["misses_total"] == "2" && (globex["hits_total"] == "" || globex["hits_total"] == "0"), "stats:globex:2024-06 holds %v, expected misses_total 2", globex)
+	ctx.Assert(globex["automated_total"] == "1" && (globex["automated_hits"] == "" || globex["automated_hits"] == "0"), "stats:globex:2024-06 holds %v, expected automated_total 1 and no automated_hits: the automated lookup was a miss", globex)
 	ctx.Equal(ctx.Kafka.Lag(eventsGroup, eventsTopic), 0, "records the consumer left uncommitted")
 }
 
@@ -1420,7 +1427,7 @@ func CheckNoText(ctx *harness.Ctx) {
 	ctx.Assert(!strings.Contains(text, eventsAnswer), "the event carries the served answer: %s. The topic is retained and replicated; the entry id is enough to find the answer in the store", text)
 	_, hasAnswer := event["answer"]
 	ctx.Assert(!hasAnswer, "the event has an answer field: %s", text)
-	for _, field := range wireFields {
+	for _, field := range eventsWireFields {
 		_, ok := event[field]
 		ctx.Assert(ok, "the event %s lacks %s", text, field)
 	}
@@ -1428,6 +1435,7 @@ func CheckNoText(ctx *harness.Ctx) {
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
+	eventsEntry(ctx, "acme", "e1")
 	ctx.Kafka.FailNext(eventsTopic, 1)
 	eventsPublish("acme", eventsHit(0.93, 41, "human"))
 	ctx.Settle()
@@ -1444,6 +1452,12 @@ func CheckOutbox(ctx *harness.Ctx) {
 		payload = p
 	}
 	ctx.Assert(payload != nil && payload["outcome"] == "hit" && payload["entry_id"] == "e1", "the outbox row must carry the event payload: %s", rows[0])
+	_, hasAnswer := payload["answer"]
+	ctx.Assert(!hasAnswer && !strings.Contains(rows[0], eventsAnswer), "the outbox row's payload must be the event, its seven fields and no answer text: %s. The relay republishes it to the same retained topic", rows[0])
+	for _, field := range eventsWireFields {
+		_, ok := payload[field]
+		ctx.Assert(ok, "the outbox row's payload must be the event, its seven fields and no answer text: %s lacks %s", rows[0], field)
+	}
 	ctx.Equal(len(ctx.Kafka.Records(eventsTopic)), 0, "a rejected produce cannot be on the topic; the records")
 	ctx.NoError(eventsPublish("globex", eventsMiss("human")), "after the broker recovered publishResult")
 	ctx.Settle()
@@ -1489,7 +1503,7 @@ const std::string kEventsTopic = "semantic-cache.result";
 const std::string kEventsGroup = "semantic-cache-stats";
 const std::string kEventsOutbox = "outbox:semantic-cache.result";
 const std::string kEventsAnswer = "Refunds take five business days.";
-const std::vector<std::string> kWire = {"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"};
+const std::vector<std::string> kEventsWire = {"outcome", "entry_id", "similarity", "policy_version", "model_version", "client_class", "entry_age_seconds"};
 
 ResultEvent eventsHit(double similarity, long age, const std::string& cls) {
   return ResultEvent{"hit", "e1", similarity, "2024-06-1", "2024-06", cls, age};
@@ -1515,7 +1529,7 @@ std::string eventsPublish(const std::string& tenant, const ResultEvent& result) 
   }
 }
 
-nlohmann::json parsed(const std::string& text) {
+nlohmann::json hParsed(const std::string& text) {
   try {
     return nlohmann::json::parse(text);
   } catch (const std::exception&) {
@@ -1530,25 +1544,32 @@ void CheckTenantKey(harness::Ctx& ctx) {
   ctx.Equal(eventsPublish("acme", eventsHit(0.93, 41, "human")), "", "publish_result on a healthy broker threw");
   ctx.Equal(eventsPublish("globex", eventsMiss("human")), "", "publish_result on a healthy broker threw");
   ctx.Equal(eventsPublish("acme", eventsHit(0.88, 4000, "automated")), "", "publish_result on a healthy broker threw");
+  ctx.Equal(eventsPublish("acme", eventsHit(0.9, 3600, "human")), "", "publish_result on a healthy broker threw");
+  ctx.Equal(eventsPublish("globex", eventsMiss("automated")), "", "publish_result on a healthy broker threw");
   ctx.Settle();
   const auto records = ctx.Kafka.Records(kEventsTopic);
-  ctx.Equal(records.size(), 3, "three lookups must produce three records on %s; the records", kEventsTopic);
-  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"acme", "globex", "acme"}, "records must be keyed by the tenant");
-  ctx.Equal(records[0].Partition, records[2].Partition,
-            "the same tenant must land on the same partition so its hits and misses are read as one stream; acme's partitions");
+  ctx.Equal(records.size(), 5, "five lookups must produce five records on %s; the records", kEventsTopic);
+  ctx.Equal(ctx.Kafka.Keys(kEventsTopic), {"acme", "globex", "acme", "acme", "globex"}, "records must be keyed by the tenant");
+  ctx.Assert(records[0].Partition == records[2].Partition && records[0].Partition == records[3].Partition &&
+                 records[1].Partition == records[4].Partition,
+             "the same tenant must land on the same partition so its hits and misses are read as one stream");
   ctx.Drain([] { consume_results(); });
   const auto acme = ctx.Redis.HGetAll("stats:acme:2024-06");
   const auto field = [](const std::map<std::string, std::string>& h, const std::string& f) { return h.count(f) ? h.at(f) : ""; };
-  ctx.Assert(field(acme, "hits_total") == "2" && (field(acme, "misses_total") == "" || field(acme, "misses_total") == "0"),
-             "stats:acme:2024-06 holds %v, expected hits_total 2 and no misses", acme);
+  ctx.Assert(field(acme, "hits_total") == "3" && (field(acme, "misses_total") == "" || field(acme, "misses_total") == "0"),
+             "stats:acme:2024-06 holds %v, expected hits_total 3 and no misses", acme);
   const double sum = field(acme, "similarity_sum").empty() ? 0 : std::stod(field(acme, "similarity_sum"));
-  ctx.Assert(sum > 1.8099 && sum < 1.8101, "similarity_sum is %q, expected 0.93 + 0.88 = 1.81", field(acme, "similarity_sum"));
+  ctx.Assert(sum > 2.7099 && sum < 2.7101, "similarity_sum is %q, expected 0.93 + 0.88 + 0.9 = 2.71", field(acme, "similarity_sum"));
   ctx.Assert(field(acme, "automated_total") == "1" && field(acme, "automated_hits") == "1",
              "stats:acme:2024-06 holds %v, expected automated_total 1 and automated_hits 1 for the automated hit", acme);
-  ctx.Equal(field(acme, "hits_older_than_1h"), "1", "hits_older_than_1h for the hit on a 4000 s old entry (stats:acme:2024-06 holds %v)", acme);
+  ctx.Equal(field(acme, "hits_older_than_1h"), "1",
+            "hits_older_than_1h: the hit on a 4000 s old entry counts, the one on a 3600 s old entry is not over an hour (stats:acme:2024-06 holds %v)",
+            acme);
   const auto globex = ctx.Redis.HGetAll("stats:globex:2024-06");
-  ctx.Assert(field(globex, "misses_total") == "1" && (field(globex, "hits_total") == "" || field(globex, "hits_total") == "0"),
-             "stats:globex:2024-06 holds %v, expected misses_total 1", globex);
+  ctx.Assert(field(globex, "misses_total") == "2" && (field(globex, "hits_total") == "" || field(globex, "hits_total") == "0"),
+             "stats:globex:2024-06 holds %v, expected misses_total 2", globex);
+  ctx.Assert(field(globex, "automated_total") == "1" && (field(globex, "automated_hits") == "" || field(globex, "automated_hits") == "0"),
+             "stats:globex:2024-06 holds %v, expected automated_total 1 and no automated_hits: the automated lookup was a miss", globex);
   ctx.Equal(ctx.Kafka.Lag(kEventsGroup, kEventsTopic), 0, "records the consumer left uncommitted");
 }
 
@@ -1559,31 +1580,36 @@ void CheckNoText(harness::Ctx& ctx) {
   const auto records = ctx.Kafka.Records(kEventsTopic);
   ctx.Equal(records.size(), 1, "one lookup must produce one record; the records");
   const std::string text = records[0].Value.value_or("");
-  const auto event = parsed(text);
+  const auto event = hParsed(text);
   ctx.Assert(event.is_object(), "the event must be JSON: %s", text);
   ctx.Assert(text.find(kEventsAnswer) == std::string::npos,
              "the event carries the served answer: %s. The topic is retained and replicated; the entry id is enough to find the answer in the store",
              text);
   ctx.Assert(!event.contains("answer"), "the event has an answer field: %s", text);
-  for (const auto& f : kWire) ctx.Assert(event.contains(f), "the event %s lacks %s", text, f);
+  for (const auto& f : kEventsWire) ctx.Assert(event.contains(f), "the event %s lacks %s", text, f);
   ctx.Assert(event["entry_id"] == "e1" && event["outcome"] == "hit" && event["similarity"] == 0.93 && event["client_class"] == "human" &&
                  event["entry_age_seconds"] == 41,
              "the event's fields must come from the result the lookup passed: %s", text);
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
+  eventsEntry(ctx, "acme", "e1");
   ctx.Kafka.FailNext(kEventsTopic, 1);
   eventsPublish("acme", eventsHit(0.93, 41, "human"));
   ctx.Settle();
   const auto rows = ctx.Redis.LRange(kEventsOutbox, 0, -1);
   ctx.Equal(rows.size(), 1, "after the broker rejected the produce %s must hold one row with the event; it holds %v; rows", kEventsOutbox, rows);
-  const auto row = parsed(rows[0]);
+  const auto row = hParsed(rows[0]);
   ctx.Assert(row.is_object() && row.value("key", "") == "acme",
              "the outbox row must carry the message key (the tenant) so the relay publishes it to the same partition (%s)", rows[0]);
   nlohmann::json payload;
-  if (row.contains("payload")) payload = row["payload"].is_string() ? parsed(row["payload"].get<std::string>()) : row["payload"];
+  if (row.contains("payload")) payload = row["payload"].is_string() ? hParsed(row["payload"].get<std::string>()) : row["payload"];
   ctx.Assert(payload.is_object() && payload.value("outcome", "") == "hit" && payload.value("entry_id", "") == "e1",
              "the outbox row must carry the event payload: %s", rows[0]);
+  bool wire = payload.is_object() && !payload.contains("answer") && rows[0].find(kEventsAnswer) == std::string::npos;
+  for (const auto& f : kEventsWire) wire = wire && payload.contains(f);
+  ctx.Assert(wire, "the outbox row's payload must be the event, its seven fields and no answer text: %s. The relay republishes it to the same retained topic",
+             rows[0]);
   ctx.Equal(ctx.Kafka.Records(kEventsTopic).size(), 0, "a rejected produce cannot be on the topic; the records");
   ctx.Equal(eventsPublish("globex", eventsMiss("human")), "", "after the broker recovered publish_result threw");
   ctx.Settle();

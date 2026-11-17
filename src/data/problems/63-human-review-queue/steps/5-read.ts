@@ -22,8 +22,8 @@ breach because nobody reclaimed it; one tenant reads another's backlog.
 - \`depth\` is the number of items in the queue now.
 - \`oldest_age_seconds\` is now minus the smallest \`enqueued_at\` in the queue (\`null\` when empty);
   a reclaimed item can sit behind newer ones.
-- \`sla_breaches\` counts queued items whose \`sla_deadline\` has passed.
-- \`X-Tenant-Id\` must name the path's tenant: missing is **401**, another tenant **403**.`,
+- \`sla_breaches\` counts queued items whose \`sla_deadline\` has been reached (now at or past it).
+- \`X-Tenant-Id\` must name the path's tenant: missing or empty is **401**, another tenant **403**.`,
   sequence: {
     participants: ['Operator', 'Review Queue', 'Review store'],
     messages: [
@@ -68,7 +68,7 @@ breach because nobody reclaimed it; one tenant reads another's backlog.
       id: 'sla-breaches',
       title: 'A breach is a deadline passed, marked or not',
       detail:
-        '`sla_breaches` counts queued items whose `sla_deadline` is past; the starter counts only items `reclaim_expired` marked, missing every item that breached while waiting.',
+        '`sla_breaches` counts queued items whose `sla_deadline` is reached (now at or past it); the starter counts only items `reclaim_expired` marked, missing every item that breached while waiting.',
       match: {
         python: {all: [/sla_deadline/], none: [/\[["']breached["']\]\s*==/]},
         typescript: {all: [/sla_deadline/], none: [/\.breached\s*===/]},
@@ -81,7 +81,7 @@ breach because nobody reclaimed it; one tenant reads another's backlog.
       id: 'tenant-scope',
       title: 'Only the tenant reads its queue',
       detail:
-        "A missing `X-Tenant-Id` is **401** and one that does not name the path's tenant **403**; the starter serves any caller.",
+        "A missing or empty `X-Tenant-Id` is **401** and one that does not name the path's tenant **403**, whatever that queue holds; the starter serves any caller.",
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/, /\b403\b/]},
         typescript: {all: [/x-tenant-id/i, /code\(\s*401\s*\)/, /code\(\s*403\s*\)/]},
@@ -489,7 +489,13 @@ async def check_sla_breaches(ctx):
     _enqueue("t1", 2)
     async with _api(ctx) as c:
         body = await _ok(c)
-    assert body.get("sla_breaches") == 1, f"r-1 has waited 400 s against a 300 s SLA, yet sla_breaches is {body.get('sla_breaches')}: a breach is a deadline passed, whether or not reclaim_expired marked it"
+        assert body.get("sla_breaches") == 1, f"r-1 has waited 400 s against a 300 s SLA, yet sla_breaches is {body.get('sla_breaches')}: a breach is a deadline passed, whether or not reclaim_expired marked it"
+        ctx.clock.advance(299)
+        body = await _ok(c)
+        assert body.get("sla_breaches") == 1, f"r-2 is one second inside its SLA, yet sla_breaches is {body.get('sla_breaches')}, expected 1 (r-1 only)"
+        ctx.clock.advance(1)
+        body = await _ok(c)
+    assert body.get("sla_breaches") == 2, f"r-2 has reached its sla_deadline, yet sla_breaches is {body.get('sla_breaches')}, expected 2: at the deadline an item is breached"
 
 
 async def check_tenant_scope(ctx):
@@ -497,8 +503,12 @@ async def check_tenant_scope(ctx):
     async with _api(ctx) as c:
         foreign = await _stats(c, tenant="t2", caller="t1")
         assert foreign.status_code == 403, f"tenant t1 read t2's queue and got {foreign.status_code}: {foreign.text}. Another tenant's backlog is 403"
+        foreign_empty = await _stats(c, tenant="t2", priority="p2", caller="t1")
+        assert foreign_empty.status_code == 403, f"tenant t1 read t2's empty p2 queue and got {foreign_empty.status_code}: {foreign_empty.text}. Another tenant's queue is 403 whatever it holds"
         anonymous = await _stats(c, tenant="t2", caller=None)
         assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
+        blank = await _stats(c, tenant="t2", caller="")
+        assert blank.status_code == 401, f"a read with an empty X-Tenant-Id answered {blank.status_code}, expected 401"
         own = await _stats(c, tenant="t2", caller="t2")
     assert own.status_code == 200, f"t2 reading its own queue answered {own.status_code}: {own.text}"
 `,
@@ -551,8 +561,14 @@ export async function check_sla_breaches(ctx) {
   await enqueue(store, 't1', 1);
   ctx.clock.advance(400); // r-1 sat untouched past its 300 s SLA; no sweep marked it
   await enqueue(store, 't1', 2);
-  const body = await ok(c);
+  let body = await ok(c);
   assert.equal(body.sla_breaches, 1, \`r-1 has waited 400 s against a 300 s SLA, yet sla_breaches is \${body.sla_breaches}: a breach is a deadline passed, whether or not reclaimExpired marked it\`);
+  ctx.clock.advance(299);
+  body = await ok(c);
+  assert.equal(body.sla_breaches, 1, \`r-2 is one second inside its SLA, yet sla_breaches is \${body.sla_breaches}, expected 1 (r-1 only)\`);
+  ctx.clock.advance(1);
+  body = await ok(c);
+  assert.equal(body.sla_breaches, 2, \`r-2 has reached its sla_deadline, yet sla_breaches is \${body.sla_breaches}, expected 2: at the deadline an item is breached\`);
 }
 
 export async function check_tenant_scope(ctx) {
@@ -560,8 +576,12 @@ export async function check_tenant_scope(ctx) {
   await enqueue(store, 't2', 1);
   const foreign = await stats(c, 't2', 'p1', 't1');
   assert.equal(foreign.status, 403, \`tenant t1 read t2's queue and got \${foreign.status}: \${foreign.text}. Another tenant's backlog is 403\`);
+  const foreignEmpty = await stats(c, 't2', 'p2', 't1');
+  assert.equal(foreignEmpty.status, 403, \`tenant t1 read t2's empty p2 queue and got \${foreignEmpty.status}: \${foreignEmpty.text}. Another tenant's queue is 403 whatever it holds\`);
   const anonymous = await stats(c, 't2', 'p1', null);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
+  const blank = await stats(c, 't2', 'p1', '');
+  assert.equal(blank.status, 401, \`a read with an empty X-Tenant-Id answered \${blank.status}, expected 401\`);
   const own = await stats(c, 't2', 'p1', 't2');
   assert.equal(own.status, 200, \`t2 reading its own queue answered \${own.status}: \${own.text}\`);
 }
@@ -578,24 +598,24 @@ import (
 	"leetbuild/harness"
 )
 
-const queue = "review:queue:t1:p1"
+const hQueue = "review:queue:t1:p1"
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-func enqueueItem(tenant string, n int) {
-	store.CreateItem(readBg, map[string]string{
+func hEnqueueItem(tenant string, n int) {
+	store.CreateItem(hReadBg, map[string]string{
 		"item_id": fmt.Sprintf("r-%d", n), "tenant": tenant, "source_type": "guardrail_block",
 		"source_id": fmt.Sprintf("s-%d", n), "priority": "p1", "payload_ref": fmt.Sprintf("blob://%d", n),
 	})
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func ok(ctx *harness.Ctx, c *harness.HTTP, priority string) map[string]any {
+func hOK(ctx *harness.Ctx, c *harness.HTTP, priority string) map[string]any {
 	r := c.Get("/v1/review/queues/t1/"+priority, "X-Tenant-Id", "t1")
 	ctx.Equal(r.Status, 200, "GET /v1/review/queues/t1/%s as t1 (%s)", priority, r.Text())
 	var body map[string]any
@@ -605,42 +625,50 @@ func ok(ctx *harness.Ctx, c *harness.HTTP, priority string) map[string]any {
 
 func CheckDepth(ctx *harness.Ctx) {
 	for _, n := range []int{1, 2, 3} {
-		enqueueItem("t1", n)
+		hEnqueueItem("t1", n)
 	}
-	ctx.Redis.Do("LPOP", queue) // a reviewer took r-1
-	c := api(ctx)
-	ctx.Equal(ok(ctx, c, "p1")["depth"], 2, "three items were enqueued and a reviewer took one: depth is what is in the queue now, not every enqueue since the start; the depth")
-	ctx.Equal(ok(ctx, c, "p2")["depth"], 0, "an empty p2 queue's depth")
+	ctx.Redis.Do("LPOP", hQueue) // a reviewer took r-1
+	c := hAPI(ctx)
+	ctx.Equal(hOK(ctx, c, "p1")["depth"], 2, "three items were enqueued and a reviewer took one: depth is what is in the queue now, not every enqueue since the start; the depth")
+	ctx.Equal(hOK(ctx, c, "p2")["depth"], 0, "an empty p2 queue's depth")
 }
 
 func CheckOldestAge(ctx *harness.Ctx) {
-	enqueueItem("t1", 1)
+	hEnqueueItem("t1", 1)
 	ctx.Clock.Advance(100)
-	enqueueItem("t1", 2)
+	hEnqueueItem("t1", 2)
 	ctx.Clock.Advance(150)
-	c := api(ctx)
-	ctx.Equal(ok(ctx, c, "p1")["oldest_age_seconds"], 250, "r-1 has waited 250 s and r-2 150 s: measure the oldest item, not the newest; oldest_age_seconds")
-	ctx.Redis.Do("LPOP", queue)
-	ctx.Redis.Do("RPUSH", queue, "r-1") // r-1 was taken, abandoned and reclaimed behind r-2
-	ctx.Equal(ok(ctx, c, "p1")["oldest_age_seconds"], 250, "r-1 came back behind r-2 and has still waited 250 s: the oldest item is not always at either end of the list; oldest_age_seconds")
-	empty := ok(ctx, c, "p2")
+	c := hAPI(ctx)
+	ctx.Equal(hOK(ctx, c, "p1")["oldest_age_seconds"], 250, "r-1 has waited 250 s and r-2 150 s: measure the oldest item, not the newest; oldest_age_seconds")
+	ctx.Redis.Do("LPOP", hQueue)
+	ctx.Redis.Do("RPUSH", hQueue, "r-1") // r-1 was taken, abandoned and reclaimed behind r-2
+	ctx.Equal(hOK(ctx, c, "p1")["oldest_age_seconds"], 250, "r-1 came back behind r-2 and has still waited 250 s: the oldest item is not always at either end of the list; oldest_age_seconds")
+	empty := hOK(ctx, c, "p2")
 	age, present := empty["oldest_age_seconds"]
 	ctx.Assert(present && age == nil, "an empty queue must report oldest_age_seconds null, got %v", empty)
 }
 
 func CheckSlaBreaches(ctx *harness.Ctx) {
-	enqueueItem("t1", 1)
+	hEnqueueItem("t1", 1)
 	ctx.Clock.Advance(400) // r-1 sat untouched past its 300 s SLA; no sweep marked it
-	enqueueItem("t1", 2)
-	ctx.Equal(ok(ctx, api(ctx), "p1")["sla_breaches"], 1, "r-1 has waited 400 s against a 300 s SLA: a breach is a deadline passed, whether or not reclaimExpired marked it; sla_breaches")
+	hEnqueueItem("t1", 2)
+	c := hAPI(ctx)
+	ctx.Equal(hOK(ctx, c, "p1")["sla_breaches"], 1, "r-1 has waited 400 s against a 300 s SLA: a breach is a deadline passed, whether or not reclaimExpired marked it; sla_breaches")
+	ctx.Clock.Advance(299)
+	ctx.Equal(hOK(ctx, c, "p1")["sla_breaches"], 1, "r-2 is one second inside its SLA (r-1 only); sla_breaches")
+	ctx.Clock.Advance(1)
+	ctx.Equal(hOK(ctx, c, "p1")["sla_breaches"], 2, "r-2 has reached its sla_deadline: at the deadline an item is breached; sla_breaches")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	enqueueItem("t2", 1)
-	c := api(ctx)
+	hEnqueueItem("t2", 1)
+	c := hAPI(ctx)
 	foreign := c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t1")
 	ctx.Equal(foreign.Status, 403, "tenant t1 reading t2's queue (%s)", foreign.Text())
+	foreignEmpty := c.Get("/v1/review/queues/t2/p2", "X-Tenant-Id", "t1")
+	ctx.Equal(foreignEmpty.Status, 403, "another tenant's queue is 403 whatever it holds; tenant t1 reading t2's empty p2 queue (%s)", foreignEmpty.Text())
 	ctx.Equal(c.Get("/v1/review/queues/t2/p1").Status, 401, "a read without X-Tenant-Id")
+	ctx.Equal(c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "").Status, 401, "a read with an empty X-Tenant-Id")
 	own := c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t2")
 	ctx.Equal(own.Status, 200, "t2 reading its own queue (%s)", own.Text())
 }
@@ -657,14 +685,14 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kQueue = "review:queue:t1:p1";
+const std::string kHQueue = "review:queue:t1:p1";
 
-void enqueueItem(const std::string& tenant, int n) {
+void hEnqueueItem(const std::string& tenant, int n) {
   const std::string id = std::to_string(n);
   store::createItem({{"item_id", "r-" + id}, {"tenant", tenant}, {"source_type", "guardrail_block"}, {"source_id", "s-" + id}, {"priority", "p1"}, {"payload_ref", "blob://" + id}});
 }
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -672,7 +700,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json ok(harness::Ctx& ctx, harness::HTTP& c, const std::string& priority) {
+json hOk(harness::Ctx& ctx, harness::HTTP& c, const std::string& priority) {
   const auto r = c.Get("/v1/review/queues/t1/" + priority, "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/review/queues/t1/%s as t1 (%s)", priority, r.Text());
   const json body = json::parse(r.Text(), nullptr, false);
@@ -682,41 +710,48 @@ json ok(harness::Ctx& ctx, harness::HTTP& c, const std::string& priority) {
 }  // namespace
 
 void CheckDepth(harness::Ctx& ctx) {
-  for (int n : {1, 2, 3}) enqueueItem("t1", n);
-  ctx.Redis.Do("LPOP", kQueue);  // a reviewer took r-1
-  auto c = api(ctx);
-  ctx.Equal(ok(ctx, c, "p1").value("depth", -1), 2, "three items were enqueued and a reviewer took one: depth is what is in the queue now, not every enqueue since the start; the depth");
-  ctx.Equal(ok(ctx, c, "p2").value("depth", -1), 0, "an empty p2 queue's depth");
+  for (int n : {1, 2, 3}) hEnqueueItem("t1", n);
+  ctx.Redis.Do("LPOP", kHQueue);  // a reviewer took r-1
+  auto c = hApi(ctx);
+  ctx.Equal(hOk(ctx, c, "p1").value("depth", -1), 2, "three items were enqueued and a reviewer took one: depth is what is in the queue now, not every enqueue since the start; the depth");
+  ctx.Equal(hOk(ctx, c, "p2").value("depth", -1), 0, "an empty p2 queue's depth");
 }
 
 void CheckOldestAge(harness::Ctx& ctx) {
-  enqueueItem("t1", 1);
+  hEnqueueItem("t1", 1);
   ctx.Clock.Advance(100);
-  enqueueItem("t1", 2);
+  hEnqueueItem("t1", 2);
   ctx.Clock.Advance(150);
-  auto c = api(ctx);
-  ctx.Equal(ok(ctx, c, "p1").value("oldest_age_seconds", json(nullptr)), json(250), "r-1 has waited 250 s and r-2 150 s: measure the oldest item, not the newest; oldest_age_seconds");
-  ctx.Redis.Do("LPOP", kQueue);
-  ctx.Redis.Do("RPUSH", kQueue, "r-1");  // r-1 was taken, abandoned and reclaimed behind r-2
-  ctx.Equal(ok(ctx, c, "p1").value("oldest_age_seconds", json(nullptr)), json(250), "r-1 came back behind r-2 and has still waited 250 s: the oldest item is not always at either end of the list; oldest_age_seconds");
-  const json empty = ok(ctx, c, "p2");
+  auto c = hApi(ctx);
+  ctx.Equal(hOk(ctx, c, "p1").value("oldest_age_seconds", json(nullptr)), json(250), "r-1 has waited 250 s and r-2 150 s: measure the oldest item, not the newest; oldest_age_seconds");
+  ctx.Redis.Do("LPOP", kHQueue);
+  ctx.Redis.Do("RPUSH", kHQueue, "r-1");  // r-1 was taken, abandoned and reclaimed behind r-2
+  ctx.Equal(hOk(ctx, c, "p1").value("oldest_age_seconds", json(nullptr)), json(250), "r-1 came back behind r-2 and has still waited 250 s: the oldest item is not always at either end of the list; oldest_age_seconds");
+  const json empty = hOk(ctx, c, "p2");
   ctx.Assert(empty.contains("oldest_age_seconds") && empty["oldest_age_seconds"].is_null(), "an empty queue must report oldest_age_seconds null, got %s", empty.dump());
 }
 
 void CheckSlaBreaches(harness::Ctx& ctx) {
-  enqueueItem("t1", 1);
+  hEnqueueItem("t1", 1);
   ctx.Clock.Advance(400);  // r-1 sat untouched past its 300 s SLA; no sweep marked it
-  enqueueItem("t1", 2);
-  auto c = api(ctx);
-  ctx.Equal(ok(ctx, c, "p1").value("sla_breaches", -1), 1, "r-1 has waited 400 s against a 300 s SLA: a breach is a deadline passed, whether or not reclaimExpired marked it; sla_breaches");
+  hEnqueueItem("t1", 2);
+  auto c = hApi(ctx);
+  ctx.Equal(hOk(ctx, c, "p1").value("sla_breaches", -1), 1, "r-1 has waited 400 s against a 300 s SLA: a breach is a deadline passed, whether or not reclaimExpired marked it; sla_breaches");
+  ctx.Clock.Advance(299);
+  ctx.Equal(hOk(ctx, c, "p1").value("sla_breaches", -1), 1, "r-2 is one second inside its SLA (r-1 only); sla_breaches");
+  ctx.Clock.Advance(1);
+  ctx.Equal(hOk(ctx, c, "p1").value("sla_breaches", -1), 2, "r-2 has reached its sla_deadline: at the deadline an item is breached; sla_breaches");
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  enqueueItem("t2", 1);
-  auto c = api(ctx);
+  hEnqueueItem("t2", 1);
+  auto c = hApi(ctx);
   const auto foreign = c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t1");
   ctx.Equal(foreign.Status, 403, "tenant t1 reading t2's queue (%s)", foreign.Text());
+  const auto foreign_empty = c.Get("/v1/review/queues/t2/p2", "X-Tenant-Id", "t1");
+  ctx.Equal(foreign_empty.Status, 403, "another tenant's queue is 403 whatever it holds; tenant t1 reading t2's empty p2 queue (%s)", foreign_empty.Text());
   ctx.Equal(c.Get("/v1/review/queues/t2/p1").Status, 401, "a read without X-Tenant-Id");
+  ctx.Equal(c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "").Status, 401, "a read with an empty X-Tenant-Id");
   const auto own = c.Get("/v1/review/queues/t2/p1", "X-Tenant-Id", "t2");
   ctx.Equal(own.Status, 200, "t2 reading its own queue (%s)", own.Text());
 }

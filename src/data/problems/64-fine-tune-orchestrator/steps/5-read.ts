@@ -65,7 +65,7 @@ Requirements:
       id: 'tenant-scope',
       title: 'Answers 404 for another team\u2019s job',
       detail:
-        'ml-legal reading ml-search\u2019s job gets 404, the same answer as an unknown id. The starter serves any job to any team.',
+        'ml-legal reading ml-search\u2019s job gets 404 with the same body as an unknown id. The starter serves any job to any team.',
       match: {
         python: {all: [/\[\s*["']team["']\s*\]\s*!=\s*team|team\s*!=\s*job\[\s*["']team["']\s*\]/]},
         typescript: {all: [/job\.team\s*!==\s*team|team\s*!==\s*job\.team/]},
@@ -91,7 +91,7 @@ Requirements:
       id: 'budget-reconcile',
       title: 'Reconciles the job\u2019s reservation: remaining = reserved - spent',
       detail:
-        'A job that reserved 600 GPU-hours and spent 450 reads {reserved: 600, spent: 450, remaining: 150}, whatever the team\u2019s pool holds. The starter reports the pool as remaining.',
+        'A job that reserved 600 GPU-hours and spent 450 reads {reserved: 600, spent: 450, remaining: 150}, whatever the team\u2019s pool holds; a running job whose reservation holds 300 reads {reserved: 300, spent: 0, remaining: 300}, whatever its compute_budget says. The starter reports the pool as remaining.',
       match: {
         python: {all: [/reserved\s*-\s*spent/], none: [/pool_key/]},
         typescript: {all: [/reserved\s*-\s*spent/], none: [/poolKey/]},
@@ -712,6 +712,8 @@ async def check_tenant_scope(ctx):
         r = await c.get("/v1/finetune/jobs/job-7", headers={"X-Team-Id": "ml-legal"})
         assert r.status_code == 404, f"ml-legal read ml-search's job and got {r.status_code}: another team's job answers 404, as an unknown id does, so a guessed id confirms nothing"
         assert "ckpt-job-7" not in r.text, f"the refusal leaks the job: {r.text}"
+        unknown = await c.get("/v1/finetune/jobs/job-404", headers={"X-Team-Id": "ml-legal"})
+        assert r.text.replace("job-7", "job-404") == unknown.text, f"another team's job must answer exactly as an unknown id does: job-7 answered {r.text}, job-404 answered {unknown.text}; a different body confirms the id exists"
 
 
 async def check_promotable_gate(ctx):
@@ -733,9 +735,13 @@ async def check_promotable_gate(ctx):
 
 async def check_budget_reconcile(ctx):
     _seed(ctx, "job-7", "succeeded", passed=True)
+    _seed(ctx, "job-8", "running")
+    ctx.redis.hset("ft:reservation:job-8", mapping={"reserved": 300, "spent": 0, "state": "running"})
     async with _api(ctx) as c:
         body = (await c.get("/v1/finetune/jobs/job-7", headers=TEAM)).json()
         assert body.get("budget") == {"reserved": 600, "spent": 450, "remaining": 150}, f"job-7 reserved 600 GPU-hours and spent 450, so its budget reads {{reserved: 600, spent: 450, remaining: 150}}; got {body.get('budget')} (the team's pool holds 5000, which is not this job's remainder)"
+        body = (await c.get("/v1/finetune/jobs/job-8", headers=TEAM)).json()
+        assert body.get("budget") == {"reserved": 300, "spent": 0, "remaining": 300}, f"job-8's reservation holds 300 GPU-hours with none spent, so its budget reads {{reserved: 300, spent: 0, remaining: 300}}; got {body.get('budget')}. The budget comes from the reservation (ft:reservation:{{job_id}}), not the job's compute_budget"
 
 
 async def check_lineage(ctx):
@@ -781,6 +787,8 @@ export async function check_tenant_scope(ctx) {
   const r = await c.get('/v1/finetune/jobs/job-7', {headers: {'X-Team-Id': 'ml-legal'}});
   assert.equal(r.status, 404, \`ml-legal read ml-search's job and got \${r.status}: another team's job answers 404, as an unknown id does, so a guessed id confirms nothing\`);
   assert(!r.text.includes('ckpt-job-7'), \`the refusal leaks the job: \${r.text}\`);
+  const unknown = await c.get('/v1/finetune/jobs/job-404', {headers: {'X-Team-Id': 'ml-legal'}});
+  assert.equal(r.text.replaceAll('job-7', 'job-404'), unknown.text, \`another team's job must answer exactly as an unknown id does: job-7 answered \${r.text}, job-404 answered \${unknown.text}; a different body confirms the id exists\`);
 }
 
 export async function check_promotable_gate(ctx) {
@@ -802,8 +810,13 @@ export async function check_promotable_gate(ctx) {
 
 export async function check_budget_reconcile(ctx) {
   seed(ctx, 'job-7', 'succeeded', true);
-  const body = await read(api(ctx), 'job-7');
+  seed(ctx, 'job-8', 'running');
+  ctx.redis.hset('ft:reservation:job-8', 'reserved', '300', 'spent', '0', 'state', 'running');
+  const c = api(ctx);
+  const body = await read(c, 'job-7');
   assert.deepEqual(body.budget, {reserved: 600, spent: 450, remaining: 150}, \`job-7 reserved 600 GPU-hours and spent 450, so its budget reads {reserved: 600, spent: 450, remaining: 150}; got \${JSON.stringify(body.budget)} (the team's pool holds 5000, which is not this job's remainder)\`);
+  const running = await read(c, 'job-8');
+  assert.deepEqual(running.budget, {reserved: 300, spent: 0, remaining: 300}, \`job-8's reservation holds 300 GPU-hours with none spent, so its budget reads {reserved: 300, spent: 0, remaining: 300}; got \${JSON.stringify(running.budget)}. The budget comes from the reservation (ft:reservation:{job_id}), not the job's compute_budget\`);
 }
 
 export async function check_lineage(ctx) {
@@ -821,11 +834,11 @@ import (
 	"leetbuild/harness"
 )
 
-var readTeam = []string{"X-Team-Id", "ml-search"}
+var harnessReadTeam = []string{"X-Team-Id", "ml-search"}
 
-// readSeed stores a job of status for ml-search, its reservation (600 reserved, 450 spent), a pool
+// harnessReadSeed stores a job of status for ml-search, its reservation (600 reserved, 450 spent), a pool
 // of 5000, and an eval: "pass", "fail" or "" for none yet.
-func readSeed(ctx *harness.Ctx, jobID, status, eval string) {
+func harnessReadSeed(ctx *harness.Ctx, jobID, status, eval string) {
 	ctx.Redis.Do("HSET", "ft:job:"+jobID, "job_id", jobID, "team", "ml-search", "status", status, "base_model", "llama-3.1-8b",
 		"dataset_version", "support-tickets@v3", "dataset_sha256", strings.Repeat("b1", 32), "config_hash", strings.Repeat("7e", 32),
 		"compute_budget", "600", "hyperparameters", \`{"learning_rate":0.0002,"lora_rank":16}\`,
@@ -840,62 +853,70 @@ func readSeed(ctx *harness.Ctx, jobID, status, eval string) {
 	}
 }
 
-func readClient(ctx *harness.Ctx) *harness.HTTP {
+func harnessReadClient(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func readBody(ctx *harness.Ctx, c *harness.HTTP, jobID string) map[string]any {
-	r := c.Get("/v1/finetune/jobs/"+jobID, readTeam...)
+func harnessReadBody(ctx *harness.Ctx, c *harness.HTTP, jobID string) map[string]any {
+	r := c.Get("/v1/finetune/jobs/"+jobID, harnessReadTeam...)
 	body, ok := r.JSON().(map[string]any)
 	ctx.Assert(ok, "the body must be a JSON object: %s", r.Text())
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	readSeed(ctx, "job-7", "succeeded", "pass")
-	c := readClient(ctx)
-	r := c.Get("/v1/finetune/jobs/job-7", readTeam...)
+	harnessReadSeed(ctx, "job-7", "succeeded", "pass")
+	c := harnessReadClient(ctx)
+	r := c.Get("/v1/finetune/jobs/job-7", harnessReadTeam...)
 	ctx.Equal(r.Status, 200, "the team's own job (%s)", r.Text())
-	body := readBody(ctx, c, "job-7")
+	body := harnessReadBody(ctx, c, "job-7")
 	ctx.Assert(body["job_id"] == "job-7" && body["status"] == "succeeded" && body["trained"] == true, "the answer carries job_id, status and trained: %v", body)
-	ctx.Equal(c.Get("/v1/finetune/jobs/job-404", readTeam...).Status, 404, "an unknown id")
+	ctx.Equal(c.Get("/v1/finetune/jobs/job-404", harnessReadTeam...).Status, 404, "an unknown id")
 	ctx.Equal(c.Get("/v1/finetune/jobs/job-7").Status, 401, "without X-Team-Id the read")
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	readSeed(ctx, "job-7", "succeeded", "pass")
-	r := readClient(ctx).Get("/v1/finetune/jobs/job-7", "X-Team-Id", "ml-legal")
+	harnessReadSeed(ctx, "job-7", "succeeded", "pass")
+	c := harnessReadClient(ctx)
+	r := c.Get("/v1/finetune/jobs/job-7", "X-Team-Id", "ml-legal")
 	ctx.Equal(r.Status, 404, "ml-legal read ml-search's job: another team's job answers 404, as an unknown id does, so a guessed id confirms nothing")
 	ctx.Assert(!strings.Contains(r.Text(), "ckpt-job-7"), "the refusal leaks the job: %s", r.Text())
+	unknown := c.Get("/v1/finetune/jobs/job-404", "X-Team-Id", "ml-legal")
+	ctx.Equal(strings.ReplaceAll(r.Text(), "job-7", "job-404"), unknown.Text(), "another team's job must answer exactly as an unknown id does (job-404 answered %s); a different body confirms the id exists. job-7's answer, its id read as job-404", unknown.Text())
 }
 
 func CheckPromotableGate(ctx *harness.Ctx) {
-	readSeed(ctx, "job-7", "succeeded", "fail")
-	readSeed(ctx, "job-8", "succeeded", "")
-	readSeed(ctx, "job-9", "succeeded", "pass")
-	readSeed(ctx, "job-10", "failed", "pass")
-	c := readClient(ctx)
-	body := readBody(ctx, c, "job-7")
+	harnessReadSeed(ctx, "job-7", "succeeded", "fail")
+	harnessReadSeed(ctx, "job-8", "succeeded", "")
+	harnessReadSeed(ctx, "job-9", "succeeded", "pass")
+	harnessReadSeed(ctx, "job-10", "failed", "pass")
+	c := harnessReadClient(ctx)
+	body := harnessReadBody(ctx, c, "job-7")
 	ctx.Assert(body["trained"] == true && body["promotable"] == false, "job-7 trained but failed its golden set and reads promotable=%v: a failed eval must keep it out of the registry", body["promotable"])
 	ctx.Equal(body["eval"], map[string]any{"passed": false, "score": 0.71}, "the eval is reported as {passed, score}")
-	body = readBody(ctx, c, "job-8")
+	body = harnessReadBody(ctx, c, "job-8")
 	_, hasEval := body["eval"]
 	ctx.Assert(body["promotable"] == false && hasEval && body["eval"] == nil, "job-8 has no eval yet: promotable must be false and eval null, got %v", body)
-	ctx.Equal(readBody(ctx, c, "job-9")["promotable"], true, "job-9 succeeded and passed its eval, so it is promotable")
-	ctx.Equal(readBody(ctx, c, "job-10")["promotable"], false, "job-10 failed training: a passing eval of an earlier checkpoint does not make it promotable")
+	ctx.Equal(harnessReadBody(ctx, c, "job-9")["promotable"], true, "job-9 succeeded and passed its eval, so it is promotable")
+	ctx.Equal(harnessReadBody(ctx, c, "job-10")["promotable"], false, "job-10 failed training: a passing eval of an earlier checkpoint does not make it promotable")
 }
 
 func CheckBudgetReconcile(ctx *harness.Ctx) {
-	readSeed(ctx, "job-7", "succeeded", "pass")
-	body := readBody(ctx, readClient(ctx), "job-7")
+	harnessReadSeed(ctx, "job-7", "succeeded", "pass")
+	harnessReadSeed(ctx, "job-8", "running", "")
+	ctx.Redis.Do("HSET", "ft:reservation:job-8", "reserved", "300", "spent", "0", "state", "running")
+	c := harnessReadClient(ctx)
+	body := harnessReadBody(ctx, c, "job-7")
 	ctx.Equal(body["budget"], map[string]any{"reserved": float64(600), "spent": float64(450), "remaining": float64(150)}, "job-7 reserved 600 GPU-hours and spent 450 (the team's pool holds 5000, which is not this job's remainder); the budget")
+	body = harnessReadBody(ctx, c, "job-8")
+	ctx.Equal(body["budget"], map[string]any{"reserved": float64(300), "spent": float64(0), "remaining": float64(300)}, "job-8's reservation holds 300 GPU-hours with none spent: the budget comes from the reservation (ft:reservation:{job_id}), not the job's compute_budget; job-8's budget")
 }
 
 func CheckLineage(ctx *harness.Ctx) {
-	readSeed(ctx, "job-7", "succeeded", "pass")
-	body := readBody(ctx, readClient(ctx), "job-7")
+	harnessReadSeed(ctx, "job-7", "succeeded", "pass")
+	body := harnessReadBody(ctx, harnessReadClient(ctx), "job-7")
 	ctx.Equal(body["checkpoint_ids"], []any{"ckpt-job-7-1", "ckpt-job-7-2"}, "a run restarted twice must show both checkpoints in order (with only the latest nobody can explain the restarts); checkpoint_ids")
 }
 `,
@@ -911,7 +932,7 @@ using json = nlohmann::json;
 
 // A job of status for ml-search, its reservation (600 reserved, 450 spent), a pool of 5000, and an
 // eval: "pass", "fail" or "" for none yet.
-void seedRead(harness::Ctx& ctx, const std::string& job_id, const std::string& status, const std::string& eval) {
+void harnessSeedRead(harness::Ctx& ctx, const std::string& job_id, const std::string& status, const std::string& eval) {
   ctx.Redis.Do("HSET", "ft:job:" + job_id, "job_id", job_id, "team", "ml-search", "status", status, "base_model", "llama-3.1-8b", "dataset_version",
                "support-tickets@v3", "dataset_sha256", "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1", "config_hash",
                "7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e7e", "compute_budget", "600", "hyperparameters",
@@ -922,10 +943,10 @@ void seedRead(harness::Ctx& ctx, const std::string& job_id, const std::string& s
   if (eval == "fail") ctx.Redis.Do("HSET", "ft:eval:" + job_id, "passed", "0", "score", "0.71");
 }
 
-struct ReadApi {
+struct HarnessReadApi {
   httplib::Server svr;
   harness::HTTP http;
-  explicit ReadApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
+  explicit HarnessReadApi(harness::Ctx& ctx) : http(ctx.HTTP(svr)) { register_routes(svr); }
 
   json body(harness::Ctx& ctx, const std::string& job_id) {
     const auto r = http.Get("/v1/finetune/jobs/" + job_id, "X-Team-Id", "ml-search");
@@ -938,8 +959,8 @@ struct ReadApi {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  seedRead(ctx, "job-7", "succeeded", "pass");
-  ReadApi api(ctx);
+  harnessSeedRead(ctx, "job-7", "succeeded", "pass");
+  HarnessReadApi api(ctx);
   const auto r = api.http.Get("/v1/finetune/jobs/job-7", "X-Team-Id", "ml-search");
   ctx.Equal(r.Status, 200, "the team's own job (%s)", r.Text());
   const json body = api.body(ctx, "job-7");
@@ -949,19 +970,23 @@ void CheckRoute(harness::Ctx& ctx) {
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  seedRead(ctx, "job-7", "succeeded", "pass");
-  ReadApi api(ctx);
+  harnessSeedRead(ctx, "job-7", "succeeded", "pass");
+  HarnessReadApi api(ctx);
   const auto r = api.http.Get("/v1/finetune/jobs/job-7", "X-Team-Id", "ml-legal");
   ctx.Equal(r.Status, 404, "ml-legal read ml-search's job: another team's job answers 404, as an unknown id does, so a guessed id confirms nothing");
   ctx.Assert(r.Text().find("ckpt-job-7") == std::string::npos, "the refusal leaks the job: %s", r.Text());
+  std::string foreign = r.Text();
+  for (size_t at = foreign.find("job-7"); at != std::string::npos; at = foreign.find("job-7", at + 7)) foreign.replace(at, 5, "job-404");
+  const auto unknown = api.http.Get("/v1/finetune/jobs/job-404", "X-Team-Id", "ml-legal");
+  ctx.Equal(foreign, unknown.Text(), "another team's job must answer exactly as an unknown id does (job-404 answered %s); a different body confirms the id exists. job-7's answer, its id read as job-404", unknown.Text());
 }
 
 void CheckPromotableGate(harness::Ctx& ctx) {
-  seedRead(ctx, "job-7", "succeeded", "fail");
-  seedRead(ctx, "job-8", "succeeded", "");
-  seedRead(ctx, "job-9", "succeeded", "pass");
-  seedRead(ctx, "job-10", "failed", "pass");
-  ReadApi api(ctx);
+  harnessSeedRead(ctx, "job-7", "succeeded", "fail");
+  harnessSeedRead(ctx, "job-8", "succeeded", "");
+  harnessSeedRead(ctx, "job-9", "succeeded", "pass");
+  harnessSeedRead(ctx, "job-10", "failed", "pass");
+  HarnessReadApi api(ctx);
   json body = api.body(ctx, "job-7");
   ctx.Assert(body.value("trained", false) && body.contains("promotable") && body["promotable"] == false, "job-7 trained but failed its golden set and reads promotable=%v: a failed eval must keep it out of the registry", body.value("promotable", json()));
   ctx.Equal(body.value("eval", json()), json({{"passed", false}, {"score", 0.71}}), "the eval is reported as {passed, score}");
@@ -972,15 +997,19 @@ void CheckPromotableGate(harness::Ctx& ctx) {
 }
 
 void CheckBudgetReconcile(harness::Ctx& ctx) {
-  seedRead(ctx, "job-7", "succeeded", "pass");
-  ReadApi api(ctx);
+  harnessSeedRead(ctx, "job-7", "succeeded", "pass");
+  harnessSeedRead(ctx, "job-8", "running", "");
+  ctx.Redis.Do("HSET", "ft:reservation:job-8", "reserved", "300", "spent", "0", "state", "running");
+  HarnessReadApi api(ctx);
   ctx.Equal(api.body(ctx, "job-7").value("budget", json()), json({{"reserved", 600}, {"spent", 450}, {"remaining", 150}}),
             "job-7 reserved 600 GPU-hours and spent 450 (the team's pool holds 5000, which is not this job's remainder); the budget");
+  ctx.Equal(api.body(ctx, "job-8").value("budget", json()), json({{"reserved", 300}, {"spent", 0}, {"remaining", 300}}),
+            "job-8's reservation holds 300 GPU-hours with none spent: the budget comes from the reservation (ft:reservation:{job_id}), not the job's compute_budget; job-8's budget");
 }
 
 void CheckLineage(harness::Ctx& ctx) {
-  seedRead(ctx, "job-7", "succeeded", "pass");
-  ReadApi api(ctx);
+  harnessSeedRead(ctx, "job-7", "succeeded", "pass");
+  HarnessReadApi api(ctx);
   ctx.Equal(api.body(ctx, "job-7").value("checkpoint_ids", json()), json({"ckpt-job-7-1", "ckpt-job-7-2"}),
             "a run restarted twice must show both checkpoints in order (with only the latest nobody can explain the restarts); checkpoint_ids");
 }
