@@ -45,7 +45,7 @@ count it; an abandoned upload stays in Redis forever.
       id: 'once',
       title: 'A re-sent part is registered once',
       detail:
-        'Registering a part that is already in the hash answers 0 and leaves the hash and the byte counter alone (`HSETNX`, or `HEXISTS` before writing); the starter overwrites the entry and adds the size again.',
+        'Registering a part that is already in the hash answers 0 and leaves the hash and the byte counter alone, even when it comes with another size or checksum (`HSETNX`, or `HEXISTS` before writing); the starter overwrites the entry and adds the size again.',
       match: {
         python: {all: [/HSETNX|HEXISTS|hsetnx|hexists/]},
         typescript: {all: [/HSETNX|HEXISTS|hsetnx|hexists/]},
@@ -58,7 +58,7 @@ count it; an abandoned upload stays in Redis forever.
       id: 'range',
       title: 'Refuses a part number outside 1..part_count',
       detail:
-        'A part number below 1 or above `part_count` answers -1 and writes nothing; the starter registers any number, so a client bug leaves entries no object will ever hold.',
+        'A part number below 1 or above `part_count` answers -1 and writes nothing, the bounds compared as numbers (part 10 of 12 is in range); the starter registers any number, so a client bug leaves entries no object will ever hold.',
       match: {
         python: {all: [/return\s+-1\b/]},
         typescript: {all: [/return\s+-1\b/]},
@@ -84,7 +84,7 @@ count it; an abandoned upload stays in Redis forever.
       id: 'ttl',
       title: 'An abandoned manifest expires after 24 hours',
       detail:
-        'The script sets `EXPIRE` on both keys with `MANIFEST_TTL_S` (24 hours), so a manifest lives 24 hours past its last registration; the starter sets no expiry and abandoned uploads stay in Redis.',
+        'The script itself sets `EXPIRE` on both keys with `MANIFEST_TTL_S` (24 hours), so neither key is ever without its TTL and a manifest lives 24 hours past its last registration; the starter sets no expiry and abandoned uploads stay in Redis.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/i, /MANIFEST_TTL_S/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/i, /MANIFEST_TTL_S/]},
@@ -600,10 +600,12 @@ def check_once(ctx):
     assert first == 1, f"registering part 1 answered {first!r}, expected 1"
     again = m.register_part("u-1", 1, 3, 5, "c1")
     assert again == 0, f"re-sending part 1 answered {again!r}, expected 0: the part is already registered"
-    assert m.uploaded_bytes("u-1") == 5, f"one 5-byte part sent twice is counted as {m.uploaded_bytes('u-1')} bytes: a re-sent part must not be counted again"
+    other = m.register_part("u-1", 1, 3, 7, "c9")
+    assert other == 0, f"re-sending part 1 with another size and checksum answered {other!r}, expected 0: the part is already registered"
+    assert m.uploaded_bytes("u-1") == 5, f"one 5-byte part sent three times is counted as {m.uploaded_bytes('u-1')} bytes: a re-sent part must not be counted again"
     assert m.register_part("u-1", 2, 3, 5, "c2") == 1, "a new part 2 must answer 1"
     parts = m.read_parts("u-1")
-    assert parts == [{"part_number": 1, "size": 5, "checksum": "c1"}, {"part_number": 2, "size": 5, "checksum": "c2"}], f"read_parts gives {parts}"
+    assert parts == [{"part_number": 1, "size": 5, "checksum": "c1"}, {"part_number": 2, "size": 5, "checksum": "c2"}], f"read_parts gives {parts}, expected part 1 as first registered (5, c1): a re-sent part changes nothing"
     assert m.uploaded_bytes("u-1") == 10, f"two 5-byte parts are counted as {m.uploaded_bytes('u-1')} bytes"
 
 
@@ -614,6 +616,9 @@ def check_range(ctx):
         assert got == -1, f"part {number} of a 3-part upload answered {got!r}, expected -1: it is outside 1..part_count"
     assert ctx.redis.exists(PARTS, COUNTER) == 0, f"a refused part number left {sorted(ctx.redis.keys('upload:u-1*'))} in Redis: nothing may be written"
     assert m.register_part("u-1", 3, 3, 5, "c3") == 1, "the last part (3 of 3) is in range and must answer 1"
+    for number, expected in ((2, 1), (10, 1), (12, 1), (13, -1)):
+        got = m.register_part("u-2", number, 12, 5, f"c{number}")
+        assert got == expected, f"part {number} of a 12-part upload answered {got!r}, expected {expected}: the range compares numbers, not strings"
 
 
 def check_atomic(ctx):
@@ -639,13 +644,18 @@ def check_atomic(ctx):
 
 def check_ttl(ctx):
     m = ctx.load("state")
+    first = ctx.redis_after(PARTS, lambda: (ctx.redis.ttl(PARTS), ctx.redis.ttl(COUNTER)))
     m.register_part("u-1", 1, 3, 5, "c1")
+    assert first.fired, "register_part never touched upload:u-1:parts"
+    for key, ttl in zip((PARTS, COUNTER), first.result):
+        assert 86000 <= ttl <= 86400, f"right after the registration wrote it, {key} had TTL {ttl}, expected 24 hours (86400 s) set in the same script: an abandoned upload must leave Redis on its own"
     for key in (PARTS, COUNTER):
         ttl = ctx.redis.ttl(key)
         assert 86000 <= ttl <= 86400, f"{key} has TTL {ttl} after a registration, expected 24 hours (86400 s): an abandoned upload must leave Redis on its own"
     ctx.clock.advance(12 * 3600)
     m.register_part("u-1", 2, 3, 5, "c2")
-    assert ctx.redis.ttl(PARTS) > 86000, f"a registration 12 hours later left {PARTS} with TTL {ctx.redis.ttl(PARTS)}: the manifest lives 24 hours after its last registration"
+    for key in (PARTS, COUNTER):
+        assert ctx.redis.ttl(key) > 86000, f"a registration 12 hours later left {key} with TTL {ctx.redis.ttl(key)}: the manifest lives 24 hours after its last registration"
     ctx.clock.advance(86401)
     assert ctx.redis.exists(PARTS, COUNTER) == 0, f"24 hours after the last registration Redis still holds {sorted(ctx.redis.keys('upload:u-1*'))}"
 `,
@@ -664,10 +674,12 @@ export async function check_once(ctx) {
   assert.equal(await m.registerPart('u-1', 1, 3, 5, 'c1'), 1, 'registering part 1 must answer 1');
   const again = await m.registerPart('u-1', 1, 3, 5, 'c1');
   assert.equal(again, 0, \`re-sending part 1 answered \${again}, expected 0: the part is already registered\`);
-  assert.equal(await m.uploadedBytes('u-1'), 5, \`one 5-byte part sent twice is counted as \${await m.uploadedBytes('u-1')} bytes: a re-sent part must not be counted again\`);
+  const other = await m.registerPart('u-1', 1, 3, 7, 'c9');
+  assert.equal(other, 0, \`re-sending part 1 with another size and checksum answered \${other}, expected 0: the part is already registered\`);
+  assert.equal(await m.uploadedBytes('u-1'), 5, \`one 5-byte part sent three times is counted as \${await m.uploadedBytes('u-1')} bytes: a re-sent part must not be counted again\`);
   assert.equal(await m.registerPart('u-1', 2, 3, 5, 'c2'), 1, 'a new part 2 must answer 1');
   const parts = await m.readParts('u-1');
-  assert.deepStrictEqual(parts, [{part_number: 1, size: 5, checksum: 'c1'}, {part_number: 2, size: 5, checksum: 'c2'}], \`readParts gives \${JSON.stringify(parts)}\`);
+  assert.deepStrictEqual(parts, [{part_number: 1, size: 5, checksum: 'c1'}, {part_number: 2, size: 5, checksum: 'c2'}], \`readParts gives \${JSON.stringify(parts)}, expected part 1 as first registered (5, c1): a re-sent part changes nothing\`);
   assert.equal(await m.uploadedBytes('u-1'), 10, 'two 5-byte parts must be counted as 10 bytes');
 }
 
@@ -679,6 +691,10 @@ export async function check_range(ctx) {
   }
   assert.equal(ctx.redis.exists(PARTS, COUNTER), 0, \`a refused part number left \${JSON.stringify(ctx.redis.keys('upload:u-1*'))} in Redis: nothing may be written\`);
   assert.equal(await m.registerPart('u-1', 3, 3, 5, 'c3'), 1, 'the last part (3 of 3) is in range and must answer 1');
+  for (const [n, expected] of [[2, 1], [10, 1], [12, 1], [13, -1]]) {
+    const got = await m.registerPart('u-2', n, 12, 5, \`c\${n}\`);
+    assert.equal(got, expected, \`part \${n} of a 12-part upload answered \${got}, expected \${expected}: the range compares numbers, not strings\`);
+  }
 }
 
 export async function check_atomic(ctx) {
@@ -703,14 +719,22 @@ export async function check_atomic(ctx) {
 
 export async function check_ttl(ctx) {
   const m = ctx.load('state');
+  const first = ctx.redisAfter(PARTS, () => [ctx.redis.ttl(PARTS), ctx.redis.ttl(COUNTER)]);
   await m.registerPart('u-1', 1, 3, 5, 'c1');
+  assert(first.fired, 'registerPart never touched upload:u-1:parts');
+  const ttls = (await first.result) as number[];
+  [PARTS, COUNTER].forEach((key, i) => {
+    assert(ttls[i] >= 86000 && ttls[i] <= 86400, \`right after the registration wrote it, \${key} had TTL \${ttls[i]}, expected 24 hours (86400 s) set in the same script: an abandoned upload must leave Redis on its own\`);
+  });
   for (const key of [PARTS, COUNTER]) {
     const ttl = ctx.redis.ttl(key);
     assert(ttl >= 86000 && ttl <= 86400, \`\${key} has TTL \${ttl} after a registration, expected 24 hours (86400 s): an abandoned upload must leave Redis on its own\`);
   }
   ctx.clock.advance(12 * 3600);
   await m.registerPart('u-1', 2, 3, 5, 'c2');
-  assert(ctx.redis.ttl(PARTS) > 86000, \`a registration 12 hours later left \${PARTS} with TTL \${ctx.redis.ttl(PARTS)}: the manifest lives 24 hours after its last registration\`);
+  for (const key of [PARTS, COUNTER]) {
+    assert(ctx.redis.ttl(key) > 86000, \`a registration 12 hours later left \${key} with TTL \${ctx.redis.ttl(key)}: the manifest lives 24 hours after its last registration\`);
+  }
   ctx.clock.advance(86401);
   assert.equal(ctx.redis.exists(PARTS, COUNTER), 0, \`24 hours after the last registration Redis still holds \${JSON.stringify(ctx.redis.keys('upload:u-1*'))}\`);
 }
@@ -719,6 +743,7 @@ export async function check_ttl(ctx) {
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -727,70 +752,78 @@ import (
 )
 
 const (
-	partsHash  = "upload:u-1:parts"
-	counterKey = "upload:u-1:bytes"
+	hPartsHash  = "upload:u-1:parts"
+	hCounterKey = "upload:u-1:bytes"
 )
 
-var stateBg = context.Background()
+var hStateBg = context.Background()
 
-// snapshot is [bytes of the parts in the hash, the counter] as another client reads them right now.
-func snapshot(ctx *harness.Ctx) [2]int64 {
+// hSnapshot is [bytes of the parts in the hash, the counter] as another client reads them right now.
+func hSnapshot(ctx *harness.Ctx) [2]int64 {
 	var parts int64
-	for _, value := range ctx.Redis.HGetAll(partsHash) {
+	for _, value := range ctx.Redis.HGetAll(hPartsHash) {
 		size, _, _ := strings.Cut(value, ":")
 		n, _ := strconv.ParseInt(size, 10, 64)
 		parts += n
 	}
-	raw, _ := ctx.Redis.Get(counterKey)
-	counted, _ := strconv.ParseInt(raw, 10, 64)
-	return [2]int64{parts, counted}
+	raw, _ := ctx.Redis.Get(hCounterKey)
+	hCounted, _ := strconv.ParseInt(raw, 10, 64)
+	return [2]int64{parts, hCounted}
 }
 
-func mustRegister(ctx *harness.Ctx, n, count int, checksum string) int64 {
-	got, err := registerPart(stateBg, "u-1", n, count, 5, checksum)
+func hMustRegister(ctx *harness.Ctx, n, count int, checksum string) int64 {
+	got, err := registerPart(hStateBg, "u-1", n, count, 5, checksum)
 	ctx.NoError(err, "registerPart(u-1, %d, %d, 5, %s)", n, count, checksum)
 	return got
 }
 
-func counted(ctx *harness.Ctx) int64 {
-	n, err := uploadedBytes(stateBg, "u-1")
+func hCounted(ctx *harness.Ctx) int64 {
+	n, err := uploadedBytes(hStateBg, "u-1")
 	ctx.NoError(err, "uploadedBytes(u-1)")
 	return n
 }
 
 func CheckOnce(ctx *harness.Ctx) {
-	ctx.Equal(mustRegister(ctx, 1, 3, "c1"), int64(1), "registering part 1")
-	ctx.Equal(mustRegister(ctx, 1, 3, "c1"), int64(0), "re-sending part 1 must answer 0 (the part is already registered)")
-	ctx.Equal(counted(ctx), int64(5), "one 5-byte part sent twice must be counted once; the counted bytes")
-	ctx.Equal(mustRegister(ctx, 2, 3, "c2"), int64(1), "a new part 2")
-	parts, err := readParts(stateBg, "u-1")
+	ctx.Equal(hMustRegister(ctx, 1, 3, "c1"), int64(1), "registering part 1")
+	ctx.Equal(hMustRegister(ctx, 1, 3, "c1"), int64(0), "re-sending part 1 must answer 0 (the part is already registered)")
+	other, err := registerPart(hStateBg, "u-1", 1, 3, 7, "c9")
+	ctx.NoError(err, "registerPart(u-1, 1, 3, 7, c9)")
+	ctx.Equal(other, int64(0), "re-sending part 1 with another size and checksum must answer 0 (the part is already registered)")
+	ctx.Equal(hCounted(ctx), int64(5), "one 5-byte part sent three times must be counted once; the counted bytes")
+	ctx.Equal(hMustRegister(ctx, 2, 3, "c2"), int64(1), "a new part 2")
+	parts, err := readParts(hStateBg, "u-1")
 	ctx.NoError(err, "readParts(u-1)")
-	ctx.Equal(parts, []Part{{PartNumber: 1, Size: 5, Checksum: "c1"}, {PartNumber: 2, Size: 5, Checksum: "c2"}}, "readParts")
-	ctx.Equal(counted(ctx), int64(10), "two 5-byte parts; the counted bytes")
+	ctx.Equal(parts, []Part{{PartNumber: 1, Size: 5, Checksum: "c1"}, {PartNumber: 2, Size: 5, Checksum: "c2"}}, "readParts (part 1 as first registered, 5 and c1: a re-sent part changes nothing)")
+	ctx.Equal(hCounted(ctx), int64(10), "two 5-byte parts; the counted bytes")
 }
 
 func CheckRange(ctx *harness.Ctx) {
 	for _, n := range []int{0, 4, -1} {
-		ctx.Equal(mustRegister(ctx, n, 3, "cx"), int64(-1), "part %d of a 3-part upload is outside 1..partCount", n)
+		ctx.Equal(hMustRegister(ctx, n, 3, "cx"), int64(-1), "part %d of a 3-part upload is outside 1..partCount", n)
 	}
-	ctx.Equal(ctx.Redis.Exists(partsHash, counterKey), int64(0), "a refused part number must write nothing (Redis holds %q); the keys", ctx.Redis.Keys("upload:u-1*"))
-	ctx.Equal(mustRegister(ctx, 3, 3, "c3"), int64(1), "the last part (3 of 3) is in range")
+	ctx.Equal(ctx.Redis.Exists(hPartsHash, hCounterKey), int64(0), "a refused part number must write nothing (Redis holds %q); the keys", ctx.Redis.Keys("upload:u-1*"))
+	ctx.Equal(hMustRegister(ctx, 3, 3, "c3"), int64(1), "the last part (3 of 3) is in range")
+	for _, tc := range [][2]int{{2, 1}, {10, 1}, {12, 1}, {13, -1}} {
+		got, err := registerPart(hStateBg, "u-2", tc[0], 12, 5, fmt.Sprintf("c%d", tc[0]))
+		ctx.NoError(err, "registerPart(u-2, %d, 12)", tc[0])
+		ctx.Equal(got, int64(tc[1]), "part %d of a 12-part upload (the range compares numbers, not strings)", tc[0])
+	}
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	mustRegister(ctx, 1, 3, "c1")
+	hMustRegister(ctx, 1, 3, "c1")
 	var seen [][2]int64
-	rival := ctx.Redis.After(partsHash, func() any {
-		seen = append(seen, snapshot(ctx))
-		got, err := registerPart(stateBg, "u-1", 2, 3, 5, "c2") // the same retried part, through another server
+	rival := ctx.Redis.After(hPartsHash, func() any {
+		seen = append(seen, hSnapshot(ctx))
+		got, err := registerPart(hStateBg, "u-1", 2, 3, 5, "c2") // the same retried part, through another server
 		ctx.NoError(err, "the other server's registerPart")
 		return got
 	})
-	ctx.Redis.After(counterKey, func() any {
-		seen = append(seen, snapshot(ctx))
+	ctx.Redis.After(hCounterKey, func() any {
+		seen = append(seen, hSnapshot(ctx))
 		return nil
 	})
-	mine := mustRegister(ctx, 2, 3, "c2")
+	mine := hMustRegister(ctx, 2, 3, "c2")
 	ctx.Assert(rival.Fired, "registerPart never touched upload:u-1:parts")
 	ctx.Assert(rival.Err == nil, "the other server's registerPart failed: %v", rival.Err)
 	for _, s := range seen {
@@ -800,20 +833,30 @@ func CheckAtomic(ctx *harness.Ctx) {
 	results := []int64{mine, theirs}
 	sort.Slice(results, func(i, j int) bool { return results[i] < results[j] })
 	ctx.Equal(results, []int64{0, 1}, "two registrations of part 2 at once: exactly one of them registers it; the answers")
-	ctx.Equal(counted(ctx), int64(10), "after part 2 was registered twice at once; the counted bytes")
+	ctx.Equal(hCounted(ctx), int64(10), "after part 2 was registered twice at once; the counted bytes")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	mustRegister(ctx, 1, 3, "c1")
-	for _, key := range []string{partsHash, counterKey} {
+	first := ctx.Redis.After(hPartsHash, func() any {
+		return [2]int64{ctx.Redis.TTL(hPartsHash), ctx.Redis.TTL(hCounterKey)}
+	})
+	hMustRegister(ctx, 1, 3, "c1")
+	ctx.Assert(first.Fired, "registerPart never touched upload:u-1:parts")
+	ttls, _ := first.Result.([2]int64)
+	for i, key := range []string{hPartsHash, hCounterKey} {
+		ctx.Assert(ttls[i] >= 86000 && ttls[i] <= 86400, "right after the registration wrote it, %s had TTL %d, expected 24 hours (86400 s) set in the same script: an abandoned upload must leave Redis on its own", key, ttls[i])
+	}
+	for _, key := range []string{hPartsHash, hCounterKey} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl >= 86000 && ttl <= 86400, "%s has TTL %d after a registration, expected 24 hours (86400 s): an abandoned upload must leave Redis on its own", key, ttl)
 	}
 	ctx.Clock.Advance(12 * 3600)
-	mustRegister(ctx, 2, 3, "c2")
-	ctx.Assert(ctx.Redis.TTL(partsHash) > 86000, "a registration 12 hours later left %s with TTL %d: the manifest lives 24 hours after its last registration", partsHash, ctx.Redis.TTL(partsHash))
+	hMustRegister(ctx, 2, 3, "c2")
+	for _, key := range []string{hPartsHash, hCounterKey} {
+		ctx.Assert(ctx.Redis.TTL(key) > 86000, "a registration 12 hours later left %s with TTL %d: the manifest lives 24 hours after its last registration", key, ctx.Redis.TTL(key))
+	}
 	ctx.Clock.Advance(86401)
-	ctx.Equal(ctx.Redis.Exists(partsHash, counterKey), int64(0), "24 hours after the last registration Redis still holds %q; the keys", ctx.Redis.Keys("upload:u-1*"))
+	ctx.Equal(ctx.Redis.Exists(hPartsHash, hCounterKey), int64(0), "24 hours after the last registration Redis still holds %q; the keys", ctx.Redis.Keys("upload:u-1*"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -827,18 +870,18 @@ func CheckTtl(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kParts = "upload:u-1:parts";
-const std::string kCounter = "upload:u-1:bytes";
+const std::string kHarnessParts = "upload:u-1:parts";
+const std::string kHarnessCounter = "upload:u-1:bytes";
 
 // (bytes of the parts in the hash, the counter) as another client reads them right now.
-std::pair<long long, long long> snapshot(harness::Ctx& ctx) {
+std::pair<long long, long long> hSnapshot(harness::Ctx& ctx) {
   long long parts = 0;
-  for (const auto& [number, value] : ctx.Redis.HGetAll(kParts)) parts += std::stoll(value.substr(0, value.find(':')));
-  const auto raw = ctx.Redis.Get(kCounter);
+  for (const auto& [number, value] : ctx.Redis.HGetAll(kHarnessParts)) parts += std::stoll(value.substr(0, value.find(':')));
+  const auto raw = ctx.Redis.Get(kHarnessCounter);
   return {parts, raw ? std::stoll(*raw) : 0};
 }
 
-struct Rival {
+struct HRival {
   bool fired = false;
   long long result = -9;
   std::optional<std::string> err;
@@ -849,35 +892,39 @@ struct Rival {
 void CheckOnce(harness::Ctx& ctx) {
   ctx.Equal(registerPart("u-1", 1, 3, 5, "c1"), 1LL, "registering part 1");
   ctx.Equal(registerPart("u-1", 1, 3, 5, "c1"), 0LL, "re-sending part 1 must answer 0 (the part is already registered)");
-  ctx.Equal(uploadedBytes("u-1"), 5LL, "one 5-byte part sent twice must be counted once; the counted bytes");
+  ctx.Equal(registerPart("u-1", 1, 3, 7, "c9"), 0LL, "re-sending part 1 with another size and checksum must answer 0 (the part is already registered)");
+  ctx.Equal(uploadedBytes("u-1"), 5LL, "one 5-byte part sent three times must be counted once; the counted bytes");
   ctx.Equal(registerPart("u-1", 2, 3, 5, "c2"), 1LL, "a new part 2");
   const auto parts = readParts("u-1");
   ctx.Assert(parts.size() == 2 && parts[0].part_number == 1 && parts[0].size == 5 && parts[0].checksum == "c1" && parts[1].part_number == 2 &&
                  parts[1].checksum == "c2",
-             "readParts gives %d parts, expected parts 1 (5, c1) and 2 (5, c2)", parts.size());
+             "readParts gives %d parts, expected parts 1 (5, c1, as first registered: a re-sent part changes nothing) and 2 (5, c2)", parts.size());
   ctx.Equal(uploadedBytes("u-1"), 10LL, "two 5-byte parts; the counted bytes");
 }
 
 void CheckRange(harness::Ctx& ctx) {
   for (const int n : {0, 4, -1}) ctx.Equal(registerPart("u-1", n, 3, 5, "cx"), -1LL, "part %d of a 3-part upload is outside 1..part_count", n);
-  ctx.Equal(ctx.Redis.Exists(kParts, kCounter), 0LL, "a refused part number must write nothing (Redis holds %q); the keys", ctx.Redis.Keys("upload:u-1*"));
+  ctx.Equal(ctx.Redis.Exists(kHarnessParts, kHarnessCounter), 0LL, "a refused part number must write nothing (Redis holds %q); the keys", ctx.Redis.Keys("upload:u-1*"));
   ctx.Equal(registerPart("u-1", 3, 3, 5, "c3"), 1LL, "the last part (3 of 3) is in range");
+  for (const auto& [n, expected] : std::vector<std::pair<int, long long>>{{2, 1}, {10, 1}, {12, 1}, {13, -1}}) {
+    ctx.Equal(registerPart("u-2", n, 12, 5, "c" + std::to_string(n)), expected, "part %d of a 12-part upload (the range compares numbers, not strings)", n);
+  }
 }
 
 void CheckAtomic(harness::Ctx& ctx) {
   registerPart("u-1", 1, 3, 5, "c1");
   auto seen = std::make_shared<std::vector<std::pair<long long, long long>>>();
-  auto rival = std::make_shared<Rival>();
-  ctx.Redis.After(kParts, [&ctx, seen, rival] {
+  auto rival = std::make_shared<HRival>();
+  ctx.Redis.After(kHarnessParts, [&ctx, seen, rival] {
     rival->fired = true;
-    seen->push_back(snapshot(ctx));
+    seen->push_back(hSnapshot(ctx));
     try {
       rival->result = registerPart("u-1", 2, 3, 5, "c2");  // the same retried part, through another server
     } catch (const std::exception& e) {
       rival->err = e.what();
     }
   });
-  ctx.Redis.After(kCounter, [&ctx, seen] { seen->push_back(snapshot(ctx)); });
+  ctx.Redis.After(kHarnessCounter, [&ctx, seen] { seen->push_back(hSnapshot(ctx)); });
   const long long mine = registerPart("u-1", 2, 3, 5, "c2");
   ctx.Assert(rival->fired, "registerPart never touched upload:u-1:parts");
   ctx.Assert(!rival->err, "the other server's registerPart failed: %s", rival->err.value_or(""));
@@ -889,16 +936,29 @@ void CheckAtomic(harness::Ctx& ctx) {
 }
 
 void CheckTtl(harness::Ctx& ctx) {
+  auto first = std::make_shared<std::vector<long long>>();
+  ctx.Redis.After(kHarnessParts, [&ctx, first] {
+    first->push_back(ctx.Redis.TTL(kHarnessParts));
+    first->push_back(ctx.Redis.TTL(kHarnessCounter));
+  });
   registerPart("u-1", 1, 3, 5, "c1");
-  for (const std::string& key : {kParts, kCounter}) {
+  ctx.Assert(first->size() == 2, "registerPart never touched upload:u-1:parts");
+  const std::vector<std::string> keys = {kHarnessParts, kHarnessCounter};
+  for (size_t i = 0; i < keys.size(); i++) {
+    ctx.Assert((*first)[i] >= 86000 && (*first)[i] <= 86400,
+               "right after the registration wrote it, %s had TTL %d, expected 24 hours (86400 s) set in the same script: an abandoned upload must leave Redis on its own", keys[i], (*first)[i]);
+  }
+  for (const std::string& key : keys) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl >= 86000 && ttl <= 86400, "%s has TTL %d after a registration, expected 24 hours (86400 s): an abandoned upload must leave Redis on its own", key, ttl);
   }
   ctx.Clock.Advance(12 * 3600);
   registerPart("u-1", 2, 3, 5, "c2");
-  ctx.Assert(ctx.Redis.TTL(kParts) > 86000, "a registration 12 hours later left %s with TTL %d: the manifest lives 24 hours after its last registration", kParts, ctx.Redis.TTL(kParts));
+  for (const std::string& key : keys) {
+    ctx.Assert(ctx.Redis.TTL(key) > 86000, "a registration 12 hours later left %s with TTL %d: the manifest lives 24 hours after its last registration", key, ctx.Redis.TTL(key));
+  }
   ctx.Clock.Advance(86401);
-  ctx.Equal(ctx.Redis.Exists(kParts, kCounter), 0LL, "24 hours after the last registration Redis still holds %q; the keys", ctx.Redis.Keys("upload:u-1*"));
+  ctx.Equal(ctx.Redis.Exists(kHarnessParts, kHarnessCounter), 0LL, "24 hours after the last registration Redis still holds %q; the keys", ctx.Redis.Keys("upload:u-1*"));
 }
 `,
   },

@@ -62,7 +62,7 @@ caller.
       id: 'tenant-404',
       title: 'Another tenant’s request is 404',
       detail:
-        'The read requires `X-Tenant-Id` (401) and answers 404 when the stored request belongs to another tenant: not the trail, and not a 403 that confirms the id exists.',
+        'The read requires `X-Tenant-Id` (401) and answers 404 when the stored request belongs to another tenant, with the same body as a request that does not exist: not the trail, not a 403 and not a different message that confirms the id exists.',
       match: {
         python: {all: [/x-tenant-id/i, /\b401\b/]},
         typescript: {all: [/x-tenant-id/i, /\b401\b/]},
@@ -88,7 +88,7 @@ caller.
       id: 'one-snapshot',
       title: 'Reads the state in one command',
       detail:
-        'The whole state hash is read with one `HGETALL`, so the step index, the status and every decision come from the same moment; separate `HGET`s let a decision land between them.',
+        'The whole state hash is read with one `HGETALL`, so the step index, the status and every decision come from the same moment, even when the last approval lands mid-read; separate `HGET`s let a decision land between them.',
       match: {
         python: {all: [/\.hgetall\(/], none: [/\.hget\(/]},
         typescript: {all: [/\.hgetall\(/], none: [/\.hget\(/]},
@@ -631,9 +631,11 @@ async def check_tenant_404(ctx):
     async with _read(ctx) as c:
         anonymous = await c.get("/v1/requests/r-1")
         foreign = await c.get("/v1/requests/r-1", headers={"X-Tenant-Id": "t-globex"})
+        missing = await c.get("/v1/requests/r-404", headers={"X-Tenant-Id": "t-globex"})
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
     assert foreign.status_code == 404, f"tenant t-globex reading t-acme's request answered {foreign.status_code}: {foreign.text}. Another tenant's request is 404"
     assert "u-mgr" not in foreign.text, f"the 404 for another tenant leaks the trail: {foreign.text}"
+    assert foreign.text.replace("r-1", "{id}") == missing.text.replace("r-404", "{id}"), f"another tenant's request answered {foreign.text}, a missing one {missing.text}: the difference confirms the id exists"
 
 
 async def check_pinned_chain(ctx):
@@ -656,7 +658,14 @@ async def check_one_snapshot(ctx):
         approved = sum(1 for s in body.get("steps", []) if s.get("state") == "approved")
         assert approved == body.get("step_index"), f"the read mixed two moments: step_index {body.get('step_index')} with {approved} approved step(s) in {body.get('steps')}. Read the state in one command"
         after = (await c.get("/v1/requests/r-1", headers=ACME)).json()
-    assert after.get("step_index") == 1 and after.get("steps", [{}])[0].get("state") == "approved", f"after the approval the trail reads {after}"
+        assert after.get("step_index") == 1 and after.get("steps", [{}])[0].get("state") == "approved", f"after the approval the trail reads {after}"
+        # The director approves the last step mid-read: status, step_index and steps must still agree.
+        last = ctx.redis_after("approval:r-1:state", lambda: chain.advance("r-1", 1, "u-dir", "approved"))
+        body = (await c.get("/v1/requests/r-1", headers=ACME)).json()
+        assert last.fired and last.error is None and last.result.get("status") == "approved", f"the director's approval during the read answered {last.result} {last.error}"
+        approved = sum(1 for s in body.get("steps", []) if s.get("state") == "approved")
+        status = "approved" if body.get("step_index") == 2 else "pending"
+        assert approved == body.get("step_index") and body.get("status") == status, f"the read mixed two moments: status {body.get('status')}, step_index {body.get('step_index')}, {approved} approved step(s). Read the state in one command"
 
 
 async def check_no_store(ctx):
@@ -703,6 +712,8 @@ export async function check_tenant_404(ctx) {
   const foreign = await c.get('/v1/requests/r-1', {headers: {'X-Tenant-Id': 't-globex'}});
   assert.equal(foreign.status, 404, \`tenant t-globex reading t-acme's request answered \${foreign.status}: \${foreign.text}. Another tenant's request is 404\`);
   assert(!foreign.text.includes('u-mgr'), \`the 404 for another tenant leaks the trail: \${foreign.text}\`);
+  const missing = await c.get('/v1/requests/r-404', {headers: {'X-Tenant-Id': 't-globex'}});
+  assert.equal(foreign.text.replaceAll('r-1', '{id}'), missing.text.replaceAll('r-404', '{id}'), \`another tenant's request answered \${foreign.text}, a missing one \${missing.text}: the difference confirms the id exists\`);
 }
 
 export async function check_pinned_chain(ctx) {
@@ -726,6 +737,15 @@ export async function check_one_snapshot(ctx) {
   assert.equal(approved, body.step_index, \`the read mixed two moments: step_index \${body.step_index} with \${approved} approved step(s) in \${JSON.stringify(body.steps)}. Read the state in one command\`);
   const after = (await c.get('/v1/requests/r-1', {headers: ACME})).json();
   assert(after.step_index === 1 && after.steps?.[0]?.state === 'approved', \`after the approval the trail reads \${JSON.stringify(after)}\`);
+  // The director approves the last step mid-read: status, step_index and steps must still agree.
+  const last = ctx.redisAfter('approval:r-1:state', () => chain.advance('r-1', 1, 'u-dir', 'approved'));
+  const final = (await c.get('/v1/requests/r-1', {headers: ACME})).json();
+  assert(last.fired && last.error === undefined, \`the director's approval during the read never ran: \${last.error}\`);
+  const lastOutcome = await last.result;
+  assert.equal(lastOutcome.status, 'approved', \`the director's approval during the read answered \${JSON.stringify(lastOutcome)}\`);
+  const finalApproved = (final.steps ?? []).filter(s => s.state === 'approved').length;
+  const finalStatus = final.step_index === 2 ? 'approved' : 'pending';
+  assert(finalApproved === final.step_index && final.status === finalStatus, \`the read mixed two moments: status \${final.status}, step_index \${final.step_index}, \${finalApproved} approved step(s). Read the state in one command\`);
 }
 
 export async function check_no_store(ctx) {
@@ -751,6 +771,23 @@ import (
 
 var readBg = context.Background()
 
+// readStepView and readView decode the answer; the harness keeps its own types so a fix may shape its own.
+type readStepView struct {
+	Step     int    \`json:"step"\`
+	Approver string \`json:"approver"\`
+	State    string \`json:"state"\`
+	Actor    string \`json:"actor"\`
+}
+
+type readView struct {
+	RequestID    string         \`json:"request_id"\`
+	ChainID      string         \`json:"chain_id"\`
+	ChainVersion int            \`json:"chain_version"\`
+	Status       string         \`json:"status"\`
+	StepIndex    int            \`json:"step_index"\`
+	Steps        []readStepView \`json:"steps"\`
+}
+
 func readServe(ctx *harness.Ctx) *harness.HTTP {
 	ctx.NoError(policy.DefineChain(readBg, "spend", 3, []string{"u-mgr", "u-dir"}), "defining the spend chain")
 	record := &store.Request{RequestID: "r-1", Tenant: "t-acme", Requester: "u-req", ChainID: "spend", ChainVersion: 3, Approvers: []string{"u-mgr", "u-dir"}, Why: "new laptop", AmountCents: 420000}
@@ -761,29 +798,39 @@ func readServe(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func readGet(ctx *harness.Ctx, c *harness.HTTP) requestView {
+func readGet(ctx *harness.Ctx, c *harness.HTTP) readView {
 	r := c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-acme")
 	ctx.Equal(r.Status, 200, "GET /v1/requests/r-1 (%s)", r.Text())
-	var view requestView
+	var view readView
 	r.Decode(&view)
 	return view
 }
 
-func readAdvance(ctx *harness.Ctx) chain.Outcome {
-	o, err := chain.Advance(readBg, "r-1", 0, "u-mgr", "approved")
-	ctx.NoError(err, "chain.Advance(r-1, 0, u-mgr)")
+func readAdvance(ctx *harness.Ctx, step int, actor string) chain.Outcome {
+	o, err := chain.Advance(readBg, "r-1", step, actor, "approved")
+	ctx.NoError(err, "chain.Advance(r-1, %d, %s)", step, actor)
 	return o
+}
+
+func readApproved(view readView) int {
+	approved := 0
+	for _, s := range view.Steps {
+		if s.State == "approved" {
+			approved++
+		}
+	}
+	return approved
 }
 
 func CheckRoute(ctx *harness.Ctx) {
 	c := readServe(ctx)
 	view := readGet(ctx, c)
 	ctx.Assert(view.RequestID == "r-1" && view.Status == "pending" && view.StepIndex == 0, "a fresh request reads as %+v", view)
-	ctx.Equal(view.Steps, []stepView{{0, "u-mgr", "pending", ""}, {1, "u-dir", "pending", ""}}, "a fresh request's steps")
-	readAdvance(ctx)
+	ctx.Equal(view.Steps, []readStepView{{0, "u-mgr", "pending", ""}, {1, "u-dir", "pending", ""}}, "a fresh request's steps")
+	readAdvance(ctx, 0, "u-mgr")
 	view = readGet(ctx, c)
 	ctx.Equal(view.StepIndex, 1, "after the manager's approval, step_index")
-	ctx.Equal(view.Steps, []stepView{{0, "u-mgr", "approved", "u-mgr"}, {1, "u-dir", "pending", ""}}, "after the manager's approval, the steps")
+	ctx.Equal(view.Steps, []readStepView{{0, "u-mgr", "approved", "u-mgr"}, {1, "u-dir", "pending", ""}}, "after the manager's approval, the steps")
 	ctx.Equal(c.Get("/v1/requests/r-404", "X-Tenant-Id", "t-acme").Status, 404, "a request that does not exist")
 }
 
@@ -793,6 +840,8 @@ func CheckTenant404(ctx *harness.Ctx) {
 	foreign := c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-globex")
 	ctx.Equal(foreign.Status, 404, "tenant t-globex reading t-acme's request (%s): another tenant's request is 404", foreign.Text())
 	ctx.Assert(!strings.Contains(foreign.Text(), "u-mgr"), "the 404 for another tenant leaks the trail: %s", foreign.Text())
+	missing := c.Get("/v1/requests/r-404", "X-Tenant-Id", "t-globex")
+	ctx.Assert(strings.ReplaceAll(foreign.Text(), "r-1", "{id}") == strings.ReplaceAll(missing.Text(), "r-404", "{id}"), "another tenant's request answered %s, a missing one %s: the difference confirms the id exists", foreign.Text(), missing.Text())
 }
 
 func CheckPinnedChain(ctx *harness.Ctx) {
@@ -810,18 +859,23 @@ func CheckPinnedChain(ctx *harness.Ctx) {
 func CheckOneSnapshot(ctx *harness.Ctx) {
 	c := readServe(ctx)
 	// The manager approves while the read is in flight, right after its first command on the state.
-	rival := ctx.Redis.After("approval:r-1:state", func() any { return readAdvance(ctx) })
+	rival := ctx.Redis.After("approval:r-1:state", func() any { return readAdvance(ctx, 0, "u-mgr") })
 	view := readGet(ctx, c)
 	ctx.Assert(rival.Fired, "the read never touched approval:r-1:state")
-	approved := 0
-	for _, s := range view.Steps {
-		if s.State == "approved" {
-			approved++
-		}
-	}
+	approved := readApproved(view)
 	ctx.Assert(approved == view.StepIndex, "the read mixed two moments: step_index %d with %d approved step(s) in %+v. Read the state in one command", view.StepIndex, approved, view.Steps)
 	after := readGet(ctx, c)
 	ctx.Assert(after.StepIndex == 1 && len(after.Steps) > 0 && after.Steps[0].State == "approved", "after the approval the trail reads %+v", after)
+	// The director approves the last step mid-read: status, step_index and steps must still agree.
+	last := ctx.Redis.After("approval:r-1:state", func() any { return readAdvance(ctx, 1, "u-dir") })
+	view = readGet(ctx, c)
+	lastOutcome, _ := last.Result.(chain.Outcome)
+	ctx.Assert(last.Fired && lastOutcome.Status == "approved", "the director's approval during the read answered %+v", lastOutcome)
+	status := "pending"
+	if view.StepIndex == 2 {
+		status = "approved"
+	}
+	ctx.Assert(readApproved(view) == view.StepIndex && view.Status == status, "the read mixed two moments: status %s, step_index %d, %d approved step(s). Read the state in one command", view.Status, view.StepIndex, readApproved(view))
 }
 
 func CheckNoStore(ctx *harness.Ctx) {
@@ -886,6 +940,13 @@ void CheckTenant404(harness::Ctx& ctx) {
   const auto foreign = c.Get("/v1/requests/r-1", "X-Tenant-Id", "t-globex");
   ctx.Equal(foreign.Status, 404, "tenant t-globex reading t-acme's request (%s): another tenant's request is 404", foreign.Text());
   ctx.Assert(foreign.Text().find("u-mgr") == std::string::npos, "the 404 for another tenant leaks the trail: %s", foreign.Text());
+  const auto missing = c.Get("/v1/requests/r-404", "X-Tenant-Id", "t-globex");
+  // The two answers, with the id each one names replaced by {id}.
+  const auto withoutId = [](std::string text, const std::string& id) {
+    for (size_t at = text.find(id); at != std::string::npos; at = text.find(id, at + 4)) text.replace(at, id.size(), "{id}");
+    return text;
+  };
+  ctx.Assert(withoutId(foreign.Text(), "r-1") == withoutId(missing.Text(), "r-404"), "another tenant's request answered %s, a missing one %s: the difference confirms the id exists", foreign.Text(), missing.Text());
 }
 
 void CheckPinnedChain(harness::Ctx& ctx) {
@@ -913,6 +974,16 @@ void CheckOneSnapshot(harness::Ctx& ctx) {
   ctx.Assert(approved == body.value("step_index", -1L), "the read mixed two moments: step_index %d with %d approved step(s) in %s. Read the state in one command", body.value("step_index", -1L), approved, body["steps"].dump());
   const auto after = readGet(ctx, c);
   ctx.Assert(after.value("step_index", -1L) == 1 && after["steps"][0].value("state", "") == "approved", "after the approval the trail reads %s", after.dump());
+  // The director approves the last step mid-read: status, step_index and steps must still agree.
+  auto last = std::make_shared<std::string>();
+  ctx.Redis.After("approval:r-1:state", [last] { *last = chain::advance("r-1", 1, "u-dir", "approved").status; });
+  const auto closing = readGet(ctx, c);
+  ctx.Equal(*last, std::string("approved"), "the director's approval during the read; its status");
+  long finalApproved = 0;
+  for (const auto& s : closing["steps"]) finalApproved += s.value("state", "") == "approved" ? 1 : 0;
+  const long finalIndex = closing.value("step_index", -1L);
+  const std::string finalStatus = finalIndex == 2 ? "approved" : "pending";
+  ctx.Assert(finalApproved == finalIndex && closing.value("status", "") == finalStatus, "the read mixed two moments: status %s, step_index %d, %d approved step(s). Read the state in one command", closing.value("status", ""), finalIndex, finalApproved);
 }
 
 void CheckNoStore(harness::Ctx& ctx) {

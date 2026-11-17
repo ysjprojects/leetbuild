@@ -99,7 +99,7 @@ service Verification {
       id: 'hard-bounce',
       title: 'A hard bounce suppresses the address',
       detail:
-        '`INVALID_ARGUMENT` from `SendVerification` is a hard bounce: `suppress` the account and answer `"suppressed"` without queueing a retry; the starter treats it like any failure and retries the dead mailbox.',
+        '`INVALID_ARGUMENT` from `SendVerification` is a hard bounce: `suppress` the account and answer `"suppressed"` without queueing a retry. It is the only terminal code: any other, a rate limit (`RESOURCE_EXHAUSTED`) included, is queued. The starter treats a bounce like any failure and retries the dead mailbox.',
       match: {
         python: {all: [/INVALID_ARGUMENT/, /accounts\.suppress\(/]},
         typescript: {all: [/INVALID_ARGUMENT/, /\bsuppress\(/]},
@@ -112,7 +112,7 @@ service Verification {
       id: 'confirm-only',
       title: 'Only a confirmed token verifies the account',
       detail:
-        'Sending writes no status; `confirm_verification` sets `verified` only when the `ConfirmReply` says `confirmed`. The starter marks the account verified when the mail goes out, when the provider is down, and for any token.',
+        'Sending writes no status and queues nothing; `confirm_verification` sets `verified` only when the `ConfirmReply` says `confirmed`. The starter marks the account verified when the mail goes out, when the provider is down, and for any token.',
       match: {
         python: {
           order: [/def confirm_verification/, /\.confirmed/, /set_status\([^\n]*["']verified["']/],
@@ -620,12 +620,19 @@ def check_hard_bounce(ctx):
     assert accounts.pending_retries() == [], f"a hard bounce was queued for retry: {accounts.pending_retries()}"
     calls = len(ctx.grpc.calls_to("SendVerification"))
     assert calls == 1, f"the bounced address was mailed {calls} times: a hard bounce is terminal"
+    # Only INVALID_ARGUMENT is a hard bounce: a rate limit is transient.
+    ctx.grpc.fail("SendVerification", grpc.StatusCode.RESOURCE_EXHAUSTED, "slow down", times=1)
+    outcome = m.send_verification("u-1")
+    assert outcome == "queued", f"RESOURCE_EXHAUSTED answered {outcome!r}, expected queued: only INVALID_ARGUMENT is a hard bounce"
+    assert _status("u-1") == "unverified" and not accounts.is_suppressed("ada@example.com"), f"a rate limit left the account {_status('u-1')} (suppression list: {accounts.is_suppressed('ada@example.com')}): only INVALID_ARGUMENT suppresses"
+    assert accounts.pending_retries() == ["u-1"], f"after RESOURCE_EXHAUSTED the retry queue holds {accounts.pending_retries()}, expected u-1"
 
 
 def check_confirm_only(ctx):
     m = _client(ctx)
     assert m.send_verification("u-1") == "sent", "with a healthy provider send_verification must answer sent"
     assert _status("u-1") == "unverified", f"the link was only sent and the account is {_status('u-1')}: sending proves nothing, a confirmed token does"
+    assert accounts.pending_retries() == [], f"a mail that went out was queued for retry: {accounts.pending_retries()}. Only a transient failure queues"
     assert m.confirm_verification("u-1", "tok-u-2") is False, "a token the provider does not confirm must answer False"
     assert _status("u-1") == "unverified", f"a token the provider rejected left the account {_status('u-1')}"
     assert m.confirm_verification("u-1", "tok-u-1") is True, "the confirmed token must answer True"
@@ -691,12 +698,20 @@ export async function check_hard_bounce(ctx) {
   assert.deepStrictEqual(await accounts.pendingRetries(), [], 'a hard bounce was queued for retry');
   const calls = ctx.grpc.callsTo('SendVerification').length;
   assert.equal(calls, 1, \`the bounced address was mailed \${calls} times: a hard bounce is terminal\`);
+  // Only INVALID_ARGUMENT is a hard bounce: a rate limit is transient.
+  ctx.grpc.fail('SendVerification', ctx.grpc.status.RESOURCE_EXHAUSTED, 'slow down', 1);
+  const limited = await m.sendVerification('u-1');
+  assert.equal(limited, 'queued', \`RESOURCE_EXHAUSTED answered \${JSON.stringify(limited)}, expected queued: only INVALID_ARGUMENT is a hard bounce\`);
+  const suppressed = await accounts.isSuppressed('ada@example.com');
+  assert(!suppressed && (await status('u-1')) === 'unverified', \`a rate limit left the account \${await status('u-1')} (suppression list: \${suppressed}): only INVALID_ARGUMENT suppresses\`);
+  assert.deepStrictEqual(await accounts.pendingRetries(), ['u-1'], \`after RESOURCE_EXHAUSTED the retry queue holds \${JSON.stringify(await accounts.pendingRetries())}, expected u-1\`);
 }
 
 export async function check_confirm_only(ctx) {
-  const {m, status} = await client(ctx);
+  const {m, accounts, status} = await client(ctx);
   assert.equal(await m.sendVerification('u-1'), 'sent', 'with a healthy provider sendVerification must answer sent');
   assert.equal(await status('u-1'), 'unverified', \`the link was only sent and the account is \${await status('u-1')}: sending proves nothing, a confirmed token does\`);
+  assert.deepStrictEqual(await accounts.pendingRetries(), [], \`a mail that went out was queued for retry: \${JSON.stringify(await accounts.pendingRetries())}. Only a transient failure queues\`);
   assert.equal(await m.confirmVerification('u-1', 'tok-u-2'), false, 'a token the provider does not confirm must answer false');
   assert.equal(await status('u-1'), 'unverified', 'a token the provider rejected must leave the account unverified');
   assert.equal(await m.confirmVerification('u-1', 'tok-u-1'), true, 'the confirmed token must answer true');
@@ -719,54 +734,54 @@ import (
 	"leetbuild/harness"
 )
 
-var verifyBg = context.Background()
+var harnessBg = context.Background()
 
-// provider mails every address but those at bounce.test (a hard bounce); tok-<user_id> is the token that proves an address.
-type provider struct {
+// harnessProvider mails every address but those at bounce.test (a hard bounce); tok-<user_id> is the token that proves an address.
+type harnessProvider struct {
 	pb.UnimplementedVerificationServer
 }
 
-func (provider) SendVerification(_ context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
+func (harnessProvider) SendVerification(_ context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
 	if strings.HasSuffix(req.GetEmail(), "@bounce.test") {
 		return nil, status.Errorf(codes.InvalidArgument, "hard bounce: %s does not exist", req.GetEmail())
 	}
 	return &pb.SendReply{MessageId: "m-" + req.GetUserId()}, nil
 }
 
-func (provider) ConfirmVerification(_ context.Context, req *pb.ConfirmRequest) (*pb.ConfirmReply, error) {
+func (harnessProvider) ConfirmVerification(_ context.Context, req *pb.ConfirmRequest) (*pb.ConfirmReply, error) {
 	return &pb.ConfirmReply{Confirmed: req.GetToken() == "tok-"+req.GetUserId()}, nil
 }
 
-func setup(ctx *harness.Ctx) {
-	pb.RegisterVerificationServer(ctx.GRPC.Server(""), provider{})
+func harnessSetup(ctx *harness.Ctx) {
+	pb.RegisterVerificationServer(ctx.GRPC.Server(""), harnessProvider{})
 	for _, a := range [][3]string{{"u-1", "ada@example.com", "+442079460958"}, {"u-2", "nobody@bounce.test", "+15550100200"}} {
-		_, err := accounts.CreateAccount(verifyBg, a[0], a[1], a[2], "Ada")
+		_, err := accounts.CreateAccount(harnessBg, a[0], a[1], a[2], "Ada")
 		ctx.NoError(err, "CreateAccount(%s) failed", a[0])
 	}
 }
 
-func statusOf(ctx *harness.Ctx, userID string) string {
-	a, err := accounts.GetAccount(verifyBg, userID)
+func harnessStatus(ctx *harness.Ctx, userID string) string {
+	a, err := accounts.GetAccount(harnessBg, userID)
 	ctx.NoError(err, "GetAccount(%s) failed", userID)
 	return a.Status
 }
 
-func mustSend(ctx *harness.Ctx, userID string) string {
-	outcome, err := sendVerification(verifyBg, userID)
+func harnessSend(ctx *harness.Ctx, userID string) string {
+	outcome, err := sendVerification(harnessBg, userID)
 	ctx.NoError(err, "sendVerification(%s) failed", userID)
 	return outcome
 }
 
-func mustConfirm(ctx *harness.Ctx, userID, token string) bool {
-	ok, err := confirmVerification(verifyBg, userID, token)
+func harnessConfirm(ctx *harness.Ctx, userID, token string) bool {
+	ok, err := confirmVerification(harnessBg, userID, token)
 	ctx.NoError(err, "confirmVerification(%s, %s) failed", userID, token)
 	return ok
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	setup(ctx)
-	ctx.Equal(mustSend(ctx, "u-1"), "sent", "with a healthy provider sendVerification must answer sent")
-	ctx.Equal(mustConfirm(ctx, "u-1", "tok-u-1"), true, "the right token must verify the account")
+	harnessSetup(ctx)
+	ctx.Equal(harnessSend(ctx, "u-1"), "sent", "with a healthy provider sendVerification must answer sent")
+	ctx.Equal(harnessConfirm(ctx, "u-1", "tok-u-1"), true, "the right token must verify the account")
 	for _, method := range []string{"SendVerification", "ConfirmVerification"} {
 		calls := ctx.GRPC.CallsTo(method, "")
 		ctx.Assert(len(calls) > 0, "no %s call was made", method)
@@ -775,43 +790,49 @@ func CheckDeadline(ctx *harness.Ctx) {
 			ctx.Assert(2500*time.Millisecond <= call.Timeout && call.Timeout <= 3500*time.Millisecond, "a %s call carries a %v deadline, expected 3 s", method, call.Timeout)
 		}
 	}
-	_, err := accounts.CreateAccount(verifyBg, "u-3", "bo@example.com", "+15550100300", "Bo")
+	_, err := accounts.CreateAccount(harnessBg, "u-3", "bo@example.com", "+15550100300", "Bo")
 	ctx.NoError(err, "CreateAccount(u-3) failed")
 	ctx.GRPC.SetLatency("SendVerification", 10.0, "")
 	before := len(ctx.GRPC.CallsTo("SendVerification", ""))
-	ctx.Equal(mustSend(ctx, "u-3"), "queued", "with the provider slower than the deadline, sendVerification's answer")
+	ctx.Equal(harnessSend(ctx, "u-3"), "queued", "with the provider slower than the deadline, sendVerification's answer")
 	ctx.Equal(len(ctx.GRPC.CallsTo("SendVerification", "")), before+1, "a deadline is queued for later, not retried in place; the calls")
 }
 
 func CheckTimeoutQueues(ctx *harness.Ctx) {
-	setup(ctx)
+	harnessSetup(ctx)
 	ctx.GRPC.Fail("SendVerification", codes.Unavailable, "provider down", 5, "")
-	outcome := mustSend(ctx, "u-1")
-	ctx.Equal(statusOf(ctx, "u-1"), "unverified", "the provider was down, so nobody proved they own ada@example.com; the account's status")
+	outcome := harnessSend(ctx, "u-1")
+	ctx.Equal(harnessStatus(ctx, "u-1"), "unverified", "the provider was down, so nobody proved they own ada@example.com; the account's status")
 	ctx.Equal(outcome, "queued", "during an outage, sendVerification's answer")
-	ctx.Equal(accounts.PendingRetries(verifyBg), []string{"u-1"}, "the retry queue")
+	ctx.Equal(accounts.PendingRetries(harnessBg), []string{"u-1"}, "the retry queue")
 	calls := len(ctx.GRPC.CallsTo("SendVerification", ""))
 	ctx.Assert(calls == 1 && ctx.Clock.Sleeps() == 0, "the outage was retried in place (%d calls, %d sleeps): the signup waits on it. Queue the retry and answer", calls, ctx.Clock.Sleeps())
 }
 
 func CheckHardBounce(ctx *harness.Ctx) {
-	setup(ctx)
-	outcome := mustSend(ctx, "u-2")
-	ctx.Equal(statusOf(ctx, "u-2"), "suppressed", "after a hard bounce, the account's status")
-	ctx.Assert(accounts.IsSuppressed(verifyBg, "nobody@bounce.test"), "the bounced address is not on the suppression list")
+	harnessSetup(ctx)
+	outcome := harnessSend(ctx, "u-2")
+	ctx.Equal(harnessStatus(ctx, "u-2"), "suppressed", "after a hard bounce, the account's status")
+	ctx.Assert(accounts.IsSuppressed(harnessBg, "nobody@bounce.test"), "the bounced address is not on the suppression list")
 	ctx.Equal(outcome, "suppressed", "a hard bounce's answer")
-	ctx.Equal(len(accounts.PendingRetries(verifyBg)), 0, "a hard bounce must not be queued for retry; the queue holds %v", accounts.PendingRetries(verifyBg))
+	ctx.Equal(len(accounts.PendingRetries(harnessBg)), 0, "a hard bounce must not be queued for retry; the queue holds %v", accounts.PendingRetries(harnessBg))
 	ctx.Equal(len(ctx.GRPC.CallsTo("SendVerification", "")), 1, "a hard bounce is terminal; the mails sent to the bounced address")
+	// Only InvalidArgument is a hard bounce: a rate limit is transient.
+	ctx.GRPC.Fail("SendVerification", codes.ResourceExhausted, "slow down", 1, "")
+	ctx.Equal(harnessSend(ctx, "u-1"), "queued", "ResourceExhausted is transient (only InvalidArgument is a hard bounce); sendVerification's answer")
+	ctx.Assert(harnessStatus(ctx, "u-1") == "unverified" && !accounts.IsSuppressed(harnessBg, "ada@example.com"), "a rate limit left the account %s (suppression list: %v): only InvalidArgument suppresses", harnessStatus(ctx, "u-1"), accounts.IsSuppressed(harnessBg, "ada@example.com"))
+	ctx.Equal(accounts.PendingRetries(harnessBg), []string{"u-1"}, "after ResourceExhausted, the retry queue")
 }
 
 func CheckConfirmOnly(ctx *harness.Ctx) {
-	setup(ctx)
-	ctx.Equal(mustSend(ctx, "u-1"), "sent", "with a healthy provider sendVerification must answer sent")
-	ctx.Equal(statusOf(ctx, "u-1"), "unverified", "the link was only sent (sending proves nothing, a confirmed token does); the account's status")
-	ctx.Equal(mustConfirm(ctx, "u-1", "tok-u-2"), false, "a token the provider does not confirm")
-	ctx.Equal(statusOf(ctx, "u-1"), "unverified", "after a token the provider rejected, the account's status")
-	ctx.Equal(mustConfirm(ctx, "u-1", "tok-u-1"), true, "the confirmed token")
-	ctx.Equal(statusOf(ctx, "u-1"), "verified", "after a confirmed token, the account's status")
+	harnessSetup(ctx)
+	ctx.Equal(harnessSend(ctx, "u-1"), "sent", "with a healthy provider sendVerification must answer sent")
+	ctx.Equal(harnessStatus(ctx, "u-1"), "unverified", "the link was only sent (sending proves nothing, a confirmed token does); the account's status")
+	ctx.Equal(len(accounts.PendingRetries(harnessBg)), 0, "a mail that went out must not be queued for retry (only a transient failure queues); the queue holds %v", accounts.PendingRetries(harnessBg))
+	ctx.Equal(harnessConfirm(ctx, "u-1", "tok-u-2"), false, "a token the provider does not confirm")
+	ctx.Equal(harnessStatus(ctx, "u-1"), "unverified", "after a token the provider rejected, the account's status")
+	ctx.Equal(harnessConfirm(ctx, "u-1", "tok-u-1"), true, "the confirmed token")
+	ctx.Equal(harnessStatus(ctx, "u-1"), "verified", "after a confirmed token, the account's status")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -825,7 +846,7 @@ func CheckConfirmOnly(ctx *harness.Ctx) {
 namespace {
 
 // Mails every address but those at bounce.test (a hard bounce); tok-<user_id> is the token that proves an address.
-class ProviderPeer final : public idverify::Verification::Service {
+class HarnessProviderPeer final : public idverify::Verification::Service {
  public:
   grpc::Status SendVerification(grpc::ServerContext*, const idverify::SendRequest* req, idverify::SendReply* out) override {
     const std::string& email = req->email();
@@ -841,21 +862,21 @@ class ProviderPeer final : public idverify::Verification::Service {
   }
 };
 
-void setup(harness::Ctx& ctx) {
-  static ProviderPeer* peer = nullptr;
+void harnessSetup(harness::Ctx& ctx) {
+  static HarnessProviderPeer* peer = nullptr;
   delete peer;
-  peer = new ProviderPeer;
+  peer = new HarnessProviderPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   accounts::createAccount("u-1", "ada@example.com", "+442079460958", "Ada");
   accounts::createAccount("u-2", "nobody@bounce.test", "+15550100200", "Nobody");
 }
 
-std::string statusOf(const std::string& user_id) { return accounts::getAccount(user_id)->status; }
+std::string harnessStatus(const std::string& user_id) { return accounts::getAccount(user_id)->status; }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  setup(ctx);
+  harnessSetup(ctx);
   ctx.Equal(sendVerification("u-1"), "sent", "with a healthy provider sendVerification must answer sent");
   ctx.Equal(confirmVerification("u-1", "tok-u-1"), true, "the right token must verify the account");
   for (const std::string method : {"SendVerification", "ConfirmVerification"}) {
@@ -874,10 +895,10 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckTimeoutQueues(harness::Ctx& ctx) {
-  setup(ctx);
+  harnessSetup(ctx);
   ctx.GRPC.Fail("SendVerification", grpc::StatusCode::UNAVAILABLE, "provider down", 5);
   const std::string outcome = sendVerification("u-1");
-  ctx.Equal(statusOf("u-1"), "unverified", "the provider was down, so nobody proved they own ada@example.com; the account's status");
+  ctx.Equal(harnessStatus("u-1"), "unverified", "the provider was down, so nobody proved they own ada@example.com; the account's status");
   ctx.Equal(outcome, "queued", "during an outage, sendVerification's answer");
   ctx.Equal(accounts::pendingRetries(), std::vector<std::string>{"u-1"}, "the retry queue");
   const size_t calls = ctx.GRPC.CallsTo("SendVerification").size();
@@ -885,23 +906,29 @@ void CheckTimeoutQueues(harness::Ctx& ctx) {
 }
 
 void CheckHardBounce(harness::Ctx& ctx) {
-  setup(ctx);
+  harnessSetup(ctx);
   const std::string outcome = sendVerification("u-2");
-  ctx.Equal(statusOf("u-2"), "suppressed", "after a hard bounce, the account's status");
+  ctx.Equal(harnessStatus("u-2"), "suppressed", "after a hard bounce, the account's status");
   ctx.Assert(accounts::isSuppressed("nobody@bounce.test"), "the bounced address is not on the suppression list");
   ctx.Equal(outcome, "suppressed", "a hard bounce's answer");
   ctx.Assert(accounts::pendingRetries().empty(), "a hard bounce must not be queued for retry; the queue holds %v", accounts::pendingRetries());
   ctx.Equal(ctx.GRPC.CallsTo("SendVerification").size(), 1, "a hard bounce is terminal; the mails sent to the bounced address");
+  // Only INVALID_ARGUMENT is a hard bounce: a rate limit is transient.
+  ctx.GRPC.Fail("SendVerification", grpc::StatusCode::RESOURCE_EXHAUSTED, "slow down", 1);
+  ctx.Equal(sendVerification("u-1"), "queued", "RESOURCE_EXHAUSTED is transient (only INVALID_ARGUMENT is a hard bounce); sendVerification's answer");
+  ctx.Assert(harnessStatus("u-1") == "unverified" && !accounts::isSuppressed("ada@example.com"), "a rate limit left the account %s (suppression list: %t): only INVALID_ARGUMENT suppresses", harnessStatus("u-1"), accounts::isSuppressed("ada@example.com"));
+  ctx.Equal(accounts::pendingRetries(), std::vector<std::string>{"u-1"}, "after RESOURCE_EXHAUSTED, the retry queue");
 }
 
 void CheckConfirmOnly(harness::Ctx& ctx) {
-  setup(ctx);
+  harnessSetup(ctx);
   ctx.Equal(sendVerification("u-1"), "sent", "with a healthy provider sendVerification must answer sent");
-  ctx.Equal(statusOf("u-1"), "unverified", "the link was only sent (sending proves nothing, a confirmed token does); the account's status");
+  ctx.Equal(harnessStatus("u-1"), "unverified", "the link was only sent (sending proves nothing, a confirmed token does); the account's status");
+  ctx.Assert(accounts::pendingRetries().empty(), "a mail that went out must not be queued for retry (only a transient failure queues); the queue holds %v", accounts::pendingRetries());
   ctx.Equal(confirmVerification("u-1", "tok-u-2"), false, "a token the provider does not confirm");
-  ctx.Equal(statusOf("u-1"), "unverified", "after a token the provider rejected, the account's status");
+  ctx.Equal(harnessStatus("u-1"), "unverified", "after a token the provider rejected, the account's status");
   ctx.Equal(confirmVerification("u-1", "tok-u-1"), true, "the confirmed token");
-  ctx.Equal(statusOf("u-1"), "verified", "after a confirmed token, the account's status");
+  ctx.Equal(harnessStatus("u-1"), "verified", "after a confirmed token, the account's status");
 }
 `,
   },

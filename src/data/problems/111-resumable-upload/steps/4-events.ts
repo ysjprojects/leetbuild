@@ -62,7 +62,7 @@ local errors; a retry after a lost acknowledgement writes the event twice.
       id: 'after-commit',
       title: 'Commits the object before producing the event',
       detail:
-        '`CommitObject` and `mark_complete` run before the produce, and a failed commit produces nothing; the starter produces first, so a consumer can fetch an object that does not exist.',
+        '`CommitObject` and `mark_complete` run before the produce, so a consumer that reads the upload finds it committed and complete, and a failed commit produces nothing; the starter produces first, so a consumer can fetch an object that does not exist.',
       match: {
         python: {order: [/\.CommitObject\(/, /store\.mark_complete\(/, /producer\.produce\(/]},
         typescript: {order: [/\.CommitObject\(/, /markComplete\(/, /producer\.send\(/]},
@@ -75,7 +75,7 @@ local errors; a retry after a lost acknowledgement writes the event twice.
       id: 'outbox',
       title: 'Writes the outbox row from the delivery report',
       detail:
-        'The delivery report decides (`on_delivery` and `flush`, an awaited `send`, the delivery channel, `send(...).get`, `dr_cb`): a refused or unacknowledged record leaves an outbox row and the call returns false. The starter catches only the exception `produce` raises for local errors.',
+        'The delivery report decides (`on_delivery` and `flush`, an awaited `send`, the delivery channel, `send(...).get`, `dr_cb`): a refused record, or no report within `ACK_TIMEOUT_S` (2 s) from a broker that does not answer, leaves an outbox row and the call returns false. The starter catches only the exception `produce` raises for local errors.',
       match: {
         python: {
           all: [/on_delivery\s*=|callback\s*=/, /store\.insert_outbox\(/, /producer\.flush\(/],
@@ -784,14 +784,18 @@ TOPIC = "upload.event"
 
 
 class Objects(resumable_upload_pb2_grpc.ObjectStoreServicer):
-    """Commits what it is asked to, and notes how many upload.event records existed at that moment."""
+    """Commits what it is asked to, and notes how many upload.event records existed at that moment and when the upload was next written."""
 
     def __init__(self, ctx):
         self.ctx = ctx
         self.commits = []
+        self.marked = None
 
     def CommitObject(self, request, context):
         self.commits.append((request, len(self.ctx.kafka.records(TOPIC))))
+        if self.marked is None:
+            # The next command on the upload record after the commit: mark_complete, before any produce.
+            self.marked = self.ctx.redis_after(f"upload:{request.upload_id}", lambda: len(self.ctx.kafka.records(TOPIC)))
         return pb.CommitReply(object_key=f"objects/{request.upload_id}", size=10)
 
 
@@ -838,6 +842,8 @@ def check_after_commit(ctx):
     assert [(p.part_number, p.checksum) for p in request.parts] == [(1, "c1"), (2, "c2"), (3, "c3")], f"CommitObject listed {[(p.part_number, p.checksum) for p in request.parts]}, expected the registered parts in order"
     assert len(ctx.kafka.records(TOPIC)) == 1, "the completion must still be produced after the commit"
     assert store.get_upload("u-1")["status"] == "complete", "a committed upload must be marked complete"
+    assert objects.marked is not None and objects.marked.fired, "complete_upload never wrote the upload record after CommitObject: mark_complete marks it complete"
+    assert objects.marked.result == 0, f"u-1 was marked complete only once upload.event held {objects.marked.result} record(s): mark_complete comes before the produce, so a consumer that reads the upload finds it complete"
     ctx.grpc.fail("CommitObject", grpc.StatusCode.UNAVAILABLE, "store node down")
     try:
         m.complete_upload("u-2")
@@ -850,7 +856,7 @@ def check_after_commit(ctx):
 
 
 def check_outbox(ctx):
-    m, _ = _events(ctx)
+    m, _ = _events(ctx, 2)
     ctx.kafka.fail_next(TOPIC, 1)
     ok = _complete(m, "u-1", "with the broker refusing the record")
     rows = _outbox(ctx)
@@ -858,6 +864,14 @@ def check_outbox(ctx):
     assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "u-1" and rows[0].get("payload", {}).get("upload_id") == "u-1", f"the outbox row is {rows[0]}, expected the topic, the key u-1 and the payload"
     assert ok is False, f"complete_upload returned {ok!r} after a refused record, expected False"
     assert store.get_upload("u-1")["status"] == "complete", "the object committed: the upload stays complete when only the event failed"
+    ctx.kafka.stall(TOPIC)  # the broker stops answering: no delivery report arrives
+    before = ctx.clock.time()
+    ok = _complete(m, "u-2", "with the broker not answering")
+    waited = ctx.clock.time() - before
+    rows = _outbox(ctx)
+    assert waited <= 2.5, f"complete_upload waited {waited:.1f} s for a broker that does not answer: the delivery report gets ACK_TIMEOUT_S (2 s)"
+    assert len(rows) == 2 and rows[1].get("key") == "u-2" and rows[1].get("payload", {}).get("upload_id") == "u-2", f"no delivery report came for u-2 and the outbox holds {rows}: a record the broker never acknowledged leaves an outbox row"
+    assert ok is False, f"complete_upload returned {ok!r} with no delivery report, expected False"
 
 
 def check_acks_idempotent(ctx):
@@ -878,13 +892,16 @@ const settle = (): Promise<void> => {
   return promise;
 };
 
-/** Uploads u-1..u-n of tenant t1, each with its three parts (4, 4 and 2 bytes) registered; the store notes the records at each commit. */
+/** Uploads u-1..u-n of tenant t1, each with its three parts (4, 4 and 2 bytes) registered; the store notes the records at each commit and when the upload is next written. */
 async function events(ctx, uploads = 1) {
   const pkg = ctx.proto('resumable_upload.proto');
   const commits: {parts: [number, string][]; recordsThen: number}[] = [];
+  const marked = {probe: null};
   ctx.grpc.serve(pkg.uploadd.ObjectStore.service, {
     CommitObject(call, callback) {
       commits.push({parts: call.request.parts.map(p => [Number(p.part_number), p.checksum]), recordsThen: ctx.kafka.records(TOPIC).length});
+      // The next command on the upload record after the commit: markComplete, before any produce.
+      if (marked.probe === null) marked.probe = ctx.redisAfter(\`upload:\${call.request.upload_id}\`, () => ctx.kafka.records(TOPIC).length);
       callback(null, {object_key: \`objects/\${call.request.upload_id}\`, size: 10});
     },
   });
@@ -894,7 +911,7 @@ async function events(ctx, uploads = 1) {
     const {upload_id} = await store.createUpload('t1', 10, 4, 3, 'video/mp4');
     for (const [n, size] of [[1, 4], [2, 4], [3, 2]]) await manifest.registerPart(upload_id, n, 3, size, \`c\${n}\`);
   }
-  return {m: ctx.load('events'), commits, store};
+  return {m: ctx.load('events'), commits, store, marked};
 }
 
 async function complete(m, uploadId: string, why: string) {
@@ -921,7 +938,7 @@ export async function check_upload_key(ctx) {
 }
 
 export async function check_after_commit(ctx) {
-  const {m, commits, store} = await events(ctx, 2);
+  const {m, commits, store, marked} = await events(ctx, 2);
   await complete(m, 'u-1', 'with a healthy store');
   await settle();
   assert(commits.length > 0, 'completeUpload never called CommitObject');
@@ -929,6 +946,9 @@ export async function check_after_commit(ctx) {
   assert.deepStrictEqual(commits[0].parts, [[1, 'c1'], [2, 'c2'], [3, 'c3']], \`CommitObject listed \${JSON.stringify(commits[0].parts)}, expected the registered parts in order\`);
   assert.equal(ctx.kafka.records(TOPIC).length, 1, 'the completion must still be produced after the commit');
   assert.equal((await store.getUpload('u-1')).status, 'complete', 'a committed upload must be marked complete');
+  assert(marked.probe !== null && marked.probe.fired, 'completeUpload never wrote the upload record after CommitObject: markComplete marks it complete');
+  const recordsThen = await marked.probe.result;
+  assert.equal(recordsThen, 0, \`u-1 was marked complete only once upload.event held \${recordsThen} record(s): markComplete comes before the produce, so a consumer that reads the upload finds it complete\`);
   ctx.grpc.fail('CommitObject', ctx.grpc.status.UNAVAILABLE, 'store node down', 1);
   let raised = false;
   try {
@@ -943,7 +963,7 @@ export async function check_after_commit(ctx) {
 }
 
 export async function check_outbox(ctx) {
-  const {m, store} = await events(ctx);
+  const {m, store} = await events(ctx, 2);
   ctx.kafka.failNext(TOPIC, 1);
   const ok = await complete(m, 'u-1', 'with the broker refusing the record');
   await settle();
@@ -952,6 +972,14 @@ export async function check_outbox(ctx) {
   assert(rows[0].topic === TOPIC && rows[0].key === 'u-1' && rows[0].payload?.upload_id === 'u-1', \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key u-1 and the payload\`);
   assert.equal(ok, false, \`completeUpload resolved \${JSON.stringify(ok)} after a refused record, expected false\`);
   assert.equal((await store.getUpload('u-1')).status, 'complete', 'the object committed: the upload stays complete when only the event failed');
+  ctx.kafka.stall(TOPIC); // the broker stops answering: no delivery report arrives
+  const before = ctx.clock.now();
+  const unanswered = await complete(m, 'u-2', 'with the broker not answering');
+  const waited = (ctx.clock.now() - before) / 1000;
+  const after = outboxRows(ctx);
+  assert(waited <= 2.5, \`completeUpload waited \${waited.toFixed(1)} s for a broker that does not answer: the delivery report gets ACK_TIMEOUT_MS (2 s)\`);
+  assert(after.length === 2 && after[1].key === 'u-2' && after[1].payload?.upload_id === 'u-2', \`no delivery report came for u-2 and the outbox holds \${JSON.stringify(after)}: a record the broker never acknowledged leaves an outbox row\`);
+  assert.equal(unanswered, false, \`completeUpload resolved \${JSON.stringify(unanswered)} with no delivery report, expected false\`);
 }
 
 export async function check_acks_idempotent(ctx) {
@@ -982,59 +1010,71 @@ import (
 	"leetbuild/harness"
 )
 
-var eventsBg = context.Background()
+var hEventsBg = context.Background()
 
-type commitSeen struct {
+type hCommitSeen struct {
 	parts       []string
 	recordsThen int
 }
 
-// objectsPeer commits what it is asked to, and notes how many upload.event records existed at that moment.
-type objectsPeer struct {
+// hObjectsPeer commits what it is asked to, and notes how many upload.event records existed at that moment.
+type hObjectsPeer struct {
 	pb.UnimplementedObjectStoreServer
 	ctx     *harness.Ctx
-	commits []commitSeen
+	commits []hCommitSeen
+	// markSet: the probe on the upload record is set; marked, markedRecords: it fired, and the records then.
+	markSet       bool
+	marked        bool
+	markedRecords int
 }
 
-func (o *objectsPeer) CommitObject(_ context.Context, req *pb.CommitRequest) (*pb.CommitReply, error) {
+func (o *hObjectsPeer) CommitObject(_ context.Context, req *pb.CommitRequest) (*pb.CommitReply, error) {
 	var parts []string
 	for _, p := range req.GetParts() {
 		parts = append(parts, fmt.Sprintf("%d:%s", p.GetPartNumber(), p.GetChecksum()))
 	}
-	o.commits = append(o.commits, commitSeen{parts: parts, recordsThen: len(o.ctx.Kafka.Records(topic))})
+	o.commits = append(o.commits, hCommitSeen{parts: parts, recordsThen: len(o.ctx.Kafka.Records(topic))})
+	if !o.markSet {
+		// The next command on the upload record after the commit: MarkComplete, before any produce.
+		o.markSet = true
+		o.ctx.Redis.After("upload:"+req.GetUploadId(), func() any {
+			o.marked, o.markedRecords = true, len(o.ctx.Kafka.Records(topic))
+			return nil
+		})
+	}
 	return &pb.CommitReply{ObjectKey: "objects/" + req.GetUploadId(), Size: 10}, nil
 }
 
-// events makes uploads u-1..u-n of tenant t1, each with its three parts (4, 4 and 2 bytes) registered.
-func events(ctx *harness.Ctx, uploads int) *objectsPeer {
-	peer := &objectsPeer{ctx: ctx}
+// hEvents makes uploads u-1..u-n of tenant t1, each with its three parts (4, 4 and 2 bytes) registered.
+func hEvents(ctx *harness.Ctx, uploads int) *hObjectsPeer {
+	peer := &hObjectsPeer{ctx: ctx}
 	pb.RegisterObjectStoreServer(ctx.GRPC.Server(""), peer)
 	for i := 0; i < uploads; i++ {
-		u := store.CreateUpload(eventsBg, "t1", 10, 4, 3, "video/mp4")
+		u := store.CreateUpload(hEventsBg, "t1", 10, 4, 3, "video/mp4")
 		for n, size := range map[int]int64{1: 4, 2: 4, 3: 2} {
-			_, err := manifest.RegisterPart(eventsBg, u.UploadID, n, 3, size, fmt.Sprintf("c%d", n))
+			_, err := manifest.RegisterPart(hEventsBg, u.UploadID, n, 3, size, fmt.Sprintf("c%d", n))
 			ctx.NoError(err, "registering part %d of %s", n, u.UploadID)
 		}
 	}
 	return peer
 }
 
-func complete(ctx *harness.Ctx, uploadID, why string) bool {
-	ok, err := completeUpload(eventsBg, uploadID)
+func hComplete(ctx *harness.Ctx, uploadID, why string) bool {
+	ok, err := completeUpload(hEventsBg, uploadID)
 	ctx.NoError(err, "%s: completeUpload(%s)", why, uploadID)
 	return ok
 }
 
-type outboxRow struct {
+type hOutboxRow struct {
 	Topic   string         \`json:"topic"\`
 	Key     string         \`json:"key"\`
 	Payload map[string]any \`json:"payload"\`
 }
 
-func outbox(ctx *harness.Ctx) []outboxRow {
-	var rows []outboxRow
+func hOutbox(ctx *harness.Ctx) []hOutboxRow {
+	var rows []hOutboxRow
 	for _, text := range ctx.Redis.LRange("outbox", 0, -1) {
-		var row outboxRow
+		var row hOutboxRow
 		ctx.NoError(json.Unmarshal([]byte(text), &row), "an outbox row must be JSON with topic, key and payload")
 		rows = append(rows, row)
 	}
@@ -1042,9 +1082,9 @@ func outbox(ctx *harness.Ctx) []outboxRow {
 }
 
 func CheckUploadKey(ctx *harness.Ctx) {
-	events(ctx, 2)
-	complete(ctx, "u-1", "completing u-1")
-	complete(ctx, "u-2", "completing u-2")
+	hEvents(ctx, 2)
+	hComplete(ctx, "u-1", "completing u-1")
+	hComplete(ctx, "u-2", "completing u-2")
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "two completions must produce two records on upload.event; the records")
 	ctx.Equal(ctx.Kafka.Keys(topic), []string{"u-1", "u-2"}, "the records must be keyed by the upload ids (without the key a later event of the same upload can land on another partition and overtake this one)")
@@ -1054,41 +1094,51 @@ func CheckUploadKey(ctx *harness.Ctx) {
 }
 
 func CheckAfterCommit(ctx *harness.Ctx) {
-	peer := events(ctx, 2)
-	complete(ctx, "u-1", "with a healthy store")
+	peer := hEvents(ctx, 2)
+	hComplete(ctx, "u-1", "with a healthy store")
 	ctx.Settle()
 	ctx.Assert(len(peer.commits) > 0, "completeUpload never called CommitObject")
 	ctx.Equal(peer.commits[0].recordsThen, 0, "when the object was committed upload.event already held records: a consumer can fetch an object that does not exist yet. Commit first, then produce; the records at commit time")
 	ctx.Equal(peer.commits[0].parts, []string{"1:c1", "2:c2", "3:c3"}, "CommitObject must list the registered parts in order")
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "the completion must still be produced after the commit; the records")
-	ctx.Equal(store.GetUpload(eventsBg, "u-1").Status, "complete", "a committed upload's status")
+	ctx.Equal(store.GetUpload(hEventsBg, "u-1").Status, "complete", "a committed upload's status")
+	ctx.Assert(peer.marked, "completeUpload never wrote the upload record after CommitObject: MarkComplete marks it complete")
+	ctx.Equal(peer.markedRecords, 0, "MarkComplete comes before the produce, so a consumer that reads the upload finds it complete; the upload.event records when u-1 was marked complete")
 	ctx.GRPC.Fail("CommitObject", codes.Unavailable, "store node down", 1, "")
-	_, err := completeUpload(eventsBg, "u-2")
+	_, err := completeUpload(hEventsBg, "u-2")
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "no upload.completed event may be produced for u-2, whose object never committed; the records")
 	ctx.Assert(err != nil, "completeUpload returned no error although CommitObject failed: the caller must learn the upload is not complete")
-	ctx.Equal(store.GetUpload(eventsBg, "u-2").Status, "pending", "u-2's status after a failed commit")
+	ctx.Equal(store.GetUpload(hEventsBg, "u-2").Status, "pending", "u-2's status after a failed commit")
 }
 
 func CheckOutbox(ctx *harness.Ctx) {
-	events(ctx, 1)
+	hEvents(ctx, 2)
 	ctx.Kafka.FailNext(topic, 1)
-	ok := complete(ctx, "u-1", "with the broker refusing the record")
+	ok := hComplete(ctx, "u-1", "with the broker refusing the record")
 	ctx.Settle()
-	rows := outbox(ctx)
+	rows := hOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the broker refused upload.completed: without an outbox row the media pipeline never hears of the upload; the rows")
 	ctx.Assert(rows[0].Topic == topic && rows[0].Key == "u-1" && rows[0].Payload["upload_id"] == "u-1", "the outbox row is %v, expected the topic, the key u-1 and the payload", rows[0])
 	ctx.Equal(ok, false, "completeUpload's result after a refused record")
-	ctx.Equal(store.GetUpload(eventsBg, "u-1").Status, "complete", "the object committed: the upload stays complete when only the event failed; the status")
+	ctx.Equal(store.GetUpload(hEventsBg, "u-1").Status, "complete", "the object committed: the upload stays complete when only the event failed; the status")
+	ctx.Kafka.Stall(topic) // the broker stops answering: no delivery report arrives
+	before := ctx.Clock.Now()
+	unanswered := hComplete(ctx, "u-2", "with the broker not answering")
+	waited := float64(ctx.Clock.Now()-before) / 1000
+	after := hOutbox(ctx)
+	ctx.Assert(waited <= 2.5, "completeUpload waited %.1f s for a broker that does not answer: the delivery report gets ackTimeout (2 s)", waited)
+	ctx.Assert(len(after) == 2 && after[1].Key == "u-2" && after[1].Payload["upload_id"] == "u-2", "no delivery report came for u-2 and the outbox holds %v: a record the broker never acknowledged leaves an outbox row", after)
+	ctx.Equal(unanswered, false, "completeUpload's result with no delivery report")
 }
 
 func CheckAcksIdempotent(ctx *harness.Ctx) {
-	events(ctx, 2)
+	hEvents(ctx, 2)
 	ctx.Kafka.LoseAcks(topic, 1) // the broker wrote it, the acknowledgement never arrived
-	complete(ctx, "u-1", "with one acknowledgement lost")
+	hComplete(ctx, "u-1", "with one acknowledgement lost")
 	ctx.Settle()
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	complete(ctx, "u-2", "completing u-2")
+	hComplete(ctx, "u-2", "completing u-2")
 	ctx.Settle()
 	ctx.Kafka.Failover(topic) // the partition leader dies right after acknowledging
 	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records")
@@ -1098,6 +1148,7 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 
 #include <nlohmann/json.hpp>
 
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -1107,21 +1158,28 @@ func CheckAcksIdempotent(ctx *harness.Ctx) {
 
 namespace {
 
-struct CommitSeen {
+struct HCommitSeen {
   std::vector<std::string> parts;
   size_t records_then = 0;
 };
 
 // Commits what it is asked to, and notes how many upload.event records existed at that moment.
-class ObjectsPeer final : public uploadd::ObjectStore::Service {
+class HObjectsPeer final : public uploadd::ObjectStore::Service {
  public:
-  explicit ObjectsPeer(harness::Ctx& ctx) : ctx_(ctx) {}
-  std::vector<CommitSeen> commits;
+  explicit HObjectsPeer(harness::Ctx& ctx) : ctx_(ctx) {}
+  std::vector<HCommitSeen> commits;
+  // The upload.event records when the upload record was next written after the commit; -1: not yet.
+  std::shared_ptr<long long> marked = std::make_shared<long long>(-1);
   grpc::Status CommitObject(grpc::ServerContext*, const uploadd::CommitRequest* req, uploadd::CommitReply* out) override {
-    CommitSeen seen;
+    HCommitSeen seen;
     for (const auto& p : req->parts()) seen.parts.push_back(std::to_string(p.part_number()) + ":" + p.checksum());
     seen.records_then = ctx_.Kafka.Records(kTopic).size();
     commits.push_back(seen);
+    if (!mark_set_) {
+      // The next command on the upload record after the commit: markComplete, before any produce.
+      mark_set_ = true;
+      ctx_.Redis.After("upload:" + req->upload_id(), [marked = marked, &ctx = ctx_] { *marked = static_cast<long long>(ctx.Kafka.Records(kTopic).size()); });
+    }
     out->set_object_key("objects/" + req->upload_id());
     out->set_size(10);
     return grpc::Status::OK;
@@ -1129,13 +1187,14 @@ class ObjectsPeer final : public uploadd::ObjectStore::Service {
 
  private:
   harness::Ctx& ctx_;
+  bool mark_set_ = false;
 };
 
 // Uploads u-1..u-n of tenant t1, each with its three parts (4, 4 and 2 bytes) registered.
-ObjectsPeer& events(harness::Ctx& ctx, int uploads) {
-  static ObjectsPeer* peer = nullptr;
+HObjectsPeer& hEvents(harness::Ctx& ctx, int uploads) {
+  static HObjectsPeer* peer = nullptr;
   delete peer;
-  peer = new ObjectsPeer(ctx);
+  peer = new HObjectsPeer(ctx);
   ctx.GRPC.Server("")->RegisterService(peer);
   for (int i = 0; i < uploads; i++) {
     const std::string upload_id = store::createUpload("t1", 10, 4, 3, "video/mp4").upload_id;
@@ -1146,7 +1205,7 @@ ObjectsPeer& events(harness::Ctx& ctx, int uploads) {
   return *peer;
 }
 
-bool complete(harness::Ctx& ctx, const std::string& upload_id, const std::string& why) {
+bool hComplete(harness::Ctx& ctx, const std::string& upload_id, const std::string& why) {
   try {
     return completeUpload(upload_id);
   } catch (const std::exception& e) {
@@ -1154,7 +1213,7 @@ bool complete(harness::Ctx& ctx, const std::string& upload_id, const std::string
   }
 }
 
-std::vector<nlohmann::json> outbox(harness::Ctx& ctx) {
+std::vector<nlohmann::json> hOutbox(harness::Ctx& ctx) {
   std::vector<nlohmann::json> rows;
   for (const auto& text : ctx.Redis.LRange("outbox", 0, -1)) {
     const auto row = nlohmann::json::parse(text, nullptr, false);
@@ -1164,27 +1223,27 @@ std::vector<nlohmann::json> outbox(harness::Ctx& ctx) {
   return rows;
 }
 
-std::string field(const nlohmann::json& j, const std::string& name) {
+std::string hField(const nlohmann::json& j, const std::string& name) {
   return j.is_object() && j.contains(name) && j[name].is_string() ? j[name].get<std::string>() : "";
 }
 
 }  // namespace
 
 void CheckUploadKey(harness::Ctx& ctx) {
-  events(ctx, 2);
-  complete(ctx, "u-1", "completing u-1");
-  complete(ctx, "u-2", "completing u-2");
+  hEvents(ctx, 2);
+  hComplete(ctx, "u-1", "completing u-1");
+  hComplete(ctx, "u-2", "completing u-2");
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "two completions must produce two records on upload.event; the records");
   ctx.Equal(ctx.Kafka.Keys(kTopic), {"u-1", "u-2"}, "the records must be keyed by the upload ids (without the key a later event of the same upload can land on another partition and overtake this one)");
   const auto value = nlohmann::json::parse(ctx.Kafka.Values(kTopic)[0], nullptr, false);
-  ctx.Assert(field(value, "type") == "upload.completed" && field(value, "upload_id") == "u-1" && field(value, "tenant") == "t1",
+  ctx.Assert(hField(value, "type") == "upload.completed" && hField(value, "upload_id") == "u-1" && hField(value, "tenant") == "t1",
              "the payload is %s, expected type upload.completed, upload_id u-1, tenant t1", ctx.Kafka.Values(kTopic)[0]);
 }
 
 void CheckAfterCommit(harness::Ctx& ctx) {
-  ObjectsPeer& peer = events(ctx, 2);
-  complete(ctx, "u-1", "with a healthy store");
+  HObjectsPeer& peer = hEvents(ctx, 2);
+  hComplete(ctx, "u-1", "with a healthy store");
   ctx.Settle();
   ctx.Assert(!peer.commits.empty(), "completeUpload never called CommitObject");
   ctx.Equal(peer.commits[0].records_then, 0,
@@ -1192,6 +1251,8 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   ctx.Equal(peer.commits[0].parts, {"1:c1", "2:c2", "3:c3"}, "CommitObject must list the registered parts in order");
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "the completion must still be produced after the commit; the records");
   ctx.Equal(store::getUpload("u-1")->status, "complete", "a committed upload's status");
+  ctx.Assert(*peer.marked >= 0, "completeUpload never wrote the upload record after CommitObject: markComplete marks it complete");
+  ctx.Equal(*peer.marked, 0LL, "markComplete comes before the produce, so a consumer that reads the upload finds it complete; the upload.event records when u-1 was marked complete");
   ctx.GRPC.Fail("CommitObject", grpc::StatusCode::UNAVAILABLE, "store node down", 1);
   bool raised = false;
   try {
@@ -1206,25 +1267,34 @@ void CheckAfterCommit(harness::Ctx& ctx) {
 }
 
 void CheckOutbox(harness::Ctx& ctx) {
-  events(ctx, 1);
+  hEvents(ctx, 2);
   ctx.Kafka.FailNext(kTopic, 1);
-  const bool ok = complete(ctx, "u-1", "with the broker refusing the record");
+  const bool ok = hComplete(ctx, "u-1", "with the broker refusing the record");
   ctx.Settle();
-  const auto rows = outbox(ctx);
+  const auto rows = hOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the broker refused upload.completed: without an outbox row the media pipeline never hears of the upload; the rows");
-  ctx.Assert(field(rows[0], "topic") == kTopic && field(rows[0], "key") == "u-1" && rows[0].contains("payload") && field(rows[0]["payload"], "upload_id") == "u-1",
+  ctx.Assert(hField(rows[0], "topic") == kTopic && hField(rows[0], "key") == "u-1" && rows[0].contains("payload") && hField(rows[0]["payload"], "upload_id") == "u-1",
              "the outbox row is %s, expected the topic, the key u-1 and the payload", rows[0].dump());
   ctx.Equal(ok, false, "completeUpload's result after a refused record");
   ctx.Equal(store::getUpload("u-1")->status, "complete", "the object committed: the upload stays complete when only the event failed; the status");
+  ctx.Kafka.Stall(kTopic);  // the broker stops answering: no delivery report arrives
+  const int64_t before = ctx.Clock.Now();
+  const bool unanswered = hComplete(ctx, "u-2", "with the broker not answering");
+  const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
+  const auto after = hOutbox(ctx);
+  ctx.Assert(waited <= 2.5, "completeUpload waited %.1f s for a broker that does not answer: the delivery report gets kAckTimeoutMs (2 s)", waited);
+  ctx.Assert(after.size() == 2 && hField(after[1], "key") == "u-2" && after[1].contains("payload") && hField(after[1]["payload"], "upload_id") == "u-2",
+             "no delivery report came for u-2 and the outbox holds %d row(s): a record the broker never acknowledged leaves an outbox row", after.size());
+  ctx.Equal(unanswered, false, "completeUpload's result with no delivery report");
 }
 
 void CheckAcksIdempotent(harness::Ctx& ctx) {
-  events(ctx, 2);
+  hEvents(ctx, 2);
   ctx.Kafka.LoseAcks(kTopic, 1);  // the broker wrote it, the acknowledgement never arrived
-  complete(ctx, "u-1", "with one acknowledgement lost");
+  hComplete(ctx, "u-1", "with one acknowledgement lost");
   ctx.Settle();
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records");
-  complete(ctx, "u-2", "completing u-2");
+  hComplete(ctx, "u-2", "completing u-2");
   ctx.Settle();
   ctx.Kafka.Failover(kTopic);  // the partition leader dies right after acknowledging
   ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "a leader failover must not lose a record (acks=all waits for every in-sync replica); the records");

@@ -24,7 +24,7 @@ down consumer makes the gate call the whole fleet again, and a blocked rotation 
 service SecretConsumer { rpc CanReadVersion(CanReadRequest) returns (CanReadReply); }
 \`\`\`
 
-- Every call carries a **\`VERIFY_DEADLINE_S\` = 2 s** deadline.
+- Every call carries its own **\`VERIFY_DEADLINE_S\` = 2 s** deadline, however long the calls before it took.
 - \`verify_consumer\` makes **one** call and answers \`{consumer_id, verified, detail}\`: verified only
   when \`can_read\` is true for exactly \`version_id\`; an error is unverified with its status.
 - \`retire\` proceeds only when there are reports and all are verified; otherwise it calls
@@ -51,7 +51,7 @@ service SecretConsumer { rpc CanReadVersion(CanReadRequest) returns (CanReadRepl
       id: 'verify-deadline',
       title: 'Each verification call carries a 2-second deadline',
       detail:
-        'The deadline is set on the call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) from the 2-second constant; without it one wedged consumer holds the rotation worker for as long as it likes.',
+        'The deadline is set on each call itself (`timeout=`, `deadline:`, `context.WithTimeout`, `withDeadlineAfter`, `set_deadline`) from the 2-second constant, a full 2 s for every call even after a slow consumer; without it one wedged consumer holds the rotation worker for as long as it likes.',
       match: {
         python: {all: [/VERIFY_DEADLINE_S\s*=\s*2\b/, /CanReadVersion\([\s\S]{0,250}?timeout\s*=\s*VERIFY_DEADLINE_S/]},
         typescript: {
@@ -830,13 +830,16 @@ FLEET = ("billing", "checkout", "ledger")
 
 
 class Consumer(secrets_rotation_pb2_grpc.SecretConsumerServicer):
-    """A registered consumer: it can read every version but those after the one it is on (holds)."""
+    """A registered consumer: it can read every version but those after the one it is on (holds); answer, a (version_id, can_read) pair, fixes its reply."""
 
-    def __init__(self, consumer_id, holds="v2"):
+    def __init__(self, consumer_id, holds="v2", answer=None):
         self.consumer_id = consumer_id
         self.holds = holds
+        self.answer = answer
 
     def CanReadVersion(self, request, context):
+        if self.answer is not None:
+            return secrets_rotation_pb2.CanReadReply(consumer_id=self.consumer_id, version_id=self.answer[0], can_read=self.answer[1])
         can = request.version_id <= self.holds
         return secrets_rotation_pb2.CanReadReply(consumer_id=self.consumer_id, version_id=request.version_id if can else self.holds, can_read=can)
 
@@ -869,16 +872,29 @@ def check_verify_deadline(ctx):
     for call in calls:
         assert call.timeout is not None, f"a CanReadVersion call to {call.target} carries no deadline: a wedged consumer holds the rotation worker for as long as it likes"
         assert 1.5 <= call.timeout <= 2.5, f"a CanReadVersion call carries a {call.timeout} s deadline, expected VERIFY_DEADLINE_S = 2"
+    # billing answers after 1.5 s, inside its deadline; every call after it still carries a full 2 s of its own.
+    ctx.grpc.set_latency("CanReadVersion", 1.5, target="billing:9000")
     ctx.grpc.set_latency("CanReadVersion", 30.0, target="ledger:9000")
+    before = len(calls)
     reports = _by_consumer(m.verify_consumers(NAME, "v2"))
     assert reports["ledger"]["verified"] is False, f"a consumer that takes 30 s to answer must be reported unverified after the deadline, got {reports['ledger']}"
-    assert reports["billing"]["verified"] and reports["checkout"]["verified"], f"the healthy consumers must still verify, got {reports}"
+    assert reports["billing"]["verified"] and reports["checkout"]["verified"], f"the healthy consumers must still verify (billing answers in 1.5 s, inside its deadline), got {reports}"
+    later = ctx.grpc.calls_to("CanReadVersion")[before:]
+    assert len(later) == 3, f"the second verification made {len(later)} CanReadVersion calls, expected one per consumer"
+    for call in later:
+        assert call.timeout is not None and 1.5 <= call.timeout <= 2.5, f"after billing took 1.5 s, the call to {call.target} carried a {call.timeout} s deadline: each call gets its own VERIFY_DEADLINE_S = 2, not what is left of one shared deadline"
 
 
 def check_reply_must_match(ctx):
     m, _ = _setup(ctx, lagging=("ledger",))
+    # audit says yes, but for the version it holds; search names v2 but says it cannot read it.
+    for consumer_id, answer in (("audit", ("v1", True)), ("search", ("v2", False))):
+        vault.register_consumer(NAME, consumer_id)
+        ctx.grpc.serve(secrets_rotation_pb2_grpc.add_SecretConsumerServicer_to_server, Consumer(consumer_id, answer=answer), target=f"{consumer_id}:9000")
     reports = _by_consumer(m.verify_consumers(NAME, "v2"))
     assert reports["ledger"]["verified"] is False, f"ledger answered can_read=false (it still runs on v1) and was reported {reports['ledger']}: only a yes for exactly v2 is a verification"
+    assert reports["audit"]["verified"] is False, f"audit answered can_read=true for version_id v1 and was reported {reports['audit']}: only a yes for exactly v2 is a verification"
+    assert reports["search"]["verified"] is False, f"search answered version_id v2 with can_read=false and was reported {reports['search']}: only a yes for exactly v2 is a verification"
     assert reports["billing"]["verified"] and reports["checkout"]["verified"], f"billing and checkout can read v2 and must verify, got {reports}"
     accepted = vault.accepted(NAME, "v2")
     assert accepted == ["billing", "checkout"], f"the vault records {accepted} as having accepted v2, expected ['billing', 'checkout']"
@@ -887,7 +903,9 @@ def check_reply_must_match(ctx):
 def check_one_call_per_consumer(ctx):
     m, _ = _setup(ctx, up=("billing", "checkout"))
     reports = _by_consumer(m.verify_consumers(NAME, "v2"))
-    assert reports.get("ledger", {}).get("verified") is False, f"ledger is down (UNAVAILABLE) and must be reported unverified, got {reports.get('ledger')}"
+    ledger = reports.get("ledger", {})
+    assert ledger.get("verified") is False, f"ledger is down (UNAVAILABLE) and must be reported unverified, got {reports.get('ledger')}"
+    assert "unavailable" in str(ledger.get("detail", "")).lower(), f"ledger's report must carry the call's status (UNAVAILABLE) as its detail, got {ledger}"
     for consumer_id in FLEET:
         made = len(ctx.grpc.calls_to("CanReadVersion", target=f"{consumer_id}:9000"))
         assert made == 1, f"{consumer_id} was called {made} times for one verification: one down consumer made the gate ask the whole fleet again. Make one call per consumer and report the failure"
@@ -906,6 +924,7 @@ def check_retire_gate(ctx):
     assert done.get("retired") is True, f"with every consumer verified retire answered {done}"
     assert rotation.valid_versions(NAME) == ["v2"], f"after the retirement valid_versions is {rotation.valid_versions(NAME)}, expected ['v2']"
     assert vault.get_version(NAME, "v1")["retired_at"] is not None, "the retirement must be recorded on v1 (vault.record_retirement)"
+    assert len(vault.alerts(NAME)) == 1, f"a retirement every consumer verified must not page, the alerts are {vault.alerts(NAME)}"
     vault.create_version("orphan", "material", 3600, "op-ana")
     vault.create_version("orphan", "material-2", 3600, "op-ana")
     rotation.activate("orphan", "v1")
@@ -917,10 +936,11 @@ def check_retire_gate(ctx):
     typescript: `const NAME = 'payments-db';
 const FLEET = ['billing', 'checkout', 'ledger'];
 
-/** A registered consumer: it can read every version but those after the one it is on (holds). */
-function consumerImpl(consumerId: string, holds = 'v2') {
+/** A registered consumer: it can read every version but those after the one it is on (holds); answer, a [version_id, can_read] pair, fixes its reply. */
+function consumerImpl(consumerId: string, holds = 'v2', answer: [string, boolean] | null = null) {
   return {
     CanReadVersion(call, callback) {
+      if (answer !== null) return callback(null, {consumer_id: consumerId, version_id: answer[0], can_read: answer[1]});
       const can = call.request.version_id <= holds;
       callback(null, {consumer_id: consumerId, version_id: can ? call.request.version_id : holds, can_read: can});
     },
@@ -952,16 +972,34 @@ export async function check_verify_deadline(ctx) {
     assert(call.timeout !== null, \`a CanReadVersion call to \${call.target} carries no deadline: a wedged consumer holds the rotation worker for as long as it likes\`);
     assert(call.timeout >= 1.5 && call.timeout <= 2.5, \`a CanReadVersion call carries a \${call.timeout} s deadline, expected VERIFY_DEADLINE_MS = 2000\`);
   }
+  // billing answers after 1.5 s, inside its deadline; every call after it still carries a full 2 s of its own.
+  ctx.grpc.setLatency('CanReadVersion', 1.5, 'billing:9000');
   ctx.grpc.setLatency('CanReadVersion', 30.0, 'ledger:9000');
+  const before = calls.length;
   reports = byConsumer(await m.verifyConsumers(NAME, 'v2'));
   assert.equal(reports.ledger.verified, false, \`a consumer that takes 30 s to answer must be reported unverified after the deadline, got \${JSON.stringify(reports.ledger)}\`);
-  assert(reports.billing.verified && reports.checkout.verified, \`the healthy consumers must still verify, got \${JSON.stringify(reports)}\`);
+  assert(reports.billing.verified && reports.checkout.verified, \`the healthy consumers must still verify (billing answers in 1.5 s, inside its deadline), got \${JSON.stringify(reports)}\`);
+  const later = ctx.grpc.callsTo('CanReadVersion').slice(before);
+  assert.equal(later.length, 3, \`the second verification made \${later.length} CanReadVersion calls, expected one per consumer\`);
+  for (const call of later) {
+    assert(
+      call.timeout !== null && call.timeout >= 1.5 && call.timeout <= 2.5,
+      \`after billing took 1.5 s, the call to \${call.target} carried a \${call.timeout} s deadline: each call gets its own VERIFY_DEADLINE_MS = 2000, not what is left of one shared deadline\`,
+    );
+  }
 }
 
 export async function check_reply_must_match(ctx) {
-  const {m, vault} = await setup(ctx, FLEET, ['ledger']);
+  const {m, vault, pkg} = await setup(ctx, FLEET, ['ledger']);
+  // audit says yes, but for the version it holds; search names v2 but says it cannot read it.
+  for (const [id, answer] of [['audit', ['v1', true]], ['search', ['v2', false]]] as [string, [string, boolean]][]) {
+    await vault.registerConsumer(NAME, id);
+    ctx.grpc.serve(pkg.secretsrotation.SecretConsumer.service, consumerImpl(id, 'v2', answer), \`\${id}:9000\`);
+  }
   const reports = byConsumer(await m.verifyConsumers(NAME, 'v2'));
   assert.equal(reports.ledger.verified, false, \`ledger answered can_read=false (it still runs on v1) and was reported \${JSON.stringify(reports.ledger)}: only a yes for exactly v2 is a verification\`);
+  assert.equal(reports.audit?.verified, false, \`audit answered can_read=true for version_id v1 and was reported \${JSON.stringify(reports.audit)}: only a yes for exactly v2 is a verification\`);
+  assert.equal(reports.search?.verified, false, \`search answered version_id v2 with can_read=false and was reported \${JSON.stringify(reports.search)}: only a yes for exactly v2 is a verification\`);
   assert(reports.billing.verified && reports.checkout.verified, \`billing and checkout can read v2 and must verify, got \${JSON.stringify(reports)}\`);
   assert.deepStrictEqual(await vault.accepted(NAME, 'v2'), ['billing', 'checkout'], 'the consumers the vault records as having accepted v2');
 }
@@ -970,6 +1008,7 @@ export async function check_one_call_per_consumer(ctx) {
   const {m} = await setup(ctx, ['billing', 'checkout']);
   const reports = byConsumer(await m.verifyConsumers(NAME, 'v2'));
   assert.equal(reports.ledger?.verified, false, \`ledger is down (UNAVAILABLE) and must be reported unverified, got \${JSON.stringify(reports.ledger)}\`);
+  assert(String(reports.ledger.detail ?? '').toLowerCase().includes('unavailable'), \`ledger's report must carry the call's status (UNAVAILABLE) as its detail, got \${JSON.stringify(reports.ledger)}\`);
   for (const id of FLEET) {
     const made = ctx.grpc.callsTo('CanReadVersion', \`\${id}:9000\`).length;
     assert.equal(made, 1, \`\${id} was called \${made} times for one verification: one down consumer made the gate ask the whole fleet again. Make one call per consumer and report the failure\`);
@@ -989,6 +1028,7 @@ export async function check_retire_gate(ctx) {
   assert.equal(done.retired, true, \`with every consumer verified retire answered \${JSON.stringify(done)}\`);
   assert.deepStrictEqual(await rotation.validVersions(NAME), ['v2'], 'after the retirement only v2 is valid');
   assert.notEqual((await vault.getVersion(NAME, 'v1')).retired_at, null, 'the retirement must be recorded on v1 (vault.recordRetirement)');
+  assert.equal((await vault.alerts(NAME)).length, 1, \`a retirement every consumer verified must not page, the alerts are \${JSON.stringify(await vault.alerts(NAME))}\`);
   await vault.createVersion('orphan', 'material', 3600, 'op-ana');
   await vault.createVersion('orphan', 'material-2', 3600, 'op-ana');
   await rotation.activate('orphan', 'v1');
@@ -1003,6 +1043,7 @@ export async function check_retire_gate(ctx) {
 import (
 	"context"
 	"sort"
+	"strings"
 	"time"
 
 	"secretd/rotation"
@@ -1019,14 +1060,18 @@ var (
 	clientFleet = []string{"billing", "checkout", "ledger"}
 )
 
-// consumerPeer can read every version but those after the one it is on (holds).
+// consumerPeer can read every version but those after the one it is on (holds); a non-nil answer fixes its reply.
 type consumerPeer struct {
 	pb.UnimplementedSecretConsumerServer
-	id    string
-	holds string
+	id     string
+	holds  string
+	answer *pb.CanReadReply
 }
 
 func (p *consumerPeer) CanReadVersion(_ context.Context, req *pb.CanReadRequest) (*pb.CanReadReply, error) {
+	if p.answer != nil {
+		return p.answer, nil
+	}
 	can := req.GetVersionId() <= p.holds
 	version := p.holds
 	if can {
@@ -1090,16 +1135,36 @@ func CheckVerifyDeadline(ctx *harness.Ctx) {
 		ctx.Assert(!call.Deadline.IsZero(), "a CanReadVersion call to %s carries no deadline: a wedged consumer holds the rotation worker for as long as it likes", call.Target)
 		ctx.Assert(1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "a CanReadVersion call carries a %v deadline, expected verifyDeadline = 2 s", call.Timeout)
 	}
+	// billing answers after 1.5 s, inside its deadline; every call after it still carries a full 2 s of its own.
+	ctx.GRPC.SetLatency("CanReadVersion", 1.5, "billing:9000")
 	ctx.GRPC.SetLatency("CanReadVersion", 30.0, "ledger:9000")
+	before := len(calls)
 	reports = clientReports(ctx)
 	ctx.Equal(reports["ledger"].Verified, false, "a consumer that takes 30 s to answer must be reported unverified after the deadline (%+v); verified", reports["ledger"])
-	ctx.Assert(reports["billing"].Verified && reports["checkout"].Verified, "the healthy consumers must still verify, got %+v", reports)
+	ctx.Assert(reports["billing"].Verified && reports["checkout"].Verified, "the healthy consumers must still verify (billing answers in 1.5 s, inside its deadline), got %+v", reports)
+	later := ctx.GRPC.CallsTo("CanReadVersion", "")[before:]
+	ctx.Equal(len(later), 3, "the second verification must make one CanReadVersion call per consumer; its calls")
+	for _, call := range later {
+		ctx.Assert(!call.Deadline.IsZero() && 1500*time.Millisecond <= call.Timeout && call.Timeout <= 2500*time.Millisecond, "after billing took 1.5 s, the call to %s carried a %v deadline: each call gets its own verifyDeadline = 2 s, not what is left of one shared deadline", call.Target, call.Timeout)
+	}
 }
 
 func CheckReplyMustMatch(ctx *harness.Ctx) {
 	clientSetup(ctx, clientName, clientFleet, "ledger")
+	// audit says yes, but for the version it holds; search names v2 but says it cannot read it.
+	for _, peer := range []*consumerPeer{
+		{id: "audit", answer: &pb.CanReadReply{ConsumerId: "audit", VersionId: "v1", CanRead: true}},
+		{id: "search", answer: &pb.CanReadReply{ConsumerId: "search", VersionId: "v2", CanRead: false}},
+	} {
+		vault.RegisterConsumer(clientBg, clientName, peer.id)
+		pb.RegisterSecretConsumerServer(ctx.GRPC.Server(peer.id+":9000"), peer)
+	}
 	reports := clientReports(ctx)
 	ctx.Equal(reports["ledger"].Verified, false, "ledger answered can_read=false (it still runs on v1) and was reported %+v: only a yes for exactly v2 is a verification; verified", reports["ledger"])
+	audit, ok := reports["audit"]
+	ctx.Assert(ok && !audit.Verified, "audit answered can_read=true for version_id v1 and was reported %+v: only a yes for exactly v2 is a verification", audit)
+	search, ok := reports["search"]
+	ctx.Assert(ok && !search.Verified, "search answered version_id v2 with can_read=false and was reported %+v: only a yes for exactly v2 is a verification", search)
 	ctx.Assert(reports["billing"].Verified && reports["checkout"].Verified, "billing and checkout can read v2 and must verify, got %+v", reports)
 	ctx.Equal(vault.Accepted(clientBg, clientName, "v2"), []string{"billing", "checkout"}, "the consumers the vault records as having accepted v2")
 }
@@ -1109,6 +1174,7 @@ func CheckOneCallPerConsumer(ctx *harness.Ctx) {
 	reports := clientReports(ctx)
 	ledger, ok := reports["ledger"]
 	ctx.Assert(ok && !ledger.Verified, "ledger is down (UNAVAILABLE) and must be reported unverified, got %+v", ledger)
+	ctx.Assert(strings.Contains(strings.ToLower(ledger.Detail), "unavailable"), "ledger's report must carry the call's status (Unavailable) as its detail, got %+v", ledger)
 	for _, id := range clientFleet {
 		made := len(ctx.GRPC.CallsTo("CanReadVersion", id+":9000"))
 		ctx.Equal(made, 1, "%s was called more than once for one verification: one down consumer made the gate ask the whole fleet again. Make one call per consumer and report the failure; its calls", id)
@@ -1130,6 +1196,7 @@ func CheckRetireGate(ctx *harness.Ctx) {
 	ctx.Equal(done.Retired, true, "with every consumer verified; retired")
 	ctx.Equal(clientValid(ctx, clientName), []string{"v2"}, "after the retirement; ValidVersions")
 	ctx.Assert(vault.GetVersion(clientBg, clientName, "v1").RetiredAt != 0, "the retirement must be recorded on v1 (vault.RecordRetirement)")
+	ctx.Equal(len(vault.Alerts(clientBg, clientName)), 1, "a retirement every consumer verified must not page; the alerts")
 	clientSetup(ctx, "orphan", nil, "")
 	empty, err := retire(clientBg, "orphan", "v1", "v2")
 	ctx.NoError(err, "retire failed")
@@ -1139,8 +1206,11 @@ func CheckRetireGate(ctx *harness.Ctx) {
 `,
     cpp: `#include <leetbuild/harness.h>
 
+#include <algorithm>
+#include <cctype>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -1150,16 +1220,22 @@ func CheckRetireGate(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kName = "payments-db";
-const std::vector<std::string> kFleet = {"billing", "checkout", "ledger"};
+const std::string hName = "payments-db";
+const std::vector<std::string> hFleet = {"billing", "checkout", "ledger"};
 
-// A registered consumer: it can read every version but those after the one it is on (holds).
-class ConsumerPeer final : public secretsrotation::SecretConsumer::Service {
+// A registered consumer: it can read every version but those after the one it is on (holds); answer, a (version_id, can_read) pair, fixes its reply.
+class HConsumerPeer final : public secretsrotation::SecretConsumer::Service {
  public:
-  ConsumerPeer(std::string id, std::string holds) : id_(std::move(id)), holds_(std::move(holds)) {}
+  HConsumerPeer(std::string id, std::string holds, std::optional<std::pair<std::string, bool>> answer = std::nullopt)
+      : id_(std::move(id)), holds_(std::move(holds)), answer_(std::move(answer)) {}
   grpc::Status CanReadVersion(grpc::ServerContext*, const secretsrotation::CanReadRequest* req, secretsrotation::CanReadReply* out) override {
-    const bool can = req->version_id() <= holds_;
     out->set_consumer_id(id_);
+    if (answer_) {
+      out->set_version_id(answer_->first);
+      out->set_can_read(answer_->second);
+      return grpc::Status::OK;
+    }
+    const bool can = req->version_id() <= holds_;
     out->set_version_id(can ? req->version_id() : holds_);
     out->set_can_read(can);
     return grpc::Status::OK;
@@ -1168,87 +1244,109 @@ class ConsumerPeer final : public secretsrotation::SecretConsumer::Service {
  private:
   std::string id_;
   std::string holds_;
+  std::optional<std::pair<std::string, bool>> answer_;
 };
 
-std::vector<std::unique_ptr<ConsumerPeer>>& peers() {
-  static std::vector<std::unique_ptr<ConsumerPeer>> all;
+std::vector<std::unique_ptr<HConsumerPeer>>& hPeers() {
+  static std::vector<std::unique_ptr<HConsumerPeer>> all;
   return all;
 }
 
-void serve(harness::Ctx& ctx, const std::string& id, const std::string& holds) {
-  peers().push_back(std::make_unique<ConsumerPeer>(id, holds));
-  ctx.GRPC.Server(id + ":9000")->RegisterService(peers().back().get());
+void hServe(harness::Ctx& ctx, const std::string& id, const std::string& holds, std::optional<std::pair<std::string, bool>> answer = std::nullopt) {
+  hPeers().push_back(std::make_unique<HConsumerPeer>(id, holds, std::move(answer)));
+  ctx.GRPC.Server(id + ":9000")->RegisterService(hPeers().back().get());
 }
 
-void setup(harness::Ctx& ctx, const std::string& name, const std::vector<std::string>& up, const std::string& lagging, bool registered = true) {
+void hSetup(harness::Ctx& ctx, const std::string& name, const std::vector<std::string>& up, const std::string& lagging, bool registered = true) {
   vault::createVersion(name, "material-one", 3600, "op-ana");
   vault::createVersion(name, "material-two", 3600, "op-ana");
   rotation::activate(name, "v1");
   rotation::activate(name, "v2");
   if (!registered) return;
-  for (const auto& id : kFleet) vault::registerConsumer(name, id);
-  for (const auto& id : up) serve(ctx, id, id == lagging ? "v1" : "v2");
+  for (const auto& id : hFleet) vault::registerConsumer(name, id);
+  for (const auto& id : up) hServe(ctx, id, id == lagging ? "v1" : "v2");
 }
 
-std::map<std::string, Report> reportsByConsumer() {
+std::map<std::string, Report> hReports() {
   std::map<std::string, Report> out;
-  for (const Report& r : verifyConsumers(kName, "v2")) out[r.consumer_id] = r;
+  for (const Report& r : verifyConsumers(hName, "v2")) out[r.consumer_id] = r;
   return out;
 }
 
 }  // namespace
 
 void CheckVerifyDeadline(harness::Ctx& ctx) {
-  setup(ctx, kName, kFleet, "");
-  auto reports = reportsByConsumer();
+  hSetup(ctx, hName, hFleet, "");
+  auto reports = hReports();
   std::vector<std::string> ids;
   for (const auto& [id, _] : reports) ids.push_back(id);
-  ctx.Equal(ids, kFleet, "verifyConsumers must answer one report per registered consumer");
+  ctx.Equal(ids, hFleet, "verifyConsumers must answer one report per registered consumer");
   const auto calls = ctx.GRPC.CallsTo("CanReadVersion");
   ctx.Assert(!calls.empty(), "no CanReadVersion call was made");
   for (const auto& call : calls) {
     ctx.Assert(call.HasDeadline(), "a CanReadVersion call to %s carries no deadline: a wedged consumer holds the rotation worker for as long as it likes", call.Target);
     ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.5, "a CanReadVersion call carries a %v s deadline, expected kVerifyDeadline = 2 s", call.TimeoutSeconds());
   }
+  // billing answers after 1.5 s, inside its deadline; every call after it still carries a full 2 s of its own.
+  ctx.GRPC.SetLatency("CanReadVersion", 1.5, "billing:9000");
   ctx.GRPC.SetLatency("CanReadVersion", 30.0, "ledger:9000");
-  reports = reportsByConsumer();
+  const size_t before = calls.size();
+  reports = hReports();
   ctx.Equal(reports["ledger"].verified, false, "a consumer that takes 30 s to answer must be reported unverified after the deadline (%s); verified", reports["ledger"].detail);
-  ctx.Assert(reports["billing"].verified && reports["checkout"].verified, "the healthy consumers must still verify");
+  ctx.Assert(reports["billing"].verified && reports["checkout"].verified, "the healthy consumers must still verify (billing answers in 1.5 s, inside its deadline)");
+  const auto all = ctx.GRPC.CallsTo("CanReadVersion");
+  ctx.Equal(all.size() - before, 3, "the second verification must make one CanReadVersion call per consumer; its calls");
+  for (size_t i = before; i < all.size(); ++i) {
+    ctx.Assert(all[i].HasDeadline() && 1.5 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 2.5,
+               "after billing took 1.5 s, the call to %s carried a %v s deadline: each call gets its own kVerifyDeadline = 2 s, not what is left of one shared deadline", all[i].Target, all[i].TimeoutSeconds());
+  }
 }
 
 void CheckReplyMustMatch(harness::Ctx& ctx) {
-  setup(ctx, kName, kFleet, "ledger");
-  auto reports = reportsByConsumer();
+  hSetup(ctx, hName, hFleet, "ledger");
+  // audit says yes, but for the version it holds; search names v2 but says it cannot read it.
+  vault::registerConsumer(hName, "audit");
+  hServe(ctx, "audit", "v2", std::make_pair(std::string("v1"), true));
+  vault::registerConsumer(hName, "search");
+  hServe(ctx, "search", "v2", std::make_pair(std::string("v2"), false));
+  auto reports = hReports();
   ctx.Equal(reports["ledger"].verified, false, "ledger answered can_read=false (it still runs on v1): only a yes for exactly v2 is a verification; verified");
+  ctx.Assert(reports.count("audit") == 1 && !reports["audit"].verified, "audit answered can_read=true for version_id v1 and was reported verified: only a yes for exactly v2 is a verification");
+  ctx.Assert(reports.count("search") == 1 && !reports["search"].verified, "search answered version_id v2 with can_read=false and was reported verified: only a yes for exactly v2 is a verification");
   ctx.Assert(reports["billing"].verified && reports["checkout"].verified, "billing and checkout can read v2 and must verify");
-  ctx.Equal(vault::accepted(kName, "v2"), {"billing", "checkout"}, "the consumers the vault records as having accepted v2");
+  ctx.Equal(vault::accepted(hName, "v2"), {"billing", "checkout"}, "the consumers the vault records as having accepted v2");
 }
 
 void CheckOneCallPerConsumer(harness::Ctx& ctx) {
-  setup(ctx, kName, {"billing", "checkout"}, "");
-  auto reports = reportsByConsumer();
+  hSetup(ctx, hName, {"billing", "checkout"}, "");
+  auto reports = hReports();
   ctx.Assert(reports.count("ledger") == 1 && !reports["ledger"].verified, "ledger is down (UNAVAILABLE) and must be reported unverified");
-  for (const auto& id : kFleet) {
+  std::string detail = reports["ledger"].detail;
+  std::transform(detail.begin(), detail.end(), detail.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  ctx.Assert(detail.find("unavailable") != std::string::npos || detail.find("14") != std::string::npos,
+             "ledger's report must carry the call's status (UNAVAILABLE, code 14) as its detail, got %q", reports["ledger"].detail);
+  for (const auto& id : hFleet) {
     const size_t made = ctx.GRPC.CallsTo("CanReadVersion", id + ":9000").size();
     ctx.Equal(made, 1, "%s was called more than once for one verification: one down consumer made the gate ask the whole fleet again. Make one call per consumer and report the failure; its calls", id);
   }
 }
 
 void CheckRetireGate(harness::Ctx& ctx) {
-  setup(ctx, kName, {"billing", "checkout"}, "");
-  const Retirement blocked = retire(kName, "v1", "v2");
+  hSetup(ctx, hName, {"billing", "checkout"}, "");
+  const Retirement blocked = retire(hName, "v1", "v2");
   ctx.Equal(blocked.retired, false, "with ledger down an unverified consumer blocks retirement; retired");
   ctx.Equal(blocked.blocked_by, {"ledger"}, "blocked_by must name ledger");
-  ctx.Equal(rotation::validVersions(kName), {"v2", "v1"}, "a blocked retirement must leave v1 valid; validVersions");
-  const auto alerts = vault::alerts(kName);
+  ctx.Equal(rotation::validVersions(hName), {"v2", "v1"}, "a blocked retirement must leave v1 valid; validVersions");
+  const auto alerts = vault::alerts(hName);
   ctx.Assert(alerts.size() == 1 && alerts[0].version_id == "v2" && alerts[0].pending == std::vector<std::string>{"ledger"},
              "a blocked retirement must page with the pending consumers (vault::raiseAlert); the alerts: %d", alerts.size());
-  serve(ctx, "ledger", "v2");
-  const Retirement done = retire(kName, "v1", "v2");
+  hServe(ctx, "ledger", "v2");
+  const Retirement done = retire(hName, "v1", "v2");
   ctx.Equal(done.retired, true, "with every consumer verified; retired");
-  ctx.Equal(rotation::validVersions(kName), {"v2"}, "after the retirement; validVersions");
-  ctx.Assert(vault::getVersion(kName, "v1")->retired_at != 0, "the retirement must be recorded on v1 (vault::recordRetirement)");
-  setup(ctx, "orphan", {}, "", false);
+  ctx.Equal(rotation::validVersions(hName), {"v2"}, "after the retirement; validVersions");
+  ctx.Assert(vault::getVersion(hName, "v1")->retired_at != 0, "the retirement must be recorded on v1 (vault::recordRetirement)");
+  ctx.Equal(vault::alerts(hName).size(), 1, "a retirement every consumer verified must not page; the alerts");
+  hSetup(ctx, "orphan", {}, "", false);
   const Retirement empty = retire("orphan", "v1", "v2");
   ctx.Equal(empty.retired, false, "a secret with no registered consumers retired its old version: nobody verified is not everybody verified; retired");
   ctx.Equal(vault::alerts("orphan").size(), 1, "a retirement blocked by an empty registry must page; the alerts");

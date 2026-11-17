@@ -63,7 +63,7 @@ service Encoder { rpc EncodeSegment(SegmentRequest) returns (SegmentResult); }
       id: 'scaled-deadline',
       title: "Each attempt's deadline scales with the segment's length",
       detail:
-        'The deadline is `DEADLINE_BASE_S` + `DEADLINE_PER_SECOND_S` × the span length (5 s for 6 s, 3 s for a 2-second tail), set on every attempt; the starter gives every call 30 s.',
+        'The deadline is `DEADLINE_BASE_S` + `DEADLINE_PER_SECOND_S` × the span length (5 s for 6 s, 3 s for a 2-second tail), set in full on every attempt, even after a first attempt that failed late; the starter gives every call 30 s.',
       match: {
         python: {
           all: [
@@ -125,7 +125,7 @@ service Encoder { rpc EncodeSegment(SegmentRequest) returns (SegmentResult); }
       id: 'classify',
       title: 'INVALID_ARGUMENT is terminal, a lost worker is retryable',
       detail:
-        'One classification, `is_retryable`, allows a second attempt for UNAVAILABLE and DEADLINE_EXCEEDED only; corrupt input (INVALID_ARGUMENT) fails on the first answer. The starter retries every status alike.',
+        'One classification, `is_retryable`, allows a second attempt for UNAVAILABLE and DEADLINE_EXCEEDED only; corrupt input (INVALID_ARGUMENT) and every other status fail on the first answer. The starter retries every status alike.',
       match: {
         python: {all: [/def is_retryable/, /UNAVAILABLE/, /DEADLINE_EXCEEDED/, /is_retryable\(\s*exc\.code\(\)/]},
         typescript: {
@@ -754,6 +754,21 @@ class Encoder(media_transcoder_pb2_grpc.EncoderServicer):
         return media_transcoder_pb2.SegmentResult(index=request.index, output_key=f"talks/42/{request.preset}/seg-{request.index:05d}.ts", duration_s=request.duration_s)
 
 
+class DrainedMidEncode(Encoder):
+    """The first call runs 4 s of the encode and then loses its worker (UNAVAILABLE); later calls encode."""
+
+    def __init__(self, ctx):
+        self.ctx = ctx
+        self.seen = 0
+
+    def EncodeSegment(self, request, context):
+        self.seen += 1
+        if self.seen == 1:
+            self.ctx.clock.advance(4)
+            context.abort(grpc.StatusCode.UNAVAILABLE, "worker drained mid-encode")
+        return super().EncodeSegment(request, context)
+
+
 def _client(ctx, duration=14.0):
     ctx.grpc.serve(media_transcoder_pb2_grpc.add_EncoderServicer_to_server, Encoder())
     job = jobs.create("t-1", "s3://uploads/talk.mov", "9f" * 32, duration, "h264-720p", presets.encoder_args("h264-720p"), "renditions", "talks/42")
@@ -795,6 +810,15 @@ def check_scaled_deadline(ctx):
     m.encode_segment(job, 1)
     retry = _calls(ctx)[-1]
     assert abs(retry.timeout - (2.0 + 0.5 * retry.request.duration_s)) < 0.1, f"the second attempt carries a {retry.timeout} s deadline: every attempt gets the scaled deadline"
+    # The first attempt fails late, 4 s into its 5 s: the retry still gets a deadline of its own.
+    ctx.grpc.serve(media_transcoder_pb2_grpc.add_EncoderServicer_to_server, DrainedMidEncode(ctx))
+    before = len(_calls(ctx))
+    try:
+        m.encode_segment(job, 0)
+    except Exception as exc:
+        raise AssertionError(f"segment 0's first attempt lost its worker 4 s into its 5 s deadline and the retry failed with {exc!r}: every attempt carries the full scaled deadline, not what is left of the first one") from exc
+    late = _calls(ctx)[before:]
+    assert len(late) == 2 and abs(late[1].timeout - 5.0) < 0.1, f"after a first attempt that failed 4 s in, the retry of a 6 s segment carried a {late[-1].timeout} s deadline over {len(late)} calls: every attempt gets the full 5 s"
 
 
 def check_bounded_attempts(ctx):
@@ -816,6 +840,12 @@ def check_classify(ctx):
     exc = _fails(m, job, 1, "with corrupt bytes in segment 1 (INVALID_ARGUMENT)")
     assert len(_calls(ctx)) == 3, f"corrupt input was sent to the encoder {len(_calls(ctx)) - 2} times: INVALID_ARGUMENT is terminal, the first answer decides"
     assert exc.code == grpc.StatusCode.INVALID_ARGUMENT, f"the failure carries {exc.code}, expected INVALID_ARGUMENT"
+    # Only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt: every other status is terminal.
+    for code in (grpc.StatusCode.INTERNAL, grpc.StatusCode.UNKNOWN, grpc.StatusCode.RESOURCE_EXHAUSTED, grpc.StatusCode.FAILED_PRECONDITION, grpc.StatusCode.NOT_FOUND):
+        before = len(_calls(ctx))
+        ctx.grpc.fail("EncodeSegment", code, "encoder refused the segment")
+        exc = _fails(m, job, 2, f"with the encoder answering {code.name} for segment 2")
+        assert len(_calls(ctx)) - before == 1 and exc.code == code, f"a {code.name} answer took {len(_calls(ctx)) - before} calls and failed with {exc.code}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, {code.name} fails on the first answer"
 
 
 def check_fail_with_index(ctx):
@@ -876,6 +906,28 @@ export async function check_scaled_deadline(ctx) {
   await m.encodeSegment(job, 1);
   const retry = calls(ctx).at(-1);
   assert(Math.abs(retry.timeout - (2 + 0.5 * Number(retry.request.duration_s))) < 0.1, \`the second attempt carries a \${retry.timeout} s deadline: every attempt gets the scaled deadline\`);
+  // The first attempt fails late, 4 s into its 5 s: the retry still gets a deadline of its own.
+  let seen = 0;
+  ctx.grpc.serve(ctx.proto('media_transcoder.proto').transcoderd.Encoder.service, {
+    EncodeSegment(call, callback) {
+      seen += 1;
+      if (seen === 1) {
+        ctx.clock.advance(4);
+        callback({code: ctx.grpc.status.UNAVAILABLE, details: 'worker drained mid-encode'});
+        return;
+      }
+      const {index, preset, duration_s} = call.request;
+      callback(null, {index, output_key: \`talks/42/\${preset}/seg-\${String(index).padStart(5, '0')}.ts\`, duration_s});
+    },
+  });
+  const before = calls(ctx).length;
+  try {
+    await m.encodeSegment(job, 0);
+  } catch (e) {
+    assert.fail(\`segment 0's first attempt lost its worker 4 s into its 5 s deadline and the retry failed with \${(e as Error).message}: every attempt carries the full scaled deadline, not what is left of the first one\`);
+  }
+  const late = calls(ctx).slice(before);
+  assert(late.length === 2 && Math.abs(late[1].timeout - 5) < 0.1, \`after a first attempt that failed 4 s in, the retry of a 6 s segment carried a \${late.at(-1)?.timeout} s deadline over \${late.length} calls: every attempt gets the full 5 s\`);
 }
 
 export async function check_bounded_attempts(ctx) {
@@ -899,6 +951,13 @@ export async function check_classify(ctx) {
   const e = await fails(m, job, 1, 'with corrupt bytes in segment 1 (INVALID_ARGUMENT)');
   assert.equal(calls(ctx).length, 3, \`corrupt input was sent to the encoder \${calls(ctx).length - 2} times: INVALID_ARGUMENT is terminal, the first answer decides\`);
   assert.equal(e.code, ctx.grpc.status.INVALID_ARGUMENT, \`the failure carries code \${e.code}, expected INVALID_ARGUMENT\`);
+  // Only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt: every other status is terminal.
+  for (const name of ['INTERNAL', 'UNKNOWN', 'RESOURCE_EXHAUSTED', 'FAILED_PRECONDITION', 'NOT_FOUND']) {
+    const before = calls(ctx).length;
+    ctx.grpc.fail('EncodeSegment', ctx.grpc.status[name], 'encoder refused the segment');
+    const terminal = await fails(m, job, 2, \`with the encoder answering \${name} for segment 2\`);
+    assert(calls(ctx).length - before === 1 && terminal.code === ctx.grpc.status[name], \`a \${name} answer took \${calls(ctx).length - before} calls and failed with code \${terminal.code}: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, \${name} fails on the first answer\`);
+  }
 }
 
 export async function check_fail_with_index(ctx) {
@@ -918,6 +977,7 @@ import (
 	"math"
 
 	"google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
 
 	pb "transcoder/gen/media_transcoder"
 	"transcoder/jobs"
@@ -928,17 +988,28 @@ import (
 
 var clientBg = context.Background()
 
-// encoderPeer encodes whatever span it is asked for.
+// encoderPeer encodes whatever span it is asked for; with drainNext set, the next call runs 4 s of
+// the encode and then loses its worker (UNAVAILABLE).
 type encoderPeer struct {
 	pb.UnimplementedEncoderServer
+	ctx       *harness.Ctx
+	drainNext *bool
 }
 
-func (encoderPeer) EncodeSegment(_ context.Context, req *pb.SegmentRequest) (*pb.SegmentResult, error) {
+func (p encoderPeer) EncodeSegment(_ context.Context, req *pb.SegmentRequest) (*pb.SegmentResult, error) {
+	if *p.drainNext {
+		*p.drainNext = false
+		p.ctx.Clock.Advance(4)
+		return nil, grpcstatus.Error(codes.Unavailable, "worker drained mid-encode")
+	}
 	return &pb.SegmentResult{Index: req.GetIndex(), OutputKey: fmt.Sprintf("talks/42/%s/seg-%05d.ts", req.GetPreset(), req.GetIndex()), DurationS: req.GetDurationS()}, nil
 }
 
+var encoderDrainNext bool
+
 func encoderClient(ctx *harness.Ctx, duration float64) *jobs.Job {
-	pb.RegisterEncoderServer(ctx.GRPC.Server(""), encoderPeer{})
+	encoderDrainNext = false
+	pb.RegisterEncoderServer(ctx.GRPC.Server(""), encoderPeer{ctx: ctx, drainNext: &encoderDrainNext})
 	args, _ := presets.EncoderArgs("h264-720p")
 	return jobs.Create(clientBg, "t-1", "s3://uploads/talk.mov", "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f", duration, "h264-720p", args, "renditions", "talks/42")
 }
@@ -997,6 +1068,13 @@ func CheckScaledDeadline(ctx *harness.Ctx) {
 	retry := calls[len(calls)-1]
 	_, length := spanOf(retry)
 	ctx.Assert(math.Abs(retry.Timeout.Seconds()-(2+0.5*length)) < 0.1, "the second attempt carries a %v deadline: every attempt gets the scaled deadline", retry.Timeout)
+	// The first attempt fails late, 4 s into its 5 s: the retry still gets a deadline of its own.
+	encoderDrainNext = true
+	before := len(encodeCalls(ctx))
+	_, err := encodeSegment(clientBg, job, 0)
+	ctx.NoError(err, "segment 0's first attempt lost its worker 4 s into its 5 s deadline and the retry failed: every attempt carries the full scaled deadline, not what is left of the first one")
+	late := encodeCalls(ctx)[before:]
+	ctx.Assert(len(late) == 2 && math.Abs(late[len(late)-1].Timeout.Seconds()-5) < 0.1, "after a first attempt that failed 4 s in, the retry of a 6 s segment carried a %v deadline over %d calls: every attempt gets the full 5 s", late[len(late)-1].Timeout, len(late))
 }
 
 func CheckBoundedAttempts(ctx *harness.Ctx) {
@@ -1018,6 +1096,13 @@ func CheckClassify(ctx *harness.Ctx) {
 	failed := mustFailSegment(ctx, job, 1, "with corrupt bytes in segment 1 (INVALID_ARGUMENT)")
 	ctx.Equal(len(encodeCalls(ctx))-2, 1, "INVALID_ARGUMENT is terminal, the first answer decides; times corrupt input was sent")
 	ctx.Equal(failed.Code, codes.InvalidArgument, "the failure's code")
+	// Only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt: every other status is terminal.
+	for _, code := range []codes.Code{codes.Internal, codes.Unknown, codes.ResourceExhausted, codes.FailedPrecondition, codes.NotFound} {
+		before := len(encodeCalls(ctx))
+		ctx.GRPC.Fail("EncodeSegment", code, "encoder refused the segment", 1, "")
+		terminal := mustFailSegment(ctx, job, 2, fmt.Sprintf("with the encoder answering %v for segment 2", code))
+		ctx.Assert(len(encodeCalls(ctx))-before == 1 && terminal.Code == code, "a %v answer took %d calls and failed with %v: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, %v fails on the first answer", code, len(encodeCalls(ctx))-before, terminal.Code, code)
+	}
 }
 
 func CheckFailWithIndex(ctx *harness.Ctx) {
@@ -1032,6 +1117,7 @@ func CheckFailWithIndex(ctx *harness.Ctx) {
 #include <cmath>
 #include <cstdio>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "transcoder/jobs.h"
@@ -1039,10 +1125,19 @@ func CheckFailWithIndex(ctx *harness.Ctx) {
 
 namespace {
 
-// Encodes whatever span it is asked for.
+// Encodes whatever span it is asked for; with drain_next set, the next call runs 4 s of the encode
+// and then loses its worker (UNAVAILABLE).
 class EncoderPeer final : public transcoderd::Encoder::Service {
  public:
+  harness::Ctx* ctx = nullptr;
+  bool drain_next = false;
+
   grpc::Status EncodeSegment(grpc::ServerContext*, const transcoderd::SegmentRequest* req, transcoderd::SegmentResult* out) override {
+    if (drain_next) {
+      drain_next = false;
+      ctx->Clock.Advance(4);
+      return grpc::Status(grpc::StatusCode::UNAVAILABLE, "worker drained mid-encode");
+    }
     char name[16];
     std::snprintf(name, sizeof name, "seg-%05d.ts", req->index());
     out->set_index(req->index());
@@ -1052,11 +1147,13 @@ class EncoderPeer final : public transcoderd::Encoder::Service {
   }
 };
 
+EncoderPeer* encoder_peer = nullptr;
+
 jobs::Job encoderClient(harness::Ctx& ctx, double duration) {
-  static EncoderPeer* peer = nullptr;
-  delete peer;
-  peer = new EncoderPeer;
-  ctx.GRPC.Server("")->RegisterService(peer);
+  delete encoder_peer;
+  encoder_peer = new EncoderPeer;
+  encoder_peer->ctx = &ctx;
+  ctx.GRPC.Server("")->RegisterService(encoder_peer);
   return jobs::create("t-1", "s3://uploads/talk.mov", std::string(64, 'f'), duration, "h264-720p", *presets::encoderArgs("h264-720p"), "renditions", "talks/42");
 }
 
@@ -1112,6 +1209,16 @@ void CheckScaledDeadline(harness::Ctx& ctx) {
   const auto& retry = calls.back();
   const double length = retry.Request<transcoderd::SegmentRequest>().duration_s();
   ctx.Assert(std::abs(retry.TimeoutSeconds() - (2 + 0.5 * length)) < 0.1, "the second attempt carries a %v s deadline: every attempt gets the scaled deadline", retry.TimeoutSeconds());
+  // The first attempt fails late, 4 s into its 5 s: the retry still gets a deadline of its own.
+  encoder_peer->drain_next = true;
+  const size_t before = encodeCalls(ctx).size();
+  try {
+    encodeSegment(job, 0);
+  } catch (const std::exception& e) {
+    ctx.Fatalf("segment 0's first attempt lost its worker 4 s into its 5 s deadline and the retry threw %s: %s: every attempt carries the full scaled deadline, not what is left of the first one", harness::CurrentExceptionType(), e.what());
+  }
+  const auto late = encodeCalls(ctx);
+  ctx.Assert(late.size() - before == 2 && std::abs(late.back().TimeoutSeconds() - 5) < 0.1, "after a first attempt that failed 4 s in, the retry of a 6 s segment carried a %v s deadline over %d calls: every attempt gets the full 5 s", late.back().TimeoutSeconds(), late.size() - before);
 }
 
 void CheckBoundedAttempts(harness::Ctx& ctx) {
@@ -1133,6 +1240,20 @@ void CheckClassify(harness::Ctx& ctx) {
   const SegmentFailed failed = mustFailSegment(ctx, job, 1, "with corrupt bytes in segment 1 (INVALID_ARGUMENT)");
   ctx.Equal(encodeCalls(ctx).size() - 2, size_t{1}, "INVALID_ARGUMENT is terminal, the first answer decides; times corrupt input was sent");
   ctx.Assert(failed.code == grpc::StatusCode::INVALID_ARGUMENT, "the failure carries code %d, expected INVALID_ARGUMENT", static_cast<int>(failed.code));
+  // Only UNAVAILABLE and DEADLINE_EXCEEDED earn a second attempt: every other status is terminal.
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal_codes = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL"},
+      {grpc::StatusCode::UNKNOWN, "UNKNOWN"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"},
+      {grpc::StatusCode::FAILED_PRECONDITION, "FAILED_PRECONDITION"},
+      {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"},
+  };
+  for (const auto& [code, name] : terminal_codes) {
+    const size_t before = encodeCalls(ctx).size();
+    ctx.GRPC.Fail("EncodeSegment", code, "encoder refused the segment", 1);
+    const SegmentFailed terminal = mustFailSegment(ctx, job, 2, "with the encoder answering " + name + " for segment 2");
+    ctx.Assert(encodeCalls(ctx).size() - before == 1 && terminal.code == code, "a %s answer took %d calls and failed with code %d: only UNAVAILABLE and DEADLINE_EXCEEDED are retried, %s fails on the first answer", name, encodeCalls(ctx).size() - before, static_cast<int>(terminal.code), name);
+  }
 }
 
 void CheckFailWithIndex(harness::Ctx& ctx) {

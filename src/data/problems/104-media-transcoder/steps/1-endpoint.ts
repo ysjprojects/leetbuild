@@ -614,8 +614,8 @@ SHA = "9f" * 32
 EVIL_ARGS = ["-vf", "movie=/etc/passwd", "-f", "image2"]
 
 
-def _body(sha=SHA, preset="h264-720p", duration=14.0, uri="s3://uploads/talk.mov", bucket="renditions", args=None):
-    body = {"source": {"uri": uri, "sha256": sha, "duration_s": duration}, "preset": preset, "output": {"bucket": bucket, "prefix": "talks/42"}}
+def _body(sha=SHA, preset="h264-720p", duration=14.0, uri="s3://uploads/talk.mov", bucket="renditions", args=None, prefix="talks/42"):
+    body = {"source": {"uri": uri, "sha256": sha, "duration_s": duration}, "preset": preset, "output": {"bucket": bucket, "prefix": prefix}}
     if args is not None:
         body["args"] = args
     return body
@@ -651,6 +651,11 @@ async def check_dedupe(ctx):
         body = retry.json()
         assert retry.status_code == 200 and body.get("job_id") == first.json()["job_id"] and body.get("deduped") is True, f"a retry of the same source and preset answered {retry.status_code} {body}: it must answer the existing job {first.json()['job_id']} with 200 and deduped true"
         assert _created(ctx) == 1, f"two submits of one source and preset created {_created(ctx)} jobs: the retry pays for the encode twice"
+        moved = await _submit(c, _body(uri="s3://uploads/talk-copy.mov", duration=30.0))
+        body = moved.json()
+        assert moved.status_code == 200 and body.get("job_id") == first.json()["job_id"] and body.get("segment_count") == 3 and body.get("deduped") is True, f"a retry of the same sha256 and preset from another uri with a 30-second duration answered {moved.status_code} {body}: it must answer the existing job {first.json()['job_id']} as stored (3 segments), 200 and deduped true"
+        other_source = await _submit(c, _body(sha="7c" * 32))
+        assert other_source.status_code == 201 and other_source.json().get("job_id") != first.json()["job_id"], f"another source of the same tenant and preset is another job, the submit answered {other_source.status_code} {other_source.text}"
         other_preset = await _submit(c, _body(preset="h265-1080p"))
         assert other_preset.status_code == 201 and other_preset.json().get("job_id") != first.json()["job_id"], f"another preset of the same source is another job, the submit answered {other_preset.status_code} {other_preset.text}"
         other_tenant = await _submit(c, _body(), tenant="t-2")
@@ -681,9 +686,13 @@ async def check_source_hash(ctx):
         "an upper-case hash": _body(sha=SHA.upper()),
         "a 63-character hash": _body(sha=SHA[:63]),
         "a non-hex hash": _body(sha="z" * 64),
+        "a 65-character hash": _body(sha=SHA + "9"),
+        "a hash followed by a newline": _body(sha=SHA + "\\n"),
         "a zero duration": _body(duration=0),
+        "a negative duration": _body(duration=-6.0),
         "an empty uri": _body(uri=""),
         "an empty bucket": _body(bucket=""),
+        "an empty prefix": _body(prefix=""),
     }
     async with _api(ctx) as c:
         for what, body in bad.items():
@@ -691,13 +700,15 @@ async def check_source_hash(ctx):
             assert r.status_code == 400, f"a submit with {what} answered {r.status_code}, expected 400"
         assert _created(ctx) == 0, f"invalid submits created {_created(ctx)} jobs: the dedupe key is built from whatever arrived"
         r = await _submit(c, _body())
-    assert r.status_code == 201, f"the valid submit answered {r.status_code}: {r.text}"
+        assert r.status_code == 201, f"the valid submit answered {r.status_code}: {r.text}"
+        short = await _submit(c, _body(sha="7c" * 32, duration=0.5))
+    assert short.status_code == 201 and short.json().get("segment_count") == 1, f"a valid half-second source answered {short.status_code} {short.text}: any positive duration is one segment or more"
 `,
     typescript: `const SHA = '9f'.repeat(32);
 const EVIL_ARGS = ['-vf', 'movie=/etc/passwd', '-f', 'image2'];
 
-function body({sha = SHA, preset = 'h264-720p', duration = 14, uri = 's3://uploads/talk.mov', bucket = 'renditions', args = undefined as string[] | undefined} = {}) {
-  return {source: {uri, sha256: sha, duration_s: duration}, preset, output: {bucket, prefix: 'talks/42'}, ...(args === undefined ? {} : {args})};
+function body({sha = SHA, preset = 'h264-720p', duration = 14, uri = 's3://uploads/talk.mov', bucket = 'renditions', prefix = 'talks/42', args = undefined as string[] | undefined} = {}) {
+  return {source: {uri, sha256: sha, duration_s: duration}, preset, output: {bucket, prefix}, ...(args === undefined ? {} : {args})};
 }
 
 function api(ctx) {
@@ -729,6 +740,11 @@ export async function check_dedupe(ctx) {
   const again = retry.json();
   assert(retry.status === 200 && again.job_id === first.json().job_id && again.deduped === true, \`a retry of the same source and preset answered \${retry.status} \${retry.text}: it must answer the existing job with 200 and deduped true\`);
   assert.equal(created(ctx), 1, \`two submits of one source and preset created \${created(ctx)} jobs: the retry pays for the encode twice\`);
+  const moved = await submit(c, body({uri: 's3://uploads/talk-copy.mov', duration: 30}));
+  const stored = moved.json();
+  assert(moved.status === 200 && stored.job_id === first.json().job_id && stored.segment_count === 3 && stored.deduped === true, \`a retry of the same sha256 and preset from another uri with a 30-second duration answered \${moved.status} \${moved.text}: it must answer the existing job as stored (3 segments), 200 and deduped true\`);
+  const otherSource = await submit(c, body({sha: '7c'.repeat(32)}));
+  assert(otherSource.status === 201 && otherSource.json().job_id !== first.json().job_id, \`another source of the same tenant and preset is another job, the submit answered \${otherSource.status} \${otherSource.text}\`);
   const otherPreset = await submit(c, body({preset: 'h265-1080p'}));
   assert(otherPreset.status === 201 && otherPreset.json().job_id !== first.json().job_id, \`another preset of the same source is another job, the submit answered \${otherPreset.status} \${otherPreset.text}\`);
   const otherTenant = await submit(c, body(), 't-2');
@@ -761,9 +777,13 @@ export async function check_source_hash(ctx) {
     ['an upper-case hash', body({sha: SHA.toUpperCase()})],
     ['a 63-character hash', body({sha: SHA.slice(0, 63)})],
     ['a non-hex hash', body({sha: 'z'.repeat(64)})],
+    ['a 65-character hash', body({sha: SHA + '9'})],
+    ['a hash followed by a newline', body({sha: SHA + '\\n'})],
     ['a zero duration', body({duration: 0})],
+    ['a negative duration', body({duration: -6})],
     ['an empty uri', body({uri: ''})],
     ['an empty bucket', body({bucket: ''})],
+    ['an empty prefix', body({prefix: ''})],
   ];
   for (const [what, json] of bad) {
     const r = await submit(c, json);
@@ -772,6 +792,8 @@ export async function check_source_hash(ctx) {
   assert.equal(created(ctx), 0, \`invalid submits created \${created(ctx)} jobs: the dedupe key is built from whatever arrived\`);
   const r = await submit(c, body());
   assert.equal(r.status, 201, \`the valid submit answered \${r.status}: \${r.text}\`);
+  const short = await submit(c, body({sha: '7c'.repeat(32), duration: 0.5}));
+  assert(short.status === 201 && short.json().segment_count === 1, \`a valid half-second source answered \${short.status} \${short.text}: any positive duration is one segment or more\`);
 }
 `,
     go: `package main
@@ -856,6 +878,11 @@ func CheckDedupe(ctx *harness.Ctx) {
 	again := decodeJob(retry)
 	ctx.Assert(retry.Status == 200 && again.JobID == firstID && again.Deduped, "a retry of the same source and preset answered %d %s: it must answer the existing job %s with 200 and deduped true", retry.Status, retry.Text(), firstID)
 	ctx.Equal(jobsCreated(ctx), 1, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created")
+	moved := postJob(c, transcodeBody(sourceSHA, "h264-720p", 30, "s3://uploads/talk-copy.mov", "renditions", nil), "t-1")
+	stored := decodeJob(moved)
+	ctx.Assert(moved.Status == 200 && stored.JobID == firstID && stored.SegmentCount == 3 && stored.Deduped, "a retry of the same sha256 and preset from another uri with a 30-second duration answered %d %s: it must answer the existing job %s as stored (3 segments), 200 and deduped true", moved.Status, moved.Text(), firstID)
+	otherSource := postJob(c, transcodeBody(strings.Repeat("7c", 32), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Assert(otherSource.Status == 201 && decodeJob(otherSource).JobID != firstID, "another source of the same tenant and preset is another job, the submit answered %d %s", otherSource.Status, otherSource.Text())
 	otherPreset := postJob(c, transcodeBody(sourceSHA, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions", nil), "t-1")
 	ctx.Assert(otherPreset.Status == 201 && decodeJob(otherPreset).JobID != firstID, "another preset of the same source is another job, the submit answered %d %s", otherPreset.Status, otherPreset.Text())
 	otherTenant := postJob(c, validBody(), "t-2")
@@ -885,6 +912,8 @@ func CheckPreset404(ctx *harness.Ctx) {
 
 func CheckSourceHash(ctx *harness.Ctx) {
 	c := submitter(ctx)
+	noPrefix := validBody()
+	noPrefix["output"] = map[string]any{"bucket": "renditions", "prefix": ""}
 	bad := []struct {
 		what string
 		body map[string]any
@@ -893,9 +922,13 @@ func CheckSourceHash(ctx *harness.Ctx) {
 		{"an upper-case hash", transcodeBody(strings.ToUpper(sourceSHA), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
 		{"a 63-character hash", transcodeBody(sourceSHA[:63], "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
 		{"a non-hex hash", transcodeBody(strings.Repeat("z", 64), "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a 65-character hash", transcodeBody(sourceSHA+"9", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a hash followed by a newline", transcodeBody(sourceSHA+"\\n", "h264-720p", 14, "s3://uploads/talk.mov", "renditions", nil)},
 		{"a zero duration", transcodeBody(sourceSHA, "h264-720p", 0, "s3://uploads/talk.mov", "renditions", nil)},
+		{"a negative duration", transcodeBody(sourceSHA, "h264-720p", -6, "s3://uploads/talk.mov", "renditions", nil)},
 		{"an empty uri", transcodeBody(sourceSHA, "h264-720p", 14, "", "renditions", nil)},
 		{"an empty bucket", transcodeBody(sourceSHA, "h264-720p", 14, "s3://uploads/talk.mov", "", nil)},
+		{"an empty prefix", noPrefix},
 	}
 	for _, b := range bad {
 		r := postJob(c, b.body, "t-1")
@@ -904,6 +937,8 @@ func CheckSourceHash(ctx *harness.Ctx) {
 	ctx.Equal(jobsCreated(ctx), 0, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created")
 	r := postJob(c, validBody(), "t-1")
 	ctx.Equal(r.Status, 201, "the valid submit (%s)", r.Text())
+	short := postJob(c, transcodeBody(strings.Repeat("7c", 32), "h264-720p", 0.5, "s3://uploads/talk.mov", "renditions", nil), "t-1")
+	ctx.Assert(short.Status == 201 && decodeJob(short).SegmentCount == 1, "a valid half-second source answered %d %s: any positive duration is one segment or more", short.Status, short.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -971,6 +1006,11 @@ void CheckDedupe(harness::Ctx& ctx) {
   const auto again = answerOf(retry);
   ctx.Assert(retry.Status == 200 && again.value("job_id", "") == first_id && again.value("deduped", false), "a retry of the same source and preset answered %d %s: it must answer the existing job %s with 200 and deduped true", retry.Status, retry.Text(), first_id);
   ctx.Equal(jobsCreated(ctx), 1L, "two submits of one source and preset must create one job (a second pays for the encode twice); jobs created");
+  const auto moved = postJob(c, transcodeBody(kSha, "h264-720p", 30, "s3://uploads/talk-copy.mov", "renditions"), "t-1");
+  const auto stored = answerOf(moved);
+  ctx.Assert(moved.Status == 200 && stored.value("job_id", "") == first_id && stored.value("segment_count", 0) == 3 && stored.value("deduped", false), "a retry of the same sha256 and preset from another uri with a 30-second duration answered %d %s: it must answer the existing job %s as stored (3 segments), 200 and deduped true", moved.Status, moved.Text(), first_id);
+  const auto other_source = postJob(c, transcodeBody(std::string(64, '7'), "h264-720p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Assert(other_source.Status == 201 && answerOf(other_source).value("job_id", "") != first_id, "another source of the same tenant and preset is another job, the submit answered %d %s", other_source.Status, other_source.Text());
   const auto other_preset = postJob(c, transcodeBody(kSha, "h265-1080p", 14, "s3://uploads/talk.mov", "renditions"), "t-1");
   ctx.Assert(other_preset.Status == 201 && answerOf(other_preset).value("job_id", "") != first_id, "another preset of the same source is another job, the submit answered %d %s", other_preset.Status, other_preset.Text());
   const auto other_tenant = postJob(c, validBody(), "t-2");
@@ -1003,14 +1043,20 @@ void CheckSourceHash(harness::Ctx& ctx) {
   auto c = submitter(ctx);
   std::string upper = kSha;
   for (char& ch : upper) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+  nlohmann::json no_prefix = validBody();
+  no_prefix["output"]["prefix"] = "";
   const std::vector<std::pair<std::string, nlohmann::json>> bad = {
       {"a short hash", transcodeBody("abc123", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
       {"an upper-case hash", transcodeBody(upper, "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
       {"a 63-character hash", transcodeBody(kSha.substr(0, 63), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
       {"a non-hex hash", transcodeBody(std::string(64, 'z'), "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a 65-character hash", transcodeBody(kSha + "9", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
+      {"a hash followed by a newline", transcodeBody(kSha + "\\n", "h264-720p", 14, "s3://uploads/talk.mov", "renditions")},
       {"a zero duration", transcodeBody(kSha, "h264-720p", 0, "s3://uploads/talk.mov", "renditions")},
+      {"a negative duration", transcodeBody(kSha, "h264-720p", -6, "s3://uploads/talk.mov", "renditions")},
       {"an empty uri", transcodeBody(kSha, "h264-720p", 14, "", "renditions")},
       {"an empty bucket", transcodeBody(kSha, "h264-720p", 14, "s3://uploads/talk.mov", "")},
+      {"an empty prefix", no_prefix},
   };
   for (const auto& [what, body] : bad) {
     const auto r = postJob(c, body, "t-1");
@@ -1019,6 +1065,8 @@ void CheckSourceHash(harness::Ctx& ctx) {
   ctx.Equal(jobsCreated(ctx), 0L, "invalid submits must create nothing (the dedupe key would be built from whatever arrived); jobs created");
   const auto r = postJob(c, validBody(), "t-1");
   ctx.Equal(r.Status, 201, "the valid submit (%s)", r.Text());
+  const auto short_source = postJob(c, transcodeBody(std::string(64, '7'), "h264-720p", 0.5, "s3://uploads/talk.mov", "renditions"), "t-1");
+  ctx.Assert(short_source.Status == 201 && answerOf(short_source).value("segment_count", 0) == 1, "a valid half-second source answered %d %s: any positive duration is one segment or more", short_source.Status, short_source.Text());
 }
 `,
   },

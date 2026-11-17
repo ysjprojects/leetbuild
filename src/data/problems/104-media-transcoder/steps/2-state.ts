@@ -23,8 +23,10 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
 - One atomic claim decides the winner: \`SET\` with \`NX\` and \`PX LEASE_MS\` (90 s) in one call,
   so a dead worker's segment is retaken once the lease runs out.
 - \`run_segment\` skips a segment that \`is_done\` (answers \`"skipped"\`), records done only after
-  \`encode\` returned, and releases the claim when \`encode\` raises.
-- \`manifest\` is computed from the done set against every index in \`range(segment_count)\`.`,
+  \`encode\` returned, and releases its claim when \`encode\` raises (only while the claim still names
+  this worker: a lease that ran out and was retaken stays with its new holder).
+- \`manifest\` is computed from the done set against every index in \`range(segment_count)\`, its
+  indices sorted as numbers.`,
   sequence: {
     participants: ['Worker A', 'Worker B', 'Redis', 'Encoder'],
     messages: [
@@ -68,7 +70,7 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
       id: 'done-after-encode',
       title: 'Done is recorded only after the encode returned',
       detail:
-        '`run_segment` calls `encode` before `mark_done`, and releases the claim when `encode` raises; the starter marks the segment done first, so a crash mid-encode leaves a hole the done set covers.',
+        '`run_segment` calls `encode` before `mark_done`, and releases its own claim when `encode` raises (a claim another worker retook after the lease ran out stays); the starter marks the segment done first, so a crash mid-encode leaves a hole the done set covers.',
       match: {
         python: {
           order: [/def run_segment/, /\bencode\(job_id, index\)/, /\bmark_done\(job_id, index\)/],
@@ -109,7 +111,7 @@ redelivered segment is encoded again; and the manifest calls a file with a hole 
       id: 'gapless-manifest',
       title: 'The manifest covers every expected index',
       detail:
-        'The manifest reads the done set (`SMEMBERS`) and reports every index of `range(segment_count)` it lacks as missing; a counter of completions counts a redelivered segment twice and calls a file with a hole complete.',
+        'The manifest reads the done set (`SMEMBERS`), sorts its indices as numbers and reports every index of `range(segment_count)` it lacks as missing; a counter of completions counts a redelivered segment twice and calls a file with a hole complete.',
       match: {
         python: {all: [/smembers\(/], none: [/transcode:count|\.incr\(/]},
         typescript: {all: [/smembers\(/], none: [/transcode:count|\.incr\(/]},
@@ -878,6 +880,11 @@ def check_lease_retake(ctx):
     assert m.claim(JOB, 2, "w-2") is False, "60 s into w-1's 90-second lease, w-2 took segment 2"
     ctx.clock.advance(31)
     assert m.claim(JOB, 2, "w-2") is True, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2"
+    # The lease is read right after the first command that took the claim: an expiry set by a second command leaves a window where a crash holds the segment forever.
+    at_claim = ctx.redis_after("transcode:claim:tj-1:7", lambda: ctx.redis.pttl("transcode:claim:tj-1:7"))
+    assert m.claim(JOB, 7, "w-1") is True, "the first claim of segment 7 must win"
+    assert at_claim.fired, "claim never touched transcode:claim:tj-1:7"
+    assert at_claim.result is not None and 0 < at_claim.result <= 90_000, f"right after the command that took segment 7 its PTTL was {at_claim.result}: a worker that crashes before a second command sets the expiry holds the segment forever. Set the lease in the claiming SET"
 
 
 def check_done_after_encode(ctx):
@@ -895,6 +902,19 @@ def check_done_after_encode(ctx):
     assert m.run_segment(JOB, 5, "w-1", ok) == "done", "a successful encode of segment 5 must answer 'done'"
     assert ok.done_during == [False], "segment 5 was already in the done set while it was still encoding: a crash at that moment leaves a hole marked done"
     assert ctx.redis.sismember("transcode:done:tj-1", 5), "after a successful encode segment 5 must be in the done set"
+
+    def outlived(job_id, index):
+        # w-1's encode outlives its lease, w-2 retakes the segment, then w-1's encode fails.
+        ctx.clock.advance(91)
+        assert m.claim(job_id, index, "w-2") is True, "w-1's lease ran out mid-encode but w-2 could not retake segment 8"
+        raise RuntimeError(f"worker lost while encoding segment {index}")
+
+    try:
+        m.run_segment(JOB, 8, "w-1", outlived)
+    except RuntimeError:
+        pass
+    holder = ctx.redis.get("transcode:claim:tj-1:8")
+    assert holder == "w-2", f"w-1's encode of segment 8 failed after its lease ran out and w-2 retook the segment; the claim now names {holder!r}: releasing must give back only a claim this worker still holds"
 
 
 def check_done_skip(ctx):
@@ -922,6 +942,16 @@ def check_gapless_manifest(ctx):
     got = m.manifest(JOB, 4)
     want = {"segment_count": 4, "done": [0, 1, 2, 3], "missing": [], "complete": True}
     assert got == want, f"with every segment done the manifest says {got}, expected {want}"
+    for i in range(12):
+        if i != 9:
+            m.mark_done("tj-2", i)
+    got = m.manifest("tj-2", 12)
+    want = {"segment_count": 12, "done": [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11], "missing": [9], "complete": False}
+    assert got == want, f"segments 0 to 11 but 9 of 12 are done and the manifest says {got}, expected {want}: indices sort as numbers"
+    for i in (0, 1, 2, 5):
+        m.mark_done("tj-3", i)
+    got = m.manifest("tj-3", 4)
+    assert got["missing"] == [3] and got["complete"] is False, f"segments 0, 1, 2 and a stray 5 of 4 are done and the manifest says {got}: segment 3 is missing, so the file is not complete"
 `,
     typescript: `const JOB = 'tj-1';
 
@@ -960,6 +990,12 @@ export async function check_lease_retake(ctx) {
   assert.equal(await m.claim(JOB, 2, 'w-2'), false, "60 s into w-1's 90-second lease, w-2 took segment 2");
   ctx.clock.advance(31);
   assert.equal(await m.claim(JOB, 2, 'w-2'), true, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2");
+  // The lease is read right after the first command that took the claim: an expiry set by a second command leaves a window where a crash holds the segment forever.
+  const atClaim = ctx.redisAfter('transcode:claim:tj-1:7', () => Number(ctx.redis.pttl('transcode:claim:tj-1:7')));
+  assert.equal(await m.claim(JOB, 7, 'w-1'), true, 'the first claim of segment 7 must win');
+  assert(atClaim.fired, 'claim never touched transcode:claim:tj-1:7');
+  const leaseAtClaim = await atClaim.result;
+  assert(leaseAtClaim > 0 && leaseAtClaim <= 90_000, \`right after the command that took segment 7 its PTTL was \${leaseAtClaim}: a worker that crashes before a second command sets the expiry holds the segment forever. Set the lease in the claiming SET\`);
 }
 
 export async function check_done_after_encode(ctx) {
@@ -972,6 +1008,15 @@ export async function check_done_after_encode(ctx) {
   assert.equal(await m.runSegment(JOB, 5, 'w-1', ok.encode), 'done', "a successful encode of segment 5 must answer 'done'");
   assert.deepStrictEqual(ok.doneDuring, [false], 'segment 5 was already in the done set while it was still encoding: a crash at that moment leaves a hole marked done');
   assert.equal(Number(ctx.redis.sismember('transcode:done:tj-1', '5')), 1, 'after a successful encode segment 5 must be in the done set');
+  // w-1's encode outlives its lease, w-2 retakes the segment, then w-1's encode fails.
+  const outlived = async (jobId: string, index: number): Promise<void> => {
+    ctx.clock.advance(91);
+    assert.equal(await m.claim(jobId, index, 'w-2'), true, "w-1's lease ran out mid-encode but w-2 could not retake segment 8");
+    throw new Error(\`worker lost while encoding segment \${index}\`);
+  };
+  await m.runSegment(JOB, 8, 'w-1', outlived).catch(() => undefined);
+  const holder = ctx.redis.get('transcode:claim:tj-1:8');
+  assert.equal(holder, 'w-2', \`w-1's encode of segment 8 failed after its lease ran out and w-2 retook the segment; the claim now names \${JSON.stringify(holder)}: releasing must give back only a claim this worker still holds\`);
 }
 
 export async function check_done_skip(ctx) {
@@ -999,6 +1044,13 @@ export async function check_gapless_manifest(ctx) {
   got = await m.manifest(JOB, 4);
   want = {segment_count: 4, done: [0, 1, 2, 3], missing: [], complete: true};
   assert.deepStrictEqual(got, want, \`with every segment done the manifest says \${JSON.stringify(got)}, expected \${JSON.stringify(want)}\`);
+  for (let i = 0; i < 12; i++) if (i !== 9) await m.markDone('tj-2', i);
+  got = await m.manifest('tj-2', 12);
+  want = {segment_count: 12, done: [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11], missing: [9], complete: false};
+  assert.deepStrictEqual(got, want, \`segments 0 to 11 but 9 of 12 are done and the manifest says \${JSON.stringify(got)}, expected \${JSON.stringify(want)}: indices sort as numbers\`);
+  for (const i of [0, 1, 2, 5]) await m.markDone('tj-3', i);
+  got = await m.manifest('tj-3', 4);
+  assert(JSON.stringify(got.missing) === '[3]' && got.complete === false, \`segments 0, 1, 2 and a stray 5 of 4 are done and the manifest says \${JSON.stringify(got)}: segment 3 is missing, so the file is not complete\`);
 }
 `,
     go: `package main
@@ -1066,6 +1118,12 @@ func CheckLeaseRetake(ctx *harness.Ctx) {
 	ctx.Equal(mustClaim(ctx, 2, "w-2"), false, "60 s into w-1's 90-second lease, w-2 must not take segment 2; won")
 	ctx.Clock.Advance(31)
 	ctx.Equal(mustClaim(ctx, 2, "w-2"), true, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2; won")
+	// The lease is read right after the first command that took the claim: an expiry set by a second command leaves a window where a crash holds the segment forever.
+	atClaim := ctx.Redis.After("transcode:claim:tj-1:7", func() any { return ctx.Redis.PTTL("transcode:claim:tj-1:7") })
+	ctx.Equal(mustClaim(ctx, 7, "w-1"), true, "the first claim of segment 7 must win; won")
+	ctx.Assert(atClaim.Fired, "claim never touched transcode:claim:tj-1:7")
+	leaseAtClaim, _ := atClaim.Result.(int64)
+	ctx.Assert(leaseAtClaim > 0 && leaseAtClaim <= 90000, "right after the command that took segment 7 its PTTL was %v: a worker that crashes before a second command sets the expiry holds the segment forever. Set the lease in the claiming SET", atClaim.Result)
 }
 
 func CheckDoneAfterEncode(ctx *harness.Ctx) {
@@ -1080,6 +1138,15 @@ func CheckDoneAfterEncode(ctx *harness.Ctx) {
 	ctx.Equal(status, "done", "a successful encode of segment 5")
 	ctx.Equal(ok.doneDuring, []bool{false}, "segment 5 was already in the done set while it was still encoding (a crash then leaves a hole marked done); done during the encode")
 	ctx.Assert(ctx.Redis.SIsMember("transcode:done:tj-1", "5"), "after a successful encode segment 5 must be in the done set")
+	// w-1's encode outlives its lease, w-2 retakes the segment, then w-1's encode fails.
+	outlived := func(jobID string, index int) error {
+		ctx.Clock.Advance(91)
+		ctx.Equal(mustClaim(ctx, index, "w-2"), true, "w-1's lease ran out mid-encode, so w-2 must retake segment 8; won")
+		return errors.New("worker lost while encoding the segment")
+	}
+	runSegment(stateBg, stateJob, 8, "w-1", outlived)
+	holder, _ := ctx.Redis.Get("transcode:claim:tj-1:8")
+	ctx.Equal(holder, "w-2", "w-1's encode of segment 8 failed after its lease ran out and w-2 retook the segment: releasing must give back only a claim this worker still holds; the claim names")
 }
 
 func CheckDoneSkip(ctx *harness.Ctx) {
@@ -1107,6 +1174,18 @@ func CheckGaplessManifest(ctx *harness.Ctx) {
 	markDone(stateBg, stateJob, 3)
 	got, _ = manifest(stateBg, stateJob, 4)
 	ctx.Equal(got, Coverage{SegmentCount: 4, Done: []int{0, 1, 2, 3}, Missing: []int{}, Complete: true}, "with every segment done, the manifest")
+	for i := 0; i < 12; i++ {
+		if i != 9 {
+			markDone(stateBg, "tj-2", i)
+		}
+	}
+	got, _ = manifest(stateBg, "tj-2", 12)
+	ctx.Equal(got, Coverage{SegmentCount: 12, Done: []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11}, Missing: []int{9}, Complete: false}, "segments 0 to 11 but 9 of 12 are done (indices sort as numbers): the manifest")
+	for _, i := range []int{0, 1, 2, 5} {
+		markDone(stateBg, "tj-3", i)
+	}
+	got, _ = manifest(stateBg, "tj-3", 4)
+	ctx.Assert(len(got.Missing) == 1 && got.Missing[0] == 3 && !got.Complete, "segments 0, 1, 2 and a stray 5 of 4 are done and the manifest says missing %v, complete %v: segment 3 is missing, so the file is not complete", got.Missing, got.Complete)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1163,6 +1242,16 @@ void CheckLeaseRetake(harness::Ctx& ctx) {
   ctx.Equal(claim(kJob, 2, "w-2"), false, "60 s into w-1's 90-second lease, w-2 must not take segment 2; won");
   ctx.Clock.Advance(31);
   ctx.Equal(claim(kJob, 2, "w-2"), true, "w-1 died and its 90-second lease ran out: w-2 must retake segment 2; won");
+  // The lease is read right after the first command that took the claim: an expiry set by a second command leaves a window where a crash holds the segment forever.
+  auto lease_fired = std::make_shared<bool>(false);
+  auto lease_at_claim = std::make_shared<long long>(0);
+  ctx.Redis.After("transcode:claim:tj-1:7", [&ctx, lease_fired, lease_at_claim] {
+    *lease_fired = true;
+    *lease_at_claim = ctx.Redis.PTTL("transcode:claim:tj-1:7");
+  });
+  ctx.Equal(claim(kJob, 7, "w-1"), true, "the first claim of segment 7 must win; won");
+  ctx.Assert(*lease_fired, "claim never touched transcode:claim:tj-1:7");
+  ctx.Assert(*lease_at_claim > 0 && *lease_at_claim <= 90000, "right after the command that took segment 7 its PTTL was %d: a worker that crashes before a second command sets the expiry holds the segment forever. Set the lease in the claiming SET", *lease_at_claim);
 }
 
 void CheckDoneAfterEncode(harness::Ctx& ctx) {
@@ -1181,6 +1270,16 @@ void CheckDoneAfterEncode(harness::Ctx& ctx) {
   ctx.Equal(runSegment(kJob, 5, "w-1", encoder(ctx, ok)), "done", "a successful encode of segment 5");
   ctx.Equal(ok.done_during, std::vector<bool>{false}, "segment 5 was already in the done set while it was still encoding (a crash then leaves a hole marked done); done during the encode");
   ctx.Assert(ctx.Redis.SIsMember("transcode:done:tj-1", "5"), "after a successful encode segment 5 must be in the done set");
+  // w-1's encode outlives its lease, w-2 retakes the segment, then w-1's encode fails.
+  try {
+    runSegment(kJob, 8, "w-1", [&ctx](const std::string& job_id, int index) {
+      ctx.Clock.Advance(91);
+      ctx.Equal(claim(job_id, index, "w-2"), true, "w-1's lease ran out mid-encode, so w-2 must retake segment 8; won");
+      throw std::runtime_error("worker lost while encoding segment " + std::to_string(index));
+    });
+  } catch (const std::runtime_error&) {
+  }
+  ctx.Equal(ctx.Redis.Get("transcode:claim:tj-1:8").value_or(""), std::string("w-2"), "w-1's encode of segment 8 failed after its lease ran out and w-2 retook the segment: releasing must give back only a claim this worker still holds; the claim names");
 }
 
 void CheckDoneSkip(harness::Ctx& ctx) {
@@ -1206,6 +1305,15 @@ void CheckGaplessManifest(harness::Ctx& ctx) {
   markDone(kJob, 3);
   got = manifest(kJob, 4);
   ctx.Assert(got.done == std::vector<int>{0, 1, 2, 3} && got.missing.empty() && got.complete, "with every segment done the manifest says done %v, missing %v, complete %t", got.done, got.missing, got.complete);
+  for (int i = 0; i < 12; ++i) {
+    if (i != 9) markDone("tj-2", i);
+  }
+  got = manifest("tj-2", 12);
+  ctx.Assert(got.done == std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11} && got.missing == std::vector<int>{9} && !got.complete,
+             "segments 0 to 11 but 9 of 12 are done and the manifest says done %v, missing %v, complete %t: indices sort as numbers (done [0 1 2 3 4 5 6 7 8 10 11], missing [9], not complete)", got.done, got.missing, got.complete);
+  for (const int i : {0, 1, 2, 5}) markDone("tj-3", i);
+  got = manifest("tj-3", 4);
+  ctx.Assert(got.missing == std::vector<int>{3} && !got.complete, "segments 0, 1, 2 and a stray 5 of 4 are done and the manifest says missing %v, complete %t: segment 3 is missing, so the file is not complete", got.missing, got.complete);
 }
 `,
   },

@@ -60,7 +60,7 @@ announced anyway; a lost acknowledgement writes the event twice; a broker error 
       id: 'ids-only',
       title: 'Carries ids and enums, not request content',
       detail:
-        'The payload is `{request_id, step, actor, decision, status}`; the request’s `why` and amount stay in the request store, out of a retained, replicated topic.',
+        'The payload is `{request_id, step, actor, decision, status}`, with `status` taken from the outcome (`pending`, `approved` after the last step, `rejected`); the request’s `why` and amount stay in the request store, out of a retained, replicated topic.',
       match: {
         python: {all: [/["']status["']\s*:/], none: [/["']why["']/, /amount_cents/]},
         typescript: {all: [/\bstatus:/], none: [/\.why\b|\bwhy:/, /amount_cents/]},
@@ -99,7 +99,7 @@ announced anyway; a lost acknowledgement writes the event twice; a broker error 
       id: 'outbox-on-failure',
       title: 'Waits for the delivery report and falls back to the outbox',
       detail:
-        'A failed delivery, or no report within 2 s, leaves an outbox row with the topic, the key and the payload; the committed decision stands. The starter fires and forgets.',
+        'A failed delivery, or no report within 2 s, leaves one outbox row with the topic, the key and the payload; a delivered event leaves none, and the committed decision stands. The starter fires and forgets.',
       match: {
         python: {all: [/outbox\.insert\(/, /on_delivery\s*=/, /\.flush\(/]},
         typescript: {all: [/outbox\.insert\(/, /await producer\.send\(/, /catch/]},
@@ -565,6 +565,11 @@ def check_ids_only(ctx):
     event = json.loads(values[0])
     expected = {"request_id": "r-1", "step": 0, "actor": "u-mgr", "decision": "approved", "status": "pending"}
     assert event == expected, f"the event is {event}, expected {expected}"
+    m.record_decision("r-2", 0, "u-mgr", "approved")
+    m.record_decision("r-2", 1, "u-dir", "approved")
+    m.record_decision("r-1", 1, "u-dir", "rejected")
+    statuses = [(e["request_id"], e["step"], e["status"]) for e in (json.loads(r.value) for r in ctx.kafka.records(TOPIC)[1:])]
+    assert statuses == [("r-2", 0, "pending"), ("r-2", 1, "approved"), ("r-1", 1, "rejected")], f"the events carry (request_id, step, status) {statuses}, expected the status each outcome answered: pending, approved (r-2's last step), rejected"
 
 
 def check_commit_first(ctx):
@@ -591,17 +596,20 @@ def check_idempotent_acks(ctx):
 
 def check_outbox_on_failure(ctx):
     m = _events(ctx)
+    m.record_decision("r-2", 0, "u-mgr", "approved")
+    assert _outbox(ctx) == [] and len(ctx.kafka.records(TOPIC)) == 1, f"a delivered event left outbox rows {_outbox(ctx)}: the relay would publish it a second time"
     ctx.kafka.fail_next(TOPIC, 1)
     outcome = m.record_decision("r-1", 0, "u-mgr", "approved")
     rows = _outbox(ctx)
     assert len(rows) == 1, f"the delivery failed and the outbox holds {len(rows)} rows: without a row the trail never hears of the decision"
-    assert rows[0].get("topic") == TOPIC and rows[0].get("key") == "r-1" and rows[0].get("payload", {}).get("step") == 0, f"the outbox row is {rows[0]}, expected the topic, the key r-1 and the payload"
+    expected = {"topic": TOPIC, "key": "r-1", "payload": {"request_id": "r-1", "step": 0, "actor": "u-mgr", "decision": "approved", "status": "pending"}}
+    assert rows[0] == expected, f"the outbox row is {rows[0]}, expected {expected}"
     assert outcome.get("advanced") is True and ctx.redis.hget("approval:r-1:state", "step_index") == "1", f"the decision must stay committed when only the produce failed, got {outcome}"
     ctx.kafka.stall(TOPIC)  # the broker stops answering
     before = ctx.clock.time()
     m.record_decision("r-1", 1, "u-dir", "approved")
     waited = ctx.clock.time() - before
-    assert waited <= 5, f"record_decision waited {waited:.0f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
+    assert waited <= 2.5, f"record_decision waited {waited:.1f} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row"
     rows = _outbox(ctx)
     assert len(rows) == 2 and rows[1].get("payload", {}).get("step") == 1, f"no delivery report within the window and the outbox holds {rows}"
 `,
@@ -649,6 +657,12 @@ export async function check_ids_only(ctx) {
   assert(!values[0].includes(WHY) && !values[0].includes('1250000'), \`the event carries the request's content: \${values[0]}\`);
   const expected = {request_id: 'r-1', step: 0, actor: 'u-mgr', decision: 'approved', status: 'pending'};
   assert.deepEqual(JSON.parse(values[0]), expected, \`the event is \${values[0]}, expected \${JSON.stringify(expected)}\`);
+  await m.recordDecision('r-2', 0, 'u-mgr', 'approved');
+  await m.recordDecision('r-2', 1, 'u-dir', 'approved');
+  await m.recordDecision('r-1', 1, 'u-dir', 'rejected');
+  await settle();
+  const statuses = ctx.kafka.values(TOPIC).slice(1).map(v => { const e = JSON.parse(v); return \`\${e.request_id}/\${e.step}/\${e.status}\`; });
+  assert.deepEqual(statuses, ['r-2/0/pending', 'r-2/1/approved', 'r-1/1/rejected'], \`the events carry (request_id/step/status) \${JSON.stringify(statuses)}, expected the status each outcome answered: pending, approved (r-2's last step), rejected\`);
 }
 
 export async function check_commit_first(ctx) {
@@ -679,18 +693,22 @@ export async function check_idempotent_acks(ctx) {
 
 export async function check_outbox_on_failure(ctx) {
   const m = await events(ctx);
+  await m.recordDecision('r-2', 0, 'u-mgr', 'approved');
+  await settle();
+  assert(outboxRows(ctx).length === 0 && ctx.kafka.records(TOPIC).length === 1, \`a delivered event left outbox rows \${JSON.stringify(outboxRows(ctx))}: the relay would publish it a second time\`);
   ctx.kafka.failNext(TOPIC, 1);
   const outcome = await m.recordDecision('r-1', 0, 'u-mgr', 'approved');
   await settle();
   let rows = outboxRows(ctx);
   assert.equal(rows.length, 1, \`the delivery failed and the outbox holds \${rows.length} rows: without a row the trail never hears of the decision\`);
-  assert(rows[0].topic === TOPIC && rows[0].key === 'r-1' && rows[0].payload?.step === 0, \`the outbox row is \${JSON.stringify(rows[0])}, expected the topic, the key r-1 and the payload\`);
+  const expected = {topic: TOPIC, key: 'r-1', payload: {request_id: 'r-1', step: 0, actor: 'u-mgr', decision: 'approved', status: 'pending'}};
+  assert.deepEqual(rows[0], expected, \`the outbox row is \${JSON.stringify(rows[0])}, expected \${JSON.stringify(expected)}\`);
   assert(outcome.advanced === true && ctx.redis.hget('approval:r-1:state', 'step_index') === '1', \`the decision must stay committed when only the produce failed, got \${JSON.stringify(outcome)}\`);
   ctx.kafka.stall(TOPIC); // the broker stops answering
   const before = ctx.clock.now();
   await m.recordDecision('r-1', 1, 'u-dir', 'approved');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 5, \`recordDecision waited \${waited.toFixed(0)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
+  assert(waited <= 2.5, \`recordDecision waited \${waited.toFixed(1)} s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row\`);
   rows = outboxRows(ctx);
   assert(rows.length === 2 && rows[1].payload?.step === 1, \`no delivery report within the window and the outbox holds \${JSON.stringify(rows)}\`);
 }
@@ -700,6 +718,7 @@ export async function check_outbox_on_failure(ctx) {
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"approvals/chain"
@@ -767,6 +786,18 @@ func CheckIdsOnly(ctx *harness.Ctx) {
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(values[0]), &event), "the event must be JSON")
 	ctx.Equal(event, map[string]any{"request_id": "r-1", "step": 0.0, "actor": "u-mgr", "decision": "approved", "status": "pending"}, "the event")
+	eventsDecide(ctx, "r-2", 0, "u-mgr")
+	eventsDecide(ctx, "r-2", 1, "u-dir")
+	_, err := recordDecision(eventsBg, "r-1", 1, "u-dir", "rejected")
+	ctx.NoError(err, "recordDecision(r-1, 1, u-dir, rejected)")
+	ctx.Settle()
+	var statuses []string
+	for _, value := range ctx.Kafka.Values(eventsTopic)[1:] {
+		var e map[string]any
+		ctx.NoError(json.Unmarshal([]byte(value), &e), "the event must be JSON")
+		statuses = append(statuses, fmt.Sprintf("%v/%v/%v", e["request_id"], e["step"], e["status"]))
+	}
+	ctx.Equal(statuses, []string{"r-2/0/pending", "r-2/1/approved", "r-1/1/rejected"}, "each event carries the status its outcome answered: pending, approved (r-2's last step), rejected; the events' request_id/step/status")
 }
 
 func CheckCommitFirst(ctx *harness.Ctx) {
@@ -797,19 +828,22 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 
 func CheckOutboxOnFailure(ctx *harness.Ctx) {
 	eventsSetup(ctx)
+	eventsDecide(ctx, "r-2", 0, "u-mgr")
+	ctx.Settle()
+	ctx.Assert(len(eventsOutbox(ctx)) == 0 && len(ctx.Kafka.Records(eventsTopic)) == 1, "a delivered event left outbox rows %+v: the relay would publish it a second time", eventsOutbox(ctx))
 	ctx.Kafka.FailNext(eventsTopic, 1)
 	outcome := eventsDecide(ctx, "r-1", 0, "u-mgr")
 	ctx.Settle()
 	rows := eventsOutbox(ctx)
 	ctx.Equal(len(rows), 1, "the delivery failed: without an outbox row the trail never hears of the decision; the rows")
-	ctx.Assert(rows[0].Topic == eventsTopic && rows[0].Key == "r-1" && rows[0].Payload["step"] == 0.0, "the outbox row is %+v, expected the topic, the key r-1 and the payload", rows[0])
+	ctx.Equal(rows[0], eventsRow{Topic: eventsTopic, Key: "r-1", Payload: map[string]any{"request_id": "r-1", "step": 0.0, "actor": "u-mgr", "decision": "approved", "status": "pending"}}, "the outbox row (topic, key r-1 and the event as payload)")
 	index, _ := ctx.Redis.HGet("approval:r-1:state", "step_index")
 	ctx.Assert(outcome.Advanced && index == "1", "the decision must stay committed when only the produce failed, got %+v", outcome)
 	ctx.Kafka.Stall(eventsTopic) // the broker stops answering
 	before := ctx.Clock.Now()
 	eventsDecide(ctx, "r-1", 1, "u-dir")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 5, "recordDecision waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
+	ctx.Assert(waited <= 2.5, "recordDecision waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited)
 	rows = eventsOutbox(ctx)
 	ctx.Assert(len(rows) == 2 && rows[1].Payload["step"] == 1.0, "no delivery report within the window and the outbox holds %+v", rows)
 }
@@ -828,12 +862,12 @@ func CheckOutboxOnFailure(ctx *harness.Ctx) {
 namespace {
 
 const std::string kEventsTopic = "approval.event";
-const std::string kWhy = "offsite for the platform team";
+const std::string kEventsWhy = "offsite for the platform team";
 
 void eventsSetup() {
   const std::vector<std::pair<std::string, std::vector<std::string>>> requests = {{"r-1", {"u-mgr", "u-dir", "u-cfo"}}, {"r-2", {"u-mgr", "u-dir"}}};
   for (const auto& [request_id, approvers] : requests) {
-    store::put(store::Request{request_id, "t-acme", "u-req", "spend", 3, approvers, kWhy, 1250000}, "");
+    store::put(store::Request{request_id, "t-acme", "u-req", "spend", 3, approvers, kEventsWhy, 1250000}, "");
     chain::startChain(request_id, approvers);
   }
 }
@@ -872,9 +906,20 @@ void CheckIdsOnly(harness::Ctx& ctx) {
   ctx.Settle();
   const auto values = ctx.Kafka.Values(kEventsTopic);
   ctx.Equal(values.size(), 1, "one decision must produce one record; the records");
-  ctx.Assert(values[0].find(kWhy) == std::string::npos && values[0].find("1250000") == std::string::npos, "the event carries the request's content: %s", values[0]);
+  ctx.Assert(values[0].find(kEventsWhy) == std::string::npos && values[0].find("1250000") == std::string::npos, "the event carries the request's content: %s", values[0]);
   const nlohmann::json expected = {{"request_id", "r-1"}, {"step", 0}, {"actor", "u-mgr"}, {"decision", "approved"}, {"status", "pending"}};
   ctx.Equal(nlohmann::json::parse(values[0], nullptr, false), expected, "the event");
+  recordDecision("r-2", 0, "u-mgr", "approved");
+  recordDecision("r-2", 1, "u-dir", "approved");
+  recordDecision("r-1", 1, "u-dir", "rejected");
+  ctx.Settle();
+  std::vector<std::string> statuses;
+  const auto all = ctx.Kafka.Values(kEventsTopic);
+  for (size_t i = 1; i < all.size(); i++) {
+    const auto e = nlohmann::json::parse(all[i], nullptr, false);
+    statuses.push_back(e.is_object() ? e.value("request_id", "") + "/" + std::to_string(e.value("step", -1)) + "/" + e.value("status", "") : all[i]);
+  }
+  ctx.Equal(statuses, std::vector<std::string>{"r-2/0/pending", "r-2/1/approved", "r-1/1/rejected"}, "each event carries the status its outcome answered: pending, approved (r-2's last step), rejected; the events' request_id/step/status");
 }
 
 void CheckCommitFirst(harness::Ctx& ctx) {
@@ -906,18 +951,22 @@ void CheckIdempotentAcks(harness::Ctx& ctx) {
 
 void CheckOutboxOnFailure(harness::Ctx& ctx) {
   eventsSetup();
+  recordDecision("r-2", 0, "u-mgr", "approved");
+  ctx.Settle();
+  ctx.Assert(eventsOutbox(ctx).empty() && ctx.Kafka.Records(kEventsTopic).size() == 1, "a delivered event left %d outbox rows: the relay would publish it a second time", eventsOutbox(ctx).size());
   ctx.Kafka.FailNext(kEventsTopic, 1);
   const chain::Outcome outcome = recordDecision("r-1", 0, "u-mgr", "approved");
   ctx.Settle();
   auto rows = eventsOutbox(ctx);
   ctx.Equal(rows.size(), 1, "the delivery failed: without an outbox row the trail never hears of the decision; the rows");
-  ctx.Assert(rows[0].value("topic", "") == kEventsTopic && rows[0].value("key", "") == "r-1" && payloadStep(rows[0]) == 0, "the outbox row is %s, expected the topic, the key r-1 and the payload", rows[0].dump());
+  const nlohmann::json expected = {{"topic", kEventsTopic}, {"key", "r-1"}, {"payload", {{"request_id", "r-1"}, {"step", 0}, {"actor", "u-mgr"}, {"decision", "approved"}, {"status", "pending"}}}};
+  ctx.Assert(rows[0] == expected, "the outbox row is %s, expected %s", rows[0].dump(), expected.dump());
   ctx.Assert(outcome.advanced && ctx.Redis.HGet("approval:r-1:state", "step_index") == std::optional<std::string>("1"), "the decision must stay committed when only the produce failed");
   ctx.Kafka.Stall(kEventsTopic);  // the broker stops answering
   const int64_t before = ctx.Clock.Now();
   recordDecision("r-1", 1, "u-dir", "approved");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 5, "recordDecision waited %.0f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
+  ctx.Assert(waited <= 2.5, "recordDecision waited %.1f s for a broker that does not answer: wait for the report at most 2 s, then write the outbox row", waited);
   rows = eventsOutbox(ctx);
   ctx.Assert(rows.size() == 2 && payloadStep(rows[1]) == 1, "no delivery report within the window and the outbox holds %d rows", rows.size());
 }

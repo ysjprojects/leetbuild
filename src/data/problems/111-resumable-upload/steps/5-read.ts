@@ -72,7 +72,7 @@ told about.
       id: 'tenant-scope',
       title: "Another tenant's upload is 404",
       detail:
-        "The upload's tenant is compared with `X-Tenant-Id` (401 when absent), and another tenant's upload answers 404 like an unknown id; the starter reads no tenant, so an upload id from a log opens any tenant's upload.",
+        "The upload's tenant is compared with `X-Tenant-Id` (401 when absent), and another tenant's upload answers the same 404 as an unknown id; the starter reads no tenant, so an upload id from a log opens any tenant's upload.",
       match: {
         python: {all: [/x-tenant-id/i, /\[["']tenant["']\]\s*!=\s*tenant|tenant\s*!=\s*upload\[["']tenant["']\]/]},
         typescript: {all: [/x-tenant-id/i, /\.tenant\s*!==\s*tenant|tenant\s*!==\s*upload\.tenant/]},
@@ -536,6 +536,7 @@ async def check_tenant_scope(ctx):
         anonymous = await c.get("/v1/uploads/u-1")
     assert foreign.status_code == 404, f"tenant t2 read t1's upload u-1 and got {foreign.status_code}: {foreign.text}. Upload ids leak through logs and URLs; another tenant's upload is 404"
     assert unknown.status_code == 404, f"an unknown upload id answered {unknown.status_code}, expected 404"
+    assert foreign.text.replace("u-1", "u-9") == unknown.text, f"another tenant's upload answered {foreign.text!r} and an unknown id {unknown.text!r}: the two must be indistinguishable, or the answer confirms that the id exists"
     assert anonymous.status_code == 401, f"a read without X-Tenant-Id answered {anonymous.status_code}, expected 401"
 
 
@@ -601,6 +602,7 @@ export async function check_tenant_scope(ctx) {
   const anonymous = await c.get('/v1/uploads/u-1');
   assert.equal(foreign.status, 404, \`tenant t2 read t1's upload u-1 and got \${foreign.status}: \${foreign.text}. Upload ids leak through logs and URLs; another tenant's upload is 404\`);
   assert.equal(unknown.status, 404, \`an unknown upload id answered \${unknown.status}, expected 404\`);
+  assert.equal(foreign.text.replaceAll('u-1', 'u-9'), unknown.text, \`another tenant's upload answered \${foreign.text} and an unknown id \${unknown.text}: the two must be indistinguishable, or the answer confirms that the id exists\`);
   assert.equal(anonymous.status, 401, \`a read without X-Tenant-Id answered \${anonymous.status}, expected 401\`);
 }
 
@@ -621,6 +623,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"uploads/manifest"
 	"uploads/store"
@@ -628,58 +631,58 @@ import (
 	"leetbuild/harness"
 )
 
-const readMib = int64(1) << 20
+const hMib = int64(1) << 20
 
-var readBg = context.Background()
+var hReadBg = context.Background()
 
-type partSeen struct {
+type hPartSeen struct {
 	PartNumber int    \`json:"part_number"\`
 	Size       int64  \`json:"size"\`
 	Checksum   string \`json:"checksum"\`
 }
 
-type statusSeen struct {
+type hStatusSeen struct {
 	UploadID      string     \`json:"upload_id"\`
 	Status        string     \`json:"status"\`
 	PartCount     int        \`json:"part_count"\`
 	UploadedBytes int64      \`json:"uploaded_bytes"\`
-	Stored        []partSeen \`json:"stored"\`
+	Stored        []hPartSeen \`json:"stored"\`
 	Resume        []int      \`json:"resume"\`
 }
 
-// partSize: 23 MiB in 5 MiB parts, the fifth holds 3 MiB.
-func partSize(n int) int64 {
+// hPartSize: 23 MiB in 5 MiB parts, the fifth holds 3 MiB.
+func hPartSize(n int) int64 {
 	if n == 5 {
-		return 3 * readMib
+		return 3 * hMib
 	}
-	return 5 * readMib
+	return 5 * hMib
 }
 
-func registerSeed(ctx *harness.Ctx, n int) {
-	_, err := manifest.RegisterPart(readBg, "u-1", n, 5, partSize(n), fmt.Sprintf("c%d", n))
+func hRegisterSeed(ctx *harness.Ctx, n int) {
+	_, err := manifest.RegisterPart(hReadBg, "u-1", n, 5, hPartSize(n), fmt.Sprintf("c%d", n))
 	ctx.NoError(err, "registering part %d", n)
 }
 
-// reader makes u-1 of tenant t1, 23 MiB in five parts, with the given parts registered.
-func reader(ctx *harness.Ctx, parts ...int) *harness.HTTP {
-	store.CreateUpload(readBg, "t1", 23*readMib, 5*readMib, 5, "video/mp4")
+// hReader makes u-1 of tenant t1, 23 MiB in five parts, with the given parts registered.
+func hReader(ctx *harness.Ctx, parts ...int) *harness.HTTP {
+	store.CreateUpload(hReadBg, "t1", 23*hMib, 5*hMib, 5, "video/mp4")
 	for _, n := range parts {
-		registerSeed(ctx, n)
+		hRegisterSeed(ctx, n)
 	}
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-// rival is another server registering part n of u-1 (one script: the hash and the counter at once).
-func rival(ctx *harness.Ctx, n int) {
-	ctx.Redis.Do("HSET", "upload:u-1:parts", n, fmt.Sprintf("%d:c%d", partSize(n), n))
-	ctx.Redis.Do("INCRBY", "upload:u-1:bytes", partSize(n))
+// hRival is another server registering part n of u-1 (one script: the hash and the counter at once).
+func hRival(ctx *harness.Ctx, n int) {
+	ctx.Redis.Do("HSET", "upload:u-1:parts", n, fmt.Sprintf("%d:c%d", hPartSize(n), n))
+	ctx.Redis.Do("INCRBY", "upload:u-1:bytes", hPartSize(n))
 }
 
-func status(c *harness.HTTP) (*harness.Response, statusSeen) {
+func hStatus(c *harness.HTTP) (*harness.Response, hStatusSeen) {
 	r := c.Get("/v1/uploads/u-1", "X-Tenant-Id", "t1")
-	var body statusSeen
+	var body hStatusSeen
 	if r.Status == 200 {
 		r.Decode(&body)
 	}
@@ -687,20 +690,20 @@ func status(c *harness.HTTP) (*harness.Response, statusSeen) {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	r, body := status(reader(ctx, 1, 2, 4))
+	r, body := hStatus(hReader(ctx, 1, 2, 4))
 	ctx.Equal(r.Status, 200, "GET /v1/uploads/u-1 (%s)", r.Text())
 	ctx.Assert(body.UploadID == "u-1" && body.PartCount == 5 && body.Status == "pending", "the read answered %s, expected upload_id u-1, part_count 5, status pending", r.Text())
 }
 
 func CheckResumeList(ctx *harness.Ctx) {
-	c := reader(ctx, 1, 2, 4)
-	r, body := status(c)
+	c := hReader(ctx, 1, 2, 4)
+	r, body := hStatus(c)
 	ctx.Assert(fmt.Sprint(body.Resume) == "[3 5]", "with parts 1, 2 and 4 of 5 registered the read answered %s: resume must be exactly [3, 5], or the client sends the whole file again", r.Text())
-	want := []partSeen{{1, partSize(1), "c1"}, {2, partSize(2), "c2"}, {4, partSize(4), "c4"}}
+	want := []hPartSeen{{1, hPartSize(1), "c1"}, {2, hPartSize(2), "c2"}, {4, hPartSize(4), "c4"}}
 	ctx.Equal(body.Stored, want, "stored must list parts 1, 2 and 4 with their sizes and checksums")
-	registerSeed(ctx, 3)
-	registerSeed(ctx, 5)
-	r, done := status(c)
+	hRegisterSeed(ctx, 3)
+	hRegisterSeed(ctx, 5)
+	r, done := hStatus(c)
 	var numbers []int
 	for _, p := range done.Stored {
 		numbers = append(numbers, p.PartNumber)
@@ -709,18 +712,20 @@ func CheckResumeList(ctx *harness.Ctx) {
 }
 
 func CheckTenantScope(ctx *harness.Ctx) {
-	c := reader(ctx, 1, 2, 4)
+	c := hReader(ctx, 1, 2, 4)
 	foreign := c.Get("/v1/uploads/u-1", "X-Tenant-Id", "t2")
 	ctx.Equal(foreign.Status, 404, "tenant t2 read t1's upload u-1 (%s): upload ids leak through logs and URLs, another tenant's upload is 404", foreign.Text())
-	ctx.Equal(c.Get("/v1/uploads/u-9", "X-Tenant-Id", "t1").Status, 404, "an unknown upload id")
+	unknown := c.Get("/v1/uploads/u-9", "X-Tenant-Id", "t1")
+	ctx.Equal(unknown.Status, 404, "an unknown upload id")
+	ctx.Assert(strings.ReplaceAll(foreign.Text(), "u-1", "u-9") == unknown.Text(), "another tenant's upload answered %q and an unknown id %q: the two must be indistinguishable, or the answer confirms that the id exists", foreign.Text(), unknown.Text())
 	ctx.Equal(c.Get("/v1/uploads/u-1").Status, 401, "a read without X-Tenant-Id")
 }
 
 func CheckConsistentRead(ctx *harness.Ctx) {
-	c := reader(ctx, 1)
-	ctx.Redis.After("upload:u-1:parts", func() any { rival(ctx, 2); return nil })
-	ctx.Redis.After("upload:u-1:bytes", func() any { rival(ctx, 3); return nil })
-	r, body := status(c)
+	c := hReader(ctx, 1)
+	ctx.Redis.After("upload:u-1:parts", func() any { hRival(ctx, 2); return nil })
+	ctx.Redis.After("upload:u-1:bytes", func() any { hRival(ctx, 3); return nil })
+	r, body := hStatus(c)
 	var listed int64
 	var numbers []int
 	for _, p := range body.Stored {
@@ -742,17 +747,17 @@ func CheckConsistentRead(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kMib = 1LL << 20;
+constexpr long long kHarnessMib = 1LL << 20;
 
 // 23 MiB in 5 MiB parts: the fifth holds 3 MiB.
-long long partSize(int n) { return n == 5 ? 3 * kMib : 5 * kMib; }
+long long hPartSize(int n) { return n == 5 ? 3 * kHarnessMib : 5 * kHarnessMib; }
 
-void registerSeed(int n) { manifest::registerPart("u-1", n, 5, partSize(n), "c" + std::to_string(n)); }
+void hRegisterSeed(int n) { manifest::registerPart("u-1", n, 5, hPartSize(n), "c" + std::to_string(n)); }
 
 // u-1 of tenant t1: 23 MiB in five parts, with the given parts registered.
-harness::HTTP reader(harness::Ctx& ctx, const std::vector<int>& parts) {
-  store::createUpload("t1", 23 * kMib, 5 * kMib, 5, "video/mp4");
-  for (const int n : parts) registerSeed(n);
+harness::HTTP hReader(harness::Ctx& ctx, const std::vector<int>& parts) {
+  store::createUpload("t1", 23 * kHarnessMib, 5 * kHarnessMib, 5, "video/mp4");
+  for (const int n : parts) hRegisterSeed(n);
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -761,17 +766,17 @@ harness::HTTP reader(harness::Ctx& ctx, const std::vector<int>& parts) {
 }
 
 // Another server registers part n of u-1 (one script: the hash and the counter at once).
-void rival(harness::Ctx& ctx, int n) {
-  ctx.Redis.Do("HSET", "upload:u-1:parts", std::to_string(n), std::to_string(partSize(n)) + ":c" + std::to_string(n));
-  ctx.Redis.Do("INCRBY", "upload:u-1:bytes", std::to_string(partSize(n)));
+void hRival(harness::Ctx& ctx, int n) {
+  ctx.Redis.Do("HSET", "upload:u-1:parts", std::to_string(n), std::to_string(hPartSize(n)) + ":c" + std::to_string(n));
+  ctx.Redis.Do("INCRBY", "upload:u-1:bytes", std::to_string(hPartSize(n)));
 }
 
-nlohmann::json parsed(const harness::Response& r) {
+nlohmann::json hParsed(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
 
-std::vector<int> numbersOf(const nlohmann::json& body) {
+std::vector<int> hNumbersOf(const nlohmann::json& body) {
   std::vector<int> out;
   if (body.contains("stored") && body["stored"].is_array()) {
     for (const auto& p : body["stored"]) out.push_back(p.value("part_number", 0));
@@ -782,52 +787,56 @@ std::vector<int> numbersOf(const nlohmann::json& body) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = reader(ctx, {1, 2, 4});
+  auto c = hReader(ctx, {1, 2, 4});
   const auto r = c.Get("/v1/uploads/u-1", "X-Tenant-Id", "t1");
   ctx.Equal(r.Status, 200, "GET /v1/uploads/u-1 (%s)", r.Text());
-  const auto body = parsed(r);
+  const auto body = hParsed(r);
   ctx.Assert(body.value("upload_id", "") == "u-1" && body.value("part_count", 0) == 5 && body.value("status", "") == "pending",
              "the read answered %s, expected upload_id u-1, part_count 5, status pending", r.Text());
 }
 
 void CheckResumeList(harness::Ctx& ctx) {
-  auto c = reader(ctx, {1, 2, 4});
+  auto c = hReader(ctx, {1, 2, 4});
   const auto r = c.Get("/v1/uploads/u-1", "X-Tenant-Id", "t1");
-  const auto body = parsed(r);
+  const auto body = hParsed(r);
   ctx.Assert(body.contains("resume") && body["resume"] == nlohmann::json::array({3, 5}),
              "with parts 1, 2 and 4 of 5 registered the read answered %s: resume must be exactly [3, 5], or the client sends the whole file again", r.Text());
   nlohmann::json expected = nlohmann::json::array();
-  for (const int n : {1, 2, 4}) expected.push_back({{"part_number", n}, {"size", partSize(n)}, {"checksum", "c" + std::to_string(n)}});
+  for (const int n : {1, 2, 4}) expected.push_back({{"part_number", n}, {"size", hPartSize(n)}, {"checksum", "c" + std::to_string(n)}});
   ctx.Assert(body.contains("stored") && body["stored"] == expected, "stored must list parts 1, 2 and 4 with their sizes and checksums, the read answered %s", r.Text());
-  registerSeed(3);
-  registerSeed(5);
+  hRegisterSeed(3);
+  hRegisterSeed(5);
   const auto r2 = c.Get("/v1/uploads/u-1", "X-Tenant-Id", "t1");
-  const auto done = parsed(r2);
-  ctx.Assert(done.contains("resume") && done["resume"] == nlohmann::json::array() && numbersOf(done) == std::vector<int>{1, 2, 3, 4, 5},
+  const auto done = hParsed(r2);
+  ctx.Assert(done.contains("resume") && done["resume"] == nlohmann::json::array() && hNumbersOf(done) == std::vector<int>{1, 2, 3, 4, 5},
              "with every part registered the read answered %s: resume must be empty and stored list parts 1 to 5", r2.Text());
 }
 
 void CheckTenantScope(harness::Ctx& ctx) {
-  auto c = reader(ctx, {1, 2, 4});
+  auto c = hReader(ctx, {1, 2, 4});
   const auto foreign = c.Get("/v1/uploads/u-1", "X-Tenant-Id", "t2");
   ctx.Equal(foreign.Status, 404, "tenant t2 read t1's upload u-1 (%s): upload ids leak through logs and URLs, another tenant's upload is 404", foreign.Text());
-  ctx.Equal(c.Get("/v1/uploads/u-9", "X-Tenant-Id", "t1").Status, 404, "an unknown upload id");
+  const auto unknown = c.Get("/v1/uploads/u-9", "X-Tenant-Id", "t1");
+  ctx.Equal(unknown.Status, 404, "an unknown upload id");
+  std::string masked = foreign.Text();
+  for (size_t at = masked.find("u-1"); at != std::string::npos; at = masked.find("u-1", at + 3)) masked.replace(at, 3, "u-9");
+  ctx.Assert(masked == unknown.Text(), "another tenant's upload answered %s and an unknown id %s: the two must be indistinguishable, or the answer confirms that the id exists", foreign.Text(), unknown.Text());
   ctx.Equal(c.Get("/v1/uploads/u-1").Status, 401, "a read without X-Tenant-Id");
 }
 
 void CheckConsistentRead(harness::Ctx& ctx) {
-  auto c = reader(ctx, {1});
-  ctx.Redis.After("upload:u-1:parts", [&ctx] { rival(ctx, 2); });
-  ctx.Redis.After("upload:u-1:bytes", [&ctx] { rival(ctx, 3); });
+  auto c = hReader(ctx, {1});
+  ctx.Redis.After("upload:u-1:parts", [&ctx] { hRival(ctx, 2); });
+  ctx.Redis.After("upload:u-1:bytes", [&ctx] { hRival(ctx, 3); });
   const auto r = c.Get("/v1/uploads/u-1", "X-Tenant-Id", "t1");
-  const auto body = parsed(r);
+  const auto body = hParsed(r);
   long long listed = 0;
   if (body.contains("stored") && body["stored"].is_array()) {
     for (const auto& p : body["stored"]) listed += p.value("size", 0LL);
   }
   ctx.Assert(body.value("uploaded_bytes", -1LL) == listed,
              "parts were registered while the read ran, and it answered uploaded_bytes %d beside stored parts %v that add up to %d: the bytes and the parts came from two reads (%s)",
-             body.value("uploaded_bytes", -1LL), numbersOf(body), listed, r.Text());
+             body.value("uploaded_bytes", -1LL), hNumbersOf(body), listed, r.Text());
 }
 `,
   },

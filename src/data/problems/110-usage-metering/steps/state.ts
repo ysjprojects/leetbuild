@@ -89,7 +89,7 @@ every account forever.
       id: 'overage',
       title: 'Flags overage instead of refusing',
       detail:
-        "A report that takes the window past the plan cap is counted; the window's `overage` becomes `1` and the answer says `over`. The starter refuses it when `total + units` passes the cap.",
+        "A report that takes the window past the plan cap is counted; the window's `overage` becomes `1` in the same script as the count and the answer says `over`. A window exactly at its cap is not over. The starter refuses it when `total + units` passes the cap.",
       match: {
         python: {all: [/total\s*>\s*cap/, /['"]overage['"]/], none: [/total\s*\+\s*units\s*>\s*cap/]},
         typescript: {all: [/total\s*>\s*cap/, /['"]overage['"]/], none: [/total\s*\+\s*units\s*>\s*cap/]},
@@ -102,7 +102,7 @@ every account forever.
       id: 'expire',
       title: 'Expires the window and the record',
       detail:
-        'The script sets `EXPIRE` of `RETAIN_SECONDS` on the record and on a window key it creates, so an hour stops costing memory once it can no longer be closed. The starter sets no expiry.',
+        'The script that writes the record and creates the window sets their `EXPIRE` of `RETAIN_SECONDS`, the window only when it is new, so an hour stops costing memory once it can no longer be closed. The starter sets no expiry.',
       match: {
         python: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /RETAIN_SECONDS/]},
         typescript: {all: [/redis\.call\(\s*['"]EXPIRE['"]/, /RETAIN_SECONDS/]},
@@ -473,7 +473,9 @@ ledger::Applied applyUsage(const std::string& account, const std::string& reques
     },
   },
   harness: {
-    python: `from metering import ledger
+    python: `import time
+
+from metering import ledger
 
 
 def _settled(probe, what):
@@ -517,20 +519,43 @@ def check_overage(ctx):
     ledger.set_plan_cap("acct_1", 1000)
     first = m.apply_usage("acct_1", "req_1", "/v1/generate", 600, "gw-eu-1")
     assert first.get("counted") is True and first.get("over") is False, f"600 of a 1000-unit plan must be counted and not over, got {first}"
-    past = m.apply_usage("acct_1", "req_2", "/v1/generate", 600, "gw-eu-1")
+    at_cap = m.apply_usage("acct_1", "req_2", "/v1/generate", 400, "gw-eu-1")
+    assert at_cap.get("counted") is True and at_cap.get("total") == 1000 and at_cap.get("over") is False, f"a window at exactly its 1000-unit cap is not over it, got {at_cap}"
+    past = m.apply_usage("acct_1", "req_3", "/v1/generate", 200, "gw-eu-1")
     assert past.get("counted") is True and past.get("total") == 1200, f"a report past the plan cap was refused ({past}): metering counts what was used and flags it, it does not block"
     assert past.get("over") is True and past.get("cap") == 1000, f"a window at 1200 of a 1000-unit plan must answer over true with cap 1000, got {past}"
     flags = ctx.redis.hgetall(ledger.window_key("acct_1", w))
     assert flags.get("overage") == "1" and flags.get("cap") == "1000", f"usage:acct_1:{w} holds {flags}: the window must carry cap 1000 and overage 1"
+    # Another gateway's report lands right after this one's count: the flag must describe the window's final total.
+    ledger.set_plan_cap("acct_2", 1000)
+    rival = ctx.redis_after(ledger.window_key("acct_2", w), lambda: m.apply_usage("acct_2", "req_b", "/v1/generate", 600, "gw-us-2"))
+    m.apply_usage("acct_2", "req_a", "/v1/generate", 600, "gw-eu-1")
+    _settled(rival, "the window key of acct_2")
+    raced = ctx.redis.hgetall(ledger.window_key("acct_2", w))
+    assert raced.get("units") == "1200" and raced.get("overage") == "1", f"two reports of 600 landing together on a 1000-unit plan left usage:acct_2:{w} at {raced}: the overage flag must be written in the same script as the count, or a slower report overwrites it"
 
 
 def check_expire(ctx):
     m = ctx.load("state")
+    # The scenario spans a minute: start it early enough in an hour that it stays in one window.
+    left = ledger.WINDOW_SECONDS - int(time.time()) % ledger.WINDOW_SECONDS
+    if left <= 120:
+        ctx.clock.advance(left)
     w = ledger.current_window()
+    window_key, record_key = ledger.window_key("acct_1", w), ledger.record_key("acct_1", "req_1")
+    # The TTL the moment each key is created: a key without one in between lives forever if the process dies.
+    at_create = {key: ctx.redis_after(key, lambda key=key: ctx.redis.ttl(key)) for key in (window_key, record_key)}
     m.apply_usage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1")
-    for key in (ledger.window_key("acct_1", w), ledger.record_key("acct_1", "req_1")):
+    for key in (window_key, record_key):
         ttl = ctx.redis.ttl(key)
         assert 0 < ttl <= ledger.RETAIN_SECONDS, f"{key} has TTL {ttl}: it must expire within RETAIN_SECONDS ({ledger.RETAIN_SECONDS} s), or Redis keeps every hour of every account"
+        ttl = _settled(at_create[key], key)
+        assert 0 < ttl <= ledger.RETAIN_SECONDS, f"right after the command that created {key} its TTL was {ttl}: the expiry must be set by the same script that writes the key"
+    ctx.clock.advance(60)
+    m.apply_usage("acct_1", "req_2", "/v1/generate", 300, "gw-eu-1")
+    assert ledger.read_window("acct_1", w)["units"] == 1500, f"a report a minute later must land in window {w}, it holds {ledger.read_window('acct_1', w)}"
+    ttl = ctx.redis.ttl(window_key)
+    assert 0 < ttl <= ledger.RETAIN_SECONDS - 60, f"a minute after the window opened another report left {window_key} with TTL {ttl}: the expiry is set on a new window key only, or a busy hour never expires"
 `,
     typescript: `function state(ctx) {
   return {m: ctx.load('state'), ledger: ctx.load('/support/metering/ledger.ts')};
@@ -571,21 +596,50 @@ export async function check_overage(ctx) {
   await ledger.setPlanCap('acct_1', 1000);
   const first = await m.applyUsage('acct_1', 'req_1', '/v1/generate', 600, 'gw-eu-1');
   assert(first.counted === true && first.over === false, \`600 of a 1000-unit plan must be counted and not over, got \${JSON.stringify(first)}\`);
-  const past = await m.applyUsage('acct_1', 'req_2', '/v1/generate', 600, 'gw-eu-1');
+  const atCap = await m.applyUsage('acct_1', 'req_2', '/v1/generate', 400, 'gw-eu-1');
+  assert(atCap.counted === true && atCap.total === 1000 && atCap.over === false, \`a window at exactly its 1000-unit cap is not over it, got \${JSON.stringify(atCap)}\`);
+  const past = await m.applyUsage('acct_1', 'req_3', '/v1/generate', 200, 'gw-eu-1');
   assert(past.counted === true && past.total === 1200, \`a report past the plan cap was refused (\${JSON.stringify(past)}): metering counts what was used and flags it, it does not block\`);
   assert(past.over === true && past.cap === 1000, \`a window at 1200 of a 1000-unit plan must answer over true with cap 1000, got \${JSON.stringify(past)}\`);
   const flags = ctx.redis.hgetall(ledger.windowKey('acct_1', w));
   assert(flags.overage === '1' && flags.cap === '1000', \`usage:acct_1:\${w} holds \${JSON.stringify(flags)}: the window must carry cap 1000 and overage 1\`);
+  // Another usaged instance counts a report right after this one's count: the flag must describe the window's final total.
+  await ledger.setPlanCap('acct_2', 1000);
+  const {APPLY_LUA} = ctx.load('/support/metering/usage.ts');
+  const rival = ctx.redisAfter(ledger.windowKey('acct_2', w), () =>
+    ctx.redis.eval(APPLY_LUA, 2, ledger.windowKey('acct_2', w), ledger.recordKey('acct_2', 'req_b'), 600, 1000, ledger.RETAIN_SECONDS, w, 'req_b', 'acct_2', '/v1/generate', 'gw-us-2'),
+  );
+  await m.applyUsage('acct_2', 'req_a', '/v1/generate', 600, 'gw-eu-1');
+  assert(rival.fired, 'nothing touched the window key of acct_2');
+  if (rival.error !== undefined) throw rival.error;
+  const raced = ctx.redis.hgetall(ledger.windowKey('acct_2', w));
+  assert(raced.units === '1200' && raced.overage === '1', \`two reports of 600 landing together on a 1000-unit plan left usage:acct_2:\${w} at \${JSON.stringify(raced)}: the overage flag must be written in the same script as the count, or a slower report overwrites it\`);
 }
 
 export async function check_expire(ctx) {
   const {m, ledger} = state(ctx);
+  // The scenario spans a minute: start it early enough in an hour that it stays in one window.
+  const left = ledger.WINDOW_SECONDS - (Math.floor(ctx.clock.now() / 1000) % ledger.WINDOW_SECONDS);
+  if (left <= 120) ctx.clock.advance(left);
   const w = ledger.currentWindow();
+  const keys = [ledger.windowKey('acct_1', w), ledger.recordKey('acct_1', 'req_1')];
+  // The TTL the moment each key is created: a key without one in between lives forever if the process dies.
+  const atCreate = keys.map(key => ctx.redisAfter(key, () => ctx.redis.ttl(key)));
   await m.applyUsage('acct_1', 'req_1', '/v1/generate', 1200, 'gw-eu-1');
-  for (const key of [ledger.windowKey('acct_1', w), ledger.recordKey('acct_1', 'req_1')]) {
+  keys.forEach((key, i) => {
     const ttl = ctx.redis.ttl(key);
     assert(ttl > 0 && ttl <= ledger.RETAIN_SECONDS, \`\${key} has TTL \${ttl}: it must expire within RETAIN_SECONDS (\${ledger.RETAIN_SECONDS} s), or Redis keeps every hour of every account\`);
-  }
+    const probe = atCreate[i];
+    assert(probe.fired, \`nothing touched \${key}\`);
+    if (probe.error !== undefined) throw probe.error;
+    assert(probe.result > 0 && probe.result <= ledger.RETAIN_SECONDS, \`right after the command that created \${key} its TTL was \${probe.result}: the expiry must be set by the same script that writes the key\`);
+  });
+  ctx.clock.advance(60);
+  await m.applyUsage('acct_1', 'req_2', '/v1/generate', 300, 'gw-eu-1');
+  const units = (await ledger.readWindow('acct_1', w)).units;
+  assert.equal(units, 1500, \`a report a minute later must land in window \${w}; its units\`);
+  const ttl = ctx.redis.ttl(keys[0]);
+  assert(ttl > 0 && ttl <= ledger.RETAIN_SECONDS - 60, \`a minute after the window opened another report left \${keys[0]} with TTL \${ttl}: the expiry is set on a new window key only, or a busy hour never expires\`);
 }
 `,
     go: `package main
@@ -645,20 +699,54 @@ func CheckOverage(ctx *harness.Ctx) {
 	ledger.SetPlanCap(stateBg, "acct_1", 1000)
 	first := mustApply(ctx, "req_1", 600, "gw-eu-1")
 	ctx.Assert(first.Counted && !first.Over, "600 of a 1000-unit plan must be counted and not over, got %+v", first)
-	past := mustApply(ctx, "req_2", 600, "gw-eu-1")
+	atCap := mustApply(ctx, "req_2", 400, "gw-eu-1")
+	ctx.Assert(atCap.Counted && atCap.Total == 1000 && !atCap.Over, "a window at exactly its 1000-unit cap is not over it, got %+v", atCap)
+	past := mustApply(ctx, "req_3", 200, "gw-eu-1")
 	ctx.Assert(past.Counted && past.Total == 1200, "a report past the plan cap was refused (%+v): metering counts what was used and flags it, it does not block", past)
 	ctx.Assert(past.Over && past.Cap == 1000, "a window at 1200 of a 1000-unit plan must answer over true with cap 1000, got %+v", past)
 	flags := ctx.Redis.HGetAll(ledger.WindowKey("acct_1", w))
 	ctx.Assert(flags["overage"] == "1" && flags["cap"] == "1000", "usage:acct_1:%d holds %v: the window must carry cap 1000 and overage 1", w, flags)
+	// Another gateway's report lands right after this one's count: the flag must describe the window's final total.
+	ledger.SetPlanCap(stateBg, "acct_2", 1000)
+	rival := ctx.Redis.After(ledger.WindowKey("acct_2", w), func() any {
+		applied, err := applyUsage(stateBg, "acct_2", "req_b", "/v1/generate", 600, "gw-us-2")
+		ctx.NoError(err, "the rival report failed")
+		return applied
+	})
+	_, err := applyUsage(stateBg, "acct_2", "req_a", "/v1/generate", 600, "gw-eu-1")
+	ctx.NoError(err, "applyUsage(acct_2, req_a) failed")
+	ctx.Assert(rival.Fired, "nothing touched the window key of acct_2")
+	ctx.Assert(rival.Err == nil, "the rival report failed: %v", rival.Err)
+	raced := ctx.Redis.HGetAll(ledger.WindowKey("acct_2", w))
+	ctx.Assert(raced["units"] == "1200" && raced["overage"] == "1", "two reports of 600 landing together on a 1000-unit plan left usage:acct_2:%d at %v: the overage flag must be written in the same script as the count, or a slower report overwrites it", w, raced)
 }
 
 func CheckExpire(ctx *harness.Ctx) {
+	// The scenario spans a minute: start it early enough in an hour that it stays in one window.
+	if left := ledger.WindowSeconds - (ctx.Clock.Now()/1000)%ledger.WindowSeconds; left <= 120 {
+		ctx.Clock.Advance(float64(left))
+	}
 	w := ledger.CurrentWindow()
+	windowKey, recordKey := ledger.WindowKey("acct_1", w), ledger.RecordKey("acct_1", "req_1")
+	// The TTL the moment each key is created: a key without one in between lives forever if the process dies.
+	windowAt := ctx.Redis.After(windowKey, func() any { return ctx.Redis.TTL(windowKey) })
+	recordAt := ctx.Redis.After(recordKey, func() any { return ctx.Redis.TTL(recordKey) })
 	mustApply(ctx, "req_1", 1200, "gw-eu-1")
-	for _, key := range []string{ledger.WindowKey("acct_1", w), ledger.RecordKey("acct_1", "req_1")} {
+	for _, key := range []string{windowKey, recordKey} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl > 0 && ttl <= ledger.RetainSeconds, "%s has TTL %d: it must expire within RetainSeconds (%d s), or Redis keeps every hour of every account", key, ttl, ledger.RetainSeconds)
 	}
+	ctx.Assert(windowAt.Fired && recordAt.Fired, "nothing touched %s or %s", windowKey, recordKey)
+	ctx.Assert(windowAt.Err == nil && recordAt.Err == nil, "reading the TTL right after the count failed: %v %v", windowAt.Err, recordAt.Err)
+	windowTTL, _ := windowAt.Result.(int64)
+	recordTTL, _ := recordAt.Result.(int64)
+	ctx.Assert(windowTTL > 0 && windowTTL <= ledger.RetainSeconds, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the key", windowKey, windowTTL)
+	ctx.Assert(recordTTL > 0 && recordTTL <= ledger.RetainSeconds, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the key", recordKey, recordTTL)
+	ctx.Clock.Advance(60)
+	mustApply(ctx, "req_2", 300, "gw-eu-1")
+	ctx.Equal(ledger.ReadWindow(stateBg, "acct_1", w).Units, int64(1500), "a report a minute later must land in window %d; its units", w)
+	ttl := ctx.Redis.TTL(windowKey)
+	ctx.Assert(ttl > 0 && ttl <= ledger.RetainSeconds-60, "a minute after the window opened another report left %s with TTL %d: the expiry is set on a new window key only, or a busy hour never expires", windowKey, ttl)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -721,20 +809,56 @@ void CheckOverage(harness::Ctx& ctx) {
   ledger::setPlanCap("acct_1", 1000);
   const auto first = applyUsage("acct_1", "req_1", "/v1/generate", 600, "gw-eu-1");
   ctx.Assert(first.counted && !first.over, "600 of a 1000-unit plan must be counted and not over, got counted %t over %t", first.counted, first.over);
-  const auto past = applyUsage("acct_1", "req_2", "/v1/generate", 600, "gw-eu-1");
+  const auto atCap = applyUsage("acct_1", "req_2", "/v1/generate", 400, "gw-eu-1");
+  ctx.Assert(atCap.counted && atCap.total == 1000 && !atCap.over, "a window at exactly its 1000-unit cap is not over it, got counted %t total %d over %t", atCap.counted, atCap.total, atCap.over);
+  const auto past = applyUsage("acct_1", "req_3", "/v1/generate", 200, "gw-eu-1");
   ctx.Assert(past.counted && past.total == 1200, "a report past the plan cap was refused (counted %t, total %d): metering counts what was used and flags it, it does not block", past.counted, past.total);
   ctx.Assert(past.over && past.cap == 1000, "a window at 1200 of a 1000-unit plan must answer over true with cap 1000, got over %t cap %d", past.over, past.cap);
   const auto flags = ctx.Redis.HGetAll(ledger::windowKey("acct_1", w));
   ctx.Assert(flags.count("overage") && flags.at("overage") == "1" && flags.count("cap") && flags.at("cap") == "1000", "usage:acct_1:%d holds %v: the window must carry cap 1000 and overage 1", w, flags);
+  // Another gateway's report lands right after this one's count: the flag must describe the window's final total.
+  ledger::setPlanCap("acct_2", 1000);
+  auto rival = std::make_shared<Rival>();
+  ctx.Redis.After(ledger::windowKey("acct_2", w), [rival] {
+    rival->fired = true;
+    try {
+      rival->applied = applyUsage("acct_2", "req_b", "/v1/generate", 600, "gw-us-2");
+    } catch (const std::exception& e) {
+      rival->err = e.what();
+    }
+  });
+  applyUsage("acct_2", "req_a", "/v1/generate", 600, "gw-eu-1");
+  ctx.Assert(rival->fired, "nothing touched the window key of acct_2");
+  ctx.Assert(!rival->err, "the rival report failed: %s", rival->err.value_or(""));
+  const auto raced = ctx.Redis.HGetAll(ledger::windowKey("acct_2", w));
+  ctx.Assert(raced.count("units") && raced.at("units") == "1200" && raced.count("overage") && raced.at("overage") == "1", "two reports of 600 landing together on a 1000-unit plan left usage:acct_2:%d at %v: the overage flag must be written in the same script as the count, or a slower report overwrites it", w, raced);
 }
 
 void CheckExpire(harness::Ctx& ctx) {
+  // The scenario spans a minute: start it early enough in an hour that it stays in one window.
+  const long long left = ledger::kWindowSeconds - (ctx.Clock.Now() / 1000) % ledger::kWindowSeconds;
+  if (left <= 120) ctx.Clock.Advance(static_cast<double>(left));
   const long long w = ledger::currentWindow();
+  const std::string windowKey = ledger::windowKey("acct_1", w);
+  const std::string recordKey = ledger::recordKey("acct_1", "req_1");
+  // The TTL the moment each key is created: a key without one in between lives forever if the process dies.
+  auto windowAt = std::make_shared<std::optional<long long>>();
+  auto recordAt = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After(windowKey, [&ctx, windowKey, windowAt] { *windowAt = ctx.Redis.TTL(windowKey); });
+  ctx.Redis.After(recordKey, [&ctx, recordKey, recordAt] { *recordAt = ctx.Redis.TTL(recordKey); });
   applyUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1");
-  for (const std::string& key : {ledger::windowKey("acct_1", w), ledger::recordKey("acct_1", "req_1")}) {
+  for (const std::string& key : {windowKey, recordKey}) {
     const long long ttl = ctx.Redis.TTL(key);
     ctx.Assert(ttl > 0 && ttl <= ledger::kRetainSeconds, "%s has TTL %d: it must expire within kRetainSeconds (%d s), or Redis keeps every hour of every account", key, ttl, ledger::kRetainSeconds);
   }
+  ctx.Assert(windowAt->has_value() && recordAt->has_value(), "nothing touched %s or %s", windowKey, recordKey);
+  ctx.Assert(windowAt->value_or(-2) > 0 && windowAt->value_or(-2) <= ledger::kRetainSeconds, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the key", windowKey, windowAt->value_or(-2));
+  ctx.Assert(recordAt->value_or(-2) > 0 && recordAt->value_or(-2) <= ledger::kRetainSeconds, "right after the command that created %s its TTL was %d: the expiry must be set by the same script that writes the key", recordKey, recordAt->value_or(-2));
+  ctx.Clock.Advance(60);
+  applyUsage("acct_1", "req_2", "/v1/generate", 300, "gw-eu-1");
+  ctx.Equal(ledger::readWindow("acct_1", w).units, 1500LL, "a report a minute later must land in window %d; its units", w);
+  const long long ttl = ctx.Redis.TTL(windowKey);
+  ctx.Assert(ttl > 0 && ttl <= ledger::kRetainSeconds - 60, "a minute after the window opened another report left %s with TTL %d: the expiry is set on a new window key only, or a busy hour never expires", windowKey, ttl);
 }
 `,
   },

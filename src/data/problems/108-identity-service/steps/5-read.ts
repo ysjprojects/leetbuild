@@ -91,7 +91,7 @@ account without saying why or leaving a trace.
       id: 'support-audit',
       title: 'Support reads need a reason and leave an audit record',
       detail:
-        'A `support` caller without `X-Support-Reason` is **400**; with one, `record_audit(caller, user_id, reason)` is written before the account is returned. The starter hands support the record with no reason and no trace.',
+        'A `support` caller without `X-Support-Reason`, or with an empty one, is **400**; with one, `record_audit(caller, user_id, reason)` is written before the account is returned, so a failed audit write keeps the record back. The starter hands support the record with no reason and no trace.',
       match: {
         python: {all: [/x-support-reason/i, /\b400\b/], order: [/role in SUPPORT_ROLES/, /accounts\.record_audit\(/]},
         typescript: {
@@ -525,7 +525,9 @@ void register_routes(httplib::Server& svr) { svr.Get(R"(/v1/users/([\\w-]+))", r
     },
   },
   harness: {
-    python: `from identityd import accounts
+    python: `import httpx
+
+from identityd import accounts
 
 PUBLIC = {"user_id", "name", "status", "created_at"}
 
@@ -570,6 +572,11 @@ async def check_public_projection(ctx):
         assert value not in r.text, f"another member's read of u-1 carries {value!r}: {r.text}. Everyone but the owner gets PUBLIC_FIELDS only"
     assert set(body) == PUBLIC, f"another member's read of u-1 carries the fields {sorted(body)}, expected exactly {sorted(PUBLIC)}"
     assert body["name"] == "Ada Lovelace" and body["status"] == "unverified", f"the public view must carry the name and the status, got {body}"
+    # A field added to the row later stays out of the public view until someone lists it.
+    ctx.redis.hset("account:u-1", "birth_date", "1815-12-10")
+    async with _api(ctx) as c:
+        later = await _get(c, "u-1", caller="u-2")
+    assert later.status_code == 200 and set(later.json()) == PUBLIC, f"after the row gained birth_date, another member's read of u-1 answered {later.status_code} {later.text}, expected exactly {sorted(PUBLIC)}: build the public view from PUBLIC_FIELDS, not by removing fields"
 
 
 async def check_cache_scope(ctx):
@@ -582,7 +589,7 @@ async def check_cache_scope(ctx):
         assert "public" not in d and "no-store" in d, f"{who} carries the email and the phone and answered Cache-Control {r.headers.get('cache-control')!r}: a shared cache keeps it and serves it to the next caller. Use private, no-store"
     d = _directives(public)
     assert "public" in d and "max-age=60" in d, f"the public view answered Cache-Control {public.headers.get('cache-control')!r}, expected public, max-age=60"
-    for who, r in (("the owner's read", own), ("the public view", public)):
+    for who, r in (("the owner's read", own), ("a support read", support), ("the public view", public)):
         assert _varies_by_caller(r), f"{who} answered Vary {r.headers.get('vary')!r}: a cache must key the answer by X-User-Id"
 
 
@@ -591,12 +598,24 @@ async def check_support_audit(ctx):
         blind = await _get(c, "u-1", caller="agent-7", role="support")
         assert blind.status_code == 400, f"a support read without X-Support-Reason answered {blind.status_code}, expected 400"
         assert accounts.audit_entries() == [], f"a refused support read left audit entries {accounts.audit_entries()}"
+        empty = await _get(c, "u-1", caller="agent-7", role="support", reason="")
+        assert empty.status_code == 400, f"a support read with an empty X-Support-Reason answered {empty.status_code}, expected 400"
         r = await _get(c, "u-1", caller="agent-7", role="support", reason="ticket 4411")
         member = await _get(c, "u-1", caller="u-2")
     assert r.status_code == 200 and r.json().get("email") == "ada@example.com", f"a support read with a reason must answer the whole account, got {r.status_code} {r.text}"
     entries = [{k: e.get(k) for k in ("actor", "user_id", "reason")} for e in accounts.audit_entries()]
     assert entries == [{"actor": "agent-7", "user_id": "u-1", "reason": "ticket 4411"}], f"after one support read the audit trail holds {entries}, expected agent-7 reading u-1 for ticket 4411"
     assert member.status_code == 200, f"a member's read answered {member.status_code}"
+    # The audit trail cannot be written (audit:lookups holds the wrong type): the record must not leave.
+    ctx.redis.delete("audit:lookups")
+    ctx.redis.set("audit:lookups", "not a list")
+    transport = httpx.ASGITransport(app=ctx.load("read").app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://service") as c:
+        try:
+            failed = await _get(c, "u-1", caller="agent-7", role="support", reason="ticket 4412")
+        except Exception:
+            failed = None
+    assert failed is None or (failed.status_code != 200 and "ada@example.com" not in failed.text), f"the audit write failed and the support read still answered {failed.status_code} {failed.text}: the record leaves only once its audit entry is written"
 `,
     typescript: `const PUBLIC = ['created_at', 'name', 'status', 'user_id'];
 
@@ -652,7 +671,7 @@ export async function check_cache_scope(ctx) {
   }
   const d = directives(pub);
   assert(d.has('public') && d.has('max-age=60'), \`the public view answered Cache-Control \${JSON.stringify(pub.headers['cache-control'])}, expected public, max-age=60\`);
-  for (const [who, r] of [["the owner's read", own], ['the public view', pub]] as const) {
+  for (const [who, r] of [["the owner's read", own], ['a support read', support], ['the public view', pub]] as const) {
     assert(variesByCaller(r), \`\${who} answered Vary \${JSON.stringify(r.headers.vary)}: a cache must key the answer by X-User-Id\`);
   }
 }
@@ -662,11 +681,23 @@ export async function check_support_audit(ctx) {
   const blind = await read(c, 'u-1', {caller: 'agent-7', role: 'support'});
   assert.equal(blind.status, 400, \`a support read without X-Support-Reason answered \${blind.status}, expected 400\`);
   assert.deepStrictEqual(await accounts.auditEntries(), [], 'a refused support read left audit entries');
+  const empty = await read(c, 'u-1', {caller: 'agent-7', role: 'support', reason: ''});
+  assert.equal(empty.status, 400, \`a support read with an empty X-Support-Reason answered \${empty.status}, expected 400\`);
   const r = await read(c, 'u-1', {caller: 'agent-7', role: 'support', reason: 'ticket 4411'});
   assert(r.status === 200 && r.json().email === 'ada@example.com', \`a support read with a reason must answer the whole account, got \${r.status} \${r.text}\`);
   const entries = (await accounts.auditEntries()).map(e => ({actor: e.actor, user_id: e.user_id, reason: e.reason}));
   assert.deepStrictEqual(entries, [{actor: 'agent-7', user_id: 'u-1', reason: 'ticket 4411'}], \`after one support read the audit trail holds \${JSON.stringify(entries)}, expected agent-7 reading u-1 for ticket 4411\`);
   assert.equal((await read(c, 'u-1', {caller: 'u-2'})).status, 200, "a member's read must answer 200");
+  // The audit trail cannot be written (audit:lookups holds the wrong type): the record must not leave.
+  ctx.redis.del('audit:lookups');
+  ctx.redis.set('audit:lookups', 'not a list');
+  let failed = null;
+  try {
+    failed = await read(c, 'u-1', {caller: 'agent-7', role: 'support', reason: 'ticket 4412'});
+  } catch {
+    failed = null;
+  }
+  assert(failed === null || (failed.status !== 200 && !failed.text.includes('ada@example.com')), \`the audit write failed and the support read still answered \${failed?.status} \${failed?.text}: the record leaves only once its audit entry is written\`);
 }
 `,
     go: `package main
@@ -682,11 +713,11 @@ import (
 	"leetbuild/harness"
 )
 
-var readBg = context.Background()
+var harnessBg = context.Background()
 
-func readAPI(ctx *harness.Ctx) *harness.HTTP {
+func harnessAPI(ctx *harness.Ctx) *harness.HTTP {
 	for _, a := range [][4]string{{"u-1", "ada@example.com", "+442079460958", "Ada Lovelace"}, {"u-2", "eve@example.com", "+15550100200", "Eve"}} {
-		_, err := accounts.CreateAccount(readBg, a[0], a[1], a[2], a[3])
+		_, err := accounts.CreateAccount(harnessBg, a[0], a[1], a[2], a[3])
 		ctx.NoError(err, "CreateAccount(%s) failed", a[0])
 	}
 	mux := http.NewServeMux()
@@ -694,7 +725,7 @@ func readAPI(ctx *harness.Ctx) *harness.HTTP {
 	return ctx.HTTP(mux)
 }
 
-func directives(r *harness.Response) map[string]bool {
+func harnessDirectives(r *harness.Response) map[string]bool {
 	out := map[string]bool{}
 	for _, d := range strings.Split(r.Header.Get("Cache-Control"), ",") {
 		if d = strings.TrimSpace(d); d != "" {
@@ -704,7 +735,7 @@ func directives(r *harness.Response) map[string]bool {
 	return out
 }
 
-func variesByCaller(r *harness.Response) bool {
+func harnessVariesByCaller(r *harness.Response) bool {
 	for _, v := range strings.Split(r.Header.Get("Vary"), ",") {
 		if strings.EqualFold(strings.TrimSpace(v), "X-User-Id") {
 			return true
@@ -713,30 +744,30 @@ func variesByCaller(r *harness.Response) bool {
 	return false
 }
 
-func bodyOf(ctx *harness.Ctx, r *harness.Response) map[string]any {
+func harnessBody(r *harness.Response) map[string]any {
 	var body map[string]any
 	r.Decode(&body)
 	return body
 }
 
 func CheckReadRoute(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessAPI(ctx)
 	own := c.Get("/v1/users/u-1", "X-User-Id", "u-1")
 	ctx.Equal(own.Status, 200, "the owner's read (%s)", own.Text())
-	body := bodyOf(ctx, own)
+	body := harnessBody(own)
 	ctx.Assert(body["email"] == "ada@example.com" && body["phone"] == "+442079460958", "the owner must see their whole account, got %s", own.Text())
 	ctx.Equal(c.Get("/v1/users/u-1").Status, 401, "a read without X-User-Id")
 	ctx.Equal(c.Get("/v1/users/u-9", "X-User-Id", "u-1").Status, 404, "a read of an unknown account")
 }
 
 func CheckPublicProjection(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessAPI(ctx)
 	r := c.Get("/v1/users/u-1", "X-User-Id", "u-2")
 	ctx.Equal(r.Status, 200, "a member's read of u-1 (%s)", r.Text())
 	for _, value := range []string{"ada@example.com", "+442079460958", "7946"} {
 		ctx.Assert(!strings.Contains(r.Text(), value), "another member's read of u-1 carries %q: %s. Everyone but the owner gets publicFields only", value, r.Text())
 	}
-	body := bodyOf(ctx, r)
+	body := harnessBody(r)
 	names := make([]string, 0, len(body))
 	for name := range body {
 		names = append(names, name)
@@ -747,31 +778,38 @@ func CheckPublicProjection(ctx *harness.Ctx) {
 }
 
 func CheckCacheScope(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessAPI(ctx)
 	own := c.Get("/v1/users/u-1", "X-User-Id", "u-1")
 	support := c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "ticket 4411")
 	public := c.Get("/v1/users/u-1", "X-User-Id", "u-2")
 	for who, r := range map[string]*harness.Response{"the owner's read": own, "a support read": support} {
-		d := directives(r)
+		d := harnessDirectives(r)
 		ctx.Assert(!d["public"] && d["no-store"], "%s carries the email and the phone and answered Cache-Control %q: a shared cache keeps it and serves it to the next caller. Use private, no-store", who, r.Header.Get("Cache-Control"))
 	}
-	d := directives(public)
+	d := harnessDirectives(public)
 	ctx.Assert(d["public"] && d["max-age=60"], "the public view answered Cache-Control %q, expected public, max-age=60", public.Header.Get("Cache-Control"))
-	for who, r := range map[string]*harness.Response{"the owner's read": own, "the public view": public} {
-		ctx.Assert(variesByCaller(r), "%s answered Vary %q: a cache must key the answer by X-User-Id", who, r.Header.Get("Vary"))
+	for who, r := range map[string]*harness.Response{"the owner's read": own, "a support read": support, "the public view": public} {
+		ctx.Assert(harnessVariesByCaller(r), "%s answered Vary %q: a cache must key the answer by X-User-Id", who, r.Header.Get("Vary"))
 	}
 }
 
 func CheckSupportAudit(ctx *harness.Ctx) {
-	c := readAPI(ctx)
+	c := harnessAPI(ctx)
 	blind := c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support")
 	ctx.Equal(blind.Status, 400, "a support read without X-Support-Reason")
-	ctx.Equal(len(accounts.AuditEntries(readBg)), 0, "a refused support read must leave no audit entry; the entries")
+	ctx.Equal(len(accounts.AuditEntries(harnessBg)), 0, "a refused support read must leave no audit entry; the entries")
+	empty := c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "")
+	ctx.Equal(empty.Status, 400, "a support read with an empty X-Support-Reason")
 	r := c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "ticket 4411")
-	ctx.Assert(r.Status == 200 && bodyOf(ctx, r)["email"] == "ada@example.com", "a support read with a reason must answer the whole account, got %d %s", r.Status, r.Text())
-	entries := accounts.AuditEntries(readBg)
+	ctx.Assert(r.Status == 200 && harnessBody(r)["email"] == "ada@example.com", "a support read with a reason must answer the whole account, got %d %s", r.Status, r.Text())
+	entries := accounts.AuditEntries(harnessBg)
 	ctx.Assert(len(entries) == 1 && entries[0].Actor == "agent-7" && entries[0].UserID == "u-1" && entries[0].Reason == "ticket 4411", "after one support read the audit trail holds %+v, expected agent-7 reading u-1 for ticket 4411", entries)
 	ctx.Equal(c.Get("/v1/users/u-1", "X-User-Id", "u-2").Status, 200, "a member's read")
+	// The audit trail cannot be written (audit:lookups holds the wrong type): the record must not leave.
+	ctx.Redis.Del("audit:lookups")
+	ctx.Redis.Set("audit:lookups", "not a list")
+	failed := c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "ticket 4412")
+	ctx.Assert(failed.Status != 200 && !strings.Contains(failed.Text(), "ada@example.com"), "the audit write failed and the support read still answered %d %s: the record leaves only once its audit entry is written", failed.Status, failed.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -790,7 +828,7 @@ using json = nlohmann::json;
 
 namespace {
 
-harness::HTTP readApi(harness::Ctx& ctx) {
+harness::HTTP harnessApi(harness::Ctx& ctx) {
   accounts::createAccount("u-1", "ada@example.com", "+442079460958", "Ada Lovelace");
   accounts::createAccount("u-2", "eve@example.com", "+15550100200", "Eve");
   static httplib::Server* svr = nullptr;
@@ -800,7 +838,7 @@ harness::HTTP readApi(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::set<std::string> listOf(const std::string& header) {
+std::set<std::string> harnessListOf(const std::string& header) {
   std::set<std::string> out;
   std::stringstream in(header);
   std::string d;
@@ -814,28 +852,28 @@ std::set<std::string> listOf(const std::string& header) {
   return out;
 }
 
-json bodyOf(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
+json harnessBody(const harness::Response& r) { return json::parse(r.Text(), nullptr, false); }
 
 }  // namespace
 
 void CheckReadRoute(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = harnessApi(ctx);
   const auto own = c.Get("/v1/users/u-1", "X-User-Id", "u-1");
   ctx.Equal(own.Status, 200, "the owner's read (%s)", own.Text());
-  const json body = bodyOf(own);
+  const json body = harnessBody(own);
   ctx.Assert(body.is_object() && body.value("email", "") == "ada@example.com" && body.value("phone", "") == "+442079460958", "the owner must see their whole account, got %s", own.Text());
   ctx.Equal(c.Get("/v1/users/u-1").Status, 401, "a read without X-User-Id");
   ctx.Equal(c.Get("/v1/users/u-9", "X-User-Id", "u-1").Status, 404, "a read of an unknown account");
 }
 
 void CheckPublicProjection(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = harnessApi(ctx);
   const auto r = c.Get("/v1/users/u-1", "X-User-Id", "u-2");
   ctx.Equal(r.Status, 200, "a member's read of u-1 (%s)", r.Text());
   for (const std::string value : {"ada@example.com", "+442079460958", "7946"}) {
     ctx.Assert(r.Text().find(value) == std::string::npos, "another member's read of u-1 carries %q: %s. Everyone but the owner gets kPublicFields only", value, r.Text());
   }
-  const json body = bodyOf(r);
+  const json body = harnessBody(r);
   std::vector<std::string> names;
   for (auto it = body.begin(); it != body.end(); ++it) names.push_back(it.key());
   ctx.Equal(names, {"created_at", "name", "status", "user_id"}, "the fields of another member's read of u-1");
@@ -843,32 +881,39 @@ void CheckPublicProjection(harness::Ctx& ctx) {
 }
 
 void CheckCacheScope(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = harnessApi(ctx);
   const auto own = c.Get("/v1/users/u-1", "X-User-Id", "u-1");
   const auto support = c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "ticket 4411");
   const auto pub = c.Get("/v1/users/u-1", "X-User-Id", "u-2");
   for (const auto& [who, r] : std::vector<std::pair<std::string, harness::Response>>{{"the owner's read", own}, {"a support read", support}}) {
-    const auto d = listOf(r.HeaderValue("Cache-Control"));
+    const auto d = harnessListOf(r.HeaderValue("Cache-Control"));
     ctx.Assert(!d.count("public") && d.count("no-store"), "%s carries the email and the phone and answered Cache-Control %q: a shared cache keeps it and serves it to the next caller. Use private, no-store", who, r.HeaderValue("Cache-Control"));
   }
-  const auto d = listOf(pub.HeaderValue("Cache-Control"));
+  const auto d = harnessListOf(pub.HeaderValue("Cache-Control"));
   ctx.Assert(d.count("public") && d.count("max-age=60"), "the public view answered Cache-Control %q, expected public, max-age=60", pub.HeaderValue("Cache-Control"));
-  for (const auto& [who, r] : std::vector<std::pair<std::string, harness::Response>>{{"the owner's read", own}, {"the public view", pub}}) {
-    ctx.Assert(listOf(r.HeaderValue("Vary")).count("x-user-id"), "%s answered Vary %q: a cache must key the answer by X-User-Id", who, r.HeaderValue("Vary"));
+  for (const auto& [who, r] : std::vector<std::pair<std::string, harness::Response>>{{"the owner's read", own}, {"a support read", support}, {"the public view", pub}}) {
+    ctx.Assert(harnessListOf(r.HeaderValue("Vary")).count("x-user-id"), "%s answered Vary %q: a cache must key the answer by X-User-Id", who, r.HeaderValue("Vary"));
   }
 }
 
 void CheckSupportAudit(harness::Ctx& ctx) {
-  auto c = readApi(ctx);
+  auto c = harnessApi(ctx);
   const auto blind = c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support");
   ctx.Equal(blind.Status, 400, "a support read without X-Support-Reason");
   ctx.Assert(accounts::auditEntries().empty(), "a refused support read must leave no audit entry");
+  const auto empty = c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "");
+  ctx.Equal(empty.Status, 400, "a support read with an empty X-Support-Reason");
   const auto r = c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "ticket 4411");
-  ctx.Assert(r.Status == 200 && bodyOf(r).value("email", "") == "ada@example.com", "a support read with a reason must answer the whole account, got %d %s", r.Status, r.Text());
+  ctx.Assert(r.Status == 200 && harnessBody(r).value("email", "") == "ada@example.com", "a support read with a reason must answer the whole account, got %d %s", r.Status, r.Text());
   const auto entries = accounts::auditEntries();
   ctx.Assert(entries.size() == 1 && entries[0].value("actor", "") == "agent-7" && entries[0].value("user_id", "") == "u-1" && entries[0].value("reason", "") == "ticket 4411",
              "after one support read the audit trail holds %d entries, expected agent-7 reading u-1 for ticket 4411", entries.size());
   ctx.Equal(c.Get("/v1/users/u-1", "X-User-Id", "u-2").Status, 200, "a member's read");
+  // The audit trail cannot be written (audit:lookups holds the wrong type): the record must not leave.
+  ctx.Redis.Del("audit:lookups");
+  ctx.Redis.Set("audit:lookups", "not a list");
+  const auto failed = c.Get("/v1/users/u-1", "X-User-Id", "agent-7", "X-Role", "support", "X-Support-Reason", "ticket 4412");
+  ctx.Assert(failed.Status != 200 && failed.Text().find("ada@example.com") == std::string::npos, "the audit write failed and the support read still answered %d %s: the record leaves only once its audit entry is written", failed.Status, failed.Text());
 }
 `,
   },

@@ -67,7 +67,7 @@ window. And a leader failover loses events the leader alone acknowledged.
       id: 'after-commit',
       title: 'Publishes only what the count committed',
       detail:
-        '`apply_usage`/`applyUsage` runs before the produce, and only a report it answers `counted` produces an event, carrying the window, the total and `over`. The starter produces first, for retries too.',
+        "`apply_usage`/`applyUsage` runs before the produce, and only a report it answers `counted` produces an event, carrying the report's own units and the count's window, total and `over` (true past the cap, false at it). The starter produces first, for retries too.",
       match: {
         python: {order: [/apply_usage\(/, /producer\.produce\(/], all: [/\[["']counted["']\]/]},
         typescript: {order: [/applyUsage\(/, /producer\.send\(/], all: [/\.counted\b/]},
@@ -487,6 +487,15 @@ def check_after_commit(ctx):
     assert len(records) == 1, f"one request id reported twice left {len(records)} events: a retry apply_usage did not count must publish nothing, or the rollup reads double"
     event = _payload(records[0])
     assert event.get("window") == w and event.get("total") == 1200 and event.get("over") is False, f"the event must carry the window {w}, the window total 1200 and over false from the count, got {event}"
+    # Two more reports on a 1500-unit plan: one lands exactly on the cap, one goes past it.
+    ledger.set_plan_cap("acct_1", 1500)
+    m.report_usage("acct_1", "req_2", "/v1/generate", 300, "gw-us-2")
+    m.report_usage("acct_1", "req_3", "/v1/generate", 100, "gw-us-2")
+    events = [_payload(r) for r in ctx.kafka.records(TOPIC)]
+    assert len(events) == 3, f"three counted reports left {len(events)} events"
+    at_cap, past = events[1], events[2]
+    assert at_cap.get("units") == 300 and at_cap.get("total") == 1500 and at_cap.get("over") is False, f"a report of 300 that brings the window to exactly its 1500-unit cap must carry units 300, total 1500 and over false from the count, got {at_cap}"
+    assert past.get("units") == 100 and past.get("total") == 1600 and past.get("over") is True, f"a report of 100 that takes the window to 1600 of a 1500-unit plan must carry units 100, total 1600 and over true from the count, got {past}"
 
 
 def check_acks_all(ctx):
@@ -542,6 +551,15 @@ export async function check_after_commit(ctx) {
   assert.equal(records.length, 1, \`one request id reported twice left \${records.length} events: a retry applyUsage did not count must publish nothing, or the rollup reads double\`);
   const event = payload(records[0]);
   assert(event.window === w && event.total === 1200 && event.over === false, \`the event must carry the window \${w}, the window total 1200 and over false from the count, got \${JSON.stringify(event)}\`);
+  // Two more reports on a 1500-unit plan: one lands exactly on the cap, one goes past it.
+  await ledger.setPlanCap('acct_1', 1500);
+  await m.reportUsage('acct_1', 'req_2', '/v1/generate', 300, 'gw-us-2');
+  await m.reportUsage('acct_1', 'req_3', '/v1/generate', 100, 'gw-us-2');
+  const rollup = ctx.kafka.records(TOPIC).map(payload);
+  assert.equal(rollup.length, 3, \`three counted reports left \${rollup.length} events\`);
+  const [, atCap, past] = rollup;
+  assert(atCap.units === 300 && atCap.total === 1500 && atCap.over === false, \`a report of 300 that brings the window to exactly its 1500-unit cap must carry units 300, total 1500 and over false from the count, got \${JSON.stringify(atCap)}\`);
+  assert(past.units === 100 && past.total === 1600 && past.over === true, \`a report of 100 that takes the window to 1600 of a 1500-unit plan must carry units 100, total 1600 and over true from the count, got \${JSON.stringify(past)}\`);
 }
 
 export async function check_acks_all(ctx) {
@@ -562,7 +580,7 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "usage.rollup"
+const hTopic = "usage.rollup"
 
 var eventsBg = context.Background()
 
@@ -580,8 +598,8 @@ func mustReport(ctx *harness.Ctx, requestID string, units int64, gateway string)
 
 func CheckTopic(ctx *harness.Ctx) {
 	mustReport(ctx, "req_1", 1200, "gw-eu-1")
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 1, "one counted report; the records on %s", topic)
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(records), 1, "one counted report; the records on %s", hTopic)
 	event := payloadOf(ctx, records[0].Value)
 	ctx.Assert(event["account"] == "acct_1" && event["units"] == float64(1200), "the event must name the account and its 1200 units, got %v", event)
 }
@@ -589,29 +607,38 @@ func CheckTopic(ctx *harness.Ctx) {
 func CheckAccountKey(ctx *harness.Ctx) {
 	mustReport(ctx, "req_1", 1200, "gw-eu-1")
 	mustReport(ctx, "req_2", 300, "gw-us-2")
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{"acct_1", "acct_1"}, "two reports of acct_1 through two gateways must be keyed by the account (keyed by anything else, one account's hour scatters across partitions); the keys")
+	records := ctx.Kafka.Records(hTopic)
+	ctx.Equal(ctx.Kafka.Keys(hTopic), []string{"acct_1", "acct_1"}, "two reports of acct_1 through two gateways must be keyed by the account (keyed by anything else, one account's hour scatters across partitions); the keys")
 	ctx.Assert(len(records) == 2 && records[0].Partition == records[1].Partition, "acct_1's events must stay on one partition, in order; they landed on %v", records)
 }
 
 func CheckAfterCommit(ctx *harness.Ctx) {
 	w := ledger.CurrentWindow()
 	// The moment the count commits, what is already on the topic.
-	atCommit := ctx.Redis.After(ledger.WindowKey("acct_1", w), func() any { return len(ctx.Kafka.Records(topic)) })
+	atCommit := ctx.Redis.After(ledger.WindowKey("acct_1", w), func() any { return len(ctx.Kafka.Records(hTopic)) })
 	mustReport(ctx, "req_1", 1200, "gw-eu-1")
 	ctx.Assert(atCommit.Fired, "reportUsage never counted the report in the window")
 	ctx.Equal(atCommit.Result, 0, "when the count ran the topic already held events: an event went out for usage the window had not counted. Count, then produce; events at the count")
 	mustReport(ctx, "req_1", 1200, "gw-us-2")
-	records := ctx.Kafka.Records(topic)
+	records := ctx.Kafka.Records(hTopic)
 	ctx.Equal(len(records), 1, "one request id reported twice: a retry ApplyUsage did not count must publish nothing, or the rollup reads double; the events")
 	event := payloadOf(ctx, records[0].Value)
 	ctx.Assert(event["window"] == float64(w) && event["total"] == float64(1200) && event["over"] == false, "the event must carry the window %d, the window total 1200 and over false from the count, got %v", w, event)
+	// Two more reports on a 1500-unit plan: one lands exactly on the cap, one goes past it.
+	ledger.SetPlanCap(eventsBg, "acct_1", 1500)
+	mustReport(ctx, "req_2", 300, "gw-us-2")
+	mustReport(ctx, "req_3", 100, "gw-us-2")
+	all := ctx.Kafka.Records(hTopic)
+	ctx.Equal(len(all), 3, "three counted reports; the events")
+	atCap, past := payloadOf(ctx, all[1].Value), payloadOf(ctx, all[2].Value)
+	ctx.Assert(atCap["units"] == float64(300) && atCap["total"] == float64(1500) && atCap["over"] == false, "a report of 300 that brings the window to exactly its 1500-unit cap must carry units 300, total 1500 and over false from the count, got %v", atCap)
+	ctx.Assert(past["units"] == float64(100) && past["total"] == float64(1600) && past["over"] == true, "a report of 100 that takes the window to 1600 of a 1500-unit plan must carry units 100, total 1600 and over true from the count, got %v", past)
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
 	mustReport(ctx, "req_1", 1200, "gw-eu-1")
-	lost := ctx.Kafka.Failover(topic)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "a leader failover lost %d rollup event(s): with RequireOne the leader alone acknowledged it. Use RequireAll; the events", lost)
+	lost := ctx.Kafka.Failover(hTopic)
+	ctx.Equal(len(ctx.Kafka.Records(hTopic)), 1, "a leader failover lost %d rollup event(s): with RequireOne the leader alone acknowledged it. Use RequireAll; the events", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -626,7 +653,7 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "usage.rollup";
+const std::string kHTopic = "usage.rollup";
 
 json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
@@ -640,8 +667,8 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
 
 void CheckTopic(harness::Ctx& ctx) {
   reportUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1");
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 1, "one counted report; the records on %s", kTopic);
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(records.size(), 1, "one counted report; the records on %s", kHTopic);
   const json event = payloadOf(ctx, records[0]);
   ctx.Assert(event.value("account", "") == "acct_1" && event.value("units", 0LL) == 1200, "the event must name the account and its 1200 units, got %s", event.dump());
 }
@@ -649,8 +676,8 @@ void CheckTopic(harness::Ctx& ctx) {
 void CheckAccountKey(harness::Ctx& ctx) {
   reportUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1");
   reportUsage("acct_1", "req_2", "/v1/generate", 300, "gw-us-2");
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"acct_1", "acct_1"}, "two reports of acct_1 through two gateways must be keyed by the account (keyed by anything else, one account's hour scatters across partitions); the keys");
+  const auto records = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHTopic), {"acct_1", "acct_1"}, "two reports of acct_1 through two gateways must be keyed by the account (keyed by anything else, one account's hour scatters across partitions); the keys");
   ctx.Assert(records.size() == 2 && records[0].Partition == records[1].Partition, "acct_1's events must stay on one partition, in order");
 }
 
@@ -658,22 +685,34 @@ void CheckAfterCommit(harness::Ctx& ctx) {
   const long long w = ledger::currentWindow();
   // The moment the count commits, what is already on the topic.
   int atCommit = -1;
-  ctx.Redis.After(ledger::windowKey("acct_1", w), [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
+  ctx.Redis.After(ledger::windowKey("acct_1", w), [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kHTopic).size()); });
   reportUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1");
   ctx.Assert(atCommit >= 0, "reportUsage never counted the report in the window");
   ctx.Equal(atCommit, 0, "when the count ran the topic already held events: an event went out for usage the window had not counted. Count, then produce; events at the count");
   reportUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-us-2");
-  const auto records = ctx.Kafka.Records(kTopic);
+  const auto records = ctx.Kafka.Records(kHTopic);
   ctx.Equal(records.size(), 1, "one request id reported twice: a retry applyUsage did not count must publish nothing, or the rollup reads double; the events");
   const json event = payloadOf(ctx, records[0]);
   ctx.Assert(event.value("window", 0LL) == w && event.value("total", 0LL) == 1200 && event.contains("over") && event["over"] == false,
              "the event must carry the window %d, the window total 1200 and over false from the count, got %s", w, event.dump());
+  // Two more reports on a 1500-unit plan: one lands exactly on the cap, one goes past it.
+  ledger::setPlanCap("acct_1", 1500);
+  reportUsage("acct_1", "req_2", "/v1/generate", 300, "gw-us-2");
+  reportUsage("acct_1", "req_3", "/v1/generate", 100, "gw-us-2");
+  const auto all = ctx.Kafka.Records(kHTopic);
+  ctx.Equal(all.size(), 3, "three counted reports; the events");
+  const json atCap = payloadOf(ctx, all[1]);
+  const json past = payloadOf(ctx, all[2]);
+  ctx.Assert(atCap.value("units", 0LL) == 300 && atCap.value("total", 0LL) == 1500 && atCap.contains("over") && atCap["over"] == false,
+             "a report of 300 that brings the window to exactly its 1500-unit cap must carry units 300, total 1500 and over false from the count, got %s", atCap.dump());
+  ctx.Assert(past.value("units", 0LL) == 100 && past.value("total", 0LL) == 1600 && past.contains("over") && past["over"] == true,
+             "a report of 100 that takes the window to 1600 of a 1500-unit plan must carry units 100, total 1600 and over true from the count, got %s", past.dump());
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {
   reportUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1");
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "a leader failover lost %d rollup event(s): with acks=1 the leader alone acknowledged it. Use acks=all; the events", lost);
+  const int lost = ctx.Kafka.Failover(kHTopic);
+  ctx.Equal(ctx.Kafka.Records(kHTopic).size(), 1, "a leader failover lost %d rollup event(s): with acks=1 the leader alone acknowledged it. Use acks=all; the events", lost);
 }
 `,
   },

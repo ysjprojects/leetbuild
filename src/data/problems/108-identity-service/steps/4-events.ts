@@ -66,7 +66,7 @@ consumers hear about changes that never committed; and a lost acknowledgement wr
       id: 'event-types',
       title: 'Event types come from one closed map',
       detail:
-        '`EVENT_TYPES` maps `created`, `verified` and `suspended` to `identity.created`, `identity.verified` and `identity.suspended`, and an unknown kind is refused before anything is produced; the starter forwards whatever kind it was given.',
+        '`EVENT_TYPES` maps `created`, `verified` and `suspended` to `identity.created`, `identity.verified` and `identity.suspended`, and an unknown kind is refused (an error, or no event) before anything is produced; the starter forwards whatever kind it was given.',
       match: {
         python: {
           all: [
@@ -146,7 +146,7 @@ consumers hear about changes that never committed; and a lost acknowledgement wr
       id: 'commit-before-produce',
       title: 'Commits the status change before producing',
       detail:
-        '`change_status` calls `accounts.transition` first and produces the event only when it moved the account, so consumers never hear about a change that did not commit; the starter produces first.',
+        '`change_status` calls `accounts.transition` first and produces the event only when it moved the account, so consumers never hear about a change that did not commit, even when another writer moves the account between a read of its status and the commit; the starter produces first.',
       match: {
         python: {order: [/def change_status\(/, /accounts\.transition\(/, /record_event\(/]},
         typescript: {order: [/function changeStatus\(/, /transition\(/, /recordEvent\(/]},
@@ -701,11 +701,10 @@ def check_event_types(ctx):
     types = [_payload(r).get("type") for r in ctx.kafka.records(TOPIC)]
     assert types == ["identity.created", "identity.verified", "identity.suspended"], f"the three events carry types {types}, expected identity.created, identity.verified, identity.suspended"
     try:
-        m.record_event("verifed", "u-1", "typo")
+        refused = m.record_event("verifed", "u-1", "typo") is None
     except Exception:
-        pass
-    else:
-        raise AssertionError("an unknown kind (verifed) must be refused, not forwarded as an event type")
+        refused = True
+    assert refused, "an unknown kind (verifed) must be refused (raise, or answer None), not forwarded as an event type"
     assert len(ctx.kafka.records(TOPIC)) == 3, "the refused kind still produced a record"
 
 
@@ -734,6 +733,13 @@ def check_commit_before_produce(ctx):
     stale = m.change_status("u-1", "unverified", "suspended", "chargeback")
     assert stale is None, "a change whose expected status is stale must not commit and must answer None"
     assert len(ctx.kafka.records(TOPIC)) == before, "a change that did not commit produced an event anyway"
+    # Another writer moves u-2 right after change_status's first command on the account: the topic must agree with what change_status answers.
+    accounts.create_account("u-2", "bo@example.com", "+15550100200", "Bo")
+    ctx.redis_after("account:u-2", lambda: ctx.redis.hset("account:u-2", "status", "suspended"))
+    before = len(ctx.kafka.records(TOPIC))
+    event = m.change_status("u-2", "unverified", "verified", "email_confirmed")
+    produced = len(ctx.kafka.records(TOPIC)) - before
+    assert produced == (0 if event is None else 1), f"another writer moved u-2 right after change_status first touched it; change_status answered {event} and produced {produced} record(s): a status read before producing proves nothing once another writer lands. Commit with accounts.transition, then produce"
 
 
 def check_idempotent_producer(ctx):
@@ -788,7 +794,13 @@ export async function check_event_types(ctx) {
   await change(m, 'verified', 'suspended', 'chargeback');
   const types = ctx.kafka.records(TOPIC).map(r => payload(r).type);
   assert.deepStrictEqual(types, ['identity.created', 'identity.verified', 'identity.suspended'], \`the three events carry types \${JSON.stringify(types)}, expected identity.created, identity.verified, identity.suspended\`);
-  await assert.rejects(m.recordEvent('verifed', 'u-1', 'typo'), 'an unknown kind (verifed) must be refused, not forwarded as an event type');
+  let refused = false;
+  try {
+    refused = (await m.recordEvent('verifed', 'u-1', 'typo')) == null;
+  } catch {
+    refused = true;
+  }
+  assert(refused, 'an unknown kind (verifed) must be refused (throw, or answer null), not forwarded as an event type');
   assert.equal(ctx.kafka.records(TOPIC).length, 3, 'the refused kind still produced a record');
 }
 
@@ -816,6 +828,13 @@ export async function check_commit_before_produce(ctx) {
   const before = ctx.kafka.records(TOPIC).length;
   assert.equal(await m.changeStatus('u-1', 'unverified', 'suspended', 'chargeback'), null, 'a change whose expected status is stale must not commit and must answer null');
   assert.equal(ctx.kafka.records(TOPIC).length, before, 'a change that did not commit produced an event anyway');
+  // Another writer moves u-2 right after changeStatus's first command on the account: the topic must agree with what changeStatus answers.
+  await accounts.createAccount('u-2', 'bo@example.com', '+15550100200', 'Bo');
+  ctx.redisAfter('account:u-2', () => ctx.redis.hset('account:u-2', 'status', 'suspended'));
+  const beforeRace = ctx.kafka.records(TOPIC).length;
+  const event = await m.changeStatus('u-2', 'unverified', 'verified', 'email_confirmed');
+  const produced = ctx.kafka.records(TOPIC).length - beforeRace;
+  assert.equal(produced, event == null ? 0 : 1, \`another writer moved u-2 right after changeStatus first touched it; changeStatus answered \${JSON.stringify(event)} and produced \${produced} record(s): a status read before producing proves nothing once another writer lands. Commit with transition, then produce\`);
 }
 
 export async function check_idempotent_producer(ctx) {
@@ -841,69 +860,69 @@ import (
 	"leetbuild/harness"
 )
 
-const topic = "identity.event"
+const harnessTopic = "identity.event"
 
-var eventsBg = context.Background()
+var harnessBg = context.Background()
 
-func setupEvents(ctx *harness.Ctx) {
-	_, err := accounts.CreateAccount(eventsBg, "u-1", "ada@example.com", "+442079460958", "Ada Lovelace")
+func harnessSetupEvents(ctx *harness.Ctx) {
+	_, err := accounts.CreateAccount(harnessBg, "u-1", "ada@example.com", "+442079460958", "Ada Lovelace")
 	ctx.NoError(err, "CreateAccount(u-1) failed")
 }
 
-func payloadOf(ctx *harness.Ctx, value []byte) map[string]any {
+func harnessPayload(ctx *harness.Ctx, value []byte) map[string]any {
 	var p map[string]any
 	ctx.Assert(json.Unmarshal(value, &p) == nil, "the record's value is not JSON: %s", value)
 	return p
 }
 
-func mustChange(ctx *harness.Ctx, expected, status, reason string) map[string]any {
-	event, err := changeStatus(eventsBg, "u-1", expected, status, reason)
+func harnessChange(ctx *harness.Ctx, expected, status, reason string) map[string]any {
+	event, err := changeStatus(harnessBg, "u-1", expected, status, reason)
 	ctx.NoError(err, "changeStatus(u-1, %s → %s) failed", expected, status)
 	ctx.Assert(event != nil, "changeStatus(u-1, %s → %s) must commit and answer the event", expected, status)
 	return event
 }
 
-func mustRecord(ctx *harness.Ctx, kind, reason string) {
-	_, err := recordEvent(eventsBg, kind, "u-1", reason)
+func harnessRecord(ctx *harness.Ctx, kind, reason string) {
+	_, err := recordEvent(harnessBg, kind, "u-1", reason)
 	ctx.NoError(err, "recordEvent(%q) failed", kind)
 }
 
 func CheckUserKey(ctx *harness.Ctx) {
-	setupEvents(ctx)
-	mustRecord(ctx, "created", "signup")
-	mustChange(ctx, "unverified", "verified", "email_confirmed")
-	mustChange(ctx, "verified", "suspended", "chargeback")
+	harnessSetupEvents(ctx)
+	harnessRecord(ctx, "created", "signup")
+	harnessChange(ctx, "unverified", "verified", "email_confirmed")
+	harnessChange(ctx, "verified", "suspended", "chargeback")
 	ctx.Settle()
-	records := ctx.Kafka.Records(topic)
-	ctx.Equal(len(records), 3, "three events must produce three records on %s; the records", topic)
-	ctx.Equal(ctx.Kafka.Keys(topic), []string{"u-1", "u-1", "u-1"}, "records must be keyed by the user id (keyed by the address, an account that changes it splits its history across partitions)")
+	records := ctx.Kafka.Records(harnessTopic)
+	ctx.Equal(len(records), 3, "three events must produce three records on %s; the records", harnessTopic)
+	ctx.Equal(ctx.Kafka.Keys(harnessTopic), []string{"u-1", "u-1", "u-1"}, "records must be keyed by the user id (keyed by the address, an account that changes it splits its history across partitions)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "u-1's events landed on partitions %d, %d, %d: one account's history must stay on one partition, in order", records[0].Partition, records[1].Partition, records[2].Partition)
 }
 
 func CheckEventTypes(ctx *harness.Ctx) {
-	setupEvents(ctx)
-	mustRecord(ctx, "created", "signup")
-	mustChange(ctx, "unverified", "verified", "email_confirmed")
-	mustChange(ctx, "verified", "suspended", "chargeback")
+	harnessSetupEvents(ctx)
+	harnessRecord(ctx, "created", "signup")
+	harnessChange(ctx, "unverified", "verified", "email_confirmed")
+	harnessChange(ctx, "verified", "suspended", "chargeback")
 	ctx.Settle()
 	var types []string
-	for _, r := range ctx.Kafka.Records(topic) {
-		t, _ := payloadOf(ctx, r.Value)["type"].(string)
+	for _, r := range ctx.Kafka.Records(harnessTopic) {
+		t, _ := harnessPayload(ctx, r.Value)["type"].(string)
 		types = append(types, t)
 	}
 	ctx.Equal(types, []string{"identity.created", "identity.verified", "identity.suspended"}, "the three events' types")
-	_, err := recordEvent(eventsBg, "verifed", "u-1", "typo")
-	ctx.Assert(err != nil, "an unknown kind (verifed) must be refused, not forwarded as an event type")
+	refusedEvent, err := recordEvent(harnessBg, "verifed", "u-1", "typo")
+	ctx.Assert(err != nil || refusedEvent == nil, "an unknown kind (verifed) must be refused (an error, or a nil event), not forwarded as an event type")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 3, "the refused kind must not produce a record; the records")
+	ctx.Equal(len(ctx.Kafka.Records(harnessTopic)), 3, "the refused kind must not produce a record; the records")
 }
 
 func CheckNoContactPii(ctx *harness.Ctx) {
-	setupEvents(ctx)
-	mustChange(ctx, "unverified", "verified", "email_confirmed")
+	harnessSetupEvents(ctx)
+	harnessChange(ctx, "unverified", "verified", "email_confirmed")
 	ctx.Settle()
-	record := ctx.Kafka.Records(topic)[0]
-	p := payloadOf(ctx, record.Value)
+	record := ctx.Kafka.Records(harnessTopic)[0]
+	p := harnessPayload(ctx, record.Value)
 	for _, name := range []string{"email", "phone", "name"} {
 		_, present := p[name]
 		ctx.Assert(!present, "the event carries the account's %s: %v. The topic is retained and replicated; carry the user id and a reason code", name, p)
@@ -916,34 +935,48 @@ func CheckNoContactPii(ctx *harness.Ctx) {
 }
 
 func CheckCommitBeforeProduce(ctx *harness.Ctx) {
-	setupEvents(ctx)
+	harnessSetupEvents(ctx)
 	// The moment the status change commits, what is already on the topic.
-	atCommit := ctx.Redis.After("account:u-1", func() any { return len(ctx.Kafka.Records(topic)) })
-	mustChange(ctx, "unverified", "verified", "email_confirmed")
+	atCommit := ctx.Redis.After("account:u-1", func() any { return len(ctx.Kafka.Records(harnessTopic)) })
+	harnessChange(ctx, "unverified", "verified", "email_confirmed")
 	ctx.Settle()
 	ctx.Assert(atCommit.Fired, "changeStatus never touched account:u-1")
 	ctx.Equal(atCommit.Result, 0, "when the change committed the topic already held records: consumers heard about a change before it existed. Commit, then produce; records at the commit")
-	a, err := accounts.GetAccount(eventsBg, "u-1")
+	a, err := accounts.GetAccount(harnessBg, "u-1")
 	ctx.NoError(err, "GetAccount failed")
 	ctx.Equal(a.Status, "verified", "the change must commit; the status")
-	before := len(ctx.Kafka.Records(topic))
-	stale, err := changeStatus(eventsBg, "u-1", "unverified", "suspended", "chargeback")
+	before := len(ctx.Kafka.Records(harnessTopic))
+	stale, err := changeStatus(harnessBg, "u-1", "unverified", "suspended", "chargeback")
 	ctx.NoError(err, "a stale change must not fail")
 	ctx.Assert(stale == nil, "a change whose expected status is stale must not commit and must answer nil, got %v", stale)
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(topic)), before, "a change that did not commit must not produce an event; the records")
+	ctx.Equal(len(ctx.Kafka.Records(harnessTopic)), before, "a change that did not commit must not produce an event; the records")
+	// Another writer moves u-2 right after changeStatus's first command on the account: the topic must agree with what changeStatus answers.
+	_, err = accounts.CreateAccount(harnessBg, "u-2", "bo@example.com", "+15550100200", "Bo")
+	ctx.NoError(err, "CreateAccount(u-2) failed")
+	ctx.Redis.After("account:u-2", func() any { return ctx.Redis.Do("HSET", "account:u-2", "status", "suspended") })
+	beforeRace := len(ctx.Kafka.Records(harnessTopic))
+	event, err := changeStatus(harnessBg, "u-2", "unverified", "verified", "email_confirmed")
+	ctx.NoError(err, "changeStatus(u-2) failed")
+	ctx.Settle()
+	produced := len(ctx.Kafka.Records(harnessTopic)) - beforeRace
+	want := 1
+	if event == nil {
+		want = 0
+	}
+	ctx.Equal(produced, want, "another writer moved u-2 right after changeStatus first touched it; changeStatus answered %v, and a status read before producing proves nothing once another writer lands (commit with accounts.Transition, then produce); the records it produced", event)
 }
 
 func CheckIdempotentProducer(ctx *harness.Ctx) {
-	setupEvents(ctx)
-	ctx.Kafka.LoseAcks(topic, 1)
-	mustChange(ctx, "unverified", "verified", "email_confirmed")
+	harnessSetupEvents(ctx)
+	ctx.Kafka.LoseAcks(harnessTopic, 1)
+	harnessChange(ctx, "unverified", "verified", "email_confirmed")
 	ctx.Settle()
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
-	mustChange(ctx, "verified", "suspended", "chargeback")
+	ctx.Equal(len(ctx.Kafka.Records(harnessTopic)), 1, "after one lost acknowledgement the producer's retry must not write the event twice (enable.idempotence); the records")
+	harnessChange(ctx, "verified", "suspended", "chargeback")
 	ctx.Settle()
-	lost := ctx.Kafka.Failover(topic)
-	ctx.Equal(len(ctx.Kafka.Records(topic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost)
+	lost := ctx.Kafka.Failover(harnessTopic)
+	ctx.Equal(len(ctx.Kafka.Records(harnessTopic)), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -960,11 +993,11 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "identity.event";
+const std::string kHarnessTopic = "identity.event";
 
-void setupEvents() { accounts::createAccount("u-1", "ada@example.com", "+442079460958", "Ada Lovelace"); }
+void harnessSetupEvents() { accounts::createAccount("u-1", "ada@example.com", "+442079460958", "Ada Lovelace"); }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json harnessPayload(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -972,7 +1005,7 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   }
 }
 
-json mustChange(harness::Ctx& ctx, const std::string& expected, const std::string& status, const std::string& reason) {
+json harnessChange(harness::Ctx& ctx, const std::string& expected, const std::string& status, const std::string& reason) {
   std::optional<json> event;
   try {
     event = changeStatus("u-1", expected, status, reason);
@@ -986,41 +1019,41 @@ json mustChange(harness::Ctx& ctx, const std::string& expected, const std::strin
 }  // namespace
 
 void CheckUserKey(harness::Ctx& ctx) {
-  setupEvents();
+  harnessSetupEvents();
   recordEvent("created", "u-1", "signup");
-  mustChange(ctx, "unverified", "verified", "email_confirmed");
-  mustChange(ctx, "verified", "suspended", "chargeback");
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 3, "three events must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {"u-1", "u-1", "u-1"}, "records must be keyed by the user id (keyed by the address, an account that changes it splits its history across partitions)");
+  harnessChange(ctx, "unverified", "verified", "email_confirmed");
+  harnessChange(ctx, "verified", "suspended", "chargeback");
+  const auto records = ctx.Kafka.Records(kHarnessTopic);
+  ctx.Equal(records.size(), 3, "three events must produce three records on %s; the records", kHarnessTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHarnessTopic), {"u-1", "u-1", "u-1"}, "records must be keyed by the user id (keyed by the address, an account that changes it splits its history across partitions)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "u-1's events landed on partitions %d, %d, %d: one account's history must stay on one partition, in order",
              records[0].Partition, records[1].Partition, records[2].Partition);
 }
 
 void CheckEventTypes(harness::Ctx& ctx) {
-  setupEvents();
+  harnessSetupEvents();
   recordEvent("created", "u-1", "signup");
-  mustChange(ctx, "unverified", "verified", "email_confirmed");
-  mustChange(ctx, "verified", "suspended", "chargeback");
+  harnessChange(ctx, "unverified", "verified", "email_confirmed");
+  harnessChange(ctx, "verified", "suspended", "chargeback");
   std::vector<std::string> types;
-  for (const auto& r : ctx.Kafka.Records(kTopic)) types.push_back(payloadOf(ctx, r).value("type", ""));
+  for (const auto& r : ctx.Kafka.Records(kHarnessTopic)) types.push_back(harnessPayload(ctx, r).value("type", ""));
   ctx.Equal(types, {"identity.created", "identity.verified", "identity.suspended"}, "the three events' types");
   bool refused = false;
   try {
-    recordEvent("verifed", "u-1", "typo");
+    refused = json(recordEvent("verifed", "u-1", "typo")).is_null();
   } catch (const std::exception&) {
     refused = true;
   }
-  ctx.Assert(refused, "an unknown kind (verifed) must be refused, not forwarded as an event type");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 3, "the refused kind must not produce a record; the records");
+  ctx.Assert(refused, "an unknown kind (verifed) must be refused (throw, or answer null), not forwarded as an event type");
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), 3, "the refused kind must not produce a record; the records");
 }
 
 void CheckNoContactPii(harness::Ctx& ctx) {
-  setupEvents();
-  mustChange(ctx, "unverified", "verified", "email_confirmed");
-  const auto record = ctx.Kafka.Records(kTopic)[0];
-  const json p = payloadOf(ctx, record);
+  harnessSetupEvents();
+  harnessChange(ctx, "unverified", "verified", "email_confirmed");
+  const auto record = ctx.Kafka.Records(kHarnessTopic)[0];
+  const json p = harnessPayload(ctx, record);
   for (const std::string name : {"email", "phone", "name"}) {
     ctx.Assert(!p.contains(name), "the event carries the account's %s: %s. The topic is retained and replicated; carry the user id and a reason code", name, p.dump());
   }
@@ -1032,29 +1065,36 @@ void CheckNoContactPii(harness::Ctx& ctx) {
 }
 
 void CheckCommitBeforeProduce(harness::Ctx& ctx) {
-  setupEvents();
+  harnessSetupEvents();
   // The moment the status change commits, what is already on the topic.
   int atCommit = -1;
-  ctx.Redis.After("account:u-1", [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  mustChange(ctx, "unverified", "verified", "email_confirmed");
+  ctx.Redis.After("account:u-1", [&] { atCommit = static_cast<int>(ctx.Kafka.Records(kHarnessTopic).size()); });
+  harnessChange(ctx, "unverified", "verified", "email_confirmed");
   ctx.Assert(atCommit >= 0, "changeStatus never touched account:u-1");
   ctx.Equal(atCommit, 0, "when the change committed the topic already held records: consumers heard about a change before it existed. Commit, then produce; records at the commit");
   ctx.Equal(accounts::getAccount("u-1")->status, "verified", "the change must commit; the status");
-  const size_t before = ctx.Kafka.Records(kTopic).size();
+  const size_t before = ctx.Kafka.Records(kHarnessTopic).size();
   const auto stale = changeStatus("u-1", "unverified", "suspended", "chargeback");
   ctx.Assert(!stale, "a change whose expected status is stale must not commit and must answer nothing");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), before, "a change that did not commit must not produce an event; the records");
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), before, "a change that did not commit must not produce an event; the records");
+  // Another writer moves u-2 right after changeStatus's first command on the account: the topic must agree with what changeStatus answers.
+  accounts::createAccount("u-2", "bo@example.com", "+15550100200", "Bo");
+  ctx.Redis.After("account:u-2", [&ctx] { ctx.Redis.Do("HSET", "account:u-2", "status", "suspended"); });
+  const size_t before_race = ctx.Kafka.Records(kHarnessTopic).size();
+  const auto event = changeStatus("u-2", "unverified", "verified", "email_confirmed");
+  const size_t produced = ctx.Kafka.Records(kHarnessTopic).size() - before_race;
+  ctx.Equal(produced, event ? size_t{1} : size_t{0}, "another writer moved u-2 right after changeStatus first touched it; changeStatus answered %s, and a status read before producing proves nothing once another writer lands (commit with accounts::transition, then produce); the records it produced", event ? event->dump() : std::string("nothing"));
 }
 
 void CheckIdempotentProducer(harness::Ctx& ctx) {
-  setupEvents();
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  mustChange(ctx, "unverified", "verified", "email_confirmed");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1,
+  harnessSetupEvents();
+  ctx.Kafka.LoseAcks(kHarnessTopic, 1);
+  harnessChange(ctx, "unverified", "verified", "email_confirmed");
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), 1,
             "one change whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
-  mustChange(ctx, "verified", "suspended", "chargeback");
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  harnessChange(ctx, "verified", "suspended", "chargeback");
+  const int lost = ctx.Kafka.Failover(kHarnessTopic);
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

@@ -57,7 +57,7 @@ account owns it.
       id: 'canonical-handles',
       title: 'Claims the canonical email and phone',
       detail:
-        '`normalize_email`/`normalizeEmail` lowercases and, for `FOLD_ALIAS_DOMAINS`, drops the dots and the `+tag`; `normalize_phone`/`normalizePhone` produces E.164 or rejects the number (**422**); both run before the claim, which takes the canonical forms. The starter claims the trimmed strings the client sent.',
+        '`normalize_email`/`normalizeEmail` lowercases every address and, only for `FOLD_ALIAS_DOMAINS`, drops the dots and the `+tag`; `normalize_phone`/`normalizePhone` produces E.164 (`+` and 8 to 15 digits) or rejects the number (**422**), as does an email with nothing before the `@`; both run before the claim, which takes the canonical forms. The starter claims the trimmed strings the client sent.',
       match: {
         python: {
           all: [/def normalize_email\(/, /def normalize_phone\(/, /FOLD_ALIAS_DOMAINS/, /\b422\b/],
@@ -95,7 +95,7 @@ account owns it.
       id: 'idempotency-key',
       title: 'A retried signup answers the first attempt',
       detail:
-        '`Idempotency-Key` is required (**400**); the recorded result (`signup_result`/`signupResult`) is read before any claim and answered on a retry, and a new account records its result. The starter ignores the header, so the retry finds its own claims and answers 409.',
+        '`Idempotency-Key` is required (**400**); the recorded result (`signup_result`/`signupResult`) is read before any claim and answered as is on a retry, even one whose body changed, and only a new account records its result, so the retry of a refused signup is refused again. The starter ignores the header, so the retry finds its own claims and answers 409.',
       match: {
         python: {
           all: [/idempotency-key/i, /accounts\.record_signup\(/, /\b400\b/],
@@ -123,7 +123,7 @@ account owns it.
       id: 'neutral-conflict',
       title: 'One neutral 409 for every collision',
       detail:
-        'A refused claim answers **409** with `SIGNUP_CONFLICT` (`{"error": "signup_conflict"}`) whichever handle collided; the body names no address, no field and no account. The starter looks up the owner and puts the address and its user id in the body.',
+        'A refused claim answers **409** with `SIGNUP_CONFLICT` (`{"error": "signup_conflict"}`) whichever handle collided; the body names no address, no field and no account, and the refused signup leaves no claim and no account row. The starter looks up the owner and puts the address and its user id in the body.',
       match: {
         python: {
           all: [/SIGNUP_CONFLICT\s*=/, /SIGNUP_CONFLICT,\s*status_code=409/],
@@ -765,7 +765,32 @@ async def check_canonical_handles(ctx):
         bad = await _signup(c, {"email": "zoe@example.com", "phone": "12", "name": "Zoe"}, "k-6")
         assert bad.status_code == 422, f"a phone of two digits answered {bad.status_code}, expected 422"
         no_at = await _signup(c, {"email": "zoe.example.com", "phone": "+15550100700", "name": "Zoe"}, "k-7")
-    assert no_at.status_code == 422, f"an email without @ answered {no_at.status_code}, expected 422"
+        assert no_at.status_code == 422, f"an email without @ answered {no_at.status_code}, expected 422"
+        upper = await _signup(c, {"email": "Bo.Smith@Example.COM", "phone": "+15550100800", "name": "Bo"}, "k-8")
+        assert upper.status_code == 201, f"a signup as Bo.Smith@Example.COM answered {upper.status_code}: {upper.text}"
+        stored = (accounts.get_account(upper.json()["user_id"]) or {}).get("email")
+        assert stored == "bo.smith@example.com", f"Bo.Smith@Example.COM is stored as {stored!r}: every address is lowercased, not only a Gmail one"
+        lower = await _signup(c, {"email": "bo.smith@example.com", "phone": "+15550100900", "name": "Bo"}, "k-9")
+        assert lower.status_code == 409, f"bo.smith@example.com after Bo.Smith@Example.COM answered {lower.status_code}: one person now has two accounts"
+        tagged = await _signup(c, {"email": "cy+news@example.com", "phone": "+15550101000", "name": "Cy"}, "k-10")
+        untagged = await _signup(c, {"email": "cy@example.com", "phone": "+15550101100", "name": "Cy"}, "k-11")
+        assert tagged.status_code == 201 and untagged.status_code == 201, f"cy+news@example.com and cy@example.com answered {tagged.status_code} and {untagged.status_code}: outside FOLD_ALIAS_DOMAINS the +tag is part of the address"
+        google = await _signup(c, {"email": "Di.Ana+x@GoogleMail.com", "phone": "+15550101200", "name": "Di"}, "k-12")
+        assert google.status_code == 201, f"a signup as Di.Ana+x@GoogleMail.com answered {google.status_code}: {google.text}"
+        stored = (accounts.get_account(google.json()["user_id"]) or {}).get("email")
+        assert stored == "diana@googlemail.com", f"Di.Ana+x@GoogleMail.com is stored as {stored!r}, expected diana@googlemail.com: googlemail.com is in FOLD_ALIAS_DOMAINS too"
+        cases = (
+            ("ed@example.com", "15550101300", 422, "a number with neither + nor 00"),
+            ("ed@example.com", "+1 555 0101 30a", 422, "a number with a letter in it"),
+            ("ed@example.com", "+1234567", 422, "7 digits are too few"),
+            ("@example.com", "+15550101400", 422, "an email with nothing before the @"),
+            ("ed@example.com", "+12345678", 201, "8 digits are a valid E.164 number"),
+            ("fay@example.com", "+123456789012345", 201, "15 digits are a valid E.164 number"),
+            ("gus@example.com", "+1234567890123456", 422, "16 digits are too many"),
+        )
+        for i, (email, phone, want, why) in enumerate(cases):
+            r = await _signup(c, {"email": email, "phone": phone, "name": "Ed"}, f"k-case-{i}")
+            assert r.status_code == want, f"a signup as {email!r} with the phone {phone!r} answered {r.status_code}, expected {want}: {why}"
 
 
 async def check_idempotency_key(ctx):
@@ -776,7 +801,15 @@ async def check_idempotency_key(ctx):
         assert retry.status_code == first.status_code and retry.json() == first.json(), f"a retry with the same Idempotency-Key must answer what the first attempt answered: first {first.status_code} {first.text}, retry {retry.status_code} {retry.text}"
         assert _accounts(ctx) == [f"account:{first.json()['user_id']}"], f"one signup and its retry left the accounts {_accounts(ctx)}"
         missing = await c.post("/v1/users", json={"email": "bo@example.com", "phone": "+15550100800", "name": "Bo"})
-    assert missing.status_code == 400, f"a signup without Idempotency-Key answered {missing.status_code}, expected 400"
+        assert missing.status_code == 400, f"a signup without Idempotency-Key answered {missing.status_code}, expected 400"
+        changed = await _signup(c, {"email": "ada.l@example.com", "phone": "+15550100900", "name": "Ada"}, "k-1")
+        assert changed.status_code == first.status_code and changed.json() == first.json(), f"a retry under k-1 whose body changed answered {changed.status_code} {changed.text}, expected the recorded {first.text}: the recorded result is read before any claim and answered as is"
+        assert _accounts(ctx) == [f"account:{first.json()['user_id']}"], f"a retry under k-1 whose body changed left the accounts {_accounts(ctx)}"
+        refused = await _signup(c, {**ADA, "phone": "+15550101000"}, "k-2")
+        assert refused.status_code == 409, f"a signup with the taken ada@example.com answered {refused.status_code}: {refused.text}"
+        again = await _signup(c, {**ADA, "phone": "+15550101000"}, "k-2")
+    assert again.status_code == 409, f"the retry of a refused signup answered {again.status_code} {again.text}: only a new account records its result"
+    assert _accounts(ctx) == [f"account:{first.json()['user_id']}"], f"a refused signup and its retry left the accounts {_accounts(ctx)}"
 
 
 async def check_neutral_conflict(ctx):
@@ -792,6 +825,7 @@ async def check_neutral_conflict(ctx):
         assert "ada@example.com" not in r.text and "7946" not in r.text, f"the 409 for a taken {what} echoes the handle: {r.text}"
         assert r.json() == {"error": "signup_conflict"}, f"the 409 for a taken {what} is {r.text}, expected {{\\"error\\": \\"signup_conflict\\"}}"
     assert owner_of("email", "eve@example.com") is None, "the refused signup kept its claim on eve@example.com"
+    assert _accounts(ctx) == [f"account:{owner}"], f"the refused signups left the accounts {_accounts(ctx)}: a refused claim writes no row"
 `,
     typescript: `const ADA = {email: 'ada@example.com', phone: '+44 20 7946 0958', name: 'Ada'};
 
@@ -830,6 +864,32 @@ export async function check_canonical_handles(ctx) {
   assert.equal(bad.status, 422, \`a phone of two digits answered \${bad.status}, expected 422\`);
   const noAt = await signup(c, {email: 'zoe.example.com', phone: '+15550100700', name: 'Zoe'}, 'k-7');
   assert.equal(noAt.status, 422, \`an email without @ answered \${noAt.status}, expected 422\`);
+  const upper = await signup(c, {email: 'Bo.Smith@Example.COM', phone: '+15550100800', name: 'Bo'}, 'k-8');
+  assert.equal(upper.status, 201, \`a signup as Bo.Smith@Example.COM answered \${upper.status}: \${upper.text}\`);
+  let stored = (await accounts.getAccount(upper.json().user_id))?.email;
+  assert.equal(stored, 'bo.smith@example.com', \`Bo.Smith@Example.COM is stored as \${JSON.stringify(stored)}: every address is lowercased, not only a Gmail one\`);
+  const lower = await signup(c, {email: 'bo.smith@example.com', phone: '+15550100900', name: 'Bo'}, 'k-9');
+  assert.equal(lower.status, 409, \`bo.smith@example.com after Bo.Smith@Example.COM answered \${lower.status}: one person now has two accounts\`);
+  const tagged = await signup(c, {email: 'cy+news@example.com', phone: '+15550101000', name: 'Cy'}, 'k-10');
+  const untagged = await signup(c, {email: 'cy@example.com', phone: '+15550101100', name: 'Cy'}, 'k-11');
+  assert(tagged.status === 201 && untagged.status === 201, \`cy+news@example.com and cy@example.com answered \${tagged.status} and \${untagged.status}: outside FOLD_ALIAS_DOMAINS the +tag is part of the address\`);
+  const google = await signup(c, {email: 'Di.Ana+x@GoogleMail.com', phone: '+15550101200', name: 'Di'}, 'k-12');
+  assert.equal(google.status, 201, \`a signup as Di.Ana+x@GoogleMail.com answered \${google.status}: \${google.text}\`);
+  stored = (await accounts.getAccount(google.json().user_id))?.email;
+  assert.equal(stored, 'diana@googlemail.com', \`Di.Ana+x@GoogleMail.com is stored as \${JSON.stringify(stored)}, expected diana@googlemail.com: googlemail.com is in FOLD_ALIAS_DOMAINS too\`);
+  const cases: [string, string, number, string][] = [
+    ['ed@example.com', '15550101300', 422, 'a number with neither + nor 00'],
+    ['ed@example.com', '+1 555 0101 30a', 422, 'a number with a letter in it'],
+    ['ed@example.com', '+1234567', 422, '7 digits are too few'],
+    ['@example.com', '+15550101400', 422, 'an email with nothing before the @'],
+    ['ed@example.com', '+12345678', 201, '8 digits are a valid E.164 number'],
+    ['fay@example.com', '+123456789012345', 201, '15 digits are a valid E.164 number'],
+    ['gus@example.com', '+1234567890123456', 422, '16 digits are too many'],
+  ];
+  for (const [i, [email, phone, want, why]] of cases.entries()) {
+    const r = await signup(c, {email, phone, name: 'Ed'}, \`k-case-\${i}\`);
+    assert.equal(r.status, want, \`a signup as \${JSON.stringify(email)} with the phone \${JSON.stringify(phone)} answered \${r.status}, expected \${want}: \${why}\`);
+  }
 }
 
 export async function check_idempotency_key(ctx) {
@@ -842,6 +902,16 @@ export async function check_idempotency_key(ctx) {
   assert.deepStrictEqual(keys, [\`account:\${first.json().user_id}\`], \`one signup and its retry left the accounts \${JSON.stringify(keys)}\`);
   const missing = await c.post('/v1/users', {json: {email: 'bo@example.com', phone: '+15550100800', name: 'Bo'}});
   assert.equal(missing.status, 400, \`a signup without Idempotency-Key answered \${missing.status}, expected 400\`);
+  const changed = await signup(c, {email: 'ada.l@example.com', phone: '+15550100900', name: 'Ada'}, 'k-1');
+  assert(changed.status === first.status && changed.text === first.text, \`a retry under k-1 whose body changed answered \${changed.status} \${changed.text}, expected the recorded \${first.text}: the recorded result is read before any claim and answered as is\`);
+  const afterChanged = ctx.redis.keys('account:u-*').sort();
+  assert.deepStrictEqual(afterChanged, [\`account:\${first.json().user_id}\`], \`a retry under k-1 whose body changed left the accounts \${JSON.stringify(afterChanged)}\`);
+  const refused = await signup(c, {...ADA, phone: '+15550101000'}, 'k-2');
+  assert.equal(refused.status, 409, \`a signup with the taken ada@example.com answered \${refused.status}: \${refused.text}\`);
+  const again = await signup(c, {...ADA, phone: '+15550101000'}, 'k-2');
+  assert.equal(again.status, 409, \`the retry of a refused signup answered \${again.status} \${again.text}: only a new account records its result\`);
+  const afterRefused = ctx.redis.keys('account:u-*').sort();
+  assert.deepStrictEqual(afterRefused, [\`account:\${first.json().user_id}\`], \`a refused signup and its retry left the accounts \${JSON.stringify(afterRefused)}\`);
 }
 
 export async function check_neutral_conflict(ctx) {
@@ -858,6 +928,8 @@ export async function check_neutral_conflict(ctx) {
     assert.deepStrictEqual(r.json(), {error: 'signup_conflict'}, \`the 409 for a taken \${what} is \${r.text}, expected {"error": "signup_conflict"}\`);
   }
   assert.equal(await handles.ownerOf('email', 'eve@example.com'), null, 'the refused signup kept its claim on eve@example.com');
+  const left = ctx.redis.keys('account:u-*').sort();
+  assert.deepStrictEqual(left, [\`account:\${owner}\`], \`the refused signups left the accounts \${JSON.stringify(left)}: a refused claim writes no row\`);
 }
 `,
     go: `package main
@@ -865,6 +937,7 @@ export async function check_neutral_conflict(ctx) {
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"identityd/accounts"
@@ -874,25 +947,25 @@ import (
 )
 
 var (
-	apiBg = context.Background()
-	ada   = map[string]string{"email": "ada@example.com", "phone": "+44 20 7946 0958", "name": "Ada"}
+	harnessBg  = context.Background()
+	harnessAda = map[string]string{"email": "ada@example.com", "phone": "+44 20 7946 0958", "name": "Ada"}
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func harnessAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func person(email, phone, name string) map[string]string {
+func harnessPerson(email, phone, name string) map[string]string {
 	return map[string]string{"email": email, "phone": phone, "name": name}
 }
 
-func signupAs(c *harness.HTTP, body map[string]string, key string) *harness.Response {
+func harnessSignup(c *harness.HTTP, body map[string]string, key string) *harness.Response {
 	return c.Post("/v1/users", body, "Idempotency-Key", key)
 }
 
-func userIDOf(ctx *harness.Ctx, r *harness.Response) string {
+func harnessUserID(ctx *harness.Ctx, r *harness.Response) string {
 	var body struct {
 		UserID string \`json:"user_id"\`
 		Status string \`json:"status"\`
@@ -901,69 +974,114 @@ func userIDOf(ctx *harness.Ctx, r *harness.Response) string {
 	return body.UserID
 }
 
-func account(ctx *harness.Ctx, userID string) *accounts.Account {
-	a, err := accounts.GetAccount(apiBg, userID)
+func harnessAccount(ctx *harness.Ctx, userID string) *accounts.Account {
+	a, err := accounts.GetAccount(harnessBg, userID)
 	ctx.NoError(err, "GetAccount(%s) failed", userID)
 	return a
 }
 
+func harnessStoredEmail(ctx *harness.Ctx, r *harness.Response) string {
+	if a := harnessAccount(ctx, harnessUserID(ctx, r)); a != nil {
+		return a.Email
+	}
+	return ""
+}
+
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := signupAs(c, person("grace@example.com", "+15550100200", "Grace"), "k-1")
+	c := harnessAPI(ctx)
+	r := harnessSignup(c, harnessPerson("grace@example.com", "+15550100200", "Grace"), "k-1")
 	ctx.Equal(r.Status, 201, "POST /v1/users (%s)", r.Text())
 	ctx.Assert(strings.Contains(r.Text(), \`"unverified"\`), "a signup must answer the new user_id with status unverified, got %s", r.Text())
-	userID := userIDOf(ctx, r)
-	a := account(ctx, userID)
+	userID := harnessUserID(ctx, r)
+	a := harnessAccount(ctx, userID)
 	ctx.Assert(a != nil && a.Name == "Grace", "the store holds %+v for %s", a, userID)
-	ctx.Equal(handles.OwnerOf(apiBg, "email", a.Email), userID, "the owner of the account's address %s", a.Email)
+	ctx.Equal(handles.OwnerOf(harnessBg, "email", a.Email), userID, "the owner of the account's address %s", a.Email)
 }
 
 func CheckCanonicalHandles(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := signupAs(c, person("Ada.Lovelace+news@Gmail.com", "+44 20 7946 0958", "Ada"), "k-1")
+	c := harnessAPI(ctx)
+	first := harnessSignup(c, harnessPerson("Ada.Lovelace+news@Gmail.com", "+44 20 7946 0958", "Ada"), "k-1")
 	ctx.Equal(first.Status, 201, "the first signup (%s)", first.Text())
-	a := account(ctx, userIDOf(ctx, first))
+	a := harnessAccount(ctx, harnessUserID(ctx, first))
 	ctx.Assert(a != nil, "the first signup wrote no account")
 	ctx.Equal(a.Email, "adalovelace@gmail.com", "the account's email: case, the dots and the +tag of a Gmail address must fold to adalovelace@gmail.com")
 	ctx.Equal(a.Phone, "+442079460958", "the account's phone, in E.164")
-	again := signupAs(c, person("adalovelace@gmail.com", "+15550100300", "Ada"), "k-2")
+	again := harnessSignup(c, harnessPerson("adalovelace@gmail.com", "+15550100300", "Ada"), "k-2")
 	ctx.Equal(again.Status, 409, "a second signup as adalovelace@gmail.com must be refused, or one person has two accounts")
-	samePhone := signupAs(c, person("ada@example.com", "0044-20-7946-0958", "Ada"), "k-3")
+	samePhone := harnessSignup(c, harnessPerson("ada@example.com", "0044-20-7946-0958", "Ada"), "k-3")
 	ctx.Equal(samePhone.Status, 409, "a signup with 0044-20-7946-0958 (the number +442079460958 already holds)")
-	dotted := signupAs(c, person("a.b@example.com", "+15550100400", "A"), "k-4")
-	plain := signupAs(c, person("ab@example.com", "+15550100500", "B"), "k-5")
+	dotted := harnessSignup(c, harnessPerson("a.b@example.com", "+15550100400", "A"), "k-4")
+	plain := harnessSignup(c, harnessPerson("ab@example.com", "+15550100500", "B"), "k-5")
 	ctx.Assert(dotted.Status == 201 && plain.Status == 201, "a.b@example.com and ab@example.com answered %d and %d: outside foldAliasDomains the dots are part of the address", dotted.Status, plain.Status)
-	bad := signupAs(c, person("zoe@example.com", "12", "Zoe"), "k-6")
+	bad := harnessSignup(c, harnessPerson("zoe@example.com", "12", "Zoe"), "k-6")
 	ctx.Equal(bad.Status, 422, "a phone of two digits")
-	noAt := signupAs(c, person("zoe.example.com", "+15550100700", "Zoe"), "k-7")
+	noAt := harnessSignup(c, harnessPerson("zoe.example.com", "+15550100700", "Zoe"), "k-7")
 	ctx.Equal(noAt.Status, 422, "an email without @")
+	upper := harnessSignup(c, harnessPerson("Bo.Smith@Example.COM", "+15550100800", "Bo"), "k-8")
+	ctx.Equal(upper.Status, 201, "a signup as Bo.Smith@Example.COM (%s)", upper.Text())
+	ctx.Equal(harnessStoredEmail(ctx, upper), "bo.smith@example.com", "the stored form of Bo.Smith@Example.COM: every address is lowercased, not only a Gmail one")
+	lower := harnessSignup(c, harnessPerson("bo.smith@example.com", "+15550100900", "Bo"), "k-9")
+	ctx.Equal(lower.Status, 409, "bo.smith@example.com after Bo.Smith@Example.COM must be refused, or one person has two accounts")
+	tagged := harnessSignup(c, harnessPerson("cy+news@example.com", "+15550101000", "Cy"), "k-10")
+	untagged := harnessSignup(c, harnessPerson("cy@example.com", "+15550101100", "Cy"), "k-11")
+	ctx.Assert(tagged.Status == 201 && untagged.Status == 201, "cy+news@example.com and cy@example.com answered %d and %d: outside foldAliasDomains the +tag is part of the address", tagged.Status, untagged.Status)
+	google := harnessSignup(c, harnessPerson("Di.Ana+x@GoogleMail.com", "+15550101200", "Di"), "k-12")
+	ctx.Equal(google.Status, 201, "a signup as Di.Ana+x@GoogleMail.com (%s)", google.Text())
+	ctx.Equal(harnessStoredEmail(ctx, google), "diana@googlemail.com", "the stored form of Di.Ana+x@GoogleMail.com: googlemail.com is in foldAliasDomains too")
+	cases := []struct {
+		email, phone string
+		want         int
+		why          string
+	}{
+		{"ed@example.com", "15550101300", 422, "a number with neither + nor 00"},
+		{"ed@example.com", "+1 555 0101 30a", 422, "a number with a letter in it"},
+		{"ed@example.com", "+1234567", 422, "7 digits are too few"},
+		{"@example.com", "+15550101400", 422, "an email with nothing before the @"},
+		{"ed@example.com", "+12345678", 201, "8 digits are a valid E.164 number"},
+		{"fay@example.com", "+123456789012345", 201, "15 digits are a valid E.164 number"},
+		{"gus@example.com", "+1234567890123456", 422, "16 digits are too many"},
+	}
+	for i, tc := range cases {
+		r := harnessSignup(c, harnessPerson(tc.email, tc.phone, "Ed"), "k-case-"+strconv.Itoa(i))
+		ctx.Equal(r.Status, tc.want, "a signup as %q with the phone %q (%s)", tc.email, tc.phone, tc.why)
+	}
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := signupAs(c, ada, "k-1")
+	c := harnessAPI(ctx)
+	first := harnessSignup(c, harnessAda, "k-1")
 	ctx.Equal(first.Status, 201, "the first signup (%s)", first.Text())
-	retry := signupAs(c, ada, "k-1")
+	only := []string{"account:" + harnessUserID(ctx, first)}
+	retry := harnessSignup(c, harnessAda, "k-1")
 	ctx.Assert(retry.Status == first.Status && strings.TrimSpace(retry.Text()) == strings.TrimSpace(first.Text()), "a retry with the same Idempotency-Key must answer what the first attempt answered: first %d %s, retry %d %s", first.Status, first.Text(), retry.Status, retry.Text())
-	ctx.Equal(ctx.Redis.Keys("account:u-*"), []string{"account:" + userIDOf(ctx, first)}, "one signup and its retry; the accounts")
-	missing := c.Post("/v1/users", person("bo@example.com", "+15550100800", "Bo"))
+	ctx.Equal(ctx.Redis.Keys("account:u-*"), only, "one signup and its retry; the accounts")
+	missing := c.Post("/v1/users", harnessPerson("bo@example.com", "+15550100800", "Bo"))
 	ctx.Equal(missing.Status, 400, "a signup without Idempotency-Key")
+	changed := harnessSignup(c, harnessPerson("ada.l@example.com", "+15550100900", "Ada"), "k-1")
+	ctx.Assert(changed.Status == first.Status && strings.TrimSpace(changed.Text()) == strings.TrimSpace(first.Text()), "a retry under k-1 whose body changed answered %d %s, expected the recorded %s: the recorded result is read before any claim and answered as is", changed.Status, changed.Text(), first.Text())
+	ctx.Equal(ctx.Redis.Keys("account:u-*"), only, "a retry under k-1 whose body changed; the accounts")
+	refused := harnessSignup(c, harnessPerson("ada@example.com", "+15550101000", "Ada"), "k-2")
+	ctx.Equal(refused.Status, 409, "a signup with the taken ada@example.com (%s)", refused.Text())
+	again := harnessSignup(c, harnessPerson("ada@example.com", "+15550101000", "Ada"), "k-2")
+	ctx.Equal(again.Status, 409, "the retry of a refused signup (%s): only a new account records its result", again.Text())
+	ctx.Equal(ctx.Redis.Keys("account:u-*"), only, "a refused signup and its retry; the accounts")
 }
 
 func CheckNeutralConflict(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := signupAs(c, ada, "k-1")
+	c := harnessAPI(ctx)
+	first := harnessSignup(c, harnessAda, "k-1")
 	ctx.Equal(first.Status, 201, "the first signup (%s)", first.Text())
-	owner := userIDOf(ctx, first)
-	byEmail := signupAs(c, person("ada@example.com", "+15550100600", "Eve"), "k-2")
-	byPhone := signupAs(c, person("eve@example.com", "+44 20 7946 0958", "Eve"), "k-3")
+	owner := harnessUserID(ctx, first)
+	byEmail := harnessSignup(c, harnessPerson("ada@example.com", "+15550100600", "Eve"), "k-2")
+	byPhone := harnessSignup(c, harnessPerson("eve@example.com", "+44 20 7946 0958", "Eve"), "k-3")
 	for what, r := range map[string]*harness.Response{"email": byEmail, "phone": byPhone} {
 		ctx.Equal(r.Status, 409, "a signup with a taken %s (%s)", what, r.Text())
 		ctx.Assert(!strings.Contains(r.Text(), owner), "the 409 for a taken %s names the account %s: %s. A stranger learns who owns the address", what, owner, r.Text())
 		ctx.Assert(!strings.Contains(r.Text(), "ada@example.com") && !strings.Contains(r.Text(), "7946"), "the 409 for a taken %s echoes the handle: %s", what, r.Text())
 		ctx.Equal(r.JSON(), map[string]any{"error": "signup_conflict"}, "the 409 for a taken %s", what)
 	}
-	ctx.Equal(handles.OwnerOf(apiBg, "email", "eve@example.com"), "", "the refused signup must not keep its claim on eve@example.com; the owner")
+	ctx.Equal(handles.OwnerOf(harnessBg, "email", "eve@example.com"), "", "the refused signup must not keep its claim on eve@example.com; the owner")
+	ctx.Equal(ctx.Redis.Keys("account:u-*"), []string{"account:" + owner}, "the refused signups write no row; the accounts")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -981,9 +1099,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kAda = {{"email", "ada@example.com"}, {"phone", "+44 20 7946 0958"}, {"name", "Ada"}};
+const json kHarnessAda = {{"email", "ada@example.com"}, {"phone", "+44 20 7946 0958"}, {"name", "Ada"}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP harnessApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -991,71 +1109,114 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json person(const std::string& email, const std::string& phone, const std::string& name) {
+json harnessPerson(const std::string& email, const std::string& phone, const std::string& name) {
   return json{{"email", email}, {"phone", phone}, {"name", name}};
 }
 
-harness::Response signupAs(harness::HTTP& c, const json& body, const std::string& key) {
+harness::Response harnessSignup(harness::HTTP& c, const json& body, const std::string& key) {
   return c.Post("/v1/users", body.dump(), "Content-Type", "application/json", "Idempotency-Key", key);
 }
 
-std::string userIdOf(const harness::Response& r) {
+std::string harnessUserId(const harness::Response& r) {
   const json body = json::parse(r.Text(), nullptr, false);
   return body.is_object() ? body.value("user_id", "") : "";
+}
+
+std::string harnessStoredEmail(const harness::Response& r) {
+  const auto account = accounts::getAccount(harnessUserId(r));
+  return account ? account->email : "";
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = signupAs(c, person("grace@example.com", "+15550100200", "Grace"), "k-1");
+  auto c = harnessApi(ctx);
+  const auto r = harnessSignup(c, harnessPerson("grace@example.com", "+15550100200", "Grace"), "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/users (%s)", r.Text());
   ctx.Assert(r.Text().find("\\"unverified\\"") != std::string::npos, "a signup must answer the new user_id with status unverified, got %s", r.Text());
-  const std::string user_id = userIdOf(r);
+  const std::string user_id = harnessUserId(r);
   const auto account = accounts::getAccount(user_id);
   ctx.Assert(account && account->name == "Grace", "the store holds no account named Grace for %s", user_id);
   ctx.Equal(handles::ownerOf("email", account->email).value_or(""), user_id, "the owner of the account's address %s", account->email);
 }
 
 void CheckCanonicalHandles(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = signupAs(c, person("Ada.Lovelace+news@Gmail.com", "+44 20 7946 0958", "Ada"), "k-1");
+  auto c = harnessApi(ctx);
+  const auto first = harnessSignup(c, harnessPerson("Ada.Lovelace+news@Gmail.com", "+44 20 7946 0958", "Ada"), "k-1");
   ctx.Equal(first.Status, 201, "the first signup (%s)", first.Text());
-  const auto account = accounts::getAccount(userIdOf(first));
+  const auto account = accounts::getAccount(harnessUserId(first));
   ctx.Assert(account.has_value(), "the first signup wrote no account");
   ctx.Equal(account->email, "adalovelace@gmail.com", "the account's email: case, the dots and the +tag of a Gmail address must fold to adalovelace@gmail.com");
   ctx.Equal(account->phone, "+442079460958", "the account's phone, in E.164");
-  const auto again = signupAs(c, person("adalovelace@gmail.com", "+15550100300", "Ada"), "k-2");
+  const auto again = harnessSignup(c, harnessPerson("adalovelace@gmail.com", "+15550100300", "Ada"), "k-2");
   ctx.Equal(again.Status, 409, "a second signup as adalovelace@gmail.com must be refused, or one person has two accounts");
-  const auto same_phone = signupAs(c, person("ada@example.com", "0044-20-7946-0958", "Ada"), "k-3");
+  const auto same_phone = harnessSignup(c, harnessPerson("ada@example.com", "0044-20-7946-0958", "Ada"), "k-3");
   ctx.Equal(same_phone.Status, 409, "a signup with 0044-20-7946-0958 (the number +442079460958 already holds)");
-  const auto dotted = signupAs(c, person("a.b@example.com", "+15550100400", "A"), "k-4");
-  const auto plain = signupAs(c, person("ab@example.com", "+15550100500", "B"), "k-5");
+  const auto dotted = harnessSignup(c, harnessPerson("a.b@example.com", "+15550100400", "A"), "k-4");
+  const auto plain = harnessSignup(c, harnessPerson("ab@example.com", "+15550100500", "B"), "k-5");
   ctx.Assert(dotted.Status == 201 && plain.Status == 201, "a.b@example.com and ab@example.com answered %d and %d: outside kFoldAliasDomains the dots are part of the address", dotted.Status, plain.Status);
-  const auto bad = signupAs(c, person("zoe@example.com", "12", "Zoe"), "k-6");
+  const auto bad = harnessSignup(c, harnessPerson("zoe@example.com", "12", "Zoe"), "k-6");
   ctx.Equal(bad.Status, 422, "a phone of two digits");
-  const auto no_at = signupAs(c, person("zoe.example.com", "+15550100700", "Zoe"), "k-7");
+  const auto no_at = harnessSignup(c, harnessPerson("zoe.example.com", "+15550100700", "Zoe"), "k-7");
   ctx.Equal(no_at.Status, 422, "an email without @");
+  const auto upper = harnessSignup(c, harnessPerson("Bo.Smith@Example.COM", "+15550100800", "Bo"), "k-8");
+  ctx.Equal(upper.Status, 201, "a signup as Bo.Smith@Example.COM (%s)", upper.Text());
+  ctx.Equal(harnessStoredEmail(upper), "bo.smith@example.com", "the stored form of Bo.Smith@Example.COM: every address is lowercased, not only a Gmail one");
+  const auto lower = harnessSignup(c, harnessPerson("bo.smith@example.com", "+15550100900", "Bo"), "k-9");
+  ctx.Equal(lower.Status, 409, "bo.smith@example.com after Bo.Smith@Example.COM must be refused, or one person has two accounts");
+  const auto tagged = harnessSignup(c, harnessPerson("cy+news@example.com", "+15550101000", "Cy"), "k-10");
+  const auto untagged = harnessSignup(c, harnessPerson("cy@example.com", "+15550101100", "Cy"), "k-11");
+  ctx.Assert(tagged.Status == 201 && untagged.Status == 201, "cy+news@example.com and cy@example.com answered %d and %d: outside kFoldAliasDomains the +tag is part of the address", tagged.Status, untagged.Status);
+  const auto google = harnessSignup(c, harnessPerson("Di.Ana+x@GoogleMail.com", "+15550101200", "Di"), "k-12");
+  ctx.Equal(google.Status, 201, "a signup as Di.Ana+x@GoogleMail.com (%s)", google.Text());
+  ctx.Equal(harnessStoredEmail(google), "diana@googlemail.com", "the stored form of Di.Ana+x@GoogleMail.com: googlemail.com is in kFoldAliasDomains too");
+  struct Case {
+    std::string email, phone;
+    int want;
+    std::string why;
+  };
+  const std::vector<Case> cases = {
+      {"ed@example.com", "15550101300", 422, "a number with neither + nor 00"},
+      {"ed@example.com", "+1 555 0101 30a", 422, "a number with a letter in it"},
+      {"ed@example.com", "+1234567", 422, "7 digits are too few"},
+      {"@example.com", "+15550101400", 422, "an email with nothing before the @"},
+      {"ed@example.com", "+12345678", 201, "8 digits are a valid E.164 number"},
+      {"fay@example.com", "+123456789012345", 201, "15 digits are a valid E.164 number"},
+      {"gus@example.com", "+1234567890123456", 422, "16 digits are too many"},
+  };
+  for (size_t i = 0; i < cases.size(); ++i) {
+    const auto r = harnessSignup(c, harnessPerson(cases[i].email, cases[i].phone, "Ed"), "k-case-" + std::to_string(i));
+    ctx.Equal(r.Status, cases[i].want, "a signup as '%s' with the phone '%s' (%s)", cases[i].email, cases[i].phone, cases[i].why);
+  }
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = signupAs(c, kAda, "k-1");
+  auto c = harnessApi(ctx);
+  const auto first = harnessSignup(c, kHarnessAda, "k-1");
   ctx.Equal(first.Status, 201, "the first signup (%s)", first.Text());
-  const auto retry = signupAs(c, kAda, "k-1");
+  const std::vector<std::string> only{"account:" + harnessUserId(first)};
+  const auto retry = harnessSignup(c, kHarnessAda, "k-1");
   ctx.Assert(retry.Status == first.Status && retry.Text() == first.Text(), "a retry with the same Idempotency-Key must answer what the first attempt answered: first %d %s, retry %d %s", first.Status, first.Text(), retry.Status, retry.Text());
-  ctx.Equal(ctx.Redis.Keys("account:u-*"), std::vector<std::string>{"account:" + userIdOf(first)}, "one signup and its retry; the accounts");
-  const auto missing = c.Post("/v1/users", person("bo@example.com", "+15550100800", "Bo").dump(), "Content-Type", "application/json");
+  ctx.Equal(ctx.Redis.Keys("account:u-*"), only, "one signup and its retry; the accounts");
+  const auto missing = c.Post("/v1/users", harnessPerson("bo@example.com", "+15550100800", "Bo").dump(), "Content-Type", "application/json");
   ctx.Equal(missing.Status, 400, "a signup without Idempotency-Key");
+  const auto changed = harnessSignup(c, harnessPerson("ada.l@example.com", "+15550100900", "Ada"), "k-1");
+  ctx.Assert(changed.Status == first.Status && changed.Text() == first.Text(), "a retry under k-1 whose body changed answered %d %s, expected the recorded %s: the recorded result is read before any claim and answered as is", changed.Status, changed.Text(), first.Text());
+  ctx.Equal(ctx.Redis.Keys("account:u-*"), only, "a retry under k-1 whose body changed; the accounts");
+  const auto refused = harnessSignup(c, harnessPerson("ada@example.com", "+15550101000", "Ada"), "k-2");
+  ctx.Equal(refused.Status, 409, "a signup with the taken ada@example.com (%s)", refused.Text());
+  const auto again = harnessSignup(c, harnessPerson("ada@example.com", "+15550101000", "Ada"), "k-2");
+  ctx.Equal(again.Status, 409, "the retry of a refused signup (%s): only a new account records its result", again.Text());
+  ctx.Equal(ctx.Redis.Keys("account:u-*"), only, "a refused signup and its retry; the accounts");
 }
 
 void CheckNeutralConflict(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = signupAs(c, kAda, "k-1");
+  auto c = harnessApi(ctx);
+  const auto first = harnessSignup(c, kHarnessAda, "k-1");
   ctx.Equal(first.Status, 201, "the first signup (%s)", first.Text());
-  const std::string owner = userIdOf(first);
-  const auto by_email = signupAs(c, person("ada@example.com", "+15550100600", "Eve"), "k-2");
-  const auto by_phone = signupAs(c, person("eve@example.com", "+44 20 7946 0958", "Eve"), "k-3");
+  const std::string owner = harnessUserId(first);
+  const auto by_email = harnessSignup(c, harnessPerson("ada@example.com", "+15550100600", "Eve"), "k-2");
+  const auto by_phone = harnessSignup(c, harnessPerson("eve@example.com", "+44 20 7946 0958", "Eve"), "k-3");
   for (const auto& [what, r] : std::vector<std::pair<std::string, harness::Response>>{{"email", by_email}, {"phone", by_phone}}) {
     ctx.Equal(r.Status, 409, "a signup with a taken %s (%s)", what, r.Text());
     ctx.Assert(r.Text().find(owner) == std::string::npos, "the 409 for a taken %s names the account %s: %s. A stranger learns who owns the address", what, owner, r.Text());
@@ -1063,6 +1224,7 @@ void CheckNeutralConflict(harness::Ctx& ctx) {
     ctx.Equal(json::parse(r.Text(), nullptr, false), json{{"error", "signup_conflict"}}, "the 409 for a taken %s", what);
   }
   ctx.Assert(!handles::ownerOf("email", "eve@example.com"), "the refused signup kept its claim on eve@example.com");
+  ctx.Equal(ctx.Redis.Keys("account:u-*"), std::vector<std::string>{"account:" + owner}, "the refused signups write no row; the accounts");
 }
 `,
   },

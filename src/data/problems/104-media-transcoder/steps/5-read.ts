@@ -46,7 +46,7 @@ tenant reads any job by id; and the URLs handed to the player never expire.
       id: 'route',
       title: 'Handles GET /v1/transcodes/{id}',
       detail:
-        'Register `GET /v1/transcodes/{id}`: the owner reads the job with its segment count and completed segments.',
+        'Register `GET /v1/transcodes/{id}`: the owner reads the job with its segment count, completed segments and `failed_segments` (an empty list when none failed).',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/transcodes\/\{/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/transcodes\/:/]},
@@ -72,7 +72,7 @@ tenant reads any job by id; and the URLs handed to the player never expire.
       id: 'failed-indices',
       title: 'Failed segments are reported, and fail the job',
       detail:
-        'The read asks `failed(job_id)`, answers the sorted indices as `failed_segments` and the state `"failed"` when there are any; the starter never looks, so a failed segment reads as "processing" forever.',
+        'The read asks `failed(job_id)`, answers the sorted indices as `failed_segments` and the state `"failed"` when there are any, even when every segment also has a done mark; the starter never looks, so a failed segment reads as "processing" forever.',
       match: {
         python: {all: [/segments\.failed\(/, /failed_segments/]},
         typescript: {all: [/await failed\(/, /failed_segments/]},
@@ -579,6 +579,7 @@ async def check_route(ctx):
     body = r.json()
     assert body.get("job_id") == job["job_id"] and body.get("segment_count") == 3 and body.get("completed_segments") == 1, f"a 3-segment job with segment 0 done answered {body}"
     assert body.get("state") == "processing", f"a job with 1 of 3 segments done reads as {body.get('state')!r}, expected processing"
+    assert body.get("failed_segments") == [], f"a job with no failed segment answers failed_segments {body.get('failed_segments')!r}: the response always carries the list, empty here"
 
 
 async def check_done_manifest(ctx):
@@ -603,6 +604,14 @@ async def check_failed_indices(ctx):
     body = r.json()
     assert body.get("failed_segments") == [2, 4], f"segments 4 and 2 failed and the read answers failed_segments {body.get('failed_segments')!r}, expected [2, 4]"
     assert body.get("state") == "failed", f"a job with failed segments reads as {body.get('state')!r}, expected failed"
+    # Every segment has a done mark, but segment 1 also failed: a failure still fails the job.
+    other = _job(18.0)
+    _done(other, [0, 1, 2])
+    segments.mark_failed(other["job_id"], 1)
+    async with _api(ctx) as c:
+        r = await _read(c, other["job_id"])
+    body = r.json()
+    assert body.get("state") == "failed" and body.get("failed_segments") == [1], f"a job whose segments are all done but whose segment 1 failed reads as {body.get('state')!r} with failed_segments {body.get('failed_segments')!r}: any failed segment makes the state failed"
 
 
 async def check_owner_404(ctx):
@@ -626,13 +635,19 @@ async def check_signed_renditions(ctx):
         _done(job, [2])
         jobs.finalize_job(job["job_id"], [{"preset": "h264-720p", "key": jobs.output_key(job), "duration_s": 18.0}])
         r = await _read(c, job["job_id"])
+        expires = int(ctx.clock.time()) + 900
+        # Ten minutes later, a new read of the same running app signs a new grant.
+        ctx.clock.advance(600)
+        later = (await _read(c, job["job_id"])).json().get("renditions") or [{}]
     renditions = r.json().get("renditions") or [{}]
     rendition = renditions[0]
-    expires = int(ctx.clock.time()) + 900
     assert rendition.get("expires_at") == expires, f"the rendition carries expires_at {rendition.get('expires_at')!r}, expected now + SIGNED_URL_TTL_S = {expires}"
     want = urls.sign("renditions", jobs.output_key(job), expires)
     assert rendition.get("url") == want, f"the read hands out {rendition.get('url')!r}: a plain storage URL never expires. Expected urls.sign(bucket, key, expires_at) = {want!r}"
     assert rendition.get("preset") == "h264-720p" and rendition.get("duration_s") == 18.0, f"the rendition must carry its preset and duration, got {rendition}"
+    expires = int(ctx.clock.time()) + 900
+    want = urls.sign("renditions", jobs.output_key(job), expires)
+    assert later[0].get("expires_at") == expires and later[0].get("url") == want, f"a read 600 s later hands out expires_at {later[0].get('expires_at')!r} and {later[0].get('url')!r}, expected {expires} and {want!r}: every read signs with now + SIGNED_URL_TTL_S"
 `,
     typescript: `async function setup(ctx, duration: number, tenant = 't-1') {
   const jobs = ctx.load('/support/transcoder/jobs.ts');
@@ -656,6 +671,7 @@ export async function check_route(ctx) {
   const body = r.json();
   assert(body.job_id === job.job_id && body.segment_count === 3 && body.completed_segments === 1, \`a 3-segment job with segment 0 done answered \${r.text}\`);
   assert.equal(body.state, 'processing', \`a job with 1 of 3 segments done reads as \${body.state}, expected processing\`);
+  assert.deepStrictEqual(body.failed_segments, [], \`a job with no failed segment answers failed_segments \${JSON.stringify(body.failed_segments)}: the response always carries the list, empty here\`);
 }
 
 export async function check_done_manifest(ctx) {
@@ -669,13 +685,19 @@ export async function check_done_manifest(ctx) {
 }
 
 export async function check_failed_indices(ctx) {
-  const {c, segments, job, done} = await setup(ctx, 30);
+  const {c, jobs, segments, job, done} = await setup(ctx, 30);
   await done([0, 1, 3]);
   await segments.markFailed(job.job_id, 4);
   await segments.markFailed(job.job_id, 2);
   const body = (await read(c, job.job_id)).json();
   assert.deepStrictEqual(body.failed_segments, [2, 4], \`segments 4 and 2 failed and the read answers failed_segments \${JSON.stringify(body.failed_segments)}, expected [2, 4]\`);
   assert.equal(body.state, 'failed', \`a job with failed segments reads as \${body.state}, expected failed\`);
+  // Every segment has a done mark, but segment 1 also failed: a failure still fails the job.
+  const other = await jobs.create('t-1', 's3://uploads/talk.mov', '7c'.repeat(32), 18, 'h264-720p', ['-c:v', 'libx264'], 'renditions', 'talks/43');
+  for (const i of [0, 1, 2]) await segments.markDone(other.job_id, i);
+  await segments.markFailed(other.job_id, 1);
+  const mixed = (await read(c, other.job_id)).json();
+  assert(mixed.state === 'failed' && JSON.stringify(mixed.failed_segments) === '[1]', \`a job whose segments are all done but whose segment 1 failed reads as \${mixed.state} with failed_segments \${JSON.stringify(mixed.failed_segments)}: any failed segment makes the state failed\`);
 }
 
 export async function check_owner_404(ctx) {
@@ -703,6 +725,12 @@ export async function check_signed_renditions(ctx) {
   const want = urls.sign('renditions', jobs.outputKey(job), expires);
   assert.equal(rendition.url, want, \`the read hands out \${rendition.url}: a plain storage URL never expires. Expected sign(bucket, key, expires_at) = \${want}\`);
   assert(rendition.preset === 'h264-720p' && rendition.duration_s === 18, \`the rendition must carry its preset and duration, got \${JSON.stringify(rendition)}\`);
+  // Ten minutes later, a new read signs a new grant.
+  ctx.clock.advance(600);
+  const later = (await read(c, job.job_id)).json().renditions?.[0] ?? {};
+  const expiresLater = Math.floor(ctx.clock.now() / 1000) + 900;
+  const wantLater = urls.sign('renditions', jobs.outputKey(job), expiresLater);
+  assert(later.expires_at === expiresLater && later.url === wantLater, \`a read 600 s later hands out expires_at \${later.expires_at} and \${later.url}, expected \${expiresLater} and \${wantLater}: every read signs with now + SIGNED_URL_TTL_S\`);
 }
 `,
     go: `package main
@@ -746,13 +774,13 @@ func markAll(job *jobs.Job, indices ...int) {
 	}
 }
 
-func reader(ctx *harness.Ctx) *harness.HTTP {
+func harnessReader(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func view(ctx *harness.Ctx, c *harness.HTTP, jobID string) jobView {
+func harnessView(ctx *harness.Ctx, c *harness.HTTP, jobID string) jobView {
 	r := c.Get("/v1/transcodes/"+jobID, "X-Tenant-Id", "t-1")
 	ctx.Equal(r.Status, 200, "the owner's read of %s (%s)", jobID, r.Text())
 	var v jobView
@@ -763,9 +791,10 @@ func view(ctx *harness.Ctx, c *harness.HTTP, jobID string) jobView {
 func CheckRoute(ctx *harness.Ctx) {
 	job := readerJob(18)
 	markAll(job, 0)
-	v := view(ctx, reader(ctx), job.JobID)
+	v := harnessView(ctx, harnessReader(ctx), job.JobID)
 	ctx.Assert(v.JobID == job.JobID && v.SegmentCount == 3 && v.CompletedSegments == 1, "a 3-segment job with segment 0 done answered %+v", v)
 	ctx.Equal(v.State, "processing", "a job with 1 of 3 segments done; its state")
+	ctx.Assert(v.FailedSegments != nil && len(v.FailedSegments) == 0, "a job with no failed segment answers failed_segments %v: the response always carries the list, empty here", v.FailedSegments)
 }
 
 func CheckDoneManifest(ctx *harness.Ctx) {
@@ -775,11 +804,11 @@ func CheckDoneManifest(ctx *harness.Ctx) {
 			markAll(job, i)
 		}
 	}
-	c := reader(ctx)
-	v := view(ctx, c, job.JobID)
+	c := harnessReader(ctx)
+	v := harnessView(ctx, c, job.JobID)
 	ctx.Assert(v.CompletedSegments == 99 && v.State == "processing", "a 100-segment job with segment 57 missing reads as %q (%d completed): done means every segment exists, not 99 %%", v.State, v.CompletedSegments)
 	markAll(job, 57)
-	ctx.Equal(view(ctx, c, job.JobID).State, "done", "with every segment done, the state")
+	ctx.Equal(harnessView(ctx, c, job.JobID).State, "done", "with every segment done, the state")
 }
 
 func CheckFailedIndices(ctx *harness.Ctx) {
@@ -787,36 +816,50 @@ func CheckFailedIndices(ctx *harness.Ctx) {
 	markAll(job, 0, 1, 3)
 	segments.MarkFailed(readBg, job.JobID, 4)
 	segments.MarkFailed(readBg, job.JobID, 2)
-	v := view(ctx, reader(ctx), job.JobID)
+	v := harnessView(ctx, harnessReader(ctx), job.JobID)
 	ctx.Equal(v.FailedSegments, []int{2, 4}, "segments 4 and 2 failed; failed_segments")
 	ctx.Equal(v.State, "failed", "a job with failed segments; its state")
+	// Every segment has a done mark, but segment 1 also failed: a failure still fails the job.
+	args, _ := presets.EncoderArgs("h264-720p")
+	other := jobs.Create(readBg, "t-1", "s3://uploads/talk.mov", "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c", 18, "h264-720p", args, "renditions", "talks/43")
+	markAll(other, 0, 1, 2)
+	segments.MarkFailed(readBg, other.JobID, 1)
+	mixed := harnessView(ctx, harnessReader(ctx), other.JobID)
+	ctx.Assert(mixed.State == "failed" && len(mixed.FailedSegments) == 1 && mixed.FailedSegments[0] == 1, "a job whose segments are all done but whose segment 1 failed reads as %q with failed_segments %v: any failed segment makes the state failed", mixed.State, mixed.FailedSegments)
 }
 
 func CheckOwner404(ctx *harness.Ctx) {
 	job := readerJob(18)
 	markAll(job, 0, 1, 2)
-	c := reader(ctx)
+	c := harnessReader(ctx)
 	foreign := c.Get("/v1/transcodes/"+job.JobID, "X-Tenant-Id", "t-2")
 	missing := c.Get("/v1/transcodes/tj-999", "X-Tenant-Id", "t-2")
 	ctx.Equal(foreign.Status, 404, "tenant t-2 read t-1's job (%s); the status", foreign.Text())
 	ctx.Equal(foreign.Text(), missing.Text(), "a foreign job and a missing one must be indistinguishable; the foreign body")
-	view(ctx, c, job.JobID)
+	harnessView(ctx, c, job.JobID)
 }
 
 func CheckSignedRenditions(ctx *harness.Ctx) {
 	job := readerJob(18)
 	markAll(job, 0, 1)
-	c := reader(ctx)
-	ctx.Equal(len(view(ctx, c, job.JobID).Renditions), 0, "a job still processing must list no renditions; renditions")
+	c := harnessReader(ctx)
+	ctx.Equal(len(harnessView(ctx, c, job.JobID).Renditions), 0, "a job still processing must list no renditions; renditions")
 	markAll(job, 2)
 	jobs.FinalizeJob(readBg, job.JobID, []jobs.Rendition{{Preset: "h264-720p", Key: jobs.OutputKey(job), DurationS: 18}})
-	v := view(ctx, c, job.JobID)
+	v := harnessView(ctx, c, job.JobID)
 	ctx.Assert(len(v.Renditions) == 1, "a done job must list its rendition, got %+v", v.Renditions)
 	r := v.Renditions[0]
 	expires := ctx.Clock.Now()/1000 + 900
 	ctx.Equal(r.ExpiresAt, expires, "the rendition's expires_at must be now + SignedURLTTL")
 	ctx.Equal(r.URL, urls.Sign("renditions", jobs.OutputKey(job), expires), "a plain storage URL never expires; the URL must be urls.Sign(bucket, key, expires_at)")
 	ctx.Assert(r.Preset == "h264-720p" && r.DurationS == 18, "the rendition must carry its preset and duration, got %+v", r)
+	// Ten minutes later, a new read signs a new grant.
+	ctx.Clock.Advance(600)
+	later := harnessView(ctx, c, job.JobID)
+	ctx.Assert(len(later.Renditions) == 1, "a done job must list its rendition, got %+v", later.Renditions)
+	expiresLater := ctx.Clock.Now()/1000 + 900
+	wantLater := urls.Sign("renditions", jobs.OutputKey(job), expiresLater)
+	ctx.Assert(later.Renditions[0].ExpiresAt == expiresLater && later.Renditions[0].URL == wantLater, "a read 600 s later hands out expires_at %d and %s, expected %d and %s: every read signs with now + SignedURLTTL", later.Renditions[0].ExpiresAt, later.Renditions[0].URL, expiresLater, wantLater)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -841,7 +884,7 @@ void markAll(const jobs::Job& job, const std::vector<int>& indices) {
   for (int i : indices) segments::markDone(job.job_id, i);
 }
 
-harness::HTTP reader(harness::Ctx& ctx) {
+harness::HTTP harnessReader(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -849,7 +892,7 @@ harness::HTTP reader(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-nlohmann::json view(harness::Ctx& ctx, harness::HTTP& c, const std::string& job_id) {
+nlohmann::json harnessView(harness::Ctx& ctx, harness::HTTP& c, const std::string& job_id) {
   const auto r = c.Get("/v1/transcodes/" + job_id, "X-Tenant-Id", "t-1");
   ctx.Equal(r.Status, 200, "the owner's read of %s (%s)", job_id, r.Text());
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
@@ -862,10 +905,11 @@ nlohmann::json view(harness::Ctx& ctx, harness::HTTP& c, const std::string& job_
 void CheckRoute(harness::Ctx& ctx) {
   const jobs::Job job = readerJob(18);
   markAll(job, {0});
-  auto c = reader(ctx);
-  const auto v = view(ctx, c, job.job_id);
+  auto c = harnessReader(ctx);
+  const auto v = harnessView(ctx, c, job.job_id);
   ctx.Assert(v.value("job_id", "") == job.job_id && v.value("segment_count", 0) == 3 && v.value("completed_segments", 0) == 1, "a 3-segment job with segment 0 done answered %s", v.dump());
   ctx.Equal(v.value("state", ""), "processing", "a job with 1 of 3 segments done; its state");
+  ctx.Assert(v.contains("failed_segments") && v["failed_segments"].is_array() && v["failed_segments"].empty(), "a job with no failed segment answers %s: the response always carries failed_segments, empty here", v.dump());
 }
 
 void CheckDoneManifest(harness::Ctx& ctx) {
@@ -875,11 +919,11 @@ void CheckDoneManifest(harness::Ctx& ctx) {
     if (i != 57) all_but_57.push_back(i);
   }
   markAll(job, all_but_57);
-  auto c = reader(ctx);
-  const auto v = view(ctx, c, job.job_id);
+  auto c = harnessReader(ctx);
+  const auto v = harnessView(ctx, c, job.job_id);
   ctx.Assert(v.value("completed_segments", 0) == 99 && v.value("state", "") == "processing", "a 100-segment job with segment 57 missing reads as %s (%d completed): done means every segment exists, not 99 percent", v.value("state", ""), v.value("completed_segments", 0));
   markAll(job, {57});
-  ctx.Equal(view(ctx, c, job.job_id).value("state", ""), "done", "with every segment done, the state");
+  ctx.Equal(harnessView(ctx, c, job.job_id).value("state", ""), "done", "with every segment done, the state");
 }
 
 void CheckFailedIndices(harness::Ctx& ctx) {
@@ -887,31 +931,37 @@ void CheckFailedIndices(harness::Ctx& ctx) {
   markAll(job, {0, 1, 3});
   segments::markFailed(job.job_id, 4);
   segments::markFailed(job.job_id, 2);
-  auto c = reader(ctx);
-  const auto v = view(ctx, c, job.job_id);
+  auto c = harnessReader(ctx);
+  const auto v = harnessView(ctx, c, job.job_id);
   ctx.Equal(v.value("failed_segments", std::vector<int>{}), std::vector<int>{2, 4}, "segments 4 and 2 failed; failed_segments");
   ctx.Equal(v.value("state", ""), "failed", "a job with failed segments; its state");
+  // Every segment has a done mark, but segment 1 also failed: a failure still fails the job.
+  const jobs::Job other = jobs::create("t-1", "s3://uploads/talk.mov", std::string(64, '7'), 18, "h264-720p", *presets::encoderArgs("h264-720p"), "renditions", "talks/43");
+  markAll(other, {0, 1, 2});
+  segments::markFailed(other.job_id, 1);
+  const auto mixed = harnessView(ctx, c, other.job_id);
+  ctx.Assert(mixed.value("state", "") == "failed" && mixed.value("failed_segments", std::vector<int>{}) == std::vector<int>{1}, "a job whose segments are all done but whose segment 1 failed answered %s: any failed segment makes the state failed", mixed.dump());
 }
 
 void CheckOwner404(harness::Ctx& ctx) {
   const jobs::Job job = readerJob(18);
   markAll(job, {0, 1, 2});
-  auto c = reader(ctx);
+  auto c = harnessReader(ctx);
   const auto foreign = c.Get("/v1/transcodes/" + job.job_id, "X-Tenant-Id", "t-2");
   const auto missing = c.Get("/v1/transcodes/tj-999", "X-Tenant-Id", "t-2");
   ctx.Equal(foreign.Status, 404, "tenant t-2 read t-1's job (%s); the status", foreign.Text());
   ctx.Equal(foreign.Text(), missing.Text(), "a foreign job and a missing one must be indistinguishable; the foreign body");
-  view(ctx, c, job.job_id);
+  harnessView(ctx, c, job.job_id);
 }
 
 void CheckSignedRenditions(harness::Ctx& ctx) {
   const jobs::Job job = readerJob(18);
   markAll(job, {0, 1});
-  auto c = reader(ctx);
-  ctx.Equal(view(ctx, c, job.job_id).value("renditions", nlohmann::json::array()).size(), size_t{0}, "a job still processing must list no renditions; renditions");
+  auto c = harnessReader(ctx);
+  ctx.Equal(harnessView(ctx, c, job.job_id).value("renditions", nlohmann::json::array()).size(), size_t{0}, "a job still processing must list no renditions; renditions");
   markAll(job, {2});
   jobs::finalizeJob(job.job_id, {{"h264-720p", jobs::outputKey(job), 18}});
-  const auto v = view(ctx, c, job.job_id);
+  const auto v = harnessView(ctx, c, job.job_id);
   const auto renditions = v.value("renditions", nlohmann::json::array());
   ctx.Assert(renditions.size() == 1, "a done job must list its rendition, got %s", v.dump());
   const auto& r = renditions[0];
@@ -919,6 +969,13 @@ void CheckSignedRenditions(harness::Ctx& ctx) {
   ctx.Equal(r.value("expires_at", 0LL), expires, "the rendition's expires_at must be now + kSignedUrlTtlS");
   ctx.Equal(r.value("url", ""), urls::sign("renditions", jobs::outputKey(job), expires), "a plain storage URL never expires; the URL must be urls::sign(bucket, key, expires_at)");
   ctx.Assert(r.value("preset", "") == "h264-720p" && r.value("duration_s", 0.0) == 18, "the rendition must carry its preset and duration, got %s", r.dump());
+  // Ten minutes later, a new read signs a new grant.
+  ctx.Clock.Advance(600);
+  const auto later = harnessView(ctx, c, job.job_id).value("renditions", nlohmann::json::array());
+  ctx.Assert(later.size() == 1, "a done job must list its rendition 600 s later too");
+  const long long expires_later = ctx.Clock.Now() / 1000 + 900;
+  const std::string want_later = urls::sign("renditions", jobs::outputKey(job), expires_later);
+  ctx.Assert(later[0].value("expires_at", 0LL) == expires_later && later[0].value("url", "") == want_later, "a read 600 s later hands out %s, expected expires_at %d and %s: every read signs with now + kSignedUrlTtlS", later[0].dump(), expires_later, want_later);
 }
 `,
   },

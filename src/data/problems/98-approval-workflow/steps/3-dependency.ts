@@ -53,7 +53,7 @@ service Eligibility { rpc CheckEligibility(EligibilityRequest) returns (Eligibil
       id: 'deadline',
       title: 'Every attempt carries a 1-second deadline',
       detail:
-        'Each `CheckEligibility` call is made with a 1-second deadline, so a hung eligibility service costs at most `MAX_ATTEMPTS` seconds and then a denial.',
+        'Each `CheckEligibility` call is made with its own 1-second deadline, the retry included, and `DEADLINE_EXCEEDED` is retried, so a hung eligibility service costs at most `MAX_ATTEMPTS` seconds and then a denial.',
       match: {
         python: {all: [/CheckEligibility\(/, /timeout\s*=/]},
         typescript: {all: [/CheckEligibility\(/, /deadline:/]},
@@ -66,7 +66,7 @@ service Eligibility { rpc CheckEligibility(EligibilityRequest) returns (Eligibil
       id: 'fail-closed',
       title: 'No answer is a denial',
       detail:
-        'When no attempt got an answer, or the call failed with a code that is not retried, the decision is denied with `eligibility_unverified`; the starter allows it.',
+        'When no attempt got an answer, or the call failed with a code that is not retried (anything but `DEADLINE_EXCEEDED` and `UNAVAILABLE`, after one call), the decision is denied with `eligibility_unverified`; a yes on the retry still counts. The starter allows it.',
       match: {
         python: {all: [/eligibility_unverified/, /MAX_ATTEMPTS/], none: [/eligibility_unavailable/]},
         typescript: {all: [/eligibility_unverified/, /MAX_ATTEMPTS/], none: [/eligibility_unavailable/]},
@@ -598,7 +598,7 @@ def _client(ctx):
 
 def _denied(ctx, outcome, reason, why):
     assert outcome.get("status") == "denied" and outcome.get("reason") == reason, f"{why}: decide answered {outcome}, expected status denied with reason {reason!r}"
-    assert outcome.get("advanced") is False, f"{why}: a denied decision answered advanced {outcome.get('advanced')}"
+    assert outcome.get("advanced") is False and outcome.get("step_index") == 0, f"{why}: a denied decision answered advanced {outcome.get('advanced')} step_index {outcome.get('step_index')}, expected advanced false on step 0"
     fields = ctx.redis.hgetall(KEY)
     assert fields.get("step_index") == "0" and "decision:0" not in fields, f"{why}: the denied decision still moved the chain: {fields}"
 
@@ -611,14 +611,18 @@ def check_deadline(ctx):
     assert calls, "decide made no CheckEligibility call"
     for call in calls:
         assert call.timeout is not None, "a CheckEligibility call carries no deadline: a hung eligibility service holds the approval open"
-        assert 0.5 <= call.timeout <= 1.5, f"a CheckEligibility call carries a {call.timeout} s deadline, expected 1 s"
+        assert 0.9 <= call.timeout <= 1.1, f"a CheckEligibility call carries a {call.timeout} s deadline, expected 1 s"
     ctx.grpc.set_latency("CheckEligibility", 30.0)
     before = ctx.clock.time()
     late = m.decide("r-1", 1, "u-dir", "approved")
     waited = ctx.clock.time() - before
-    assert waited <= 3, f"decide waited {waited:.0f} s on a hung eligibility service: each attempt gets 1 s"
+    assert waited <= 2.5, f"decide waited {waited:.1f} s on a hung eligibility service: each attempt gets 1 s"
     assert late.get("status") == "denied" and late.get("reason") == "eligibility_unverified", f"with the eligibility service hung the director's approval answered {late}, expected a denial"
     assert ctx.redis.hget(KEY, "step_index") == "1", "a decision eligibility never confirmed moved the chain"
+    hung = ctx.grpc.calls_to("CheckEligibility")[len(calls):]
+    assert len(hung) == 2, f"on a hung eligibility service decide made {len(hung)} CheckEligibility calls, expected MAX_ATTEMPTS = 2: DEADLINE_EXCEEDED is retried"
+    deadlines = [call.timeout for call in hung]
+    assert all(t is not None and 0.9 <= t <= 1.1 for t in deadlines), f"the attempts on a hung eligibility service carried deadlines of {deadlines} s: every attempt gets its own full 1 s, not what is left of the first"
 
 
 def check_fail_closed(ctx):
@@ -630,6 +634,14 @@ def check_fail_closed(ctx):
     ctx.grpc.fail("CheckEligibility", grpc.StatusCode.PERMISSION_DENIED, "caller not allowed", times=1)
     _denied(ctx, m.decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with CheckEligibility refused (PERMISSION_DENIED)")
     assert len(ctx.grpc.calls_to("CheckEligibility")) == 3, "a PERMISSION_DENIED is not retried"
+    for n, code in enumerate((grpc.StatusCode.INTERNAL, grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.NOT_FOUND)):
+        ctx.grpc.fail("CheckEligibility", code, "eligibility failed", times=1)
+        _denied(ctx, m.decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", f"with CheckEligibility failing {code.name}")
+        calls = len(ctx.grpc.calls_to("CheckEligibility"))
+        assert calls == 4 + n, f"decide called CheckEligibility {calls - 3 - n} times on a {code.name}: only DEADLINE_EXCEEDED and UNAVAILABLE are retried"
+    ctx.grpc.fail("CheckEligibility", grpc.StatusCode.UNAVAILABLE, "eligibility blipped", times=1)
+    ok = m.decide("r-1", 0, "u-mgr", "approved")
+    assert ok.get("advanced") is True, f"one UNAVAILABLE and then a yes answered {ok}: the second attempt's answer counts"
 
 
 def check_departed_approver(ctx):
@@ -673,7 +685,7 @@ async function client(ctx) {
 
 function denied(ctx, outcome, reason: string, why: string): void {
   assert(outcome.status === 'denied' && outcome.reason === reason, \`\${why}: decide answered \${JSON.stringify(outcome)}, expected status denied with reason \${reason}\`);
-  assert.equal(outcome.advanced, false, \`\${why}: a denied decision answered advanced \${outcome.advanced}\`);
+  assert(outcome.advanced === false && outcome.step_index === 0, \`\${why}: a denied decision answered advanced \${outcome.advanced} step_index \${outcome.step_index}, expected advanced false on step 0\`);
   const f = ctx.redis.hgetall(KEY);
   assert(f.step_index === '0' && f['decision:0'] === undefined, \`\${why}: the denied decision still moved the chain: \${JSON.stringify(f)}\`);
 }
@@ -686,15 +698,19 @@ export async function check_deadline(ctx) {
   assert(calls.length > 0, 'decide made no CheckEligibility call');
   for (const call of calls) {
     assert(call.timeout !== null, 'a CheckEligibility call carries no deadline: a hung eligibility service holds the approval open');
-    assert(0.5 <= call.timeout && call.timeout <= 1.5, \`a CheckEligibility call carries a \${call.timeout} s deadline, expected 1 s\`);
+    assert(0.9 <= call.timeout && call.timeout <= 1.1, \`a CheckEligibility call carries a \${call.timeout} s deadline, expected 1 s\`);
   }
   ctx.grpc.setLatency('CheckEligibility', 30);
   const before = ctx.clock.now();
   const late = await m.decide('r-1', 1, 'u-dir', 'approved');
   const waited = (ctx.clock.now() - before) / 1000;
-  assert(waited <= 3, \`decide waited \${waited.toFixed(0)} s on a hung eligibility service: each attempt gets 1 s\`);
+  assert(waited <= 2.5, \`decide waited \${waited.toFixed(1)} s on a hung eligibility service: each attempt gets 1 s\`);
   assert(late.status === 'denied' && late.reason === 'eligibility_unverified', \`with the eligibility service hung the director's approval answered \${JSON.stringify(late)}, expected a denial\`);
   assert.equal(ctx.redis.hget(KEY, 'step_index'), '1', 'a decision eligibility never confirmed moved the chain');
+  const hung = ctx.grpc.callsTo('CheckEligibility').slice(calls.length);
+  assert.equal(hung.length, 2, \`on a hung eligibility service decide made \${hung.length} CheckEligibility calls, expected MAX_ATTEMPTS = 2: DEADLINE_EXCEEDED is retried\`);
+  const deadlines = hung.map(call => call.timeout);
+  assert(deadlines.every(t => t !== null && 0.9 <= t && t <= 1.1), \`the attempts on a hung eligibility service carried deadlines of \${JSON.stringify(deadlines)} s: every attempt gets its own full 1 s, not what is left of the first\`);
 }
 
 export async function check_fail_closed(ctx) {
@@ -706,6 +722,15 @@ export async function check_fail_closed(ctx) {
   ctx.grpc.fail('CheckEligibility', ctx.grpc.status.PERMISSION_DENIED, 'caller not allowed', 1);
   denied(ctx, await m.decide('r-1', 0, 'u-mgr', 'approved'), 'eligibility_unverified', 'with CheckEligibility refused (PERMISSION_DENIED)');
   assert.equal(ctx.grpc.callsTo('CheckEligibility').length, 3, 'a PERMISSION_DENIED is not retried');
+  for (const [n, code] of (['INTERNAL', 'INVALID_ARGUMENT', 'NOT_FOUND'] as const).entries()) {
+    ctx.grpc.fail('CheckEligibility', ctx.grpc.status[code], 'eligibility failed', 1);
+    denied(ctx, await m.decide('r-1', 0, 'u-mgr', 'approved'), 'eligibility_unverified', \`with CheckEligibility failing \${code}\`);
+    const made = ctx.grpc.callsTo('CheckEligibility').length;
+    assert.equal(made, 4 + n, \`decide called CheckEligibility \${made - 3 - n} times on a \${code}: only DEADLINE_EXCEEDED and UNAVAILABLE are retried\`);
+  }
+  ctx.grpc.fail('CheckEligibility', ctx.grpc.status.UNAVAILABLE, 'eligibility blipped', 1);
+  const ok = await m.decide('r-1', 0, 'u-mgr', 'approved');
+  assert.equal(ok.advanced, true, \`one UNAVAILABLE and then a yes answered \${JSON.stringify(ok)}: the second attempt's answer counts\`);
 }
 
 export async function check_departed_approver(ctx) {
@@ -780,7 +805,7 @@ func clientDecide(ctx *harness.Ctx, step int, actor string) chain.Outcome {
 
 func clientDenied(ctx *harness.Ctx, o chain.Outcome, reason, why string) {
 	ctx.Assert(o.Status == "denied" && o.Reason == reason, "%s: decide answered %+v, expected status denied with reason %q", why, o, reason)
-	ctx.Assert(!o.Advanced, "%s: a denied decision answered advanced true", why)
+	ctx.Assert(!o.Advanced && o.StepIndex == 0, "%s: a denied decision answered advanced %t step_index %d, expected advanced false on step 0", why, o.Advanced, o.StepIndex)
 	f := ctx.Redis.HGetAll(clientKey)
 	_, decided := f["decision:0"]
 	ctx.Assert(f["step_index"] == "0" && !decided, "%s: the denied decision still moved the chain: %v", why, f)
@@ -794,16 +819,21 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(len(calls) > 0, "decide made no CheckEligibility call")
 	for _, call := range calls {
 		ctx.Assert(call.HasDeadline(), "a CheckEligibility call carries no deadline: a hung eligibility service holds the approval open")
-		ctx.Assert(call.Timeout.Seconds() >= 0.5 && call.Timeout.Seconds() <= 1.5, "a CheckEligibility call carries a %v deadline, expected 1 s", call.Timeout)
+		ctx.Assert(call.Timeout.Seconds() >= 0.9 && call.Timeout.Seconds() <= 1.1, "a CheckEligibility call carries a %v deadline, expected 1 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("CheckEligibility", 30, "")
 	before := ctx.Clock.Now()
 	late := clientDecide(ctx, 1, "u-dir")
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	ctx.Assert(waited <= 3, "decide waited %.0f s on a hung eligibility service: each attempt gets 1 s", waited)
+	ctx.Assert(waited <= 2.5, "decide waited %.1f s on a hung eligibility service: each attempt gets 1 s", waited)
 	ctx.Assert(late.Status == "denied" && late.Reason == "eligibility_unverified", "with the eligibility service hung the director's approval answered %+v, expected a denial", late)
 	index, _ := ctx.Redis.HGet(clientKey, "step_index")
 	ctx.Equal(index, "1", "a decision eligibility never confirmed must not move the chain; step_index")
+	hung := ctx.GRPC.CallsTo("CheckEligibility", "")[len(calls):]
+	ctx.Equal(len(hung), 2, "on a hung eligibility service decide must make MAX_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried); the CheckEligibility calls")
+	for _, call := range hung {
+		ctx.Assert(call.HasDeadline() && call.Timeout.Seconds() >= 0.9 && call.Timeout.Seconds() <= 1.1, "an attempt on a hung eligibility service carried a %v deadline: every attempt gets its own full 1 s, not what is left of the first", call.Timeout)
+	}
 }
 
 func CheckFailClosed(ctx *harness.Ctx) {
@@ -814,6 +844,14 @@ func CheckFailClosed(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("CheckEligibility", codes.PermissionDenied, "caller not allowed", 1, "")
 	clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with CheckEligibility refused (PERMISSION_DENIED)")
 	ctx.Equal(len(ctx.GRPC.CallsTo("CheckEligibility", "")), 3, "a PERMISSION_DENIED is not retried; the CheckEligibility calls")
+	for n, code := range []codes.Code{codes.Internal, codes.InvalidArgument, codes.NotFound} {
+		ctx.GRPC.Fail("CheckEligibility", code, "eligibility failed", 1, "")
+		clientDenied(ctx, clientDecide(ctx, 0, "u-mgr"), "eligibility_unverified", "with CheckEligibility failing "+code.String())
+		ctx.Equal(len(ctx.GRPC.CallsTo("CheckEligibility", "")), 4+n, "only DEADLINE_EXCEEDED and UNAVAILABLE are retried; after a %v, the CheckEligibility calls", code)
+	}
+	ctx.GRPC.Fail("CheckEligibility", codes.Unavailable, "eligibility blipped", 1, "")
+	ok := clientDecide(ctx, 0, "u-mgr")
+	ctx.Assert(ok.Advanced, "one UNAVAILABLE and then a yes answered %+v: the second attempt's answer counts", ok)
 }
 
 func CheckDepartedApprover(ctx *harness.Ctx) {
@@ -871,7 +909,7 @@ class DirectoryPeer final : public approvalwf::Eligibility::Service {
   }
 };
 
-approvalwf::EligibilityReply person(bool active, bool eligible, const std::string& delegated_to) {
+approvalwf::EligibilityReply clientPerson(bool active, bool eligible, const std::string& delegated_to) {
   approvalwf::EligibilityReply reply;
   reply.set_active(active);
   reply.set_eligible(eligible);
@@ -888,13 +926,13 @@ DirectoryPeer& clientSetup(harness::Ctx& ctx) {
   return *directory;
 }
 
-std::string show(const chain::Outcome& o) {
+std::string clientShow(const chain::Outcome& o) {
   return "{advanced " + std::string(o.advanced ? "true" : "false") + ", step_index " + std::to_string(o.step_index) + ", status " + o.status + ", reason " + o.reason + "}";
 }
 
 void clientDenied(harness::Ctx& ctx, const chain::Outcome& o, const std::string& reason, const std::string& why) {
-  ctx.Assert(o.status == "denied" && o.reason == reason, "%s: decide answered %s, expected status denied with reason %q", why, show(o), reason);
-  ctx.Assert(!o.advanced, "%s: a denied decision answered advanced true", why);
+  ctx.Assert(o.status == "denied" && o.reason == reason, "%s: decide answered %s, expected status denied with reason %q", why, clientShow(o), reason);
+  ctx.Assert(!o.advanced && o.step_index == 0, "%s: a denied decision answered %s, expected advanced false on step 0", why, clientShow(o));
   auto f = ctx.Redis.HGetAll(kClientKey);
   ctx.Assert(f["step_index"] == "0" && f.count("decision:0") == 0, "%s: the denied decision still moved the chain: %v", why, f);
 }
@@ -904,20 +942,25 @@ void clientDenied(harness::Ctx& ctx, const chain::Outcome& o, const std::string&
 void CheckDeadline(harness::Ctx& ctx) {
   clientSetup(ctx);
   const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced, "with the eligibility service healthy the manager's approval answered %s", show(ok));
+  ctx.Assert(ok.advanced, "with the eligibility service healthy the manager's approval answered %s", clientShow(ok));
   const auto calls = ctx.GRPC.CallsTo("CheckEligibility");
   ctx.Assert(!calls.empty(), "decide made no CheckEligibility call");
   for (const auto& call : calls) {
     ctx.Assert(call.HasDeadline(), "a CheckEligibility call carries no deadline: a hung eligibility service holds the approval open");
-    ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.5, "a CheckEligibility call carries a %v s deadline, expected 1 s", call.TimeoutSeconds());
+    ctx.Assert(0.9 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.1, "a CheckEligibility call carries a %v s deadline, expected 1 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("CheckEligibility", 30.0);
   const int64_t before = ctx.Clock.Now();
   const chain::Outcome late = decide("r-1", 1, "u-dir", "approved");
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(waited <= 3, "decide waited %.0f s on a hung eligibility service: each attempt gets 1 s", waited);
-  ctx.Assert(late.status == "denied" && late.reason == "eligibility_unverified", "with the eligibility service hung the director's approval answered %s, expected a denial", show(late));
+  ctx.Assert(waited <= 2.5, "decide waited %.1f s on a hung eligibility service: each attempt gets 1 s", waited);
+  ctx.Assert(late.status == "denied" && late.reason == "eligibility_unverified", "with the eligibility service hung the director's approval answered %s, expected a denial", clientShow(late));
   ctx.Equal(ctx.Redis.HGet(kClientKey, "step_index"), std::optional<std::string>("1"), "a decision eligibility never confirmed must not move the chain; step_index");
+  const auto all = ctx.GRPC.CallsTo("CheckEligibility");
+  ctx.Equal(all.size() - calls.size(), size_t{2}, "on a hung eligibility service decide must make MAX_ATTEMPTS = 2 calls (DEADLINE_EXCEEDED is retried); the CheckEligibility calls");
+  for (size_t i = calls.size(); i < all.size(); i++) {
+    ctx.Assert(all[i].HasDeadline() && 0.9 <= all[i].TimeoutSeconds() && all[i].TimeoutSeconds() <= 1.1, "an attempt on a hung eligibility service carried a %v s deadline: every attempt gets its own full 1 s, not what is left of the first", all[i].TimeoutSeconds());
+  }
 }
 
 void CheckFailClosed(harness::Ctx& ctx) {
@@ -928,32 +971,41 @@ void CheckFailClosed(harness::Ctx& ctx) {
   ctx.GRPC.Fail("CheckEligibility", grpc::StatusCode::PERMISSION_DENIED, "caller not allowed", 1);
   clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with CheckEligibility refused (PERMISSION_DENIED)");
   ctx.Equal(ctx.GRPC.CallsTo("CheckEligibility").size(), 3, "a PERMISSION_DENIED is not retried; the CheckEligibility calls");
+  const grpc::StatusCode terminal[] = {grpc::StatusCode::INTERNAL, grpc::StatusCode::INVALID_ARGUMENT, grpc::StatusCode::NOT_FOUND};
+  for (size_t n = 0; n < 3; n++) {
+    ctx.GRPC.Fail("CheckEligibility", terminal[n], "eligibility failed", 1);
+    clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "eligibility_unverified", "with CheckEligibility failing status " + std::to_string(static_cast<int>(terminal[n])));
+    ctx.Equal(ctx.GRPC.CallsTo("CheckEligibility").size(), 4 + n, "only DEADLINE_EXCEEDED and UNAVAILABLE are retried; after status %d, the CheckEligibility calls", static_cast<int>(terminal[n]));
+  }
+  ctx.GRPC.Fail("CheckEligibility", grpc::StatusCode::UNAVAILABLE, "eligibility blipped", 1);
+  const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
+  ctx.Assert(ok.advanced, "one UNAVAILABLE and then a yes answered %s: the second attempt's answer counts", clientShow(ok));
 }
 
 void CheckDepartedApprover(harness::Ctx& ctx) {
   DirectoryPeer& directory = clientSetup(ctx);
-  directory.people["u-mgr"] = person(false, true, "");
+  directory.people["u-mgr"] = clientPerson(false, true, "");
   clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "approver_departed", "with the manager marked inactive");
 }
 
 void CheckDelegation(harness::Ctx& ctx) {
   DirectoryPeer& directory = clientSetup(ctx);
-  directory.people["u-mgr"] = person(true, true, "u-deputy");
+  directory.people["u-mgr"] = clientPerson(true, true, "u-deputy");
   clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "delegation_mismatch", "with the manager's approvals delegated to u-deputy");
-  directory.people["u-mgr"] = person(true, true, "u-mgr");
+  directory.people["u-mgr"] = clientPerson(true, true, "u-mgr");
   const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced, "a delegated_to naming the actor themselves is no hand-off, but decide answered %s", show(ok));
+  ctx.Assert(ok.advanced, "a delegated_to naming the actor themselves is no hand-off, but decide answered %s", clientShow(ok));
 }
 
 void CheckVerifyFirst(harness::Ctx& ctx) {
   DirectoryPeer& directory = clientSetup(ctx);
-  directory.people["u-mgr"] = person(true, false, "");
+  directory.people["u-mgr"] = clientPerson(true, false, "");
   clientDenied(ctx, decide("r-1", 0, "u-mgr", "approved"), "approver_ineligible", "with the manager not eligible for this request");
   directory.people.clear();
   auto asked = std::make_shared<long>(-1);
   ctx.Redis.After(kClientKey, [&ctx, asked] { *asked = static_cast<long>(ctx.GRPC.CallsTo("CheckEligibility").size()); });
   const chain::Outcome ok = decide("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced, "with the manager eligible again the approval answered %s", show(ok));
+  ctx.Assert(ok.advanced, "with the manager eligible again the approval answered %s", clientShow(ok));
   ctx.Equal(*asked, 2, "verify first, then record: the CheckEligibility calls answered when decide touched the chain");
 }
 `,

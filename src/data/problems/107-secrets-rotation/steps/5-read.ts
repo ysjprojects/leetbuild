@@ -20,13 +20,15 @@ caller lists every secret's versions, a flag returns plaintext into proxy logs, 
 an hourly secret healthy for a month, and the engineer on call, who is rarely the owner, cannot see
 which consumer blocks a retirement.
 
-- \`X-Scopes\` (space or comma separated) without **\`secrets\`**: **403**.
+- \`X-Scopes\` (space or comma separated) without the **\`secrets\`** scope itself: **403**, checked
+  before the secret is looked up.
 - The query is checked against \`ALLOWED_QUERY\` (\`limit\` only): anything else is **400**; \`limit\`
   is 1 to \`MAX_LIMIT\` (200), default 50, **400** otherwise.
 - Every entry is \`version_view(...)\`: \`version_id\`, \`fingerprint\`, \`rotation_seconds\`,
   \`created_at\`, \`rotate_at\`, \`activated_at\`, \`retired_at\`, \`health\` and
   \`acceptance: {verified, pending}\`, for every caller holding the scope.
-- \`health_of\` is \`retired\` once retired, \`overdue\` from the version's own \`rotate_at\`, else \`ok\`.`,
+- \`health_of\` is \`retired\` once retired, \`overdue\` from the second of the version's own
+  \`rotate_at\` on, else \`ok\`.`,
   sequence: {
     participants: ['Ops console', 'secretd', 'secretd.vault'],
     messages: [
@@ -47,7 +49,7 @@ which consumer blocks a retirement.
       id: 'read-route',
       title: 'Registers GET /v1/secrets/{name}/versions',
       detail:
-        'The read answers the versions newest first (up to `limit`) for a caller with the scope, **401** without `X-Operator-Id` and **404** for an unknown secret.',
+        'The read answers the versions newest first (up to `limit`, 50 without it) for a caller with the scope, **401** without `X-Operator-Id` and **404** for an unknown secret.',
       match: {
         python: {all: [/@app\.get\(\s*["']\/v1\/secrets\/\{name\}\/versions["']/, /\b401\b/, /\b404\b/]},
         typescript: {all: [/app\.get\(\s*['"]\/v1\/secrets\/:name\/versions['"]/, /\b401\b/, /\b404\b/]},
@@ -60,7 +62,7 @@ which consumer blocks a retirement.
       id: 'scope-required',
       title: 'The secrets scope is required',
       detail:
-        'The caller must hold the `secrets` scope in `X-Scopes` (**403** otherwise): version ids, fingerprints and rotation windows map a whole secret inventory, and the starter checks no scope at all.',
+        'The caller must hold the `secrets` scope itself in `X-Scopes` (**403** otherwise, whether the secret exists or not; `secrets-readonly` is another scope): version ids, fingerprints and rotation windows map a whole secret inventory, and the starter checks no scope at all.',
       match: {
         python: {all: [/x-scopes/i, /\b403\b/]},
         typescript: {all: [/x-scopes/i, /code\(\s*403\s*\)/]},
@@ -73,7 +75,7 @@ which consumer blocks a retirement.
       id: 'closed-query',
       title: 'No parameter can surface material',
       detail:
-        "The query is validated against `ALLOWED_QUERY` and `limit` against `MAX_LIMIT` (**400** otherwise), and no entry reads the version's material; the starter honours `include_material` for the owner.",
+        "The query is validated against `ALLOWED_QUERY` and `limit` against `MAX_LIMIT` (**400** otherwise, for any parameter outside the list), and every entry carries only the fields `version_view` names, never the version's material; the starter honours `include_material` for the owner.",
       match: {
         python: {all: [/ALLOWED_QUERY/, /MAX_LIMIT\s*=\s*200\b/], none: [/include_material/, /\[["']material["']\]/]},
         typescript: {all: [/ALLOWED_QUERY/, /MAX_LIMIT\s*=\s*200\b/], none: [/include_material/, /\.material\b/]},
@@ -86,7 +88,7 @@ which consumer blocks a retirement.
       id: 'health-interval',
       title: "Health follows the version's own interval",
       detail:
-        "`health_of`/`healthOf` compares the clock with the version's `rotate_at`; the starter measures every version against the 30-day default, so an hourly secret looks healthy for a month.",
+        "`health_of`/`healthOf` compares the clock with the version's `rotate_at`: `overdue` from that second on, `retired` for a retired version whatever its interval; the starter measures every version against the 30-day default, so an hourly secret looks healthy for a month.",
       match: {
         python: {
           all: [/def health_of\(/, /now\s*>=\s*version\[["']rotate_at["']\]/],
@@ -865,16 +867,29 @@ async def check_read_route(ctx):
         anonymous = await c.get(PATH)
         assert anonymous.status_code == 401, f"a read without X-Operator-Id answered {anonymous.status_code}, expected 401"
         unknown = await c.get("/v1/secrets/nope/versions", headers=OWNER)
-    assert unknown.status_code == 404, f"a read of an unknown secret answered {unknown.status_code}, expected 404"
+        assert unknown.status_code == 404, f"a read of an unknown secret answered {unknown.status_code}, expected 404"
+        for i in range(51):
+            vault.create_version("bulk", f"material-{i}", 3600, "op-ana")
+        bulk = _ok(await c.get("/v1/secrets/bulk/versions", headers=OWNER), "GET /v1/secrets/bulk/versions (51 versions, no limit)")
+    ids = [v.get("version_id") for v in bulk.get("versions", [])]
+    assert len(ids) == 50 and ids[0] == "v51" and ids[-1] == "v2", f"without limit a read answers the 50 newest versions (DEFAULT_LIMIT), v51 down to v2, got {len(ids)}: {ids[:2]}..{ids[-2:]}"
 
 
 async def check_scope_required(ctx):
     async with _read(ctx) as c:
-        for headers in ({"X-Operator-Id": "op-eve"}, {"X-Operator-Id": "op-eve", "X-Scopes": "deploy metrics"}):
+        for headers in (
+            {"X-Operator-Id": "op-eve"},
+            {"X-Operator-Id": "op-eve", "X-Scopes": "deploy metrics"},
+            {"X-Operator-Id": "op-eve", "X-Scopes": "secrets-readonly,deploy"},
+            {"X-Operator-Id": "op-eve", "X-Scopes": "nosecrets"},
+        ):
             r = await c.get(PATH, headers=headers)
-            assert r.status_code == 403, f"a read with scopes {headers.get('X-Scopes')!r} answered {r.status_code}: without the secrets scope it must be 403"
+            assert r.status_code == 403, f"a read with scopes {headers.get('X-Scopes')!r} answered {r.status_code}: without the secrets scope itself it must be 403"
             assert "fingerprint" not in r.text, f"a refused read still listed the versions: {r.text}"
+        missing = await c.get("/v1/secrets/nope/versions", headers={"X-Operator-Id": "op-eve"})
+        assert missing.status_code == 403, f"a read of an unknown secret without the secrets scope answered {missing.status_code}: the scope is checked first (403), so a caller without it cannot tell which secrets exist"
         _ok(await c.get(PATH, headers=ON_CALL), "a read with X-Scopes: secrets,deploy")
+        _ok(await c.get(PATH, headers={"X-Operator-Id": "op-ben", "X-Scopes": "deploy secrets"}), "a read with X-Scopes: deploy secrets")
 
 
 async def check_closed_query(ctx):
@@ -882,21 +897,33 @@ async def check_closed_query(ctx):
         r = await c.get(PATH, params={"include_material": "true"}, headers=OWNER)
         assert MATERIAL not in r.text, f"include_material=true returned the material to the owner: {r.text}. No parameter may widen the read"
         assert r.status_code == 400, f"an unknown query parameter (include_material) answered {r.status_code}, expected 400"
+        r = await c.get(PATH, params={"expand": "material"}, headers=OWNER)
+        assert r.status_code == 400, f"an unknown query parameter (expand) answered {r.status_code}, expected 400: the query is checked against ALLOWED_QUERY, not against the parameters known to be dangerous"
         for limit in ("0", "201", "ten"):
             r = await c.get(PATH, params={"limit": limit}, headers=OWNER)
             assert r.status_code == 400, f"limit={limit} answered {r.status_code}, expected 400 (limit is 1..200)"
         body = _ok(await c.get(PATH, params={"limit": "200"}, headers=OWNER), f"GET {PATH}?limit=200")
     assert all("material" not in v for v in body["versions"]), f"an entry carries material: {body}"
+    fields = {"version_id", "fingerprint", "rotation_seconds", "created_at", "rotate_at", "activated_at", "retired_at", "health", "acceptance"}
+    for v in body["versions"]:
+        extra = sorted(set(v) - fields)
+        assert not extra, f"an entry carries fields beyond those version_view names: {extra}. Build it from the fields it names"
 
 
 async def check_health_interval(ctx):
     async with _read(ctx) as c:
         fresh = _by_id(_ok(await c.get(PATH, headers=OWNER), f"GET {PATH}"))
         assert fresh["v1"].get("health") == "ok" and fresh["v2"].get("health") == "ok", f"right after the creates both versions are ok, got {fresh}"
-        ctx.clock.advance(3601)
+        ctx.clock.advance(3599)
+        early = _by_id(_ok(await c.get(PATH, headers=OWNER), f"GET {PATH} 3599 s later"))
+        assert early["v1"].get("health") == "ok", f"v1 rotates every 3600 s and is 3599 s old, yet its health is {early['v1'].get('health')!r}"
+        ctx.clock.advance(1)
         later = _by_id(_ok(await c.get(PATH, headers=OWNER), f"GET {PATH} an hour later"))
-    assert later["v1"].get("health") == "overdue", f"v1 rotates every 3600 s and was created over an hour ago, yet its health is {later['v1'].get('health')!r}: health follows the version's own rotate_at"
-    assert later["v2"].get("health") == "ok", f"v2 rotates every 30 days and is an hour old, yet its health is {later['v2'].get('health')!r}"
+        assert later["v1"].get("health") == "overdue", f"v1 rotates every 3600 s and reached its rotate_at, yet its health is {later['v1'].get('health')!r}: health follows the version's own rotate_at, overdue from that second on"
+        assert later["v2"].get("health") == "ok", f"v2 rotates every 30 days and is an hour old, yet its health is {later['v2'].get('health')!r}"
+        vault.record_retirement(NAME, "v1")
+        retired = _by_id(_ok(await c.get(PATH, headers=OWNER), f"GET {PATH} after v1 retired"))
+    assert retired["v1"].get("health") == "retired", f"v1 is retired (and past its rotate_at), yet its health is {retired['v1'].get('health')!r}: a retired version is retired, whatever its interval says"
 
 
 async def check_acceptance_visible(ctx):
@@ -904,6 +931,8 @@ async def check_acceptance_visible(ctx):
         body = _ok(await c.get(PATH, headers=ON_CALL), f"GET {PATH} as op-ben (not the owner)")
     v2 = _by_id(body)["v2"]
     assert v2.get("acceptance") == {"verified": ["billing", "checkout"], "pending": ["ledger"]}, f"the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance {{verified: [billing, checkout], pending: [ledger]}}, got {v2.get('acceptance')!r}"
+    v1 = _by_id(body)["v1"]
+    assert v1.get("acceptance") == {"verified": [], "pending": ["billing", "checkout", "ledger"]}, f"nobody verified v1, so its acceptance is {{verified: [], pending: [billing, checkout, ledger]}}, got {v1.get('acceptance')!r}"
 `,
     typescript: `const NAME = 'payments-db';
 const MATERIAL = 'pg-password-CANARY-41d7';
@@ -942,16 +971,30 @@ export async function check_read_route(ctx) {
   assert.equal(anonymous.status, 401, \`a read without X-Operator-Id answered \${anonymous.status}, expected 401\`);
   const unknown = await c.get('/v1/secrets/nope/versions', {headers: OWNER});
   assert.equal(unknown.status, 404, \`a read of an unknown secret answered \${unknown.status}, expected 404\`);
+  for (let i = 0; i < 51; i++) await vault.createVersion('bulk', \`material-\${i}\`, 3600, 'op-ana');
+  const ids = (ok(await c.get('/v1/secrets/bulk/versions', {headers: OWNER}), 'GET /v1/secrets/bulk/versions (51 versions, no limit)').versions ?? []).map(v => v.version_id);
+  assert(
+    ids.length === 50 && ids[0] === 'v51' && ids[49] === 'v2',
+    \`without limit a read answers the 50 newest versions (DEFAULT_LIMIT), v51 down to v2, got \${ids.length}: \${JSON.stringify(ids.slice(0, 2))}..\${JSON.stringify(ids.slice(-2))}\`,
+  );
 }
 
 export async function check_scope_required(ctx) {
   const {c} = await read(ctx);
-  for (const headers of [{'X-Operator-Id': 'op-eve'}, {'X-Operator-Id': 'op-eve', 'X-Scopes': 'deploy metrics'}]) {
+  for (const headers of [
+    {'X-Operator-Id': 'op-eve'},
+    {'X-Operator-Id': 'op-eve', 'X-Scopes': 'deploy metrics'},
+    {'X-Operator-Id': 'op-eve', 'X-Scopes': 'secrets-readonly,deploy'},
+    {'X-Operator-Id': 'op-eve', 'X-Scopes': 'nosecrets'},
+  ]) {
     const r = await c.get(PATH, {headers});
-    assert.equal(r.status, 403, \`a read with scopes \${JSON.stringify(headers['X-Scopes'] ?? null)} answered \${r.status}: without the secrets scope it must be 403\`);
+    assert.equal(r.status, 403, \`a read with scopes \${JSON.stringify(headers['X-Scopes'] ?? null)} answered \${r.status}: without the secrets scope itself it must be 403\`);
     assert(!r.text.includes('fingerprint'), \`a refused read still listed the versions: \${r.text}\`);
   }
+  const missing = await c.get('/v1/secrets/nope/versions', {headers: {'X-Operator-Id': 'op-eve'}});
+  assert.equal(missing.status, 403, \`a read of an unknown secret without the secrets scope answered \${missing.status}: the scope is checked first (403), so a caller without it cannot tell which secrets exist\`);
   ok(await c.get(PATH, {headers: ON_CALL}), 'a read with X-Scopes: secrets,deploy');
+  ok(await c.get(PATH, {headers: {'X-Operator-Id': 'op-ben', 'X-Scopes': 'deploy secrets'}}), 'a read with X-Scopes: deploy secrets');
 }
 
 export async function check_closed_query(ctx) {
@@ -959,31 +1002,49 @@ export async function check_closed_query(ctx) {
   let r = await c.get(\`\${PATH}?include_material=true\`, {headers: OWNER});
   assert(!r.text.includes(MATERIAL), \`include_material=true returned the material to the owner: \${r.text}. No parameter may widen the read\`);
   assert.equal(r.status, 400, \`an unknown query parameter (include_material) answered \${r.status}, expected 400\`);
+  r = await c.get(\`\${PATH}?expand=material\`, {headers: OWNER});
+  assert.equal(r.status, 400, \`an unknown query parameter (expand) answered \${r.status}, expected 400: the query is checked against ALLOWED_QUERY, not against the parameters known to be dangerous\`);
   for (const limit of ['0', '201', 'ten']) {
     r = await c.get(\`\${PATH}?limit=\${limit}\`, {headers: OWNER});
     assert.equal(r.status, 400, \`limit=\${limit} answered \${r.status}, expected 400 (limit is 1..200)\`);
   }
   const body = ok(await c.get(\`\${PATH}?limit=200\`, {headers: OWNER}), \`GET \${PATH}?limit=200\`);
   assert(body.versions.every(v => !('material' in v)), \`an entry carries material: \${JSON.stringify(body)}\`);
+  const fields = ['version_id', 'fingerprint', 'rotation_seconds', 'created_at', 'rotate_at', 'activated_at', 'retired_at', 'health', 'acceptance'];
+  for (const v of body.versions) {
+    const extra = Object.keys(v).filter(k => !fields.includes(k));
+    assert.equal(extra.length, 0, \`an entry carries fields beyond those versionView names: \${JSON.stringify(extra)}. Build it from the fields it names\`);
+  }
 }
 
 export async function check_health_interval(ctx) {
-  const {c} = await read(ctx);
+  const {c, vault} = await read(ctx);
   const fresh = byId(ok(await c.get(PATH, {headers: OWNER}), \`GET \${PATH}\`));
   assert(fresh.v1?.health === 'ok' && fresh.v2?.health === 'ok', \`right after the creates both versions are ok, got \${JSON.stringify(fresh)}\`);
-  ctx.clock.advance(3601);
+  ctx.clock.advance(3599);
+  const early = byId(ok(await c.get(PATH, {headers: OWNER}), \`GET \${PATH} 3599 s later\`));
+  assert.equal(early.v1.health, 'ok', \`v1 rotates every 3600 s and is 3599 s old, yet its health is \${JSON.stringify(early.v1.health)}\`);
+  ctx.clock.advance(1);
   const later = byId(ok(await c.get(PATH, {headers: OWNER}), \`GET \${PATH} an hour later\`));
-  assert.equal(later.v1.health, 'overdue', \`v1 rotates every 3600 s and was created over an hour ago, yet its health is \${JSON.stringify(later.v1.health)}: health follows the version's own rotate_at\`);
+  assert.equal(later.v1.health, 'overdue', \`v1 rotates every 3600 s and reached its rotate_at, yet its health is \${JSON.stringify(later.v1.health)}: health follows the version's own rotate_at, overdue from that second on\`);
   assert.equal(later.v2.health, 'ok', \`v2 rotates every 30 days and is an hour old, yet its health is \${JSON.stringify(later.v2.health)}\`);
+  await vault.recordRetirement(NAME, 'v1');
+  const retired = byId(ok(await c.get(PATH, {headers: OWNER}), \`GET \${PATH} after v1 retired\`));
+  assert.equal(retired.v1.health, 'retired', \`v1 is retired (and past its rotate_at), yet its health is \${JSON.stringify(retired.v1.health)}: a retired version is retired, whatever its interval says\`);
 }
 
 export async function check_acceptance_visible(ctx) {
   const {c} = await read(ctx);
-  const v2 = byId(ok(await c.get(PATH, {headers: ON_CALL}), \`GET \${PATH} as op-ben (not the owner)\`)).v2;
+  const body = byId(ok(await c.get(PATH, {headers: ON_CALL}), \`GET \${PATH} as op-ben (not the owner)\`));
   assert.deepStrictEqual(
-    v2.acceptance,
+    body.v2.acceptance,
     {verified: ['billing', 'checkout'], pending: ['ledger']},
-    \`the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance {verified: [billing, checkout], pending: [ledger]}, got \${JSON.stringify(v2.acceptance)}\`,
+    \`the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance {verified: [billing, checkout], pending: [ledger]}, got \${JSON.stringify(body.v2.acceptance)}\`,
+  );
+  assert.deepStrictEqual(
+    body.v1.acceptance,
+    {verified: [], pending: ['billing', 'checkout', 'ledger']},
+    \`nobody verified v1, so its acceptance is {verified: [], pending: [billing, checkout, ledger]}, got \${JSON.stringify(body.v1.acceptance)}\`,
   );
 }
 `,
@@ -991,6 +1052,7 @@ export async function check_acceptance_visible(ctx) {
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -1059,16 +1121,23 @@ func CheckReadRoute(ctx *harness.Ctx) {
 	ctx.Equal(readIDs(one), []string{"v2"}, "limit=1 must answer the newest version only")
 	ctx.Equal(c.Get(readPath).Status, 401, "a read without X-Operator-Id")
 	ctx.Equal(c.Get("/v1/secrets/nope/versions", "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 404, "a read of an unknown secret")
+	for i := 0; i < 51; i++ {
+		vault.CreateVersion(readBg, "bulk", fmt.Sprintf("material-%d", i), 3600, "op-ana")
+	}
+	ids := readIDs(readOK(ctx, c.Get("/v1/secrets/bulk/versions", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET /v1/secrets/bulk/versions (51 versions, no limit)"))
+	ctx.Assert(len(ids) == 50 && ids[0] == "v51" && ids[49] == "v2", "without limit a read answers the 50 newest versions (defaultLimit), v51 down to v2, got %d: %v", len(ids), ids)
 }
 
 func CheckScopeRequired(ctx *harness.Ctx) {
 	c := readClient(ctx)
-	for _, scopes := range []string{"", "deploy metrics"} {
+	for _, scopes := range []string{"", "deploy metrics", "secrets-readonly,deploy", "nosecrets"} {
 		r := c.Get(readPath, "X-Operator-Id", "op-eve", "X-Scopes", scopes)
-		ctx.Equal(r.Status, 403, "a read with scopes %q (without the secrets scope it must be 403)", scopes)
+		ctx.Equal(r.Status, 403, "a read with scopes %q (without the secrets scope itself it must be 403)", scopes)
 		ctx.Assert(!strings.Contains(r.Text(), "fingerprint"), "a refused read still listed the versions: %s", r.Text())
 	}
+	ctx.Equal(c.Get("/v1/secrets/nope/versions", "X-Operator-Id", "op-eve").Status, 403, "a read of an unknown secret without the secrets scope (the scope is checked first, so a caller without it cannot tell which secrets exist)")
 	readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "a read with X-Scopes: secrets,deploy")
+	readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ben", "X-Scopes", "deploy secrets"), "a read with X-Scopes: deploy secrets")
 }
 
 func CheckClosedQuery(ctx *harness.Ctx) {
@@ -1076,12 +1145,17 @@ func CheckClosedQuery(ctx *harness.Ctx) {
 	r := c.Get(readPath+"?include_material=true", "X-Operator-Id", "op-ana", "X-Scopes", "secrets")
 	ctx.Assert(!strings.Contains(r.Text(), readMaterial), "include_material=true returned the material to the owner: %s. No parameter may widen the read", r.Text())
 	ctx.Equal(r.Status, 400, "an unknown query parameter (include_material)")
+	ctx.Equal(c.Get(readPath+"?expand=material", "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 400, "an unknown query parameter (expand): the query is checked against allowedQuery, not against the parameters known to be dangerous")
 	for _, limit := range []string{"0", "201", "ten"} {
 		ctx.Equal(c.Get(readPath+"?limit="+limit, "X-Operator-Id", "op-ana", "X-Scopes", "secrets").Status, 400, "limit=%s (limit is 1..200)", limit)
 	}
+	fields := map[string]bool{"version_id": true, "fingerprint": true, "rotation_seconds": true, "created_at": true, "rotate_at": true, "activated_at": true, "retired_at": true, "health": true, "acceptance": true}
 	for _, v := range readOK(ctx, c.Get(readPath+"?limit=200", "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+"?limit=200") {
 		_, has := v["material"]
 		ctx.Assert(!has, "an entry carries material: %v", v)
+		for field := range v {
+			ctx.Assert(fields[field], "an entry carries %s beyond the fields versionView names: %v. Build it from the fields it names", field, v)
+		}
 	}
 }
 
@@ -1089,22 +1163,30 @@ func CheckHealthInterval(ctx *harness.Ctx) {
 	c := readClient(ctx)
 	fresh := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath))
 	ctx.Assert(fresh["v1"]["health"] == "ok" && fresh["v2"]["health"] == "ok", "right after the creates both versions are ok, got %v", fresh)
-	ctx.Clock.Advance(3601)
+	ctx.Clock.Advance(3599)
+	early := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+" 3599 s later"))
+	ctx.Equal(early["v1"]["health"], "ok", "v1 rotates every 3600 s and is 3599 s old; its health")
+	ctx.Clock.Advance(1)
 	later := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+" an hour later"))
-	ctx.Equal(later["v1"]["health"], "overdue", "v1 rotates every 3600 s and was created over an hour ago: health follows the version's own rotate_at; its health")
+	ctx.Equal(later["v1"]["health"], "overdue", "v1 rotates every 3600 s and reached its rotate_at: health follows the version's own rotate_at, overdue from that second on; its health")
 	ctx.Equal(later["v2"]["health"], "ok", "v2 rotates every 30 days and is an hour old; its health")
+	vault.RecordRetirement(readBg, readName, "v1")
+	retired := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"), "GET "+readPath+" after v1 retired"))
+	ctx.Equal(retired["v1"]["health"], "retired", "v1 is retired (and past its rotate_at): a retired version is retired, whatever its interval says; its health")
 }
 
 func CheckAcceptanceVisible(ctx *harness.Ctx) {
 	c := readClient(ctx)
-	v2 := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "GET "+readPath+" as op-ben (not the owner)"))["v2"]
-	ctx.Equal(v2["acceptance"], map[string]any{"verified": []any{"billing", "checkout"}, "pending": []any{"ledger"}}, "the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance")
+	body := readByID(readOK(ctx, c.Get(readPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "GET "+readPath+" as op-ben (not the owner)"))
+	ctx.Equal(body["v2"]["acceptance"], map[string]any{"verified": []any{"billing", "checkout"}, "pending": []any{"ledger"}}, "the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance")
+	ctx.Equal(body["v1"]["acceptance"], map[string]any{"verified": []any{}, "pending": []any{"billing", "checkout", "ledger"}}, "nobody verified v1, so its acceptance")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -1115,19 +1197,19 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kName = "payments-db";
-const std::string kMaterial = "pg-password-CANARY-41d7";
-const std::string kPath = "/v1/secrets/payments-db/versions";
+const std::string hName = "payments-db";
+const std::string hMaterial = "pg-password-CANARY-41d7";
+const std::string hPath = "/v1/secrets/payments-db/versions";
 
 // Seeds v1 (hourly) and v2 (30 days), three consumers, two of which verified v2.
-harness::HTTP read(harness::Ctx& ctx) {
-  vault::createVersion(kName, kMaterial, 3600, "op-ana");
-  vault::createVersion(kName, kMaterial + "-2", 2592000, "op-ana");
-  vault::recordActivation(kName, "v1");
-  vault::recordActivation(kName, "v2");
-  for (const std::string id : {"billing", "checkout", "ledger"}) vault::registerConsumer(kName, id);
-  vault::recordAcceptance(kName, "v2", "billing");
-  vault::recordAcceptance(kName, "v2", "checkout");
+harness::HTTP hRead(harness::Ctx& ctx) {
+  vault::createVersion(hName, hMaterial, 3600, "op-ana");
+  vault::createVersion(hName, hMaterial + "-2", 2592000, "op-ana");
+  vault::recordActivation(hName, "v1");
+  vault::recordActivation(hName, "v2");
+  for (const std::string id : {"billing", "checkout", "ledger"}) vault::registerConsumer(hName, id);
+  vault::recordAcceptance(hName, "v2", "billing");
+  vault::recordAcceptance(hName, "v2", "checkout");
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -1135,20 +1217,20 @@ harness::HTTP read(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response asOwner(harness::HTTP& c, const std::string& path) { return c.Get(path, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"); }
+harness::Response hAsOwner(harness::HTTP& c, const std::string& path) { return c.Get(path, "X-Operator-Id", "op-ana", "X-Scopes", "secrets"); }
 
-json ok(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+json hOk(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   ctx.Equal(r.Status, 200, "%s (%s)", what, r.Text());
   return json::parse(r.Text()).value("versions", json::array());
 }
 
-std::vector<std::string> ids(const json& versions) {
+std::vector<std::string> hIds(const json& versions) {
   std::vector<std::string> out;
   for (const auto& v : versions) out.push_back(v.value("version_id", ""));
   return out;
 }
 
-std::map<std::string, json> byId(const json& versions) {
+std::map<std::string, json> hById(const json& versions) {
   std::map<std::string, json> out;
   for (const auto& v : versions) out[v.value("version_id", "")] = v;
   return out;
@@ -1157,53 +1239,71 @@ std::map<std::string, json> byId(const json& versions) {
 }  // namespace
 
 void CheckReadRoute(harness::Ctx& ctx) {
-  auto c = read(ctx);
-  const json versions = ok(ctx, asOwner(c, kPath), "GET " + kPath);
-  ctx.Equal(ids(versions), {"v2", "v1"}, "the versions must come newest first");
-  ctx.Equal(versions[0].value("fingerprint", ""), vault::fingerprint(kMaterial + "-2"), "each entry carries the version's fingerprint");
-  ctx.Equal(ids(ok(ctx, asOwner(c, kPath + "?limit=1"), "GET " + kPath + "?limit=1")), {"v2"}, "limit=1 must answer the newest version only");
-  ctx.Equal(c.Get(kPath).Status, 401, "a read without X-Operator-Id");
-  ctx.Equal(asOwner(c, "/v1/secrets/nope/versions").Status, 404, "a read of an unknown secret");
+  auto c = hRead(ctx);
+  const json versions = hOk(ctx, hAsOwner(c, hPath), "GET " + hPath);
+  ctx.Equal(hIds(versions), {"v2", "v1"}, "the versions must come newest first");
+  ctx.Equal(versions[0].value("fingerprint", ""), vault::fingerprint(hMaterial + "-2"), "each entry carries the version's fingerprint");
+  ctx.Equal(hIds(hOk(ctx, hAsOwner(c, hPath + "?limit=1"), "GET " + hPath + "?limit=1")), {"v2"}, "limit=1 must answer the newest version only");
+  ctx.Equal(c.Get(hPath).Status, 401, "a read without X-Operator-Id");
+  ctx.Equal(hAsOwner(c, "/v1/secrets/nope/versions").Status, 404, "a read of an unknown secret");
+  for (int i = 0; i < 51; ++i) vault::createVersion("bulk", "material-" + std::to_string(i), 3600, "op-ana");
+  const auto bulk = hIds(hOk(ctx, hAsOwner(c, "/v1/secrets/bulk/versions"), "GET /v1/secrets/bulk/versions (51 versions, no limit)"));
+  ctx.Assert(bulk.size() == 50 && bulk.front() == "v51" && bulk.back() == "v2", "without limit a read answers the 50 newest versions (kDefaultLimit), v51 down to v2, got %d", bulk.size());
 }
 
 void CheckScopeRequired(harness::Ctx& ctx) {
-  auto c = read(ctx);
-  for (const std::string scopes : {"", "deploy metrics"}) {
-    const auto r = c.Get(kPath, "X-Operator-Id", "op-eve", "X-Scopes", scopes);
-    ctx.Equal(r.Status, 403, "a read with scopes %q (without the secrets scope it must be 403)", scopes);
+  auto c = hRead(ctx);
+  for (const std::string scopes : {"", "deploy metrics", "secrets-readonly,deploy", "nosecrets"}) {
+    const auto r = c.Get(hPath, "X-Operator-Id", "op-eve", "X-Scopes", scopes);
+    ctx.Equal(r.Status, 403, "a read with scopes %q (without the secrets scope itself it must be 403)", scopes);
     ctx.Assert(r.Text().find("fingerprint") == std::string::npos, "a refused read still listed the versions: %s", r.Text());
   }
-  ok(ctx, c.Get(kPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "a read with X-Scopes: secrets,deploy");
+  ctx.Equal(c.Get("/v1/secrets/nope/versions", "X-Operator-Id", "op-eve").Status, 403, "a read of an unknown secret without the secrets scope (the scope is checked first, so a caller without it cannot tell which secrets exist)");
+  hOk(ctx, c.Get(hPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "a read with X-Scopes: secrets,deploy");
+  hOk(ctx, c.Get(hPath, "X-Operator-Id", "op-ben", "X-Scopes", "deploy secrets"), "a read with X-Scopes: deploy secrets");
 }
 
 void CheckClosedQuery(harness::Ctx& ctx) {
-  auto c = read(ctx);
-  const auto r = asOwner(c, kPath + "?include_material=true");
-  ctx.Assert(r.Text().find(kMaterial) == std::string::npos, "include_material=true returned the material to the owner: %s. No parameter may widen the read", r.Text());
+  auto c = hRead(ctx);
+  const auto r = hAsOwner(c, hPath + "?include_material=true");
+  ctx.Assert(r.Text().find(hMaterial) == std::string::npos, "include_material=true returned the material to the owner: %s. No parameter may widen the read", r.Text());
   ctx.Equal(r.Status, 400, "an unknown query parameter (include_material)");
+  ctx.Equal(hAsOwner(c, hPath + "?expand=material").Status, 400, "an unknown query parameter (expand): the query is checked against kAllowedQuery, not against the parameters known to be dangerous");
   for (const std::string limit : {"0", "201", "ten"}) {
-    ctx.Equal(asOwner(c, kPath + "?limit=" + limit).Status, 400, "limit=%s (limit is 1..200)", limit);
+    ctx.Equal(hAsOwner(c, hPath + "?limit=" + limit).Status, 400, "limit=%s (limit is 1..200)", limit);
   }
-  for (const auto& v : ok(ctx, asOwner(c, kPath + "?limit=200"), "GET " + kPath + "?limit=200")) {
+  const std::vector<std::string> fields = {"version_id", "fingerprint", "rotation_seconds", "created_at", "rotate_at", "activated_at", "retired_at", "health", "acceptance"};
+  for (const auto& v : hOk(ctx, hAsOwner(c, hPath + "?limit=200"), "GET " + hPath + "?limit=200")) {
     ctx.Assert(!v.contains("material"), "an entry carries material: %s", v.dump());
+    for (auto it = v.begin(); it != v.end(); ++it) {
+      ctx.Assert(std::find(fields.begin(), fields.end(), it.key()) != fields.end(), "an entry carries %s beyond the fields versionView names: %s. Build it from the fields it names", it.key(), v.dump());
+    }
   }
 }
 
 void CheckHealthInterval(harness::Ctx& ctx) {
-  auto c = read(ctx);
-  auto fresh = byId(ok(ctx, asOwner(c, kPath), "GET " + kPath));
+  auto c = hRead(ctx);
+  auto fresh = hById(hOk(ctx, hAsOwner(c, hPath), "GET " + hPath));
   ctx.Assert(fresh["v1"].value("health", "") == "ok" && fresh["v2"].value("health", "") == "ok", "right after the creates both versions are ok");
-  ctx.Clock.Advance(3601);
-  auto later = byId(ok(ctx, asOwner(c, kPath), "GET " + kPath + " an hour later"));
-  ctx.Equal(later["v1"].value("health", ""), "overdue", "v1 rotates every 3600 s and was created over an hour ago: health follows the version's own rotate_at; its health");
+  ctx.Clock.Advance(3599);
+  auto early = hById(hOk(ctx, hAsOwner(c, hPath), "GET " + hPath + " 3599 s later"));
+  ctx.Equal(early["v1"].value("health", ""), "ok", "v1 rotates every 3600 s and is 3599 s old; its health");
+  ctx.Clock.Advance(1);
+  auto later = hById(hOk(ctx, hAsOwner(c, hPath), "GET " + hPath + " an hour later"));
+  ctx.Equal(later["v1"].value("health", ""), "overdue", "v1 rotates every 3600 s and reached its rotate_at: health follows the version's own rotate_at, overdue from that second on; its health");
   ctx.Equal(later["v2"].value("health", ""), "ok", "v2 rotates every 30 days and is an hour old; its health");
+  vault::recordRetirement(hName, "v1");
+  auto retired = hById(hOk(ctx, hAsOwner(c, hPath), "GET " + hPath + " after v1 retired"));
+  ctx.Equal(retired["v1"].value("health", ""), "retired", "v1 is retired (and past its rotate_at): a retired version is retired, whatever its interval says; its health");
 }
 
 void CheckAcceptanceVisible(harness::Ctx& ctx) {
-  auto c = read(ctx);
-  auto v2 = byId(ok(ctx, c.Get(kPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "GET " + kPath + " as op-ben (not the owner)"))["v2"];
+  auto c = hRead(ctx);
+  auto body = hById(hOk(ctx, c.Get(hPath, "X-Operator-Id", "op-ben", "X-Scopes", "secrets,deploy"), "GET " + hPath + " as op-ben (not the owner)"));
   const json expected = {{"verified", {"billing", "checkout"}}, {"pending", {"ledger"}}};
-  ctx.Equal(v2.value("acceptance", json()), expected, "the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance");
+  ctx.Equal(body["v2"].value("acceptance", json()), expected, "the on-call engineer (op-ben, holding the secrets scope) must see v2's acceptance");
+  const json nobody = {{"verified", json::array()}, {"pending", {"billing", "checkout", "ledger"}}};
+  ctx.Equal(body["v1"].value("acceptance", json()), nobody, "nobody verified v1, so its acceptance");
 }
 `,
   },

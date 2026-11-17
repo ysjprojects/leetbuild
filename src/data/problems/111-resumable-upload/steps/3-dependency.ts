@@ -66,7 +66,7 @@ assembled corrupt; one restarting node fails the part and the client has to send
       id: 'deadline',
       title: 'Every WritePart carries a 30-second deadline',
       detail:
-        'The call is made with `WRITE_DEADLINE_S` (30 s), so a hung store node costs at most three deadlines and the part is not registered; the starter sets no deadline and waits as long as the node does.',
+        'Every attempt is made with its own `WRITE_DEADLINE_S` (30 s), not what is left of the first, so a hung store node costs three deadlines, the part is not registered and the call answers false; the starter sets no deadline and waits as long as the node does.',
       match: {
         python: {all: [/WRITE_DEADLINE_S\s*=\s*30\b/, /WritePart\([\s\S]{0,200}?timeout\s*=\s*WRITE_DEADLINE_S/]},
         typescript: {
@@ -117,7 +117,7 @@ assembled corrupt; one restarting node fails the part and the client has to send
       id: 'retry',
       title: 'Retries the failed part alone, three attempts',
       detail:
-        '`UNAVAILABLE`, `DEADLINE_EXCEEDED` and a checksum mismatch are tried again for this part, `MAX_PART_ATTEMPTS` (3) attempts in all, and then `store_part` reports false; the starter gives up on the first failure.',
+        '`UNAVAILABLE`, `DEADLINE_EXCEEDED` and a checksum mismatch are tried again for this part, `MAX_PART_ATTEMPTS` (3) attempts in all, and then `store_part` reports false; any other status is raised at once. The starter gives up on the first failure.',
       match: {
         python: {all: [/MAX_PART_ATTEMPTS\s*=\s*3\b/, /for \w+ in range\(MAX_PART_ATTEMPTS\)/, /UNAVAILABLE/]},
         typescript: {all: [/MAX_PART_ATTEMPTS\s*=\s*3\b/, /attempt < MAX_PART_ATTEMPTS/, /UNAVAILABLE/]},
@@ -555,11 +555,16 @@ def check_deadline(ctx):
     ctx.grpc.set_latency("WritePart", 45.0)
     before = ctx.clock.time()
     try:
-        m.store_part("u-1", 2, PART, _sha(PART))
-    except grpc.RpcError:
-        pass  # reporting the deadline to the caller is fine too
+        ok = m.store_part("u-1", 2, PART, _sha(PART))
+    except grpc.RpcError as exc:
+        raise AssertionError(f"with the store hanging, store_part raised {exc.code().name}: DEADLINE_EXCEEDED is retried, and after MAX_PART_ATTEMPTS attempts store_part returns False") from None
     waited = ctx.clock.time() - before
     assert 2 not in _registered(), "part 2 is registered although every write of it ran past the deadline"
+    hung = _writes(ctx, 2)
+    assert len(hung) == 3, f"with the store hanging part 2 was written {len(hung)} time(s): DEADLINE_EXCEEDED is retried, MAX_PART_ATTEMPTS = 3 attempts"
+    for attempt, call in enumerate(hung, 1):
+        assert call.timeout is not None and 29.5 <= call.timeout <= 30.5, f"attempt {attempt} of part 2 carried a {call.timeout} s deadline: every attempt gets its own WRITE_DEADLINE_S (30 s), not what is left of the first"
+    assert ok is False, f"store_part answered {ok!r} after three attempts past the deadline, expected False"
     assert waited <= 91, f"store_part spent {waited:.0f} s on one part with the store hanging: three attempts of 30 s at most"
 
 
@@ -582,12 +587,26 @@ def check_retry(ctx):
     objects.corrupt = 1
     ok = _store(m, 2, PART, "after one corrupted copy")
     assert ok is True and len(_writes(ctx, 2)) == 2, f"after one checksum mismatch store_part answered {ok!r} with {len(_writes(ctx, 2))} write(s): the part must be written again"
-    ctx.grpc.fail("WritePart", grpc.StatusCode.UNAVAILABLE, "store node down", times=10)
+    ctx.grpc.fail("WritePart", grpc.StatusCode.UNAVAILABLE, "store node down", times=3)
     ok = _store(m, 3, b"ef", "with the store node down")
     writes = len(_writes(ctx, 3))
     assert writes == 3, f"with the store node down part 3 was written {writes} time(s), expected MAX_PART_ATTEMPTS = 3"
     assert ok is False and 3 not in _registered(), f"store_part answered {ok!r} for a part the store never took, expected False with nothing registered"
     assert sorted(_registered()) == [1, 2], f"a failed part 3 must leave parts 1 and 2 registered, the manifest holds {sorted(_registered())}"
+    for code in (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.NOT_FOUND, grpc.StatusCode.PERMISSION_DENIED):
+        ctx.grpc.fail("WritePart", code, "refused by the store", times=1)
+        tried = len(_writes(ctx, 3))
+        try:
+            got = m.store_part("u-1", 3, b"ef", _sha(b"ef"))
+        except Exception:
+            got = "raised"
+        assert got == "raised", f"WritePart failed with {code.name} and store_part answered {got!r}: only UNAVAILABLE, DEADLINE_EXCEEDED and a mismatch are retried, any other status is raised"
+        assert len(_writes(ctx, 3)) == tried + 1, f"WritePart failed with {code.name} and part 3 was written {len(_writes(ctx, 3)) - tried} times: a status that is not retryable is raised at once"
+        assert 3 not in _registered(), f"part 3 is registered after WritePart failed with {code.name}"
+    ctx.grpc.fail("WritePart", grpc.StatusCode.DEADLINE_EXCEEDED, "store node slow", times=1)
+    tried = len(_writes(ctx, 3))
+    ok = _store(m, 3, b"ef", "after one DEADLINE_EXCEEDED")
+    assert ok is True and len(_writes(ctx, 3)) == tried + 2 and 3 in _registered(), f"after one DEADLINE_EXCEEDED store_part answered {ok!r} with {len(_writes(ctx, 3)) - tried} write(s): part 3 must be written again and registered"
 `,
     typescript: `import {createHash} from 'node:crypto';
 
@@ -647,13 +666,20 @@ export async function check_deadline(ctx) {
   }
   ctx.grpc.setLatency('WritePart', 45.0);
   const before = ctx.clock.now();
+  let ok;
   try {
-    await m.storePart('u-1', 2, PART, sha(PART));
-  } catch {
-    // reporting the deadline to the caller is fine too
+    ok = await m.storePart('u-1', 2, PART, sha(PART));
+  } catch (e) {
+    assert.fail(\`with the store hanging, storePart threw \${(e as Error).message}: DEADLINE_EXCEEDED is retried, and after MAX_PART_ATTEMPTS attempts storePart resolves false\`);
   }
   const waited = (ctx.clock.now() - before) / 1000;
   assert(!(await registered(manifest)).has(2), 'part 2 is registered although every write of it ran past the deadline');
+  const hung = writes(ctx, 2);
+  assert.equal(hung.length, 3, \`with the store hanging part 2 was written \${hung.length} time(s): DEADLINE_EXCEEDED is retried, MAX_PART_ATTEMPTS = 3 attempts\`);
+  hung.forEach((call, i) => {
+    assert(call.timeout !== null && call.timeout >= 29.5 && call.timeout <= 30.5, \`attempt \${i + 1} of part 2 carried a \${call.timeout} s deadline: every attempt gets its own WRITE_DEADLINE_MS (30 s), not what is left of the first\`);
+  });
+  assert.equal(ok, false, \`storePart answered \${ok} after three attempts past the deadline, expected false\`);
   assert(waited <= 91, \`storePart spent \${waited.toFixed(0)} s on one part with the store hanging: three attempts of 30 s at most\`);
 }
 
@@ -677,11 +703,28 @@ export async function check_retry(ctx) {
   objects.corrupt = 1;
   ok = await storeIt(m, 2, PART, 'after one corrupted copy');
   assert(ok === true && writes(ctx, 2).length === 2, \`after one checksum mismatch storePart answered \${ok} with \${writes(ctx, 2).length} write(s): the part must be written again\`);
-  ctx.grpc.fail('WritePart', ctx.grpc.status.UNAVAILABLE, 'store node down', 10);
+  ctx.grpc.fail('WritePart', ctx.grpc.status.UNAVAILABLE, 'store node down', 3);
   ok = await storeIt(m, 3, TAIL, 'with the store node down');
   assert.equal(writes(ctx, 3).length, 3, \`with the store node down part 3 was written \${writes(ctx, 3).length} time(s), expected MAX_PART_ATTEMPTS = 3\`);
   assert(ok === false && !(await registered(manifest)).has(3), \`storePart answered \${ok} for a part the store never took, expected false with nothing registered\`);
   assert.deepStrictEqual([...(await registered(manifest)).keys()], [1, 2], 'a failed part 3 must leave parts 1 and 2 registered');
+  for (const code of ['INVALID_ARGUMENT', 'NOT_FOUND', 'PERMISSION_DENIED']) {
+    ctx.grpc.fail('WritePart', ctx.grpc.status[code], 'refused by the store', 1);
+    const tried = writes(ctx, 3).length;
+    let got: unknown = 'threw';
+    try {
+      got = await m.storePart('u-1', 3, TAIL, sha(TAIL));
+    } catch {
+      // the status reaches the caller
+    }
+    assert.equal(got, 'threw', \`WritePart failed with \${code} and storePart answered \${got}: only UNAVAILABLE, DEADLINE_EXCEEDED and a mismatch are retried, any other status is thrown\`);
+    assert.equal(writes(ctx, 3).length, tried + 1, \`WritePart failed with \${code} and part 3 was written \${writes(ctx, 3).length - tried} times: a status that is not retryable is thrown at once\`);
+    assert(!(await registered(manifest)).has(3), \`part 3 is registered after WritePart failed with \${code}\`);
+  }
+  ctx.grpc.fail('WritePart', ctx.grpc.status.DEADLINE_EXCEEDED, 'store node slow', 1);
+  const tried = writes(ctx, 3).length;
+  ok = await storeIt(m, 3, TAIL, 'after one DEADLINE_EXCEEDED');
+  assert(ok === true && writes(ctx, 3).length === tried + 2 && (await registered(manifest)).has(3), \`after one DEADLINE_EXCEEDED storePart answered \${ok} with \${writes(ctx, 3).length - tried} write(s): part 3 must be written again and registered\`);
 }
 `,
     go: `package main
@@ -702,40 +745,40 @@ import (
 )
 
 var (
-	clientBg = context.Background()
-	part     = []byte("abcd")
-	tail     = []byte("ef")
+	hClientBg = context.Background()
+	hPart     = []byte("abcd")
+	hTail     = []byte("ef")
 )
 
-func sha(data []byte) string {
+func hSha(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
 }
 
-// objectsPeer answers the SHA-256 of what it received; the next corrupt writes arrive with their first byte flipped.
-type objectsPeer struct {
+// hObjectsPeer answers the SHA-256 of what it received; the next corrupt writes arrive with their first byte flipped.
+type hObjectsPeer struct {
 	pb.UnimplementedObjectStoreServer
 	corrupt int
 }
 
-func (o *objectsPeer) WritePart(_ context.Context, req *pb.WritePartRequest) (*pb.WritePartReply, error) {
+func (o *hObjectsPeer) WritePart(_ context.Context, req *pb.WritePartRequest) (*pb.WritePartReply, error) {
 	data := append([]byte{}, req.GetData()...)
 	if o.corrupt > 0 {
 		o.corrupt--
 		data[0] ^= 0xff
 	}
-	return &pb.WritePartReply{Checksum: sha(data), Size: int64(len(data))}, nil
+	return &pb.WritePartReply{Checksum: hSha(data), Size: int64(len(data))}, nil
 }
 
-func client(ctx *harness.Ctx) *objectsPeer {
-	peer := &objectsPeer{}
+func hClient(ctx *harness.Ctx) *hObjectsPeer {
+	peer := &hObjectsPeer{}
 	pb.RegisterObjectStoreServer(ctx.GRPC.Server(""), peer)
-	store.CreateUpload(clientBg, "t1", 10, 4, 3, "video/mp4") // u-1: parts of 4, 4 and 2 bytes
+	store.CreateUpload(hClientBg, "t1", 10, 4, 3, "video/mp4") // u-1: parts of 4, 4 and 2 bytes
 	return peer
 }
 
-func registered(ctx *harness.Ctx) map[int]manifest.Part {
-	parts, err := manifest.ReadParts(clientBg, "u-1")
+func hRegistered(ctx *harness.Ctx) map[int]manifest.Part {
+	parts, err := manifest.ReadParts(hClientBg, "u-1")
 	ctx.NoError(err, "manifest.ReadParts(u-1)")
 	out := map[int]manifest.Part{}
 	for _, p := range parts {
@@ -744,7 +787,7 @@ func registered(ctx *harness.Ctx) map[int]manifest.Part {
 	return out
 }
 
-func writes(ctx *harness.Ctx, n int) []*pb.WritePartRequest {
+func hWrites(ctx *harness.Ctx, n int) []*pb.WritePartRequest {
 	var out []*pb.WritePartRequest
 	for _, c := range ctx.GRPC.CallsTo("WritePart", "") {
 		if req := c.Request.(*pb.WritePartRequest); int(req.GetPartNumber()) == n {
@@ -754,67 +797,93 @@ func writes(ctx *harness.Ctx, n int) []*pb.WritePartRequest {
 	return out
 }
 
-func storeIt(ctx *harness.Ctx, n int, data []byte, why string) bool {
-	ok, err := storePart(clientBg, "u-1", n, data, sha(data))
+func hStoreIt(ctx *harness.Ctx, n int, data []byte, why string) bool {
+	ok, err := storePart(hClientBg, "u-1", n, data, hSha(data))
 	ctx.NoError(err, "%s: storePart returned an error", why)
 	return ok
 }
 
 func CheckStoresPart(ctx *harness.Ctx) {
-	client(ctx)
-	ctx.Equal(storeIt(ctx, 1, part, "with a healthy store"), true, "storePart's answer for a part the store received intact")
-	w := writes(ctx, 1)
-	ctx.Assert(len(w) == 1 && string(w[0].GetData()) == string(part) && w[0].GetUploadId() == "u-1", "part 1 must be written once with its bytes, the store saw %d write(s)", len(w))
-	ctx.Equal(registered(ctx), map[int]manifest.Part{1: {PartNumber: 1, Size: 4, Checksum: sha(part)}}, "the manifest must hold part 1 with size 4 and its checksum")
+	hClient(ctx)
+	ctx.Equal(hStoreIt(ctx, 1, hPart, "with a healthy store"), true, "storePart's answer for a part the store received intact")
+	w := hWrites(ctx, 1)
+	ctx.Assert(len(w) == 1 && string(w[0].GetData()) == string(hPart) && w[0].GetUploadId() == "u-1", "part 1 must be written once with its bytes, the store saw %d write(s)", len(w))
+	ctx.Equal(hRegistered(ctx), map[int]manifest.Part{1: {PartNumber: 1, Size: 4, Checksum: hSha(hPart)}}, "the manifest must hold part 1 with size 4 and its checksum")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	client(ctx)
-	storeIt(ctx, 1, part, "with a healthy store")
+	hClient(ctx)
+	hStoreIt(ctx, 1, hPart, "with a healthy store")
 	for _, call := range ctx.GRPC.CallsTo("WritePart", "") {
 		ctx.Assert(call.HasDeadline(), "a WritePart call carries no deadline: a store node that hangs holds the part, and the client's request, open")
 		ctx.Assert(29500*time.Millisecond <= call.Timeout && call.Timeout <= 30500*time.Millisecond, "a WritePart call carries a %v deadline, expected writeDeadline = 30 s", call.Timeout)
 	}
 	ctx.GRPC.SetLatency("WritePart", 45.0, "")
 	before := ctx.Clock.Now()
-	storePart(clientBg, "u-1", 2, part, sha(part)) // an error reporting the deadline is fine too
+	ok, err := storePart(hClientBg, "u-1", 2, hPart, hSha(hPart))
+	ctx.Assert(err == nil, "with the store hanging, storePart returned %v: DEADLINE_EXCEEDED is retried, and after maxPartAttempts attempts storePart returns false", err)
 	waited := float64(ctx.Clock.Now()-before) / 1000
-	_, has := registered(ctx)[2]
+	_, has := hRegistered(ctx)[2]
 	ctx.Assert(!has, "part 2 is registered although every write of it ran past the deadline")
+	var hung []time.Duration
+	for _, call := range ctx.GRPC.CallsTo("WritePart", "") {
+		if call.Request.(*pb.WritePartRequest).GetPartNumber() == 2 {
+			hung = append(hung, call.Timeout)
+		}
+	}
+	ctx.Equal(len(hung), 3, "with the store hanging, the writes of part 2 (DEADLINE_EXCEEDED is retried, maxPartAttempts = 3 attempts)")
+	for i, timeout := range hung {
+		ctx.Assert(29500*time.Millisecond <= timeout && timeout <= 30500*time.Millisecond, "attempt %d of part 2 carried a %v deadline: every attempt gets its own writeDeadline (30 s), not what is left of the first", i+1, timeout)
+	}
+	ctx.Equal(ok, false, "storePart's answer after three attempts past the deadline")
 	ctx.Assert(waited <= 91, "storePart spent %.0f s on one part with the store hanging: three attempts of 30 s at most", waited)
 }
 
 func CheckChecksum(ctx *harness.Ctx) {
-	peer := client(ctx)
+	peer := hClient(ctx)
 	peer.corrupt = 10
-	ok := storeIt(ctx, 2, part, "with every copy of part 2 corrupted on the way")
-	_, has := registered(ctx)[2]
+	ok := hStoreIt(ctx, 2, hPart, "with every copy of part 2 corrupted on the way")
+	_, has := hRegistered(ctx)[2]
 	ctx.Assert(!has, "part 2 is registered although the store answered a checksum other than the client's: a resume would skip it and the object would be assembled corrupt")
 	ctx.Equal(ok, false, "storePart's answer for a part whose checksum never matched")
-	ctx.Assert(len(writes(ctx, 2)) <= 3, "part 2 was written %d times: maxPartAttempts is 3", len(writes(ctx, 2)))
+	ctx.Assert(len(hWrites(ctx, 2)) <= 3, "part 2 was written %d times: maxPartAttempts is 3", len(hWrites(ctx, 2)))
 	peer.corrupt = 0
-	ctx.Equal(storeIt(ctx, 2, part, "with the store healthy again"), true, "once the store receives part 2 intact, storePart's answer")
-	_, has = registered(ctx)[2]
+	ctx.Equal(hStoreIt(ctx, 2, hPart, "with the store healthy again"), true, "once the store receives part 2 intact, storePart's answer")
+	_, has = hRegistered(ctx)[2]
 	ctx.Assert(has, "once the store receives part 2 intact it must be registered")
 }
 
 func CheckRetry(ctx *harness.Ctx) {
-	peer := client(ctx)
+	peer := hClient(ctx)
 	ctx.GRPC.Fail("WritePart", codes.Unavailable, "store node restarting", 1, "")
-	ok := storeIt(ctx, 1, part, "after one UNAVAILABLE from a restarting store node")
-	ctx.Assert(ok && len(writes(ctx, 1)) == 2, "after one UNAVAILABLE storePart answered %v with %d write(s): part 1 must be written again and registered", ok, len(writes(ctx, 1)))
+	ok := hStoreIt(ctx, 1, hPart, "after one UNAVAILABLE from a restarting store node")
+	ctx.Assert(ok && len(hWrites(ctx, 1)) == 2, "after one UNAVAILABLE storePart answered %v with %d write(s): part 1 must be written again and registered", ok, len(hWrites(ctx, 1)))
 	peer.corrupt = 1
-	ok = storeIt(ctx, 2, part, "after one corrupted copy")
-	ctx.Assert(ok && len(writes(ctx, 2)) == 2, "after one checksum mismatch storePart answered %v with %d write(s): the part must be written again", ok, len(writes(ctx, 2)))
-	ctx.GRPC.Fail("WritePart", codes.Unavailable, "store node down", 10, "")
-	ok = storeIt(ctx, 3, tail, "with the store node down")
-	ctx.Equal(len(writes(ctx, 3)), 3, "with the store node down, the writes of part 3 (maxPartAttempts = 3)")
-	_, has := registered(ctx)[3]
+	ok = hStoreIt(ctx, 2, hPart, "after one corrupted copy")
+	ctx.Assert(ok && len(hWrites(ctx, 2)) == 2, "after one checksum mismatch storePart answered %v with %d write(s): the part must be written again", ok, len(hWrites(ctx, 2)))
+	ctx.GRPC.Fail("WritePart", codes.Unavailable, "store node down", 3, "")
+	ok = hStoreIt(ctx, 3, hTail, "with the store node down")
+	ctx.Equal(len(hWrites(ctx, 3)), 3, "with the store node down, the writes of part 3 (maxPartAttempts = 3)")
+	_, has := hRegistered(ctx)[3]
 	ctx.Assert(!ok && !has, "storePart answered %v for a part the store never took, expected false with nothing registered", ok)
-	got := registered(ctx)
+	got := hRegistered(ctx)
 	_, one := got[1]
 	_, two := got[2]
 	ctx.Assert(len(got) == 2 && one && two, "a failed part 3 must leave parts 1 and 2 registered, the manifest holds %v", got)
+	for _, code := range []codes.Code{codes.InvalidArgument, codes.NotFound, codes.PermissionDenied} {
+		ctx.GRPC.Fail("WritePart", code, "refused by the store", 1, "")
+		tried := len(hWrites(ctx, 3))
+		ok, err := storePart(hClientBg, "u-1", 3, hTail, hSha(hTail))
+		ctx.Assert(err != nil, "WritePart failed with %v and storePart answered %v with no error: only Unavailable, DeadlineExceeded and a mismatch are retried, any other status is returned", code, ok)
+		ctx.Equal(len(hWrites(ctx, 3)), tried+1, "WritePart failed with %v: a status that is not retryable is returned at once; the writes of part 3", code)
+		_, has := hRegistered(ctx)[3]
+		ctx.Assert(!has, "part 3 is registered after WritePart failed with %v", code)
+	}
+	ctx.GRPC.Fail("WritePart", codes.DeadlineExceeded, "store node slow", 1, "")
+	tried := len(hWrites(ctx, 3))
+	ok = hStoreIt(ctx, 3, hTail, "after one DEADLINE_EXCEEDED")
+	_, has = hRegistered(ctx)[3]
+	ctx.Assert(ok && len(hWrites(ctx, 3)) == tried+2 && has, "after one DEADLINE_EXCEEDED storePart answered %v with %d write(s): part 3 must be written again and registered", ok, len(hWrites(ctx, 3))-tried)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -832,10 +901,10 @@ func CheckRetry(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kPart = "abcd";
-const std::string kTail = "ef";
+const std::string kHarnessPart = "abcd";
+const std::string kHarnessTail = "ef";
 
-std::string sha(const std::string& data) {
+std::string hSha(const std::string& data) {
   unsigned char md[SHA256_DIGEST_LENGTH];
   SHA256(reinterpret_cast<const unsigned char*>(data.data()), data.size(), md);
   std::string hex;
@@ -848,7 +917,7 @@ std::string sha(const std::string& data) {
 }
 
 // Answers the SHA-256 of what it received; the next corrupt writes arrive with their first byte flipped.
-class ObjectsPeer final : public uploadd::ObjectStore::Service {
+class HObjectsPeer final : public uploadd::ObjectStore::Service {
  public:
   int corrupt = 0;
   grpc::Status WritePart(grpc::ServerContext*, const uploadd::WritePartRequest* req, uploadd::WritePartReply* out) override {
@@ -857,28 +926,28 @@ class ObjectsPeer final : public uploadd::ObjectStore::Service {
       corrupt--;
       data[0] = static_cast<char>(data[0] ^ 0xff);
     }
-    out->set_checksum(sha(data));
+    out->set_checksum(hSha(data));
     out->set_size(static_cast<long long>(data.size()));
     return grpc::Status::OK;
   }
 };
 
-ObjectsPeer& client(harness::Ctx& ctx) {
-  static ObjectsPeer* peer = nullptr;
+HObjectsPeer& hClient(harness::Ctx& ctx) {
+  static HObjectsPeer* peer = nullptr;
   delete peer;
-  peer = new ObjectsPeer;
+  peer = new HObjectsPeer;
   ctx.GRPC.Server("")->RegisterService(peer);
   store::createUpload("t1", 10, 4, 3, "video/mp4");  // u-1: parts of 4, 4 and 2 bytes
   return *peer;
 }
 
-std::map<int, manifest::Part> registered() {
+std::map<int, manifest::Part> hRegistered() {
   std::map<int, manifest::Part> out;
   for (const auto& p : manifest::readParts("u-1")) out[p.part_number] = p;
   return out;
 }
 
-std::vector<uploadd::WritePartRequest> writes(harness::Ctx& ctx, int n) {
+std::vector<uploadd::WritePartRequest> hWrites(harness::Ctx& ctx, int n) {
   std::vector<uploadd::WritePartRequest> out;
   for (const auto& c : ctx.GRPC.CallsTo("WritePart")) {
     const auto req = c.Request<uploadd::WritePartRequest>();
@@ -887,9 +956,9 @@ std::vector<uploadd::WritePartRequest> writes(harness::Ctx& ctx, int n) {
   return out;
 }
 
-bool storeIt(harness::Ctx& ctx, int n, const std::string& data, const std::string& why) {
+bool hStoreIt(harness::Ctx& ctx, int n, const std::string& data, const std::string& why) {
   try {
-    return storePart("u-1", n, data, sha(data));
+    return storePart("u-1", n, data, hSha(data));
   } catch (const std::exception& e) {
     ctx.Fatalf("%s: storePart threw %s: %s", why, harness::CurrentExceptionType(), e.what());
   }
@@ -898,59 +967,88 @@ bool storeIt(harness::Ctx& ctx, int n, const std::string& data, const std::strin
 }  // namespace
 
 void CheckStoresPart(harness::Ctx& ctx) {
-  client(ctx);
-  ctx.Equal(storeIt(ctx, 1, kPart, "with a healthy store"), true, "storePart's answer for a part the store received intact");
-  const auto w = writes(ctx, 1);
-  ctx.Assert(w.size() == 1 && w[0].data() == kPart && w[0].upload_id() == "u-1", "part 1 must be written once with its bytes, the store saw %d write(s)", w.size());
-  const auto parts = registered();
-  ctx.Assert(parts.size() == 1 && parts.count(1) && parts.at(1).size == 4 && parts.at(1).checksum == sha(kPart), "the manifest must hold part 1 with size 4 and its checksum, it holds %d part(s)", parts.size());
+  hClient(ctx);
+  ctx.Equal(hStoreIt(ctx, 1, kHarnessPart, "with a healthy store"), true, "storePart's answer for a part the store received intact");
+  const auto w = hWrites(ctx, 1);
+  ctx.Assert(w.size() == 1 && w[0].data() == kHarnessPart && w[0].upload_id() == "u-1", "part 1 must be written once with its bytes, the store saw %d write(s)", w.size());
+  const auto parts = hRegistered();
+  ctx.Assert(parts.size() == 1 && parts.count(1) && parts.at(1).size == 4 && parts.at(1).checksum == hSha(kHarnessPart), "the manifest must hold part 1 with size 4 and its checksum, it holds %d part(s)", parts.size());
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  client(ctx);
-  storeIt(ctx, 1, kPart, "with a healthy store");
+  hClient(ctx);
+  hStoreIt(ctx, 1, kHarnessPart, "with a healthy store");
   for (const auto& call : ctx.GRPC.CallsTo("WritePart")) {
     ctx.Assert(call.HasDeadline(), "a WritePart call carries no deadline: a store node that hangs holds the part, and the client's request, open");
     ctx.Assert(29.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 30.5, "a WritePart call carries a %v s deadline, expected kWriteDeadline = 30 s", call.TimeoutSeconds());
   }
   ctx.GRPC.SetLatency("WritePart", 45.0);
   const int64_t before = ctx.Clock.Now();
+  bool ok = true;
   try {
-    storePart("u-1", 2, kPart, sha(kPart));
-  } catch (const std::exception&) {
-    // reporting the deadline to the caller is fine too
+    ok = storePart("u-1", 2, kHarnessPart, hSha(kHarnessPart));
+  } catch (const std::exception& e) {
+    ctx.Fatalf("with the store hanging, storePart threw %s: DEADLINE_EXCEEDED is retried, and after kMaxPartAttempts attempts storePart returns false", e.what());
   }
   const double waited = static_cast<double>(ctx.Clock.Now() - before) / 1000;
-  ctx.Assert(!registered().count(2), "part 2 is registered although every write of it ran past the deadline");
+  ctx.Assert(!hRegistered().count(2), "part 2 is registered although every write of it ran past the deadline");
+  std::vector<double> hung;
+  for (const auto& call : ctx.GRPC.CallsTo("WritePart")) {
+    if (call.Request<uploadd::WritePartRequest>().part_number() == 2) hung.push_back(call.HasDeadline() ? call.TimeoutSeconds() : -1);
+  }
+  ctx.Equal(hung.size(), 3, "with the store hanging, the writes of part 2 (DEADLINE_EXCEEDED is retried, kMaxPartAttempts = 3 attempts)");
+  for (size_t i = 0; i < hung.size(); i++) {
+    ctx.Assert(29.5 <= hung[i] && hung[i] <= 30.5, "attempt %d of part 2 carried a %v s deadline: every attempt gets its own kWriteDeadline (30 s), not what is left of the first", i + 1, hung[i]);
+  }
+  ctx.Equal(ok, false, "storePart's answer after three attempts past the deadline");
   ctx.Assert(waited <= 91, "storePart spent %.0f s on one part with the store hanging: three attempts of 30 s at most", waited);
 }
 
 void CheckChecksum(harness::Ctx& ctx) {
-  ObjectsPeer& peer = client(ctx);
+  HObjectsPeer& peer = hClient(ctx);
   peer.corrupt = 10;
-  const bool ok = storeIt(ctx, 2, kPart, "with every copy of part 2 corrupted on the way");
-  ctx.Assert(!registered().count(2), "part 2 is registered although the store answered a checksum other than the client's: a resume would skip it and the object would be assembled corrupt");
+  const bool ok = hStoreIt(ctx, 2, kHarnessPart, "with every copy of part 2 corrupted on the way");
+  ctx.Assert(!hRegistered().count(2), "part 2 is registered although the store answered a checksum other than the client's: a resume would skip it and the object would be assembled corrupt");
   ctx.Equal(ok, false, "storePart's answer for a part whose checksum never matched");
-  ctx.Assert(writes(ctx, 2).size() <= 3, "part 2 was written %d times: kMaxPartAttempts is 3", writes(ctx, 2).size());
+  ctx.Assert(hWrites(ctx, 2).size() <= 3, "part 2 was written %d times: kMaxPartAttempts is 3", hWrites(ctx, 2).size());
   peer.corrupt = 0;
-  ctx.Equal(storeIt(ctx, 2, kPart, "with the store healthy again"), true, "once the store receives part 2 intact, storePart's answer");
-  ctx.Assert(registered().count(2), "once the store receives part 2 intact it must be registered");
+  ctx.Equal(hStoreIt(ctx, 2, kHarnessPart, "with the store healthy again"), true, "once the store receives part 2 intact, storePart's answer");
+  ctx.Assert(hRegistered().count(2), "once the store receives part 2 intact it must be registered");
 }
 
 void CheckRetry(harness::Ctx& ctx) {
-  ObjectsPeer& peer = client(ctx);
+  HObjectsPeer& peer = hClient(ctx);
   ctx.GRPC.Fail("WritePart", grpc::StatusCode::UNAVAILABLE, "store node restarting", 1);
-  bool ok = storeIt(ctx, 1, kPart, "after one UNAVAILABLE from a restarting store node");
-  ctx.Assert(ok && writes(ctx, 1).size() == 2, "after one UNAVAILABLE storePart answered %t with %d write(s): part 1 must be written again and registered", ok, writes(ctx, 1).size());
+  bool ok = hStoreIt(ctx, 1, kHarnessPart, "after one UNAVAILABLE from a restarting store node");
+  ctx.Assert(ok && hWrites(ctx, 1).size() == 2, "after one UNAVAILABLE storePart answered %t with %d write(s): part 1 must be written again and registered", ok, hWrites(ctx, 1).size());
   peer.corrupt = 1;
-  ok = storeIt(ctx, 2, kPart, "after one corrupted copy");
-  ctx.Assert(ok && writes(ctx, 2).size() == 2, "after one checksum mismatch storePart answered %t with %d write(s): the part must be written again", ok, writes(ctx, 2).size());
-  ctx.GRPC.Fail("WritePart", grpc::StatusCode::UNAVAILABLE, "store node down", 10);
-  ok = storeIt(ctx, 3, kTail, "with the store node down");
-  ctx.Equal(writes(ctx, 3).size(), 3, "with the store node down, the writes of part 3 (kMaxPartAttempts = 3)");
-  ctx.Assert(!ok && !registered().count(3), "storePart answered %t for a part the store never took, expected false with nothing registered", ok);
-  const auto got = registered();
+  ok = hStoreIt(ctx, 2, kHarnessPart, "after one corrupted copy");
+  ctx.Assert(ok && hWrites(ctx, 2).size() == 2, "after one checksum mismatch storePart answered %t with %d write(s): the part must be written again", ok, hWrites(ctx, 2).size());
+  ctx.GRPC.Fail("WritePart", grpc::StatusCode::UNAVAILABLE, "store node down", 3);
+  ok = hStoreIt(ctx, 3, kHarnessTail, "with the store node down");
+  ctx.Equal(hWrites(ctx, 3).size(), 3, "with the store node down, the writes of part 3 (kMaxPartAttempts = 3)");
+  ctx.Assert(!ok && !hRegistered().count(3), "storePart answered %t for a part the store never took, expected false with nothing registered", ok);
+  const auto got = hRegistered();
   ctx.Assert(got.size() == 2 && got.count(1) && got.count(2), "a failed part 3 must leave parts 1 and 2 registered, the manifest holds %d part(s)", got.size());
+  for (const auto& [code, name] : std::vector<std::pair<grpc::StatusCode, std::string>>{
+           {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"}, {grpc::StatusCode::NOT_FOUND, "NOT_FOUND"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}}) {
+    ctx.GRPC.Fail("WritePart", code, "refused by the store", 1);
+    const size_t tried = hWrites(ctx, 3).size();
+    bool threw = false;
+    bool answer = false;
+    try {
+      answer = storePart("u-1", 3, kHarnessTail, hSha(kHarnessTail));
+    } catch (const std::exception&) {
+      threw = true;
+    }
+    ctx.Assert(threw, "WritePart failed with %s and storePart answered %t: only UNAVAILABLE, DEADLINE_EXCEEDED and a mismatch are retried, any other status is thrown", name, answer);
+    ctx.Equal(hWrites(ctx, 3).size(), tried + 1, "WritePart failed with %s: a status that is not retryable is thrown at once; the writes of part 3", name);
+    ctx.Assert(!hRegistered().count(3), "part 3 is registered after WritePart failed with %s", name);
+  }
+  ctx.GRPC.Fail("WritePart", grpc::StatusCode::DEADLINE_EXCEEDED, "store node slow", 1);
+  const size_t tried = hWrites(ctx, 3).size();
+  ok = hStoreIt(ctx, 3, kHarnessTail, "after one DEADLINE_EXCEEDED");
+  ctx.Assert(ok && hWrites(ctx, 3).size() == tried + 2 && hRegistered().count(3), "after one DEADLINE_EXCEEDED storePart answered %t with %d write(s): part 3 must be written again and registered", ok, hWrites(ctx, 3).size() - tried);
 }
 `,
   },

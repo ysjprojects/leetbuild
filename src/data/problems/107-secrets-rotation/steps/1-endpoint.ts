@@ -58,7 +58,7 @@ without an interval is never due for rotation.
       id: 'material-sealed',
       title: 'The 201 body is a projection without material',
       detail:
-        'The response is built by `public_version`/`publicVersion` from the fields it names; the vault record, which carries the material, is never serialized as the body.',
+        'The response is built by `public_version`/`publicVersion` from the six fields it names and carries no other; the vault record, which carries the material, is never serialized as the body.',
       match: {
         python: {all: [/def public_version\(/, /public_version\(\s*record\s*\)/], none: [/JSONResponse\(\s*record\b/]},
         typescript: {
@@ -90,7 +90,7 @@ without an interval is never due for rotation.
       id: 'rotation-policy',
       title: 'Every secret gets a bounded rotation interval',
       detail:
-        'A missing `rotation_seconds` is `DEFAULT_ROTATION_SECONDS` (30 days), and a value outside `MIN_ROTATION_SECONDS`..`MAX_ROTATION_SECONDS` (300..7 776 000) is **400** before anything is written; the starter turns a missing interval into 0.',
+        'A missing `rotation_seconds` is `DEFAULT_ROTATION_SECONDS` (30 days), and a value outside `MIN_ROTATION_SECONDS`..`MAX_ROTATION_SECONDS` (300..7 776 000, both bounds allowed) is **400** before anything is written; the starter turns a missing interval into 0.',
       match: {
         python: {
           all: [
@@ -608,6 +608,8 @@ async def check_material_sealed(ctx):
     assert body.get("fingerprint") == expected, f"the 201 body must carry the SHA-256 fingerprint {expected}, got {body.get('fingerprint')!r}"
     for field in ("name", "version_id", "rotation_seconds", "created_at", "rotate_at"):
         assert field in body, f"the 201 body must carry {field}, got {body}"
+    extra = sorted(set(body) - {"name", "version_id", "fingerprint", "rotation_seconds", "created_at", "rotate_at"})
+    assert not extra, f"the 201 body carries fields beyond name, version_id, fingerprint, rotation_seconds, created_at and rotate_at: {extra}. Build it from the fields it names"
 
 
 async def check_audit_ids_only(ctx):
@@ -626,8 +628,10 @@ async def check_audit_ids_only(ctx):
         root.setLevel(level)
     logged = captured.getvalue()
     assert MATERIAL not in logged, f"the material reached the logs: {logged.strip()!r}. The audit line carries the operator, the name, the version id and the fingerprint"
-    lines = [line for line in logged.splitlines() if "op-ana" in line]
-    assert any("v1" in line for line in lines), f"the create must write an audit line naming the operator and version v1, the logs hold {logged.strip()!r}"
+    lines = [line for line in logged.splitlines() if "op-ana" in line and "v1" in line]
+    assert lines, f"the create must write an audit line naming the operator and version v1, the logs hold {logged.strip()!r}"
+    fingerprint = hashlib.sha256(MATERIAL.encode()).hexdigest()
+    assert any(fingerprint in line and "payments-db" in line for line in lines), f"the audit line must carry the name payments-db and the fingerprint {fingerprint} beside the operator and the version, got {lines}"
 
 
 async def check_rotation_policy(ctx):
@@ -639,6 +643,9 @@ async def check_rotation_policy(ctx):
             r = await _create(c, name=f"bad-{bad}", rotation_seconds=bad)
             assert r.status_code == 400, f"rotation_seconds={bad} answered {r.status_code}, expected 400: the interval lies within 300..7776000"
             assert vault.versions(f"bad-{bad}") == [], f"a create refused for rotation_seconds={bad} still wrote a version"
+        for edge in (300, 7_776_000):
+            r = _created(await _create(c, name=f"edge-{edge}", rotation_seconds=edge), f"POST /v1/secrets with rotation_seconds={edge}, a bound of 300..7776000")
+            assert r.get("rotation_seconds") == edge, f"rotation_seconds={edge} must be kept as given, got {r.get('rotation_seconds')!r}"
         hourly = _created(await _create(c, name="hourly", rotation_seconds=3600), "POST /v1/secrets with rotation_seconds=3600")
     assert hourly.get("rotate_at") == hourly.get("created_at", 0) + 3600, f"rotate_at must be created_at + 3600, got {hourly}"
 `,
@@ -682,6 +689,8 @@ export async function check_material_sealed(ctx) {
   for (const field of ['name', 'version_id', 'rotation_seconds', 'created_at', 'rotate_at']) {
     assert(field in body, \`the 201 body must carry \${field}, got \${r.text}\`);
   }
+  const extra = Object.keys(body).filter(k => !['name', 'version_id', 'fingerprint', 'rotation_seconds', 'created_at', 'rotate_at'].includes(k));
+  assert.equal(extra.length, 0, \`the 201 body carries fields beyond name, version_id, fingerprint, rotation_seconds, created_at and rotate_at: \${JSON.stringify(extra)}. Build it from the fields it names\`);
 }
 
 export async function check_audit_ids_only(ctx) {
@@ -697,9 +706,12 @@ export async function check_audit_ids_only(ctx) {
   }
   const leak = logged.find(line => line.includes(MATERIAL));
   assert(leak === undefined, \`the material reached the logs: \${JSON.stringify(leak)}. The audit line carries the operator, the name, the version id and the fingerprint\`);
+  const lines = logged.filter(line => line.includes('op-ana') && line.includes('v1'));
+  assert(lines.length > 0, \`the create must write an audit line naming the operator and version v1, the logs hold \${JSON.stringify(logged)}\`);
+  const fingerprint = createHash('sha256').update(MATERIAL).digest('hex');
   assert(
-    logged.some(line => line.includes('op-ana') && line.includes('v1')),
-    \`the create must write an audit line naming the operator and version v1, the logs hold \${JSON.stringify(logged)}\`,
+    lines.some(line => line.includes(fingerprint) && line.includes('payments-db')),
+    \`the audit line must carry the name payments-db and the fingerprint \${fingerprint} beside the operator and the version, got \${JSON.stringify(lines)}\`,
   );
 }
 
@@ -712,6 +724,10 @@ export async function check_rotation_policy(ctx) {
     const r = await create(c, \`bad-\${bad}\`, {rotation_seconds: bad});
     assert.equal(r.status, 400, \`rotation_seconds=\${bad} answered \${r.status}, expected 400: the interval lies within 300..7776000\`);
     assert.equal((await vault.versions(\`bad-\${bad}\`)).length, 0, \`a create refused for rotation_seconds=\${bad} still wrote a version\`);
+  }
+  for (const edge of [300, 7_776_000]) {
+    const r = created(await create(c, \`edge-\${edge}\`, {rotation_seconds: edge}), \`POST /v1/secrets with rotation_seconds=\${edge}, a bound of 300..7776000\`);
+    assert.equal(r.rotation_seconds, edge, \`rotation_seconds=\${edge} must be kept as given, got \${JSON.stringify(r.rotation_seconds)}\`);
   }
   const hourly = created(await create(c, 'hourly', {rotation_seconds: 3600}), 'POST /v1/secrets with rotation_seconds=3600');
   assert.equal(hourly.rotate_at, hourly.created_at + 3600, \`rotate_at must be created_at + 3600, got \${JSON.stringify(hourly)}\`);
@@ -782,6 +798,10 @@ func CheckMaterialSealed(ctx *harness.Ctx) {
 		_, ok := body[field]
 		ctx.Assert(ok, "the 201 body must carry %s, got %s", field, r.Text())
 	}
+	public := map[string]bool{"name": true, "version_id": true, "fingerprint": true, "rotation_seconds": true, "created_at": true, "rotate_at": true}
+	for field := range body {
+		ctx.Assert(public[field], "the 201 body carries %s beyond name, version_id, fingerprint, rotation_seconds, created_at and rotate_at: %s. Build it from the fields it names", field, r.Text())
+	}
 }
 
 func CheckAuditIdsOnly(ctx *harness.Ctx) {
@@ -792,11 +812,20 @@ func CheckAuditIdsOnly(ctx *harness.Ctx) {
 	log.SetOutput(os.Stderr)
 	apiCreated(ctx, r, "POST /v1/secrets")
 	ctx.Assert(!strings.Contains(logged.String(), apiMaterial), "the material reached the logs: %q. The audit line carries the operator, the name, the version id and the fingerprint", strings.TrimSpace(logged.String()))
-	found := false
+	var lines []string
 	for _, line := range strings.Split(logged.String(), "\\n") {
-		found = found || (strings.Contains(line, "op-ana") && strings.Contains(line, "v1"))
+		if strings.Contains(line, "op-ana") && strings.Contains(line, "v1") {
+			lines = append(lines, line)
+		}
 	}
-	ctx.Assert(found, "the create must write an audit line naming the operator and version v1, the logs hold %q", strings.TrimSpace(logged.String()))
+	ctx.Assert(len(lines) > 0, "the create must write an audit line naming the operator and version v1, the logs hold %q", strings.TrimSpace(logged.String()))
+	sum := sha256.Sum256([]byte(apiMaterial))
+	fingerprint := hex.EncodeToString(sum[:])
+	found := false
+	for _, line := range lines {
+		found = found || (strings.Contains(line, fingerprint) && strings.Contains(line, "payments-db"))
+	}
+	ctx.Assert(found, "the audit line must carry the name payments-db and the fingerprint %s beside the operator and the version, got %q", fingerprint, lines)
 }
 
 func CheckRotationPolicy(ctx *harness.Ctx) {
@@ -811,6 +840,10 @@ func CheckRotationPolicy(ctx *harness.Ctx) {
 		ctx.Equal(r.Status, 400, "rotation_seconds=%d (the interval lies within 300..7776000)", bad)
 		ctx.Equal(len(vault.Versions(context.Background(), name)), 0, "a create refused for rotation_seconds=%d still wrote a version; the versions", bad)
 	}
+	for _, edge := range []int{300, 7776000} {
+		r := apiCreated(ctx, apiCreate(c, fmt.Sprintf("edge-%d", edge), map[string]any{"rotation_seconds": edge}, "X-Operator-Id", "op-ana"), fmt.Sprintf("POST /v1/secrets with rotation_seconds=%d, a bound of 300..7776000", edge))
+		ctx.Equal(r["rotation_seconds"], edge, "rotation_seconds=%d must be kept as given", edge)
+	}
 	hourly := apiCreated(ctx, apiCreate(c, "hourly", map[string]any{"rotation_seconds": 3600}, "X-Operator-Id", "op-ana"), "POST /v1/secrets with rotation_seconds=3600")
 	hourlyCreated, _ := hourly["created_at"].(float64)
 	ctx.Equal(hourly["rotate_at"], hourlyCreated+3600, "rotate_at must be created_at + 3600")
@@ -821,6 +854,7 @@ func CheckRotationPolicy(ctx *harness.Ctx) {
 #include <nlohmann/json.hpp>
 
 #include <iostream>
+#include <set>
 #include <sstream>
 #include <string>
 
@@ -828,9 +862,9 @@ func CheckRotationPolicy(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kMaterial = "pg-password-CANARY-41d7";
+const std::string hMaterial = "pg-password-CANARY-41d7";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -838,13 +872,13 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-harness::Response create(harness::HTTP& c, const std::string& name, nlohmann::json extra = nlohmann::json::object()) {
-  nlohmann::json body = {{"name", name}, {"material", kMaterial}};
+harness::Response hCreate(harness::HTTP& c, const std::string& name, nlohmann::json extra = nlohmann::json::object()) {
+  nlohmann::json body = {{"name", name}, {"material", hMaterial}};
   body.update(extra);
   return c.Post("/v1/secrets", body.dump(), "Content-Type", "application/json", "X-Operator-Id", "op-ana");
 }
 
-nlohmann::json created(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
+nlohmann::json hCreated(harness::Ctx& ctx, const harness::Response& r, const std::string& what) {
   ctx.Equal(r.Status, 201, "%s (%s)", what, r.Text());
   return nlohmann::json::parse(r.Text());
 }
@@ -852,61 +886,74 @@ nlohmann::json created(harness::Ctx& ctx, const harness::Response& r, const std:
 }  // namespace
 
 void CheckCreateRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto anonymous = c.Post("/v1/secrets", nlohmann::json{{"name", "payments-db"}, {"material", kMaterial}}.dump(), "Content-Type", "application/json");
+  auto c = hApi(ctx);
+  const auto anonymous = c.Post("/v1/secrets", nlohmann::json{{"name", "payments-db"}, {"material", hMaterial}}.dump(), "Content-Type", "application/json");
   ctx.Equal(anonymous.Status, 401, "a create without X-Operator-Id");
-  const auto first = created(ctx, create(c, "payments-db"), "POST /v1/secrets");
-  const auto second = created(ctx, create(c, "payments-db"), "a second POST /v1/secrets for the same name");
+  const auto first = hCreated(ctx, hCreate(c, "payments-db"), "POST /v1/secrets");
+  const auto second = hCreated(ctx, hCreate(c, "payments-db"), "a second POST /v1/secrets for the same name");
   ctx.Assert(first.value("name", "") == "payments-db" && first.value("version_id", "") == "v1", "the first create must answer name payments-db and version_id v1, got %s", first.dump());
   ctx.Equal(second.value("version_id", ""), "v2", "the second create's version_id");
   const auto stored = vault::getVersion("payments-db", "v1");
-  ctx.Assert(stored && stored->material == kMaterial, "the vault must hold version v1 with its material");
+  ctx.Assert(stored && stored->material == hMaterial, "the vault must hold version v1 with its material");
 }
 
 void CheckMaterialSealed(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = create(c, "payments-db", {{"rotation_seconds", 3600}});
-  const auto body = created(ctx, r, "POST /v1/secrets");
+  auto c = hApi(ctx);
+  const auto r = hCreate(c, "payments-db", {{"rotation_seconds", 3600}});
+  const auto body = hCreated(ctx, r, "POST /v1/secrets");
   ctx.Assert(!body.contains("material"), "the 201 body carries the material: %s. Answer publicVersion(record): ids, fingerprint and window only", r.Text());
-  ctx.Assert(r.Text().find(kMaterial) == std::string::npos, "the 201 body carries the material under another name: %s", r.Text());
-  ctx.Equal(body.value("fingerprint", ""), vault::fingerprint(kMaterial), "the 201 body must carry the SHA-256 fingerprint");
+  ctx.Assert(r.Text().find(hMaterial) == std::string::npos, "the 201 body carries the material under another name: %s", r.Text());
+  ctx.Equal(body.value("fingerprint", ""), vault::fingerprint(hMaterial), "the 201 body must carry the SHA-256 fingerprint");
   for (const std::string field : {"name", "version_id", "rotation_seconds", "created_at", "rotate_at"}) {
     ctx.Assert(body.contains(field), "the 201 body must carry %s, got %s", field, r.Text());
+  }
+  const std::set<std::string> fields = {"name", "version_id", "fingerprint", "rotation_seconds", "created_at", "rotate_at"};
+  for (auto it = body.begin(); it != body.end(); ++it) {
+    ctx.Assert(fields.count(it.key()) == 1, "the 201 body carries %s beyond name, version_id, fingerprint, rotation_seconds, created_at and rotate_at: %s. Build it from the fields it names", it.key(), r.Text());
   }
 }
 
 void CheckAuditIdsOnly(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   std::ostringstream logged;
   auto* out = std::cout.rdbuf(logged.rdbuf());
   auto* err = std::cerr.rdbuf(logged.rdbuf());
   auto* clog = std::clog.rdbuf(logged.rdbuf());
-  const auto r = create(c, "payments-db");
+  const auto r = hCreate(c, "payments-db");
   std::cout.rdbuf(out);
   std::cerr.rdbuf(err);
   std::clog.rdbuf(clog);
-  created(ctx, r, "POST /v1/secrets");
-  ctx.Assert(logged.str().find(kMaterial) == std::string::npos, "the material reached the logs: %q. The audit line carries the operator, the name, the version id and the fingerprint", logged.str());
+  hCreated(ctx, r, "POST /v1/secrets");
+  ctx.Assert(logged.str().find(hMaterial) == std::string::npos, "the material reached the logs: %q. The audit line carries the operator, the name, the version id and the fingerprint", logged.str());
   std::istringstream lines(logged.str());
+  bool named = false;
   bool found = false;
+  const std::string fingerprint = vault::fingerprint(hMaterial);
   for (std::string line; std::getline(lines, line);) {
-    found = found || (line.find("op-ana") != std::string::npos && line.find("v1") != std::string::npos);
+    if (line.find("op-ana") == std::string::npos || line.find("v1") == std::string::npos) continue;
+    named = true;
+    found = found || (line.find(fingerprint) != std::string::npos && line.find("payments-db") != std::string::npos);
   }
-  ctx.Assert(found, "the create must write an audit line naming the operator and version v1, the logs hold %q", logged.str());
+  ctx.Assert(named, "the create must write an audit line naming the operator and version v1, the logs hold %q", logged.str());
+  ctx.Assert(found, "the audit line must carry the name payments-db and the fingerprint %s beside the operator and the version, the logs hold %q", fingerprint, logged.str());
 }
 
 void CheckRotationPolicy(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto fallback = created(ctx, create(c, "default-interval"), "POST /v1/secrets without rotation_seconds");
+  auto c = hApi(ctx);
+  const auto fallback = hCreated(ctx, hCreate(c, "default-interval"), "POST /v1/secrets without rotation_seconds");
   ctx.Equal(fallback.value("rotation_seconds", 0LL), 2592000LL, "a create without rotation_seconds must get the 30-day default");
   ctx.Equal(fallback.value("rotate_at", 0LL), fallback.value("created_at", 0LL) + 2592000, "rotate_at must be created_at + rotation_seconds");
   for (const long long bad : {0LL, 299LL, 7776001LL}) {
     const std::string name = "bad-" + std::to_string(bad);
-    const auto r = create(c, name, {{"rotation_seconds", bad}});
+    const auto r = hCreate(c, name, {{"rotation_seconds", bad}});
     ctx.Equal(r.Status, 400, "rotation_seconds=%d (the interval lies within 300..7776000)", bad);
     ctx.Equal(vault::versions(name).size(), 0, "a create refused for rotation_seconds=%d still wrote a version; the versions", bad);
   }
-  const auto hourly = created(ctx, create(c, "hourly", {{"rotation_seconds", 3600}}), "POST /v1/secrets with rotation_seconds=3600");
+  for (const long long edge : {300LL, 7776000LL}) {
+    const auto r = hCreated(ctx, hCreate(c, "edge-" + std::to_string(edge), {{"rotation_seconds", edge}}), "POST /v1/secrets with rotation_seconds=" + std::to_string(edge) + ", a bound of 300..7776000");
+    ctx.Equal(r.value("rotation_seconds", 0LL), edge, "rotation_seconds=%d must be kept as given", edge);
+  }
+  const auto hourly = hCreated(ctx, hCreate(c, "hourly", {{"rotation_seconds", 3600}}), "POST /v1/secrets with rotation_seconds=3600");
   ctx.Equal(hourly.value("rotate_at", 0LL), hourly.value("created_at", 0LL) + 3600, "rotate_at must be created_at + 3600");
 }
 `,

@@ -67,7 +67,7 @@ client retry opens a second request with a second chain.
       id: 'policy-approvers',
       title: 'Takes the approvers from the policy only',
       detail:
-        'The approvers are the ones `resolve_approvers` returns and its version is pinned as `chain_version`; the body’s `approvers` is never read. The starter lets the caller name the chain.',
+        'The approvers are the ones `resolve_approvers` returns and its version is pinned as `chain_version`, in the stored request and in the answer; the body’s `approvers` is never read, not even to refuse it. The starter lets the caller name the chain.',
       match: {
         python: {all: [/resolve_approvers\(/, /chain_version/], none: [/body\.approvers/]},
         typescript: {all: [/resolveApprovers\(/, /chain_version/], none: [/body\.approvers/]},
@@ -80,7 +80,7 @@ client retry opens a second request with a second chain.
       id: 'self-approval',
       title: 'Rejects a requester who is on their own chain',
       detail:
-        'When the requester is one of the resolved approvers the submit is **409** `requester_cannot_approve` and nothing is stored, no request and no chain.',
+        'When the requester is any one of the resolved approvers, first or last, the submit is **409** `requester_cannot_approve` and nothing is stored, no request and no chain.',
       match: {
         python: {all: [/requester_cannot_approve/, /\b409\b/]},
         typescript: {all: [/requester_cannot_approve/, /\b409\b/]},
@@ -106,7 +106,7 @@ client retry opens a second request with a second chain.
       id: 'idempotency',
       title: 'Replays a retried submit',
       detail:
-        '`Idempotency-Key` is required (400) and looked up with `store.get(tenant, key)` before the chain is resolved; a hit answers the stored request with `"replayed": true` instead of storing a second one.',
+        '`Idempotency-Key` is required (400) and looked up with `store.get(tenant, key)` before the chain is resolved; a hit answers the stored request, its pinned version and approvers, with `"replayed": true` instead of storing a second one, even after the policy has changed.',
       match: {
         python: {all: [/idempotency-key/i], order: [/store\.get\(/, /resolve_approvers\(/]},
         typescript: {all: [/idempotency-key/i], order: [/store\.get\(/, /resolveApprovers\(/]},
@@ -807,11 +807,15 @@ async def check_policy_approvers(ctx):
     async with _api(ctx) as c:
         r = await c.post("/v1/requests", json={**BODY, "approvers": ["u-friend"]}, headers=_headers())
         assert r.status_code == 201, f"a submit naming its own approvers answered {r.status_code}: {r.text}"
+        answered = r.json()
+        assert answered.get("approvers") == ["u-mgr", "u-dir"] and answered.get("chain_version") == 3, f"the submit answered {r.text}, expected the policy's approvers [u-mgr, u-dir] and chain_version 3"
         stored = store.load(r.json()["request_id"])
         assert stored["approvers"] == ["u-mgr", "u-dir"], f"the stored chain is {stored['approvers']}: the requester named it. The approvers come from the policy (u-mgr, u-dir)"
         assert stored["chain_version"] == 3, f"the stored chain_version is {stored['chain_version']}, expected the policy's version 3"
         current = ctx.redis.hget(f"approval:{stored['request_id']}:state", "current_approver")
         assert current == "u-mgr", f"the chain waits on {current!r}, expected the policy's first approver u-mgr"
+        named = await c.post("/v1/requests", json={**BODY, "approvers": ["u-req"]}, headers=_headers(key="k-3"))
+        assert named.status_code == 201, f"u-req naming themselves in the body's approvers answered {named.status_code}: the body's approvers is never read, and u-req is not on the policy's chain"
         policy.define_chain("spend", 4, ["u-mgr", "u-cfo"])
         assert store.load(stored["request_id"])["chain_version"] == 3, "a policy edit after the submit changed the pinned request"
         unknown = await c.post("/v1/requests", json={**BODY, "chain_id": "travel"}, headers=_headers(key="k-2"))
@@ -824,6 +828,8 @@ async def check_self_approval(ctx):
         assert r.status_code == 409, f"the director submitted a request on a chain they approve and got {r.status_code}, expected 409"
         assert "requester_cannot_approve" in r.text, f"the 409 must say requester_cannot_approve, got {r.text}"
         assert _stored(ctx) == [] and ctx.redis.keys("approval:*") == [], f"a refused submit stored {_stored(ctx)} {ctx.redis.keys('approval:*')}"
+        first = await c.post("/v1/requests", json=BODY, headers=_headers(user="u-mgr", key="k-4"))
+        assert first.status_code == 409, f"the manager, the chain's first approver, submitted a request and got {first.status_code}, expected 409"
         r = await c.post("/v1/requests", json={**BODY, "approvers": ["u-friend"]}, headers=_headers(user="u-dir", key="k-2"))
         assert r.status_code == 409, f"the director naming u-friend as approver got {r.status_code}: the policy's chain still holds the director, expected 409"
         ok = await c.post("/v1/requests", json=BODY, headers=_headers(key="k-3"))
@@ -854,6 +860,11 @@ async def check_idempotency(ctx):
         assert len(_stored(ctx)) == 1, f"two submits with one Idempotency-Key stored {_stored(ctx)}: a retry opened a second chain"
         other = await c.post("/v1/requests", json=BODY, headers=_headers(tenant="t-globex", key="k-1"))
         assert other.status_code == 201 and other.json().get("request_id") != first.json()["request_id"], f"the same key from another tenant answered {other.status_code} {other.text}: keys are per tenant"
+        policy.define_chain("spend", 4, ["u-req", "u-cfo"])
+        late = await c.post("/v1/requests", json=BODY, headers=_headers(key="k-1"))
+        assert late.status_code == 200, f"a replay of k-1 after the policy put u-req on the chain answered {late.status_code} {late.text}: the key is looked up before the chain is resolved, expected 200"
+        body = late.json()
+        assert (body.get("request_id"), body.get("chain_version"), body.get("approvers")) == (first.json()["request_id"], 3, ["u-mgr", "u-dir"]), f"the replay after a policy edit answered {late.text}, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])"
         missing = await c.post("/v1/requests", json=BODY, headers=_headers(key=""))
     assert missing.status_code == 400, f"a submit without Idempotency-Key answered {missing.status_code}, expected 400"
 `,
@@ -891,11 +902,15 @@ export async function check_policy_approvers(ctx) {
   const {c, store, policy} = await api(ctx);
   const r = await c.post('/v1/requests', {json: {...BODY, approvers: ['u-friend']}, headers: headers()});
   assert.equal(r.status, 201, \`a submit naming its own approvers answered \${r.status}: \${r.text}\`);
+  const answered = r.json();
+  assert(JSON.stringify(answered.approvers) === '["u-mgr","u-dir"]' && answered.chain_version === 3, \`the submit answered \${r.text}, expected the policy's approvers [u-mgr, u-dir] and chain_version 3\`);
   const record = await store.load(r.json().request_id);
   assert.deepEqual(record.approvers, ['u-mgr', 'u-dir'], \`the stored chain is \${JSON.stringify(record.approvers)}: the requester named it. The approvers come from the policy (u-mgr, u-dir)\`);
   assert.equal(record.chain_version, 3, \`the stored chain_version is \${record.chain_version}, expected the policy's version 3\`);
   const current = ctx.redis.hget(\`approval:\${record.request_id}:state\`, 'current_approver');
   assert.equal(current, 'u-mgr', \`the chain waits on \${current}, expected the policy's first approver u-mgr\`);
+  const named = await c.post('/v1/requests', {json: {...BODY, approvers: ['u-req']}, headers: headers('u-req', 't-acme', 'k-3')});
+  assert.equal(named.status, 201, \`u-req naming themselves in the body's approvers answered \${named.status}: the body's approvers is never read, and u-req is not on the policy's chain\`);
   await policy.defineChain('spend', 4, ['u-mgr', 'u-cfo']);
   assert.equal((await store.load(record.request_id)).chain_version, 3, 'a policy edit after the submit changed the pinned request');
   const unknown = await c.post('/v1/requests', {json: {...BODY, chain_id: 'travel'}, headers: headers('u-req', 't-acme', 'k-2')});
@@ -908,6 +923,8 @@ export async function check_self_approval(ctx) {
   assert.equal(r.status, 409, \`the director submitted a request on a chain they approve and got \${r.status}, expected 409\`);
   assert(r.text.includes('requester_cannot_approve'), \`the 409 must say requester_cannot_approve, got \${r.text}\`);
   assert(stored(ctx).length === 0 && ctx.redis.keys('approval:*').length === 0, \`a refused submit stored \${JSON.stringify(stored(ctx))} \${JSON.stringify(ctx.redis.keys('approval:*'))}\`);
+  const manager = await c.post('/v1/requests', {json: BODY, headers: headers('u-mgr', 't-acme', 'k-4')});
+  assert.equal(manager.status, 409, \`the manager, the chain's first approver, submitted a request and got \${manager.status}, expected 409\`);
   r = await c.post('/v1/requests', {json: {...BODY, approvers: ['u-friend']}, headers: headers('u-dir', 't-acme', 'k-2')});
   assert.equal(r.status, 409, \`the director naming u-friend as approver got \${r.status}: the policy's chain still holds the director, expected 409\`);
   const ok = await c.post('/v1/requests', {json: BODY, headers: headers('u-req', 't-acme', 'k-3')});
@@ -928,7 +945,7 @@ export async function check_why_cap(ctx) {
 }
 
 export async function check_idempotency(ctx) {
-  const {c} = await api(ctx);
+  const {c, policy} = await api(ctx);
   const first = await c.post('/v1/requests', {json: BODY, headers: headers()});
   assert.equal(first.status, 201, \`the first submit answered \${first.status}: \${first.text}\`);
   const replay = await c.post('/v1/requests', {json: BODY, headers: headers()});
@@ -938,6 +955,11 @@ export async function check_idempotency(ctx) {
   assert.equal(stored(ctx).length, 1, \`two submits with one Idempotency-Key stored \${JSON.stringify(stored(ctx))}: a retry opened a second chain\`);
   const other = await c.post('/v1/requests', {json: BODY, headers: headers('u-req', 't-globex', 'k-1')});
   assert(other.status === 201 && other.json().request_id !== first.json().request_id, \`the same key from another tenant answered \${other.status} \${other.text}: keys are per tenant\`);
+  await policy.defineChain('spend', 4, ['u-req', 'u-cfo']);
+  const late = await c.post('/v1/requests', {json: BODY, headers: headers()});
+  assert.equal(late.status, 200, \`a replay of k-1 after the policy put u-req on the chain answered \${late.status} \${late.text}: the key is looked up before the chain is resolved, expected 200\`);
+  const again = late.json();
+  assert(again.request_id === first.json().request_id && again.chain_version === 3 && JSON.stringify(again.approvers) === '["u-mgr","u-dir"]', \`the replay after a policy edit answered \${late.text}, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])\`);
   const missing = await c.post('/v1/requests', {json: BODY, headers: headers('u-req', 't-acme', '')});
   assert.equal(missing.status, 400, \`a submit without Idempotency-Key answered \${missing.status}, expected 400\`);
 }
@@ -1020,12 +1042,16 @@ func CheckPolicyApprovers(ctx *harness.Ctx) {
 	c := apiServe(ctx)
 	r := apiSubmit(c, apiWith("approvers", []string{"u-friend"}), "u-req", "t-acme", "k-1")
 	ctx.Equal(r.Status, 201, "a submit naming its own approvers (%s)", r.Text())
+	answered := apiDecode(r)
+	ctx.Assert(answered.ChainVersion == 3 && strings.Join(answered.Approvers, ",") == "u-mgr,u-dir", "the submit answered %s, expected the policy's approvers [u-mgr, u-dir] and chain_version 3", r.Text())
 	record := apiLoad(ctx, apiDecode(r).RequestID)
 	ctx.Assert(record != nil, "no request stored for %s", r.Text())
 	ctx.Equal(record.Approvers, []string{"u-mgr", "u-dir"}, "the requester named the chain; the approvers come from the policy. The stored approvers")
 	ctx.Equal(record.ChainVersion, 3, "the stored chain_version must be the policy's version 3")
 	current, _ := ctx.Redis.HGet("approval:"+record.RequestID+":state", "current_approver")
 	ctx.Equal(current, "u-mgr", "the chain must wait on the policy's first approver; current_approver")
+	named := apiSubmit(c, apiWith("approvers", []string{"u-req"}), "u-req", "t-acme", "k-3")
+	ctx.Equal(named.Status, 201, "u-req naming themselves in the body's approvers: the body's approvers is never read, and u-req is not on the policy's chain")
 	ctx.NoError(policy.DefineChain(apiBg, "spend", 4, []string{"u-mgr", "u-cfo"}), "redefining the spend chain")
 	ctx.Equal(apiLoad(ctx, record.RequestID).ChainVersion, 3, "a policy edit after the submit must not change the pinned request; chain_version")
 	unknown := apiSubmit(c, apiWith("chain_id", "travel"), "u-req", "t-acme", "k-2")
@@ -1038,6 +1064,7 @@ func CheckSelfApproval(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 409, "the director submitted a request on a chain they approve")
 	ctx.Assert(strings.Contains(r.Text(), "requester_cannot_approve"), "the 409 must say requester_cannot_approve, got %s", r.Text())
 	ctx.Assert(len(ctx.Redis.Keys("request:r-*")) == 0 && len(ctx.Redis.Keys("approval:*")) == 0, "a refused submit stored %q %q", ctx.Redis.Keys("request:r-*"), ctx.Redis.Keys("approval:*"))
+	ctx.Equal(apiSubmit(c, apiBody, "u-mgr", "t-acme", "k-4").Status, 409, "the manager, the chain's first approver, submitted a request")
 	r = apiSubmit(c, apiWith("approvers", []string{"u-friend"}), "u-dir", "t-acme", "k-2")
 	ctx.Equal(r.Status, 409, "the director naming u-friend as approver: the policy's chain still holds the director")
 	ok := apiSubmit(c, apiBody, "u-req", "t-acme", "k-3")
@@ -1064,6 +1091,11 @@ func CheckIdempotency(ctx *harness.Ctx) {
 	ctx.Equal(len(ctx.Redis.Keys("request:r-*")), 1, "two submits with one Idempotency-Key must store one request (a retry opened a second chain); the stored requests")
 	other := apiSubmit(c, apiBody, "u-req", "t-globex", "k-1")
 	ctx.Assert(other.Status == 201 && apiDecode(other).RequestID != apiDecode(first).RequestID, "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text())
+	ctx.NoError(policy.DefineChain(apiBg, "spend", 4, []string{"u-req", "u-cfo"}), "putting u-req on the spend chain")
+	late := apiSubmit(c, apiBody, "u-req", "t-acme", "k-1")
+	ctx.Equal(late.Status, 200, "a replay of k-1 after the policy put u-req on the chain: the key is looked up before the chain is resolved (%s)", late.Text())
+	again := apiDecode(late)
+	ctx.Assert(again.RequestID == apiDecode(first).RequestID && again.ChainVersion == 3 && strings.Join(again.Approvers, ",") == "u-mgr,u-dir", "the replay after a policy edit answered %s, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])", late.Text())
 	missing := apiSubmit(c, apiBody, "u-req", "t-acme", "")
 	ctx.Equal(missing.Status, 400, "a submit without Idempotency-Key")
 }
@@ -1080,7 +1112,7 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json kBody = {{"chain_id", "spend"}, {"why", "new laptop"}, {"amount_cents", 420000}};
+const nlohmann::json kApiBody = {{"chain_id", "spend"}, {"why", "new laptop"}, {"amount_cents", 420000}};
 
 harness::HTTP apiServe(harness::Ctx& ctx) {
   policy::defineChain("spend", 3, {"u-mgr", "u-dir"});
@@ -1092,7 +1124,7 @@ harness::HTTP apiServe(harness::Ctx& ctx) {
 }
 
 nlohmann::json apiWith(const std::string& field, const nlohmann::json& value) {
-  nlohmann::json out = kBody;
+  nlohmann::json out = kApiBody;
   out[field] = value;
   return out;
 }
@@ -1107,24 +1139,30 @@ std::string apiRequestId(const harness::Response& r) {
   return body.is_object() ? body.value("request_id", "") : "";
 }
 
-std::string repeat(const std::string& unit, int n) {
+std::string apiRepeat(const std::string& unit, int n) {
   std::string out;
   for (int i = 0; i < n; i++) out += unit;
   return out;
+}
+
+// The answer carries the chain pinned at the first submit: version 3, approvers u-mgr then u-dir.
+bool apiPinned(const harness::Response& r) {
+  const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
+  return body.is_object() && body.value("chain_version", 0) == 3 && body.value("approvers", nlohmann::json::array()) == nlohmann::json::array({"u-mgr", "u-dir"});
 }
 
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
   auto c = apiServe(ctx);
-  const auto r = apiSubmit(c, kBody, "u-req", "t-acme", "k-1");
+  const auto r = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/requests (%s)", r.Text());
   const std::string request_id = apiRequestId(r);
   const auto record = store::load(request_id);
   ctx.Assert(record.has_value(), "the submit answered %s but no request %q is in the store", r.Text(), request_id);
   ctx.Assert(record->tenant == "t-acme" && record->requester == "u-req" && record->why == "new laptop", "the stored request is tenant %q requester %q why %q", record->tenant, record->requester, record->why);
   ctx.Equal(ctx.Redis.HGet("approval:" + request_id + ":state", "current_approver"), std::optional<std::string>("u-mgr"), "the chain of %s must wait on its first approver; current_approver", request_id);
-  const auto anonymous = c.Post("/v1/requests", kBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-2");
+  const auto anonymous = c.Post("/v1/requests", kApiBody.dump(), "Content-Type", "application/json", "Idempotency-Key", "k-2");
   ctx.Equal(anonymous.Status, 401, "a submit without X-Tenant-Id and X-User-Id");
 }
 
@@ -1132,11 +1170,13 @@ void CheckPolicyApprovers(harness::Ctx& ctx) {
   auto c = apiServe(ctx);
   const auto r = apiSubmit(c, apiWith("approvers", {"u-friend"}), "u-req", "t-acme", "k-1");
   ctx.Equal(r.Status, 201, "a submit naming its own approvers (%s)", r.Text());
+  ctx.Assert(apiPinned(r), "the submit answered %s, expected the policy's approvers [u-mgr, u-dir] and chain_version 3", r.Text());
   const auto record = store::load(apiRequestId(r));
   ctx.Assert(record.has_value(), "no request stored for %s", r.Text());
   ctx.Equal(record->approvers, std::vector<std::string>{"u-mgr", "u-dir"}, "the requester named the chain; the approvers come from the policy. The stored approvers");
   ctx.Equal(record->chain_version, 3, "the stored chain_version must be the policy's version 3");
   ctx.Equal(ctx.Redis.HGet("approval:" + record->request_id + ":state", "current_approver"), std::optional<std::string>("u-mgr"), "the chain must wait on the policy's first approver; current_approver");
+  ctx.Equal(apiSubmit(c, apiWith("approvers", {"u-req"}), "u-req", "t-acme", "k-3").Status, 201, "u-req naming themselves in the body's approvers: the body's approvers is never read, and u-req is not on the policy's chain");
   policy::defineChain("spend", 4, {"u-mgr", "u-cfo"});
   ctx.Equal(store::load(record->request_id)->chain_version, 3, "a policy edit after the submit must not change the pinned request; chain_version");
   const auto unknown = apiSubmit(c, apiWith("chain_id", "travel"), "u-req", "t-acme", "k-2");
@@ -1145,38 +1185,43 @@ void CheckPolicyApprovers(harness::Ctx& ctx) {
 
 void CheckSelfApproval(harness::Ctx& ctx) {
   auto c = apiServe(ctx);
-  auto r = apiSubmit(c, kBody, "u-dir", "t-acme", "k-1");
+  auto r = apiSubmit(c, kApiBody, "u-dir", "t-acme", "k-1");
   ctx.Equal(r.Status, 409, "the director submitted a request on a chain they approve");
   ctx.Assert(r.Text().find("requester_cannot_approve") != std::string::npos, "the 409 must say requester_cannot_approve, got %s", r.Text());
   ctx.Assert(ctx.Redis.Keys("request:r-*").empty() && ctx.Redis.Keys("approval:*").empty(), "a refused submit stored %q %q", ctx.Redis.Keys("request:r-*"), ctx.Redis.Keys("approval:*"));
+  ctx.Equal(apiSubmit(c, kApiBody, "u-mgr", "t-acme", "k-4").Status, 409, "the manager, the chain's first approver, submitted a request");
   r = apiSubmit(c, apiWith("approvers", {"u-friend"}), "u-dir", "t-acme", "k-2");
   ctx.Equal(r.Status, 409, "the director naming u-friend as approver: the policy's chain still holds the director");
-  const auto ok = apiSubmit(c, kBody, "u-req", "t-acme", "k-3");
+  const auto ok = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-3");
   ctx.Equal(ok.Status, 201, "a requester who is not on the chain (%s)", ok.Text());
 }
 
 void CheckWhyCap(harness::Ctx& ctx) {
   auto c = apiServe(ctx);
-  ctx.Equal(apiSubmit(c, apiWith("why", repeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes");
-  ctx.Equal(apiSubmit(c, apiWith("why", repeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes");
-  ctx.Equal(apiSubmit(c, apiWith("why", repeat("\\u00e9", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters");
+  ctx.Equal(apiSubmit(c, apiWith("why", apiRepeat("x", 4096)), "u-req", "t-acme", "k-1").Status, 201, "a why of exactly 4096 bytes");
+  ctx.Equal(apiSubmit(c, apiWith("why", apiRepeat("x", 4097)), "u-req", "t-acme", "k-2").Status, 413, "a why of 4097 bytes");
+  ctx.Equal(apiSubmit(c, apiWith("why", apiRepeat("\\u00e9", 2049)), "u-req", "t-acme", "k-3").Status, 413, "a why of 2049 two-byte characters (4098 bytes): measure UTF-8 bytes, not characters");
   ctx.Equal(apiSubmit(c, apiWith("why", ""), "u-req", "t-acme", "k-4").Status, 400, "an empty why");
   ctx.Equal(ctx.Redis.Keys("request:r-*").size(), 1, "only the 4096-byte request may be stored; the stored requests");
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
   auto c = apiServe(ctx);
-  const auto first = apiSubmit(c, kBody, "u-req", "t-acme", "k-1");
+  const auto first = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
   ctx.Equal(first.Status, 201, "the first submit (%s)", first.Text());
-  const auto replay = apiSubmit(c, kBody, "u-req", "t-acme", "k-1");
+  const auto replay = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
   ctx.Equal(replay.Status, 200, "a replay of Idempotency-Key k-1");
   const auto body = nlohmann::json::parse(replay.Text(), nullptr, false);
   ctx.Assert(apiRequestId(replay) == apiRequestId(first) && body.is_object() && body.value("replayed", false),
              "the replay answered %s, expected the original request_id %s with replayed true", replay.Text(), apiRequestId(first));
   ctx.Equal(ctx.Redis.Keys("request:r-*").size(), 1, "two submits with one Idempotency-Key must store one request (a retry opened a second chain); the stored requests");
-  const auto other = apiSubmit(c, kBody, "u-req", "t-globex", "k-1");
+  const auto other = apiSubmit(c, kApiBody, "u-req", "t-globex", "k-1");
   ctx.Assert(other.Status == 201 && apiRequestId(other) != apiRequestId(first), "the same key from another tenant answered %d %s: keys are per tenant", other.Status, other.Text());
-  ctx.Equal(apiSubmit(c, kBody, "u-req", "t-acme", "").Status, 400, "a submit without Idempotency-Key");
+  policy::defineChain("spend", 4, {"u-req", "u-cfo"});
+  const auto late = apiSubmit(c, kApiBody, "u-req", "t-acme", "k-1");
+  ctx.Equal(late.Status, 200, "a replay of k-1 after the policy put u-req on the chain: the key is looked up before the chain is resolved (%s)", late.Text());
+  ctx.Assert(apiRequestId(late) == apiRequestId(first) && apiPinned(late), "the replay after a policy edit answered %s, expected the stored request (chain_version 3, approvers [u-mgr, u-dir])", late.Text());
+  ctx.Equal(apiSubmit(c, kApiBody, "u-req", "t-acme", "").Status, 400, "a submit without Idempotency-Key");
 }
 `,
   },

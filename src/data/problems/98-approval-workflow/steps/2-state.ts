@@ -93,7 +93,7 @@ that waits past the hour is gone.
       id: 'rejection-ends',
       title: 'A rejection closes the chain',
       detail:
-        'A `rejected` decision sets `status` to `rejected` without moving the index, and every later decision is refused with `chain closed`.',
+        'A `rejected` decision, on any step including the last, is recorded as `decision:{i}` and `actor:{i}` and sets `status` to `rejected` without moving the index. Every later decision on a closed chain, rejected or approved, is refused with `chain closed`.',
       match: {
         python: {all: [/['"]status['"]\s*,\s*['"]rejected['"]/, /chain closed/]},
         typescript: {all: [/['"]status['"]\s*,\s*['"]rejected['"]/, /chain closed/]},
@@ -613,8 +613,19 @@ def check_rejection_ends(ctx):
     m.advance("r-1", 0, "u-mgr", "approved")
     rejected = m.advance("r-1", 1, "u-dir", "rejected")
     assert rejected == {"advanced": True, "step_index": 1, "status": "rejected", "reason": ""}, f"the director's rejection answered {rejected}, expected the chain closed as rejected on step 1"
+    fields = ctx.redis.hgetall(KEY)
+    assert (fields.get("status"), fields.get("step_index"), fields.get("decision:1"), fields.get("actor:1")) == ("rejected", "1", "rejected", "u-dir"), f"after the director's rejection the state is {fields}: expected status rejected, step_index 1, decision:1 rejected by u-dir"
     _refused(m.advance("r-1", 1, "u-dir", "approved"), "chain closed", "an approval after the rejection")
     _refused(m.advance("r-1", 2, "u-cfo", "approved"), "chain closed", "the CFO deciding a rejected chain")
+    m.start_chain("r-2", ["u-mgr", "u-dir"])
+    m.advance("r-2", 0, "u-mgr", "approved")
+    last = m.advance("r-2", 1, "u-dir", "rejected")
+    assert last.get("advanced") is True and last.get("status") == "rejected", f"the director rejecting the last step of r-2 answered {last}, expected status rejected"
+    m.start_chain("r-3", ["u-mgr", "u-dir"])
+    m.advance("r-3", 0, "u-mgr", "approved")
+    done = m.advance("r-3", 1, "u-dir", "approved")
+    assert done.get("status") == "approved", f"the last approval of r-3 answered {done}, expected status approved"
+    _refused(m.advance("r-3", 1, "u-dir", "approved"), "chain closed", "a repeated approval on an approved chain")
 
 
 def check_atomic_decision(ctx):
@@ -685,8 +696,19 @@ export async function check_rejection_ends(ctx) {
   await m.advance('r-1', 0, 'u-mgr', 'approved');
   const rejected = await m.advance('r-1', 1, 'u-dir', 'rejected');
   assert.deepEqual(rejected, {advanced: true, step_index: 1, status: 'rejected', reason: ''}, \`the director's rejection answered \${JSON.stringify(rejected)}, expected the chain closed as rejected on step 1\`);
+  const f = ctx.redis.hgetall(KEY);
+  assert(f.status === 'rejected' && f.step_index === '1' && f['decision:1'] === 'rejected' && f['actor:1'] === 'u-dir', \`after the director's rejection the state is \${JSON.stringify(f)}: expected status rejected, step_index 1, decision:1 rejected by u-dir\`);
   refused(await m.advance('r-1', 1, 'u-dir', 'approved'), 'chain closed', 'an approval after the rejection');
   refused(await m.advance('r-1', 2, 'u-cfo', 'approved'), 'chain closed', 'the CFO deciding a rejected chain');
+  await m.startChain('r-2', ['u-mgr', 'u-dir']);
+  await m.advance('r-2', 0, 'u-mgr', 'approved');
+  const last = await m.advance('r-2', 1, 'u-dir', 'rejected');
+  assert(last.advanced === true && last.status === 'rejected', \`the director rejecting the last step of r-2 answered \${JSON.stringify(last)}, expected status rejected\`);
+  await m.startChain('r-3', ['u-mgr', 'u-dir']);
+  await m.advance('r-3', 0, 'u-mgr', 'approved');
+  const done = await m.advance('r-3', 1, 'u-dir', 'approved');
+  assert.equal(done.status, 'approved', \`the last approval of r-3 answered \${JSON.stringify(done)}, expected status approved\`);
+  refused(await m.advance('r-3', 1, 'u-dir', 'approved'), 'chain closed', 'a repeated approval on an approved chain');
 }
 
 export async function check_atomic_decision(ctx) {
@@ -770,8 +792,24 @@ func CheckRejectionEnds(ctx *harness.Ctx) {
 	stateChain(ctx)
 	stateDecide(ctx, 0, "u-mgr", "approved")
 	ctx.Equal(stateDecide(ctx, 1, "u-dir", "rejected"), Outcome{Advanced: true, StepIndex: 1, Status: "rejected"}, "the director's rejection must close the chain as rejected on step 1")
+	f := ctx.Redis.HGetAll(stateHashKey)
+	ctx.Assert(f["status"] == "rejected" && f["step_index"] == "1" && f["decision:1"] == "rejected" && f["actor:1"] == "u-dir", "after the director's rejection the state is %v: expected status rejected, step_index 1, decision:1 rejected by u-dir", f)
 	stateRefused(ctx, stateDecide(ctx, 1, "u-dir", "approved"), "chain closed", "an approval after the rejection")
 	stateRefused(ctx, stateDecide(ctx, 2, "u-cfo", "approved"), "chain closed", "the CFO deciding a rejected chain")
+	decideOn := func(id string, step int, actor, decision string) Outcome {
+		o, err := advance(stateBg, id, step, actor, decision)
+		ctx.NoError(err, "advance(%s, %d, %s, %s)", id, step, actor, decision)
+		return o
+	}
+	ctx.NoError(startChain(stateBg, "r-2", []string{"u-mgr", "u-dir"}), "startChain(r-2)")
+	decideOn("r-2", 0, "u-mgr", "approved")
+	last := decideOn("r-2", 1, "u-dir", "rejected")
+	ctx.Assert(last.Advanced && last.Status == "rejected", "the director rejecting the last step of r-2 answered %+v, expected status rejected", last)
+	ctx.NoError(startChain(stateBg, "r-3", []string{"u-mgr", "u-dir"}), "startChain(r-3)")
+	decideOn("r-3", 0, "u-mgr", "approved")
+	done := decideOn("r-3", 1, "u-dir", "approved")
+	ctx.Equal(done.Status, "approved", "the last approval of r-3; status")
+	stateRefused(ctx, decideOn("r-3", 1, "u-dir", "approved"), "chain closed", "a repeated approval on an approved chain")
 }
 
 func CheckAtomicDecision(ctx *harness.Ctx) {
@@ -806,7 +844,7 @@ void stateRefused(harness::Ctx& ctx, const Outcome& o, const std::string& reason
   ctx.Equal(o.reason, reason, "%s: the reason", why);
 }
 
-std::string show(const Outcome& o) {
+std::string stateShow(const Outcome& o) {
   return "{advanced " + std::string(o.advanced ? "true" : "false") + ", step_index " + std::to_string(o.step_index) + ", status " + o.status + ", reason \\"" + o.reason + "\\"}";
 }
 
@@ -828,15 +866,15 @@ void CheckStateHash(harness::Ctx& ctx) {
 void CheckSingleStep(harness::Ctx& ctx) {
   startChain("r-1", {"u-mgr", "u-dir", "u-cfo"});
   const Outcome first = advance("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(first.advanced && first.step_index == 1 && first.status == "pending", "the manager's approval of step 0 answered %s", show(first));
+  ctx.Assert(first.advanced && first.step_index == 1 && first.status == "pending", "the manager's approval of step 0 answered %s", stateShow(first));
   const Outcome again = advance("r-1", 0, "u-mgr", "approved");
   stateRefused(ctx, again, "stale step", "a repeated approval of step 0 (a double click)");
   ctx.Equal(again.step_index, 1, "a repeated approval must leave the chain on step 1; step_index");
   stateRefused(ctx, advance("r-1", 2, "u-dir", "approved"), "stale step", "a decision on step 2 while the chain is on step 1");
   const Outcome second = advance("r-1", 1, "u-dir", "approved");
-  ctx.Assert(second.advanced && second.status == "pending" && second.step_index == 2, "the director's approval of step 1 answered %s: one signature is still missing", show(second));
+  ctx.Assert(second.advanced && second.status == "pending" && second.step_index == 2, "the director's approval of step 1 answered %s: one signature is still missing", stateShow(second));
   const Outcome last = advance("r-1", 2, "u-cfo", "approved");
-  ctx.Assert(last.status == "approved" && last.step_index == 3, "the last approval answered %s, expected status approved", show(last));
+  ctx.Assert(last.status == "approved" && last.step_index == 3, "the last approval answered %s, expected status approved", stateShow(last));
 }
 
 void CheckCurrentApprover(harness::Ctx& ctx) {
@@ -844,7 +882,7 @@ void CheckCurrentApprover(harness::Ctx& ctx) {
   stateRefused(ctx, advance("r-1", 0, "u-dir", "approved"), "not the current approver", "the director approving the manager's step 0");
   stateRefused(ctx, advance("r-1", 0, "u-intruder", "approved"), "not the current approver", "an actor who is on no step");
   const Outcome ok = advance("r-1", 0, "u-mgr", "approved");
-  ctx.Assert(ok.advanced && ok.step_index == 1, "the manager's approval of step 0 answered %s", show(ok));
+  ctx.Assert(ok.advanced && ok.step_index == 1, "the manager's approval of step 0 answered %s", stateShow(ok));
   stateRefused(ctx, advance("r-1", 1, "u-cfo", "approved"), "not the current approver", "the CFO approving the director's step 1");
 }
 
@@ -852,9 +890,20 @@ void CheckRejectionEnds(harness::Ctx& ctx) {
   startChain("r-1", {"u-mgr", "u-dir", "u-cfo"});
   advance("r-1", 0, "u-mgr", "approved");
   const Outcome rejected = advance("r-1", 1, "u-dir", "rejected");
-  ctx.Assert(rejected.advanced && rejected.step_index == 1 && rejected.status == "rejected", "the director's rejection answered %s, expected the chain closed as rejected on step 1", show(rejected));
+  ctx.Assert(rejected.advanced && rejected.step_index == 1 && rejected.status == "rejected", "the director's rejection answered %s, expected the chain closed as rejected on step 1", stateShow(rejected));
+  auto f = ctx.Redis.HGetAll(kStateKey);
+  ctx.Assert(f["status"] == "rejected" && f["step_index"] == "1" && f["decision:1"] == "rejected" && f["actor:1"] == "u-dir", "after the director's rejection the state is %v: expected status rejected, step_index 1, decision:1 rejected by u-dir", f);
   stateRefused(ctx, advance("r-1", 1, "u-dir", "approved"), "chain closed", "an approval after the rejection");
   stateRefused(ctx, advance("r-1", 2, "u-cfo", "approved"), "chain closed", "the CFO deciding a rejected chain");
+  startChain("r-2", {"u-mgr", "u-dir"});
+  advance("r-2", 0, "u-mgr", "approved");
+  const Outcome last = advance("r-2", 1, "u-dir", "rejected");
+  ctx.Assert(last.advanced && last.status == "rejected", "the director rejecting the last step of r-2 answered %s, expected status rejected", stateShow(last));
+  startChain("r-3", {"u-mgr", "u-dir"});
+  advance("r-3", 0, "u-mgr", "approved");
+  const Outcome done = advance("r-3", 1, "u-dir", "approved");
+  ctx.Equal(done.status, "approved", "the last approval of r-3; status");
+  stateRefused(ctx, advance("r-3", 1, "u-dir", "approved"), "chain closed", "a repeated approval on an approved chain");
 }
 
 void CheckAtomicDecision(harness::Ctx& ctx) {
@@ -864,9 +913,9 @@ void CheckAtomicDecision(harness::Ctx& ctx) {
   ctx.Redis.After(kStateKey, [theirs] { *theirs = advance("r-1", 0, "u-mgr", "approved"); });
   const Outcome mine = advance("r-1", 0, "u-mgr", "approved");
   ctx.Assert(theirs->has_value(), "advance never touched the state hash");
-  ctx.Assert((*theirs)->advanced != mine.advanced, "two servers handling one approval answered %s and %s: exactly one may advance the chain", show(**theirs), show(mine));
+  ctx.Assert((*theirs)->advanced != mine.advanced, "two servers handling one approval answered %s and %s: exactly one may advance the chain", stateShow(**theirs), stateShow(mine));
   const Outcome next = advance("r-1", 1, "u-dir", "approved");
-  ctx.Assert(next.advanced && next.step_index == 2 && next.status == "pending", "after the race the director's approval answered %s: the race skipped a step", show(next));
+  ctx.Assert(next.advanced && next.step_index == 2 && next.status == "pending", "after the race the director's approval answered %s: the race skipped a step", stateShow(next));
 }
 `,
   },

@@ -777,7 +777,7 @@ import (
 	"leetbuild/harness"
 )
 
-const topicName = "transcode.event"
+const harnessTopic = "transcode.event"
 
 var eventsBg = context.Background()
 
@@ -786,7 +786,7 @@ func eventJob() *jobs.Job {
 	return jobs.Create(eventsBg, "t-1", "s3://uploads/talk.mov", "9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f9f", 18, "h264-720p", args, "renditions", "talks/42")
 }
 
-func coverage(n int, missing ...int) segments.Coverage {
+func harnessCoverage(n int, missing ...int) segments.Coverage {
 	gone := map[int]bool{}
 	for _, i := range missing {
 		gone[i] = true
@@ -824,10 +824,10 @@ func CheckJobKey(ctx *harness.Ctx) {
 	job := eventJob()
 	mustSegments(ctx, job, "w-1", 0, 2)
 	mustSegments(ctx, job, "w-2", 2, 3)
-	ctx.Assert(mustComplete(ctx, job, coverage(3)) != nil, "a job whose three segments are done must be completed")
-	records := ctx.Kafka.Records(topicName)
-	ctx.Equal(len(records), 3, "three events must produce three records on %s; the records", topicName)
-	ctx.Equal(ctx.Kafka.Keys(topicName), []string{job.JobID, job.JobID, job.JobID}, "records must be keyed by the job id (keyed by the worker, one job's events scatter across partitions)")
+	ctx.Assert(mustComplete(ctx, job, harnessCoverage(3)) != nil, "a job whose three segments are done must be completed")
+	records := ctx.Kafka.Records(harnessTopic)
+	ctx.Equal(len(records), 3, "three events must produce three records on %s; the records", harnessTopic)
+	ctx.Equal(ctx.Kafka.Keys(harnessTopic), []string{job.JobID, job.JobID, job.JobID}, "records must be keyed by the job id (keyed by the worker, one job's events scatter across partitions)")
 	ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition, "%s's events landed on partitions %d, %d, %d: one job's history must stay on one partition, in order", job.JobID, records[0].Partition, records[1].Partition, records[2].Partition)
 	first := recordPayload(ctx, records[0].Value)
 	ctx.Assert(first["segment_start"] == 0.0 && first["segment_end"] == 2.0 && first["outcome"] == "done", "the first event must carry the range [0, 2) and its outcome, got %v", first)
@@ -835,22 +835,22 @@ func CheckJobKey(ctx *harness.Ctx) {
 
 func CheckGaplessComplete(ctx *harness.Ctx) {
 	job := eventJob()
-	got := mustComplete(ctx, job, coverage(3, 2))
+	got := mustComplete(ctx, job, harnessCoverage(3, 2))
 	ctx.Assert(got == nil, "completeJob announced a job whose segment 2 is missing: %v", got)
-	ctx.Equal(len(ctx.Kafka.Records(topicName)), 0, "a job with a hole must produce no completion; the records")
+	ctx.Equal(len(ctx.Kafka.Records(harnessTopic)), 0, "a job with a hole must produce no completion; the records")
 	ctx.Equal(jobs.Get(eventsBg, job.JobID).State, "queued", "a job with segment 2 missing must not be finalized; its state")
-	ctx.Assert(mustComplete(ctx, job, coverage(3)) != nil, "once every segment is done the job must be completed")
+	ctx.Assert(mustComplete(ctx, job, harnessCoverage(3)) != nil, "once every segment is done the job must be completed")
 	ctx.Equal(jobs.Get(eventsBg, job.JobID).State, "done", "the completed job must be finalized; its state")
 }
 
 func CheckAfterManifest(ctx *harness.Ctx) {
 	job := eventJob()
 	// The moment the job row is written, what is already on the topic.
-	atFinal := ctx.Redis.After("job:"+job.JobID, func() any { return len(ctx.Kafka.Records(topicName)) })
-	mustComplete(ctx, job, coverage(3))
+	atFinal := ctx.Redis.After("job:"+job.JobID, func() any { return len(ctx.Kafka.Records(harnessTopic)) })
+	mustComplete(ctx, job, harnessCoverage(3))
 	ctx.Assert(atFinal.Fired, "completeJob never finalized the job")
 	ctx.Equal(atFinal.Result, 0, "when the job was finalized the topic already held records: a consumer reading the announced job found it still queued. Finalize, then produce; records at the finalize")
-	ctx.Equal(len(ctx.Kafka.Records(topicName)), 1, "one completion, the records")
+	ctx.Equal(len(ctx.Kafka.Records(harnessTopic)), 1, "one completion, the records")
 	final := jobs.Get(eventsBg, job.JobID)
 	ctx.Equal(final.State, "done", "the finalized job's state")
 	ctx.Equal(final.Renditions, []jobs.Rendition{{Preset: "h264-720p", Key: "talks/42/h264-720p/index.m3u8", DurationS: 18}}, "the finalized job's renditions")
@@ -858,7 +858,7 @@ func CheckAfterManifest(ctx *harness.Ctx) {
 
 func CheckSignedRefs(ctx *harness.Ctx) {
 	job := eventJob()
-	event := mustComplete(ctx, job, coverage(3))
+	event := mustComplete(ctx, job, harnessCoverage(3))
 	ctx.Assert(event != nil, "a complete job must be announced")
 	raw, _ := json.Marshal(event)
 	var decoded struct {
@@ -874,7 +874,7 @@ func CheckSignedRefs(ctx *harness.Ctx) {
 	ctx.Equal(r.ExpiresAt, expires, "the rendition's expires_at must be now + SignedURLTTL")
 	want := urls.Sign("renditions", jobs.OutputKey(job), expires)
 	ctx.Equal(r.URL, want, "a plain storage URL in a retained topic never expires; the rendition's URL must be urls.Sign(bucket, key, expires_at)")
-	records := ctx.Kafka.Records(topicName)
+	records := ctx.Kafka.Records(harnessTopic)
 	ctx.Equal(string(records[len(records)-1].Value), string(raw), "the record on the topic must be the event completeJob returned")
 }
 
@@ -882,8 +882,8 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 	job := eventJob()
 	mustSegments(ctx, job, "w-1", 0, 2)
 	mustSegments(ctx, job, "w-1", 2, 3)
-	lost := ctx.Kafka.Failover(topicName)
-	ctx.Equal(len(ctx.Kafka.Records(topicName)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
+	lost := ctx.Kafka.Failover(harnessTopic)
+	ctx.Equal(len(ctx.Kafka.Records(harnessTopic)), 2, "after a leader failover %d record(s) were lost: with RequireOne the leader alone acknowledged the event. Use RequireAll; the records on the topic", lost)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -902,13 +902,13 @@ func CheckIdempotentAcks(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kTopic = "transcode.event";
+const std::string kHarnessTopic = "transcode.event";
 
 jobs::Job eventJob() {
   return jobs::create("t-1", "s3://uploads/talk.mov", std::string(64, 'f'), 18, "h264-720p", *presets::encoderArgs("h264-720p"), "renditions", "talks/42");
 }
 
-segments::Coverage coverage(int n, const std::vector<int>& missing = {}) {
+segments::Coverage harnessCoverage(int n, const std::vector<int>& missing = {}) {
   segments::Coverage out;
   out.segment_count = n;
   const std::set<int> gone(missing.begin(), missing.end());
@@ -940,10 +940,10 @@ void CheckJobKey(harness::Ctx& ctx) {
   const jobs::Job job = eventJob();
   publishSegments(job, "w-1", 0, 2, "done");
   publishSegments(job, "w-2", 2, 3, "done");
-  ctx.Assert(mustComplete(ctx, job, coverage(3)).has_value(), "a job whose three segments are done must be completed");
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), size_t{3}, "three events must produce three records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {job.job_id, job.job_id, job.job_id}, "records must be keyed by the job id (keyed by the worker, one job's events scatter across partitions)");
+  ctx.Assert(mustComplete(ctx, job, harnessCoverage(3)).has_value(), "a job whose three segments are done must be completed");
+  const auto records = ctx.Kafka.Records(kHarnessTopic);
+  ctx.Equal(records.size(), size_t{3}, "three events must produce three records on %s; the records", kHarnessTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHarnessTopic), {job.job_id, job.job_id, job.job_id}, "records must be keyed by the job id (keyed by the worker, one job's events scatter across partitions)");
   ctx.Assert(records[0].Partition == records[1].Partition && records[1].Partition == records[2].Partition,
              "%s's events landed on partitions %d, %d, %d: one job's history must stay on one partition, in order", job.job_id, records[0].Partition, records[1].Partition, records[2].Partition);
   const auto first = recordPayload(ctx, records[0]);
@@ -952,11 +952,11 @@ void CheckJobKey(harness::Ctx& ctx) {
 
 void CheckGaplessComplete(harness::Ctx& ctx) {
   const jobs::Job job = eventJob();
-  const auto got = mustComplete(ctx, job, coverage(3, {2}));
+  const auto got = mustComplete(ctx, job, harnessCoverage(3, {2}));
   ctx.Assert(!got.has_value(), "completeJob announced a job whose segment 2 is missing: %s", got ? got->dump() : "");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), size_t{0}, "a job with a hole must produce no completion; the records");
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), size_t{0}, "a job with a hole must produce no completion; the records");
   ctx.Equal(jobs::get(job.job_id)->state, "queued", "a job with segment 2 missing must not be finalized; its state");
-  ctx.Assert(mustComplete(ctx, job, coverage(3)).has_value(), "once every segment is done the job must be completed");
+  ctx.Assert(mustComplete(ctx, job, harnessCoverage(3)).has_value(), "once every segment is done the job must be completed");
   ctx.Equal(jobs::get(job.job_id)->state, "done", "the completed job must be finalized; its state");
 }
 
@@ -964,11 +964,11 @@ void CheckAfterManifest(harness::Ctx& ctx) {
   const jobs::Job job = eventJob();
   // The moment the job row is written, what is already on the topic.
   int at_final = -1;
-  ctx.Redis.After("job:" + job.job_id, [&] { at_final = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  mustComplete(ctx, job, coverage(3));
+  ctx.Redis.After("job:" + job.job_id, [&] { at_final = static_cast<int>(ctx.Kafka.Records(kHarnessTopic).size()); });
+  mustComplete(ctx, job, harnessCoverage(3));
   ctx.Assert(at_final >= 0, "completeJob never finalized the job");
   ctx.Equal(at_final, 0, "when the job was finalized the topic already held records: a consumer reading the announced job found it still queued. Finalize, then produce; records at the finalize");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), size_t{1}, "one completion, the records");
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), size_t{1}, "one completion, the records");
   const auto final_job = jobs::get(job.job_id);
   ctx.Equal(final_job->state, "done", "the finalized job's state");
   ctx.Assert(final_job->renditions.size() == 1 && final_job->renditions[0].key == "talks/42/h264-720p/index.m3u8" && final_job->renditions[0].duration_s == 18,
@@ -977,24 +977,24 @@ void CheckAfterManifest(harness::Ctx& ctx) {
 
 void CheckSignedRefs(harness::Ctx& ctx) {
   const jobs::Job job = eventJob();
-  const auto event = mustComplete(ctx, job, coverage(3));
+  const auto event = mustComplete(ctx, job, harnessCoverage(3));
   ctx.Assert(event && event->contains("renditions") && (*event)["renditions"].size() == 1, "the completion must carry one rendition, got %s", event ? event->dump() : "");
   const auto& r = (*event)["renditions"][0];
   const long long expires = ctx.Clock.Now() / 1000 + 900;
   ctx.Equal(r.value("expires_at", 0LL), expires, "the rendition's expires_at must be now + kSignedUrlTtlS");
   ctx.Equal(r.value("url", ""), urls::sign("renditions", jobs::outputKey(job), expires), "a plain storage URL in a retained topic never expires; the rendition's URL must be urls::sign(bucket, key, expires_at)");
-  const auto records = ctx.Kafka.Records(kTopic);
+  const auto records = ctx.Kafka.Records(kHarnessTopic);
   ctx.Assert(recordPayload(ctx, records.back()) == *event, "the record on the topic must be the event completeJob returned");
 }
 
 void CheckIdempotentAcks(harness::Ctx& ctx) {
   const jobs::Job job = eventJob();
-  ctx.Kafka.LoseAcks(kTopic, 1);
+  ctx.Kafka.LoseAcks(kHarnessTopic, 1);
   publishSegments(job, "w-1", 0, 2, "done");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), size_t{1}, "one event whose acknowledgement was lost: the producer's retry wrote it twice and the consumer counts segments twice. Set enable.idempotence (with acks=all); the records on the topic");
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), size_t{1}, "one event whose acknowledgement was lost: the producer's retry wrote it twice and the consumer counts segments twice. Set enable.idempotence (with acks=all); the records on the topic");
   publishSegments(job, "w-1", 2, 3, "done");
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), size_t{2}, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  const int lost = ctx.Kafka.Failover(kHarnessTopic);
+  ctx.Equal(ctx.Kafka.Records(kHarnessTopic).size(), size_t{2}, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

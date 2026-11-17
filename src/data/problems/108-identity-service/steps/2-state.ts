@@ -66,7 +66,7 @@ a week after signing up, a stranger can claim a live account's address.
       id: 'owner-release',
       title: 'Releases only the handles the user still owns',
       detail:
-        '`release_handles` deletes a key only while it holds the releasing user id, in one compare-and-delete Lua script; the starter deletes every key it is given, including the claim of the account that made the signup lose.',
+        '`release_handles` deletes a key only while it holds the releasing user id, in one compare-and-delete Lua script, so a claim that changes hands between a read and a delete survives; the starter deletes every key it is given, including the claim of the account that made the signup lose.',
       match: {
         python: {all: [/redis\.call\(\s*['"]GET['"]|\.watch\(/, /ARGV\[1\]/], none: [/\.delete\(/]},
         typescript: {all: [/redis\.call\(\s*['"]GET['"]|\.watch\(/, /ARGV\[1\]/], none: [/\.del\(/]},
@@ -79,7 +79,7 @@ a week after signing up, a stranger can claim a live account's address.
       id: 'durable-claim',
       title: 'A claim lasts as long as the account',
       detail:
-        'Claims carry no expiry, so a live account keeps its handles; the starter writes them with a 7-day `EX`, after which a second account can claim the same address.',
+        'Claims carry no expiry at any instant, not even one set by the writing command and lifted afterwards, so a live account keeps its handles; the starter writes them with a 7-day `EX`, after which a second account can claim the same address.',
       match: {
         python: {all: [/nx=True/], none: [/\bex\s*=/, /\.expire\(/, /CLAIM_TTL_S\s*=/]},
         typescript: {all: [/'NX'/], none: [/'EX'/, /\.expire\(/, /CLAIM_TTL_S\s*=/]},
@@ -551,6 +551,11 @@ def check_owner_release(ctx):
     m.release_handles("u-2", ADA)
     assert ctx.redis.get(EMAIL_KEY) == "u-1" and ctx.redis.get(PHONE_KEY) == "u-1", "release_handles('u-2', …) deleted claims that belong to u-1"
     assert m.claim_handles("u-3", {"email": "zoe@example.com", "phone": "+442079460958"}) is False, "a third signup claimed the phone u-1 owns"
+    # u-1 gives its address back while the handle changes hands: right after the release's first command on the key, u-4 holds it.
+    handover = ctx.redis_after(EMAIL_KEY, lambda: ctx.redis.set(EMAIL_KEY, "u-4"))
+    m.release_handles("u-1", {"email": "ada@example.com"})
+    assert handover.fired, f"release_handles('u-1', …) never touched {EMAIL_KEY}"
+    assert ctx.redis.get(EMAIL_KEY) == "u-4", f"{EMAIL_KEY} passed to u-4 between the release's read and its delete, and now holds {ctx.redis.get(EMAIL_KEY)!r}: u-1's release deleted u-4's claim. Compare and delete in one script"
 
 
 def check_durable_claim(ctx):
@@ -561,6 +566,12 @@ def check_durable_claim(ctx):
         assert ttl == -1, f"{key} expires in {ttl} s: once it lapses a second account can take a live account's handle. A claim lasts as long as the account"
     ctx.clock.advance(8 * 24 * 3600)
     assert m.claim_handles("u-2", {"email": "ada@example.com"}) is False, "eight days later a second signup claimed ada@example.com, which u-1 still owns"
+    # Eight days pass right after the claim's first command on a key: no expiry may exist at any instant.
+    bo_key = "handle:email:bo@example.com"
+    lapse = ctx.redis_after(bo_key, lambda: ctx.clock.advance(8 * 24 * 3600))
+    assert m.claim_handles("u-3", {"email": "bo@example.com"}) is True, "claiming a free handle must succeed"
+    assert lapse.fired, f"claim_handles('u-3', …) never touched {bo_key}"
+    assert ctx.redis.get(bo_key) == "u-3", f"eight days passed right after the first command on {bo_key}, which now holds {ctx.redis.get(bo_key)!r}: the command that writes a claim set an expiry, and the claim lapsed before it was lifted"
 `,
     typescript: `const ADA = {email: 'ada@example.com', phone: '+442079460958'};
 const EMAIL_KEY = 'handle:email:ada@example.com';
@@ -604,6 +615,11 @@ export async function check_owner_release(ctx) {
   await m.releaseHandles('u-2', ADA);
   assert(ctx.redis.get(EMAIL_KEY) === 'u-1' && ctx.redis.get(PHONE_KEY) === 'u-1', "releaseHandles('u-2', …) deleted claims that belong to u-1");
   assert.equal(await m.claimHandles('u-3', {email: 'zoe@example.com', phone: '+442079460958'}), false, 'a third signup claimed the phone u-1 owns');
+  // u-1 gives its address back while the handle changes hands: right after the release's first command on the key, u-4 holds it.
+  const handover = ctx.redisAfter(EMAIL_KEY, () => ctx.redis.set(EMAIL_KEY, 'u-4'));
+  await m.releaseHandles('u-1', {email: 'ada@example.com'});
+  assert(handover.fired, \`releaseHandles('u-1', …) never touched \${EMAIL_KEY}\`);
+  assert.equal(ctx.redis.get(EMAIL_KEY), 'u-4', \`\${EMAIL_KEY} passed to u-4 between the release's read and its delete, and now holds \${JSON.stringify(ctx.redis.get(EMAIL_KEY))}: u-1's release deleted u-4's claim. Compare and delete in one script\`);
 }
 
 export async function check_durable_claim(ctx) {
@@ -615,6 +631,12 @@ export async function check_durable_claim(ctx) {
   }
   ctx.clock.advance(8 * 24 * 3600);
   assert.equal(await m.claimHandles('u-2', {email: 'ada@example.com'}), false, 'eight days later a second signup claimed ada@example.com, which u-1 still owns');
+  // Eight days pass right after the claim's first command on a key: no expiry may exist at any instant.
+  const boKey = 'handle:email:bo@example.com';
+  const lapse = ctx.redisAfter(boKey, () => ctx.clock.advance(8 * 24 * 3600));
+  assert.equal(await m.claimHandles('u-3', {email: 'bo@example.com'}), true, 'claiming a free handle must succeed');
+  assert(lapse.fired, \`claimHandles('u-3', …) never touched \${boKey}\`);
+  assert.equal(ctx.redis.get(boKey), 'u-3', \`eight days passed right after the first command on \${boKey}, which now holds \${JSON.stringify(ctx.redis.get(boKey))}: the command that writes a claim set an expiry, and the claim lapsed before it was lifted\`);
 }
 `,
     go: `package main
@@ -626,44 +648,44 @@ import (
 )
 
 var (
-	stateBg  = context.Background()
-	adaClaim = map[string]string{"email": "ada@example.com", "phone": "+442079460958"}
+	harnessBg  = context.Background()
+	harnessAda = map[string]string{"email": "ada@example.com", "phone": "+442079460958"}
 )
 
 const (
-	emailKey = "handle:email:ada@example.com"
-	phoneKey = "handle:phone:+442079460958"
+	harnessEmailKey = "handle:email:ada@example.com"
+	harnessPhoneKey = "handle:phone:+442079460958"
 )
 
-func mustClaim(ctx *harness.Ctx, userID string, handles map[string]string) bool {
-	won, err := claimHandles(stateBg, userID, handles)
+func harnessClaim(ctx *harness.Ctx, userID string, handles map[string]string) bool {
+	won, err := claimHandles(harnessBg, userID, handles)
 	ctx.NoError(err, "claimHandles(%s, %v) failed", userID, handles)
 	return won
 }
 
-func holder(ctx *harness.Ctx, key string) string {
+func harnessHolder(ctx *harness.Ctx, key string) string {
 	v, _ := ctx.Redis.Get(key)
 	return v
 }
 
 func CheckClaim(ctx *harness.Ctx) {
-	ctx.Equal(mustClaim(ctx, "u-1", adaClaim), true, "claiming two free handles must succeed; won")
-	ctx.Equal(holder(ctx, emailKey), "u-1", "%s must hold the owner", emailKey)
-	ctx.Equal(holder(ctx, phoneKey), "u-1", "%s must hold the owner", phoneKey)
-	ctx.Equal(ownerOf(stateBg, "email", "ada@example.com"), "u-1", "ownerOf(email, ada@example.com)")
-	ctx.NoError(releaseHandles(stateBg, "u-1", adaClaim), "releaseHandles(u-1) failed")
+	ctx.Equal(harnessClaim(ctx, "u-1", harnessAda), true, "claiming two free handles must succeed; won")
+	ctx.Equal(harnessHolder(ctx, harnessEmailKey), "u-1", "%s must hold the owner", harnessEmailKey)
+	ctx.Equal(harnessHolder(ctx, harnessPhoneKey), "u-1", "%s must hold the owner", harnessPhoneKey)
+	ctx.Equal(ownerOf(harnessBg, "email", "ada@example.com"), "u-1", "ownerOf(email, ada@example.com)")
+	ctx.NoError(releaseHandles(harnessBg, "u-1", harnessAda), "releaseHandles(u-1) failed")
 	ctx.Equal(len(ctx.Redis.Keys("handle:*")), 0, "after u-1 released its own handles Redis still holds %v; the claims", ctx.Redis.Keys("handle:*"))
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
 	// A second signup for the same address runs right after this one's first command on the key.
-	rival := ctx.Redis.After(emailKey, func() any {
-		won, err := claimHandles(stateBg, "u-2", map[string]string{"email": "ada@example.com"})
+	rival := ctx.Redis.After(harnessEmailKey, func() any {
+		won, err := claimHandles(harnessBg, "u-2", map[string]string{"email": "ada@example.com"})
 		ctx.NoError(err, "the rival claim failed")
 		return won
 	})
-	won := mustClaim(ctx, "u-1", map[string]string{"email": "ada@example.com"})
-	ctx.Assert(rival.Fired, "nothing touched %s", emailKey)
+	won := harnessClaim(ctx, "u-1", map[string]string{"email": "ada@example.com"})
+	ctx.Assert(rival.Fired, "nothing touched %s", harnessEmailKey)
 	ctx.Assert(rival.Err == nil, "the rival claim failed: %v", rival.Err)
 	rivalWon := rival.Result == true
 	ctx.Assert(!(won && rivalWon), "two signups for ada@example.com in the same instant both claimed it (u-1: %v, u-2: %v): a check and a separate write let both through. Claim with one SET NX", won, rivalWon)
@@ -672,28 +694,42 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	if won {
 		winner = "u-1"
 	}
-	ctx.Equal(holder(ctx, emailKey), winner, "%s must hold the signup whose claim succeeded", emailKey)
+	ctx.Equal(harnessHolder(ctx, harnessEmailKey), winner, "%s must hold the signup whose claim succeeded", harnessEmailKey)
 }
 
 func CheckOwnerRelease(ctx *harness.Ctx) {
-	ctx.Equal(mustClaim(ctx, "u-1", adaClaim), true, "claiming two free handles must succeed; won")
+	ctx.Equal(harnessClaim(ctx, "u-1", harnessAda), true, "claiming two free handles must succeed; won")
 	// A second signup with a new address and u-1's phone loses on the phone.
-	ctx.Equal(mustClaim(ctx, "u-2", map[string]string{"email": "eve@example.com", "phone": "+442079460958"}), false, "a signup with a phone u-1 holds must be refused; won")
-	ctx.Equal(holder(ctx, phoneKey), "u-1", "after u-2's refused signup the refused signup deleted u-1's claim (release only the handles you own); %s holds", phoneKey)
-	ctx.Equal(holder(ctx, "handle:email:eve@example.com"), "", "the refused signup must not keep its claim on eve@example.com; it holds")
-	ctx.NoError(releaseHandles(stateBg, "u-2", adaClaim), "releaseHandles(u-2) failed")
-	ctx.Assert(holder(ctx, emailKey) == "u-1" && holder(ctx, phoneKey) == "u-1", "releaseHandles(u-2, …) deleted claims that belong to u-1")
-	ctx.Equal(mustClaim(ctx, "u-3", map[string]string{"email": "zoe@example.com", "phone": "+442079460958"}), false, "a third signup must not claim the phone u-1 owns; won")
+	ctx.Equal(harnessClaim(ctx, "u-2", map[string]string{"email": "eve@example.com", "phone": "+442079460958"}), false, "a signup with a phone u-1 holds must be refused; won")
+	ctx.Equal(harnessHolder(ctx, harnessPhoneKey), "u-1", "after u-2's refused signup the refused signup deleted u-1's claim (release only the handles you own); %s holds", harnessPhoneKey)
+	ctx.Equal(harnessHolder(ctx, "handle:email:eve@example.com"), "", "the refused signup must not keep its claim on eve@example.com; it holds")
+	ctx.NoError(releaseHandles(harnessBg, "u-2", harnessAda), "releaseHandles(u-2) failed")
+	ctx.Assert(harnessHolder(ctx, harnessEmailKey) == "u-1" && harnessHolder(ctx, harnessPhoneKey) == "u-1", "releaseHandles(u-2, …) deleted claims that belong to u-1")
+	ctx.Equal(harnessClaim(ctx, "u-3", map[string]string{"email": "zoe@example.com", "phone": "+442079460958"}), false, "a third signup must not claim the phone u-1 owns; won")
+	// u-1 gives its address back while the handle changes hands: right after the release's first command on the key, u-4 holds it.
+	handover := ctx.Redis.After(harnessEmailKey, func() any { return ctx.Redis.Set(harnessEmailKey, "u-4") })
+	ctx.NoError(releaseHandles(harnessBg, "u-1", map[string]string{"email": "ada@example.com"}), "releaseHandles(u-1) failed")
+	ctx.Assert(handover.Fired, "releaseHandles(u-1, …) never touched %s", harnessEmailKey)
+	ctx.Equal(harnessHolder(ctx, harnessEmailKey), "u-4", "%s passed to u-4 between the release's read and its delete; u-1's release must not delete u-4's claim (compare and delete in one script), and the key holds", harnessEmailKey)
 }
 
 func CheckDurableClaim(ctx *harness.Ctx) {
-	ctx.Equal(mustClaim(ctx, "u-1", adaClaim), true, "claiming two free handles must succeed; won")
-	for _, key := range []string{emailKey, phoneKey} {
+	ctx.Equal(harnessClaim(ctx, "u-1", harnessAda), true, "claiming two free handles must succeed; won")
+	for _, key := range []string{harnessEmailKey, harnessPhoneKey} {
 		ttl := ctx.Redis.TTL(key)
 		ctx.Assert(ttl == -1, "%s expires in %d s: once it lapses a second account can take a live account's handle. A claim lasts as long as the account", key, ttl)
 	}
 	ctx.Clock.Advance(8 * 24 * 3600)
-	ctx.Equal(mustClaim(ctx, "u-2", map[string]string{"email": "ada@example.com"}), false, "eight days later a second signup must not claim ada@example.com, which u-1 still owns; won")
+	ctx.Equal(harnessClaim(ctx, "u-2", map[string]string{"email": "ada@example.com"}), false, "eight days later a second signup must not claim ada@example.com, which u-1 still owns; won")
+	// Eight days pass right after the claim's first command on a key: no expiry may exist at any instant.
+	boKey := "handle:email:bo@example.com"
+	lapse := ctx.Redis.After(boKey, func() any {
+		ctx.Clock.Advance(8 * 24 * 3600)
+		return nil
+	})
+	ctx.Equal(harnessClaim(ctx, "u-3", map[string]string{"email": "bo@example.com"}), true, "claiming a free handle must succeed; won")
+	ctx.Assert(lapse.Fired, "claimHandles(u-3, …) never touched %s", boKey)
+	ctx.Equal(harnessHolder(ctx, boKey), "u-3", "eight days passed right after the first command on %s: the command that writes a claim must set no expiry, or the claim lapses before it is lifted; the key holds", boKey)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -708,14 +744,14 @@ const Handles kAda = {{"email", "ada@example.com"}, {"phone", "+442079460958"}};
 const std::string kEmailKey = "handle:email:ada@example.com";
 const std::string kPhoneKey = "handle:phone:+442079460958";
 
-std::string holder(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key).value_or(""); }
+std::string harnessHolder(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key).value_or(""); }
 
 }  // namespace
 
 void CheckClaim(harness::Ctx& ctx) {
   ctx.Equal(claimHandles("u-1", kAda), true, "claiming two free handles must succeed; won");
-  ctx.Equal(holder(ctx, kEmailKey), "u-1", "%s must hold the owner", kEmailKey);
-  ctx.Equal(holder(ctx, kPhoneKey), "u-1", "%s must hold the owner", kPhoneKey);
+  ctx.Equal(harnessHolder(ctx, kEmailKey), "u-1", "%s must hold the owner", kEmailKey);
+  ctx.Equal(harnessHolder(ctx, kPhoneKey), "u-1", "%s must hold the owner", kPhoneKey);
   ctx.Equal(ownerOf("email", "ada@example.com").value_or(""), "u-1", "ownerOf(email, ada@example.com)");
   releaseHandles("u-1", kAda);
   ctx.Assert(ctx.Redis.Keys("handle:*").empty(), "after u-1 released its own handles Redis still holds %v", ctx.Redis.Keys("handle:*"));
@@ -742,18 +778,27 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   ctx.Assert(!rival->err, "the rival claim failed: %s", rival->err.value_or(""));
   ctx.Assert(!(won && rival->won), "two signups for ada@example.com in the same instant both claimed it (u-1: %t, u-2: %t): a check and a separate write let both through. Claim with one SET NX", won, rival->won);
   ctx.Assert(won || rival->won, "neither of two signups for ada@example.com claimed it");
-  ctx.Equal(holder(ctx, kEmailKey), won ? "u-1" : "u-2", "%s must hold the signup whose claim succeeded", kEmailKey);
+  ctx.Equal(harnessHolder(ctx, kEmailKey), won ? "u-1" : "u-2", "%s must hold the signup whose claim succeeded", kEmailKey);
 }
 
 void CheckOwnerRelease(harness::Ctx& ctx) {
   ctx.Equal(claimHandles("u-1", kAda), true, "claiming two free handles must succeed; won");
   // A second signup with a new address and u-1's phone loses on the phone.
   ctx.Equal(claimHandles("u-2", {{"email", "eve@example.com"}, {"phone", "+442079460958"}}), false, "a signup with a phone u-1 holds must be refused; won");
-  ctx.Equal(holder(ctx, kPhoneKey), "u-1", "after u-2's refused signup the refused signup deleted u-1's claim (release only the handles you own); %s holds", kPhoneKey);
-  ctx.Equal(holder(ctx, "handle:email:eve@example.com"), "", "the refused signup must not keep its claim on eve@example.com; it holds");
+  ctx.Equal(harnessHolder(ctx, kPhoneKey), "u-1", "after u-2's refused signup the refused signup deleted u-1's claim (release only the handles you own); %s holds", kPhoneKey);
+  ctx.Equal(harnessHolder(ctx, "handle:email:eve@example.com"), "", "the refused signup must not keep its claim on eve@example.com; it holds");
   releaseHandles("u-2", kAda);
-  ctx.Assert(holder(ctx, kEmailKey) == "u-1" && holder(ctx, kPhoneKey) == "u-1", "releaseHandles(u-2, …) deleted claims that belong to u-1");
+  ctx.Assert(harnessHolder(ctx, kEmailKey) == "u-1" && harnessHolder(ctx, kPhoneKey) == "u-1", "releaseHandles(u-2, …) deleted claims that belong to u-1");
   ctx.Equal(claimHandles("u-3", {{"email", "zoe@example.com"}, {"phone", "+442079460958"}}), false, "a third signup must not claim the phone u-1 owns; won");
+  // u-1 gives its address back while the handle changes hands: right after the release's first command on the key, u-4 holds it.
+  auto handover = std::make_shared<bool>(false);
+  ctx.Redis.After(kEmailKey, [&ctx, handover] {
+    *handover = true;
+    ctx.Redis.Set(kEmailKey, "u-4");
+  });
+  releaseHandles("u-1", {{"email", "ada@example.com"}});
+  ctx.Assert(*handover, "releaseHandles(u-1, …) never touched %s", kEmailKey);
+  ctx.Equal(harnessHolder(ctx, kEmailKey), "u-4", "%s passed to u-4 between the release's read and its delete; u-1's release must not delete u-4's claim (compare and delete in one script), and the key holds", kEmailKey);
 }
 
 void CheckDurableClaim(harness::Ctx& ctx) {
@@ -764,6 +809,16 @@ void CheckDurableClaim(harness::Ctx& ctx) {
   }
   ctx.Clock.Advance(8 * 24 * 3600);
   ctx.Equal(claimHandles("u-2", {{"email", "ada@example.com"}}), false, "eight days later a second signup must not claim ada@example.com, which u-1 still owns; won");
+  // Eight days pass right after the claim's first command on a key: no expiry may exist at any instant.
+  const std::string bo_key = "handle:email:bo@example.com";
+  auto lapse = std::make_shared<bool>(false);
+  ctx.Redis.After(bo_key, [&ctx, lapse] {
+    *lapse = true;
+    ctx.Clock.Advance(8 * 24 * 3600);
+  });
+  ctx.Equal(claimHandles("u-3", {{"email", "bo@example.com"}}), true, "claiming a free handle must succeed; won");
+  ctx.Assert(*lapse, "claimHandles(u-3, …) never touched %s", bo_key);
+  ctx.Equal(harnessHolder(ctx, bo_key), "u-3", "eight days passed right after the first command on %s: the command that writes a claim must set no expiry, or the claim lapses before it is lifted; the key holds", bo_key);
 }
 `,
   },

@@ -20,8 +20,9 @@ audit learns about an activation before the pointer moved; and a lost acknowledg
 event twice.
 
 - The record key is the **secret name**.
-- The payload is \`{type, secret, version_id, fingerprint, at}\`, \`type\` one of \`EVENT_TYPES\`
-  (\`created\`, \`activated\`, \`retired\`, \`revoked\`). No material.
+- The payload is \`{type, secret, version_id, fingerprint, at}\` and nothing else, \`type\` one of
+  \`EVENT_TYPES\` (\`created\`, \`activated\`, \`retired\`, \`revoked\`), \`at\` the second the event is
+  produced. No material.
 - \`rotate\` moves the pointer first and produces only afterwards.
 - The producer is idempotent with \`acks=all\` (the stack's equivalent: kafkajs \`idempotent\`,
   librdkafka \`enable.idempotence\`; kafka-go has no idempotent producer, so its writer uses
@@ -65,7 +66,7 @@ event twice.
       id: 'no-material',
       title: 'The payload carries the fingerprint, never the material',
       detail:
-        "Every event names the secret, the version id, the version's `fingerprint` and a time; nothing reads the version's material into it, because a topic cannot be un-published.",
+        "Every event carries exactly the type, the secret, the version id, the version's `fingerprint` and the time it was produced (`at`); nothing reads the version's material or its other fields into it, because a topic cannot be un-published.",
       match: {
         python: {all: [/["']fingerprint["']/, /["']at["']/], none: [/\[["']material["']\]/]},
         typescript: {all: [/fingerprint/, /\bat:/], none: [/\.material\b/]},
@@ -655,6 +656,8 @@ def check_secret_key(ctx):
 
 def check_no_material(ctx):
     m = _events(ctx)
+    created_at = vault.get_version(NAME, "v1")["created_at"]
+    ctx.clock.advance(120)  # the rotation happens two minutes after the version was created
     m.rotate(NAME, "v1")
     record = ctx.kafka.records(TOPIC)[0]
     assert MATERIAL.encode() not in record.value, f"the event carries the material: {record.value!r}. The topic is retained and replicated; carry the fingerprint"
@@ -664,6 +667,9 @@ def check_no_material(ctx):
     got = {k: payload.get(k) for k in expected}
     assert got == expected, f"the event must carry {expected}, got {payload}"
     assert isinstance(payload.get("at"), int), f"the event must carry the time as whole seconds (at), got {payload.get('at')!r}"
+    assert created_at + 120 <= payload["at"] <= created_at + 125, f"the event's at is {payload['at']}, but v1 was created at {created_at} and rotated 120 s later: at is when the event happened"
+    extra = sorted(set(payload) - {"type", "secret", "version_id", "fingerprint", "at"})
+    assert not extra, f"the event carries fields beyond type, secret, version_id, fingerprint and at: {extra}. Build it from the fields it names"
 
 
 def check_publish_after_swap(ctx):
@@ -726,6 +732,8 @@ export async function check_secret_key(ctx) {
 
 export async function check_no_material(ctx) {
   const {m, vault} = await events(ctx);
+  const createdAt = (await vault.getVersion(NAME, 'v1')).created_at;
+  ctx.clock.advance(120); // the rotation happens two minutes after the version was created
   await m.rotate(NAME, 'v1');
   const record = ctx.kafka.records(TOPIC)[0];
   assert(!record.value.toString().includes(MATERIAL), \`the event carries the material: \${record.value}. The topic is retained and replicated; carry the fingerprint\`);
@@ -735,6 +743,9 @@ export async function check_no_material(ctx) {
   const got = Object.fromEntries(Object.keys(expected).map(k => [k, p[k]]));
   assert.deepStrictEqual(got, expected, \`the event must carry \${JSON.stringify(expected)}, got \${JSON.stringify(p)}\`);
   assert(Number.isInteger(p.at), \`the event must carry the time as whole seconds (at), got \${JSON.stringify(p.at)}\`);
+  assert(p.at >= createdAt + 120 && p.at <= createdAt + 125, \`the event's at is \${p.at}, but v1 was created at \${createdAt} and rotated 120 s later: at is when the event happened\`);
+  const extra = Object.keys(p).filter(k => !['type', 'secret', 'version_id', 'fingerprint', 'at'].includes(k));
+  assert.equal(extra.length, 0, \`the event carries fields beyond type, secret, version_id, fingerprint and at: \${JSON.stringify(extra)}. Build it from the fields it names\`);
 }
 
 export async function check_publish_after_swap(ctx) {
@@ -825,6 +836,8 @@ func CheckSecretKey(ctx *harness.Ctx) {
 
 func CheckNoMaterial(ctx *harness.Ctx) {
 	eventsSetup()
+	createdAt := float64(vault.GetVersion(eventsBg, eventsName, "v1").CreatedAt)
+	ctx.Clock.Advance(120) // the rotation happens two minutes after the version was created
 	eventsRotate(ctx, "v1")
 	record := ctx.Kafka.Records(eventsTopic)[0]
 	ctx.Assert(!strings.Contains(string(record.Value), eventsMaterial), "the event carries the material: %s. The topic is retained and replicated; carry the fingerprint", record.Value)
@@ -835,6 +848,11 @@ func CheckNoMaterial(ctx *harness.Ctx) {
 		"the event must carry type activated, secret %s, version_id v1 and the version's fingerprint, got %v", eventsName, p)
 	at, ok := p["at"].(float64)
 	ctx.Assert(ok && at == float64(int64(at)) && at > 0, "the event must carry the time as whole seconds (at), got %v", p["at"])
+	ctx.Assert(at >= createdAt+120 && at <= createdAt+125, "the event's at is %.0f, but v1 was created at %.0f and rotated 120 s later: at is when the event happened", at, createdAt)
+	for field := range p {
+		ctx.Assert(field == "type" || field == "secret" || field == "version_id" || field == "fingerprint" || field == "at",
+			"the event carries %s beyond type, secret, version_id, fingerprint and at: %s. Build it from the fields it names", field, record.Value)
+	}
 }
 
 func CheckPublishAfterSwap(ctx *harness.Ctx) {
@@ -874,16 +892,16 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kTopic = "secret.event";
-const std::string kName = "payments-db";
-const std::string kMaterial = "pg-password-CANARY-41d7";
+const std::string hTopic = "secret.event";
+const std::string hName = "payments-db";
+const std::string hMaterial = "pg-password-CANARY-41d7";
 
-void setup() {
-  vault::createVersion(kName, kMaterial, 3600, "op-ana");
-  vault::createVersion(kName, kMaterial + "-2", 3600, "op-ana");
+void hSetup() {
+  vault::createVersion(hName, hMaterial, 3600, "op-ana");
+  vault::createVersion(hName, hMaterial + "-2", 3600, "op-ana");
 }
 
-json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
+json hPayload(harness::Ctx& ctx, const harness::KafkaRecord& record) {
   try {
     return json::parse(record.Value.value_or(""));
   } catch (const std::exception& e) {
@@ -894,58 +912,67 @@ json payloadOf(harness::Ctx& ctx, const harness::KafkaRecord& record) {
 }  // namespace
 
 void CheckSecretKey(harness::Ctx& ctx) {
-  setup();
-  publishEvent("created", kName, "v1");
-  rotate(kName, "v1");
-  publishEvent("created", kName, "v2");
-  rotate(kName, "v2");
-  publishEvent("retired", kName, "v1");
-  const auto records = ctx.Kafka.Records(kTopic);
-  ctx.Equal(records.size(), 5, "five lifecycle events must produce five records on %s; the records", kTopic);
-  ctx.Equal(ctx.Kafka.Keys(kTopic), {kName, kName, kName, kName, kName}, "records must be keyed by the secret name (keyed by anything else, one secret's history scatters across partitions)");
+  hSetup();
+  publishEvent("created", hName, "v1");
+  rotate(hName, "v1");
+  publishEvent("created", hName, "v2");
+  rotate(hName, "v2");
+  publishEvent("retired", hName, "v1");
+  const auto records = ctx.Kafka.Records(hTopic);
+  ctx.Equal(records.size(), 5, "five lifecycle events must produce five records on %s; the records", hTopic);
+  ctx.Equal(ctx.Kafka.Keys(hTopic), {hName, hName, hName, hName, hName}, "records must be keyed by the secret name (keyed by anything else, one secret's history scatters across partitions)");
   for (const auto& r : records) {
-    ctx.Assert(r.Partition == records[0].Partition, "%s's events landed on partitions %d and %d: one secret's history must stay on one partition, in order", kName, records[0].Partition, r.Partition);
+    ctx.Assert(r.Partition == records[0].Partition, "%s's events landed on partitions %d and %d: one secret's history must stay on one partition, in order", hName, records[0].Partition, r.Partition);
   }
   std::vector<std::string> types;
-  for (const auto& r : records) types.push_back(payloadOf(ctx, r).value("type", ""));
+  for (const auto& r : records) types.push_back(hPayload(ctx, r).value("type", ""));
   ctx.Equal(types, {"created", "activated", "created", "activated", "retired"}, "the events must keep their order on the partition");
 }
 
 void CheckNoMaterial(harness::Ctx& ctx) {
-  setup();
-  rotate(kName, "v1");
-  const auto record = ctx.Kafka.Records(kTopic)[0];
+  hSetup();
+  const long long created_at = vault::getVersion(hName, "v1")->created_at;
+  ctx.Clock.Advance(120);  // the rotation happens two minutes after the version was created
+  rotate(hName, "v1");
+  const auto record = ctx.Kafka.Records(hTopic)[0];
   const std::string text = record.Value.value_or("");
-  ctx.Assert(text.find(kMaterial) == std::string::npos, "the event carries the material: %s. The topic is retained and replicated; carry the fingerprint", text);
-  const json p = payloadOf(ctx, record);
+  ctx.Assert(text.find(hMaterial) == std::string::npos, "the event carries the material: %s. The topic is retained and replicated; carry the fingerprint", text);
+  const json p = hPayload(ctx, record);
   ctx.Assert(!p.contains("material"), "the event has a material field: %s", p.dump());
-  ctx.Assert(p.value("type", "") == "activated" && p.value("secret", "") == kName && p.value("version_id", "") == "v1" && p.value("fingerprint", "") == vault::fingerprint(kMaterial),
-             "the event must carry type activated, secret %s, version_id v1 and the version's fingerprint, got %s", kName, p.dump());
+  ctx.Assert(p.value("type", "") == "activated" && p.value("secret", "") == hName && p.value("version_id", "") == "v1" && p.value("fingerprint", "") == vault::fingerprint(hMaterial),
+             "the event must carry type activated, secret %s, version_id v1 and the version's fingerprint, got %s", hName, p.dump());
   ctx.Assert(p.contains("at") && p["at"].is_number_integer(), "the event must carry the time as whole seconds (at), got %s", p.dump());
+  const long long at = p["at"].get<long long>();
+  ctx.Assert(at >= created_at + 120 && at <= created_at + 125, "the event's at is %d, but v1 was created at %d and rotated 120 s later: at is when the event happened", at, created_at);
+  for (auto it = p.begin(); it != p.end(); ++it) {
+    const std::string& field = it.key();
+    ctx.Assert(field == "type" || field == "secret" || field == "version_id" || field == "fingerprint" || field == "at",
+               "the event carries %s beyond type, secret, version_id, fingerprint and at: %s. Build it from the fields it names", field, text);
+  }
 }
 
 void CheckPublishAfterSwap(harness::Ctx& ctx) {
-  setup();
+  hSetup();
   // The moment the pointer moves, what is already on the topic.
   int atSwap = -1;
-  ctx.Redis.After("secret:payments-db:active", [&] { atSwap = static_cast<int>(ctx.Kafka.Records(kTopic).size()); });
-  rotate(kName, "v1");
+  ctx.Redis.After("secret:payments-db:active", [&] { atSwap = static_cast<int>(ctx.Kafka.Records(hTopic).size()); });
+  rotate(hName, "v1");
   ctx.Assert(atSwap >= 0, "rotate never moved secret:payments-db:active");
   ctx.Equal(atSwap, 0, "when the pointer moved the topic already held records: the event announced a version consumers could not resolve yet. Activate, then produce; records at the swap");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1, "after the rotation, the records on the topic");
-  ctx.Equal(rotation::validVersions(kName), {"v1"}, "after the rotation; validVersions");
-  ctx.Assert(vault::getVersion(kName, "v1")->activated_at != 0, "the activation must be recorded on v1 (vault::recordActivation)");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1, "after the rotation, the records on the topic");
+  ctx.Equal(rotation::validVersions(hName), {"v1"}, "after the rotation; validVersions");
+  ctx.Assert(vault::getVersion(hName, "v1")->activated_at != 0, "the activation must be recorded on v1 (vault::recordActivation)");
 }
 
 void CheckDurableProducer(harness::Ctx& ctx) {
-  setup();
-  ctx.Kafka.LoseAcks(kTopic, 1);
-  rotate(kName, "v1");
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 1,
+  hSetup();
+  ctx.Kafka.LoseAcks(hTopic, 1);
+  rotate(hName, "v1");
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 1,
             "one rotation whose acknowledgement was lost: the producer's retry wrote the event twice. Set enable.idempotence (with acks=all); the records on the topic");
-  rotate(kName, "v2");
-  const int lost = ctx.Kafka.Failover(kTopic);
-  ctx.Equal(ctx.Kafka.Records(kTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
+  rotate(hName, "v2");
+  const int lost = ctx.Kafka.Failover(hTopic);
+  ctx.Equal(ctx.Kafka.Records(hTopic).size(), 2, "after a leader failover %d record(s) were lost: with acks=1 the leader alone acknowledged the event. Use acks=all; the records on the topic", lost);
 }
 `,
   },

@@ -42,7 +42,7 @@ pointer; and a revoke can take the active version away from every consumer.
       id: 'overlap-window',
       title: 'The previous version stays valid for the overlap',
       detail:
-        'The swap keeps the previous version under `secret:{name}:overlap` with `OVERLAP_SECONDS` (900) as its expiry, and nothing deletes the key early; the starter deletes it the moment the new version activates.',
+        'The swap keeps the previous version under `secret:{name}:overlap` with `OVERLAP_SECONDS` (900) as its expiry, given by the same script that writes the key, and nothing deletes the key early; the starter deletes it the moment the new version activates.',
       match: {
         python: {all: [/OVERLAP_SECONDS\s*=\s*900\b/, /KEYS\[2\]/], none: [/\.delete\(/]},
         typescript: {all: [/OVERLAP_SECONDS\s*=\s*900\b/, /KEYS\[2\]/], none: [/\.del\(/]},
@@ -559,10 +559,16 @@ REVOKED = "secret:payments-db:revoked"
 def check_overlap_window(ctx):
     m = ctx.load("state")
     assert m.activate(NAME, "v1") is None, "the first activation has no previous version: activate must answer None"
+    # The overlap carries its expiry from the command that writes it: a crash between a write and a later EXPIRE keeps the old version valid for ever.
+    born = ctx.redis_after(OVERLAP, lambda: ctx.redis.ttl(OVERLAP))
     previous = m.activate(NAME, "v2")
     assert previous == "v1", f"activating v2 over v1 answered {previous!r}, expected v1"
     valid = m.valid_versions(NAME)
     assert valid == ["v2", "v1"], f"right after the swap valid_versions is {valid}: a consumer mid-deploy still holds v1, so v1 stays valid for the overlap (expected ['v2', 'v1'])"
+    assert born.fired, f"activating v2 over v1 never wrote {OVERLAP}: the previous version stays valid under the overlap key"
+    if born.error is not None:
+        raise born.error
+    assert 0 < born.result <= 900, f"right after the command that wrote {OVERLAP} its TTL was {born.result}: the swap script sets the overlap with EX OVERLAP_SECONDS itself, not in a later command"
     ttl = ctx.redis.ttl(OVERLAP)
     assert 0 < ttl <= 900, f"{OVERLAP} has TTL {ttl}, expected the 900-second overlap"
     ctx.clock.advance(890)
@@ -618,10 +624,16 @@ const REVOKED = 'secret:payments-db:revoked';
 export async function check_overlap_window(ctx) {
   const m = ctx.load('state');
   assert.equal(await m.activate(NAME, 'v1'), null, 'the first activation has no previous version: activate must answer null');
+  // The overlap carries its expiry from the command that writes it: a crash between a write and a later EXPIRE keeps the old version valid for ever.
+  const born = ctx.redisAfter(OVERLAP, () => ctx.redis.ttl(OVERLAP));
   const previous = await m.activate(NAME, 'v2');
   assert.equal(previous, 'v1', \`activating v2 over v1 answered \${JSON.stringify(previous)}, expected v1\`);
   const valid = await m.validVersions(NAME);
   assert.deepStrictEqual(valid, ['v2', 'v1'], \`right after the swap validVersions is \${JSON.stringify(valid)}: a consumer mid-deploy still holds v1, so v1 stays valid for the overlap\`);
+  assert(born.fired, \`activating v2 over v1 never wrote \${OVERLAP}: the previous version stays valid under the overlap key\`);
+  if (born.error !== undefined) throw born.error;
+  const bornTtl = await born.result;
+  assert(bornTtl > 0 && bornTtl <= 900, \`right after the command that wrote \${OVERLAP} its TTL was \${bornTtl}: the swap script sets the overlap with EX OVERLAP_SECONDS itself, not in a later command\`);
   const ttl = ctx.redis.ttl(OVERLAP);
   assert(ttl > 0 && ttl <= 900, \`\${OVERLAP} has TTL \${ttl}, expected the 900-second overlap\`);
   ctx.clock.advance(890);
@@ -703,8 +715,14 @@ func stateValid(ctx *harness.Ctx) []string {
 
 func CheckOverlapWindow(ctx *harness.Ctx) {
 	ctx.Equal(stateActivate(ctx, "v1"), "", "the first activation has no previous version: activate must answer \\"\\"")
+	// The overlap carries its expiry from the command that writes it: a crash between a write and a later EXPIRE keeps the old version valid for ever.
+	born := ctx.Redis.After(stateOverlap, func() any { return ctx.Redis.TTL(stateOverlap) })
 	ctx.Equal(stateActivate(ctx, "v2"), "v1", "activating v2 over v1 must answer the previous version")
 	ctx.Equal(stateValid(ctx), []string{"v2", "v1"}, "right after the swap a consumer mid-deploy still holds v1, so v1 stays valid for the overlap; validVersions")
+	ctx.Assert(born.Fired, "activating v2 over v1 never wrote %s: the previous version stays valid under the overlap key", stateOverlap)
+	ctx.Assert(born.Err == nil, "reading the overlap TTL failed: %v", born.Err)
+	bornTTL, _ := born.Result.(int64)
+	ctx.Assert(bornTTL > 0 && bornTTL <= 900, "right after the command that wrote %s its TTL was %d: the swap script sets the overlap with EX overlapSeconds itself, not in a later command", stateOverlap, bornTTL)
 	ttl := ctx.Redis.TTL(stateOverlap)
 	ctx.Assert(ttl > 0 && ttl <= 900, "%s has TTL %d, expected the 900-second overlap", stateOverlap, ttl)
 	ctx.Clock.Advance(890)
@@ -771,66 +789,71 @@ func CheckRevokeExplicit(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kName = "payments-db";
-const std::string kActive = "secret:payments-db:active";
-const std::string kOverlap = "secret:payments-db:overlap";
-const std::string kRevoked = "secret:payments-db:revoked";
+const std::string hName = "payments-db";
+const std::string hActive = "secret:payments-db:active";
+const std::string hOverlap = "secret:payments-db:overlap";
+const std::string hRevoked = "secret:payments-db:revoked";
 
 }  // namespace
 
 void CheckOverlapWindow(harness::Ctx& ctx) {
-  ctx.Equal(activate(kName, "v1"), "", "the first activation has no previous version: activate must answer \\"\\"");
-  ctx.Equal(activate(kName, "v2"), "v1", "activating v2 over v1 must answer the previous version");
-  ctx.Equal(validVersions(kName), {"v2", "v1"}, "right after the swap a consumer mid-deploy still holds v1, so v1 stays valid for the overlap; validVersions");
-  const long long ttl = ctx.Redis.TTL(kOverlap);
-  ctx.Assert(ttl > 0 && ttl <= 900, "%s has TTL %d, expected the 900-second overlap", kOverlap, ttl);
+  ctx.Equal(activate(hName, "v1"), "", "the first activation has no previous version: activate must answer \\"\\"");
+  // The overlap carries its expiry from the command that writes it: a crash between a write and a later EXPIRE keeps the old version valid for ever.
+  auto born = std::make_shared<std::optional<long long>>();
+  ctx.Redis.After(hOverlap, [&ctx, born] { *born = ctx.Redis.TTL(hOverlap); });
+  ctx.Equal(activate(hName, "v2"), "v1", "activating v2 over v1 must answer the previous version");
+  ctx.Equal(validVersions(hName), {"v2", "v1"}, "right after the swap a consumer mid-deploy still holds v1, so v1 stays valid for the overlap; validVersions");
+  ctx.Assert(born->has_value(), "activating v2 over v1 never wrote %s: the previous version stays valid under the overlap key", hOverlap);
+  ctx.Assert(**born > 0 && **born <= 900, "right after the command that wrote %s its TTL was %d: the swap script sets the overlap with EX kOverlapSeconds itself, not in a later command", hOverlap, **born);
+  const long long ttl = ctx.Redis.TTL(hOverlap);
+  ctx.Assert(ttl > 0 && ttl <= 900, "%s has TTL %d, expected the 900-second overlap", hOverlap, ttl);
   ctx.Clock.Advance(890);
-  ctx.Equal(validVersions(kName), {"v2", "v1"}, "890 s after the swap (the overlap lasts kOverlapSeconds = 900); validVersions");
+  ctx.Equal(validVersions(hName), {"v2", "v1"}, "890 s after the swap (the overlap lasts kOverlapSeconds = 900); validVersions");
   ctx.Clock.Advance(20);
-  ctx.Equal(validVersions(kName), {"v2"}, "past the overlap; validVersions");
+  ctx.Equal(validVersions(hName), {"v2"}, "past the overlap; validVersions");
 }
 
 void CheckAtomicSwap(harness::Ctx& ctx) {
-  activate(kName, "v1");
+  activate(hName, "v1");
   // A second rotation (to v3) lands while this one (to v2) is swapping the pointer.
   auto theirs = std::make_shared<std::optional<std::string>>();
   auto failure = std::make_shared<std::optional<std::string>>();
-  ctx.Redis.After(kActive, [theirs, failure] {
+  ctx.Redis.After(hActive, [theirs, failure] {
     try {
-      *theirs = activate(kName, "v3");
+      *theirs = activate(hName, "v3");
     } catch (const std::exception& e) {
       *failure = e.what();
     }
   });
-  const std::string ours = activate(kName, "v2");
+  const std::string ours = activate(hName, "v2");
   ctx.Assert(!failure->has_value(), "the rival activation failed: %s", failure->value_or(""));
-  ctx.Assert(theirs->has_value(), "nothing touched %s", kActive);
+  ctx.Assert(theirs->has_value(), "nothing touched %s", hActive);
   const std::string rival = **theirs;
   ctx.Assert((ours == "v1" && rival == "v2") || (ours == "v3" && rival == "v1"),
              "two activations racing over v1 answered previous versions %q (to v2) and %q (to v3): one of them read the pointer, the other moved it, and the first overwrote it, so a version vanished from every window. Read and move the pointer in one Lua script",
              ours, rival);
   const std::vector<std::string> expected = ours == "v1" ? std::vector<std::string>{"v3", "v2"} : std::vector<std::string>{"v2", "v3"};
-  ctx.Equal(std::vector<std::string>{ctx.Redis.Get(kActive).value_or(""), ctx.Redis.Get(kOverlap).value_or("")}, expected, "after the race, active and overlap");
+  ctx.Equal(std::vector<std::string>{ctx.Redis.Get(hActive).value_or(""), ctx.Redis.Get(hOverlap).value_or("")}, expected, "after the race, active and overlap");
 }
 
 void CheckPointerPermanent(harness::Ctx& ctx) {
-  activate(kName, "v1");
-  ctx.Equal(ctx.Redis.TTL(kActive), -1, "%s has a TTL: a quiet week would drop the pointer and every consumer with it. The pointer has no TTL; its TTL", kActive);
+  activate(hName, "v1");
+  ctx.Equal(ctx.Redis.TTL(hActive), -1, "%s has a TTL: a quiet week would drop the pointer and every consumer with it. The pointer has no TTL; its TTL", hActive);
   ctx.Clock.Advance(7 * 86400);
-  ctx.Equal(validVersions(kName), {"v1"}, "a week without rotations later; validVersions");
-  activate(kName, "v2");
-  ctx.Equal(ctx.Redis.TTL(kActive), -1, "after the second activation the pointer must still have no TTL; its TTL");
+  ctx.Equal(validVersions(hName), {"v1"}, "a week without rotations later; validVersions");
+  activate(hName, "v2");
+  ctx.Equal(ctx.Redis.TTL(hActive), -1, "after the second activation the pointer must still have no TTL; its TTL");
 }
 
 void CheckRevokeExplicit(harness::Ctx& ctx) {
-  activate(kName, "v1");
-  activate(kName, "v2");
-  ctx.Equal(revoke(kName, "v2"), false, "revoking the active version v2 must be refused: every consumer would lose the secret. Activate another version first; revoke answered");
-  ctx.Equal(ctx.Redis.Get(kActive).value_or(""), "v2", "a refused revoke must leave the pointer; active");
-  ctx.Assert(!ctx.Redis.SIsMember(kRevoked, "v2"), "a refused revoke still recorded v2 as revoked");
-  ctx.Equal(revoke(kName, "v1"), true, "revoking the previous version v1 must succeed; revoke answered");
-  ctx.Assert(ctx.Redis.SIsMember(kRevoked, "v1"), "%s must hold v1 after the revoke", kRevoked);
-  ctx.Equal(validVersions(kName), {"v2"}, "after revoking v1 (a revoked version stops working at once, overlap or not); validVersions");
+  activate(hName, "v1");
+  activate(hName, "v2");
+  ctx.Equal(revoke(hName, "v2"), false, "revoking the active version v2 must be refused: every consumer would lose the secret. Activate another version first; revoke answered");
+  ctx.Equal(ctx.Redis.Get(hActive).value_or(""), "v2", "a refused revoke must leave the pointer; active");
+  ctx.Assert(!ctx.Redis.SIsMember(hRevoked, "v2"), "a refused revoke still recorded v2 as revoked");
+  ctx.Equal(revoke(hName, "v1"), true, "revoking the previous version v1 must succeed; revoke answered");
+  ctx.Assert(ctx.Redis.SIsMember(hRevoked, "v1"), "%s must hold v1 after the revoke", hRevoked);
+  ctx.Equal(validVersions(hName), {"v2"}, "after revoking v1 (a revoked version stops working at once, overlap or not); validVersions");
 }
 `,
   },

@@ -68,7 +68,7 @@ cannot be reconciled against the gateway's logs.
       id: 'validate',
       title: 'Bounds units and requires the ids',
       detail:
-        'A report with an empty `request_id`, `account` or `route`, or `units` outside 0..`MAX_UNITS_PER_REQUEST` (Go `maxUnitsPerRequest`, Scala `MaxUnitsPerRequest`, C++ `kMaxUnitsPerRequest`), is **400** and counts nothing. The starter accepts any value.',
+        'A report with an empty `request_id`, `account` or `route`, or `units` outside 0..`MAX_UNITS_PER_REQUEST` (Go `maxUnitsPerRequest`, Scala `MaxUnitsPerRequest`, C++ `kMaxUnitsPerRequest`), is **400** and counts nothing; 0 and the maximum itself are counted. The starter accepts any value.',
       match: {
         python: {all: [/MAX_UNITS_PER_REQUEST\s*=/, /[<>]=?\s*MAX_UNITS_PER_REQUEST\b/]},
         typescript: {all: [/MAX_UNITS_PER_REQUEST\s*=/, /[<>]=?\s*MAX_UNITS_PER_REQUEST\b/]},
@@ -81,7 +81,7 @@ cannot be reconciled against the gateway's logs.
       id: 'gateway-required',
       title: 'Requires the reporting gateway',
       detail:
-        'A report without `X-Gateway-Id` (or with an empty one) is **400** with `missing X-Gateway-Id`, and nothing is counted. The starter reads the header for its log line only.',
+        'A report without `X-Gateway-Id` (or with an empty one) is **400** with `missing X-Gateway-Id`, a retry of a counted request included, and nothing is counted. The starter reads the header for its log line only.',
       match: {
         python: {all: [/missing X-Gateway-Id/, /\b400\b/]},
         typescript: {all: [/missing X-Gateway-Id/, /\b400\b/]},
@@ -537,17 +537,23 @@ async def check_validate(ctx):
             assert r.status_code == 400, f"a report with {what} answered {r.status_code}, expected 400"
         assert _units() == 0, f"rejected reports must count nothing; the window holds {_units()} units"
         r = await c.post("/v1/usage", json={**REPORT, "units": 1_000_000}, headers=GW)
+        zero = await c.post("/v1/usage", json={**REPORT, "request_id": "req_zero", "units": 0}, headers=GW)
     assert r.status_code == 200, f"a report of exactly MAX_UNITS_PER_REQUEST (1000000) units answered {r.status_code}, expected 200"
+    assert zero.status_code == 200 and zero.json().get("counted") is True, f"a report of 0 units is in range (0 to MAX_UNITS_PER_REQUEST) and must be counted, got {zero.status_code}: {zero.text}"
 
 
 async def check_gateway_required(ctx):
     async with _api(ctx) as c:
         r = await c.post("/v1/usage", json=REPORT)
         empty = await c.post("/v1/usage", json=REPORT, headers={"X-Gateway-Id": ""})
-    assert r.status_code == 400, f"a report without X-Gateway-Id answered {r.status_code}, expected 400"
-    assert "X-Gateway-Id" in r.text, f"the 400 must say missing X-Gateway-Id, got {r.text}"
-    assert empty.status_code == 400, f"a report with an empty X-Gateway-Id answered {empty.status_code}, expected 400"
-    assert _units() == 0 and ledger.find_record("acct_1", "req_8f21") is None, "a report no gateway claims was counted: it cannot be reconciled against any gateway's logs"
+        assert r.status_code == 400, f"a report without X-Gateway-Id answered {r.status_code}, expected 400"
+        assert "X-Gateway-Id" in r.text, f"the 400 must say missing X-Gateway-Id, got {r.text}"
+        assert empty.status_code == 400, f"a report with an empty X-Gateway-Id answered {empty.status_code}, expected 400"
+        assert _units() == 0 and ledger.find_record("acct_1", "req_8f21") is None, "a report no gateway claims was counted: it cannot be reconciled against any gateway's logs"
+        counted = await c.post("/v1/usage", json=REPORT, headers=GW)
+        assert counted.status_code == 200, f"a report with X-Gateway-Id answered {counted.status_code}: {counted.text}"
+        retry = await c.post("/v1/usage", json=REPORT)
+    assert retry.status_code == 400, f"a retry of a counted report without X-Gateway-Id answered {retry.status_code}, expected 400: the gateway is required on every report, counted before or not"
 
 
 async def check_record_gateway(ctx):
@@ -609,6 +615,8 @@ export async function check_validate(ctx) {
   assert.equal(await units(), 0, 'rejected reports must count nothing; the window total');
   const r = await c.post('/v1/usage', {json: {...REPORT, units: 1_000_000}, headers: GW});
   assert.equal(r.status, 200, \`a report of exactly MAX_UNITS_PER_REQUEST (1000000) units answered \${r.status}, expected 200\`);
+  const zero = await c.post('/v1/usage', {json: {...REPORT, request_id: 'req_zero', units: 0}, headers: GW});
+  assert(zero.status === 200 && zero.json().counted === true, \`a report of 0 units is in range (0 to MAX_UNITS_PER_REQUEST) and must be counted, got \${zero.status}: \${zero.text}\`);
 }
 
 export async function check_gateway_required(ctx) {
@@ -619,6 +627,10 @@ export async function check_gateway_required(ctx) {
   assert(r.text.includes('X-Gateway-Id'), \`the 400 must say missing X-Gateway-Id, got \${r.text}\`);
   assert.equal(empty.status, 400, \`a report with an empty X-Gateway-Id answered \${empty.status}, expected 400\`);
   assert((await units()) === 0 && (await ledger.findRecord('acct_1', 'req_8f21')) === null, "a report no gateway claims was counted: it cannot be reconciled against any gateway's logs");
+  const counted = await c.post('/v1/usage', {json: REPORT, headers: GW});
+  assert.equal(counted.status, 200, \`a report with X-Gateway-Id answered \${counted.status}: \${counted.text}\`);
+  const retry = await c.post('/v1/usage', {json: REPORT});
+  assert.equal(retry.status, 400, \`a retry of a counted report without X-Gateway-Id answered \${retry.status}, expected 400: the gateway is required on every report, counted before or not\`);
 }
 
 export async function check_record_gateway(ctx) {
@@ -644,68 +656,68 @@ import (
 )
 
 var (
-	bg     = context.Background()
-	report = map[string]any{"request_id": "req_8f21", "account": "acct_1", "route": "/v1/generate", "units": 1200}
+	hBg     = context.Background()
+	hReport = map[string]any{"request_id": "req_8f21", "account": "acct_1", "route": "/v1/generate", "units": 1200}
 )
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func with(field string, value any) map[string]any {
+func hWith(field string, value any) map[string]any {
 	out := map[string]any{}
-	for k, v := range report {
+	for k, v := range hReport {
 		out[k] = v
 	}
 	out[field] = value
 	return out
 }
 
-func windowUnits(account string) int64 {
-	return ledger.ReadWindow(bg, account, ledger.CurrentWindow()).Units
+func hWindowUnits(account string) int64 {
+	return ledger.ReadWindow(hBg, account, ledger.CurrentWindow()).Units
 }
 
-type answer struct {
+type hAnswer struct {
 	Counted bool   \`json:"counted"\`
 	Units   int64  \`json:"units"\`
 	Gateway string \`json:"gateway"\`
 }
 
-func decode(r *harness.Response) answer {
-	var a answer
+func hDecode(r *harness.Response) hAnswer {
+	var a hAnswer
 	r.Decode(&a)
 	return a
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/usage", report, "X-Gateway-Id", "gw-eu-1")
+	c := hAPI(ctx)
+	r := c.Post("/v1/usage", hReport, "X-Gateway-Id", "gw-eu-1")
 	ctx.Equal(r.Status, 200, "POST /v1/usage (%s)", r.Text())
-	a := decode(r)
+	a := hDecode(r)
 	ctx.Assert(a.Counted && a.Units == 1200, "a new report must answer counted true with its 1200 units, got %s", r.Text())
-	ctx.Equal(windowUnits("acct_1"), int64(1200), "after one report of 1200 units, the window total")
+	ctx.Equal(hWindowUnits("acct_1"), int64(1200), "after one report of 1200 units, the window total")
 }
 
 func CheckDedupe(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := c.Post("/v1/usage", report, "X-Gateway-Id", "gw-eu-1")
+	c := hAPI(ctx)
+	first := c.Post("/v1/usage", hReport, "X-Gateway-Id", "gw-eu-1")
 	ctx.Equal(first.Status, 200, "the first report (%s)", first.Text())
-	retry := c.Post("/v1/usage", report, "X-Gateway-Id", "gw-eu-1")
-	late := c.Post("/v1/usage", with("units", 900), "X-Gateway-Id", "gw-us-2")
-	other := c.Post("/v1/usage", with("account", "acct_2"), "X-Gateway-Id", "gw-eu-1")
-	total := windowUnits("acct_1")
+	retry := c.Post("/v1/usage", hReport, "X-Gateway-Id", "gw-eu-1")
+	late := c.Post("/v1/usage", hWith("units", 900), "X-Gateway-Id", "gw-us-2")
+	other := c.Post("/v1/usage", hWith("account", "acct_2"), "X-Gateway-Id", "gw-eu-1")
+	total := hWindowUnits("acct_1")
 	ctx.Assert(total == 1200, "the gateways sent req_8f21 three times and the window holds %d units: the same (account, request_id) must be counted once", total)
 	ctx.Equal(retry.Status, 200, "a retry of a counted report")
-	a := decode(retry)
+	a := hDecode(retry)
 	ctx.Assert(!a.Counted && a.Units == 1200, "a retry must answer counted false with the units counted the first time, got %s", retry.Text())
-	ctx.Equal(decode(late).Units, int64(1200), "a later report of req_8f21 with other units must answer the 1200 counted first; the units")
-	ctx.Assert(decode(other).Counted && windowUnits("acct_2") == 1200, "req_8f21 of another account is another request: it must be counted, got %s", other.Text())
+	ctx.Equal(hDecode(late).Units, int64(1200), "a later report of req_8f21 with other units must answer the 1200 counted first; the units")
+	ctx.Assert(hDecode(other).Counted && hWindowUnits("acct_2") == 1200, "req_8f21 of another account is another request: it must be counted, got %s", other.Text())
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	bad := []struct {
 		body map[string]any
 		what string
@@ -713,33 +725,39 @@ func CheckValidate(ctx *harness.Ctx) {
 		{map[string]any{"request_id": "req_neg", "account": "acct_1", "route": "/v1/generate", "units": -5}, "units -5"},
 		{map[string]any{"request_id": "req_big", "account": "acct_1", "route": "/v1/generate", "units": 1000001}, "units 1000001 (over maxUnitsPerRequest)"},
 		{map[string]any{"request_id": "req_acct", "account": "", "route": "/v1/generate", "units": 1200}, "an empty account"},
-		{with("request_id", ""), "an empty request_id"},
+		{hWith("request_id", ""), "an empty request_id"},
 		{map[string]any{"request_id": "req_route", "account": "acct_1", "route": "", "units": 1200}, "an empty route"},
 	}
 	for _, b := range bad {
 		r := c.Post("/v1/usage", b.body, "X-Gateway-Id", "gw-eu-1")
 		ctx.Equal(r.Status, 400, "a report with %s", b.what)
 	}
-	ctx.Equal(windowUnits("acct_1"), int64(0), "rejected reports must count nothing; the window total")
-	r := c.Post("/v1/usage", with("units", 1000000), "X-Gateway-Id", "gw-eu-1")
+	ctx.Equal(hWindowUnits("acct_1"), int64(0), "rejected reports must count nothing; the window total")
+	r := c.Post("/v1/usage", hWith("units", 1000000), "X-Gateway-Id", "gw-eu-1")
 	ctx.Equal(r.Status, 200, "a report of exactly maxUnitsPerRequest (1000000) units")
+	zero := c.Post("/v1/usage", map[string]any{"request_id": "req_zero", "account": "acct_1", "route": "/v1/generate", "units": 0}, "X-Gateway-Id", "gw-eu-1")
+	ctx.Assert(zero.Status == 200 && hDecode(zero).Counted, "a report of 0 units is in range (0 to maxUnitsPerRequest) and must be counted, got %d: %s", zero.Status, zero.Text())
 }
 
 func CheckGatewayRequired(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/usage", report)
-	empty := c.Post("/v1/usage", report, "X-Gateway-Id", "")
+	c := hAPI(ctx)
+	r := c.Post("/v1/usage", hReport)
+	empty := c.Post("/v1/usage", hReport, "X-Gateway-Id", "")
 	ctx.Equal(r.Status, 400, "a report without X-Gateway-Id")
 	ctx.Assert(strings.Contains(r.Text(), "X-Gateway-Id"), "the 400 must say missing X-Gateway-Id, got %s", r.Text())
 	ctx.Equal(empty.Status, 400, "a report with an empty X-Gateway-Id")
-	ctx.Assert(windowUnits("acct_1") == 0 && ledger.FindRecord(bg, "acct_1", "req_8f21") == nil, "a report no gateway claims was counted: it cannot be reconciled against any gateway's logs")
+	ctx.Assert(hWindowUnits("acct_1") == 0 && ledger.FindRecord(hBg, "acct_1", "req_8f21") == nil, "a report no gateway claims was counted: it cannot be reconciled against any gateway's logs")
+	counted := c.Post("/v1/usage", hReport, "X-Gateway-Id", "gw-eu-1")
+	ctx.Equal(counted.Status, 200, "a report with X-Gateway-Id (%s)", counted.Text())
+	retry := c.Post("/v1/usage", hReport)
+	ctx.Equal(retry.Status, 400, "a retry of a counted report without X-Gateway-Id (the gateway is required on every report, counted before or not)")
 }
 
 func CheckRecordGateway(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := c.Post("/v1/usage", report, "X-Gateway-Id", "gw-eu-1")
-	ctx.Equal(decode(r).Gateway, "gw-eu-1", "the response must echo the reporting gateway (%s)", r.Text())
-	stored := ledger.FindRecord(bg, "acct_1", "req_8f21")
+	c := hAPI(ctx)
+	r := c.Post("/v1/usage", hReport, "X-Gateway-Id", "gw-eu-1")
+	ctx.Equal(hDecode(r).Gateway, "gw-eu-1", "the response must echo the reporting gateway (%s)", r.Text())
+	stored := ledger.FindRecord(hBg, "acct_1", "req_8f21")
 	ctx.Assert(stored != nil, "the report left no record in the ledger")
 	ctx.Assert(stored.Gateway == "gw-eu-1", "the stored record names gateway %q, expected gw-eu-1: without it the row cannot be joined to the gateway's logs", stored.Gateway)
 	ctx.Assert(stored.Route == "/v1/generate" && stored.Units == 1200, "the record must keep the route and units, got %+v", *stored)
@@ -759,9 +777,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const json kReport = {{"request_id", "req_8f21"}, {"account", "acct_1"}, {"route", "/v1/generate"}, {"units", 1200}};
+const json kHReport = {{"request_id", "req_8f21"}, {"account", "acct_1"}, {"route", "/v1/generate"}, {"units", 1200}};
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -769,19 +787,19 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-json with(const std::string& field, const json& value) {
-  json out = kReport;
+json hWith(const std::string& field, const json& value) {
+  json out = kHReport;
   out[field] = value;
   return out;
 }
 
-harness::Response post(harness::HTTP& c, const json& body, const std::string& gateway = "gw-eu-1") {
+harness::Response hPost(harness::HTTP& c, const json& body, const std::string& gateway = "gw-eu-1") {
   return c.Post("/v1/usage", body.dump(), "Content-Type", "application/json", "X-Gateway-Id", gateway);
 }
 
-long long windowUnits(const std::string& account) { return ledger::readWindow(account, ledger::currentWindow()).units; }
+long long hWindowUnits(const std::string& account) { return ledger::readWindow(account, ledger::currentWindow()).units; }
 
-json parsed(const harness::Response& r) {
+json hParsed(const harness::Response& r) {
   try {
     return json::parse(r.Text());
   } catch (const std::exception&) {
@@ -792,66 +810,74 @@ json parsed(const harness::Response& r) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kReport);
+  auto c = hApi(ctx);
+  const auto r = hPost(c, kHReport);
   ctx.Equal(r.Status, 200, "POST /v1/usage (%s)", r.Text());
-  const json a = parsed(r);
+  const json a = hParsed(r);
   ctx.Assert(a.value("counted", false) && a.value("units", 0LL) == 1200, "a new report must answer counted true with its 1200 units, got %s", r.Text());
-  ctx.Equal(windowUnits("acct_1"), 1200LL, "after one report of 1200 units, the window total");
+  ctx.Equal(hWindowUnits("acct_1"), 1200LL, "after one report of 1200 units, the window total");
 }
 
 void CheckDedupe(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = post(c, kReport);
+  auto c = hApi(ctx);
+  const auto first = hPost(c, kHReport);
   ctx.Equal(first.Status, 200, "the first report (%s)", first.Text());
-  const auto retry = post(c, kReport);
-  const auto late = post(c, with("units", 900), "gw-us-2");
-  const auto other = post(c, with("account", "acct_2"));
-  const long long total = windowUnits("acct_1");
+  const auto retry = hPost(c, kHReport);
+  const auto late = hPost(c, hWith("units", 900), "gw-us-2");
+  const auto other = hPost(c, hWith("account", "acct_2"));
+  const long long total = hWindowUnits("acct_1");
   ctx.Assert(total == 1200, "the gateways sent req_8f21 three times and the window holds %d units: the same (account, request_id) must be counted once", total);
   ctx.Equal(retry.Status, 200, "a retry of a counted report");
-  const json a = parsed(retry);
+  const json a = hParsed(retry);
   ctx.Assert(!a.value("counted", true) && a.value("units", 0LL) == 1200, "a retry must answer counted false with the units counted the first time, got %s", retry.Text());
-  ctx.Equal(parsed(late).value("units", 0LL), 1200LL, "a later report of req_8f21 with other units must answer the 1200 counted first; the units");
-  ctx.Assert(parsed(other).value("counted", false) && windowUnits("acct_2") == 1200, "req_8f21 of another account is another request: it must be counted, got %s", other.Text());
+  ctx.Equal(hParsed(late).value("units", 0LL), 1200LL, "a later report of req_8f21 with other units must answer the 1200 counted first; the units");
+  ctx.Assert(hParsed(other).value("counted", false) && hWindowUnits("acct_2") == 1200, "req_8f21 of another account is another request: it must be counted, got %s", other.Text());
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  json negative = with("units", -5);
+  auto c = hApi(ctx);
+  json negative = hWith("units", -5);
   negative["request_id"] = "req_neg";
-  json big = with("units", 1000001);
+  json big = hWith("units", 1000001);
   big["request_id"] = "req_big";
-  json noAccount = with("account", "");
+  json noAccount = hWith("account", "");
   noAccount["request_id"] = "req_acct";
-  json noRoute = with("route", "");
+  json noRoute = hWith("route", "");
   noRoute["request_id"] = "req_route";
   const std::vector<std::pair<json, std::string>> bad = {
       {negative, "units -5"},
       {big, "units 1000001 (over kMaxUnitsPerRequest)"},
       {noAccount, "an empty account"},
-      {with("request_id", ""), "an empty request_id"},
+      {hWith("request_id", ""), "an empty request_id"},
       {noRoute, "an empty route"},
   };
-  for (const auto& [body, what] : bad) ctx.Equal(post(c, body).Status, 400, "a report with %s", what);
-  ctx.Equal(windowUnits("acct_1"), 0LL, "rejected reports must count nothing; the window total");
-  ctx.Equal(post(c, with("units", 1000000)).Status, 200, "a report of exactly kMaxUnitsPerRequest (1000000) units");
+  for (const auto& [body, what] : bad) ctx.Equal(hPost(c, body).Status, 400, "a report with %s", what);
+  ctx.Equal(hWindowUnits("acct_1"), 0LL, "rejected reports must count nothing; the window total");
+  ctx.Equal(hPost(c, hWith("units", 1000000)).Status, 200, "a report of exactly kMaxUnitsPerRequest (1000000) units");
+  json zeroBody = hWith("units", 0);
+  zeroBody["request_id"] = "req_zero";
+  const auto zero = hPost(c, zeroBody);
+  ctx.Assert(zero.Status == 200 && hParsed(zero).value("counted", false), "a report of 0 units is in range (0 to kMaxUnitsPerRequest) and must be counted, got %d: %s", zero.Status, zero.Text());
 }
 
 void CheckGatewayRequired(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = c.Post("/v1/usage", kReport.dump(), "Content-Type", "application/json");
-  const auto empty = post(c, kReport, "");
+  auto c = hApi(ctx);
+  const auto r = c.Post("/v1/usage", kHReport.dump(), "Content-Type", "application/json");
+  const auto empty = hPost(c, kHReport, "");
   ctx.Equal(r.Status, 400, "a report without X-Gateway-Id");
   ctx.Assert(r.Text().find("X-Gateway-Id") != std::string::npos, "the 400 must say missing X-Gateway-Id, got %s", r.Text());
   ctx.Equal(empty.Status, 400, "a report with an empty X-Gateway-Id");
-  ctx.Assert(windowUnits("acct_1") == 0 && !ledger::findRecord("acct_1", "req_8f21"), "a report no gateway claims was counted: it cannot be reconciled against any gateway's logs");
+  ctx.Assert(hWindowUnits("acct_1") == 0 && !ledger::findRecord("acct_1", "req_8f21"), "a report no gateway claims was counted: it cannot be reconciled against any gateway's logs");
+  const auto counted = hPost(c, kHReport);
+  ctx.Equal(counted.Status, 200, "a report with X-Gateway-Id (%s)", counted.Text());
+  const auto retry = c.Post("/v1/usage", kHReport.dump(), "Content-Type", "application/json");
+  ctx.Equal(retry.Status, 400, "a retry of a counted report without X-Gateway-Id (the gateway is required on every report, counted before or not)");
 }
 
 void CheckRecordGateway(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = post(c, kReport);
-  ctx.Equal(parsed(r).value("gateway", ""), "gw-eu-1", "the response must echo the reporting gateway (%s)", r.Text());
+  auto c = hApi(ctx);
+  const auto r = hPost(c, kHReport);
+  ctx.Equal(hParsed(r).value("gateway", ""), "gw-eu-1", "the response must echo the reporting gateway (%s)", r.Text());
   const auto stored = ledger::findRecord("acct_1", "req_8f21");
   ctx.Assert(stored.has_value(), "the report left no record in the ledger");
   ctx.Assert(stored->gateway == "gw-eu-1", "the stored record names gateway %q, expected gw-eu-1: without it the row cannot be joined to the gateway's logs", stored->gateway);

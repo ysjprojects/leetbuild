@@ -55,7 +55,7 @@ one tenant initiates a terabyte; a client that timed out and retried starts a se
       id: 'part-size',
       title: 'Bounds the part size',
       detail:
-        '`part_bytes` outside `MIN_PART_BYTES`..`MAX_PART_BYTES` (5 MiB to 64 MiB) is **400** and creates nothing; the starter takes any part size, so 1-byte parts make a manifest of millions of entries.',
+        '`part_bytes` outside `MIN_PART_BYTES`..`MAX_PART_BYTES` (5 MiB to 64 MiB, both bounds included) is **400** and creates nothing; the starter takes any part size, so 1-byte parts make a manifest of millions of entries.',
       match: {
         python: {all: [/MIN_PART_BYTES/, /MAX_PART_BYTES/, /\b400\b/]},
         typescript: {all: [/MIN_PART_BYTES/, /MAX_PART_BYTES/, /\b400\b/]},
@@ -81,7 +81,7 @@ one tenant initiates a terabyte; a client that timed out and retried starts a se
       id: 'quota',
       title: 'Holds an upload to the 5 GiB tenant quota',
       detail:
-        'A `total_bytes` above `MAX_UPLOAD_BYTES` (5 GiB) is **413**, one that is not positive is **400**, and neither creates an upload; the starter checks no total, so one tenant can reserve unlimited storage.',
+        'A `total_bytes` above `MAX_UPLOAD_BYTES` (5 GiB) is **413**, one that is zero or negative is **400**, and neither creates an upload; the starter checks no total, so one tenant can reserve unlimited storage.',
       match: {
         python: {all: [/MAX_UPLOAD_BYTES/, /\b413\b/]},
         typescript: {all: [/MAX_UPLOAD_BYTES/, /\b413\b/]},
@@ -627,9 +627,12 @@ async def check_part_size(ctx):
         tiny = await _init(c, 10 * MIB, 1, "k-1")
         small = await _init(c, 10 * MIB, 4 * MIB, "k-2")
         huge = await _init(c, 1 << 30, 128 * MIB, "k-3")
+        under = await _init(c, 10 * MIB, 5 * MIB - 1, "k-6")
+        over = await _init(c, 1 << 30, 64 * MIB + 1, "k-7")
         assert tiny.status_code == 400, f"part_bytes 1 answered {tiny.status_code}: {tiny.text}. Ten million 1-byte parts would be ten million manifest entries; expected 400"
         assert small.status_code == 400, f"part_bytes 4 MiB (under MIN_PART_BYTES, 5 MiB) answered {small.status_code}, expected 400"
         assert huge.status_code == 400, f"part_bytes 128 MiB (over MAX_PART_BYTES, 64 MiB) answered {huge.status_code}, expected 400"
+        assert under.status_code == 400 and over.status_code == 400, f"part_bytes of 5 MiB - 1 and 64 MiB + 1 answered {under.status_code} and {over.status_code}, expected 400 for both: the bounds are 5 MiB (5 << 20) and 64 MiB (64 << 20) exactly"
         assert _created(ctx) == 0, f"{_created(ctx)} upload(s) were created from part sizes out of range"
         low = await _init(c, 10 * MIB, 5 * MIB, "k-4")
         high = await _init(c, 1 << 30, 64 * MIB, "k-5")
@@ -652,8 +655,10 @@ async def check_quota(ctx):
     async with _api(ctx) as c:
         over = await _init(c, (5 << 30) + 1, 64 * MIB, "k-1")
         empty = await _init(c, 0, 5 * MIB, "k-2")
+        negative = await _init(c, -5 * MIB, 5 * MIB, "k-4")
         assert over.status_code == 413, f"total_bytes 5 GiB + 1 answered {over.status_code}: {over.text}. Over the tenant quota is 413"
         assert empty.status_code == 400, f"total_bytes 0 answered {empty.status_code}, expected 400"
+        assert negative.status_code == 400, f"total_bytes -5 MiB answered {negative.status_code}, expected 400: a total that is not positive is refused"
         assert _created(ctx) == 0, f"{_created(ctx)} upload(s) were created for a total over the quota or not positive"
         full = await _init(c, 5 << 30, 64 * MIB, "k-3")
     assert full.status_code == 201 and full.json().get("part_count") == 80, f"exactly 5 GiB in 64 MiB parts must be accepted as 80 parts, got {full.status_code} {full.text}"
@@ -702,9 +707,12 @@ export async function check_part_size(ctx) {
   const tiny = await init(c, 10 * MIB, 1, 'k-1');
   const small = await init(c, 10 * MIB, 4 * MIB, 'k-2');
   const huge = await init(c, 2 ** 30, 128 * MIB, 'k-3');
+  const under = await init(c, 10 * MIB, 5 * MIB - 1, 'k-6');
+  const over = await init(c, 2 ** 30, 64 * MIB + 1, 'k-7');
   assert.equal(tiny.status, 400, \`part_bytes 1 answered \${tiny.status}: \${tiny.text}. Ten million 1-byte parts would be ten million manifest entries; expected 400\`);
   assert.equal(small.status, 400, \`part_bytes 4 MiB (under MIN_PART_BYTES, 5 MiB) answered \${small.status}, expected 400\`);
   assert.equal(huge.status, 400, \`part_bytes 128 MiB (over MAX_PART_BYTES, 64 MiB) answered \${huge.status}, expected 400\`);
+  assert(under.status === 400 && over.status === 400, \`part_bytes of 5 MiB - 1 and 64 MiB + 1 answered \${under.status} and \${over.status}, expected 400 for both: the bounds are 5 MiB (5 * 2 ** 20) and 64 MiB (64 * 2 ** 20) exactly\`);
   assert.equal(created(ctx), 0, \`\${created(ctx)} upload(s) were created from part sizes out of range\`);
   const low = await init(c, 10 * MIB, 5 * MIB, 'k-4');
   const high = await init(c, 2 ** 30, 64 * MIB, 'k-5');
@@ -727,8 +735,10 @@ export async function check_quota(ctx) {
   const {c} = api(ctx);
   const over = await init(c, 5 * 2 ** 30 + 1, 64 * MIB, 'k-1');
   const empty = await init(c, 0, 5 * MIB, 'k-2');
+  const negative = await init(c, -5 * MIB, 5 * MIB, 'k-4');
   assert.equal(over.status, 413, \`total_bytes 5 GiB + 1 answered \${over.status}: \${over.text}. Over the tenant quota is 413\`);
   assert.equal(empty.status, 400, \`total_bytes 0 answered \${empty.status}, expected 400\`);
+  assert.equal(negative.status, 400, \`total_bytes -5 MiB answered \${negative.status}, expected 400: a total that is not positive is refused\`);
   assert.equal(created(ctx), 0, \`\${created(ctx)} upload(s) were created for a total over the quota or not positive\`);
   const full = await init(c, 5 * 2 ** 30, 64 * MIB, 'k-3');
   assert(full.status === 201 && full.json().part_count === 80, \`exactly 5 GiB in 64 MiB parts must be accepted as 80 parts, got \${full.status} \${full.text}\`);
@@ -762,102 +772,107 @@ import (
 	"leetbuild/harness"
 )
 
-const mib = int64(1) << 20
+const hMib = int64(1) << 20
 
-type initView struct {
+type hInitView struct {
 	UploadID  string \`json:"upload_id"\`
 	PartBytes int64  \`json:"part_bytes"\`
 	PartCount int    \`json:"part_count"\`
 	Status    string \`json:"status"\`
 }
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func initAs(c *harness.HTTP, total, part int64, key, tenant string) *harness.Response {
+func hInitAs(c *harness.HTTP, total, part int64, key, tenant string) *harness.Response {
 	body := map[string]any{"total_bytes": total, "part_bytes": part, "content_type": "video/mp4"}
 	return c.Post("/v1/uploads", body, "X-Tenant-Id", tenant, "Idempotency-Key", key)
 }
 
-func decoded(r *harness.Response) initView {
-	var v initView
+func hDecoded(r *harness.Response) hInitView {
+	var v hInitView
 	r.Decode(&v)
 	return v
 }
 
-func created(ctx *harness.Ctx) int {
+func hCreated(ctx *harness.Ctx) int {
 	seq, _ := ctx.Redis.Get("upload:seq")
 	n, _ := strconv.Atoi(seq)
 	return n
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c := api(ctx)
-	r := initAs(c, 10*mib, 5*mib, "k-1", "t1")
+	c := hAPI(ctx)
+	r := hInitAs(c, 10*hMib, 5*hMib, "k-1", "t1")
 	ctx.Equal(r.Status, 201, "POST /v1/uploads (%s)", r.Text())
-	body := decoded(r)
-	ctx.Assert(body.PartCount == 2 && body.PartBytes == 5*mib && body.Status == "pending", "10 MiB in 5 MiB parts must answer part_count 2, part_bytes 5 MiB, status pending; got %s", r.Text())
+	body := hDecoded(r)
+	ctx.Assert(body.PartCount == 2 && body.PartBytes == 5*hMib && body.Status == "pending", "10 MiB in 5 MiB parts must answer part_count 2, part_bytes 5 MiB, status pending; got %s", r.Text())
 	upload := store.GetUpload(context.Background(), body.UploadID)
-	ctx.Assert(upload != nil && upload.Tenant == "t1" && upload.TotalBytes == 10*mib, "the upload record of %s is %+v", body.UploadID, upload)
-	anonymous := c.Post("/v1/uploads", map[string]any{"total_bytes": 10 * mib, "part_bytes": 5 * mib, "content_type": "video/mp4"}, "Idempotency-Key", "k-2")
+	ctx.Assert(upload != nil && upload.Tenant == "t1" && upload.TotalBytes == 10*hMib, "the upload record of %s is %+v", body.UploadID, upload)
+	anonymous := c.Post("/v1/uploads", map[string]any{"total_bytes": 10 * hMib, "part_bytes": 5 * hMib, "content_type": "video/mp4"}, "Idempotency-Key", "k-2")
 	ctx.Equal(anonymous.Status, 401, "an initiation without X-Tenant-Id")
 }
 
 func CheckPartSize(ctx *harness.Ctx) {
-	c := api(ctx)
-	tiny := initAs(c, 10*mib, 1, "k-1", "t1")
-	small := initAs(c, 10*mib, 4*mib, "k-2", "t1")
-	huge := initAs(c, 1<<30, 128*mib, "k-3", "t1")
+	c := hAPI(ctx)
+	tiny := hInitAs(c, 10*hMib, 1, "k-1", "t1")
+	small := hInitAs(c, 10*hMib, 4*hMib, "k-2", "t1")
+	huge := hInitAs(c, 1<<30, 128*hMib, "k-3", "t1")
+	under := hInitAs(c, 10*hMib, 5*hMib-1, "k-6", "t1")
+	over := hInitAs(c, 1<<30, 64*hMib+1, "k-7", "t1")
 	ctx.Equal(tiny.Status, 400, "part_bytes 1 (ten million 1-byte parts would be ten million manifest entries; %s)", tiny.Text())
 	ctx.Equal(small.Status, 400, "part_bytes 4 MiB (under minPartBytes, 5 MiB)")
 	ctx.Equal(huge.Status, 400, "part_bytes 128 MiB (over maxPartBytes, 64 MiB)")
-	ctx.Equal(created(ctx), 0, "uploads created from part sizes out of range")
-	low := initAs(c, 10*mib, 5*mib, "k-4", "t1")
-	high := initAs(c, 1<<30, 64*mib, "k-5", "t1")
+	ctx.Assert(under.Status == 400 && over.Status == 400, "part_bytes of 5 MiB - 1 and 64 MiB + 1 answered %d and %d, expected 400 for both: the bounds are 5 MiB (5 << 20) and 64 MiB (64 << 20) exactly", under.Status, over.Status)
+	ctx.Equal(hCreated(ctx), 0, "uploads created from part sizes out of range")
+	low := hInitAs(c, 10*hMib, 5*hMib, "k-4", "t1")
+	high := hInitAs(c, 1<<30, 64*hMib, "k-5", "t1")
 	ctx.Assert(low.Status == 201 && high.Status == 201, "part_bytes of exactly 5 MiB and 64 MiB must be accepted, got %d and %d", low.Status, high.Status)
 }
 
 func CheckPartCount(ctx *harness.Ctx) {
-	c := api(ctx)
-	tail := initAs(c, 11*mib, 5*mib, "k-1", "t1")
-	short := initAs(c, 3*mib, 5*mib, "k-2", "t1")
-	even := initAs(c, 10*mib, 5*mib, "k-3", "t1")
-	ctx.Assert(tail.Status == 201 && decoded(tail).PartCount == 3, "11 MiB in 5 MiB parts answered %d %s: it needs part_count 3 (the last part holds 1 MiB), or that megabyte can never be sent", tail.Status, tail.Text())
-	ctx.Assert(short.Status == 201 && decoded(short).PartCount == 1, "a 3 MiB file in 5 MiB parts answered %d %s: it is one short part, part_count 1", short.Status, short.Text())
-	ctx.Equal(decoded(even).PartCount, 2, "10 MiB in 5 MiB parts; the part count")
-	upload := store.GetUpload(context.Background(), decoded(tail).UploadID)
+	c := hAPI(ctx)
+	tail := hInitAs(c, 11*hMib, 5*hMib, "k-1", "t1")
+	short := hInitAs(c, 3*hMib, 5*hMib, "k-2", "t1")
+	even := hInitAs(c, 10*hMib, 5*hMib, "k-3", "t1")
+	ctx.Assert(tail.Status == 201 && hDecoded(tail).PartCount == 3, "11 MiB in 5 MiB parts answered %d %s: it needs part_count 3 (the last part holds 1 MiB), or that megabyte can never be sent", tail.Status, tail.Text())
+	ctx.Assert(short.Status == 201 && hDecoded(short).PartCount == 1, "a 3 MiB file in 5 MiB parts answered %d %s: it is one short part, part_count 1", short.Status, short.Text())
+	ctx.Equal(hDecoded(even).PartCount, 2, "10 MiB in 5 MiB parts; the part count")
+	upload := store.GetUpload(context.Background(), hDecoded(tail).UploadID)
 	ctx.Assert(upload != nil && upload.PartCount == 3, "the upload record must hold part_count 3, got %+v", upload)
 }
 
 func CheckQuota(ctx *harness.Ctx) {
-	c := api(ctx)
-	over := initAs(c, 5<<30+1, 64*mib, "k-1", "t1")
-	empty := initAs(c, 0, 5*mib, "k-2", "t1")
+	c := hAPI(ctx)
+	over := hInitAs(c, 5<<30+1, 64*hMib, "k-1", "t1")
+	empty := hInitAs(c, 0, 5*hMib, "k-2", "t1")
+	negative := hInitAs(c, -5*hMib, 5*hMib, "k-4", "t1")
 	ctx.Equal(over.Status, 413, "total_bytes 5 GiB + 1 is over the tenant quota (%s)", over.Text())
 	ctx.Equal(empty.Status, 400, "total_bytes 0")
-	ctx.Equal(created(ctx), 0, "uploads created for a total over the quota or not positive")
-	full := initAs(c, 5<<30, 64*mib, "k-3", "t1")
-	ctx.Assert(full.Status == 201 && decoded(full).PartCount == 80, "exactly 5 GiB in 64 MiB parts must be accepted as 80 parts, got %d %s", full.Status, full.Text())
+	ctx.Equal(negative.Status, 400, "total_bytes -5 MiB (a total that is not positive is refused)")
+	ctx.Equal(hCreated(ctx), 0, "uploads created for a total over the quota or not positive")
+	full := hInitAs(c, 5<<30, 64*hMib, "k-3", "t1")
+	ctx.Assert(full.Status == 201 && hDecoded(full).PartCount == 80, "exactly 5 GiB in 64 MiB parts must be accepted as 80 parts, got %d %s", full.Status, full.Text())
 }
 
 func CheckIdempotency(ctx *harness.Ctx) {
-	c := api(ctx)
-	first := initAs(c, 10*mib, 5*mib, "k-1", "t1")
-	retry := initAs(c, 10*mib, 5*mib, "k-1", "t1")
+	c := hAPI(ctx)
+	first := hInitAs(c, 10*hMib, 5*hMib, "k-1", "t1")
+	retry := hInitAs(c, 10*hMib, 5*hMib, "k-1", "t1")
 	ctx.Equal(first.Status, 201, "the first initiation (%s)", first.Text())
-	firstID := decoded(first).UploadID
-	ctx.Assert((retry.Status == 200 || retry.Status == 201) && decoded(retry).UploadID == firstID, "a retry with the same Idempotency-Key answered %d %s, expected the first upload %s: a second upload orphans every part the client sent to the first", retry.Status, retry.Text(), firstID)
-	ctx.Equal(created(ctx), 1, "the retry must not create a second upload; uploads created")
-	other := decoded(initAs(c, 10*mib, 5*mib, "k-1", "t2")).UploadID
-	fresh := decoded(initAs(c, 10*mib, 5*mib, "k-2", "t1")).UploadID
+	firstID := hDecoded(first).UploadID
+	ctx.Assert((retry.Status == 200 || retry.Status == 201) && hDecoded(retry).UploadID == firstID, "a retry with the same Idempotency-Key answered %d %s, expected the first upload %s: a second upload orphans every part the client sent to the first", retry.Status, retry.Text(), firstID)
+	ctx.Equal(hCreated(ctx), 1, "the retry must not create a second upload; uploads created")
+	other := hDecoded(hInitAs(c, 10*hMib, 5*hMib, "k-1", "t2")).UploadID
+	fresh := hDecoded(hInitAs(c, 10*hMib, 5*hMib, "k-2", "t1")).UploadID
 	ctx.Assert(other != firstID, "another tenant's initiation with the same key got the first tenant's upload: the key is scoped to the tenant")
 	ctx.Assert(fresh != firstID && fresh != other, "a new Idempotency-Key must create a new upload")
-	none := c.Post("/v1/uploads", map[string]any{"total_bytes": 10 * mib, "part_bytes": 5 * mib, "content_type": "video/mp4"}, "X-Tenant-Id", "t1")
+	none := c.Post("/v1/uploads", map[string]any{"total_bytes": 10 * hMib, "part_bytes": 5 * hMib, "content_type": "video/mp4"}, "X-Tenant-Id", "t1")
 	ctx.Equal(none.Status, 400, "an initiation without Idempotency-Key")
-	ctx.Equal(created(ctx), 3, "uploads created (k-1 for t1, k-1 for t2, k-2)")
+	ctx.Equal(hCreated(ctx), 3, "uploads created (k-1 for t1, k-1 for t2, k-2)")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -870,9 +885,9 @@ func CheckIdempotency(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long kMib = 1LL << 20;
+constexpr long long kHarnessMib = 1LL << 20;
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hAPI(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -880,20 +895,20 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-std::string body(long long total, long long part) {
+std::string hBody(long long total, long long part) {
   return nlohmann::json{{"total_bytes", total}, {"part_bytes", part}, {"content_type", "video/mp4"}}.dump();
 }
 
-harness::Response initAs(harness::HTTP& c, long long total, long long part, const std::string& key, const std::string& tenant = "t1") {
-  return c.Post("/v1/uploads", body(total, part), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
+harness::Response hInitAs(harness::HTTP& c, long long total, long long part, const std::string& key, const std::string& tenant = "t1") {
+  return c.Post("/v1/uploads", hBody(total, part), "Content-Type", "application/json", "X-Tenant-Id", tenant, "Idempotency-Key", key);
 }
 
-nlohmann::json parsed(const harness::Response& r) {
+nlohmann::json hParsed(const harness::Response& r) {
   const auto j = nlohmann::json::parse(r.Text(), nullptr, false);
   return j.is_object() ? j : nlohmann::json::object();
 }
 
-long long created(harness::Ctx& ctx) {
+long long hCreated(harness::Ctx& ctx) {
   const auto seq = ctx.Redis.Get("upload:seq");
   return seq ? std::stoll(*seq) : 0;
 }
@@ -901,72 +916,77 @@ long long created(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto r = initAs(c, 10 * kMib, 5 * kMib, "k-1");
+  auto c = hAPI(ctx);
+  const auto r = hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib, "k-1");
   ctx.Equal(r.Status, 201, "POST /v1/uploads (%s)", r.Text());
-  const auto b = parsed(r);
-  ctx.Assert(b.value("part_count", 0) == 2 && b.value("part_bytes", 0LL) == 5 * kMib && b.value("status", "") == "pending",
+  const auto b = hParsed(r);
+  ctx.Assert(b.value("part_count", 0) == 2 && b.value("part_bytes", 0LL) == 5 * kHarnessMib && b.value("status", "") == "pending",
              "10 MiB in 5 MiB parts must answer part_count 2, part_bytes 5 MiB, status pending; got %s", r.Text());
   const auto upload = store::getUpload(b.value("upload_id", ""));
-  ctx.Assert(upload && upload->tenant == "t1" && upload->total_bytes == 10 * kMib, "the upload record of %s is missing or wrong (%s)", b.value("upload_id", ""), r.Text());
-  const auto anonymous = c.Post("/v1/uploads", body(10 * kMib, 5 * kMib), "Content-Type", "application/json", "Idempotency-Key", "k-2");
+  ctx.Assert(upload && upload->tenant == "t1" && upload->total_bytes == 10 * kHarnessMib, "the upload record of %s is missing or wrong (%s)", b.value("upload_id", ""), r.Text());
+  const auto anonymous = c.Post("/v1/uploads", hBody(10 * kHarnessMib, 5 * kHarnessMib), "Content-Type", "application/json", "Idempotency-Key", "k-2");
   ctx.Equal(anonymous.Status, 401, "an initiation without X-Tenant-Id");
 }
 
 void CheckPartSize(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto tiny = initAs(c, 10 * kMib, 1, "k-1");
-  const auto small = initAs(c, 10 * kMib, 4 * kMib, "k-2");
-  const auto huge = initAs(c, 1LL << 30, 128 * kMib, "k-3");
+  auto c = hAPI(ctx);
+  const auto tiny = hInitAs(c, 10 * kHarnessMib, 1, "k-1");
+  const auto small = hInitAs(c, 10 * kHarnessMib, 4 * kHarnessMib, "k-2");
+  const auto huge = hInitAs(c, 1LL << 30, 128 * kHarnessMib, "k-3");
+  const auto under = hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib - 1, "k-6");
+  const auto over = hInitAs(c, 1LL << 30, 64 * kHarnessMib + 1, "k-7");
   ctx.Equal(tiny.Status, 400, "part_bytes 1 (ten million 1-byte parts would be ten million manifest entries; %s)", tiny.Text());
   ctx.Equal(small.Status, 400, "part_bytes 4 MiB (under kMinPartBytes, 5 MiB)");
   ctx.Equal(huge.Status, 400, "part_bytes 128 MiB (over kMaxPartBytes, 64 MiB)");
-  ctx.Equal(created(ctx), 0, "uploads created from part sizes out of range");
-  const auto low = initAs(c, 10 * kMib, 5 * kMib, "k-4");
-  const auto high = initAs(c, 1LL << 30, 64 * kMib, "k-5");
+  ctx.Assert(under.Status == 400 && over.Status == 400, "part_bytes of 5 MiB - 1 and 64 MiB + 1 answered %d and %d, expected 400 for both: the bounds are 5 MiB (5 << 20) and 64 MiB (64 << 20) exactly", under.Status, over.Status);
+  ctx.Equal(hCreated(ctx), 0, "uploads created from part sizes out of range");
+  const auto low = hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib, "k-4");
+  const auto high = hInitAs(c, 1LL << 30, 64 * kHarnessMib, "k-5");
   ctx.Assert(low.Status == 201 && high.Status == 201, "part_bytes of exactly 5 MiB and 64 MiB must be accepted, got %d and %d", low.Status, high.Status);
 }
 
 void CheckPartCount(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto tail = initAs(c, 11 * kMib, 5 * kMib, "k-1");
-  const auto short_ = initAs(c, 3 * kMib, 5 * kMib, "k-2");
-  const auto even = initAs(c, 10 * kMib, 5 * kMib, "k-3");
-  ctx.Assert(tail.Status == 201 && parsed(tail).value("part_count", 0) == 3,
+  auto c = hAPI(ctx);
+  const auto tail = hInitAs(c, 11 * kHarnessMib, 5 * kHarnessMib, "k-1");
+  const auto short_ = hInitAs(c, 3 * kHarnessMib, 5 * kHarnessMib, "k-2");
+  const auto even = hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib, "k-3");
+  ctx.Assert(tail.Status == 201 && hParsed(tail).value("part_count", 0) == 3,
              "11 MiB in 5 MiB parts answered %d %s: it needs part_count 3 (the last part holds 1 MiB), or that megabyte can never be sent", tail.Status, tail.Text());
-  ctx.Assert(short_.Status == 201 && parsed(short_).value("part_count", 0) == 1, "a 3 MiB file in 5 MiB parts answered %d %s: it is one short part, part_count 1", short_.Status, short_.Text());
-  ctx.Equal(parsed(even).value("part_count", 0), 2, "10 MiB in 5 MiB parts; the part count");
-  const auto upload = store::getUpload(parsed(tail).value("upload_id", ""));
+  ctx.Assert(short_.Status == 201 && hParsed(short_).value("part_count", 0) == 1, "a 3 MiB file in 5 MiB parts answered %d %s: it is one short part, part_count 1", short_.Status, short_.Text());
+  ctx.Equal(hParsed(even).value("part_count", 0), 2, "10 MiB in 5 MiB parts; the part count");
+  const auto upload = store::getUpload(hParsed(tail).value("upload_id", ""));
   ctx.Assert(upload && upload->part_count == 3, "the upload record must hold part_count 3, got %d", upload ? upload->part_count : 0);
 }
 
 void CheckQuota(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto over = initAs(c, (5LL << 30) + 1, 64 * kMib, "k-1");
-  const auto empty = initAs(c, 0, 5 * kMib, "k-2");
+  auto c = hAPI(ctx);
+  const auto over = hInitAs(c, (5LL << 30) + 1, 64 * kHarnessMib, "k-1");
+  const auto empty = hInitAs(c, 0, 5 * kHarnessMib, "k-2");
+  const auto negative = hInitAs(c, -5 * kHarnessMib, 5 * kHarnessMib, "k-4");
   ctx.Equal(over.Status, 413, "total_bytes 5 GiB + 1 is over the tenant quota (%s)", over.Text());
   ctx.Equal(empty.Status, 400, "total_bytes 0");
-  ctx.Equal(created(ctx), 0, "uploads created for a total over the quota or not positive");
-  const auto full = initAs(c, 5LL << 30, 64 * kMib, "k-3");
-  ctx.Assert(full.Status == 201 && parsed(full).value("part_count", 0) == 80, "exactly 5 GiB in 64 MiB parts must be accepted as 80 parts, got %d %s", full.Status, full.Text());
+  ctx.Equal(negative.Status, 400, "total_bytes -5 MiB (a total that is not positive is refused)");
+  ctx.Equal(hCreated(ctx), 0, "uploads created for a total over the quota or not positive");
+  const auto full = hInitAs(c, 5LL << 30, 64 * kHarnessMib, "k-3");
+  ctx.Assert(full.Status == 201 && hParsed(full).value("part_count", 0) == 80, "exactly 5 GiB in 64 MiB parts must be accepted as 80 parts, got %d %s", full.Status, full.Text());
 }
 
 void CheckIdempotency(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  const auto first = initAs(c, 10 * kMib, 5 * kMib, "k-1");
-  const auto retry = initAs(c, 10 * kMib, 5 * kMib, "k-1");
+  auto c = hAPI(ctx);
+  const auto first = hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib, "k-1");
+  const auto retry = hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib, "k-1");
   ctx.Equal(first.Status, 201, "the first initiation (%s)", first.Text());
-  const std::string first_id = parsed(first).value("upload_id", "");
-  ctx.Assert((retry.Status == 200 || retry.Status == 201) && parsed(retry).value("upload_id", "") == first_id,
+  const std::string first_id = hParsed(first).value("upload_id", "");
+  ctx.Assert((retry.Status == 200 || retry.Status == 201) && hParsed(retry).value("upload_id", "") == first_id,
              "a retry with the same Idempotency-Key answered %d %s, expected the first upload %s: a second upload orphans every part the client sent to the first", retry.Status, retry.Text(), first_id);
-  ctx.Equal(created(ctx), 1, "the retry must not create a second upload; uploads created");
-  const std::string other = parsed(initAs(c, 10 * kMib, 5 * kMib, "k-1", "t2")).value("upload_id", "");
-  const std::string fresh = parsed(initAs(c, 10 * kMib, 5 * kMib, "k-2")).value("upload_id", "");
+  ctx.Equal(hCreated(ctx), 1, "the retry must not create a second upload; uploads created");
+  const std::string other = hParsed(hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib, "k-1", "t2")).value("upload_id", "");
+  const std::string fresh = hParsed(hInitAs(c, 10 * kHarnessMib, 5 * kHarnessMib, "k-2")).value("upload_id", "");
   ctx.Assert(other != first_id, "another tenant's initiation with the same key got the first tenant's upload: the key is scoped to the tenant");
   ctx.Assert(fresh != first_id && fresh != other, "a new Idempotency-Key must create a new upload");
-  const auto none = c.Post("/v1/uploads", body(10 * kMib, 5 * kMib), "Content-Type", "application/json", "X-Tenant-Id", "t1");
+  const auto none = c.Post("/v1/uploads", hBody(10 * kHarnessMib, 5 * kHarnessMib), "Content-Type", "application/json", "X-Tenant-Id", "t1");
   ctx.Equal(none.Status, 400, "an initiation without Idempotency-Key");
-  ctx.Equal(created(ctx), 3, "uploads created (k-1 for t1, k-1 for t2, k-2)");
+  ctx.Equal(hCreated(ctx), 3, "uploads created (k-1 for t1, k-1 for t2, k-2)");
 }
 `,
   },

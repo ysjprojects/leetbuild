@@ -62,7 +62,7 @@ are missing, and nothing ties the number to the last billing close. Any caller c
       id: 'overage',
       title: 'Reports the cap and the overage flag',
       detail:
-        "The answer carries the window's `cap` and `overage`, so an account past its plan cannot read as fine. The starter answers neither.",
+        "The answer carries the window's own `cap` and `overage`, the ones the count wrote, even after the plan changes mid-hour, so an account past its plan cannot read as fine. The starter answers neither.",
       match: {
         python: {all: [/["']overage["']\s*:\s*totals\[["']overage["']\]/, /["']cap["']\s*:\s*totals\[["']cap["']\]/]},
         typescript: {all: [/overage:\s*totals\.overage/, /cap:\s*totals\.cap/]},
@@ -75,7 +75,7 @@ are missing, and nothing ties the number to the last billing close. Any caller c
       id: 'close-id',
       title: 'Names the last close that tied out',
       detail:
-        'The answer carries `close_id` from `last_close`/`lastClose` (null before the first close), so the number can be tied to the billing close that confirmed it. The starter answers none.',
+        'The answer carries `close_id` from `last_close`/`lastClose` (null before the first close), whatever window that close was for, so the number can be tied to the billing close that confirmed it. The starter answers none.',
       match: {
         python: {all: [/ledger\.last_close\(/, /["']close_id["']\s*:/]},
         typescript: {all: [/lastClose\(/, /close_id:/]},
@@ -385,10 +385,17 @@ async def check_window(ctx):
 
 async def check_overage(ctx):
     ledger.set_plan_cap("acct_1", 1000)
-    apply_usage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1")
+    apply_usage("acct_1", "req_1", "/v1/generate", 600, "gw-eu-1")
     async with _api(ctx) as c:
+        under = (await c.get(PATH, headers=ME)).json()
+        assert under.get("cap") == 1000 and under.get("overage") is False, f"an account at 600 units of a 1000-unit plan must read cap 1000 and overage false, got {under}"
+        apply_usage("acct_1", "req_2", "/v1/generate", 600, "gw-eu-1")
         body = (await c.get(PATH, headers=ME)).json()
-    assert body.get("cap") == 1000 and body.get("overage") is True, f"an account at 1200 units of a 1000-unit plan must read cap 1000 and overage true, got {body}"
+        assert body.get("cap") == 1000 and body.get("overage") is True, f"an account at 1200 units of a 1000-unit plan must read cap 1000 and overage true, got {body}"
+        # The plan is raised mid-hour: the window was counted, and flagged, against the cap it carries.
+        ledger.set_plan_cap("acct_1", 5000)
+        raised = (await c.get(PATH, headers=ME)).json()
+    assert raised.get("cap") == 1000 and raised.get("overage") is True, f"after the plan was raised the window still carries cap 1000 and overage 1, and the read answered {raised}: answer the window's cap and flag, not the plan's"
 
 
 async def check_close_id(ctx):
@@ -396,6 +403,9 @@ async def check_close_id(ctx):
     async with _api(ctx) as c:
         before = (await c.get(PATH, headers=ME)).json()
         assert "close_id" in before and before["close_id"] is None, f"before any close the read must answer close_id null, got {before}"
+        ledger.mark_closed("acct_1", w - 2, f"close:acct_1:{w - 2}", 700)
+        older = (await c.get(PATH, headers=ME)).json()
+        assert older.get("close_id") == f"close:acct_1:{w - 2}", f"the last close that tied out is close:acct_1:{w - 2}, and the read answered {older}: answer the close last_close holds, whatever window it closed"
         ledger.mark_closed("acct_1", w - 1, f"close:acct_1:{w - 1}", 900)
         after = (await c.get(PATH, headers=ME)).json()
     assert after.get("close_id") == f"close:acct_1:{w - 1}", f"after the last hour closed the read must name close:acct_1:{w - 1}, got {after}"
@@ -442,9 +452,16 @@ export async function check_window(ctx) {
 export async function check_overage(ctx) {
   const {c, ledger, usage} = api(ctx);
   await ledger.setPlanCap('acct_1', 1000);
-  await usage.applyUsage('acct_1', 'req_1', '/v1/generate', 1200, 'gw-eu-1');
+  await usage.applyUsage('acct_1', 'req_1', '/v1/generate', 600, 'gw-eu-1');
+  const under = (await c.get(PATH, {headers: ME})).json();
+  assert(under.cap === 1000 && under.overage === false, \`an account at 600 units of a 1000-unit plan must read cap 1000 and overage false, got \${JSON.stringify(under)}\`);
+  await usage.applyUsage('acct_1', 'req_2', '/v1/generate', 600, 'gw-eu-1');
   const body = (await c.get(PATH, {headers: ME})).json();
   assert(body.cap === 1000 && body.overage === true, \`an account at 1200 units of a 1000-unit plan must read cap 1000 and overage true, got \${JSON.stringify(body)}\`);
+  // The plan is raised mid-hour: the window was counted, and flagged, against the cap it carries.
+  await ledger.setPlanCap('acct_1', 5000);
+  const raised = (await c.get(PATH, {headers: ME})).json();
+  assert(raised.cap === 1000 && raised.overage === true, \`after the plan was raised the window still carries cap 1000 and overage 1, and the read answered \${JSON.stringify(raised)}: answer the window's cap and flag, not the plan's\`);
 }
 
 export async function check_close_id(ctx) {
@@ -452,6 +469,9 @@ export async function check_close_id(ctx) {
   const w = ledger.currentWindow();
   const before = (await c.get(PATH, {headers: ME})).json();
   assert('close_id' in before && before.close_id === null, \`before any close the read must answer close_id null, got \${JSON.stringify(before)}\`);
+  await ledger.markClosed('acct_1', w - 2, \`close:acct_1:\${w - 2}\`, 700);
+  const older = (await c.get(PATH, {headers: ME})).json();
+  assert.equal(older.close_id, \`close:acct_1:\${w - 2}\`, \`the last close that tied out is close:acct_1:\${w - 2}, and the read answered \${JSON.stringify(older)}: answer the close lastClose holds, whatever window it closed\`);
   await ledger.markClosed('acct_1', w - 1, \`close:acct_1:\${w - 1}\`, 900);
   const after = (await c.get(PATH, {headers: ME})).json();
   assert.equal(after.close_id, \`close:acct_1:\${w - 1}\`, \`after the last hour closed the read must name close:acct_1:\${w - 1}, got \${JSON.stringify(after)}\`);
@@ -478,70 +498,82 @@ import (
 	"strings"
 
 	"metering/ledger"
-	"metering/usage"
+	hUsage "metering/usage"
 
 	"leetbuild/harness"
 )
 
-const path = "/v1/accounts/acct_1/usage"
+const hPath = "/v1/accounts/acct_1/usage"
 
 var readBg = context.Background()
 
-func api(ctx *harness.Ctx) *harness.HTTP {
+func hAPI(ctx *harness.Ctx) *harness.HTTP {
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
-func seed() {
+func hSeed() {
 	ledger.RecordUsage(readBg, ledger.Record{RequestID: "req_1", Account: "acct_1", Route: "/v1/generate", Units: 1200, Gateway: "gw-eu-1"})
 }
 
-func read(ctx *harness.Ctx, c *harness.HTTP) map[string]any {
-	r := c.Get(path, "X-Account-Id", "acct_1")
-	ctx.Equal(r.Status, 200, "GET %s (%s)", path, r.Text())
+func hRead(ctx *harness.Ctx, c *harness.HTTP) map[string]any {
+	r := c.Get(hPath, "X-Account-Id", "acct_1")
+	ctx.Equal(r.Status, 200, "GET %s (%s)", hPath, r.Text())
 	body, _ := r.JSON().(map[string]any)
 	return body
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	ctx.Equal(read(ctx, api(ctx))["account"], "acct_1", "the read must name the account")
+	ctx.Equal(hRead(ctx, hAPI(ctx))["account"], "acct_1", "the read must name the account")
 }
 
 func CheckWindow(ctx *harness.Ctx) {
 	ctx.Redis.Set("batch:usage:acct_1", "40") // last night's export
-	seed()
+	hSeed()
 	w := ledger.CurrentWindow()
-	body := read(ctx, api(ctx))
+	body := hRead(ctx, hAPI(ctx))
 	ctx.Assert(body["units"] == float64(1200), "the window holds 1200 units and the read answered %v: read the current window, not the nightly batch", body["units"])
 	ctx.Assert(body["window"] == float64(w), "the read must name the window it read (%d), got %v", w, body["window"])
 }
 
 func CheckOverage(ctx *harness.Ctx) {
+	c := hAPI(ctx)
 	ledger.SetPlanCap(readBg, "acct_1", 1000)
-	_, err := usage.ApplyUsage(readBg, "acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1")
+	_, err := hUsage.ApplyUsage(readBg, "acct_1", "req_1", "/v1/generate", 600, "gw-eu-1")
 	ctx.NoError(err, "seeding the window failed")
-	body := read(ctx, api(ctx))
+	under := hRead(ctx, c)
+	ctx.Assert(under["cap"] == float64(1000) && under["overage"] == false, "an account at 600 units of a 1000-unit plan must read cap 1000 and overage false, got %v", under)
+	_, err = hUsage.ApplyUsage(readBg, "acct_1", "req_2", "/v1/generate", 600, "gw-eu-1")
+	ctx.NoError(err, "seeding the window failed")
+	body := hRead(ctx, c)
 	ctx.Assert(body["cap"] == float64(1000) && body["overage"] == true, "an account at 1200 units of a 1000-unit plan must read cap 1000 and overage true, got %v", body)
+	// The plan is raised mid-hour: the window was counted, and flagged, against the cap it carries.
+	ledger.SetPlanCap(readBg, "acct_1", 5000)
+	raised := hRead(ctx, c)
+	ctx.Assert(raised["cap"] == float64(1000) && raised["overage"] == true, "after the plan was raised the window still carries cap 1000 and overage 1, and the read answered %v: answer the window's cap and flag, not the plan's", raised)
 }
 
 func CheckCloseId(ctx *harness.Ctx) {
-	c := api(ctx)
+	c := hAPI(ctx)
 	w := ledger.CurrentWindow()
-	before := read(ctx, c)
+	before := hRead(ctx, c)
 	value, present := before["close_id"]
 	ctx.Assert(present && value == nil, "before any close the read must answer close_id null, got %v", before)
+	older := fmt.Sprintf("close:acct_1:%d", w-2)
+	ledger.MarkClosed(readBg, "acct_1", w-2, older, 700)
+	ctx.Equal(hRead(ctx, c)["close_id"], older, "the last close that tied out closed window %d: answer the close LastClose holds, whatever window it closed; the read's close_id", w-2)
 	want := fmt.Sprintf("close:acct_1:%d", w-1)
 	ledger.MarkClosed(readBg, "acct_1", w-1, want, 900)
-	ctx.Equal(read(ctx, c)["close_id"], want, "after the last hour closed, the read's close_id")
+	ctx.Equal(hRead(ctx, c)["close_id"], want, "after the last hour closed, the read's close_id")
 }
 
 func CheckAuthz(ctx *harness.Ctx) {
-	seed()
-	c := api(ctx)
-	anonymous := c.Get(path)
-	other := c.Get(path, "X-Account-Id", "acct_2")
-	mine := c.Get(path, "X-Account-Id", "acct_1")
+	hSeed()
+	c := hAPI(ctx)
+	anonymous := c.Get(hPath)
+	other := c.Get(hPath, "X-Account-Id", "acct_2")
+	mine := c.Get(hPath, "X-Account-Id", "acct_1")
 	ctx.Equal(anonymous.Status, 401, "a read without X-Account-Id")
 	ctx.Equal(other.Status, 403, "acct_2 reading acct_1's usage")
 	ctx.Assert(!strings.Contains(other.Text(), "1200"), "the 403 leaked acct_1's usage: %s", other.Text())
@@ -561,9 +593,9 @@ using json = nlohmann::json;
 
 namespace {
 
-const std::string kPath = "/v1/accounts/acct_1/usage";
+const std::string kHPath = "/v1/accounts/acct_1/usage";
 
-harness::HTTP api(harness::Ctx& ctx) {
+harness::HTTP hApi(harness::Ctx& ctx) {
   static httplib::Server* svr = nullptr;
   delete svr;
   svr = new httplib::Server;
@@ -571,7 +603,7 @@ harness::HTTP api(harness::Ctx& ctx) {
   return ctx.HTTP(*svr);
 }
 
-void seed() {
+void hSeed() {
   ledger::Record record;
   record.request_id = "req_1";
   record.account = "acct_1";
@@ -581,9 +613,9 @@ void seed() {
   ledger::recordUsage(record);
 }
 
-json read(harness::Ctx& ctx, harness::HTTP& c) {
-  const auto r = c.Get(kPath, "X-Account-Id", "acct_1");
-  ctx.Equal(r.Status, 200, "GET %s (%s)", kPath, r.Text());
+json hRead(harness::Ctx& ctx, harness::HTTP& c) {
+  const auto r = c.Get(kHPath, "X-Account-Id", "acct_1");
+  ctx.Equal(r.Status, 200, "GET %s (%s)", kHPath, r.Text());
   try {
     return json::parse(r.Text());
   } catch (const std::exception&) {
@@ -591,48 +623,61 @@ json read(harness::Ctx& ctx, harness::HTTP& c) {
   }
 }
 
+std::string hCloseId(const json& body) {
+  return body.contains("close_id") && body["close_id"].is_string() ? body["close_id"].get<std::string>() : std::string();
+}
+
 }  // namespace
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto c = api(ctx);
-  ctx.Equal(read(ctx, c).value("account", ""), "acct_1", "the read must name the account");
+  auto c = hApi(ctx);
+  ctx.Equal(hRead(ctx, c).value("account", ""), "acct_1", "the read must name the account");
 }
 
 void CheckWindow(harness::Ctx& ctx) {
   ctx.Redis.Set("batch:usage:acct_1", "40");  // last night's export
-  seed();
+  hSeed();
   const long long w = ledger::currentWindow();
-  auto c = api(ctx);
-  const json body = read(ctx, c);
+  auto c = hApi(ctx);
+  const json body = hRead(ctx, c);
   ctx.Assert(body.value("units", 0LL) == 1200, "the window holds 1200 units and the read answered %s: read the current window, not the nightly batch", body.dump());
   ctx.Assert(body.value("window", 0LL) == w, "the read must name the window it read (%d), got %s", w, body.dump());
 }
 
 void CheckOverage(harness::Ctx& ctx) {
+  auto c = hApi(ctx);
   ledger::setPlanCap("acct_1", 1000);
-  usage::applyUsage("acct_1", "req_1", "/v1/generate", 1200, "gw-eu-1");
-  auto c = api(ctx);
-  const json body = read(ctx, c);
+  usage::applyUsage("acct_1", "req_1", "/v1/generate", 600, "gw-eu-1");
+  const json under = hRead(ctx, c);
+  ctx.Assert(under.value("cap", 0LL) == 1000 && under.contains("overage") && under["overage"] == false, "an account at 600 units of a 1000-unit plan must read cap 1000 and overage false, got %s", under.dump());
+  usage::applyUsage("acct_1", "req_2", "/v1/generate", 600, "gw-eu-1");
+  const json body = hRead(ctx, c);
   ctx.Assert(body.value("cap", 0LL) == 1000 && body.contains("overage") && body["overage"] == true, "an account at 1200 units of a 1000-unit plan must read cap 1000 and overage true, got %s", body.dump());
+  // The plan is raised mid-hour: the window was counted, and flagged, against the cap it carries.
+  ledger::setPlanCap("acct_1", 5000);
+  const json raised = hRead(ctx, c);
+  ctx.Assert(raised.value("cap", 0LL) == 1000 && raised.contains("overage") && raised["overage"] == true, "after the plan was raised the window still carries cap 1000 and overage 1, and the read answered %s: answer the window's cap and flag, not the plan's", raised.dump());
 }
 
 void CheckCloseId(harness::Ctx& ctx) {
-  auto c = api(ctx);
+  auto c = hApi(ctx);
   const long long w = ledger::currentWindow();
-  const json before = read(ctx, c);
+  const json before = hRead(ctx, c);
   ctx.Assert(before.contains("close_id") && before["close_id"].is_null(), "before any close the read must answer close_id null, got %s", before.dump());
+  const std::string older = "close:acct_1:" + std::to_string(w - 2);
+  ledger::markClosed("acct_1", w - 2, older, 700);
+  ctx.Equal(hCloseId(hRead(ctx, c)), older, "the last close that tied out closed window %d: answer the close lastClose holds, whatever window it closed; the read's close_id", w - 2);
   const std::string want = "close:acct_1:" + std::to_string(w - 1);
   ledger::markClosed("acct_1", w - 1, want, 900);
-  const json after = read(ctx, c);
-  ctx.Equal(after.contains("close_id") && after["close_id"].is_string() ? after["close_id"].get<std::string>() : std::string(), want, "after the last hour closed, the read's close_id");
+  ctx.Equal(hCloseId(hRead(ctx, c)), want, "after the last hour closed, the read's close_id");
 }
 
 void CheckAuthz(harness::Ctx& ctx) {
-  seed();
-  auto c = api(ctx);
-  const auto anonymous = c.Get(kPath);
-  const auto other = c.Get(kPath, "X-Account-Id", "acct_2");
-  const auto mine = c.Get(kPath, "X-Account-Id", "acct_1");
+  hSeed();
+  auto c = hApi(ctx);
+  const auto anonymous = c.Get(kHPath);
+  const auto other = c.Get(kHPath, "X-Account-Id", "acct_2");
+  const auto mine = c.Get(kHPath, "X-Account-Id", "acct_1");
   ctx.Equal(anonymous.Status, 401, "a read without X-Account-Id");
   ctx.Equal(other.Status, 403, "acct_2 reading acct_1's usage");
   ctx.Assert(other.Text().find("1200") == std::string::npos, "the 403 leaked acct_1's usage: %s", other.Text());

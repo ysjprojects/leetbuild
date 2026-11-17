@@ -58,7 +58,7 @@ failed, and it records whatever billing answers without comparing it to the coun
       id: 'close-id',
       title: 'Derives one close id per (account, window)',
       detail:
-        'The close id comes from `close_id`/`closeId` (Go `closeID`) as `close:{account}:{window}`, the same on every attempt and every run, so billing can tell a retry from a second close. The starter mints a random id per attempt.',
+        'The close id comes from `close_id`/`closeId` (Go `closeID`) as `close:{account}:{window}` of the window being closed, the same on every attempt and every run, an hour later included, so billing can tell a retry from a second close. The starter mints a random id per attempt.',
       match: {
         python: {all: [/def close_id\(/, /f["']close:\{account\}:\{window\}/], none: [/uuid/]},
         typescript: {
@@ -74,7 +74,7 @@ failed, and it records whatever billing answers without comparing it to the coun
       id: 'deadline',
       title: 'Bounds every call with a 5-second deadline',
       detail:
-        'Each `ClosePeriod` call carries `DEADLINE_SECONDS` (5 s; TypeScript `DEADLINE_MS`, Go `deadline`, C++ `kDeadline`), so a stalled billing service fails the attempt instead of holding the worker. The starter calls with no deadline.',
+        'Each `ClosePeriod` call carries its own full `DEADLINE_SECONDS` (5 s; TypeScript `DEADLINE_MS`, Go `deadline`, C++ `kDeadline`), so a stalled billing service fails the attempt instead of holding the worker, and all `ATTEMPTS` still run. The starter calls with no deadline.',
       match: {
         python: {all: [/DEADLINE_SECONDS\s*=\s*5\b/, /ClosePeriod\([\s\S]{0,300}?timeout\s*=\s*DEADLINE_SECONDS/]},
         typescript: {all: [/DEADLINE_MS\s*=\s*5000\b/, /deadline:\s*Date\.now\(\)\s*\+\s*DEADLINE_MS/]},
@@ -570,8 +570,10 @@ def check_close_id(ctx):
     ids = [c.request.close_id for c in ctx.grpc.calls_to("ClosePeriod")]
     assert ids == [expected, expected], f"the two attempts carried close ids {ids}, expected {expected} on both: a fresh id per attempt lets an attempt that landed be billed again"
     assert ledger.last_close("acct_1")["close_id"] == expected, f"the window was marked closed under {ledger.last_close('acct_1')['close_id']!r}, expected {expected}"
+    # The scheduler runs the close again an hour later, for the window it left behind.
+    ctx.clock.advance(ledger.WINDOW_SECONDS)
     m.close_period("acct_1", w)
-    assert list(billing.billed) == [expected], f"running the close again billed the period under {sorted(billing.billed)}: every run must carry {expected}"
+    assert list(billing.billed) == [expected], f"running the close of window {w} again an hour later billed it under {sorted(billing.billed)}: every run must carry {expected}, derived from the window closed, not the current one"
 
 
 def check_deadline(ctx):
@@ -584,6 +586,7 @@ def check_deadline(ctx):
         assert call.timeout is not None, "a ClosePeriod call carries no deadline: a stalled billing service holds the worker"
         assert 4.5 <= call.timeout <= 5.5, f"a ClosePeriod call carries a {call.timeout} s deadline, expected DEADLINE_SECONDS = 5"
     assert result == "PERIOD_OPEN", f"with billing slower than every deadline close_period answered {result!r}, expected PERIOD_OPEN"
+    assert len(calls) == 3, f"with billing slower than every deadline close_period made {len(calls)} attempt(s), expected ATTEMPTS = 3: every attempt carries its own full deadline, not what is left of one shared budget"
 
 
 def check_timeout_open(ctx):
@@ -601,6 +604,12 @@ def check_reconcile(ctx):
     result = m.close_period("acct_1", w)
     assert result == "PERIOD_OPEN", f"billing billed 1400 of the window's 1500 units and close_period answered {result!r}: a close that does not tie out stays PERIOD_OPEN"
     assert ledger.last_close("acct_1") is None, f"a close that does not tie out was marked: {ledger.last_close('acct_1')}"
+    # A billing service that bills more than was counted does not tie out either.
+    ledger.record_usage({"request_id": "req_9", "account": "acct_2", "route": "/v1/generate", "units": 500, "gateway": "gw-eu-1"})
+    billing.short = -100
+    result = m.close_period("acct_2", w)
+    assert result == "PERIOD_OPEN", f"billing billed 600 of the window's 500 units and close_period answered {result!r}: a close that does not tie out stays PERIOD_OPEN, whichever way it is off"
+    assert ledger.last_close("acct_2") is None, f"a close billed above the window was marked: {ledger.last_close('acct_2')}"
 `,
     typescript: `/** Bills each close id once; short takes units off what it bills (a billing service that lost some). */
 function client(ctx) {
@@ -644,9 +653,11 @@ export async function check_close_id(ctx) {
   const ids = ctx.grpc.callsTo('ClosePeriod').map(c => c.request.close_id);
   assert.deepStrictEqual(ids, [expected, expected], \`the two attempts carried close ids \${JSON.stringify(ids)}, expected \${expected} on both: a fresh id per attempt lets an attempt that landed be billed again\`);
   assert.equal((await ledger.lastClose('acct_1')).close_id, expected, 'the window must be marked closed under the derived close id');
+  // The scheduler runs the close again an hour later, for the window it left behind.
+  ctx.clock.advance(ledger.WINDOW_SECONDS);
   await m.closePeriod('acct_1', w);
   const billed = [...billing.billed.keys()];
-  assert.deepStrictEqual(billed, [expected], \`running the close again billed the period under \${JSON.stringify(billed)}: every run must carry \${expected}\`);
+  assert.deepStrictEqual(billed, [expected], \`running the close of window \${w} again an hour later billed it under \${JSON.stringify(billed)}: every run must carry \${expected}, derived from the window closed, not the current one\`);
 }
 
 export async function check_deadline(ctx) {
@@ -661,6 +672,7 @@ export async function check_deadline(ctx) {
     assert(4.5 <= call.timeout && call.timeout <= 5.5, \`a ClosePeriod call carries a \${call.timeout} s deadline, expected DEADLINE_MS = 5000\`);
   }
   assert.equal(result, 'PERIOD_OPEN', \`with billing slower than every deadline closePeriod answered \${result}, expected PERIOD_OPEN\`);
+  assert.equal(calls.length, 3, \`with billing slower than every deadline closePeriod made \${calls.length} attempt(s), expected ATTEMPTS = 3: every attempt carries its own full deadline, not what is left of one shared budget\`);
 }
 
 export async function check_timeout_open(ctx) {
@@ -680,6 +692,12 @@ export async function check_reconcile(ctx) {
   const result = await m.closePeriod('acct_1', w);
   assert.equal(result, 'PERIOD_OPEN', \`billing billed 1400 of the window's 1500 units and closePeriod answered \${result}: a close that does not tie out stays PERIOD_OPEN\`);
   assert.equal(await ledger.lastClose('acct_1'), null, 'a close that does not tie out was marked');
+  // A billing service that bills more than was counted does not tie out either.
+  await ledger.recordUsage({request_id: 'req_9', account: 'acct_2', route: '/v1/generate', units: 500, gateway: 'gw-eu-1'});
+  billing.short = -100;
+  const over = await m.closePeriod('acct_2', w);
+  assert.equal(over, 'PERIOD_OPEN', \`billing billed 600 of the window's 500 units and closePeriod answered \${over}: a close that does not tie out stays PERIOD_OPEN, whichever way it is off\`);
+  assert.equal(await ledger.lastClose('acct_2'), null, 'a close billed above the window was marked');
 }
 `,
     go: `package main
@@ -715,7 +733,7 @@ func (b *billingPeer) ClosePeriod(_ context.Context, req *pb.ClosePeriodRequest)
 	return &pb.ClosePeriodReply{CloseId: req.GetCloseId(), BilledUnits: b.billed[req.GetCloseId()]}, nil
 }
 
-func setup(ctx *harness.Ctx) (*billingPeer, int64) {
+func hSetup(ctx *harness.Ctx) (*billingPeer, int64) {
 	peer := &billingPeer{billed: map[string]int64{}}
 	pb.RegisterBillingServer(ctx.GRPC.Server(""), peer)
 	ledger.RecordUsage(clientBg, ledger.Record{RequestID: "req_1", Account: "acct_1", Route: "/v1/generate", Units: 1200, Gateway: "gw-eu-1"})
@@ -724,7 +742,7 @@ func setup(ctx *harness.Ctx) (*billingPeer, int64) {
 }
 
 func CheckCloses(ctx *harness.Ctx) {
-	_, w := setup(ctx)
+	_, w := hSetup(ctx)
 	result := closePeriod(clientBg, "acct_1", w)
 	ctx.Equal(result, "PERIOD_CLOSED", "with billing healthy, closePeriod")
 	calls := ctx.GRPC.CallsTo("ClosePeriod", "")
@@ -736,7 +754,7 @@ func CheckCloses(ctx *harness.Ctx) {
 }
 
 func CheckCloseId(ctx *harness.Ctx) {
-	peer, w := setup(ctx)
+	peer, w := hSetup(ctx)
 	expected := fmt.Sprintf("close:acct_1:%d", w)
 	ctx.GRPC.Fail("ClosePeriod", codes.Unavailable, "", 1, "")
 	ctx.Equal(closePeriod(clientBg, "acct_1", w), "PERIOD_CLOSED", "after one UNAVAILABLE the retry must close the period; closePeriod")
@@ -746,12 +764,14 @@ func CheckCloseId(ctx *harness.Ctx) {
 	}
 	ctx.Equal(ids, []string{expected, expected}, "a fresh id per attempt lets an attempt that landed be billed again; the two attempts' close ids")
 	ctx.Equal(ledger.LastClose(clientBg, "acct_1").CloseID, expected, "the window must be marked closed under the derived close id")
+	// The scheduler runs the close again an hour later, for the window it left behind.
+	ctx.Clock.Advance(ledger.WindowSeconds)
 	closePeriod(clientBg, "acct_1", w)
-	ctx.Equal(peer.ids, []string{expected}, "running the close again must carry %s; the close ids billing billed", expected)
+	ctx.Equal(peer.ids, []string{expected}, "running the close of window %d again an hour later must carry %s, derived from the window closed, not the current one; the close ids billing billed", w, expected)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	_, w := setup(ctx)
+	_, w := hSetup(ctx)
 	ctx.GRPC.SetLatency("ClosePeriod", 30.0, "")
 	result := closePeriod(clientBg, "acct_1", w)
 	calls := ctx.GRPC.CallsTo("ClosePeriod", "")
@@ -761,10 +781,11 @@ func CheckDeadline(ctx *harness.Ctx) {
 		ctx.Assert(4500*time.Millisecond <= call.Timeout && call.Timeout <= 5500*time.Millisecond, "a ClosePeriod call carries a %v deadline, expected 5 s", call.Timeout)
 	}
 	ctx.Equal(result, "PERIOD_OPEN", "with billing slower than every deadline, closePeriod")
+	ctx.Equal(len(calls), 3, "with billing slower than every deadline, every attempt carries its own full deadline, not what is left of one shared budget; the attempts (ATTEMPTS = 3)")
 }
 
 func CheckTimeoutOpen(ctx *harness.Ctx) {
-	_, w := setup(ctx)
+	_, w := hSetup(ctx)
 	ctx.GRPC.Fail("ClosePeriod", codes.DeadlineExceeded, "", 3, "")
 	result := closePeriod(clientBg, "acct_1", w)
 	ctx.Equal(result, "PERIOD_OPEN", "every attempt timed out: billing never confirmed the close, so the period stays open; closePeriod")
@@ -773,11 +794,16 @@ func CheckTimeoutOpen(ctx *harness.Ctx) {
 }
 
 func CheckReconcile(ctx *harness.Ctx) {
-	peer, w := setup(ctx)
+	peer, w := hSetup(ctx)
 	peer.short = 100
 	result := closePeriod(clientBg, "acct_1", w)
 	ctx.Equal(result, "PERIOD_OPEN", "billing billed 1400 of the window's 1500 units: a close that does not tie out stays open; closePeriod")
 	ctx.Assert(ledger.LastClose(clientBg, "acct_1") == nil, "a close that does not tie out was marked: %+v", ledger.LastClose(clientBg, "acct_1"))
+	// A billing service that bills more than was counted does not tie out either.
+	ledger.RecordUsage(clientBg, ledger.Record{RequestID: "req_9", Account: "acct_2", Route: "/v1/generate", Units: 500, Gateway: "gw-eu-1"})
+	peer.short = -100
+	ctx.Equal(closePeriod(clientBg, "acct_2", w), "PERIOD_OPEN", "billing billed 600 of the window's 500 units: a close that does not tie out stays open, whichever way it is off; closePeriod")
+	ctx.Assert(ledger.LastClose(clientBg, "acct_2") == nil, "a close billed above the window was marked: %+v", ledger.LastClose(clientBg, "acct_2"))
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -807,7 +833,7 @@ class BillingPeer final : public usagemeter::Billing::Service {
   }
 };
 
-BillingPeer& setup(harness::Ctx& ctx) {
+BillingPeer& hSetup(harness::Ctx& ctx) {
   static BillingPeer* peer = nullptr;
   delete peer;
   peer = new BillingPeer;
@@ -830,7 +856,7 @@ BillingPeer& setup(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckCloses(harness::Ctx& ctx) {
-  setup(ctx);
+  hSetup(ctx);
   const long long w = ledger::currentWindow();
   ctx.Equal(closePeriod("acct_1", w), "PERIOD_CLOSED", "with billing healthy, closePeriod");
   const auto calls = ctx.GRPC.CallsTo("ClosePeriod");
@@ -842,7 +868,7 @@ void CheckCloses(harness::Ctx& ctx) {
 }
 
 void CheckCloseId(harness::Ctx& ctx) {
-  BillingPeer& peer = setup(ctx);
+  BillingPeer& peer = hSetup(ctx);
   const long long w = ledger::currentWindow();
   const std::string expected = "close:acct_1:" + std::to_string(w);
   ctx.GRPC.Fail("ClosePeriod", grpc::StatusCode::UNAVAILABLE, "", 1);
@@ -852,12 +878,14 @@ void CheckCloseId(harness::Ctx& ctx) {
   ctx.Equal(ids, std::vector<std::string>{expected, expected}, "a fresh id per attempt lets an attempt that landed be billed again; the two attempts' close ids");
   const auto close = ledger::lastClose("acct_1");
   ctx.Equal(close ? close->close_id : std::string(), expected, "the window must be marked closed under the derived close id");
+  // The scheduler runs the close again an hour later, for the window it left behind.
+  ctx.Clock.Advance(static_cast<double>(ledger::kWindowSeconds));
   closePeriod("acct_1", w);
-  ctx.Equal(peer.ids, std::vector<std::string>{expected}, "running the close again must carry %s; the close ids billing billed", expected);
+  ctx.Equal(peer.ids, std::vector<std::string>{expected}, "running the close of window %d again an hour later must carry %s, derived from the window closed, not the current one; the close ids billing billed", w, expected);
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  setup(ctx);
+  hSetup(ctx);
   const long long w = ledger::currentWindow();
   ctx.GRPC.SetLatency("ClosePeriod", 30.0);
   const std::string result = closePeriod("acct_1", w);
@@ -868,10 +896,11 @@ void CheckDeadline(harness::Ctx& ctx) {
     ctx.Assert(4.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 5.5, "a ClosePeriod call carries a %v s deadline, expected kDeadline = 5 s", call.TimeoutSeconds());
   }
   ctx.Equal(result, "PERIOD_OPEN", "with billing slower than every deadline, closePeriod");
+  ctx.Equal(calls.size(), 3, "with billing slower than every deadline, every attempt carries its own full deadline, not what is left of one shared budget; the attempts (ATTEMPTS = 3)");
 }
 
 void CheckTimeoutOpen(harness::Ctx& ctx) {
-  setup(ctx);
+  hSetup(ctx);
   const long long w = ledger::currentWindow();
   ctx.GRPC.Fail("ClosePeriod", grpc::StatusCode::DEADLINE_EXCEEDED, "", 3);
   ctx.Equal(closePeriod("acct_1", w), "PERIOD_OPEN", "every attempt timed out: billing never confirmed the close, so the period stays open; closePeriod");
@@ -880,11 +909,22 @@ void CheckTimeoutOpen(harness::Ctx& ctx) {
 }
 
 void CheckReconcile(harness::Ctx& ctx) {
-  BillingPeer& peer = setup(ctx);
+  BillingPeer& peer = hSetup(ctx);
   const long long w = ledger::currentWindow();
   peer.short_by = 100;
   ctx.Equal(closePeriod("acct_1", w), "PERIOD_OPEN", "billing billed 1400 of the window's 1500 units: a close that does not tie out stays open; closePeriod");
   ctx.Assert(!ledger::lastClose("acct_1"), "a close that does not tie out was marked");
+  // A billing service that bills more than was counted does not tie out either.
+  ledger::Record extra;
+  extra.request_id = "req_9";
+  extra.account = "acct_2";
+  extra.route = "/v1/generate";
+  extra.units = 500;
+  extra.gateway = "gw-eu-1";
+  ledger::recordUsage(extra);
+  peer.short_by = -100;
+  ctx.Equal(closePeriod("acct_2", w), "PERIOD_OPEN", "billing billed 600 of the window's 500 units: a close that does not tie out stays open, whichever way it is off; closePeriod");
+  ctx.Assert(!ledger::lastClose("acct_2"), "a close billed above the window was marked");
 }
 `,
   },
