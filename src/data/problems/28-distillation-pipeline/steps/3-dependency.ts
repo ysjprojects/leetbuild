@@ -452,7 +452,6 @@ func generate(ctx context.Context, state JobState, jobID, promptID, prompt strin
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -496,6 +495,9 @@ type Sample struct {
 	Attempts       int
 }
 
+// statusNames names every gRPC status code in lower snake case, indexed by its number.
+var statusNames = [...]string{"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"}
+
 // generate makes one teacher sample: reserve budget, call with a deadline and bounded retries, record one outcome.
 func generate(ctx context.Context, state JobState, jobID, promptID, prompt string) (Sample, error) {
 	reservation, err := state.Reserve(ctx, jobID, prompt)
@@ -527,7 +529,11 @@ func generate(ctx context.Context, state JobState, jobID, promptID, prompt strin
 			if code == codes.DeadlineExceeded {
 				return rejected("deadline", attempt)
 			}
-			return rejected(strings.ToLower(code.String()), attempt)
+			reason := "unknown"
+			if int(code) < len(statusNames) {
+				reason = statusNames[code]
+			}
+			return rejected(reason, attempt)
 		}
 		if reply.GetRefused() {
 			return rejected("refusal", attempt)
@@ -793,7 +799,11 @@ std::string reason_of(grpc::StatusCode code) {
     case grpc::StatusCode::DEADLINE_EXCEEDED: return "deadline";
     case grpc::StatusCode::INVALID_ARGUMENT: return "invalid_argument";
     case grpc::StatusCode::RESOURCE_EXHAUSTED: return "resource_exhausted";
-    default: return "status_" + std::to_string(static_cast<int>(code));
+    default: {
+      static const char* const kNames[] = {"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"};
+      const int n = static_cast<int>(code);
+      return n >= 0 && n < 17 ? kNames[n] : "unknown";
+    }
   }
 }
 
@@ -919,7 +929,7 @@ def check_retry_unavailable(ctx):
         calls, rejected = len(_calls(ctx)), _progress(ctx).get("rejected", 0)
         ctx.grpc.fail("Generate", code, "teacher error", times=1, target=config.TEACHER)
         sample = m.generate(state, JOB, f"p-{code.name}", f"What is {code.name}?")
-        _expect(sample, "rejected")
+        _expect(sample, "rejected", code.name.lower())
         assert len(_calls(ctx)) == calls + 1, f"{code.name} is not UNAVAILABLE, so it is not retried: expected one call, saw {len(_calls(ctx)) - calls}"
         assert _progress(ctx).get("rejected") == rejected + 1 and sum(_reasons(ctx).values()) == rejected + 1, f"a {code.name} is recorded once as rejected with a reason: {_progress(ctx)}, {_reasons(ctx)}"
 
@@ -1036,7 +1046,7 @@ export async function check_retry_unavailable(ctx) {
     const before = calls(ctx).length;
     const rejected = progress(ctx).rejected ?? 0;
     ctx.grpc.fail('Generate', ctx.grpc.status[code], 'teacher error', 1, config.TEACHER);
-    expect(await m.generate(state, JOB, \`p-\${code}\`, \`What is \${code}?\`), 'rejected');
+    expect(await m.generate(state, JOB, \`p-\${code}\`, \`What is \${code}?\`), 'rejected', code.toLowerCase());
     assert.equal(calls(ctx).length, before + 1, \`\${code} is not UNAVAILABLE, so it is not retried: expected one call, saw \${calls(ctx).length - before}\`);
     const total = Object.values(reasons(ctx)).reduce((a: number, b) => a + Number(b), 0);
     assert(progress(ctx).rejected === rejected + 1 && total === rejected + 1, \`a \${code} is recorded once as rejected with a reason: \${JSON.stringify(progress(ctx))}, \${JSON.stringify(reasons(ctx))}\`);
@@ -1219,10 +1229,14 @@ func CheckRetryUnavailable(ctx *harness.Ctx) {
 		gap := call.Timeout - deadlines[0]
 		ctx.Assert(call.HasDeadline() && -10*time.Millisecond <= gap && gap <= 10*time.Millisecond, "attempt deadlines %v: call %d did not carry the full deadline, every attempt gets its own four seconds, not what is left of one deadline shared by the retries", deadlines, i+1)
 	}
-	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted} {
+	for _, terminal := range []struct {
+		code   codes.Code
+		reason string
+	}{{codes.Internal, "internal"}, {codes.ResourceExhausted, "resource_exhausted"}} {
+		code := terminal.code
 		before, rejected := len(hClientCalls(ctx)), hClientCount(ctx, config.ProgressKey(kHClientJob), "rejected")
 		ctx.GRPC.Fail("Generate", code, "teacher error", 1, config.Teacher)
-		hClientExpect(ctx, hClientGenerate(ctx, state, "p-"+code.String(), "What is "+code.String()+"?"), "rejected", "")
+		hClientExpect(ctx, hClientGenerate(ctx, state, "p-"+code.String(), "What is "+code.String()+"?"), "rejected", terminal.reason)
 		ctx.Equal(len(hClientCalls(ctx))-before, 1, "%v is not UNAVAILABLE, so it is not retried; calls for it", code)
 		total := int64(0)
 		for field := range ctx.Redis.HGetAll(config.ReasonsKey(kHClientJob)) {
@@ -1407,11 +1421,11 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
   for (size_t i = 0; i < all.size(); ++i) {
     ctx.Assert(all[i].HasDeadline() && std::abs(all[i].TimeoutSeconds() - all[0].TimeoutSeconds()) <= 0.01, "attempt deadlines [%s]: call %d did not carry the full deadline, every attempt gets its own four seconds, not what is left of one deadline shared by the retries", deadlines, i + 1);
   }
-  for (const auto& [code, name] : {std::pair{grpc::StatusCode::INTERNAL, "INTERNAL"}, std::pair{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}}) {
+  for (const auto& [code, name, reason] : {std::tuple{grpc::StatusCode::INTERNAL, "INTERNAL", "internal"}, std::tuple{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "resource_exhausted"}}) {
     const size_t before = ctx.GRPC.CallsTo("Generate").size();
     const long long rejected = hClientCount(ctx, config::progress_key(kHJob), "rejected");
     ctx.GRPC.Fail("Generate", code, "teacher error", 1, config::kTeacher);
-    hClientExpect(ctx, generate(w.state, kHJob, std::string("p-") + name, std::string("What is ") + name + "?"), "rejected");
+    hClientExpect(ctx, generate(w.state, kHJob, std::string("p-") + name, std::string("What is ") + name + "?"), "rejected", reason);
     ctx.Equal(ctx.GRPC.CallsTo("Generate").size() - before, 1, "%s is not UNAVAILABLE, so it is not retried; calls for it", name);
     long long total = 0;
     for (const auto& [field, value] : ctx.Redis.HGetAll(config::reasons_key(kHJob))) total += std::strtoll(value.c_str(), nullptr, 10);

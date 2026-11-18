@@ -502,7 +502,7 @@ import spray.json.RootJsonFormat
 
 import evals.{Datasets, Run, Runs}
 
-final case class RunRequest(dataset_id: String, model_version: String, sample_budget: Option[Int])
+final case class RunRequest(dataset_id: String, model_version: String, sample_budget: Option[BigDecimal])
 
 object EvalApi {
   implicit val system: ActorSystem = ActorSystem("eval-harness")
@@ -517,7 +517,7 @@ object EvalApi {
         optionalHeaderValueByName("X-Tenant-Id") { tenantOpt =>
           optionalHeaderValueByName("Idempotency-Key") { idemOpt =>
             entity(as[RunRequest]) { body =>
-              val budget = body.sample_budget.getOrElse(0)
+              val budget = body.sample_budget.filter(_.isWhole).getOrElse(BigDecimal(0))
               if (!tenantOpt.exists(_.nonEmpty)) {
                 complete(StatusCodes.Unauthorized, """{"error":"missing X-Tenant-Id"}""")
               } else if (!idemOpt.exists(_.nonEmpty)) {
@@ -535,7 +535,7 @@ object EvalApi {
                   case Some(stored) =>
                     complete(StatusCodes.OK, stored.run)
                   case None =>
-                    val run = Run(UUID.randomUUID().toString, "queued", body.dataset_id, body.model_version, budget)
+                    val run = Run(UUID.randomUUID().toString, "queued", body.dataset_id, body.model_version, budget.toInt)
                     Runs.put(tenant, idemKey, run)
                     system.log.info(s"eval run=\${run.run_id} tenant=$tenant dataset=\${run.dataset_id} budget=$budget")
                     complete(StatusCodes.Accepted, run)
@@ -624,9 +624,10 @@ void start_run(const httplib::Request& req, httplib::Response& res) {
   if (!body.is_object() || !body.contains("model_version") || !body["model_version"].is_string() ||
       body["model_version"].get<std::string>().empty())
     return reject(res, 400, "model_version is required");
-  if (!body.contains("sample_budget") || !body["sample_budget"].is_number_integer()) return reject(res, 400, "sample_budget must be 1..5000");
+  if (!body.contains("sample_budget") || !body["sample_budget"].is_number_integer() || body["sample_budget"] < 1 ||
+      body["sample_budget"] > kMaxSamples)
+    return reject(res, 400, "sample_budget must be 1..5000");
   const int budget = body["sample_budget"].get<int>();
-  if (budget < 1 || budget > kMaxSamples) return reject(res, 400, "sample_budget must be 1..5000");
   const std::string dataset_id = body.value("dataset_id", std::string());
   if (!datasets::exists(dataset_id)) return reject(res, 404, "unknown dataset");
 
@@ -709,7 +710,7 @@ async def check_dataset_404(ctx):
 
 async def check_budget_cap(ctx):
     async with _api(ctx) as c:
-        for budget in (0, -5, 5001, 1_000_000):
+        for budget in (0, -5, 5001, 1_000_000, 4_294_967_297):
             r = await _post(c, {**GOOD, "sample_budget": budget}, key=f"k-{budget}")
             assert r.status_code == 400, f"sample_budget={budget} answered {r.status_code}, expected 400 (the budget is 1..5000 judge calls)"
         missing = {k: v for k, v in GOOD.items() if k != "sample_budget"}
@@ -791,7 +792,7 @@ export async function check_dataset_404(ctx) {
 
 export async function check_budget_cap(ctx) {
   const c = api(ctx);
-  for (const budget of [0, -5, 5001, 1_000_000]) {
+  for (const budget of [0, -5, 5001, 1_000_000, 4_294_967_297]) {
     const r = await post(c, {...GOOD, sample_budget: budget}, {key: \`k-\${budget}\`});
     assert.equal(r.status, 400, \`sample_budget=\${budget} answered \${r.status}, expected 400 (the budget is 1..5000 judge calls)\`);
   }
@@ -913,7 +914,7 @@ func CheckDataset404(ctx *harness.Ctx) {
 
 func CheckBudgetCap(ctx *harness.Ctx) {
 	c := hApiClient(ctx)
-	for _, budget := range []int{0, -5, 5001, 1_000_000} {
+	for _, budget := range []int64{0, -5, 5001, 1_000_000, 4_294_967_297} {
 		r := hApiPost(c, hApiWith(map[string]any{"sample_budget": budget}), "k-budget", "t1")
 		ctx.Equal(r.Status, 400, "sample_budget=%d (the budget is 1..5000 judge calls)", budget)
 	}
@@ -1023,7 +1024,7 @@ void CheckDataset404(harness::Ctx& ctx) {
 
 void CheckBudgetCap(harness::Ctx& ctx) {
   HApi api(ctx);
-  for (int budget : {0, -5, 5001, 1000000}) {
+  for (long long budget : {0LL, -5LL, 5001LL, 1000000LL, 4294967297LL}) {
     const auto r = api.post(hWith(kHGood, "sample_budget", budget), "k-budget");
     ctx.Equal(r.Status, 400, "sample_budget=%d (the budget is 1..5000 judge calls)", budget);
   }

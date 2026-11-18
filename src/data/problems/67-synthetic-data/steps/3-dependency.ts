@@ -439,7 +439,6 @@ func judgeRecord(ctx context.Context, state JobState, record records.SyntheticRe
 import (
 	"context"
 	"log"
-	"strconv"
 	"time"
 
 	"google.golang.org/grpc"
@@ -475,6 +474,9 @@ type Verdict struct {
 	JudgeVersion string
 }
 
+// statusNames names every gRPC status code in lower snake case, indexed by its number.
+var statusNames = [...]string{"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"}
+
 // reasonOf names a status the way the other runtimes do (INVALID_ARGUMENT → invalid_argument).
 func reasonOf(code codes.Code) string {
 	switch code {
@@ -485,7 +487,10 @@ func reasonOf(code codes.Code) string {
 	case codes.PermissionDenied:
 		return "permission_denied"
 	}
-	return "status_" + strconv.Itoa(int(code))
+	if int(code) < len(statusNames) {
+		return statusNames[code]
+	}
+	return "unknown"
 }
 
 // judgeRecord scores one generated record and settles it: admitted with the judge's score, parked or rejected.
@@ -740,7 +745,11 @@ std::string reason_of(grpc::StatusCode code) {
     case grpc::StatusCode::INVALID_ARGUMENT: return "invalid_argument";
     case grpc::StatusCode::RESOURCE_EXHAUSTED: return "resource_exhausted";
     case grpc::StatusCode::PERMISSION_DENIED: return "permission_denied";
-    default: return "status_" + std::to_string(static_cast<int>(code));
+    default: {
+      static const char* const kNames[] = {"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"};
+      const int n = static_cast<int>(code);
+      return n >= 0 && n < 17 ? kNames[n] : "unknown";
+    }
   }
 }
 
@@ -868,7 +877,7 @@ def check_retry_unavailable(ctx):
     assert all(t is not None and 0.8 <= t <= 1.0 and abs(t - timeouts[0]) <= 0.02 for t in timeouts), f"every attempt carries its own 900 ms deadline, the calls carried {timeouts}: a deadline shared by the retries leaves the last attempt only what the first ones and the backoff did not use"
     gaps = [round(b.started - a.started, 3) for a, b in zip(_calls(ctx)[2:], _calls(ctx)[3:])]
     assert all(g > 0 for g in gaps), f"each retry waits a backoff after an UNAVAILABLE, the gaps between the three calls were {gaps} s"
-    terminal = [(grpc.StatusCode.INVALID_ARGUMENT, "invalid_argument"), (grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.PERMISSION_DENIED, "permission_denied"), (grpc.StatusCode.INTERNAL, None)]
+    terminal = [(grpc.StatusCode.INVALID_ARGUMENT, "invalid_argument"), (grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.PERMISSION_DENIED, "permission_denied"), (grpc.StatusCode.INTERNAL, "internal")]
     for n, (code, reason) in enumerate(terminal, start=3):
         before = len(_calls(ctx))
         ctx.grpc.fail("Score", code, "judge says no", times=1, target=config.JUDGE)
@@ -975,7 +984,7 @@ export async function check_retry_unavailable(ctx) {
   const tail = calls(ctx).slice(2);
   const gaps = tail.slice(1).map((c, i) => c.started - tail[i].started);
   assert(gaps.every(g => g > 0), \`each retry waits a backoff after an UNAVAILABLE, the gaps between the three calls were \${JSON.stringify(gaps)} ms\`);
-  const terminal: [string, string | undefined][] = [['INVALID_ARGUMENT', 'invalid_argument'], ['RESOURCE_EXHAUSTED', 'resource_exhausted'], ['PERMISSION_DENIED', 'permission_denied'], ['INTERNAL', undefined]];
+  const terminal: [string, string][] = [['INVALID_ARGUMENT', 'invalid_argument'], ['RESOURCE_EXHAUSTED', 'resource_exhausted'], ['PERMISSION_DENIED', 'permission_denied'], ['INTERNAL', 'internal']];
   for (const [i, [name, reason]] of terminal.entries()) {
     const before = calls(ctx).length;
     ctx.grpc.fail('Score', ctx.grpc.status[name], 'judge says no', 1, config.JUDGE);
@@ -1142,7 +1151,7 @@ func CheckRetryUnavailable(ctx *harness.Ctx) {
 	terminal := []struct {
 		code   codes.Code
 		reason string
-	}{{codes.InvalidArgument, "invalid_argument"}, {codes.ResourceExhausted, "resource_exhausted"}, {codes.PermissionDenied, "permission_denied"}, {codes.Internal, ""}}
+	}{{codes.InvalidArgument, "invalid_argument"}, {codes.ResourceExhausted, "resource_exhausted"}, {codes.PermissionDenied, "permission_denied"}, {codes.Internal, "internal"}}
 	for i, t := range terminal {
 		before := len(clientCalls(ctx))
 		ctx.GRPC.Fail("Score", t.code, "judge says no", 1, config.Judge)
@@ -1303,7 +1312,7 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
     const auto gap = std::chrono::duration_cast<std::chrono::milliseconds>(calls[i].Started - calls[i - 1].Started).count();
     ctx.Assert(gap > 0, "each retry waits a backoff after an UNAVAILABLE, call %d started %d ms after the one before", static_cast<int>(i - 1), static_cast<long long>(gap));
   }
-  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INVALID_ARGUMENT, "invalid_argument"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "resource_exhausted"}, {grpc::StatusCode::PERMISSION_DENIED, "permission_denied"}, {grpc::StatusCode::INTERNAL, ""}};
+  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INVALID_ARGUMENT, "invalid_argument"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "resource_exhausted"}, {grpc::StatusCode::PERMISSION_DENIED, "permission_denied"}, {grpc::StatusCode::INTERNAL, "internal"}};
   for (size_t i = 0; i < terminal.size(); i++) {
     const size_t before = ctx.GRPC.CallsTo("Score").size();
     ctx.GRPC.Fail("Score", terminal[i].first, "judge says no", 1, config::kJudge);

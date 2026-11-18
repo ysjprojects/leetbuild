@@ -408,7 +408,6 @@ func runShard(ctx context.Context, batchID, model string, shardID int, recs []re
 import (
 	"context"
 	"log"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -430,6 +429,9 @@ const (
 var conn, _ = grpc.NewClient(config.ModelServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 var stub = pb.NewModelClient(conn)
 
+// statusNames names every gRPC status code in lower snake case, indexed by its number.
+var statusNames = [...]string{"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"}
+
 // reasonOf names a final status the way the output file does: the gRPC code in lower snake case.
 func reasonOf(code codes.Code) string {
 	switch code {
@@ -442,7 +444,10 @@ func reasonOf(code codes.Code) string {
 	case codes.FailedPrecondition:
 		return "failed_precondition"
 	}
-	return strings.ToLower(code.String())
+	if int(code) < len(statusNames) {
+		return statusNames[code]
+	}
+	return "unknown"
 }
 
 // infer runs one record: a deadline per attempt, Unavailable retried at most twice, anything else final.
@@ -664,7 +669,11 @@ std::string reason_of(grpc::StatusCode code) {
     case grpc::StatusCode::INVALID_ARGUMENT: return "invalid_argument";
     case grpc::StatusCode::RESOURCE_EXHAUSTED: return "resource_exhausted";
     case grpc::StatusCode::FAILED_PRECONDITION: return "failed_precondition";
-    default: return "status_" + std::to_string(static_cast<int>(code));
+    default: {
+      static const char* const kNames[] = {"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"};
+      const int n = static_cast<int>(code);
+      return n >= 0 && n < 17 ? kNames[n] : "unknown";
+    }
   }
 }
 
@@ -783,7 +792,7 @@ def check_retry_unavailable(ctx):
     assert calls == 3, f"a model server that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the record, saw {calls}"
     assert result.failed == 1 and _errors(result) == [("r0", "unavailable")], f"after three UNAVAILABLE the record fails with reason unavailable: failed {result.failed}, errors {_errors(result)}"
     ctx.grpc.failures.clear()  # the two UNAVAILABLE the record above did not use
-    for code, reason in ((grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.FAILED_PRECONDITION, "failed_precondition")):
+    for code, reason in ((grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.FAILED_PRECONDITION, "failed_precondition"), (grpc.StatusCode.PERMISSION_DENIED, "permission_denied"), (grpc.StatusCode.INTERNAL, "internal")):
         before = len(_calls(ctx))
         ctx.grpc.fail("Infer", code, "refused", times=1, target=config.MODEL_SERVER)
         result = m.run_shard(B, "sum-v7", 2, _records(1))
@@ -881,7 +890,7 @@ export async function check_retry_unavailable(ctx) {
   assert.equal(n, 3, \`a model server that stays UNAVAILABLE gets MAX_ATTEMPTS = 3 calls for the record, saw \${n}\`);
   assert(result.failed === 1 && JSON.stringify(errors(result)) === JSON.stringify([['r0', 'unavailable']]), \`after three UNAVAILABLE the record fails with reason unavailable: failed \${result.failed}, errors \${JSON.stringify(errors(result))}\`);
   ctx.grpc.clearFailures(); // the two UNAVAILABLE the record above did not use
-  for (const [code, reason] of [[ctx.grpc.status.RESOURCE_EXHAUSTED, 'resource_exhausted'], [ctx.grpc.status.FAILED_PRECONDITION, 'failed_precondition']]) {
+  for (const [code, reason] of [[ctx.grpc.status.RESOURCE_EXHAUSTED, 'resource_exhausted'], [ctx.grpc.status.FAILED_PRECONDITION, 'failed_precondition'], [ctx.grpc.status.PERMISSION_DENIED, 'permission_denied'], [ctx.grpc.status.INTERNAL, 'internal']]) {
     const before = calls(ctx).length;
     ctx.grpc.fail('Infer', code, 'refused', 1, config.MODEL_SERVER);
     result = await m.runShard(B, 'sum-v7', 2, records(1));
@@ -1028,7 +1037,7 @@ func CheckRetryUnavailable(ctx *harness.Ctx) {
 	for _, terminal := range []struct {
 		code   codes.Code
 		reason string
-	}{{codes.ResourceExhausted, "resource_exhausted"}, {codes.FailedPrecondition, "failed_precondition"}} {
+	}{{codes.ResourceExhausted, "resource_exhausted"}, {codes.FailedPrecondition, "failed_precondition"}, {codes.PermissionDenied, "permission_denied"}, {codes.Internal, "internal"}} {
 		before := len(hClientCalls(ctx))
 		ctx.GRPC.Fail("Infer", terminal.code, "refused", 1, config.ModelServer)
 		result = hClientRun(2, hClientRecords(1, -1))
@@ -1172,7 +1181,7 @@ void CheckRetryUnavailable(harness::Ctx& ctx) {
   ctx.Equal(ctx.GRPC.CallsTo("Infer").size() - 2, 3, "a model server that stays UNAVAILABLE gets kMaxAttempts = 3 calls for the record; calls");
   ctx.Assert(result.failed == 1 && hClientErrors(result) == std::vector<std::string>{"r0:unavailable"}, "after three UNAVAILABLE the record fails with reason unavailable: failed %d, errors %v", result.failed, hClientErrors(result));
   ctx.GRPC.ClearFailures();  // the two UNAVAILABLE the record above did not use
-  for (const auto& [code, reason] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::RESOURCE_EXHAUSTED, "resource_exhausted"}, {grpc::StatusCode::FAILED_PRECONDITION, "failed_precondition"}}) {
+  for (const auto& [code, reason] : std::vector<std::pair<grpc::StatusCode, std::string>>{{grpc::StatusCode::RESOURCE_EXHAUSTED, "resource_exhausted"}, {grpc::StatusCode::FAILED_PRECONDITION, "failed_precondition"}, {grpc::StatusCode::PERMISSION_DENIED, "permission_denied"}, {grpc::StatusCode::INTERNAL, "internal"}}) {
     const auto before = ctx.GRPC.CallsTo("Infer").size();
     ctx.GRPC.Fail("Infer", code, "refused", 1, config::kModelServer);
     result = run_shard(kHBatch, "sum-v7", 2, hClientRecords(1));

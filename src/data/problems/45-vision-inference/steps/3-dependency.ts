@@ -92,12 +92,15 @@ Requirements:
       match: {
         python: {all: [/downgrade_reason/, /small\.Predict\(/], none: [/["']unknown["']/, /attempt\s*%\s*2/]},
         typescript: {all: [/downgrade_reason/, /small\.Predict\(/], none: [/['"]unknown['"]/, /attempt\s*%\s*2/]},
-        go: {all: [/DowngradeReason/, /small\.Predict\(/], none: [/"unknown"/, /attempt\s*%\s*2/]},
+        go: {all: [/DowngradeReason/, /small\.Predict\(/], none: [/Label:\s*"unknown"/, /attempt\s*%\s*2/]},
         scala: {
           all: [/downgradeReason/, /small(\.withDeadlineAfter\([^)]*\))?\.predict\(/],
           none: [/"unknown"/, /attempt\s*%\s*2/],
         },
-        cpp: {all: [/downgrade_reason/, /small->Predict\(|call\(\s*\*small\b/], none: [/"unknown"/, /attempt\s*%\s*2/]},
+        cpp: {
+          all: [/downgrade_reason/, /small->Predict\(|call\(\s*\*small\b/],
+          none: [/label\s*=\s*"unknown"/, /attempt\s*%\s*2/],
+        },
       },
     },
     {
@@ -478,7 +481,6 @@ func predict(ctx context.Context, pool Pool, tenant, inferenceID, imageKey, task
 import (
 	"context"
 	"log"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -526,6 +528,9 @@ type Prediction struct {
 	Attempts        int
 }
 
+// statusNames names every gRPC status code in lower snake case, indexed by its number.
+var statusNames = [...]string{"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"}
+
 func reasonOf(code codes.Code) string {
 	if code == codes.DeadlineExceeded {
 		return "deadline"
@@ -536,7 +541,10 @@ func reasonOf(code codes.Code) string {
 	if code == codes.ResourceExhausted {
 		return "resource_exhausted"
 	}
-	return strings.ToLower(code.String())
+	if int(code) < len(statusNames) {
+		return statusNames[code]
+	}
+	return "unknown"
 }
 
 func complete(reply *pb.PredictReply, attempts int, downgraded bool) Prediction {
@@ -846,7 +854,11 @@ std::string reason_of(grpc::StatusCode code) {
     case grpc::StatusCode::DEADLINE_EXCEEDED: return "deadline";
     case grpc::StatusCode::INVALID_ARGUMENT: return "invalid_argument";
     case grpc::StatusCode::RESOURCE_EXHAUSTED: return "resource_exhausted";
-    default: return "status_" + std::to_string(static_cast<int>(code));
+    default: {
+      static const char* const kNames[] = {"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"};
+      const int n = static_cast<int>(code);
+      return n >= 0 && n < 17 ? kNames[n] : "unknown";
+    }
   }
 }
 
@@ -990,7 +1002,7 @@ def check_retry_policy(ctx):
     assert r.get("attempts") == 2 and len(_large(ctx)) == 3, f"one UNAVAILABLE earns one retry on the large model: {r}, {len(_large(ctx)) - 1} large calls"
     assert r.get("model_version") == models.LARGE_VERSION and len(_small(ctx)) == 0, f"the retry answered, so no downgrade: {r}"
     assert ctx.clock.sleeps >= 1, "a retry waits a backoff before the next attempt"
-    for i, (code, reason) in enumerate(((grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.PERMISSION_DENIED, None))):
+    for i, (code, reason) in enumerate(((grpc.StatusCode.RESOURCE_EXHAUSTED, "resource_exhausted"), (grpc.StatusCode.PERMISSION_DENIED, "permission_denied"))):
         before = len(_large(ctx))
         ctx.grpc.fail("Predict", code, "refused", times=1, target=config.LARGE_MODEL)
         r = m.predict(pool, "t1", f"inf-{3 + i}", CAT, "classify")
@@ -1104,7 +1116,7 @@ export async function check_retry_policy(ctx) {
   assert(r.attempts === 2 && large().length === 3, \`one UNAVAILABLE earns one retry on the large model: \${JSON.stringify(r)}, \${large().length - 1} large calls\`);
   assert(r.model_version === models.LARGE_VERSION && small().length === 0, \`the retry answered, so no downgrade: \${JSON.stringify(r)}\`);
   assert(ctx.clock.sleeps >= 1, 'a retry waits a backoff before the next attempt');
-  for (const [i, [code, name, reason]] of ([[ctx.grpc.status.RESOURCE_EXHAUSTED, 'RESOURCE_EXHAUSTED', 'resource_exhausted'], [ctx.grpc.status.PERMISSION_DENIED, 'PERMISSION_DENIED', undefined]] as const).entries()) {
+  for (const [i, [code, name, reason]] of ([[ctx.grpc.status.RESOURCE_EXHAUSTED, 'RESOURCE_EXHAUSTED', 'resource_exhausted'], [ctx.grpc.status.PERMISSION_DENIED, 'PERMISSION_DENIED', 'permission_denied']] as const).entries()) {
     const before = large().length;
     ctx.grpc.fail('Predict', code, 'refused', 1, config.LARGE_MODEL);
     r = await m.predict(pool, 't1', \`inf-\${3 + i}\`, CAT, 'classify');
@@ -1268,7 +1280,7 @@ func CheckRetryPolicy(ctx *harness.Ctx) {
 		code   codes.Code
 		name   string
 		reason string
-	}{{codes.ResourceExhausted, "RESOURCE_EXHAUSTED", "resource_exhausted"}, {codes.PermissionDenied, "PERMISSION_DENIED", ""}} {
+	}{{codes.ResourceExhausted, "RESOURCE_EXHAUSTED", "resource_exhausted"}, {codes.PermissionDenied, "PERMISSION_DENIED", "permission_denied"}} {
 		before := len(hClientLarge(ctx))
 		ctx.GRPC.Fail("Predict", tc.code, "refused", 1, config.LargeModel)
 		r = hClientPredict(ctx, pool, "t1", "inf-"+string(rune('3'+i)))
@@ -1439,7 +1451,7 @@ void CheckRetryPolicy(harness::Ctx& ctx) {
     std::string reason;
   };
   int n = 3;
-  for (const Terminal& t : {Terminal{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "resource_exhausted"}, Terminal{grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", ""}}) {
+  for (const Terminal& t : {Terminal{grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "resource_exhausted"}, Terminal{grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", "permission_denied"}}) {
     const size_t before = hLargeCalls(ctx);
     ctx.GRPC.Fail("Predict", t.code, "refused", 1, config::kLargeModel);
     r = predict(w.pool, "t1", "inf-" + std::to_string(n++), kHCat, "classify");

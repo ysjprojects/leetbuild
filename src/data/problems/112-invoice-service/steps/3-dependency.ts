@@ -464,9 +464,7 @@ func finalizeWithTax(ctx context.Context, tenant, invoiceID string) (Outcome, er
 import (
 	"context"
 	"fmt"
-	"strings"
 	"time"
-	"unicode"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -512,16 +510,15 @@ type Outcome struct {
 	Attempts  int    \`json:"attempts,omitempty"\`
 }
 
-// reasonOf is a status as the hold records it: "unavailable", "deadline_exceeded".
+// statusNames names every gRPC status code in lower snake case, indexed by its number.
+var statusNames = [...]string{"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"}
+
+// reasonOf is a status as the hold records it: "unavailable", "deadline_exceeded", "permission_denied".
 func reasonOf(code codes.Code) string {
-	var b strings.Builder
-	for i, r := range code.String() {
-		if i > 0 && unicode.IsUpper(r) {
-			b.WriteByte('_')
-		}
-		b.WriteRune(unicode.ToLower(r))
+	if int(code) < len(statusNames) {
+		return statusNames[code]
 	}
-	return b.String()
+	return "unknown"
 }
 
 // finalizeWithTax quotes the tax, then finalizes the draft.
@@ -765,18 +762,13 @@ struct Outcome {
   int attempts = 0;
 };
 
-// A status as the hold records it: "unavailable", "deadline_exceeded".
+// A status as the hold records it: "unavailable", "deadline_exceeded", "permission_denied".
 std::string reasonOf(grpc::StatusCode code) {
-  switch (code) {
-    case grpc::StatusCode::UNAVAILABLE:
-      return "unavailable";
-    case grpc::StatusCode::DEADLINE_EXCEEDED:
-      return "deadline_exceeded";
-    case grpc::StatusCode::INTERNAL:
-      return "internal";
-    default:
-      return "status_" + std::to_string(static_cast<int>(code));
-  }
+  static const char* const kNames[] = {"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found",
+                                       "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted",
+                                       "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"};
+  const int n = static_cast<int>(code);
+  return n >= 0 && n < 17 ? kNames[n] : "unknown";
 }
 
 // Quote the tax, then finalize the draft.
@@ -886,9 +878,10 @@ def check_bounded_retry(ctx):
         ctx.grpc.failures.clear()
         before = len(ctx.grpc.calls_to("Quote"))
         ctx.grpc.fail("Quote", code, times=1)
-        m.finalize_with_tax("t-1", _draft())
+        out = m.finalize_with_tax("t-1", _draft())
         again = len(ctx.grpc.calls_to("Quote")) - before
         assert again == 1, f"an answer of {code.name} was retried ({again} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are transient"
+        assert out.get("status") == "held" and out.get("reason") == code.name.lower(), f"an answer of {code.name} gave {out}, expected held with reason {code.name.lower()}"
 
 
 def check_terminal_jurisdiction(ctx):
@@ -993,9 +986,10 @@ export async function check_bounded_retry(ctx) {
     ctx.grpc.clearFailures();
     const before = ctx.grpc.callsTo('Quote').length;
     ctx.grpc.fail('Quote', ctx.grpc.status[code], '', 1);
-    await m.finalizeWithTax('t-1', await draft(store));
+    const out = await m.finalizeWithTax('t-1', await draft(store));
     const again = ctx.grpc.callsTo('Quote').length - before;
     assert.equal(again, 1, \`an answer of \${code} was retried (\${again} calls): only UNAVAILABLE and DEADLINE_EXCEEDED are transient\`);
+    assert(out.status === 'held' && out.reason === code.toLowerCase(), \`an answer of \${code} gave \${JSON.stringify(out)}, expected held with reason \${code.toLowerCase()}\`);
   }
 }
 
@@ -1128,12 +1122,17 @@ func CheckBoundedRetry(ctx *harness.Ctx) {
 	ctx.GRPC.Fail("Quote", codes.DeadlineExceeded, "", 10, "")
 	finalizeWithTax(hBg, "t-1", hDraft("DE"))
 	ctx.Equal(len(ctx.GRPC.CallsTo("Quote", ""))-calls, 3, "a tax service answering DeadlineExceeded (transient), the calls for one finalize (taxMaxAttempts = 3)")
-	for _, code := range []codes.Code{codes.Internal, codes.InvalidArgument, codes.PermissionDenied, codes.ResourceExhausted} {
+	for _, terminal := range []struct {
+		code   codes.Code
+		reason string
+	}{{codes.Internal, "internal"}, {codes.InvalidArgument, "invalid_argument"}, {codes.PermissionDenied, "permission_denied"}, {codes.ResourceExhausted, "resource_exhausted"}} {
+		code := terminal.code
 		ctx.GRPC.ClearFailures()
 		before := len(ctx.GRPC.CallsTo("Quote", ""))
 		ctx.GRPC.Fail("Quote", code, "", 1, "")
-		finalizeWithTax(hBg, "t-1", hDraft("DE"))
+		out, _ := finalizeWithTax(hBg, "t-1", hDraft("DE"))
 		ctx.Equal(len(ctx.GRPC.CallsTo("Quote", ""))-before, 1, "an answer of %v must not be retried (only Unavailable and DeadlineExceeded are transient); the calls", code)
+		ctx.Assert(out.Status == "held" && out.Reason == terminal.reason, "an answer of %v gave %+v, expected held with reason %s", code, out, terminal.reason)
 	}
 }
 
@@ -1268,16 +1267,18 @@ void CheckBoundedRetry(harness::Ctx& ctx) {
   ctx.GRPC.Fail("Quote", grpc::StatusCode::DEADLINE_EXCEEDED, "", 10);
   finalizeWithTax("t-1", hDraft("DE"));
   ctx.Equal(ctx.GRPC.CallsTo("Quote").size() - calls, 3, "a tax service answering DEADLINE_EXCEEDED (transient), the calls for one finalize (kTaxMaxAttempts = 3)");
-  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {{grpc::StatusCode::INTERNAL, "INTERNAL"},
-                                                                          {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT"},
-                                                                          {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"},
-                                                                          {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}};
-  for (const auto& [code, name] : terminal) {
+  const std::vector<std::tuple<grpc::StatusCode, std::string, std::string>> terminal = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL", "internal"},
+      {grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT", "invalid_argument"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", "permission_denied"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "resource_exhausted"}};
+  for (const auto& [code, name, reason] : terminal) {
     ctx.GRPC.ClearFailures();
     const size_t before = ctx.GRPC.CallsTo("Quote").size();
     ctx.GRPC.Fail("Quote", code, "", 1);
-    finalizeWithTax("t-1", hDraft("DE"));
+    const Outcome out = finalizeWithTax("t-1", hDraft("DE"));
     ctx.Equal(ctx.GRPC.CallsTo("Quote").size() - before, 1, "an answer of %s must not be retried (only UNAVAILABLE and DEADLINE_EXCEEDED are transient); the calls", name);
+    ctx.Assert(out.status == "held" && out.reason == reason, "an answer of %s gave %s, expected held with reason %s", name, hShow(out), reason);
   }
 }
 

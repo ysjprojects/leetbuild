@@ -298,7 +298,6 @@ func embed(ctx context.Context, text, modelVersion string) ([]float32, error) {
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -319,16 +318,15 @@ const (
 var conn, _ = grpc.NewClient(config.ModelServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 var stub = pb.NewEmbedderClient(conn)
 
-// reasonOf names a status the way every language of the service does: unavailable, deadline_exceeded, invalid_argument.
+// statusNames names every gRPC status code in lower snake case, indexed by its number.
+var statusNames = [...]string{"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"}
+
+// reasonOf names a status the way every language of the service does: unavailable, deadline_exceeded, permission_denied.
 func reasonOf(code codes.Code) string {
-	switch code {
-	case codes.DeadlineExceeded:
-		return "deadline_exceeded"
-	case codes.InvalidArgument:
-		return "invalid_argument"
-	default:
-		return strings.ToLower(code.String())
+	if int(code) < len(statusNames) {
+		return statusNames[code]
 	}
+	return "unknown"
 }
 
 // embed is the model server's vector of text under modelVersion; a *config.EmbedError when there is no usable one.
@@ -476,14 +474,13 @@ constexpr std::chrono::milliseconds kBackoff{200};
 auto channel = grpc::CreateChannel(config::kModelServer, grpc::InsecureChannelCredentials());
 auto stub = embedding::Embedder::NewStub(channel);
 
-// A status named the way every language of the service names it: unavailable, deadline_exceeded, invalid_argument.
+// A status named the way every language of the service names it: unavailable, deadline_exceeded, permission_denied.
 std::string reasonOf(grpc::StatusCode code) {
-  switch (code) {
-    case grpc::StatusCode::UNAVAILABLE: return "unavailable";
-    case grpc::StatusCode::DEADLINE_EXCEEDED: return "deadline_exceeded";
-    case grpc::StatusCode::INVALID_ARGUMENT: return "invalid_argument";
-    default: return "status_" + std::to_string(static_cast<int>(code));
-  }
+  static const char* const kNames[] = {"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found",
+                                       "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted",
+                                       "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"};
+  const int n = static_cast<int>(code);
+  return n >= 0 && n < 17 ? kNames[n] : "unknown";
 }
 
 // The model server's vector of text under model_version; config::EmbedError when there is no usable one.
@@ -619,7 +616,7 @@ def check_unavailable_only(ctx):
         ctx.grpc.fail("Embed", code, "refused", times=1, target=MODEL_SERVER)
         value, err = _attempt(lambda: m.embed(f"An input for {code.name}.", MODEL_VERSION))
         n = len(_calls(ctx)) - before
-        assert n == 1 and err is not None, f"{code.name} is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError, saw {n} calls and {value if err is None else 'EmbedError(' + repr(err.reason) + ')'}"
+        assert n == 1 and err is not None and err.reason == code.name.lower(), f"{code.name} is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError({code.name.lower()!r}), saw {n} calls and {value if err is None else 'EmbedError(' + repr(err.reason) + ')'}"
 
 
 def check_model_check(ctx):
@@ -729,7 +726,7 @@ export async function check_unavailable_only(ctx) {
     ctx.grpc.fail('Embed', ctx.grpc.status[name], 'refused', 1, config.MODEL_SERVER);
     const r = await attempt(m.embed(\`An input for \${name}.\`, config.MODEL_VERSION));
     const n = calls(ctx).length - before;
-    assert(n === 1 && r.err !== null, \`\${name} is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError, saw \${n} calls and \${r.err === null ? JSON.stringify(r.value) : \`EmbedError(\${r.err.reason})\`}\`);
+    assert(n === 1 && r.err !== null && r.err.reason === name.toLowerCase(), \`\${name} is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError(\${name.toLowerCase()}), saw \${n} calls and \${r.err === null ? JSON.stringify(r.value) : \`EmbedError(\${r.err.reason})\`}\`);
   }
 }
 
@@ -869,12 +866,15 @@ func CheckUnavailableOnly(ctx *harness.Ctx) {
 	ctx.Assert(n == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", n)
 	ctx.Assert(err != nil, "an INVALID_ARGUMENT must return an EmbedError, embed returned %v", got)
 	ctx.Equal(err.Reason, "invalid_argument", "the EmbedError must name the status")
-	for _, code := range []codes.Code{codes.Internal, codes.ResourceExhausted, codes.PermissionDenied} {
+	for _, c := range []struct {
+		code   codes.Code
+		reason string
+	}{{codes.Internal, "internal"}, {codes.ResourceExhausted, "resource_exhausted"}, {codes.PermissionDenied, "permission_denied"}} {
 		before := len(ctx.GRPC.CallsTo("Embed", ""))
-		ctx.GRPC.Fail("Embed", code, "refused", 1, config.ModelServer)
-		got, err := hClientAttempt(ctx, "An input for "+code.String()+".")
+		ctx.GRPC.Fail("Embed", c.code, "refused", 1, config.ModelServer)
+		got, err := hClientAttempt(ctx, "An input for "+c.code.String()+".")
 		n := len(ctx.GRPC.CallsTo("Embed", "")) - before
-		ctx.Assert(n == 1 && err != nil, "%v is not UNAVAILABLE and earns no retry: expected one Embed call and an EmbedError, saw %d calls and %v (%v)", code, n, got, err)
+		ctx.Assert(n == 1 && err != nil && err.Reason == c.reason, "%v is not UNAVAILABLE and earns no retry: expected one Embed call and an EmbedError(%s), saw %d calls and %v (%v)", c.code, c.reason, n, got, err)
 	}
 }
 
@@ -1015,14 +1015,16 @@ void CheckUnavailableOnly(harness::Ctx& ctx) {
   ctx.Assert(hCalls(ctx) == 1, "INVALID_ARGUMENT is the input's fault and a retry cannot fix it, yet embed called Embed %d times", hCalls(ctx));
   ctx.Assert(a.reason.has_value(), "an INVALID_ARGUMENT must throw EmbedError, embed returned %v", a.value);
   ctx.Equal(a.reason.value_or(""), "invalid_argument", "the EmbedError must name the status");
-  const std::vector<std::pair<grpc::StatusCode, std::string>> terminal = {
-      {grpc::StatusCode::INTERNAL, "INTERNAL"}, {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED"}, {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED"}};
-  for (const auto& [code, name] : terminal) {
+  const std::vector<std::tuple<grpc::StatusCode, std::string, std::string>> terminal = {
+      {grpc::StatusCode::INTERNAL, "INTERNAL", "internal"},
+      {grpc::StatusCode::RESOURCE_EXHAUSTED, "RESOURCE_EXHAUSTED", "resource_exhausted"},
+      {grpc::StatusCode::PERMISSION_DENIED, "PERMISSION_DENIED", "permission_denied"}};
+  for (const auto& [code, name, reason] : terminal) {
     const size_t before = hCalls(ctx);
     ctx.GRPC.Fail("Embed", code, "refused", 1, config::kModelServer);
     const HAttempt t = hClientAttempt(ctx, "An input for " + name + ".");
     const size_t n = hCalls(ctx) - before;
-    ctx.Assert(n == 1 && t.reason.has_value(), "%s is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError, saw %d calls and %s", name, n, t.reason.value_or("a vector"));
+    ctx.Assert(n == 1 && t.reason == reason, "%s is not UNAVAILABLE and earns no retry: expected one Embed call and EmbedError(%s), saw %d calls and %s", name, reason, n, t.reason.value_or("a vector"));
   }
 }
 

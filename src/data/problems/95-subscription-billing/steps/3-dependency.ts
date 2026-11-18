@@ -386,7 +386,6 @@ func chargeInvoice(ctx context.Context, invoice *store.Invoice) store.Outcome {
 
 import (
 	"context"
-	"strings"
 	"time"
 
 	"google.golang.org/grpc"
@@ -397,6 +396,9 @@ import (
 	pb "billing/gen/subscription_billing"
 	"billing/store" // store.Invoice, store.Outcome, store.ProcessorInvoice
 )
+
+// statusNames names every gRPC status code in lower snake case, indexed by its number.
+var statusNames = [...]string{"ok", "cancelled", "unknown", "invalid_argument", "deadline_exceeded", "not_found", "already_exists", "permission_denied", "resource_exhausted", "failed_precondition", "aborted", "out_of_range", "unimplemented", "internal", "unavailable", "data_loss", "unauthenticated"}
 
 const (
 	deadline    = 5 * time.Second
@@ -443,7 +445,11 @@ func chargeInvoice(ctx context.Context, invoice *store.Invoice) store.Outcome {
 			case codes.Unavailable:
 				continue
 			}
-			return store.Outcome{State: "failed", Reason: strings.ToLower(status.Code(err).String())}
+			reason := "unknown"
+			if code := status.Code(err); int(code) < len(statusNames) {
+				reason = statusNames[code]
+			}
+			return store.Outcome{State: "failed", Reason: reason}
 		}
 		if result.GetStatus() == "declined" {
 			return store.Outcome{State: "failed", Reason: result.GetDeclineCode()} // final: the issuer said no
