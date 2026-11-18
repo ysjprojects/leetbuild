@@ -6,7 +6,7 @@
  * harnesses run in the browser runtimes, here in Node). Run after editing problems:
  *
  *   yarn verify                               # everything
- *   yarn verify --problem image-cache         # one problem (by id or NN- prefix)
+ *   yarn verify --problem image-cache         # one problem (by id, or its directory: 00-image-cache)
  *   yarn verify --file src/data/problems/00-image-cache/index.ts   # one problem file, not via the index
  *   yarn verify --verbose                     # list every check result
  *   yarn verify --no-runtime                  # static checks only (no Pyodide boot)
@@ -67,6 +67,13 @@ const flag = (name: string): string | null => {
   return i >= 0 ? args[i + 1] ?? null : null;
 };
 const onlyProblem = flag('--problem');
+/** `--problem` names one course: its id, or its directory under src/data/problems (`NN-id`). */
+const isOnlyProblem = (problem: Problem): boolean =>
+  onlyProblem !== null &&
+  (onlyProblem === problem.id ||
+    (/^\d+-/.test(onlyProblem) &&
+      onlyProblem.replace(/^\d+-/, '') === problem.id &&
+      existsSync(resolve('src/data/problems', onlyProblem))));
 const onlyFile = flag('--file');
 const verbose = args.includes('--verbose');
 const withRuntime = !args.includes('--no-runtime');
@@ -924,17 +931,13 @@ async function main(): Promise<void> {
     console.log(`${guides.length === 0 ? '✓' : '✗'} failure-mode guides and the sections checks link to`);
     errors.push(...guides);
   }
-  errors.push(
-    ...protoCollisions(problems, onlyProblem === null ? null : problems.filter(p => onlyProblem.endsWith(p.id))),
-  );
+  errors.push(...protoCollisions(problems, onlyProblem === null ? null : problems.filter(isOnlyProblem)));
   const ids = new Set<string>();
   let steps = 0;
   let checked = 0;
   const harnesses: Partial<Record<Language, number>> = {};
   let programs = 0;
-  const selected = shareOf(
-    problems.filter(p => onlyProblem === null || p.id === onlyProblem || onlyProblem.endsWith(p.id)),
-  );
+  const selected = shareOf(problems.filter(p => onlyProblem === null || isOnlyProblem(p)));
   const runtimes: Partial<Record<Language, NodeRuntime>> = {};
   if (withRuntime)
     for (const {language, boot} of EXECUTING) {

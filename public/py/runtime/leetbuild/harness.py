@@ -271,6 +271,10 @@ def run_checks(harness_src: str, check_ids: list[str], files: dict[str, str]) ->
 async def _run_checks(harness_src: str, check_ids: list[str], files: dict[str, str]) -> list[dict]:
     namespace: dict[str, Any] = {"__name__": "harness"}
     try:
+        # The harness's own imports must see this job's /work and /support, not a previous job's
+        # modules: the worker outlives a course, and the last run may have left `sessions` (a
+        # learner's sessions.py) where this course ships a `sessions` package.
+        _purge_modules()
         exec(compile(harness_src, "<harness>", "exec"), namespace)
     except BaseException as exc:
         return [{"id": cid, "passed": False, "message": f"the harness failed to load: {_explain(exc)}"} for cid in check_ids]
