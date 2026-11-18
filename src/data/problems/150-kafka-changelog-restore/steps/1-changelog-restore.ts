@@ -1234,45 +1234,45 @@ import (
 	"leetbuild/harness"
 )
 
-const kvTopic = "kv-changelog"
+const kHKvTopic = "kv-changelog"
 
 // seedKV is a record from the changelog's writer: a JSON value, or a tombstone (nil) for a delete.
-func seedKV(ctx *harness.Ctx, partition int, key string, value any) {
+func hSeedKV(ctx *harness.Ctx, partition int, key string, value any) {
 	var raw []byte
 	if value != nil {
 		raw, _ = json.Marshal(value)
 	}
-	ctx.Kafka.SeedPartition(kvTopic, partition, key, raw)
+	ctx.Kafka.SeedPartition(kHKvTopic, partition, key, raw)
 }
 
-func drainStart(ctx *harness.Ctx, onRestored func(partition int, offset int64)) {
+func hDrainStart(ctx *harness.Ctx, onRestored func(partition int, offset int64)) {
 	ctx.Drain(func() { _ = Start(context.Background(), onRestored) })
 }
 
-func getKV(ctx *harness.Ctx, key string) any {
+func hGetKV(ctx *harness.Ctx, key string) any {
 	v, err := Get(key)
 	ctx.NoError(err, "Get(%q)", key)
 	return v
 }
 
-func kvNotReady(key string) bool {
+func hKvNotReady(key string) bool {
 	_, err := Get(key)
 	return errors.Is(err, ErrNotReady)
 }
 
 func CheckLastWriteWins(ctx *harness.Ctx) {
-	seedKV(ctx, 0, "a", 1)
-	seedKV(ctx, 1, "b", map[string]any{"n": 2})
-	seedKV(ctx, 0, "a", 3)
-	seedKV(ctx, 1, "b", nil)
-	seedKV(ctx, 2, "c", "four")
-	drainStart(ctx, nil)
+	hSeedKV(ctx, 0, "a", 1)
+	hSeedKV(ctx, 1, "b", map[string]any{"n": 2})
+	hSeedKV(ctx, 0, "a", 3)
+	hSeedKV(ctx, 1, "b", nil)
+	hSeedKV(ctx, 2, "c", "four")
+	hDrainStart(ctx, nil)
 	s := GetStats()
 	ctx.Equal(s.Ready, true, "every partition was replayed to its end: the view must be ready (stats %+v)", s)
-	ctx.Equal(getKV(ctx, "a"), 3, "a was written as 1 then 3 on one partition: the last write wins")
-	ctx.Equal(getKV(ctx, "c"), "four", "c was written once")
-	ctx.Equal(getKV(ctx, "b"), nil, "b was tombstoned after its write: it must be absent")
-	ctx.Equal(getKV(ctx, "nope"), nil, "a key the changelog never held answers nil")
+	ctx.Equal(hGetKV(ctx, "a"), 3, "a was written as 1 then 3 on one partition: the last write wins")
+	ctx.Equal(hGetKV(ctx, "c"), "four", "c was written once")
+	ctx.Equal(hGetKV(ctx, "b"), nil, "b was tombstoned after its write: it must be absent")
+	ctx.Equal(hGetKV(ctx, "nope"), nil, "a key the changelog never held answers nil")
 	ctx.Equal(s.Restored, 5, "5 records were replayed: Restored")
 	ctx.Equal(s.AppliedLive, 0, "nothing was written after Start: AppliedLive")
 }
@@ -1282,15 +1282,15 @@ func CheckNotReadyMidRestore(ctx *harness.Ctx) {
 	total := 0
 	for p, n := range sizes {
 		for i := range n {
-			seedKV(ctx, p, fmt.Sprintf("p%dk%d", p, i), i)
+			hSeedKV(ctx, p, fmt.Sprintf("p%dk%d", p, i), i)
 		}
 		total += n
 	}
 	seen := 0
 	var servedEarly [][3]int64
-	drainStart(ctx, func(partition int, offset int64) {
+	hDrainStart(ctx, func(partition int, offset int64) {
 		seen++
-		if seen < total && (!kvNotReady("p0k0") || GetStats().Ready) {
+		if seen < total && (!hKvNotReady("p0k0") || GetStats().Ready) {
 			servedEarly = append(servedEarly, [3]int64{int64(seen), int64(partition), offset})
 		}
 	})
@@ -1299,21 +1299,21 @@ func CheckNotReadyMidRestore(ctx *harness.Ctx) {
 		ctx.Fatalf("Get must return ErrNotReady (and Ready stay false) until every partition reached its captured end: the view answered after %d of %d records (partition %d offset %d), partitions 0 and 1 were done, partition 2 was not", servedEarly[0][0], total, servedEarly[0][1], servedEarly[0][2])
 	}
 	ctx.Equal(GetStats().Ready, true, "once partition 2 reached its end the view must be ready")
-	ctx.Equal(getKV(ctx, "p2k24"), 24, "p2k24")
+	ctx.Equal(hGetKV(ctx, "p2k24"), 24, "p2k24")
 }
 
 func CheckLiveAfterCapture(ctx *harness.Ctx) {
-	seedKV(ctx, 0, "a", "old")
-	seedKV(ctx, 1, "b", "old")
+	hSeedKV(ctx, 0, "a", "old")
+	hSeedKV(ctx, 1, "b", "old")
 	for i := range 3 {
-		seedKV(ctx, 2, fmt.Sprintf("c%d", i), i)
+		hSeedKV(ctx, 2, fmt.Sprintf("c%d", i), i)
 	}
 	written := 0
-	drainStart(ctx, func(int, int64) {
+	hDrainStart(ctx, func(int, int64) {
 		if written == 0 {
 			// the writer keeps writing while we restore: these land after the capture
-			seedKV(ctx, 0, "a", "new")
-			seedKV(ctx, 1, "d", "new")
+			hSeedKV(ctx, 0, "a", "new")
+			hSeedKV(ctx, 1, "d", "new")
 			written = 2
 		}
 	})
@@ -1321,44 +1321,44 @@ func CheckLiveAfterCapture(ctx *harness.Ctx) {
 	ctx.Equal(s.Ready, true, "the view must be ready once the 5 captured records are replayed (stats %+v)", s)
 	ctx.Equal(s.Restored, 5, "5 records existed when Start captured the ends (a record written after the capture is live even when it is delivered before the restore is complete): Restored")
 	ctx.Equal(s.AppliedLive, 2, "2 records were written after the capture: AppliedLive")
-	ctx.Equal(getKV(ctx, "a"), "new", "the live write to a must be applied")
-	ctx.Equal(getKV(ctx, "d"), "new", "the live write to d must be applied")
+	ctx.Equal(hGetKV(ctx, "a"), "new", "the live write to a must be applied")
+	ctx.Equal(hGetKV(ctx, "d"), "new", "the live write to d must be applied")
 }
 
 func CheckTombstoneResurrect(ctx *harness.Ctx) {
-	seedKV(ctx, 0, "a", 1)
-	seedKV(ctx, 0, "a", nil)
-	seedKV(ctx, 0, "a", 2)
-	seedKV(ctx, 1, "b", 1)
-	drainStart(ctx, func(partition int, offset int64) {
+	hSeedKV(ctx, 0, "a", 1)
+	hSeedKV(ctx, 0, "a", nil)
+	hSeedKV(ctx, 0, "a", 2)
+	hSeedKV(ctx, 1, "b", 1)
+	hDrainStart(ctx, func(partition int, offset int64) {
 		if partition == 1 && offset == 0 {
 			// live: delete b, write it again, delete a key never held
-			seedKV(ctx, 1, "b", nil)
-			seedKV(ctx, 1, "b", "back")
-			seedKV(ctx, 2, "c", nil)
+			hSeedKV(ctx, 1, "b", nil)
+			hSeedKV(ctx, 1, "b", "back")
+			hSeedKV(ctx, 2, "c", nil)
 		}
 	})
 	s := GetStats()
 	ctx.Equal(s.Ready, true, "stats %+v", s)
-	ctx.Equal(getKV(ctx, "a"), 2, "a was written, tombstoned, written again during the restore")
-	ctx.Equal(getKV(ctx, "b"), "back", "b was tombstoned then written again live")
-	ctx.Equal(getKV(ctx, "c"), nil, "a tombstone for a key the view never held is a no-op")
+	ctx.Equal(hGetKV(ctx, "a"), 2, "a was written, tombstoned, written again during the restore")
+	ctx.Equal(hGetKV(ctx, "b"), "back", "b was tombstoned then written again live")
+	ctx.Equal(hGetKV(ctx, "c"), nil, "a tombstone for a key the view never held is a no-op")
 	ctx.Equal(s.Restored, 4, "Restored")
 	ctx.Equal(s.AppliedLive, 3, "AppliedLive (partition 2 was empty at the capture)")
 }
 
 func CheckAllPartitions(ctx *harness.Ctx) {
 	for i := range 3 {
-		seedKV(ctx, 0, fmt.Sprintf("x%d", i), i)
+		hSeedKV(ctx, 0, fmt.Sprintf("x%d", i), i)
 	}
 	for i := range 2 {
-		seedKV(ctx, 2, fmt.Sprintf("z%d", i), i)
+		hSeedKV(ctx, 2, fmt.Sprintf("z%d", i), i)
 	}
-	drainStart(ctx, nil)
+	hDrainStart(ctx, nil)
 	assigned := map[int]bool{}
 	for _, c := range ctx.Kafka.Consumers() {
 		for _, tp := range c.Assignment {
-			if tp.Topic == kvTopic {
+			if tp.Topic == kHKvTopic {
 				assigned[tp.Partition] = true
 			}
 		}
@@ -1371,17 +1371,17 @@ func CheckAllPartitions(ctx *harness.Ctx) {
 	ctx.Equal(partitionsAssigned, []int{0, 1, 2}, "all three partitions of kv-changelog must be assigned, the empty one included: partitions assigned")
 	s := GetStats()
 	ctx.Equal(s.Ready, true, "partition 1 is empty: its captured end is 0, so it is caught up from the start and must not block readiness")
-	ctx.Assert(getKV(ctx, "x2") == 2.0 && getKV(ctx, "z1") == 1.0, "records from partitions 0 and 2 must both be in the view")
+	ctx.Assert(hGetKV(ctx, "x2") == 2.0 && hGetKV(ctx, "z1") == 1.0, "records from partitions 0 and 2 must both be in the view")
 	ctx.Equal(s.Restored, 5, "Restored")
 }
 
 func CheckNoCommits(ctx *harness.Ctx) {
-	seedKV(ctx, 0, "a", 1)
-	seedKV(ctx, 1, "b", 2)
-	drainStart(ctx, nil)
+	hSeedKV(ctx, 0, "a", 1)
+	hSeedKV(ctx, 1, "b", 2)
+	hDrainStart(ctx, nil)
 	ctx.Clock.Advance(10) // long enough for any auto-commit timer
 	ctx.Equal(len(ctx.Kafka.Commits("")), 0, "a restore consumer commits nothing (no GroupID, never CommitMessages): commits")
-	ctx.Assert(GetStats().Ready && getKV(ctx, "b") == 2.0, "after the restore the view must be ready and serve b = 2")
+	ctx.Assert(GetStats().Ready && hGetKV(ctx, "b") == 2.0, "after the restore the view must be ready and serve b = 2")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1399,23 +1399,23 @@ func CheckNoCommits(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kvTopic = "kv-changelog";
+const std::string kHKvTopic = "kv-changelog";
 
-std::string showStats(const Stats& s) {
+std::string hShowStats(const Stats& s) {
   return harness::Sprintf("{ready:%t restored:%d applied_live:%d}", s.ready, s.restored, s.applied_live);
 }
 
 // seedKV is a record from the changelog's writer: a JSON value, or a tombstone (null) for a delete.
-void seedKV(harness::Ctx& ctx, int partition, const std::string& key, const nlohmann::json& value) {
-  ctx.Kafka.SeedPartition(kvTopic, partition, key, value.is_null() ? std::optional<std::string>() : value.dump());
+void hSeedKV(harness::Ctx& ctx, int partition, const std::string& key, const nlohmann::json& value) {
+  ctx.Kafka.SeedPartition(kHKvTopic, partition, key, value.is_null() ? std::optional<std::string>() : value.dump());
 }
 
-void drainStart(harness::Ctx& ctx, std::function<void(int, long)> onRestored) {
+void hDrainStart(harness::Ctx& ctx, std::function<void(int, long)> onRestored) {
   ctx.Drain([&] { start(onRestored); });
 }
 
 // getKV is get(key): the value's JSON text, empty when the view does not hold the key.
-std::optional<std::string> getKV(harness::Ctx& ctx, const std::string& key) {
+std::optional<std::string> hGetKV(harness::Ctx& ctx, const std::string& key) {
   try {
     return get(key);
   } catch (const std::exception& e) {
@@ -1423,7 +1423,7 @@ std::optional<std::string> getKV(harness::Ctx& ctx, const std::string& key) {
   }
 }
 
-bool kvNotReady(const std::string& key) {
+bool hKvNotReady(const std::string& key) {
   try {
     get(key);
   } catch (const NotReadyError&) {
@@ -1435,18 +1435,18 @@ bool kvNotReady(const std::string& key) {
 }  // namespace
 
 void CheckLastWriteWins(harness::Ctx& ctx) {
-  seedKV(ctx, 0, "a", 1);
-  seedKV(ctx, 1, "b", {{"n", 2}});
-  seedKV(ctx, 0, "a", 3);
-  seedKV(ctx, 1, "b", nullptr);
-  seedKV(ctx, 2, "c", "four");
-  drainStart(ctx, nullptr);
+  hSeedKV(ctx, 0, "a", 1);
+  hSeedKV(ctx, 1, "b", {{"n", 2}});
+  hSeedKV(ctx, 0, "a", 3);
+  hSeedKV(ctx, 1, "b", nullptr);
+  hSeedKV(ctx, 2, "c", "four");
+  hDrainStart(ctx, nullptr);
   const Stats s = stats();
-  ctx.Equal(s.ready, true, "every partition was replayed to its end: the view must be ready (stats %s)", showStats(s));
-  ctx.Equal(getKV(ctx, "a"), "3", "a was written as 1 then 3 on one partition: the last write wins");
-  ctx.Equal(getKV(ctx, "c"), R"("four")", "c was written once");
-  ctx.Equal(getKV(ctx, "b"), nullptr, "b was tombstoned after its write: it must be absent");
-  ctx.Equal(getKV(ctx, "nope"), nullptr, "a key the changelog never held answers nothing");
+  ctx.Equal(s.ready, true, "every partition was replayed to its end: the view must be ready (stats %s)", hShowStats(s));
+  ctx.Equal(hGetKV(ctx, "a"), "3", "a was written as 1 then 3 on one partition: the last write wins");
+  ctx.Equal(hGetKV(ctx, "c"), R"("four")", "c was written once");
+  ctx.Equal(hGetKV(ctx, "b"), nullptr, "b was tombstoned after its write: it must be absent");
+  ctx.Equal(hGetKV(ctx, "nope"), nullptr, "a key the changelog never held answers nothing");
   ctx.Equal(s.restored, 5, "5 records were replayed: restored");
   ctx.Equal(s.applied_live, 0, "nothing was written after start: applied_live");
 }
@@ -1455,91 +1455,91 @@ void CheckNotReadyMidRestore(harness::Ctx& ctx) {
   const std::vector<int> sizes = {2, 3, 25};
   int total = 0;
   for (size_t p = 0; p < sizes.size(); p++) {
-    for (int i = 0; i < sizes[p]; i++) seedKV(ctx, static_cast<int>(p), "p" + std::to_string(p) + "k" + std::to_string(i), i);
+    for (int i = 0; i < sizes[p]; i++) hSeedKV(ctx, static_cast<int>(p), "p" + std::to_string(p) + "k" + std::to_string(i), i);
     total += sizes[p];
   }
   int seen = 0;
   std::vector<std::array<int64_t, 3>> servedEarly;
-  drainStart(ctx, [&](int partition, long offset) {
+  hDrainStart(ctx, [&](int partition, long offset) {
     seen++;
-    if (seen < total && (!kvNotReady("p0k0") || stats().ready)) servedEarly.push_back({seen, partition, offset});
+    if (seen < total && (!hKvNotReady("p0k0") || stats().ready)) servedEarly.push_back({seen, partition, offset});
   });
   ctx.Equal(seen, total, "on_restored must be called once per replayed record: calls");
   if (!servedEarly.empty())
     ctx.Fatalf("get must throw NotReadyError (and ready stay false) until every partition reached its captured end: the view answered after %d of %d records (partition %d offset %d), partitions 0 and 1 were done, partition 2 was not",
                servedEarly[0][0], total, servedEarly[0][1], servedEarly[0][2]);
   ctx.Equal(stats().ready, true, "once partition 2 reached its end the view must be ready");
-  ctx.Equal(getKV(ctx, "p2k24"), "24", "p2k24");
+  ctx.Equal(hGetKV(ctx, "p2k24"), "24", "p2k24");
 }
 
 void CheckLiveAfterCapture(harness::Ctx& ctx) {
-  seedKV(ctx, 0, "a", "old");
-  seedKV(ctx, 1, "b", "old");
-  for (int i = 0; i < 3; i++) seedKV(ctx, 2, "c" + std::to_string(i), i);
+  hSeedKV(ctx, 0, "a", "old");
+  hSeedKV(ctx, 1, "b", "old");
+  for (int i = 0; i < 3; i++) hSeedKV(ctx, 2, "c" + std::to_string(i), i);
   int written = 0;
-  drainStart(ctx, [&](int, long) {
+  hDrainStart(ctx, [&](int, long) {
     if (written == 0) {
       // the writer keeps writing while we restore: these land after the capture
-      seedKV(ctx, 0, "a", "new");
-      seedKV(ctx, 1, "d", "new");
+      hSeedKV(ctx, 0, "a", "new");
+      hSeedKV(ctx, 1, "d", "new");
       written = 2;
     }
   });
   const Stats s = stats();
-  ctx.Equal(s.ready, true, "the view must be ready once the 5 captured records are replayed (stats %s)", showStats(s));
+  ctx.Equal(s.ready, true, "the view must be ready once the 5 captured records are replayed (stats %s)", hShowStats(s));
   ctx.Equal(s.restored, 5,
             "5 records existed when start captured the ends (a record written after the capture is live even when it is delivered before the restore is complete): restored");
   ctx.Equal(s.applied_live, 2, "2 records were written after the capture: applied_live");
-  ctx.Equal(getKV(ctx, "a"), R"("new")", "the live write to a must be applied");
-  ctx.Equal(getKV(ctx, "d"), R"("new")", "the live write to d must be applied");
+  ctx.Equal(hGetKV(ctx, "a"), R"("new")", "the live write to a must be applied");
+  ctx.Equal(hGetKV(ctx, "d"), R"("new")", "the live write to d must be applied");
 }
 
 void CheckTombstoneResurrect(harness::Ctx& ctx) {
-  seedKV(ctx, 0, "a", 1);
-  seedKV(ctx, 0, "a", nullptr);
-  seedKV(ctx, 0, "a", 2);
-  seedKV(ctx, 1, "b", 1);
-  drainStart(ctx, [&](int partition, long offset) {
+  hSeedKV(ctx, 0, "a", 1);
+  hSeedKV(ctx, 0, "a", nullptr);
+  hSeedKV(ctx, 0, "a", 2);
+  hSeedKV(ctx, 1, "b", 1);
+  hDrainStart(ctx, [&](int partition, long offset) {
     if (partition == 1 && offset == 0) {
       // live: delete b, write it again, delete a key never held
-      seedKV(ctx, 1, "b", nullptr);
-      seedKV(ctx, 1, "b", "back");
-      seedKV(ctx, 2, "c", nullptr);
+      hSeedKV(ctx, 1, "b", nullptr);
+      hSeedKV(ctx, 1, "b", "back");
+      hSeedKV(ctx, 2, "c", nullptr);
     }
   });
   const Stats s = stats();
-  ctx.Equal(s.ready, true, "stats %s", showStats(s));
-  ctx.Equal(getKV(ctx, "a"), "2", "a was written, tombstoned, written again during the restore");
-  ctx.Equal(getKV(ctx, "b"), R"("back")", "b was tombstoned then written again live");
-  ctx.Equal(getKV(ctx, "c"), nullptr, "a tombstone for a key the view never held is a no-op");
+  ctx.Equal(s.ready, true, "stats %s", hShowStats(s));
+  ctx.Equal(hGetKV(ctx, "a"), "2", "a was written, tombstoned, written again during the restore");
+  ctx.Equal(hGetKV(ctx, "b"), R"("back")", "b was tombstoned then written again live");
+  ctx.Equal(hGetKV(ctx, "c"), nullptr, "a tombstone for a key the view never held is a no-op");
   ctx.Equal(s.restored, 4, "restored");
   ctx.Equal(s.applied_live, 3, "applied_live (partition 2 was empty at the capture)");
 }
 
 void CheckAllPartitions(harness::Ctx& ctx) {
-  for (int i = 0; i < 3; i++) seedKV(ctx, 0, "x" + std::to_string(i), i);
-  for (int i = 0; i < 2; i++) seedKV(ctx, 2, "z" + std::to_string(i), i);
-  drainStart(ctx, nullptr);
+  for (int i = 0; i < 3; i++) hSeedKV(ctx, 0, "x" + std::to_string(i), i);
+  for (int i = 0; i < 2; i++) hSeedKV(ctx, 2, "z" + std::to_string(i), i);
+  hDrainStart(ctx, nullptr);
   std::set<int> assigned;
   for (const auto& c : ctx.Kafka.Consumers())
     for (const auto& tp : c.Assignment)
-      if (tp.Topic == kvTopic) assigned.insert(tp.Partition);
+      if (tp.Topic == kHKvTopic) assigned.insert(tp.Partition);
   ctx.Equal(std::vector<int>(assigned.begin(), assigned.end()), {0, 1, 2},
             "all three partitions of kv-changelog must be assigned, the empty one included: partitions assigned");
   const Stats s = stats();
   ctx.Equal(s.ready, true,
             "partition 1 is empty: its captured end is 0, so it is caught up from the start and must not block readiness");
-  ctx.Assert(getKV(ctx, "x2") == "2" && getKV(ctx, "z1") == "1", "records from partitions 0 and 2 must both be in the view");
+  ctx.Assert(hGetKV(ctx, "x2") == "2" && hGetKV(ctx, "z1") == "1", "records from partitions 0 and 2 must both be in the view");
   ctx.Equal(s.restored, 5, "restored");
 }
 
 void CheckNoCommits(harness::Ctx& ctx) {
-  seedKV(ctx, 0, "a", 1);
-  seedKV(ctx, 1, "b", 2);
-  drainStart(ctx, nullptr);
+  hSeedKV(ctx, 0, "a", 1);
+  hSeedKV(ctx, 1, "b", 2);
+  hDrainStart(ctx, nullptr);
   ctx.Clock.Advance(10);  // long enough for any auto-commit timer
   ctx.Equal(ctx.Kafka.Commits("").size(), 0, "a restore consumer commits nothing (auto-commit off, no commit call): commits");
-  ctx.Assert(stats().ready && getKV(ctx, "b") == "2", "after the restore the view must be ready and serve b = 2");
+  ctx.Assert(stats().ready && hGetKV(ctx, "b") == "2", "after the restore the view must be ready and serve b = 2");
 }
 `,
   },

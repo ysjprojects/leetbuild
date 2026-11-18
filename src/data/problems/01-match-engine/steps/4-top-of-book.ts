@@ -469,19 +469,19 @@ import (
 	"leetbuild/harness"
 )
 
-func publishTop(ctx *harness.Ctx, symbol string, bid, ask, last float64) {
+func hPublishTop(ctx *harness.Ctx, symbol string, bid, ask, last float64) {
 	ctx.NoError(publishTopOfBook(context.Background(), symbol, bid, ask, last), "publishTopOfBook(%q, %v, %v, %v) returned an error", symbol, bid, ask, last)
 }
 
 // tickListener is another connection subscribed to ticks:{symbol}: every message it received, in order.
-func tickListener(ctx *harness.Ctx, symbol string) *[]string {
+func hTickListener(ctx *harness.Ctx, symbol string) *[]string {
 	received := &[]string{}
 	ctx.Redis.Subscribe("ticks:"+symbol, func(_, message string) { *received = append(*received, message) })
 	return received
 }
 
 // numericHash is the hash with every value read as a number.
-func numericHash(ctx *harness.Ctx, key string) map[string]float64 {
+func hNumericHash(ctx *harness.Ctx, key string) map[string]float64 {
 	out := map[string]float64{}
 	for k, v := range ctx.Redis.HGetAll(key) {
 		n, err := strconv.ParseFloat(v, 64)
@@ -492,7 +492,7 @@ func numericHash(ctx *harness.Ctx, key string) map[string]float64 {
 }
 
 // asNumber is the TypeScript Number(v ?? -1): a JSON number, or a string holding one.
-func asNumber(v any) any {
+func hAsNumber(v any) any {
 	switch n := v.(type) {
 	case nil:
 		return -1.0
@@ -505,43 +505,43 @@ func asNumber(v any) any {
 }
 
 func CheckHash(ctx *harness.Ctx) {
-	publishTop(ctx, "ACME", 10.05, 10.06, 10.05)
+	hPublishTop(ctx, "ACME", 10.05, 10.06, 10.05)
 	ctx.Equal(ctx.Redis.Type("book:ACME"), "hash", "the type of book:ACME")
 	ttl := ctx.Redis.TTL("book:ACME")
 	ctx.Equal(ttl, -1, "book:ACME has a TTL of %d s; the top of book is state, not a cache entry; TTL", ttl)
-	publishTop(ctx, "ACME", 10.07, 10.08, 10.07)
-	ctx.Equal(numericHash(ctx, "book:ACME")["bid"], 10.07, "a second update must overwrite the hash with the current top of book; bid")
+	hPublishTop(ctx, "ACME", 10.07, 10.08, 10.07)
+	ctx.Equal(hNumericHash(ctx, "book:ACME")["bid"], 10.07, "a second update must overwrite the hash with the current top of book; bid")
 }
 
 func CheckFields(ctx *harness.Ctx) {
-	publishTop(ctx, "ACME", 10.05, 10.06, 10.0)
+	hPublishTop(ctx, "ACME", 10.05, 10.06, 10.0)
 	fields := []string{}
 	for k := range ctx.Redis.HGetAll("book:ACME") {
 		fields = append(fields, k)
 	}
 	sort.Strings(fields)
 	ctx.Equal(fields, []string{"ask", "bid", "last"}, "book:ACME must have exactly the fields bid, ask, last")
-	ctx.Equal(numericHash(ctx, "book:ACME"), map[string]float64{"bid": 10.05, "ask": 10.06, "last": 10.0}, "book:ACME must hold bid 10.05, ask 10.06, last 10.0")
-	publishTop(ctx, "NEW", 0, 10.5, 0)
-	ctx.Equal(numericHash(ctx, "book:NEW"), map[string]float64{"bid": 0, "ask": 10.5, "last": 0}, "an empty side (0) must still be stored as 0")
+	ctx.Equal(hNumericHash(ctx, "book:ACME"), map[string]float64{"bid": 10.05, "ask": 10.06, "last": 10.0}, "book:ACME must hold bid 10.05, ask 10.06, last 10.0")
+	hPublishTop(ctx, "NEW", 0, 10.5, 0)
+	ctx.Equal(hNumericHash(ctx, "book:NEW"), map[string]float64{"bid": 0, "ask": 10.5, "last": 0}, "an empty side (0) must still be stored as 0")
 }
 
 func CheckPublish(ctx *harness.Ctx) {
-	received := tickListener(ctx, "ACME")
-	other := tickListener(ctx, "BETA")
-	publishTop(ctx, "ACME", 10.05, 10.06, 10.05)
+	received := hTickListener(ctx, "ACME")
+	other := hTickListener(ctx, "BETA")
+	hPublishTop(ctx, "ACME", 10.05, 10.06, 10.05)
 	ctx.Settle()
 	ctx.Assert(len(*received) > 0, "nothing was published on ticks:ACME")
 	var tick map[string]any
 	ctx.NoError(json.Unmarshal([]byte((*received)[0]), &tick), "the tick must be JSON, got %q", (*received)[0])
 	ctx.Equal(tick["symbol"], "ACME", "the tick must name the symbol, got %s; symbol", (*received)[0])
-	ctx.Equal([]any{asNumber(tick["bid"]), asNumber(tick["ask"]), asNumber(tick["last"])}, []any{10.05, 10.06, 10.05}, "the tick must repeat bid/ask/last, got %s", (*received)[0])
+	ctx.Equal([]any{hAsNumber(tick["bid"]), hAsNumber(tick["ask"]), hAsNumber(tick["last"])}, []any{10.05, 10.06, 10.05}, "the tick must repeat bid/ask/last, got %s", (*received)[0])
 	ctx.Equal(len(*other), 0, "the tick for ACME leaked onto ticks:BETA; messages there")
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
 	ctx.Redis.Do("HSET", "book:ACME", "bid", "1", "ask", "2", "last", "1")
-	received := tickListener(ctx, "ACME")
+	received := hTickListener(ctx, "ACME")
 	// Two readers that land between the commands, as another connection's request would: one reads
 	// the hash the moment a tick is out, the other announces itself the moment the hash changed.
 	var bidWhenTickOut any
@@ -550,10 +550,10 @@ func CheckAtomic(ctx *harness.Ctx) {
 		return nil
 	})
 	ctx.Redis.After("book:ACME", func() any { return ctx.Redis.Publish("ticks:ACME", "reader saw the hash") })
-	publishTop(ctx, "ACME", 10.05, 10.06, 10.05)
+	hPublishTop(ctx, "ACME", 10.05, 10.06, 10.05)
 	ctx.Settle()
 	ctx.Assert(len(ctx.Redis.HGetAll("book:ACME")) > 0 && len(*received) > 0, "the hash and the tick must both be produced")
-	ctx.Equal(asNumber(bidWhenTickOut), 10.05, "the tick was published while book:ACME still held an older bid: a reader woken by the tick would read a stale hash. HSet and Publish belong in one TxPipelined; bid when the tick was out")
+	ctx.Equal(hAsNumber(bidWhenTickOut), 10.05, "the tick was published while book:ACME still held an older bid: a reader woken by the tick would read a stale hash. HSet and Publish belong in one TxPipelined; bid when the tick was out")
 	ctx.Assert((*received)[0] != "reader saw the hash", "a reader saw the new book:ACME before any tick announced it: without MULTI/EXEC (TxPipelined) a reader can see one command without the other")
 }
 `,
@@ -571,14 +571,14 @@ func CheckAtomic(ctx *harness.Ctx) {
 namespace {
 
 // strconv.ParseFloat: the whole text as a number, nullopt otherwise.
-std::optional<double> parseFloat(const std::string& text) {
+std::optional<double> hParseFloat(const std::string& text) {
   char* end = nullptr;
   const double n = std::strtod(text.c_str(), &end);
   if (text.empty() || end != text.c_str() + text.size()) return std::nullopt;
   return n;
 }
 
-void publishTop(harness::Ctx& ctx, const std::string& symbol, double bid, double ask, double last) {
+void hPublishTop(harness::Ctx& ctx, const std::string& symbol, double bid, double ask, double last) {
   try {
     publish_top_of_book(symbol, bid, ask, last);
   } catch (const std::exception& e) {
@@ -587,17 +587,17 @@ void publishTop(harness::Ctx& ctx, const std::string& symbol, double bid, double
 }
 
 // tickListener is another connection subscribed to ticks:{symbol}: every message it received, in order.
-std::shared_ptr<std::vector<std::string>> tickListener(harness::Ctx& ctx, const std::string& symbol) {
+std::shared_ptr<std::vector<std::string>> hTickListener(harness::Ctx& ctx, const std::string& symbol) {
   auto received = std::make_shared<std::vector<std::string>>();
   ctx.Redis.Subscribe("ticks:" + symbol, [received](const std::string&, const std::string& message) { received->push_back(message); });
   return received;
 }
 
 // numericHash is the hash with every value read as a number.
-std::map<std::string, double> numericHash(harness::Ctx& ctx, const std::string& key) {
+std::map<std::string, double> hNumericHash(harness::Ctx& ctx, const std::string& key) {
   std::map<std::string, double> out;
   for (const auto& [k, v] : ctx.Redis.HGetAll(key)) {
-    const auto n = parseFloat(v);
+    const auto n = hParseFloat(v);
     ctx.Assert(n.has_value(), "%s field %s holds %q, not a number", key, k, v);
     out[k] = *n;
   }
@@ -605,10 +605,10 @@ std::map<std::string, double> numericHash(harness::Ctx& ctx, const std::string& 
 }
 
 // asNumber is the TypeScript Number(v ?? -1): a JSON number, or a string holding one.
-harness::Any asNumber(const harness::Any& v) {
+harness::Any hAsNumber(const harness::Any& v) {
   if (v.IsNil()) return harness::Any(-1.0);
   if (v.IsString()) {
-    if (const auto n = parseFloat(v.String())) return harness::Any(*n);
+    if (const auto n = hParseFloat(v.String())) return harness::Any(*n);
   }
   return v;
 }
@@ -616,31 +616,31 @@ harness::Any asNumber(const harness::Any& v) {
 }  // namespace
 
 void CheckHash(harness::Ctx& ctx) {
-  publishTop(ctx, "ACME", 10.05, 10.06, 10.05);
+  hPublishTop(ctx, "ACME", 10.05, 10.06, 10.05);
   ctx.Equal(ctx.Redis.Type("book:ACME"), "hash", "the type of book:ACME");
   const long long ttl = ctx.Redis.TTL("book:ACME");
   ctx.Equal(ttl, -1, "book:ACME has a TTL of %d s; the top of book is state, not a cache entry; TTL", ttl);
-  publishTop(ctx, "ACME", 10.07, 10.08, 10.07);
-  ctx.Equal(numericHash(ctx, "book:ACME")["bid"], 10.07, "a second update must overwrite the hash with the current top of book; bid");
+  hPublishTop(ctx, "ACME", 10.07, 10.08, 10.07);
+  ctx.Equal(hNumericHash(ctx, "book:ACME")["bid"], 10.07, "a second update must overwrite the hash with the current top of book; bid");
 }
 
 void CheckFields(harness::Ctx& ctx) {
-  publishTop(ctx, "ACME", 10.05, 10.06, 10.0);
+  hPublishTop(ctx, "ACME", 10.05, 10.06, 10.0);
   std::vector<std::string> fields;
   for (const auto& [k, v] : ctx.Redis.HGetAll("book:ACME")) fields.push_back(k);
   std::sort(fields.begin(), fields.end());
   ctx.Equal(fields, {"ask", "bid", "last"}, "book:ACME must have exactly the fields bid, ask, last");
-  ctx.Equal(numericHash(ctx, "book:ACME"), std::map<std::string, double>{{"bid", 10.05}, {"ask", 10.06}, {"last", 10.0}},
+  ctx.Equal(hNumericHash(ctx, "book:ACME"), std::map<std::string, double>{{"bid", 10.05}, {"ask", 10.06}, {"last", 10.0}},
             "book:ACME must hold bid 10.05, ask 10.06, last 10.0");
-  publishTop(ctx, "NEW", 0, 10.5, 0);
-  ctx.Equal(numericHash(ctx, "book:NEW"), std::map<std::string, double>{{"bid", 0}, {"ask", 10.5}, {"last", 0}},
+  hPublishTop(ctx, "NEW", 0, 10.5, 0);
+  ctx.Equal(hNumericHash(ctx, "book:NEW"), std::map<std::string, double>{{"bid", 0}, {"ask", 10.5}, {"last", 0}},
             "an empty side (0) must still be stored as 0");
 }
 
 void CheckPublish(harness::Ctx& ctx) {
-  const auto received = tickListener(ctx, "ACME");
-  const auto other = tickListener(ctx, "BETA");
-  publishTop(ctx, "ACME", 10.05, 10.06, 10.05);
+  const auto received = hTickListener(ctx, "ACME");
+  const auto other = hTickListener(ctx, "BETA");
+  hPublishTop(ctx, "ACME", 10.05, 10.06, 10.05);
   ctx.Settle();
   ctx.Assert(!received->empty(), "nothing was published on ticks:ACME");
   const std::string first = (*received)[0];
@@ -648,23 +648,23 @@ void CheckPublish(harness::Ctx& ctx) {
   ctx.Assert(parsed.has_value(), "the tick must be JSON, got %q", first);
   const harness::Any& tick = *parsed;
   ctx.Equal(tick["symbol"], "ACME", "the tick must name the symbol, got %s; symbol", first);
-  ctx.Equal(std::vector<harness::Any>{asNumber(tick["bid"]), asNumber(tick["ask"]), asNumber(tick["last"])}, {10.05, 10.06, 10.05},
+  ctx.Equal(std::vector<harness::Any>{hAsNumber(tick["bid"]), hAsNumber(tick["ask"]), hAsNumber(tick["last"])}, {10.05, 10.06, 10.05},
             "the tick must repeat bid/ask/last, got %s", first);
   ctx.Equal(other->size(), 0, "the tick for ACME leaked onto ticks:BETA; messages there");
 }
 
 void CheckAtomic(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "book:ACME", "bid", "1", "ask", "2", "last", "1");
-  const auto received = tickListener(ctx, "ACME");
+  const auto received = hTickListener(ctx, "ACME");
   // Two readers that land between the commands, as another connection's request would: one reads
   // the hash the moment a tick is out, the other announces itself the moment the hash changed.
   std::optional<std::string> bidWhenTickOut;
   ctx.Redis.After("ticks:ACME", [&] { bidWhenTickOut = ctx.Redis.HGet("book:ACME", "bid"); });
   ctx.Redis.After("book:ACME", [&] { ctx.Redis.Publish("ticks:ACME", "reader saw the hash"); });
-  publishTop(ctx, "ACME", 10.05, 10.06, 10.05);
+  hPublishTop(ctx, "ACME", 10.05, 10.06, 10.05);
   ctx.Settle();
   ctx.Assert(!ctx.Redis.HGetAll("book:ACME").empty() && !received->empty(), "the hash and the tick must both be produced");
-  ctx.Equal(asNumber(harness::Any::Of(bidWhenTickOut)), 10.05,
+  ctx.Equal(hAsNumber(harness::Any::Of(bidWhenTickOut)), 10.05,
             "the tick was published while book:ACME still held an older bid: a reader woken by the tick would read a stale hash. hset and publish belong in one redis.transaction(); bid when the tick was out");
   ctx.Assert((*received)[0] != "reader saw the hash",
              "a reader saw the new book:ACME before any tick announced it: without MULTI/EXEC (redis.transaction()) a reader can see one command without the other");

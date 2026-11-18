@@ -670,24 +670,24 @@ type Order struct {
 	ClientOrderID string  \`json:"client_order_id"\`
 }
 
-func orderFor(orderID, symbol string) Order {
+func hOrderFor(orderID, symbol string) Order {
 	return Order{OrderID: orderID, Symbol: symbol, Side: "BUY", Price: 10.05, Qty: 100, ClientOrderID: "c-1"}
 }
 
-func mustPublish(ctx *harness.Ctx, o Order) {
+func hMustPublish(ctx *harness.Ctx, o Order) {
 	ctx.NoError(publishOrder(context.Background(), o), "publishOrder(%s) returned an error", o.OrderID)
 }
 
 // failsToPublish: publishOrder must return an error (the gateway's 503).
-func failsToPublish(ctx *harness.Ctx, o Order, what string) {
+func hFailsToPublish(ctx *harness.Ctx, o Order, what string) {
 	err := publishOrder(context.Background(), o)
 	ctx.Assert(err != nil, "%s must make publishOrder return an error, it returned nil", what)
 }
 
 func CheckKeyedBySymbol(ctx *harness.Ctx) {
-	mustPublish(ctx, orderFor("o-1", "ACME"))
-	mustPublish(ctx, orderFor("o-2", "ACME"))
-	mustPublish(ctx, orderFor("o-3", "BETA"))
+	hMustPublish(ctx, hOrderFor("o-1", "ACME"))
+	hMustPublish(ctx, hOrderFor("o-2", "ACME"))
+	hMustPublish(ctx, hOrderFor("o-3", "BETA"))
 	produced := ctx.Kafka.Records("orders")
 	ctx.Equal(len(produced), 3, "expected three records on orders")
 	ctx.Equal(ctx.Kafka.Keys("orders"), []string{"ACME", "ACME", "BETA"}, "records must be keyed by the symbol")
@@ -698,7 +698,7 @@ func CheckKeyedBySymbol(ctx *harness.Ctx) {
 }
 
 func CheckAcksAll(ctx *harness.Ctx) {
-	mustPublish(ctx, orderFor("o-1", "ACME"))
+	hMustPublish(ctx, hOrderFor("o-1", "ACME"))
 	// The partition leader fails right after it answered: a record acknowledged by the leader alone is gone.
 	ctx.Kafka.Failover("orders")
 	held := len(ctx.Kafka.Records("orders"))
@@ -708,7 +708,7 @@ func CheckAcksAll(ctx *harness.Ctx) {
 func CheckIdempotent(ctx *harness.Ctx) {
 	// The broker writes the order but its acknowledgement is lost on the way back: the producer retries.
 	ctx.Kafka.LoseAcks("orders", 1)
-	mustPublish(ctx, orderFor("o-1", "ACME"))
+	hMustPublish(ctx, hOrderFor("o-1", "ACME"))
 	// kafka-go has no idempotent producer (the step's Go text): at least once, identical copies that
 	// carry the order_id header so the engine can deduplicate them.
 	records := ctx.Kafka.Records("orders")
@@ -728,14 +728,14 @@ func CheckWaitsForAck(ctx *harness.Ctx) {
 	// The broker is slow but answers within ackTimeout: the call waits for the ack and returns.
 	ctx.Kafka.StallFor("orders", 0.5)
 	start := ctx.Clock.Now()
-	mustPublish(ctx, orderFor("o-1", "ACME"))
+	hMustPublish(ctx, hOrderFor("o-1", "ACME"))
 	waited := ctx.Clock.Now() - start
 	ctx.Equal(len(ctx.Kafka.Records("orders")), 1, "the order must be on the topic once publishOrder returned")
 	ctx.Assert(waited >= 500, "publishOrder returned after %d ms while the broker only answered after 500 ms: it returned without waiting for the acknowledgement", waited)
 	// The broker never answers: the wait is bounded by ackTimeout, not kafka-go's 10 s default.
 	ctx.Kafka.Stall("orders")
 	start = ctx.Clock.Now()
-	failsToPublish(ctx, orderFor("o-2", "ACME"), "an acknowledgement that never arrives")
+	hFailsToPublish(ctx, hOrderFor("o-2", "ACME"), "an acknowledgement that never arrives")
 	gaveUp := ctx.Clock.Now() - start
 	limit := ackTimeout.Milliseconds()
 	ctx.Assert(gaveUp >= limit-1 && gaveUp <= limit+1000, "publishOrder gave up after %d ms, expected ackTimeout (%d ms)", gaveUp, limit)
@@ -743,13 +743,13 @@ func CheckWaitsForAck(ctx *harness.Ctx) {
 
 func CheckRaises(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext("orders", 1)
-	failsToPublish(ctx, orderFor("o-1", "ACME"), "a delivery error")
+	hFailsToPublish(ctx, hOrderFor("o-1", "ACME"), "a delivery error")
 	ctx.Equal(len(ctx.Kafka.Records("orders")), 0, "the failed order must not be on the topic; records on orders")
-	mustPublish(ctx, orderFor("o-2", "ACME")) // the producer is still usable afterwards
+	hMustPublish(ctx, hOrderFor("o-2", "ACME")) // the producer is still usable afterwards
 	ctx.Equal(len(ctx.Kafka.Records("orders")), 1, "the next order must be published normally; records on orders")
 	// The broker never answers: the write times out with the record still pending.
 	ctx.Kafka.Stall("orders")
-	failsToPublish(ctx, orderFor("o-3", "ACME"), "an acknowledgement that never arrives within ackTimeout")
+	hFailsToPublish(ctx, hOrderFor("o-3", "ACME"), "an acknowledgement that never arrives within ackTimeout")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -760,11 +760,11 @@ func CheckRaises(ctx *harness.Ctx) {
 
 namespace {
 
-Order orderFor(const std::string& order_id, const std::string& symbol) {
+Order hOrderFor(const std::string& order_id, const std::string& symbol) {
   return Order{order_id, symbol, "BUY", "c-1", 10.05, 100};
 }
 
-void mustPublish(harness::Ctx& ctx, const Order& o) {
+void hMustPublish(harness::Ctx& ctx, const Order& o) {
   try {
     publish_order(o);
   } catch (const std::exception& e) {
@@ -773,7 +773,7 @@ void mustPublish(harness::Ctx& ctx, const Order& o) {
 }
 
 // failsToPublish: publish_order must throw PublishFailed (the gateway's 503).
-void failsToPublish(harness::Ctx& ctx, const Order& o, const std::string& what) {
+void hFailsToPublish(harness::Ctx& ctx, const Order& o, const std::string& what) {
   try {
     publish_order(o);
   } catch (const PublishFailed&) {
@@ -787,9 +787,9 @@ void failsToPublish(harness::Ctx& ctx, const Order& o, const std::string& what) 
 }  // namespace
 
 void CheckKeyedBySymbol(harness::Ctx& ctx) {
-  mustPublish(ctx, orderFor("o-1", "ACME"));
-  mustPublish(ctx, orderFor("o-2", "ACME"));
-  mustPublish(ctx, orderFor("o-3", "BETA"));
+  hMustPublish(ctx, hOrderFor("o-1", "ACME"));
+  hMustPublish(ctx, hOrderFor("o-2", "ACME"));
+  hMustPublish(ctx, hOrderFor("o-3", "BETA"));
   const auto produced = ctx.Kafka.Records("orders");
   ctx.Equal(produced.size(), 3, "expected three records on orders");
   ctx.Equal(ctx.Kafka.Keys("orders"), {"ACME", "ACME", "BETA"}, "records must be keyed by the symbol");
@@ -801,7 +801,7 @@ void CheckKeyedBySymbol(harness::Ctx& ctx) {
 }
 
 void CheckAcksAll(harness::Ctx& ctx) {
-  mustPublish(ctx, orderFor("o-1", "ACME"));
+  hMustPublish(ctx, hOrderFor("o-1", "ACME"));
   // The partition leader fails right after it answered: a record acknowledged by the leader alone is gone.
   ctx.Kafka.Failover("orders");
   const size_t held = ctx.Kafka.Records("orders").size();
@@ -811,7 +811,7 @@ void CheckAcksAll(harness::Ctx& ctx) {
 void CheckIdempotent(harness::Ctx& ctx) {
   // The broker writes the order but its acknowledgement is lost on the way back: the producer retries.
   ctx.Kafka.LoseAcks("orders", 1);
-  mustPublish(ctx, orderFor("o-1", "ACME"));
+  hMustPublish(ctx, hOrderFor("o-1", "ACME"));
   // librdkafka has an idempotent producer (kafka-go, which the Go harness accepts tagged copies from,
   // has none): the broker drops the retried copy, so orders holds the order exactly once.
   const auto records = ctx.Kafka.Records("orders");
@@ -827,14 +827,14 @@ void CheckWaitsForAck(harness::Ctx& ctx) {
   // The broker is slow but answers within kAckTimeoutMs: the call waits for the ack and returns.
   ctx.Kafka.StallFor("orders", 0.5);
   int64_t start = ctx.Clock.Now();
-  mustPublish(ctx, orderFor("o-1", "ACME"));
+  hMustPublish(ctx, hOrderFor("o-1", "ACME"));
   const int64_t waited = ctx.Clock.Now() - start;
   ctx.Equal(ctx.Kafka.Records("orders").size(), 1, "the order must be on the topic once publish_order returned");
   ctx.Assert(waited >= 500, "publish_order returned after %d ms while the broker only answered after 500 ms: it returned without waiting for the acknowledgement", waited);
   // The broker never answers: the wait is bounded by kAckTimeoutMs, not librdkafka's 5-minute message timeout.
   ctx.Kafka.Stall("orders");
   start = ctx.Clock.Now();
-  failsToPublish(ctx, orderFor("o-2", "ACME"), "an acknowledgement that never arrives");
+  hFailsToPublish(ctx, hOrderFor("o-2", "ACME"), "an acknowledgement that never arrives");
   const int64_t gaveUp = ctx.Clock.Now() - start;
   const int64_t limit = kAckTimeoutMs;
   ctx.Assert(gaveUp >= limit - 1 && gaveUp <= limit + 1000, "publish_order gave up after %d ms, expected kAckTimeoutMs (%d ms)", gaveUp, limit);
@@ -842,13 +842,13 @@ void CheckWaitsForAck(harness::Ctx& ctx) {
 
 void CheckRaises(harness::Ctx& ctx) {
   ctx.Kafka.FailNext("orders", 1);
-  failsToPublish(ctx, orderFor("o-1", "ACME"), "a delivery error");
+  hFailsToPublish(ctx, hOrderFor("o-1", "ACME"), "a delivery error");
   ctx.Equal(ctx.Kafka.Records("orders").size(), 0, "the failed order must not be on the topic; records on orders");
-  mustPublish(ctx, orderFor("o-2", "ACME"));  // the producer is still usable afterwards
+  hMustPublish(ctx, hOrderFor("o-2", "ACME"));  // the producer is still usable afterwards
   ctx.Equal(ctx.Kafka.Records("orders").size(), 1, "the next order must be published normally; records on orders");
   // The broker never answers: the flush times out with the record still pending.
   ctx.Kafka.Stall("orders");
-  failsToPublish(ctx, orderFor("o-3", "ACME"), "an acknowledgement that never arrives within kAckTimeoutMs");
+  hFailsToPublish(ctx, hOrderFor("o-3", "ACME"), "an acknowledgement that never arrives within kAckTimeoutMs");
 }
 `,
   },

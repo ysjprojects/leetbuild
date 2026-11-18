@@ -893,27 +893,27 @@ import (
 	"leetbuild/harness"
 )
 
-const longURL = "https://example.com/launch"
+const kHLongURL = "https://example.com/launch"
 
 // fakeStore is the links table: what was saved, which names are taken, which were asked about.
-type fakeStore struct {
+type HFakeStore struct {
 	taken       map[string]bool
 	saved       [][2]string
 	existsCalls []string
 }
 
-func (s *fakeStore) Exists(_ context.Context, code string) (bool, error) {
+func (s *HFakeStore) Exists(_ context.Context, code string) (bool, error) {
 	s.existsCalls = append(s.existsCalls, code)
 	return s.taken[code], nil
 }
 
-func (s *fakeStore) Save(_ context.Context, code, url string) error {
+func (s *HFakeStore) Save(_ context.Context, code, url string) error {
 	s.saved = append(s.saved, [2]string{code, url})
 	s.taken[code] = true
 	return nil
 }
 
-func (s *fakeStore) Lookup(_ context.Context, code string) (string, error) {
+func (s *HFakeStore) Lookup(_ context.Context, code string) (string, error) {
 	for _, pair := range s.saved {
 		if pair[0] == code {
 			return pair[1], nil
@@ -922,7 +922,7 @@ func (s *fakeStore) Lookup(_ context.Context, code string) (string, error) {
 	return "", nil
 }
 
-func (s *fakeStore) has(code, url string) bool {
+func (s *HFakeStore) has(code, url string) bool {
 	for _, pair := range s.saved {
 		if pair[0] == code && pair[1] == url {
 			return true
@@ -932,14 +932,14 @@ func (s *fakeStore) has(code, url string) bool {
 }
 
 // api is the learner's server with the links table and the key service stood in for.
-type api struct {
-	store *fakeStore
+type HApi struct {
+	store *HFakeStore
 	codes []string
 	http  *harness.HTTP
 }
 
-func newAPI(ctx *harness.Ctx, taken ...string) *api {
-	a := &api{store: &fakeStore{taken: map[string]bool{}}}
+func hNewAPI(ctx *harness.Ctx, taken ...string) *HApi {
+	a := &HApi{store: &HFakeStore{taken: map[string]bool{}}}
 	for _, code := range taken {
 		a.store.taken[code] = true
 	}
@@ -952,17 +952,17 @@ func newAPI(ctx *harness.Ctx, taken ...string) *api {
 	return a
 }
 
-func (a *api) shorten(body map[string]any) *harness.Response { return a.http.Post("/shorten", body) }
+func (a *HApi) shorten(body map[string]any) *harness.Response { return a.http.Post("/shorten", body) }
 
 func CheckRoute(ctx *harness.Ctx) {
-	a := newAPI(ctx)
-	r := a.shorten(map[string]any{"url": longURL})
+	a := hNewAPI(ctx)
+	r := a.shorten(map[string]any{"url": kHLongURL})
 	ctx.Assert(r.Status != 404 && r.Status != 405, "POST /shorten answered %d: no handler is registered for it", r.Status)
 	ctx.Equal(r.Status, 201, "POST /shorten with a valid url")
 }
 
 func CheckValidateUrl(ctx *harness.Ctx) {
-	a := newAPI(ctx)
+	a := hNewAPI(ctx)
 	for _, bad := range []string{"ftp://example.com/file", "example.com/no-scheme", "javascript:alert(1)", ""} {
 		r := a.shorten(map[string]any{"url": bad})
 		ctx.Equal(r.Status, 400, "url %q is not http(s)", bad)
@@ -979,14 +979,14 @@ func CheckValidateUrl(ctx *harness.Ctx) {
 }
 
 func CheckAliasFormat(ctx *harness.Ctx) {
-	a := newAPI(ctx)
+	a := hNewAPI(ctx)
 	for _, bad := range []string{"abc", "has space", strings.Repeat("a", 33), "dots.are.out", "sl/ash"} {
-		r := a.shorten(map[string]any{"url": longURL, "alias": bad})
+		r := a.shorten(map[string]any{"url": kHLongURL, "alias": bad})
 		ctx.Equal(r.Status, 400, "alias %q does not match aliasRe", bad)
 	}
 	ctx.Equal(a.store.existsCalls, []string(nil), "a malformed alias is rejected before the store is asked whether it exists")
 	ctx.Equal(len(a.store.saved), 0, "a malformed alias must not be saved")
-	r := a.shorten(map[string]any{"url": longURL, "alias": "launch_2026-v1"})
+	r := a.shorten(map[string]any{"url": kHLongURL, "alias": "launch_2026-v1"})
 	ctx.Equal(r.Status, 201, "alias \\"launch_2026-v1\\" is valid")
 	var body struct {
 		Code string \`json:"code"\`
@@ -996,22 +996,22 @@ func CheckAliasFormat(ctx *harness.Ctx) {
 }
 
 func CheckAliasTaken(ctx *harness.Ctx) {
-	a := newAPI(ctx, "launch")
-	r := a.shorten(map[string]any{"url": longURL, "alias": "launch"})
+	a := hNewAPI(ctx, "launch")
+	r := a.shorten(map[string]any{"url": kHLongURL, "alias": "launch"})
 	ctx.Equal(r.Status, 409, "alias \\"launch\\" already exists")
 	ctx.Equal(len(a.store.saved), 0, "a taken alias must not be overwritten")
 	ctx.Equal(len(a.codes), 0, "a taken alias is a client error: no code from nextCode is spent on it")
-	r = a.shorten(map[string]any{"url": longURL, "alias": "launch2"})
+	r = a.shorten(map[string]any{"url": kHLongURL, "alias": "launch2"})
 	ctx.Equal(r.Status, 201, "a free alias must be accepted")
-	ctx.Assert(a.store.has("launch2", longURL), "expected store.Save(ctx, \\"launch2\\", url), saved: %v", a.store.saved)
+	ctx.Assert(a.store.has("launch2", kHLongURL), "expected store.Save(ctx, \\"launch2\\", url), saved: %v", a.store.saved)
 }
 
 func CheckCreated(ctx *harness.Ctx) {
-	a := newAPI(ctx)
-	r := a.shorten(map[string]any{"url": longURL})
+	a := hNewAPI(ctx)
+	r := a.shorten(map[string]any{"url": kHLongURL})
 	ctx.Equal(r.Status, 201, "a valid url without an alias")
 	ctx.Equal(a.codes, []string{"g9Xc"}, "without an alias the code must come from nextCode")
-	ctx.Assert(len(a.store.saved) == 1 && a.store.has("g9Xc", longURL), "expected one store.Save(ctx, \\"g9Xc\\", url), saved: %v", a.store.saved)
+	ctx.Assert(len(a.store.saved) == 1 && a.store.has("g9Xc", kHLongURL), "expected one store.Save(ctx, \\"g9Xc\\", url), saved: %v", a.store.saved)
 	var body struct {
 		Code     string \`json:"code"\`
 		ShortURL string \`json:"short_url"\`
@@ -1034,11 +1034,11 @@ func CheckCreated(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string longURL = "https://example.com/launch";
+const std::string kHLongURL = "https://example.com/launch";
 
 // fakeStore is the links table: what was saved, which names are taken, which were asked about. It
 // takes the place of links::table, which every Store goes through (Go swaps the store variable).
-class fakeStore : public links::Table {
+class HFakeStore : public links::Table {
  public:
   std::set<std::string> taken;
   std::vector<std::array<std::string, 2>> saved;
@@ -1070,24 +1070,24 @@ class fakeStore : public links::Table {
 };
 
 // The codes the key service stand-in handed out in this check.
-std::vector<std::string>* mintedCodes = nullptr;
+std::vector<std::string>* hMintedCodes = nullptr;
 
-harness::HTTP standIn(harness::Ctx& ctx, fakeStore& store, std::vector<std::string>& codes) {
+harness::HTTP hStandIn(harness::Ctx& ctx, HFakeStore& store, std::vector<std::string>& codes) {
   links::table = &store;
-  mintedCodes = &codes;
+  hMintedCodes = &codes;
   return ctx.Main().HTTP();
 }
 
 // api is the learner's server with the links table and the key service stood in for.
-struct api {
-  fakeStore store;
+struct HApi {
+  HFakeStore store;
   std::vector<std::string> codes;
   harness::HTTP http;
 
-  explicit api(harness::Ctx& ctx, std::initializer_list<std::string> taken = {}) : http(standIn(ctx, store, codes)) {
+  explicit HApi(harness::Ctx& ctx, std::initializer_list<std::string> taken = {}) : http(hStandIn(ctx, store, codes)) {
     store.taken.insert(taken.begin(), taken.end());
   }
-  api(const api&) = delete;
+  HApi(const HApi&) = delete;
 
   harness::Response shorten(const nlohmann::json& body) {
     return http.Post("/shorten", body.dump(), "Content-Type", "application/json");
@@ -1095,7 +1095,7 @@ struct api {
 };
 
 // The string field of a JSON response body ("" when it has none: Go's decoding into a struct).
-std::string field(const harness::Response& r, const std::string& name) {
+std::string hField(const harness::Response& r, const std::string& name) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   if (!body.is_object() || !body.contains(name) || !body[name].is_string()) return "";
   return body[name].get<std::string>();
@@ -1105,19 +1105,19 @@ std::string field(const harness::Response& r, const std::string& name) {
 
 // The key service step 2 builds, stood in for (Go swaps the nextCode variable instead).
 std::string next_code() {
-  if (mintedCodes) mintedCodes->push_back("g9Xc");
+  if (hMintedCodes) hMintedCodes->push_back("g9Xc");
   return "g9Xc";
 }
 
 void CheckRoute(harness::Ctx& ctx) {
-  api a(ctx);
-  const auto r = a.shorten({{"url", longURL}});
+  HApi a(ctx);
+  const auto r = a.shorten({{"url", kHLongURL}});
   ctx.Assert(r.Status != 404 && r.Status != 405, "POST /shorten answered %d: no handler is registered for it", r.Status);
   ctx.Equal(r.Status, 201, "POST /shorten with a valid url");
 }
 
 void CheckValidateUrl(harness::Ctx& ctx) {
-  api a(ctx);
+  HApi a(ctx);
   for (const std::string bad : {"ftp://example.com/file", "example.com/no-scheme", "javascript:alert(1)", ""}) {
     const auto r = a.shorten({{"url", bad}});
     ctx.Equal(r.Status, 400, "url %q is not http(s)", bad);
@@ -1135,37 +1135,37 @@ void CheckValidateUrl(harness::Ctx& ctx) {
 }
 
 void CheckAliasFormat(harness::Ctx& ctx) {
-  api a(ctx);
+  HApi a(ctx);
   for (const std::string bad : {std::string("abc"), std::string("has space"), std::string(33, 'a'), std::string("dots.are.out"), std::string("sl/ash")}) {
-    const auto r = a.shorten({{"url", longURL}, {"alias", bad}});
+    const auto r = a.shorten({{"url", kHLongURL}, {"alias", bad}});
     ctx.Equal(r.Status, 400, "alias %q does not match kAliasRe", bad);
   }
   ctx.Equal(a.store.existsCalls, std::vector<std::string>{}, "a malformed alias is rejected before the store is asked whether it exists");
   ctx.Equal(a.store.saved.size(), 0, "a malformed alias must not be saved");
-  const auto r = a.shorten({{"url", longURL}, {"alias", "launch_2026-v1"}});
+  const auto r = a.shorten({{"url", kHLongURL}, {"alias", "launch_2026-v1"}});
   ctx.Equal(r.Status, 201, R"(alias "launch_2026-v1" is valid)");
-  ctx.Equal(field(r, "code"), "launch_2026-v1", "the custom alias must become the code");
+  ctx.Equal(hField(r, "code"), "launch_2026-v1", "the custom alias must become the code");
 }
 
 void CheckAliasTaken(harness::Ctx& ctx) {
-  api a(ctx, {"launch"});
-  auto r = a.shorten({{"url", longURL}, {"alias", "launch"}});
+  HApi a(ctx, {"launch"});
+  auto r = a.shorten({{"url", kHLongURL}, {"alias", "launch"}});
   ctx.Equal(r.Status, 409, R"(alias "launch" already exists)");
   ctx.Equal(a.store.saved.size(), 0, "a taken alias must not be overwritten");
   ctx.Equal(a.codes.size(), 0, "a taken alias is a client error: no code from next_code is spent on it");
-  r = a.shorten({{"url", longURL}, {"alias", "launch2"}});
+  r = a.shorten({{"url", kHLongURL}, {"alias", "launch2"}});
   ctx.Equal(r.Status, 201, "a free alias must be accepted");
-  ctx.Assert(a.store.has("launch2", longURL), R"(expected store.save("launch2", url), saved: %v)", a.store.saved);
+  ctx.Assert(a.store.has("launch2", kHLongURL), R"(expected store.save("launch2", url), saved: %v)", a.store.saved);
 }
 
 void CheckCreated(harness::Ctx& ctx) {
-  api a(ctx);
-  const auto r = a.shorten({{"url", longURL}});
+  HApi a(ctx);
+  const auto r = a.shorten({{"url", kHLongURL}});
   ctx.Equal(r.Status, 201, "a valid url without an alias");
   ctx.Equal(a.codes, std::vector<std::string>{"g9Xc"}, "without an alias the code must come from next_code");
-  ctx.Assert(a.store.saved.size() == 1 && a.store.has("g9Xc", longURL), R"(expected one store.save("g9Xc", url), saved: %v)", a.store.saved);
-  const std::string code = field(r, "code");
-  const std::string shortURL = field(r, "short_url");
+  ctx.Assert(a.store.saved.size() == 1 && a.store.has("g9Xc", kHLongURL), R"(expected one store.save("g9Xc", url), saved: %v)", a.store.saved);
+  const std::string code = hField(r, "code");
+  const std::string shortURL = hField(r, "short_url");
   ctx.Equal(code, "g9Xc", "the body must carry the code");
   ctx.Equal(shortURL, kBaseUrl + "g9Xc", "short_url must be kBaseUrl + code");
   ctx.Equal(r.HeaderValue("Location"), shortURL, "Location must point at the short url");

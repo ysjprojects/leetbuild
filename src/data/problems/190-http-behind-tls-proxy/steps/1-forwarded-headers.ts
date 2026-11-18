@@ -1125,21 +1125,21 @@ import (
 )
 
 const (
-	fwdHost    = "shop.example.com"
-	fwdLB      = "10.0.0.2"
-	fwdLB2     = "10.0.0.3"
-	fwdOutside = "198.51.100.23"
-	fwdHSTS    = "max-age=63072000; includeSubDomains"
+	kHFwdHost    = "shop.example.com"
+	kHFwdLB      = "10.0.0.2"
+	kHFwdLB2     = "10.0.0.3"
+	kHFwdOutside = "198.51.100.23"
+	kHFwdHSTS    = "max-age=63072000; includeSubDomains"
 )
 
 // fwdSend sends a request whose connection comes from peer, as the load balancer's would; header
 // pairs follow the body.
-func fwdSend(c *harness.HTTP, peer, method, url string, body any, header ...string) *harness.Response {
-	return c.From(peer+":40000").Do(method, url, body, append([]string{"Host", fwdHost}, header...)...)
+func hFwdSend(c *harness.HTTP, peer, method, url string, body any, header ...string) *harness.Response {
+	return c.From(peer+":40000").Do(method, url, body, append([]string{"Host", kHFwdHost}, header...)...)
 }
 
 // fwdHeader is a header's value, or nil when the response does not carry it.
-func fwdHeader(r *harness.Response, name string) any {
+func hFwdHeader(r *harness.Response, name string) any {
 	if _, ok := r.Header[http.CanonicalHeaderKey(name)]; !ok {
 		return nil
 	}
@@ -1148,59 +1148,59 @@ func fwdHeader(r *harness.Response, name string) any {
 
 func CheckHttpsViaProxy(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	r := fwdSend(c, fwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7")
-	ctx.Equal(r.Status, 200, "GET /whoami from the proxy %s with X-Forwarded-Proto: https (the client used https)", fwdLB)
+	r := hFwdSend(c, kHFwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7")
+	ctx.Equal(r.Status, 200, "GET /whoami from the proxy %s with X-Forwarded-Proto: https (the client used https)", kHFwdLB)
 	ctx.Equal(r.JSON(), map[string]any{"client_ip": "203.0.113.7", "scheme": "https"}, "/whoami")
-	r = fwdSend(c, fwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "HTTPS, http")
+	r = hFwdSend(c, kHFwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "HTTPS, http")
 	ctx.Equal(r.Status, 200, "X-Forwarded-Proto: HTTPS, http (the first value, lowercased, is https)")
-	ctx.Equal(r.JSON(), map[string]any{"client_ip": fwdLB, "scheme": "https"}, "with no X-Forwarded-For /whoami (the client is the peer)")
-	r = fwdSend(c, fwdLB2, "POST", "/orders", map[string]any{"sku": "A-1", "qty": 2}, "X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7")
-	ctx.Equal(r.Status, 201, "POST /orders over https through %s", fwdLB2)
+	ctx.Equal(r.JSON(), map[string]any{"client_ip": kHFwdLB, "scheme": "https"}, "with no X-Forwarded-For /whoami (the client is the peer)")
+	r = hFwdSend(c, kHFwdLB2, "POST", "/orders", map[string]any{"sku": "A-1", "qty": 2}, "X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7")
+	ctx.Equal(r.Status, 201, "POST /orders over https through %s", kHFwdLB2)
 	ctx.Equal(orders, []map[string]any{{"sku": "A-1", "qty": float64(2)}}, "orders must hold the one order just posted")
 }
 
 func CheckRedirect308(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	r := fwdSend(c, fwdOutside, "GET", "/whoami?verbose=1&ref=mail", nil)
+	r := hFwdSend(c, kHFwdOutside, "GET", "/whoami?verbose=1&ref=mail", nil)
 	ctx.Equal(r.Status, 308, "GET /whoami over plain http (301 lets a client turn a POST into a GET)")
-	want := "https://" + fwdHost + "/whoami?verbose=1&ref=mail"
-	ctx.Equal(fwdHeader(r, "Location"), want, "Location: https, the Host header, the path, the query")
+	want := "https://" + kHFwdHost + "/whoami?verbose=1&ref=mail"
+	ctx.Equal(hFwdHeader(r, "Location"), want, "Location: https, the Host header, the path, the query")
 	body := r.Text()
 	if len(body) > 60 {
 		body = body[:60]
 	}
 	ctx.Assert(r.Text() == "", "the 308 has a body (%q): send it empty", body)
-	r = fwdSend(c, fwdOutside, "GET", "/whoami", nil)
-	ctx.Equal(fwdHeader(r, "Location"), "https://"+fwdHost+"/whoami", "with no query Location (no trailing ?)")
-	r = fwdSend(c, fwdLB, "POST", "/orders?ref=mail", map[string]any{"sku": "A-1", "qty": 2}, "X-Forwarded-Proto", "http")
-	ctx.Equal(r.Status, 308, "POST /orders forwarded by %s as X-Forwarded-Proto: http", fwdLB)
-	ctx.Equal(fwdHeader(r, "Location"), "https://"+fwdHost+"/orders?ref=mail", "Location")
+	r = hFwdSend(c, kHFwdOutside, "GET", "/whoami", nil)
+	ctx.Equal(hFwdHeader(r, "Location"), "https://"+kHFwdHost+"/whoami", "with no query Location (no trailing ?)")
+	r = hFwdSend(c, kHFwdLB, "POST", "/orders?ref=mail", map[string]any{"sku": "A-1", "qty": 2}, "X-Forwarded-Proto", "http")
+	ctx.Equal(r.Status, 308, "POST /orders forwarded by %s as X-Forwarded-Proto: http", kHFwdLB)
+	ctx.Equal(hFwdHeader(r, "Location"), "https://"+kHFwdHost+"/orders?ref=mail", "Location")
 	ctx.Assert(len(orders) == 0, "the redirected POST still recorded %v: redirect before the handler runs", orders)
 }
 
 func CheckUntrustedSpoof(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	forged := []string{"X-Forwarded-Proto", "https", "X-Forwarded-For", "10.0.0.2"}
-	r := fwdSend(c, fwdOutside, "GET", "/whoami", nil, forged...)
-	ctx.Equal(r.Status, 308, "%s sent X-Forwarded-Proto: https; it is not a trusted proxy, so the request is plain http and gets 308", fwdOutside)
-	ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), nil, "a forged X-Forwarded-Proto earned HSTS on plain http")
-	r = fwdSend(c, fwdOutside, "POST", "/orders", map[string]any{"sku": "A-1", "qty": 1}, forged...)
-	ctx.Equal(r.Status, 308, "a POST /orders from %s with forged headers", fwdOutside)
+	r := hFwdSend(c, kHFwdOutside, "GET", "/whoami", nil, forged...)
+	ctx.Equal(r.Status, 308, "%s sent X-Forwarded-Proto: https; it is not a trusted proxy, so the request is plain http and gets 308", kHFwdOutside)
+	ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), nil, "a forged X-Forwarded-Proto earned HSTS on plain http")
+	r = hFwdSend(c, kHFwdOutside, "POST", "/orders", map[string]any{"sku": "A-1", "qty": 1}, forged...)
+	ctx.Equal(r.Status, 308, "a POST /orders from %s with forged headers", kHFwdOutside)
 	ctx.Assert(len(orders) == 0, "a forged https POST was recorded: %v", orders)
-	r = fwdSend(c, "10.0.0.20", "GET", "/whoami", nil, "X-Forwarded-Proto", "https")
+	r = hFwdSend(c, "10.0.0.20", "GET", "/whoami", nil, "X-Forwarded-Proto", "https")
 	ctx.Equal(r.Status, 308, "peer 10.0.0.20 is not in trustedProxies but its X-Forwarded-Proto was trusted: match the address exactly")
 }
 
 func CheckXffWalk(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	for _, tc := range [][3]string{
-		{fwdLB, "1.2.3.4, 203.0.113.7, 10.0.0.3", "203.0.113.7"},
-		{fwdLB, "203.0.113.7,10.0.0.3,10.0.0.2", "203.0.113.7"},
-		{fwdLB2, "10.0.0.3, 10.0.0.2", "10.0.0.3"},
-		{fwdLB2, "198.51.100.4", "198.51.100.4"},
+		{kHFwdLB, "1.2.3.4, 203.0.113.7, 10.0.0.3", "203.0.113.7"},
+		{kHFwdLB, "203.0.113.7,10.0.0.3,10.0.0.2", "203.0.113.7"},
+		{kHFwdLB2, "10.0.0.3, 10.0.0.2", "10.0.0.3"},
+		{kHFwdLB2, "198.51.100.4", "198.51.100.4"},
 	} {
 		peer, xff, want := tc[0], tc[1], tc[2]
-		r := fwdSend(c, peer, "GET", "/whoami", nil, "X-Forwarded-Proto", "https", "X-Forwarded-For", xff)
+		r := hFwdSend(c, peer, "GET", "/whoami", nil, "X-Forwarded-Proto", "https", "X-Forwarded-For", xff)
 		ctx.Equal(r.Status, 200, "GET /whoami from %s with X-Forwarded-Proto: https", peer)
 		var who struct {
 			ClientIP any \`json:"client_ip"\`
@@ -1216,15 +1216,15 @@ func CheckXffWalk(ctx *harness.Ctx) {
 
 func CheckHsts(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	r := fwdSend(c, fwdLB, "GET", "/no-such-route", nil, "X-Forwarded-Proto", "https")
+	r := hFwdSend(c, kHFwdLB, "GET", "/no-such-route", nil, "X-Forwarded-Proto", "https")
 	ctx.Equal(r.Status, 404, "an https GET /no-such-route")
-	ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), fwdHSTS, "the https 404's Strict-Transport-Security (every https response needs it)")
-	r = fwdSend(c, fwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "https")
-	ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), fwdHSTS, "the https /whoami's Strict-Transport-Security")
-	r = fwdSend(c, fwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "http")
-	ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), nil, "the plain-http 308's Strict-Transport-Security (RFC 6797 7.2 forbids it over http)")
-	r = fwdSend(c, fwdOutside, "GET", "/healthz", nil)
-	ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), nil, "an http /healthz's Strict-Transport-Security (send it only over https)")
+	ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), kHFwdHSTS, "the https 404's Strict-Transport-Security (every https response needs it)")
+	r = hFwdSend(c, kHFwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "https")
+	ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), kHFwdHSTS, "the https /whoami's Strict-Transport-Security")
+	r = hFwdSend(c, kHFwdLB, "GET", "/whoami", nil, "X-Forwarded-Proto", "http")
+	ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), nil, "the plain-http 308's Strict-Transport-Security (RFC 6797 7.2 forbids it over http)")
+	r = hFwdSend(c, kHFwdOutside, "GET", "/healthz", nil)
+	ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), nil, "an http /healthz's Strict-Transport-Security (send it only over https)")
 }
 
 func CheckHealthzExempt(ctx *harness.Ctx) {
@@ -1233,12 +1233,12 @@ func CheckHealthzExempt(ctx *harness.Ctx) {
 		peer   string
 		header []string
 	}{
-		{fwdOutside, nil},
-		{fwdLB, []string{"X-Forwarded-Proto", "http"}},
+		{kHFwdOutside, nil},
+		{kHFwdLB, []string{"X-Forwarded-Proto", "http"}},
 	} {
-		r := fwdSend(c, tc.peer, "GET", "/healthz", nil, tc.header...)
+		r := hFwdSend(c, tc.peer, "GET", "/healthz", nil, tc.header...)
 		ctx.Equal(r.Status, 200, "GET /healthz over plain http from %s (the load balancer probes it without TLS)", tc.peer)
-		ctx.Equal(fwdHeader(r, "Location"), nil, "GET /healthz from %s: Location", tc.peer)
+		ctx.Equal(hFwdHeader(r, "Location"), nil, "GET /healthz from %s: Location", tc.peer)
 		ctx.Equal(r.Text(), "ok", "GET /healthz body")
 	}
 }
@@ -1252,29 +1252,29 @@ func CheckHealthzExempt(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string fwdHost = "shop.example.com";
-const std::string fwdLB = "10.0.0.2";
-const std::string fwdLB2 = "10.0.0.3";
-const std::string fwdOutside = "198.51.100.23";
-const std::string fwdHSTS = "max-age=63072000; includeSubDomains";
-const std::optional<std::string> fwdNil;
+const std::string kHFwdHost = "shop.example.com";
+const std::string kHFwdLB = "10.0.0.2";
+const std::string kHFwdLB2 = "10.0.0.3";
+const std::string kHFwdOutside = "198.51.100.23";
+const std::string kHFwdHSTS = "max-age=63072000; includeSubDomains";
+const std::optional<std::string> kHFwdNil;
 
 // fwdSend sends a request whose connection comes from peer, as the load balancer's would; header
 // pairs follow the body.
-harness::Response fwdSend(harness::HTTP& c, const std::string& peer, const std::string& method, const std::string& url,
+harness::Response hFwdSend(harness::HTTP& c, const std::string& peer, const std::string& method, const std::string& url,
                           const std::string& body, std::vector<std::string> header = {}) {
-  header.insert(header.begin(), {"Host", fwdHost});
+  header.insert(header.begin(), {"Host", kHFwdHost});
   return c.From(peer).Send(method, url, body, header);
 }
 
 // fwdHeader is a header's value, or nil when the response does not carry it.
-std::optional<std::string> fwdHeader(const harness::Response& r, const std::string& name) {
+std::optional<std::string> hFwdHeader(const harness::Response& r, const std::string& name) {
   if (!r.Header.count(name)) return std::nullopt;
   return r.HeaderValue(name);
 }
 
 // The orders the program recorded, each decoded (nil when it is not JSON).
-std::vector<std::optional<harness::Any>> fwdOrders() {
+std::vector<std::optional<harness::Any>> hFwdOrders() {
   std::lock_guard<std::mutex> lock(orders_mu);
   std::vector<std::optional<harness::Any>> out;
   for (const auto& order : orders) out.push_back(harness::ParseJSON(order));
@@ -1285,59 +1285,59 @@ std::vector<std::optional<harness::Any>> fwdOrders() {
 
 void CheckHttpsViaProxy(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  auto r = fwdSend(c, fwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7"});
-  ctx.Equal(r.Status, 200, "GET /whoami from the proxy %s with X-Forwarded-Proto: https (the client used https)", fwdLB);
+  auto r = hFwdSend(c, kHFwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7"});
+  ctx.Equal(r.Status, 200, "GET /whoami from the proxy %s with X-Forwarded-Proto: https (the client used https)", kHFwdLB);
   ctx.Equal(r.JSON(), harness::ParseJSON(R"({"client_ip":"203.0.113.7","scheme":"https"})"), "/whoami");
-  r = fwdSend(c, fwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "HTTPS, http"});
+  r = hFwdSend(c, kHFwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "HTTPS, http"});
   ctx.Equal(r.Status, 200, "X-Forwarded-Proto: HTTPS, http (the first value, lowercased, is https)");
-  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"client_ip":")" + fwdLB + R"(","scheme":"https"})"), "with no X-Forwarded-For /whoami (the client is the peer)");
-  r = fwdSend(c, fwdLB2, "POST", "/orders", R"({"qty":2,"sku":"A-1"})", {"X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7"});
-  ctx.Equal(r.Status, 201, "POST /orders over https through %s", fwdLB2);
-  ctx.Equal(fwdOrders(), harness::ParseJSON(R"([{"sku":"A-1","qty":2}])"), "orders must hold the one order just posted");
+  ctx.Equal(r.JSON(), harness::ParseJSON(R"({"client_ip":")" + kHFwdLB + R"(","scheme":"https"})"), "with no X-Forwarded-For /whoami (the client is the peer)");
+  r = hFwdSend(c, kHFwdLB2, "POST", "/orders", R"({"qty":2,"sku":"A-1"})", {"X-Forwarded-Proto", "https", "X-Forwarded-For", "203.0.113.7"});
+  ctx.Equal(r.Status, 201, "POST /orders over https through %s", kHFwdLB2);
+  ctx.Equal(hFwdOrders(), harness::ParseJSON(R"([{"sku":"A-1","qty":2}])"), "orders must hold the one order just posted");
 }
 
 void CheckRedirect308(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  auto r = fwdSend(c, fwdOutside, "GET", "/whoami?verbose=1&ref=mail", "");
+  auto r = hFwdSend(c, kHFwdOutside, "GET", "/whoami?verbose=1&ref=mail", "");
   ctx.Equal(r.Status, 308, "GET /whoami over plain http (301 lets a client turn a POST into a GET)");
-  const std::string want = "https://" + fwdHost + "/whoami?verbose=1&ref=mail";
-  ctx.Equal(fwdHeader(r, "Location"), want, "Location: https, the Host header, the path, the query");
+  const std::string want = "https://" + kHFwdHost + "/whoami?verbose=1&ref=mail";
+  ctx.Equal(hFwdHeader(r, "Location"), want, "Location: https, the Host header, the path, the query");
   const std::string body = r.Text().substr(0, 60);
   ctx.Assert(r.Text() == "", "the 308 has a body (%q): send it empty", body);
-  r = fwdSend(c, fwdOutside, "GET", "/whoami", "");
-  ctx.Equal(fwdHeader(r, "Location"), "https://" + fwdHost + "/whoami", "with no query Location (no trailing ?)");
-  r = fwdSend(c, fwdLB, "POST", "/orders?ref=mail", R"({"qty":2,"sku":"A-1"})", {"X-Forwarded-Proto", "http"});
-  ctx.Equal(r.Status, 308, "POST /orders forwarded by %s as X-Forwarded-Proto: http", fwdLB);
-  ctx.Equal(fwdHeader(r, "Location"), "https://" + fwdHost + "/orders?ref=mail", "Location");
-  const auto recorded = fwdOrders();
+  r = hFwdSend(c, kHFwdOutside, "GET", "/whoami", "");
+  ctx.Equal(hFwdHeader(r, "Location"), "https://" + kHFwdHost + "/whoami", "with no query Location (no trailing ?)");
+  r = hFwdSend(c, kHFwdLB, "POST", "/orders?ref=mail", R"({"qty":2,"sku":"A-1"})", {"X-Forwarded-Proto", "http"});
+  ctx.Equal(r.Status, 308, "POST /orders forwarded by %s as X-Forwarded-Proto: http", kHFwdLB);
+  ctx.Equal(hFwdHeader(r, "Location"), "https://" + kHFwdHost + "/orders?ref=mail", "Location");
+  const auto recorded = hFwdOrders();
   ctx.Assert(recorded.empty(), "the redirected POST still recorded %v: redirect before the handler runs", recorded);
 }
 
 void CheckUntrustedSpoof(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
   const std::vector<std::string> forged = {"X-Forwarded-Proto", "https", "X-Forwarded-For", "10.0.0.2"};
-  auto r = fwdSend(c, fwdOutside, "GET", "/whoami", "", forged);
-  ctx.Equal(r.Status, 308, "%s sent X-Forwarded-Proto: https; it is not a trusted proxy, so the request is plain http and gets 308", fwdOutside);
-  ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), fwdNil, "a forged X-Forwarded-Proto earned HSTS on plain http");
-  r = fwdSend(c, fwdOutside, "POST", "/orders", R"({"qty":1,"sku":"A-1"})", forged);
-  ctx.Equal(r.Status, 308, "a POST /orders from %s with forged headers", fwdOutside);
-  const auto recorded = fwdOrders();
+  auto r = hFwdSend(c, kHFwdOutside, "GET", "/whoami", "", forged);
+  ctx.Equal(r.Status, 308, "%s sent X-Forwarded-Proto: https; it is not a trusted proxy, so the request is plain http and gets 308", kHFwdOutside);
+  ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), kHFwdNil, "a forged X-Forwarded-Proto earned HSTS on plain http");
+  r = hFwdSend(c, kHFwdOutside, "POST", "/orders", R"({"qty":1,"sku":"A-1"})", forged);
+  ctx.Equal(r.Status, 308, "a POST /orders from %s with forged headers", kHFwdOutside);
+  const auto recorded = hFwdOrders();
   ctx.Assert(recorded.empty(), "a forged https POST was recorded: %v", recorded);
-  r = fwdSend(c, "10.0.0.20", "GET", "/whoami", "", {"X-Forwarded-Proto", "https"});
+  r = hFwdSend(c, "10.0.0.20", "GET", "/whoami", "", {"X-Forwarded-Proto", "https"});
   ctx.Equal(r.Status, 308, "peer 10.0.0.20 is not in trustedProxies but its X-Forwarded-Proto was trusted: match the address exactly");
 }
 
 void CheckXffWalk(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
   const std::vector<std::vector<std::string>> cases = {
-      {fwdLB, "1.2.3.4, 203.0.113.7, 10.0.0.3", "203.0.113.7"},
-      {fwdLB, "203.0.113.7,10.0.0.3,10.0.0.2", "203.0.113.7"},
-      {fwdLB2, "10.0.0.3, 10.0.0.2", "10.0.0.3"},
-      {fwdLB2, "198.51.100.4", "198.51.100.4"},
+      {kHFwdLB, "1.2.3.4, 203.0.113.7, 10.0.0.3", "203.0.113.7"},
+      {kHFwdLB, "203.0.113.7,10.0.0.3,10.0.0.2", "203.0.113.7"},
+      {kHFwdLB2, "10.0.0.3, 10.0.0.2", "10.0.0.3"},
+      {kHFwdLB2, "198.51.100.4", "198.51.100.4"},
   };
   for (const auto& tc : cases) {
     const std::string &peer = tc[0], &xff = tc[1], &want = tc[2];
-    const auto r = fwdSend(c, peer, "GET", "/whoami", "", {"X-Forwarded-Proto", "https", "X-Forwarded-For", xff});
+    const auto r = hFwdSend(c, peer, "GET", "/whoami", "", {"X-Forwarded-Proto", "https", "X-Forwarded-For", xff});
     ctx.Equal(r.Status, 200, "GET /whoami from %s with X-Forwarded-Proto: https", peer);
     const auto who = harness::ParseJSON(r.Text());
     const harness::Any clientIP = who && who->IsObject() ? (*who)["client_ip"] : harness::Any();
@@ -1352,27 +1352,27 @@ void CheckXffWalk(harness::Ctx& ctx) {
 
 void CheckHsts(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  auto r = fwdSend(c, fwdLB, "GET", "/no-such-route", "", {"X-Forwarded-Proto", "https"});
+  auto r = hFwdSend(c, kHFwdLB, "GET", "/no-such-route", "", {"X-Forwarded-Proto", "https"});
   ctx.Equal(r.Status, 404, "an https GET /no-such-route");
-  ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), fwdHSTS, "the https 404's Strict-Transport-Security (every https response needs it)");
-  r = fwdSend(c, fwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "https"});
-  ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), fwdHSTS, "the https /whoami's Strict-Transport-Security");
-  r = fwdSend(c, fwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "http"});
-  ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), fwdNil, "the plain-http 308's Strict-Transport-Security (RFC 6797 7.2 forbids it over http)");
-  r = fwdSend(c, fwdOutside, "GET", "/healthz", "");
-  ctx.Equal(fwdHeader(r, "Strict-Transport-Security"), fwdNil, "an http /healthz's Strict-Transport-Security (send it only over https)");
+  ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), kHFwdHSTS, "the https 404's Strict-Transport-Security (every https response needs it)");
+  r = hFwdSend(c, kHFwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "https"});
+  ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), kHFwdHSTS, "the https /whoami's Strict-Transport-Security");
+  r = hFwdSend(c, kHFwdLB, "GET", "/whoami", "", {"X-Forwarded-Proto", "http"});
+  ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), kHFwdNil, "the plain-http 308's Strict-Transport-Security (RFC 6797 7.2 forbids it over http)");
+  r = hFwdSend(c, kHFwdOutside, "GET", "/healthz", "");
+  ctx.Equal(hFwdHeader(r, "Strict-Transport-Security"), kHFwdNil, "an http /healthz's Strict-Transport-Security (send it only over https)");
 }
 
 void CheckHealthzExempt(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
   const std::vector<std::pair<std::string, std::vector<std::string>>> cases = {
-      {fwdOutside, {}},
-      {fwdLB, {"X-Forwarded-Proto", "http"}},
+      {kHFwdOutside, {}},
+      {kHFwdLB, {"X-Forwarded-Proto", "http"}},
   };
   for (const auto& [peer, header] : cases) {
-    const auto r = fwdSend(c, peer, "GET", "/healthz", "", header);
+    const auto r = hFwdSend(c, peer, "GET", "/healthz", "", header);
     ctx.Equal(r.Status, 200, "GET /healthz over plain http from %s (the load balancer probes it without TLS)", peer);
-    ctx.Equal(fwdHeader(r, "Location"), fwdNil, "GET /healthz from %s: Location", peer);
+    ctx.Equal(hFwdHeader(r, "Location"), kHFwdNil, "GET /healthz from %s: Location", peer);
     ctx.Equal(r.Text(), "ok", "GET /healthz body");
   }
 }

@@ -993,7 +993,7 @@ import (
 	"leetbuild/harness"
 )
 
-const clrSchema = \`
+const kHClrSchema = \`
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1010,23 +1010,23 @@ CREATE TABLE entries (
 );
 \`
 
-const clrH = 3600 * 1000
+const kHClrH = 3600 * 1000
 
 var (
-	clrCapture  = []Entry{{Account: "cash:acquirer", Currency: "EUR", Amount: 4999}, {Account: "clearing:payments", Currency: "EUR", Amount: -4999}}
-	clrPayout   = []Entry{{Account: "clearing:payments", Currency: "EUR", Amount: 4999}, {Account: "clearing:payouts", Currency: "EUR", Amount: -4999}}
-	clrCashOnly = []Entry{{Account: "cash:bank", Currency: "EUR", Amount: 100}, {Account: "cash:acquirer", Currency: "EUR", Amount: -100}}
+	hClrCapture  = []Entry{{Account: "cash:acquirer", Currency: "EUR", Amount: 4999}, {Account: "clearing:payments", Currency: "EUR", Amount: -4999}}
+	hClrPayout   = []Entry{{Account: "clearing:payments", Currency: "EUR", Amount: 4999}, {Account: "clearing:payouts", Currency: "EUR", Amount: -4999}}
+	hClrCashOnly = []Entry{{Account: "cash:bank", Currency: "EUR", Amount: 100}, {Account: "cash:acquirer", Currency: "EUR", Amount: -100}}
 )
 
 // clrWorld is an empty ledger behind the real journal writer (step 4), which calls the learner's
 // track after every commit.
-func clrWorld(ctx *harness.Ctx) {
-	ctx.DB.Reset(clrSchema)
+func hClrWorld(ctx *harness.Ctx) {
+	ctx.DB.Reset(kHClrSchema)
 }
 
 // clrWrite is a real transaction through the journal, posted at its own time ("" settles nothing):
 // one database transaction, then track. It returns the transaction id.
-func clrWrite(ctx *harness.Ctx, entries []Entry, postedAt int64, settles string) string {
+func hClrWrite(ctx *harness.Ctx, entries []Entry, postedAt int64, settles string) string {
 	var settled *string
 	if settles != "" {
 		settled = &settles
@@ -1053,7 +1053,7 @@ func clrWrite(ctx *harness.Ctx, entries []Entry, postedAt int64, settles string)
 	return transactionID
 }
 
-func clrOpen(ctx *harness.Ctx) map[string]float64 {
+func hClrOpen(ctx *harness.Ctx) map[string]float64 {
 	out := map[string]float64{}
 	for _, z := range ctx.Redis.ZRangeWithScores("clearing:open", 0, -1) {
 		out[z.Member] = z.Score
@@ -1062,7 +1062,7 @@ func clrOpen(ctx *harness.Ctx) map[string]float64 {
 }
 
 // clrNames maps transaction ids to the names they were written under (unknown ids stay as they are).
-func clrNames(transactionIDs []string, names map[string]string) []string {
+func hClrNames(transactionIDs []string, names map[string]string) []string {
 	out := []string{}
 	for _, id := range transactionIDs {
 		if name, ok := names[id]; ok {
@@ -1073,7 +1073,7 @@ func clrNames(transactionIDs []string, names map[string]string) []string {
 	return out
 }
 
-func clrStuckIDs(items []StuckItem) []string {
+func hClrStuckIDs(items []StuckItem) []string {
 	out := []string{}
 	for _, item := range items {
 		out = append(out, item.TransactionID)
@@ -1081,7 +1081,7 @@ func clrStuckIDs(items []StuckItem) []string {
 	return out
 }
 
-func clrAbs(v int64) int64 {
+func hClrAbs(v int64) int64 {
 	if v < 0 {
 		return -v
 	}
@@ -1089,25 +1089,25 @@ func clrAbs(v int64) int64 {
 }
 
 func CheckOpensItem(ctx *harness.Ctx) {
-	clrWorld(ctx)
-	t0 := time.Now().UnixMilli() - 3*clrH
-	a := clrWrite(ctx, clrCapture, t0, "")
+	hClrWorld(ctx)
+	t0 := time.Now().UnixMilli() - 3*kHClrH
+	a := hClrWrite(ctx, hClrCapture, t0, "")
 	ctx.Equal(ctx.Redis.Type("clearing:open"), "zset", "clearing:open must be a sorted set")
 	s, ok := ctx.Redis.ZScore("clearing:open", a)
 	ctx.Assert(ok, "a transaction crediting clearing:payments must be added to clearing:open under its transaction id")
 	ctx.Equal(s, t0, "the score must be the transaction's own posted_at: a late event must already be overdue")
-	b := clrWrite(ctx, clrCashOnly, time.Now().UnixMilli(), "")
+	b := hClrWrite(ctx, hClrCashOnly, time.Now().UnixMilli(), "")
 	_, ok = ctx.Redis.ZScore("clearing:open", b)
 	ctx.Assert(!ok, "a transaction between cash accounts touches no clearing account and must not be tracked")
-	c := clrWrite(ctx, clrPayout, t0+1, "")
-	ctx.Equal(clrOpen(ctx), map[string]float64{a: float64(t0), c: float64(t0 + 1)}, "clearing:open should hold the capture and the payout")
+	c := hClrWrite(ctx, hClrPayout, t0+1, "")
+	ctx.Equal(hClrOpen(ctx), map[string]float64{a: float64(t0), c: float64(t0 + 1)}, "clearing:open should hold the capture and the payout")
 }
 
 func CheckSettlesCloses(ctx *harness.Ctx) {
-	clrWorld(ctx)
-	t0 := time.Now().UnixMilli() - 3*clrH
-	a := clrWrite(ctx, clrCapture, t0, "")
-	b := clrWrite(ctx, clrPayout, t0+2*clrH, a)
+	hClrWorld(ctx)
+	t0 := time.Now().UnixMilli() - 3*kHClrH
+	a := hClrWrite(ctx, hClrCapture, t0, "")
+	b := hClrWrite(ctx, hClrPayout, t0+2*kHClrH, a)
 	_, ok := ctx.Redis.ZScore("clearing:open", a)
 	ctx.Assert(!ok, "the transaction that settles the capture must ZRem it from clearing:open")
 	_, ok = ctx.Redis.ZScore("clearing:open", b)
@@ -1118,29 +1118,29 @@ func CheckSettlesCloses(ctx *harness.Ctx) {
 				ctx.Fatalf("settling an id that is not open must be a no-op, but the write failed in track with %v", rec)
 			}
 		}()
-		clrWrite(ctx, clrPayout, t0, "tx-unknown")
+		hClrWrite(ctx, hClrPayout, t0, "tx-unknown")
 	}()
-	ctx.Equal(clrOpen(ctx), map[string]float64{}, "clearing:open should be empty")
-	c := clrWrite(ctx, clrCapture, t0, "")
-	d := clrWrite(ctx, clrCapture, t0+1, "")
-	clrWrite(ctx, clrPayout, t0+2, c)
-	ctx.Equal(clrOpen(ctx), map[string]float64{d: float64(t0 + 1)}, "only the first of two captures was settled: clearing:open should hold the second")
+	ctx.Equal(hClrOpen(ctx), map[string]float64{}, "clearing:open should be empty")
+	c := hClrWrite(ctx, hClrCapture, t0, "")
+	d := hClrWrite(ctx, hClrCapture, t0+1, "")
+	hClrWrite(ctx, hClrPayout, t0+2, c)
+	ctx.Equal(hClrOpen(ctx), map[string]float64{d: float64(t0 + 1)}, "only the first of two captures was settled: clearing:open should hold the second")
 }
 
 func CheckStuckWindow(ctx *harness.Ctx) {
-	clrWorld(ctx)
+	hClrWorld(ctx)
 	now := time.Now().UnixMilli()
 	ids := map[string]string{}
 	for _, w := range []struct {
 		name  string
 		hours int64
 	}{{"48h", 48}, {"23h", 23}, {"25h", 25}, {"1h", 1}} {
-		ids[clrWrite(ctx, clrCapture, now-w.hours*clrH, "")] = w.name
+		ids[hClrWrite(ctx, hClrCapture, now-w.hours*kHClrH, "")] = w.name
 	}
 	items, err := stuck(context.Background(), nowMs())
 	ctx.Assert(err == nil, "stuck must return the list of stuck items, it failed: %v", err)
-	ctx.Equal(len(clrOpen(ctx)), 4, "stuck reports; it must not remove anything from clearing:open: items there")
-	got := clrNames(clrStuckIDs(items), ids)
+	ctx.Equal(len(hClrOpen(ctx)), 4, "stuck reports; it must not remove anything from clearing:open: items there")
+	got := hClrNames(hClrStuckIDs(items), ids)
 	ctx.Equal(got, []string{"48h", "25h"}, "of transactions posted 48 h, 23 h, 25 h and 1 h ago, the ones older than 24 h, oldest first")
 	for _, item := range items {
 		s, _ := ctx.Redis.ZScore("clearing:open", item.TransactionID)
@@ -1150,14 +1150,14 @@ func CheckStuckWindow(ctx *harness.Ctx) {
 	for _, item := range items {
 		ages[ids[item.TransactionID]] = item.AgeS
 	}
-	ctx.Assert(clrAbs(ages["48h"]-48*3600) <= 2 && clrAbs(ages["25h"]-25*3600) <= 2, "AgeS must be the age in seconds, got %v", ages)
+	ctx.Assert(hClrAbs(ages["48h"]-48*3600) <= 2 && hClrAbs(ages["25h"]-25*3600) <= 2, "AgeS must be the age in seconds, got %v", ages)
 	ctx.Clock.Advance(2 * 3600)
 	items, err = stuck(context.Background(), nowMs())
 	ctx.Assert(err == nil, "stuck must return the list of stuck items, it failed: %v", err)
-	got = clrNames(clrStuckIDs(items), ids)
+	got = hClrNames(hClrStuckIDs(items), ids)
 	ctx.Equal(got, []string{"48h", "25h", "23h"}, "two hours later the 23 h one has crossed 24 h and must be reported")
 	// A late event: posted 30 h ago, journaled just now — stuck immediately, because the score is its own time.
-	late := clrWrite(ctx, clrCapture, time.Now().UnixMilli()-30*clrH, "")
+	late := hClrWrite(ctx, hClrCapture, time.Now().UnixMilli()-30*kHClrH, "")
 	items, _ = stuck(context.Background(), nowMs())
 	found := false
 	for _, item := range items {
@@ -1167,14 +1167,14 @@ func CheckStuckWindow(ctx *harness.Ctx) {
 }
 
 func CheckStuckEndpoint(ctx *harness.Ctx) {
-	clrWorld(ctx)
+	hClrWorld(ctx)
 	now := time.Now().UnixMilli()
 	ids := map[string]string{}
 	for _, w := range []struct {
 		name  string
 		hours int64
 	}{{"27h", 27}, {"2h", 2}, {"30h", 30}} {
-		ids[clrWrite(ctx, clrCapture, now-w.hours*clrH, "")] = w.name
+		ids[hClrWrite(ctx, hClrCapture, now-w.hours*kHClrH, "")] = w.name
 	}
 	r := ctx.Main(main).HTTP().Get("/clearing/stuck")
 	ctx.Equal(r.Status, 200, "GET /clearing/stuck")
@@ -1188,7 +1188,7 @@ func CheckStuckEndpoint(ctx *harness.Ctx) {
 		id, _ := item["transaction_id"].(string)
 		transactionIDs = append(transactionIDs, id)
 	}
-	ctx.Equal(clrNames(transactionIDs, ids), []string{"30h", "27h"}, "expected the two transactions older than 24 h, oldest first")
+	ctx.Equal(hClrNames(transactionIDs, ids), []string{"30h", "27h"}, "expected the two transactions older than 24 h, oldest first")
 	for _, raw := range body {
 		item, _ := raw.(map[string]any)
 		_, hasID := item["transaction_id"]
@@ -1198,7 +1198,7 @@ func CheckStuckEndpoint(ctx *harness.Ctx) {
 	}
 	age, _ := body[0].(map[string]any)["age_s"].(float64)
 	ctx.Assert(age-30*3600 <= 2 && 30*3600-age <= 2, "the 30 h one's age_s should be about %d, got %v", 30*3600, age)
-	ctx.Equal(len(clrOpen(ctx)), 3, "reading the report must not change clearing:open: items there")
+	ctx.Equal(len(hClrOpen(ctx)), 3, "reading the report must not change clearing:open: items there")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1212,7 +1212,7 @@ func CheckStuckEndpoint(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string clrSchema = R"(
+const std::string kHClrSchema = R"(
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1229,19 +1229,19 @@ CREATE TABLE entries (
 );
 )";
 
-constexpr int64_t clrH = 3600 * 1000;
+constexpr int64_t kHClrH = 3600 * 1000;
 
-const std::vector<Entry> clrCapture = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", -4999}};
-const std::vector<Entry> clrPayout = {{"clearing:payments", "EUR", 4999}, {"clearing:payouts", "EUR", -4999}};
-const std::vector<Entry> clrCashOnly = {{"cash:bank", "EUR", 100}, {"cash:acquirer", "EUR", -100}};
+const std::vector<Entry> kHClrCapture = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", -4999}};
+const std::vector<Entry> kHClrPayout = {{"clearing:payments", "EUR", 4999}, {"clearing:payouts", "EUR", -4999}};
+const std::vector<Entry> kHClrCashOnly = {{"cash:bank", "EUR", 100}, {"cash:acquirer", "EUR", -100}};
 
 // clrWorld is an empty ledger behind the real journal writer (step 4), which calls the learner's
 // track after every commit.
-void clrWorld(harness::Ctx& ctx) { ctx.DB.Reset(clrSchema); }
+void hClrWorld(harness::Ctx& ctx) { ctx.DB.Reset(kHClrSchema); }
 
 // clrWrite is a real transaction through the journal, posted at its own time ("" settles nothing):
 // one database transaction, then track. It returns the transaction id.
-std::string clrWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, int64_t postedAt, const std::string& settles) {
+std::string hClrWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, int64_t postedAt, const std::string& settles) {
   std::optional<std::string> settled;
   if (!settles.empty()) settled = settles;
   const std::string transactionID = new_uuid();
@@ -1260,14 +1260,14 @@ std::string clrWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, int64
   return transactionID;
 }
 
-std::map<std::string, double> clrOpen(harness::Ctx& ctx) {
+std::map<std::string, double> hClrOpen(harness::Ctx& ctx) {
   std::map<std::string, double> out;
   for (const auto& z : ctx.Redis.ZRangeWithScores("clearing:open", 0, -1)) out[z.Member] = z.Score;
   return out;
 }
 
 // clrStuck calls the learner's stuck at the current time; an exception (Go: a non-nil error) fails the check.
-std::vector<StuckItem> clrStuck(harness::Ctx& ctx) {
+std::vector<StuckItem> hClrStuck(harness::Ctx& ctx) {
   try {
     return stuck(now_ms());
   } catch (const std::exception& e) {
@@ -1276,7 +1276,7 @@ std::vector<StuckItem> clrStuck(harness::Ctx& ctx) {
 }
 
 // clrNames maps transaction ids to the names they were written under (unknown ids stay as they are).
-std::vector<std::string> clrNames(const std::vector<std::string>& transactionIDs, const std::map<std::string, std::string>& names) {
+std::vector<std::string> hClrNames(const std::vector<std::string>& transactionIDs, const std::map<std::string, std::string>& names) {
   std::vector<std::string> out;
   for (const auto& id : transactionIDs) {
     const auto it = names.find(id);
@@ -1285,7 +1285,7 @@ std::vector<std::string> clrNames(const std::vector<std::string>& transactionIDs
   return out;
 }
 
-std::vector<std::string> clrStuckIDs(const std::vector<StuckItem>& items) {
+std::vector<std::string> hClrStuckIDs(const std::vector<StuckItem>& items) {
   std::vector<std::string> out;
   for (const auto& item : items) out.push_back(item.transaction_id);
   return out;
@@ -1294,48 +1294,48 @@ std::vector<std::string> clrStuckIDs(const std::vector<StuckItem>& items) {
 }  // namespace
 
 void CheckOpensItem(harness::Ctx& ctx) {
-  clrWorld(ctx);
-  const int64_t t0 = ctx.Clock.Now() - 3 * clrH;
-  const std::string a = clrWrite(ctx, clrCapture, t0, "");
+  hClrWorld(ctx);
+  const int64_t t0 = ctx.Clock.Now() - 3 * kHClrH;
+  const std::string a = hClrWrite(ctx, kHClrCapture, t0, "");
   ctx.Equal(ctx.Redis.Type("clearing:open"), "zset", "clearing:open must be a sorted set");
   const auto s = ctx.Redis.ZScore("clearing:open", a);
   ctx.Assert(s.has_value(), "a transaction crediting clearing:payments must be added to clearing:open under its transaction id");
   ctx.Equal(*s, t0, "the score must be the transaction's own posted_at: a late event must already be overdue");
-  const std::string b = clrWrite(ctx, clrCashOnly, ctx.Clock.Now(), "");
+  const std::string b = hClrWrite(ctx, kHClrCashOnly, ctx.Clock.Now(), "");
   ctx.Assert(!ctx.Redis.ZScore("clearing:open", b).has_value(), "a transaction between cash accounts touches no clearing account and must not be tracked");
-  const std::string c = clrWrite(ctx, clrPayout, t0 + 1, "");
-  ctx.Equal(clrOpen(ctx), std::map<std::string, double>{{a, double(t0)}, {c, double(t0 + 1)}}, "clearing:open should hold the capture and the payout");
+  const std::string c = hClrWrite(ctx, kHClrPayout, t0 + 1, "");
+  ctx.Equal(hClrOpen(ctx), std::map<std::string, double>{{a, double(t0)}, {c, double(t0 + 1)}}, "clearing:open should hold the capture and the payout");
 }
 
 void CheckSettlesCloses(harness::Ctx& ctx) {
-  clrWorld(ctx);
-  const int64_t t0 = ctx.Clock.Now() - 3 * clrH;
-  const std::string a = clrWrite(ctx, clrCapture, t0, "");
-  const std::string b = clrWrite(ctx, clrPayout, t0 + 2 * clrH, a);
+  hClrWorld(ctx);
+  const int64_t t0 = ctx.Clock.Now() - 3 * kHClrH;
+  const std::string a = hClrWrite(ctx, kHClrCapture, t0, "");
+  const std::string b = hClrWrite(ctx, kHClrPayout, t0 + 2 * kHClrH, a);
   ctx.Assert(!ctx.Redis.ZScore("clearing:open", a).has_value(), "the transaction that settles the capture must ZRem it from clearing:open");
   ctx.Assert(!ctx.Redis.ZScore("clearing:open", b).has_value(), "the settling transaction is the closing side of the flow: it must not open an item of its own");
   // Go recovers a panic here; in C++ the learner's track throws (sw::redis::Error is a std::exception).
   try {
-    clrWrite(ctx, clrPayout, t0, "tx-unknown");
+    hClrWrite(ctx, kHClrPayout, t0, "tx-unknown");
   } catch (const std::exception& e) {
     ctx.Fatalf("settling an id that is not open must be a no-op, but the write failed in track with %v", std::string(e.what()));
   }
-  ctx.Equal(clrOpen(ctx), std::map<std::string, double>{}, "clearing:open should be empty");
-  const std::string c = clrWrite(ctx, clrCapture, t0, "");
-  const std::string d = clrWrite(ctx, clrCapture, t0 + 1, "");
-  clrWrite(ctx, clrPayout, t0 + 2, c);
-  ctx.Equal(clrOpen(ctx), std::map<std::string, double>{{d, double(t0 + 1)}}, "only the first of two captures was settled: clearing:open should hold the second");
+  ctx.Equal(hClrOpen(ctx), std::map<std::string, double>{}, "clearing:open should be empty");
+  const std::string c = hClrWrite(ctx, kHClrCapture, t0, "");
+  const std::string d = hClrWrite(ctx, kHClrCapture, t0 + 1, "");
+  hClrWrite(ctx, kHClrPayout, t0 + 2, c);
+  ctx.Equal(hClrOpen(ctx), std::map<std::string, double>{{d, double(t0 + 1)}}, "only the first of two captures was settled: clearing:open should hold the second");
 }
 
 void CheckStuckWindow(harness::Ctx& ctx) {
-  clrWorld(ctx);
+  hClrWorld(ctx);
   const int64_t now = ctx.Clock.Now();
   std::map<std::string, std::string> ids;
   const std::vector<std::pair<std::string, int64_t>> windows = {{"48h", 48}, {"23h", 23}, {"25h", 25}, {"1h", 1}};
-  for (const auto& [name, hours] : windows) ids[clrWrite(ctx, clrCapture, now - hours * clrH, "")] = name;
-  auto items = clrStuck(ctx);
-  ctx.Equal(clrOpen(ctx).size(), 4, "stuck reports; it must not remove anything from clearing:open: items there");
-  auto got = clrNames(clrStuckIDs(items), ids);
+  for (const auto& [name, hours] : windows) ids[hClrWrite(ctx, kHClrCapture, now - hours * kHClrH, "")] = name;
+  auto items = hClrStuck(ctx);
+  ctx.Equal(hClrOpen(ctx).size(), 4, "stuck reports; it must not remove anything from clearing:open: items there");
+  auto got = hClrNames(hClrStuckIDs(items), ids);
   ctx.Equal(got, {"48h", "25h"}, "of transactions posted 48 h, 23 h, 25 h and 1 h ago, the ones older than 24 h, oldest first");
   for (const auto& item : items) {
     const double s = ctx.Redis.ZScore("clearing:open", item.transaction_id).value_or(0);
@@ -1345,22 +1345,22 @@ void CheckStuckWindow(harness::Ctx& ctx) {
   for (const auto& item : items) ages[ids[item.transaction_id]] = item.age_s;
   ctx.Assert(std::abs(ages["48h"] - 48 * 3600) <= 2 && std::abs(ages["25h"] - 25 * 3600) <= 2, "age_s must be the age in seconds, got %v", ages);
   ctx.Clock.Advance(2 * 3600);
-  items = clrStuck(ctx);
-  got = clrNames(clrStuckIDs(items), ids);
+  items = hClrStuck(ctx);
+  got = hClrNames(hClrStuckIDs(items), ids);
   ctx.Equal(got, {"48h", "25h", "23h"}, "two hours later the 23 h one has crossed 24 h and must be reported");
   // A late event: posted 30 h ago, journaled just now — stuck immediately, because the score is its own time.
-  const std::string late = clrWrite(ctx, clrCapture, ctx.Clock.Now() - 30 * clrH, "");
+  const std::string late = hClrWrite(ctx, kHClrCapture, ctx.Clock.Now() - 30 * kHClrH, "");
   bool found = false;
-  for (const auto& item : clrStuck(ctx)) found = found || item.transaction_id == late;
+  for (const auto& item : hClrStuck(ctx)) found = found || item.transaction_id == late;
   ctx.Assert(found, "a transaction posted 30 h ago that reaches the journal now is already stuck");
 }
 
 void CheckStuckEndpoint(harness::Ctx& ctx) {
-  clrWorld(ctx);
+  hClrWorld(ctx);
   const int64_t now = ctx.Clock.Now();
   std::map<std::string, std::string> ids;
   const std::vector<std::pair<std::string, int64_t>> windows = {{"27h", 27}, {"2h", 2}, {"30h", 30}};
-  for (const auto& [name, hours] : windows) ids[clrWrite(ctx, clrCapture, now - hours * clrH, "")] = name;
+  for (const auto& [name, hours] : windows) ids[hClrWrite(ctx, kHClrCapture, now - hours * kHClrH, "")] = name;
   const auto r = ctx.Main().HTTP().Get("/clearing/stuck");
   ctx.Equal(r.Status, 200, "GET /clearing/stuck");
   const std::string contentType = r.HeaderValue("Content-Type");
@@ -1369,7 +1369,7 @@ void CheckStuckEndpoint(harness::Ctx& ctx) {
   ctx.Assert(body.IsArray(), "the report is a JSON list, got %s", r.Text());
   std::vector<std::string> transactionIDs;
   for (const auto& item : body.Items()) transactionIDs.push_back(item["transaction_id"].String());
-  ctx.Equal(clrNames(transactionIDs, ids), {"30h", "27h"}, "expected the two transactions older than 24 h, oldest first");
+  ctx.Equal(hClrNames(transactionIDs, ids), {"30h", "27h"}, "expected the two transactions older than 24 h, oldest first");
   for (const auto& item : body.Items()) {
     const auto& fields = item.Fields();
     const bool hasID = fields.count("transaction_id") != 0, hasOpened = fields.count("opened_at") != 0, hasAge = fields.count("age_s") != 0;
@@ -1377,7 +1377,7 @@ void CheckStuckEndpoint(harness::Ctx& ctx) {
   }
   const double age = body[0]["age_s"].Float();
   ctx.Assert(age - 30 * 3600 <= 2 && 30 * 3600 - age <= 2, "the 30 h one's age_s should be about %d, got %v", 30 * 3600, age);
-  ctx.Equal(clrOpen(ctx).size(), 3, "reading the report must not change clearing:open: items there");
+  ctx.Equal(hClrOpen(ctx).size(), 3, "reading the report must not change clearing:open: items there");
 }
 `,
   },

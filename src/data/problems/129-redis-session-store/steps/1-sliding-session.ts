@@ -896,38 +896,38 @@ import (
 	"leetbuild/harness"
 )
 
-const ssTTL = 1800
+const kHSsTTL = 1800
 
 var (
-	ssHex32  = regexp.MustCompile("^[0-9a-f]{32}$")
-	ssNobody = strings.Repeat("0", 32)
-	ssBg     = context.Background()
+	hSsHex32  = regexp.MustCompile("^[0-9a-f]{32}$")
+	hSsNobody = strings.Repeat("0", 32)
+	hSsBg     = context.Background()
 )
 
-func ssCreate(ctx *harness.Ctx, userID string, data map[string]string) string {
-	sid, err := create(ssBg, userID, data)
+func hSsCreate(ctx *harness.Ctx, userID string, data map[string]string) string {
+	sid, err := create(hSsBg, userID, data)
 	ctx.NoError(err, "create(ctx, %q, %s) returned an error", userID, harness.Show(data))
 	return sid
 }
 
-func ssGet(ctx *harness.Ctx, sid string) map[string]string {
-	got, err := get(ssBg, sid)
+func hSsGet(ctx *harness.Ctx, sid string) map[string]string {
+	got, err := get(hSsBg, sid)
 	ctx.NoError(err, "get(ctx, %q) returned an error", sid)
 	return got
 }
 
-func ssTouch(ctx *harness.Ctx, sid string) bool {
-	ok, err := touch(ssBg, sid)
+func hSsTouch(ctx *harness.Ctx, sid string) bool {
+	ok, err := touch(hSsBg, sid)
 	ctx.NoError(err, "touch(ctx, %q) returned an error", sid)
 	return ok
 }
 
-func ssDestroy(ctx *harness.Ctx, sid string) {
-	ctx.NoError(destroy(ssBg, sid), "destroy(ctx, %q) returned an error", sid)
+func hSsDestroy(ctx *harness.Ctx, sid string) {
+	ctx.NoError(destroy(hSsBg, sid), "destroy(ctx, %q) returned an error", sid)
 }
 
 // ssFieldNames is the hash's field names, sorted.
-func ssFieldNames(fields map[string]string) []string {
+func hSsFieldNames(fields map[string]string) []string {
 	names := make([]string, 0, len(fields))
 	for f := range fields {
 		names = append(names, f)
@@ -939,10 +939,10 @@ func ssFieldNames(fields map[string]string) []string {
 func CheckSessionId(ctx *harness.Ctx) {
 	sids := make([]string, 0, 50)
 	for i := range 50 {
-		sids = append(sids, ssCreate(ctx, fmt.Sprintf("u%d", i), map[string]string{"theme": "dark", "locale": "de"}))
+		sids = append(sids, hSsCreate(ctx, fmt.Sprintf("u%d", i), map[string]string{"theme": "dark", "locale": "de"}))
 	}
 	for _, sid := range sids {
-		ctx.Assert(ssHex32.MatchString(sid), "a session id must be 32 lower-case hex chars (16 random bytes), got %q", sid)
+		ctx.Assert(hSsHex32.MatchString(sid), "a session id must be 32 lower-case hex chars (16 random bytes), got %q", sid)
 	}
 	distinct := map[string]bool{}
 	for _, sid := range sids {
@@ -959,10 +959,10 @@ func CheckSessionId(ctx *harness.Ctx) {
 	now := ctx.Clock.Now() / 1000
 	ctx.Assert(ok && err == nil && at-now <= 1 && now-at <= 1, "created_at must be the unix seconds at create, it is %q", createdAt)
 	ctx.Assert(fields["theme"] == "dark" && fields["locale"] == "de", "every entry of data must be a field of the hash; the hash holds %s", harness.Show(fields))
-	ctx.Equal(ssFieldNames(fields), []string{"created_at", "locale", "theme", "user_id"}, "the hash must hold exactly user_id, created_at and the data entries")
-	ctx.Equal(ssGet(ctx, sid), fields, "get must return the hash's fields as stored")
-	bare := ssCreate(ctx, "u99", map[string]string{})
-	ctx.Equal(ssFieldNames(ctx.Redis.HGetAll("sess:"+bare)), []string{"created_at", "user_id"}, "with empty data the hash holds only user_id and created_at")
+	ctx.Equal(hSsFieldNames(fields), []string{"created_at", "locale", "theme", "user_id"}, "the hash must hold exactly user_id, created_at and the data entries")
+	ctx.Equal(hSsGet(ctx, sid), fields, "get must return the hash's fields as stored")
+	bare := hSsCreate(ctx, "u99", map[string]string{})
+	ctx.Equal(hSsFieldNames(ctx.Redis.HGetAll("sess:"+bare)), []string{"created_at", "user_id"}, "with empty data the hash holds only user_id and created_at")
 	keys := ctx.Redis.Keys("*")
 	want := make([]string, 0, len(sids)+1)
 	for _, s := range append(sids, bare) {
@@ -977,75 +977,75 @@ func CheckSessionId(ctx *harness.Ctx) {
 }
 
 func CheckTtlOnCreate(ctx *harness.Ctx) {
-	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
-	ctx.Equal(ctx.Redis.TTL("sess:"+sid), ssTTL, "right after create the TTL of sess:{sid} must be %d s (sessionTTL)", ssTTL)
+	sid := hSsCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	ctx.Equal(ctx.Redis.TTL("sess:"+sid), kHSsTTL, "right after create the TTL of sess:{sid} must be %d s (sessionTTL)", kHSsTTL)
 	ctx.Clock.Advance(100)
-	ctx.Equal(ctx.Redis.TTL("sess:"+sid), ssTTL-100, "the TTL counts down while nobody reads: 100 s later")
+	ctx.Equal(ctx.Redis.TTL("sess:"+sid), kHSsTTL-100, "the TTL counts down while nobody reads: 100 s later")
 	theme, _ := ctx.Redis.HGet("sess:"+sid, "theme")
 	ctx.Equal(theme, "dark", "the fields must survive the EXPIRE (EXPIRE sets a TTL, it does not rewrite the hash)")
 }
 
 func CheckSlidesOnGet(ctx *harness.Ctx) {
-	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	sid := hSsCreate(ctx, "ana", map[string]string{"theme": "dark"})
 	k := "sess:" + sid
 	stored := ctx.Redis.HGetAll(k)
 	ctx.Clock.Advance(1000)
-	ctx.Equal(ctx.Redis.TTL(k), ssTTL-1000, "the TTL 1000 s after create")
-	got := ssGet(ctx, sid)
+	ctx.Equal(ctx.Redis.TTL(k), kHSsTTL-1000, "the TTL 1000 s after create")
+	got := hSsGet(ctx, sid)
 	ctx.Assert(got != nil && got["user_id"] == "ana" && got["theme"] == "dark", "get on a live session must return its fields, got %s", harness.Show(got))
-	ctx.Equal(ctx.Redis.TTL(k), ssTTL, "a read must slide the TTL back to %d (EXPIRE after HGETALL)", ssTTL)
+	ctx.Equal(ctx.Redis.TTL(k), kHSsTTL, "a read must slide the TTL back to %d (EXPIRE after HGETALL)", kHSsTTL)
 	ctx.Equal(ctx.Redis.HGetAll(k), stored, "a read must not rewrite the hash (created_at and the data stay as they were)")
 	ctx.Clock.Advance(1500)
 	ctx.Equal(ctx.Redis.Exists(k), 1, "2500 s after create but only 1500 s after the last read the session must still be there")
-	ctx.Assert(ssGet(ctx, sid) != nil, "a session read every 1500 s must never expire")
-	ctx.Equal(ctx.Redis.TTL(k), ssTTL, "every read slides the TTL, not just the first")
+	ctx.Assert(hSsGet(ctx, sid) != nil, "a session read every 1500 s must never expire")
+	ctx.Equal(ctx.Redis.TTL(k), kHSsTTL, "every read slides the TTL, not just the first")
 }
 
 func CheckTouch(ctx *harness.Ctx) {
-	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	sid := hSsCreate(ctx, "ana", map[string]string{"theme": "dark"})
 	k := "sess:" + sid
 	stored := ctx.Redis.HGetAll(k)
 	ctx.Clock.Advance(1000)
-	ctx.Equal(ssTouch(ctx, sid), true, "touch on a live session must return true")
-	ctx.Equal(ctx.Redis.TTL(k), ssTTL, "touch must slide the TTL back to %d", ssTTL)
+	ctx.Equal(hSsTouch(ctx, sid), true, "touch on a live session must return true")
+	ctx.Equal(ctx.Redis.TTL(k), kHSsTTL, "touch must slide the TTL back to %d", kHSsTTL)
 	ctx.Equal(ctx.Redis.HGetAll(k), stored, "touch must leave the fields alone")
-	ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an unknown id must return false (EXPIRE answers 0 for a missing key)")
-	ctx.Equal(ctx.Redis.Exists("sess:"+ssNobody), 0, "touch on an unknown id must not create a key")
+	ctx.Equal(hSsTouch(ctx, hSsNobody), false, "touch on an unknown id must return false (EXPIRE answers 0 for a missing key)")
+	ctx.Equal(ctx.Redis.Exists("sess:"+hSsNobody), 0, "touch on an unknown id must not create a key")
 	ctx.Equal(ctx.Redis.Keys("*"), []string{k}, "touch must write no other key")
 }
 
 func CheckExpires(ctx *harness.Ctx) {
-	sid := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	sid := hSsCreate(ctx, "ana", map[string]string{"theme": "dark"})
 	k := "sess:" + sid
 	ctx.Clock.Advance(1799)
 	ctx.Equal(ctx.Redis.Exists(k), 1, "1799 s without a read is still inside the idle window: the session must be there")
 	ctx.Clock.Advance(2)
 	ctx.Equal(ctx.Redis.Exists(k), 0, "1801 s without a read: Redis must have evicted sess:{sid} (the TTL set at create is the only thing keeping it alive)")
-	ctx.Assert(ssGet(ctx, sid) == nil, "get on an expired session must return nil")
-	ctx.Equal(ssTouch(ctx, sid), false, "touch on an expired session must return false")
+	ctx.Assert(hSsGet(ctx, sid) == nil, "get on an expired session must return nil")
+	ctx.Equal(hSsTouch(ctx, sid), false, "touch on an expired session must return false")
 	keys := ctx.Redis.Keys("*")
 	ctx.Assert(len(keys) == 0, "get/touch on an expired session must not recreate anything, found %s", harness.Show(keys))
-	other := ssCreate(ctx, "bo", map[string]string{})
+	other := hSsCreate(ctx, "bo", map[string]string{})
 	ctx.Clock.Advance(1000)
-	ctx.Assert(ssGet(ctx, other) != nil, "get on a live session must return its fields")
+	ctx.Assert(hSsGet(ctx, other) != nil, "get on a live session must return its fields")
 	ctx.Clock.Advance(1799)
 	ctx.Equal(ctx.Redis.Exists("sess:"+other), 1, "a read at 1000 s buys a fresh 1800 s: 1799 s after it the session must still be there")
 	ctx.Clock.Advance(2)
-	ctx.Assert(ssGet(ctx, other) == nil, "a read buys 1800 s and no more: 1801 s after the last read the session must be gone")
+	ctx.Assert(hSsGet(ctx, other) == nil, "a read buys 1800 s and no more: 1801 s after the last read the session must be gone")
 }
 
 func CheckDestroyAndUnknown(ctx *harness.Ctx) {
-	a := ssCreate(ctx, "ana", map[string]string{"theme": "dark"})
-	b := ssCreate(ctx, "bo", map[string]string{"theme": "light"})
-	ssDestroy(ctx, a)
+	a := hSsCreate(ctx, "ana", map[string]string{"theme": "dark"})
+	b := hSsCreate(ctx, "bo", map[string]string{"theme": "light"})
+	hSsDestroy(ctx, a)
 	ctx.Equal(ctx.Redis.Exists("sess:"+a), 0, "destroy must DEL sess:{sid}")
-	ctx.Assert(ssGet(ctx, a) == nil, "get after destroy must return nil")
-	ctx.Equal(ssTouch(ctx, a), false, "touch after destroy must return false")
-	got := ssGet(ctx, b)
+	ctx.Assert(hSsGet(ctx, a) == nil, "get after destroy must return nil")
+	ctx.Equal(hSsTouch(ctx, a), false, "touch after destroy must return false")
+	got := hSsGet(ctx, b)
 	ctx.Assert(got != nil && got["theme"] == "light", "destroying one session must not touch another")
-	ssDestroy(ctx, a) // idempotent
-	ctx.Assert(ssGet(ctx, ssNobody) == nil, "get on an id that was never created must return nil")
-	ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an id that was never created must return false")
+	hSsDestroy(ctx, a) // idempotent
+	ctx.Assert(hSsGet(ctx, hSsNobody) == nil, "get on an id that was never created must return nil")
+	ctx.Equal(hSsTouch(ctx, hSsNobody), false, "touch on an id that was never created must return false")
 	ctx.Equal(ctx.Redis.Keys("*"), []string{"sess:" + b}, "a miss must create no key: only sess:{b} may exist")
 }
 `,
@@ -1064,13 +1064,13 @@ func CheckDestroyAndUnknown(ctx *harness.Ctx) {
 
 namespace {
 
-using Fields = std::map<std::string, std::string>;
+using HFields = std::map<std::string, std::string>;
 
-constexpr long long ssTTL = 1800;
-const std::regex ssHex32("^[0-9a-f]{32}$");
-const std::string ssNobody(32, '0');
+constexpr long long kHSsTTL = 1800;
+const std::regex hSsHex32("^[0-9a-f]{32}$");
+const std::string hSsNobody(32, '0');
 
-std::string ssCreate(harness::Ctx& ctx, const std::string& userID, const Fields& data) {
+std::string hSsCreate(harness::Ctx& ctx, const std::string& userID, const HFields& data) {
   try {
     return create(userID, data);
   } catch (const std::exception& e) {
@@ -1079,7 +1079,7 @@ std::string ssCreate(harness::Ctx& ctx, const std::string& userID, const Fields&
   return "";
 }
 
-std::optional<Fields> ssGet(harness::Ctx& ctx, const std::string& sid) {
+std::optional<HFields> hSsGet(harness::Ctx& ctx, const std::string& sid) {
   try {
     return get(sid);
   } catch (const std::exception& e) {
@@ -1088,7 +1088,7 @@ std::optional<Fields> ssGet(harness::Ctx& ctx, const std::string& sid) {
   return std::nullopt;
 }
 
-bool ssTouch(harness::Ctx& ctx, const std::string& sid) {
+bool hSsTouch(harness::Ctx& ctx, const std::string& sid) {
   try {
     return touch(sid);
   } catch (const std::exception& e) {
@@ -1097,7 +1097,7 @@ bool ssTouch(harness::Ctx& ctx, const std::string& sid) {
   return false;
 }
 
-void ssDestroy(harness::Ctx& ctx, const std::string& sid) {
+void hSsDestroy(harness::Ctx& ctx, const std::string& sid) {
   try {
     destroy(sid);
   } catch (const std::exception& e) {
@@ -1106,7 +1106,7 @@ void ssDestroy(harness::Ctx& ctx, const std::string& sid) {
 }
 
 // ssFieldNames is the hash's field names, sorted.
-std::vector<std::string> ssFieldNames(const Fields& fields) {
+std::vector<std::string> hSsFieldNames(const HFields& fields) {
   std::vector<std::string> names;
   for (const auto& [f, _] : fields) names.push_back(f);
   return names;
@@ -1117,17 +1117,17 @@ std::vector<std::string> ssFieldNames(const Fields& fields) {
 void CheckSessionId(harness::Ctx& ctx) {
   std::vector<std::string> sids;
   for (int i = 0; i < 50; i++) {
-    sids.push_back(ssCreate(ctx, harness::Sprintf("u%d", i), {{"theme", "dark"}, {"locale", "de"}}));
+    sids.push_back(hSsCreate(ctx, harness::Sprintf("u%d", i), {{"theme", "dark"}, {"locale", "de"}}));
   }
   for (const auto& sid : sids) {
-    ctx.Assert(std::regex_match(sid, ssHex32), "a session id must be 32 lower-case hex chars (16 random bytes), got %q", sid);
+    ctx.Assert(std::regex_match(sid, hSsHex32), "a session id must be 32 lower-case hex chars (16 random bytes), got %q", sid);
   }
   const std::set<std::string> distinct(sids.begin(), sids.end());
   ctx.Equal(distinct.size(), 50, "fifty sessions must get fifty distinct ids (a secure random source, never a counter or a timestamp)");
   const std::string sid = sids[0];
   const std::string k = "sess:" + sid;
   ctx.Equal(ctx.Redis.Type(k), "hash", "the session must be the hash sess:{sid}; the type of %s", k);
-  Fields fields = ctx.Redis.HGetAll(k);
+  HFields fields = ctx.Redis.HGetAll(k);
   ctx.Equal(fields["user_id"], "u0", "the hash must carry user_id = u0 (it holds %s)", harness::ShowValue(fields));
   const bool ok = fields.count("created_at") > 0;
   const std::string createdAt = ok ? fields["created_at"] : "";
@@ -1138,10 +1138,10 @@ void CheckSessionId(harness::Ctx& ctx) {
   ctx.Assert(ok && parsed && at - now <= 1 && now - at <= 1, "created_at must be the unix seconds at create, it is %q", createdAt);
   ctx.Assert(fields["theme"] == "dark" && fields["locale"] == "de", "every entry of data must be a field of the hash; the hash holds %s", harness::ShowValue(fields));
   fields = ctx.Redis.HGetAll(k);
-  ctx.Equal(ssFieldNames(fields), {"created_at", "locale", "theme", "user_id"}, "the hash must hold exactly user_id, created_at and the data entries");
-  ctx.Equal(ssGet(ctx, sid).value_or(Fields{}), fields, "get must return the hash's fields as stored");
-  const std::string bare = ssCreate(ctx, "u99", {});
-  ctx.Equal(ssFieldNames(ctx.Redis.HGetAll("sess:" + bare)), {"created_at", "user_id"}, "with empty data the hash holds only user_id and created_at");
+  ctx.Equal(hSsFieldNames(fields), {"created_at", "locale", "theme", "user_id"}, "the hash must hold exactly user_id, created_at and the data entries");
+  ctx.Equal(hSsGet(ctx, sid).value_or(HFields{}), fields, "get must return the hash's fields as stored");
+  const std::string bare = hSsCreate(ctx, "u99", {});
+  ctx.Equal(hSsFieldNames(ctx.Redis.HGetAll("sess:" + bare)), {"created_at", "user_id"}, "with empty data the hash holds only user_id and created_at");
   const auto keys = ctx.Redis.Keys("*");
   std::vector<std::string> want;
   sids.push_back(bare);
@@ -1152,76 +1152,76 @@ void CheckSessionId(harness::Ctx& ctx) {
 }
 
 void CheckTtlOnCreate(harness::Ctx& ctx) {
-  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
-  ctx.Equal(ctx.Redis.TTL("sess:" + sid), ssTTL, "right after create the TTL of sess:{sid} must be %d s (sessionTTL)", ssTTL);
+  const std::string sid = hSsCreate(ctx, "ana", {{"theme", "dark"}});
+  ctx.Equal(ctx.Redis.TTL("sess:" + sid), kHSsTTL, "right after create the TTL of sess:{sid} must be %d s (sessionTTL)", kHSsTTL);
   ctx.Clock.Advance(100);
-  ctx.Equal(ctx.Redis.TTL("sess:" + sid), ssTTL - 100, "the TTL counts down while nobody reads: 100 s later");
+  ctx.Equal(ctx.Redis.TTL("sess:" + sid), kHSsTTL - 100, "the TTL counts down while nobody reads: 100 s later");
   const auto theme = ctx.Redis.HGet("sess:" + sid, "theme");
   ctx.Equal(theme.value_or(""), "dark", "the fields must survive the EXPIRE (EXPIRE sets a TTL, it does not rewrite the hash)");
 }
 
 void CheckSlidesOnGet(harness::Ctx& ctx) {
-  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string sid = hSsCreate(ctx, "ana", {{"theme", "dark"}});
   const std::string k = "sess:" + sid;
   const auto stored = ctx.Redis.HGetAll(k);
   ctx.Clock.Advance(1000);
-  ctx.Equal(ctx.Redis.TTL(k), ssTTL - 1000, "the TTL 1000 s after create");
-  const auto got = ssGet(ctx, sid);
+  ctx.Equal(ctx.Redis.TTL(k), kHSsTTL - 1000, "the TTL 1000 s after create");
+  const auto got = hSsGet(ctx, sid);
   ctx.Assert(got && got->count("user_id") && got->at("user_id") == "ana" && got->count("theme") && got->at("theme") == "dark",
              "get on a live session must return its fields, got %s", harness::ShowValue(got));
-  ctx.Equal(ctx.Redis.TTL(k), ssTTL, "a read must slide the TTL back to %d (EXPIRE after HGETALL)", ssTTL);
+  ctx.Equal(ctx.Redis.TTL(k), kHSsTTL, "a read must slide the TTL back to %d (EXPIRE after HGETALL)", kHSsTTL);
   ctx.Equal(ctx.Redis.HGetAll(k), stored, "a read must not rewrite the hash (created_at and the data stay as they were)");
   ctx.Clock.Advance(1500);
   ctx.Equal(ctx.Redis.Exists(k), 1, "2500 s after create but only 1500 s after the last read the session must still be there");
-  ctx.Assert(ssGet(ctx, sid).has_value(), "a session read every 1500 s must never expire");
-  ctx.Equal(ctx.Redis.TTL(k), ssTTL, "every read slides the TTL, not just the first");
+  ctx.Assert(hSsGet(ctx, sid).has_value(), "a session read every 1500 s must never expire");
+  ctx.Equal(ctx.Redis.TTL(k), kHSsTTL, "every read slides the TTL, not just the first");
 }
 
 void CheckTouch(harness::Ctx& ctx) {
-  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string sid = hSsCreate(ctx, "ana", {{"theme", "dark"}});
   const std::string k = "sess:" + sid;
   const auto stored = ctx.Redis.HGetAll(k);
   ctx.Clock.Advance(1000);
-  ctx.Equal(ssTouch(ctx, sid), true, "touch on a live session must return true");
-  ctx.Equal(ctx.Redis.TTL(k), ssTTL, "touch must slide the TTL back to %d", ssTTL);
+  ctx.Equal(hSsTouch(ctx, sid), true, "touch on a live session must return true");
+  ctx.Equal(ctx.Redis.TTL(k), kHSsTTL, "touch must slide the TTL back to %d", kHSsTTL);
   ctx.Equal(ctx.Redis.HGetAll(k), stored, "touch must leave the fields alone");
-  ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an unknown id must return false (EXPIRE answers 0 for a missing key)");
-  ctx.Equal(ctx.Redis.Exists("sess:" + ssNobody), 0, "touch on an unknown id must not create a key");
+  ctx.Equal(hSsTouch(ctx, hSsNobody), false, "touch on an unknown id must return false (EXPIRE answers 0 for a missing key)");
+  ctx.Equal(ctx.Redis.Exists("sess:" + hSsNobody), 0, "touch on an unknown id must not create a key");
   ctx.Equal(ctx.Redis.Keys("*"), std::vector<std::string>{k}, "touch must write no other key");
 }
 
 void CheckExpires(harness::Ctx& ctx) {
-  const std::string sid = ssCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string sid = hSsCreate(ctx, "ana", {{"theme", "dark"}});
   const std::string k = "sess:" + sid;
   ctx.Clock.Advance(1799);
   ctx.Equal(ctx.Redis.Exists(k), 1, "1799 s without a read is still inside the idle window: the session must be there");
   ctx.Clock.Advance(2);
   ctx.Equal(ctx.Redis.Exists(k), 0, "1801 s without a read: Redis must have evicted sess:{sid} (the TTL set at create is the only thing keeping it alive)");
-  ctx.Assert(!ssGet(ctx, sid).has_value(), "get on an expired session must return nil");
-  ctx.Equal(ssTouch(ctx, sid), false, "touch on an expired session must return false");
+  ctx.Assert(!hSsGet(ctx, sid).has_value(), "get on an expired session must return nil");
+  ctx.Equal(hSsTouch(ctx, sid), false, "touch on an expired session must return false");
   const auto keys = ctx.Redis.Keys("*");
   ctx.Assert(keys.empty(), "get/touch on an expired session must not recreate anything, found %s", harness::ShowValue(keys));
-  const std::string other = ssCreate(ctx, "bo", {});
+  const std::string other = hSsCreate(ctx, "bo", {});
   ctx.Clock.Advance(1000);
-  ctx.Assert(ssGet(ctx, other).has_value(), "get on a live session must return its fields");
+  ctx.Assert(hSsGet(ctx, other).has_value(), "get on a live session must return its fields");
   ctx.Clock.Advance(1799);
   ctx.Equal(ctx.Redis.Exists("sess:" + other), 1, "a read at 1000 s buys a fresh 1800 s: 1799 s after it the session must still be there");
   ctx.Clock.Advance(2);
-  ctx.Assert(!ssGet(ctx, other).has_value(), "a read buys 1800 s and no more: 1801 s after the last read the session must be gone");
+  ctx.Assert(!hSsGet(ctx, other).has_value(), "a read buys 1800 s and no more: 1801 s after the last read the session must be gone");
 }
 
 void CheckDestroyAndUnknown(harness::Ctx& ctx) {
-  const std::string a = ssCreate(ctx, "ana", {{"theme", "dark"}});
-  const std::string b = ssCreate(ctx, "bo", {{"theme", "light"}});
-  ssDestroy(ctx, a);
+  const std::string a = hSsCreate(ctx, "ana", {{"theme", "dark"}});
+  const std::string b = hSsCreate(ctx, "bo", {{"theme", "light"}});
+  hSsDestroy(ctx, a);
   ctx.Equal(ctx.Redis.Exists("sess:" + a), 0, "destroy must DEL sess:{sid}");
-  ctx.Assert(!ssGet(ctx, a).has_value(), "get after destroy must return nil");
-  ctx.Equal(ssTouch(ctx, a), false, "touch after destroy must return false");
-  const auto got = ssGet(ctx, b);
+  ctx.Assert(!hSsGet(ctx, a).has_value(), "get after destroy must return nil");
+  ctx.Equal(hSsTouch(ctx, a), false, "touch after destroy must return false");
+  const auto got = hSsGet(ctx, b);
   ctx.Assert(got && got->count("theme") && got->at("theme") == "light", "destroying one session must not touch another");
-  ssDestroy(ctx, a);  // idempotent
-  ctx.Assert(!ssGet(ctx, ssNobody).has_value(), "get on an id that was never created must return nil");
-  ctx.Equal(ssTouch(ctx, ssNobody), false, "touch on an id that was never created must return false");
+  hSsDestroy(ctx, a);  // idempotent
+  ctx.Assert(!hSsGet(ctx, hSsNobody).has_value(), "get on an id that was never created must return nil");
+  ctx.Equal(hSsTouch(ctx, hSsNobody), false, "touch on an id that was never created must return false");
   ctx.Equal(ctx.Redis.Keys("*"), std::vector<std::string>{"sess:" + b}, "a miss must create no key: only sess:{b} may exist");
 }
 `,

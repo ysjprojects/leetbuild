@@ -805,13 +805,13 @@ import (
 )
 
 // bucketGateway is rateLimit wrapped around a route the harness registers, counting what got through.
-type bucketGateway struct {
+type HBucketGateway struct {
 	served []string
 	http   *harness.HTTP
 }
 
-func newBucketGateway(ctx *harness.Ctx) *bucketGateway {
-	g := &bucketGateway{}
+func hNewBucketGateway(ctx *harness.Ctx) *HBucketGateway {
+	g := &HBucketGateway{}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /items/{id}", func(rw http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -823,7 +823,7 @@ func newBucketGateway(ctx *harness.Ctx) *bucketGateway {
 	return g
 }
 
-func (g *bucketGateway) burst(n int, header ...string) []int {
+func (g *HBucketGateway) burst(n int, header ...string) []int {
 	if len(header) == 0 {
 		header = []string{"X-API-Key", "k1"}
 	}
@@ -835,7 +835,7 @@ func (g *bucketGateway) burst(n int, header ...string) []int {
 }
 
 // bucketStatuses is n copies of status, then the tail.
-func bucketStatuses(n, status int, tail ...int) []int {
+func hBucketStatuses(n, status int, tail ...int) []int {
 	out := make([]int, 0, n+len(tail))
 	for range n {
 		out = append(out, status)
@@ -844,7 +844,7 @@ func bucketStatuses(n, status int, tail ...int) []int {
 }
 
 func CheckKey(ctx *harness.Ctx) {
-	g := newBucketGateway(ctx)
+	g := hNewBucketGateway(ctx)
 	g.http.Get("/items/42", "X-API-Key", "k1")
 	g.http.Get("/items/42", "X-API-Key", "k2")
 	g.http.Get("/items/42")
@@ -862,7 +862,7 @@ func CheckKey(ctx *harness.Ctx) {
 }
 
 func CheckAtomicLua(ctx *harness.Ctx) {
-	g := newBucketGateway(ctx)
+	g := hNewBucketGateway(ctx)
 	// Another gateway replica lands right after the first command that touches the bucket — between a
 	// client-side read and its write-back — and spends the whole bucket.
 	ctx.Redis.After("bucket:k1", func() any {
@@ -883,23 +883,23 @@ func CheckAtomicLua(ctx *harness.Ctx) {
 }
 
 func CheckRefillCapped(ctx *harness.Ctx) {
-	g := newBucketGateway(ctx)
-	ctx.Equal(g.burst(11), bucketStatuses(10, 200, 429), "a fresh key gets a full burst of 10, then 429")
+	g := hNewBucketGateway(ctx)
+	ctx.Equal(g.burst(11), hBucketStatuses(10, 200, 429), "a fresh key gets a full burst of 10, then 429")
 	ctx.Clock.Advance(1.0)
-	ctx.Equal(g.burst(6), bucketStatuses(5, 200, 429), "one second at rate 5 refills 5 tokens, so 5 allowed then 429")
+	ctx.Equal(g.burst(6), hBucketStatuses(5, 200, 429), "one second at rate 5 refills 5 tokens, so 5 allowed then 429")
 	ctx.Clock.Advance(100.0)
-	ctx.Equal(g.burst(11), bucketStatuses(10, 200, 429), "after 100 idle seconds the bucket is capped at burst (10), not 500")
+	ctx.Equal(g.burst(11), hBucketStatuses(10, 200, 429), "after 100 idle seconds the bucket is capped at burst (10), not 500")
 }
 
 func CheckTakeOne(ctx *harness.Ctx) {
-	g := newBucketGateway(ctx)
+	g := hNewBucketGateway(ctx)
 	var remaining []string
 	for range 3 {
 		remaining = append(remaining, g.http.Get("/items/42", "X-API-Key", "k1").Header.Get("X-RateLimit-Remaining"))
 	}
 	ctx.Equal(remaining, []string{"9", "8", "7"}, "X-RateLimit-Remaining over three requests (one token each)")
 	g.burst(7)
-	ctx.Equal(g.burst(5), bucketStatuses(5, 429), "with the bucket empty every request is denied")
+	ctx.Equal(g.burst(5), hBucketStatuses(5, 429), "with the bucket empty every request is denied")
 	tokens, _ := ctx.Redis.HGet("bucket:k1", "tokens")
 	n, err := strconv.ParseFloat(tokens, 64)
 	ctx.Assert(err == nil && n >= 0, "bucket:k1 holds %q tokens after denied requests: a denial must not take a token", tokens)
@@ -908,7 +908,7 @@ func CheckTakeOne(ctx *harness.Ctx) {
 }
 
 func CheckDeny429(ctx *harness.Ctx) {
-	g := newBucketGateway(ctx)
+	g := hNewBucketGateway(ctx)
 	for range 10 {
 		r := g.http.Get("/items/42", "X-API-Key", "k1")
 		ctx.Equal(r.Status, 200, "a request within the burst")
@@ -933,12 +933,12 @@ func CheckDeny429(ctx *harness.Ctx) {
 namespace {
 
 // rate_limit wrapped around a route the harness registers, counting what got through.
-struct BucketGateway {
+struct HBucketGateway {
   std::vector<std::string> served;
   httplib::Server svr;
   harness::HTTP http;
 
-  explicit BucketGateway(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+  explicit HBucketGateway(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
     svr.set_pre_routing_handler(rate_limit);
     svr.Get(R"(/items/([^/]+))", [this](const httplib::Request& req, httplib::Response& res) {
       const std::string id = req.matches[1];
@@ -955,14 +955,14 @@ struct BucketGateway {
 };
 
 // n copies of status, then the tail.
-std::vector<int> bucketStatuses(int n, int status, std::vector<int> tail = {}) {
+std::vector<int> hBucketStatuses(int n, int status, std::vector<int> tail = {}) {
   std::vector<int> out(static_cast<size_t>(n), status);
   out.insert(out.end(), tail.begin(), tail.end());
   return out;
 }
 
 // A token count as Redis holds it; NaN when it is not a number.
-double tokensOf(const std::optional<std::string>& tokens) {
+double hTokensOf(const std::optional<std::string>& tokens) {
   if (!tokens) return std::nan("");
   char* end = nullptr;
   const double n = std::strtod(tokens->c_str(), &end);
@@ -972,7 +972,7 @@ double tokensOf(const std::optional<std::string>& tokens) {
 }  // namespace
 
 void CheckKey(harness::Ctx& ctx) {
-  BucketGateway g(ctx);
+  HBucketGateway g(ctx);
   g.http.Get("/items/42", "X-API-Key", "k1");
   g.http.Get("/items/42", "X-API-Key", "k2");
   g.http.Get("/items/42");
@@ -985,11 +985,11 @@ void CheckKey(harness::Ctx& ctx) {
                fields);
   }
   const auto tokens = ctx.Redis.HGet("bucket:k1", "tokens");
-  ctx.Assert(tokensOf(tokens) == 9, "bucket:k1 holds %q tokens after one request, expected burst - 1 = 9", tokens);
+  ctx.Assert(hTokensOf(tokens) == 9, "bucket:k1 holds %q tokens after one request, expected burst - 1 = 9", tokens);
 }
 
 void CheckAtomicLua(harness::Ctx& ctx) {
-  BucketGateway g(ctx);
+  HBucketGateway g(ctx);
   // Another gateway replica lands right after the first command that touches the bucket — between a
   // client-side read and its write-back — and spends the whole bucket.
   ctx.Redis.After("bucket:k1", [&ctx] {
@@ -1001,7 +1001,7 @@ void CheckAtomicLua(harness::Ctx& ctx) {
   ctx.Equal(first.Status, 200, "the first request on a fresh key (%s)", first.Text());
   ctx.Equal(ctx.Redis.Type("bucket:k1"), "hash", "the request wrote no bucket:k1 hash; its type");
   const auto tokens = ctx.Redis.HGet("bucket:k1", "tokens");
-  ctx.Assert(tokensOf(tokens) == 0,
+  ctx.Assert(hTokensOf(tokens) == 0,
              "bucket:k1 holds %q tokens after another replica emptied it between your read and your write: the "
              "replica's update was lost. Refill and take must run inside one EVAL/EVALSHA script, not as HMGET … "
              "HSET from the client",
@@ -1012,26 +1012,26 @@ void CheckAtomicLua(harness::Ctx& ctx) {
 }
 
 void CheckRefillCapped(harness::Ctx& ctx) {
-  BucketGateway g(ctx);
-  ctx.Equal(g.burst(11), bucketStatuses(10, 200, {429}), "a fresh key gets a full burst of 10, then 429");
+  HBucketGateway g(ctx);
+  ctx.Equal(g.burst(11), hBucketStatuses(10, 200, {429}), "a fresh key gets a full burst of 10, then 429");
   ctx.Clock.Advance(1.0);
-  ctx.Equal(g.burst(6), bucketStatuses(5, 200, {429}), "one second at rate 5 refills 5 tokens, so 5 allowed then 429");
+  ctx.Equal(g.burst(6), hBucketStatuses(5, 200, {429}), "one second at rate 5 refills 5 tokens, so 5 allowed then 429");
   ctx.Clock.Advance(100.0);
-  ctx.Equal(g.burst(11), bucketStatuses(10, 200, {429}),
+  ctx.Equal(g.burst(11), hBucketStatuses(10, 200, {429}),
             "after 100 idle seconds the bucket is capped at burst (10), not 500");
 }
 
 void CheckTakeOne(harness::Ctx& ctx) {
-  BucketGateway g(ctx);
+  HBucketGateway g(ctx);
   std::vector<std::string> remaining;
   for (int i = 0; i < 3; i++) {
     remaining.push_back(g.http.Get("/items/42", "X-API-Key", "k1").HeaderValue("X-RateLimit-Remaining"));
   }
   ctx.Equal(remaining, {"9", "8", "7"}, "X-RateLimit-Remaining over three requests (one token each)");
   g.burst(7);
-  ctx.Equal(g.burst(5), bucketStatuses(5, 429), "with the bucket empty every request is denied");
+  ctx.Equal(g.burst(5), hBucketStatuses(5, 429), "with the bucket empty every request is denied");
   const auto tokens = ctx.Redis.HGet("bucket:k1", "tokens");
-  const double n = tokensOf(tokens);
+  const double n = hTokensOf(tokens);
   ctx.Assert(!std::isnan(n) && n >= 0, "bucket:k1 holds %q tokens after denied requests: a denial must not take a token",
              tokens);
   ctx.Clock.Advance(0.4);
@@ -1040,7 +1040,7 @@ void CheckTakeOne(harness::Ctx& ctx) {
 }
 
 void CheckDeny429(harness::Ctx& ctx) {
-  BucketGateway g(ctx);
+  HBucketGateway g(ctx);
   for (int i = 0; i < 10; i++) {
     const auto r = g.http.Get("/items/42", "X-API-Key", "k1");
     ctx.Equal(r.Status, 200, "a request within the burst");

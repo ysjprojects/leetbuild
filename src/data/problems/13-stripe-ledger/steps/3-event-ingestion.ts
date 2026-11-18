@@ -1520,7 +1520,7 @@ import (
 	"leetbuild/harness"
 )
 
-const ingestSchema = \`
+const kHIngestSchema = \`
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1538,38 +1538,38 @@ CREATE TABLE entries (
 \`
 
 const (
-	ingestT0    = 1700000000000
-	ingestTopic = "money-events"
-	ingestDead  = "money-events.dead"
+	kHIngestT0    = 1700000000000
+	kHIngestTopic = "money-events"
+	kHIngestDead  = "money-events.dead"
 )
 
-func ingestEvent(eventID, kind string, amount int64, currency string, occurredAt int64) map[string]any {
+func hIngestEvent(eventID, kind string, amount int64, currency string, occurredAt int64) map[string]any {
 	return map[string]any{"event_id": eventID, "type": kind, "amount": amount, "currency": currency, "occurred_at": occurredAt, "charge": "ch_" + eventID}
 }
 
-func ingestCaptured(eventID string, amount int64) map[string]any {
-	return ingestEvent(eventID, "payment.captured", amount, "EUR", ingestT0)
+func hIngestCaptured(eventID string, amount int64) map[string]any {
+	return hIngestEvent(eventID, "payment.captured", amount, "EUR", kHIngestT0)
 }
 
-func ingestJSON(v any) string {
+func hIngestJSON(v any) string {
 	data, _ := json.Marshal(v)
 	return string(data)
 }
 
 // ingestSeed puts events on money-events keyed by their id; a string is a raw record keyed "raw".
-func ingestSeed(ctx *harness.Ctx, events ...any) {
+func hIngestSeed(ctx *harness.Ctx, events ...any) {
 	for _, e := range events {
 		if raw, ok := e.(string); ok {
-			ctx.Kafka.Seed(ingestTopic, "raw", raw)
+			ctx.Kafka.Seed(kHIngestTopic, "raw", raw)
 		} else {
-			ctx.Kafka.Seed(ingestTopic, e.(map[string]any)["event_id"], ingestJSON(e))
+			ctx.Kafka.Seed(kHIngestTopic, e.(map[string]any)["event_id"], hIngestJSON(e))
 		}
 	}
 }
 
 // ingestJournalWrite is the journal writer of step 4 (ledger_writer.go): one database transaction,
 // insert-or-skip on the event id, the entries at the transaction's posted_at.
-func ingestJournalWrite(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
+func hIngestJournalWrite(ctx context.Context, entries []Entry, description string, eventID *string, postedAt int64, settles *string) (string, error) {
 	transactionID := uuid.NewString()
 	if postedAt == 0 {
 		postedAt = time.Now().UnixMilli()
@@ -1603,14 +1603,14 @@ func ingestJournalWrite(ctx context.Context, entries []Entry, description string
 
 // ingestConsumer puts the learner's consumer in front of the real journal writer (step 4) and an
 // empty ledger database.
-func ingestConsumer(ctx *harness.Ctx) {
-	ctx.DB.Reset(ingestSchema)
-	writeTransaction = ingestJournalWrite
+func hIngestConsumer(ctx *harness.Ctx) {
+	ctx.DB.Reset(kHIngestSchema)
+	writeTransaction = hIngestJournalWrite
 }
 
 // ingestRun runs the learner's loop until it returns or waits for records that will not come; it
 // returns what run returned (nil while it was still waiting).
-func ingestRun(ctx *harness.Ctx) error {
+func hIngestRun(ctx *harness.Ctx) error {
 	loop, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var err error
@@ -1623,25 +1623,25 @@ func ingestRun(ctx *harness.Ctx) error {
 
 // ingestRestart is a fresh replica of the consumer: the old reader leaves the group, a new one with
 // the learner's configuration joins it and starts from the committed offsets.
-func ingestRestart() {
+func hIngestRestart() {
 	config := reader.Config()
 	reader.Close()
 	reader = kafka.NewReader(config)
 }
 
 // ingestTx is a transaction of the journal with its entries {account, currency, amount, posted_at}.
-type ingestTx struct {
+type HIngestTx struct {
 	row     harness.Row
 	entries [][4]any
 }
 
 // ingestJournal is the journal by event id, as the database holds it.
-func ingestJournal(ctx *harness.Ctx) map[string]ingestTx {
+func hIngestJournal(ctx *harness.Ctx) map[string]HIngestTx {
 	transactions := ctx.DB.Query("SELECT * FROM transactions ORDER BY event_id")
 	entries := ctx.DB.Query("SELECT * FROM entries ORDER BY account")
-	out := map[string]ingestTx{}
+	out := map[string]HIngestTx{}
 	for _, t := range transactions {
-		tx := ingestTx{row: t}
+		tx := HIngestTx{row: t}
 		for _, e := range entries {
 			if e["transaction_id"] == t["id"] {
 				tx.entries = append(tx.entries, [4]any{e["account"], e["currency"], e["amount"], e["posted_at"]})
@@ -1653,7 +1653,7 @@ func ingestJournal(ctx *harness.Ctx) map[string]ingestTx {
 	return out
 }
 
-func ingestKeys(j map[string]ingestTx) []string {
+func hIngestKeys(j map[string]HIngestTx) []string {
 	keys := []string{}
 	for k := range j {
 		keys = append(keys, k)
@@ -1664,28 +1664,28 @@ func ingestKeys(j map[string]ingestTx) []string {
 
 // ingestCommit is a commit as the broker saw it, with the database's query log and the
 // dead-letter topic's values at that instant.
-type ingestCommit struct {
+type HIngestCommit struct {
 	group   string
 	offsets harness.KafkaOffsets
 	queries []harness.DBQuery
 	dead    []string
 }
 
-func ingestWatch(ctx *harness.Ctx) *[]ingestCommit {
-	seen := &[]ingestCommit{}
+func hIngestWatch(ctx *harness.Ctx) *[]HIngestCommit {
+	seen := &[]HIngestCommit{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		copied := harness.KafkaOffsets{}
 		for tp, offset := range offsets {
 			copied[tp] = offset
 		}
-		*seen = append(*seen, ingestCommit{group: group, offsets: copied, queries: ctx.DB.Queries(), dead: ctx.Kafka.Values(ingestDead)})
+		*seen = append(*seen, HIngestCommit{group: group, offsets: copied, queries: ctx.DB.Queries(), dead: ctx.Kafka.Values(kHIngestDead)})
 	})
 	return seen
 }
 
 // ingestWriteCommitted reports whether the database had committed a write of eventID by the end of
 // this query log.
-func ingestWriteCommitted(queries []harness.DBQuery, eventID string) bool {
+func hIngestWriteCommitted(queries []harness.DBQuery, eventID string) bool {
 	for i, q := range queries {
 		if !strings.Contains(strings.ToLower(q.SQL), "insert into transactions") {
 			continue
@@ -1706,27 +1706,27 @@ func ingestWriteCommitted(queries []harness.DBQuery, eventID string) bool {
 
 // ingestCommitted is a record of money-events with the query log and the dead-letter values at
 // the commit that first covered its offset.
-type ingestCommitted struct {
+type HIngestCommitted struct {
 	record  harness.KafkaRecord
 	queries []harness.DBQuery
 	dead    []string
 }
 
-func ingestNewlyCommitted(ctx *harness.Ctx, commits []ingestCommit) []ingestCommitted {
-	out := []ingestCommitted{}
+func hIngestNewlyCommitted(ctx *harness.Ctx, commits []HIngestCommit) []HIngestCommitted {
+	out := []HIngestCommitted{}
 	done := map[int]int64{}
 	for _, c := range commits {
 		if c.group != "ledger" {
 			continue
 		}
 		for tp, offset := range c.offsets {
-			if tp.Topic != ingestTopic {
+			if tp.Topic != kHIngestTopic {
 				continue
 			}
 			p := tp.Partition
-			for _, record := range ctx.Kafka.Records(ingestTopic) {
+			for _, record := range ctx.Kafka.Records(kHIngestTopic) {
 				if record.Partition == p && done[p] <= record.Offset && record.Offset < offset {
-					out = append(out, ingestCommitted{record: record, queries: c.queries, dead: c.dead})
+					out = append(out, HIngestCommitted{record: record, queries: c.queries, dead: c.dead})
 				}
 			}
 			if offset > done[p] {
@@ -1737,24 +1737,24 @@ func ingestNewlyCommitted(ctx *harness.Ctx, commits []ingestCommit) []ingestComm
 	return out
 }
 
-func ingestFullyCommitted(ctx *harness.Ctx) {
-	lag := ctx.Kafka.Lag("ledger", ingestTopic)
+func hIngestFullyCommitted(ctx *harness.Ctx) {
+	lag := ctx.Kafka.Lag("ledger", kHIngestTopic)
 	ctx.Assert(lag == 0, "%d record(s) of money-events are not committed for group ledger after the consumer handled them", lag)
 }
 
 func CheckGroupManualCommit(ctx *harness.Ctx) {
-	ingestSeed(ctx, ingestCaptured("e1", 4999), ingestCaptured("e2", 120), ingestCaptured("e3", 7))
-	ingestConsumer(ctx)
-	commits := ingestWatch(ctx)
-	ingestRun(ctx)
-	j := ingestJournal(ctx)
-	ctx.Equal(ingestKeys(j), []string{"e1", "e2", "e3"}, "the consumer must read money-events and write every event: the journal's event ids")
+	hIngestSeed(ctx, hIngestCaptured("e1", 4999), hIngestCaptured("e2", 120), hIngestCaptured("e3", 7))
+	hIngestConsumer(ctx)
+	commits := hIngestWatch(ctx)
+	hIngestRun(ctx)
+	j := hIngestJournal(ctx)
+	ctx.Equal(hIngestKeys(j), []string{"e1", "e2", "e3"}, "the consumer must read money-events and write every event: the journal's event ids")
 	committedGroups := map[string]bool{}
 	for _, c := range *commits {
 		committedGroups[c.group] = true
 	}
 	ctx.Assert(len(ctx.Kafka.Commits("ledger")) > 0, "no offsets were committed for group ledger (groups that committed: %v)", committedGroups)
-	ingestFullyCommitted(ctx)
+	hIngestFullyCommitted(ctx)
 	members, groups := 0, []string{}
 	autoCommit := false
 	for _, c := range ctx.Kafka.Consumers() {
@@ -1766,9 +1766,9 @@ func CheckGroupManualCommit(ctx *harness.Ctx) {
 	}
 	ctx.Assert(members > 0, "no consumer joined group ledger (groups seen: %q)", groups)
 	ctx.Assert(!autoCommit, "the consumer commits automatically: ReadMessage (or a CommitInterval) acknowledges before the write — FetchMessage, then CommitMessages after writeTransaction returned")
-	for _, c := range ingestNewlyCommitted(ctx, *commits) {
+	for _, c := range hIngestNewlyCommitted(ctx, *commits) {
 		eventID := string(c.record.Key)
-		ctx.Assert(ingestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was in the journal: offsets are committed by the consumer, after the write", eventID)
+		ctx.Assert(hIngestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was in the journal: offsets are committed by the consumer, after the write", eventID)
 	}
 	// e4's write is slow (the transactions insert takes 6 s) and then fails on a constraint: a consumer
 	// that acknowledges before the write has returned loses e4.
@@ -1778,40 +1778,40 @@ func CheckGroupManualCommit(ctx *harness.Ctx) {
 		slow = true
 		ctx.Clock.Advance(6)
 	})
-	ingestSeed(ctx, ingestCaptured("e4", 7777))
-	ingestRun(ctx) // the failed write surfaces here; what matters is what was committed
+	hIngestSeed(ctx, hIngestCaptured("e4", 7777))
+	hIngestRun(ctx) // the failed write surfaces here; what matters is what was committed
 	ctx.Assert(slow, "e4 was never written: the consumer must keep reading money-events")
-	lag := ctx.Kafka.Lag("ledger", ingestTopic)
+	lag := ctx.Kafka.Lag("ledger", kHIngestTopic)
 	ctx.Assert(lag == 1, "e4's write took 6 s and then failed, yet group ledger's lag is %d instead of 1: e4 was acknowledged although its write never landed — FetchMessage and CommitMessages yourself, after the write", lag)
 	ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down")
-	ingestRestart()
-	ingestRun(ctx)
-	j = ingestJournal(ctx)
+	hIngestRestart()
+	hIngestRun(ctx)
+	j = hIngestJournal(ctx)
 	e4, ok := j["e4"]
-	ctx.Assert(ok && len(e4.entries) == 2, "after a restart e4 must be redelivered and written once, the journal holds %q", ingestKeys(j))
-	ingestFullyCommitted(ctx)
+	ctx.Assert(ok && len(e4.entries) == 2, "after a restart e4 must be redelivered and written once, the journal holds %q", hIngestKeys(j))
+	hIngestFullyCommitted(ctx)
 }
 
 func CheckMapping(ctx *harness.Ctx) {
-	ingestSeed(ctx,
-		ingestCaptured("e1", 4999),
-		ingestEvent("e2", "payout.sent", 120000, "USD", ingestT0+5),
-		ingestEvent("e3", "refund.issued", 999, "EUR", ingestT0+9),
+	hIngestSeed(ctx,
+		hIngestCaptured("e1", 4999),
+		hIngestEvent("e2", "payout.sent", 120000, "USD", kHIngestT0+5),
+		hIngestEvent("e3", "refund.issued", 999, "EUR", kHIngestT0+9),
 	)
-	ingestConsumer(ctx)
-	ingestRun(ctx)
-	j := ingestJournal(ctx)
-	ctx.Equal(ingestKeys(j), []string{"e1", "e2", "e3"}, "three mapped events must become three transactions keyed by their event id")
+	hIngestConsumer(ctx)
+	hIngestRun(ctx)
+	j := hIngestJournal(ctx)
+	ctx.Equal(hIngestKeys(j), []string{"e1", "e2", "e3"}, "three mapped events must become three transactions keyed by their event id")
 	expected := map[string]struct {
 		entries     []string
 		description string
 		occurredAt  int64
 	}{
-		"e1": {[]string{"cash:acquirer EUR 4999", "clearing:payments EUR -4999"}, "payment.captured", ingestT0},
-		"e2": {[]string{"cash:bank USD -120000", "clearing:payouts USD 120000"}, "payout.sent", ingestT0 + 5},
-		"e3": {[]string{"cash:acquirer EUR -999", "clearing:payments EUR 999"}, "refund.issued", ingestT0 + 9},
+		"e1": {[]string{"cash:acquirer EUR 4999", "clearing:payments EUR -4999"}, "payment.captured", kHIngestT0},
+		"e2": {[]string{"cash:bank USD -120000", "clearing:payouts USD 120000"}, "payout.sent", kHIngestT0 + 5},
+		"e3": {[]string{"cash:acquirer EUR -999", "clearing:payments EUR 999"}, "refund.issued", kHIngestT0 + 9},
 	}
-	for _, eventID := range ingestKeys(j) {
+	for _, eventID := range hIngestKeys(j) {
 		tx, want := j[eventID], expected[eventID]
 		got := []string{}
 		postedAts := []any{}
@@ -1828,22 +1828,22 @@ func CheckMapping(ctx *harness.Ctx) {
 		}
 		ctx.Assert(atOccurred, "%s: posted at %v / %v, expected the event's occurred_at %d", eventID, tx.row["posted_at"], postedAts, want.occurredAt)
 	}
-	got := toEntries(Event{EventID: "x", Type: "payment.captured", Amount: 250, Currency: "EUR", OccurredAt: ingestT0})
+	got := toEntries(Event{EventID: "x", Type: "payment.captured", Amount: 250, Currency: "EUR", OccurredAt: kHIngestT0})
 	ctx.Equal(got, []Entry{{Account: "cash:acquirer", Currency: "EUR", Amount: 250}, {Account: "clearing:payments", Currency: "EUR", Amount: -250}}, "toEntries of a 250 EUR payment.captured")
-	ctx.Assert(toEntries(Event{EventID: "x", Type: "dispute.opened", Amount: 4999, Currency: "EUR", OccurredAt: ingestT0}) == nil, "toEntries must return nil for a type without a mapping")
+	ctx.Assert(toEntries(Event{EventID: "x", Type: "dispute.opened", Amount: 4999, Currency: "EUR", OccurredAt: kHIngestT0}) == nil, "toEntries must return nil for a type without a mapping")
 }
 
 func CheckDeadLetter(ctx *harness.Ctx) {
-	unknown := ingestEvent("e2", "dispute.opened", 4999, "EUR", ingestT0)
-	ingestSeed(ctx, ingestCaptured("e1", 4999), unknown, "{not json", ingestCaptured("e4", 4999))
-	ingestConsumer(ctx)
+	unknown := hIngestEvent("e2", "dispute.opened", 4999, "EUR", kHIngestT0)
+	hIngestSeed(ctx, hIngestCaptured("e1", 4999), unknown, "{not json", hIngestCaptured("e4", 4999))
+	hIngestConsumer(ctx)
 	// The dead-letter topic's leader is slow to acknowledge for the first 30 s of the run.
-	ctx.Kafka.StallFor(ingestDead, 30)
-	commits := ingestWatch(ctx)
-	ingestRun(ctx)
-	j := ingestJournal(ctx)
-	ctx.Equal(ingestKeys(j), []string{"e1", "e4"}, "only the mapped events are written: the journal's event ids")
-	for _, c := range ingestNewlyCommitted(ctx, *commits) {
+	ctx.Kafka.StallFor(kHIngestDead, 30)
+	commits := hIngestWatch(ctx)
+	hIngestRun(ctx)
+	j := hIngestJournal(ctx)
+	ctx.Equal(hIngestKeys(j), []string{"e1", "e4"}, "only the mapped events are written: the journal's event ids")
+	for _, c := range hIngestNewlyCommitted(ctx, *commits) {
 		if key := string(c.record.Key); key == "e2" || key == "raw" {
 			parked := false
 			for _, v := range c.dead {
@@ -1852,16 +1852,16 @@ func CheckDeadLetter(ctx *harness.Ctx) {
 			ctx.Assert(parked, "the offset of %q was committed while its dead-letter copy was not on money-events.dead yet: wait for the broker's acknowledgement before committing, or a crash in between loses the only copy", string(c.record.Value))
 		}
 	}
-	parked := ctx.Kafka.Records(ingestDead)
+	parked := ctx.Kafka.Records(kHIngestDead)
 	ctx.Equal(len(parked), 2, "the unmapped event and the malformed record must both be parked on money-events.dead: records there")
 	values := map[string]bool{}
 	for _, r := range parked {
 		values[string(r.Value)] = true
 	}
-	ctx.Assert(values[ingestJSON(unknown)], "the unmapped event must be parked with its original value, unchanged")
+	ctx.Assert(values[hIngestJSON(unknown)], "the unmapped event must be parked with its original value, unchanged")
 	ctx.Assert(values["{not json"], "the malformed record must be parked with its original value, unchanged")
 	for _, r := range parked {
-		if string(r.Value) == ingestJSON(unknown) {
+		if string(r.Value) == hIngestJSON(unknown) {
 			ctx.Equal(string(r.Key), "e2", "the parked record must keep the original key")
 		}
 	}
@@ -1876,50 +1876,50 @@ func CheckDeadLetter(ctx *harness.Ctx) {
 }
 
 func CheckContinuesAfterDead(ctx *harness.Ctx) {
-	ingestSeed(ctx,
-		ingestEvent("e1", "dispute.opened", 4999, "EUR", ingestT0),
-		ingestCaptured("e2", 4999),
+	hIngestSeed(ctx,
+		hIngestEvent("e1", "dispute.opened", 4999, "EUR", kHIngestT0),
+		hIngestCaptured("e2", 4999),
 		"{not json",
-		ingestCaptured("e4", 4999),
-		ingestEvent("e5", "chargeback.won", 4999, "EUR", ingestT0),
+		hIngestCaptured("e4", 4999),
+		hIngestEvent("e5", "chargeback.won", 4999, "EUR", kHIngestT0),
 	)
-	ingestConsumer(ctx)
-	if err := ingestRun(ctx); err != nil {
+	hIngestConsumer(ctx)
+	if err := hIngestRun(ctx); err != nil {
 		ctx.Fatalf("an event that cannot be mapped must not stop the consumer, but run returned %v", err)
 	}
-	j := ingestJournal(ctx)
-	ctx.Equal(ingestKeys(j), []string{"e2", "e4"}, "the events after a parked one must still be written: the journal's event ids")
-	ctx.Equal(len(ctx.Kafka.Records(ingestDead)), 3, "three records must be parked: records on money-events.dead")
-	lag := ctx.Kafka.Lag("ledger", ingestTopic)
+	j := hIngestJournal(ctx)
+	ctx.Equal(hIngestKeys(j), []string{"e2", "e4"}, "the events after a parked one must still be written: the journal's event ids")
+	ctx.Equal(len(ctx.Kafka.Records(kHIngestDead)), 3, "three records must be parked: records on money-events.dead")
+	lag := ctx.Kafka.Lag("ledger", kHIngestTopic)
 	ctx.Assert(lag == 0, "%d record(s) not committed: a parked record's offset must be committed too, or it is redelivered forever", lag)
 }
 
 func CheckCommitAfterWrite(ctx *harness.Ctx) {
-	ingestSeed(ctx, ingestCaptured("e1", 4999), ingestCaptured("e2", 120))
-	ingestConsumer(ctx)
-	commits := ingestWatch(ctx)
-	ingestRun(ctx)
-	committed := ingestNewlyCommitted(ctx, *commits)
+	hIngestSeed(ctx, hIngestCaptured("e1", 4999), hIngestCaptured("e2", 120))
+	hIngestConsumer(ctx)
+	commits := hIngestWatch(ctx)
+	hIngestRun(ctx)
+	committed := hIngestNewlyCommitted(ctx, *commits)
 	ctx.Assert(len(committed) > 0, "the offsets of e1 and e2 were never committed")
 	for _, c := range committed {
 		eventID := string(c.record.Key)
-		ctx.Assert(ingestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was committed in the journal: commit the offset only after writeTransaction returned", eventID)
+		ctx.Assert(hIngestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was committed in the journal: commit the offset only after writeTransaction returned", eventID)
 	}
 	// The journal starts refusing: an entry of 7777 now violates a constraint, so e3's write rolls back.
 	ctx.DB.Exec("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID")
-	ingestSeed(ctx, ingestCaptured("e3", 7777))
-	ingestRun(ctx) // the failed write surfaces here; what matters is what was committed
-	_, written := ingestJournal(ctx)["e3"]
+	hIngestSeed(ctx, hIngestCaptured("e3", 7777))
+	hIngestRun(ctx) // the failed write surfaces here; what matters is what was committed
+	_, written := hIngestJournal(ctx)["e3"]
 	ctx.Assert(!written, "e3's write failed in the database and must have left nothing in the journal")
-	ctx.Equal(ctx.Kafka.Lag("ledger", ingestTopic), 1, "a record whose write failed must not be committed: it has to come back")
-	ctx.Equal(len(ctx.Kafka.Records(ingestDead)), 0, "a failed write is not a dead letter: the record is retried, not parked")
+	ctx.Equal(ctx.Kafka.Lag("ledger", kHIngestTopic), 1, "a record whose write failed must not be committed: it has to come back")
+	ctx.Equal(len(ctx.Kafka.Records(kHIngestDead)), 0, "a failed write is not a dead letter: the record is retried, not parked")
 	ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down")
-	ingestRestart()
-	ingestRun(ctx)
-	j := ingestJournal(ctx)
-	ctx.Equal(ingestKeys(j), []string{"e1", "e2", "e3"}, "after a restart the consumer must redeliver e3 and write it: the journal's event ids")
+	hIngestRestart()
+	hIngestRun(ctx)
+	j := hIngestJournal(ctx)
+	ctx.Equal(hIngestKeys(j), []string{"e1", "e2", "e3"}, "after a restart the consumer must redeliver e3 and write it: the journal's event ids")
 	ctx.Equal(len(j["e3"].entries), 2, "e3 must be written exactly once: its entries in the journal")
-	ingestFullyCommitted(ctx)
+	hIngestFullyCommitted(ctx)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1946,7 +1946,7 @@ func CheckCommitAfterWrite(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string ingestSchema = R"(
+const std::string kHIngestSchema = R"(
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1963,25 +1963,25 @@ CREATE TABLE entries (
 );
 )";
 
-constexpr int64_t ingestT0 = 1700000000000LL;
-const std::string ingestTopic = "money-events";
-const std::string ingestDead = "money-events.dead";
+constexpr int64_t kHIngestT0 = 1700000000000LL;
+const std::string kHIngestTopic = "money-events";
+const std::string kHIngestDead = "money-events.dead";
 
-nlohmann::json ingestEvent(const std::string& eventID, const std::string& kind, int64_t amount, const std::string& currency, int64_t occurredAt) {
+nlohmann::json hIngestEvent(const std::string& eventID, const std::string& kind, int64_t amount, const std::string& currency, int64_t occurredAt) {
   return {{"event_id", eventID}, {"type", kind}, {"amount", amount}, {"currency", currency}, {"occurred_at", occurredAt}, {"charge", "ch_" + eventID}};
 }
 
-nlohmann::json ingestCaptured(const std::string& eventID, int64_t amount) { return ingestEvent(eventID, "payment.captured", amount, "EUR", ingestT0); }
+nlohmann::json hIngestCaptured(const std::string& eventID, int64_t amount) { return hIngestEvent(eventID, "payment.captured", amount, "EUR", kHIngestT0); }
 
-std::string ingestJSON(const nlohmann::json& v) { return v.dump(); }
+std::string hIngestJSON(const nlohmann::json& v) { return v.dump(); }
 
 // ingestSeed puts events on money-events keyed by their id; a string is a raw record keyed "raw".
-void ingestSeed(harness::Ctx& ctx, std::initializer_list<nlohmann::json> events) {
+void hIngestSeed(harness::Ctx& ctx, std::initializer_list<nlohmann::json> events) {
   for (const auto& e : events) {
     if (e.is_string()) {
-      ctx.Kafka.Seed(ingestTopic, "raw", e.get<std::string>());
+      ctx.Kafka.Seed(kHIngestTopic, "raw", e.get<std::string>());
     } else {
-      ctx.Kafka.Seed(ingestTopic, e["event_id"].get<std::string>(), ingestJSON(e));
+      ctx.Kafka.Seed(kHIngestTopic, e["event_id"].get<std::string>(), hIngestJSON(e));
     }
   }
 }
@@ -2021,23 +2021,23 @@ namespace {
 // The learner's run loop as the harness drives it. Go cancels run's context at the end of every
 // ingestRun; C++'s run() takes no context, so a loop still waiting for records stays alive and the
 // next ingestRun lets it carry on instead of starting a second loop on the same consumer.
-struct ingestLoop {
+struct HIngestLoop {
   bool done = false;
   std::optional<std::string> error;
   std::exception_ptr failure;
 };
-std::shared_ptr<ingestLoop> ingestLive;
+std::shared_ptr<HIngestLoop> hIngestLive;
 
 // ingestConsumer puts the learner's consumer in front of the real journal writer (step 4, defined
 // above) and an empty ledger database.
-void ingestConsumer(harness::Ctx& ctx) { ctx.DB.Reset(ingestSchema); }
+void hIngestConsumer(harness::Ctx& ctx) { ctx.DB.Reset(kHIngestSchema); }
 
 // ingestRun runs the learner's loop until it returns or waits for records that will not come; it
 // returns what run threw (nullopt while it was still waiting).
-std::optional<std::string> ingestRun(harness::Ctx& ctx) {
-  if (ingestLive == nullptr || ingestLive->done) {
-    auto loop = std::make_shared<ingestLoop>();
-    ingestLive = loop;
+std::optional<std::string> hIngestRun(harness::Ctx& ctx) {
+  if (hIngestLive == nullptr || hIngestLive->done) {
+    auto loop = std::make_shared<HIngestLoop>();
+    hIngestLive = loop;
     ctx.Drain([loop] {
       try {
         run();
@@ -2051,7 +2051,7 @@ std::optional<std::string> ingestRun(harness::Ctx& ctx) {
   } else {
     ctx.Settle();
   }
-  const auto loop = ingestLive;
+  const auto loop = hIngestLive;
   if (loop->failure) std::rethrow_exception(loop->failure);
   return loop->done ? loop->error : std::nullopt;
 }
@@ -2059,25 +2059,25 @@ std::optional<std::string> ingestRun(harness::Ctx& ctx) {
 // ingestRestart is a fresh replica of the consumer: the old consumer leaves the group, a new one with
 // the learner's configuration (make_consumer) joins it and starts from the committed offsets. A loop
 // still waiting in the old consumer's consume stays parked there.
-void ingestRestart() {
+void hIngestRestart() {
   consumer->close();
   consumer = make_consumer();
-  ingestLive = nullptr;
+  hIngestLive = nullptr;
 }
 
 // ingestTx is a transaction of the journal with its entries {account, currency, amount, posted_at}.
-struct ingestTx {
+struct HIngestTx {
   harness::Row row;
   std::vector<std::array<harness::Any, 4>> entries;
 };
 
 // ingestJournal is the journal by event id, as the database holds it.
-std::map<std::string, ingestTx> ingestJournal(harness::Ctx& ctx) {
+std::map<std::string, HIngestTx> hIngestJournal(harness::Ctx& ctx) {
   const auto transactions = ctx.DB.Query("SELECT * FROM transactions ORDER BY event_id");
   const auto entries = ctx.DB.Query("SELECT * FROM entries ORDER BY account");
-  std::map<std::string, ingestTx> out;
+  std::map<std::string, HIngestTx> out;
   for (const auto& t : transactions) {
-    ingestTx tx{t, {}};
+    HIngestTx tx{t, {}};
     for (const auto& e : entries) {
       if (e.at("transaction_id") == t.at("id")) {
         tx.entries.push_back({e.at("account"), e.at("currency"), e.at("amount"), e.at("posted_at")});
@@ -2088,7 +2088,7 @@ std::map<std::string, ingestTx> ingestJournal(harness::Ctx& ctx) {
   return out;
 }
 
-std::vector<std::string> ingestKeys(const std::map<std::string, ingestTx>& j) {
+std::vector<std::string> hIngestKeys(const std::map<std::string, HIngestTx>& j) {
   std::vector<std::string> keys;
   for (const auto& [k, _] : j) keys.push_back(k);
   return keys;
@@ -2096,22 +2096,22 @@ std::vector<std::string> ingestKeys(const std::map<std::string, ingestTx>& j) {
 
 // ingestCommit is a commit as the broker saw it, with the database's query log and the dead-letter
 // topic's values at that instant.
-struct ingestCommit {
+struct HIngestCommit {
   std::string group;
   harness::KafkaOffsets offsets;
   std::vector<harness::DBQuery> queries;
   std::vector<std::string> dead;
 };
 
-std::shared_ptr<std::vector<ingestCommit>> ingestWatch(harness::Ctx& ctx) {
-  auto seen = std::make_shared<std::vector<ingestCommit>>();
+std::shared_ptr<std::vector<HIngestCommit>> hIngestWatch(harness::Ctx& ctx) {
+  auto seen = std::make_shared<std::vector<HIngestCommit>>();
   ctx.Kafka.OnCommit([&ctx, seen](const std::string& group, const harness::KafkaOffsets& offsets) {
-    seen->push_back({group, offsets, ctx.DB.Queries(), ctx.Kafka.Values(ingestDead)});
+    seen->push_back({group, offsets, ctx.DB.Queries(), ctx.Kafka.Values(kHIngestDead)});
   });
   return seen;
 }
 
-std::string ingestTrimUpper(const std::string& s) {
+std::string hIngestTrimUpper(const std::string& s) {
   const auto begin = s.find_first_not_of(" \\t\\r\\n");
   if (begin == std::string::npos) return "";
   const auto end = s.find_last_not_of(" \\t\\r\\n");
@@ -2122,7 +2122,7 @@ std::string ingestTrimUpper(const std::string& s) {
 
 // ingestWriteCommitted reports whether the database had committed a write of eventID by the end of
 // this query log.
-bool ingestWriteCommitted(const std::vector<harness::DBQuery>& queries, const std::string& eventID) {
+bool hIngestWriteCommitted(const std::vector<harness::DBQuery>& queries, const std::string& eventID) {
   for (size_t i = 0; i < queries.size(); i++) {
     std::string lower = queries[i].SQL;
     for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -2130,7 +2130,7 @@ bool ingestWriteCommitted(const std::vector<harness::DBQuery>& queries, const st
     for (const auto& arg : queries[i].Args) {
       if (arg == eventID) {
         for (size_t k = i + 1; k < queries.size(); k++) {
-          if (ingestTrimUpper(queries[k].SQL) == "COMMIT") return true;
+          if (hIngestTrimUpper(queries[k].SQL) == "COMMIT") return true;
         }
         return false;
       }
@@ -2141,21 +2141,21 @@ bool ingestWriteCommitted(const std::vector<harness::DBQuery>& queries, const st
 
 // ingestCommitted is a record of money-events with the query log and the dead-letter values at the
 // commit that first covered its offset.
-struct ingestCommitted {
+struct HIngestCommitted {
   harness::KafkaRecord record;
   std::vector<harness::DBQuery> queries;
   std::vector<std::string> dead;
 };
 
-std::vector<ingestCommitted> ingestNewlyCommitted(harness::Ctx& ctx, const std::vector<ingestCommit>& commits) {
-  std::vector<ingestCommitted> out;
+std::vector<HIngestCommitted> hIngestNewlyCommitted(harness::Ctx& ctx, const std::vector<HIngestCommit>& commits) {
+  std::vector<HIngestCommitted> out;
   std::map<int, int64_t> done;
   for (const auto& c : commits) {
     if (c.group != "ledger") continue;
     for (const auto& [tp, offset] : c.offsets) {
-      if (tp.Topic != ingestTopic) continue;
+      if (tp.Topic != kHIngestTopic) continue;
       const int p = tp.Partition;
-      for (const auto& record : ctx.Kafka.Records(ingestTopic)) {
+      for (const auto& record : ctx.Kafka.Records(kHIngestTopic)) {
         if (record.Partition == p && done[p] <= record.Offset && record.Offset < offset) out.push_back({record, c.queries, c.dead});
       }
       if (offset > done[p]) done[p] = offset;
@@ -2164,13 +2164,13 @@ std::vector<ingestCommitted> ingestNewlyCommitted(harness::Ctx& ctx, const std::
   return out;
 }
 
-void ingestFullyCommitted(harness::Ctx& ctx) {
-  const int64_t lag = ctx.Kafka.Lag("ledger", ingestTopic);
+void hIngestFullyCommitted(harness::Ctx& ctx) {
+  const int64_t lag = ctx.Kafka.Lag("ledger", kHIngestTopic);
   ctx.Assert(lag == 0, "%d record(s) of money-events are not committed for group ledger after the consumer handled them", lag);
 }
 
 // An entry as Go's %v prints the struct: {account currency amount}.
-std::vector<std::tuple<std::string, std::string, int64_t>> ingestEntries(const std::optional<std::vector<Entry>>& entries) {
+std::vector<std::tuple<std::string, std::string, int64_t>> hIngestEntries(const std::optional<std::vector<Entry>>& entries) {
   std::vector<std::tuple<std::string, std::string, int64_t>> out;
   if (entries) {
     for (const auto& e : *entries) out.emplace_back(e.account, e.currency, e.amount);
@@ -2181,16 +2181,16 @@ std::vector<std::tuple<std::string, std::string, int64_t>> ingestEntries(const s
 }  // namespace
 
 void CheckGroupManualCommit(harness::Ctx& ctx) {
-  ingestSeed(ctx, {ingestCaptured("e1", 4999), ingestCaptured("e2", 120), ingestCaptured("e3", 7)});
-  ingestConsumer(ctx);
-  const auto commits = ingestWatch(ctx);
-  ingestRun(ctx);
-  auto j = ingestJournal(ctx);
-  ctx.Equal(ingestKeys(j), {"e1", "e2", "e3"}, "the consumer must read money-events and write every event: the journal's event ids");
+  hIngestSeed(ctx, {hIngestCaptured("e1", 4999), hIngestCaptured("e2", 120), hIngestCaptured("e3", 7)});
+  hIngestConsumer(ctx);
+  const auto commits = hIngestWatch(ctx);
+  hIngestRun(ctx);
+  auto j = hIngestJournal(ctx);
+  ctx.Equal(hIngestKeys(j), {"e1", "e2", "e3"}, "the consumer must read money-events and write every event: the journal's event ids");
   std::map<std::string, bool> committedGroups;
   for (const auto& c : *commits) committedGroups[c.group] = true;
   ctx.Assert(!ctx.Kafka.Commits("ledger").empty(), "no offsets were committed for group ledger (groups that committed: %v)", committedGroups);
-  ingestFullyCommitted(ctx);
+  hIngestFullyCommitted(ctx);
   int members = 0;
   std::vector<std::string> groups;
   bool autoCommit = false;
@@ -2203,9 +2203,9 @@ void CheckGroupManualCommit(harness::Ctx& ctx) {
   }
   ctx.Assert(members > 0, "no consumer joined group ledger (groups seen: %q)", groups);
   ctx.Assert(!autoCommit, "the consumer commits automatically: enable.auto.commit acknowledges on a timer, before the write — set it to false and commitSync after write_transaction returned");
-  for (const auto& c : ingestNewlyCommitted(ctx, *commits)) {
+  for (const auto& c : hIngestNewlyCommitted(ctx, *commits)) {
     const std::string eventID = c.record.Key.value_or("");
-    ctx.Assert(ingestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was in the journal: offsets are committed by the consumer, after the write", eventID);
+    ctx.Assert(hIngestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was in the journal: offsets are committed by the consumer, after the write", eventID);
   }
   // e4's write is slow (the transactions insert takes 6 s) and then fails on a constraint: a consumer
   // that acknowledges before the write has returned loses e4.
@@ -2215,41 +2215,41 @@ void CheckGroupManualCommit(harness::Ctx& ctx) {
     slow = true;
     ctx.Clock.Advance(6);
   });
-  ingestSeed(ctx, {ingestCaptured("e4", 7777)});
-  ingestRun(ctx);  // the failed write surfaces here; what matters is what was committed
+  hIngestSeed(ctx, {hIngestCaptured("e4", 7777)});
+  hIngestRun(ctx);  // the failed write surfaces here; what matters is what was committed
   ctx.Assert(slow, "e4 was never written: the consumer must keep reading money-events");
-  const int64_t lag = ctx.Kafka.Lag("ledger", ingestTopic);
+  const int64_t lag = ctx.Kafka.Lag("ledger", kHIngestTopic);
   ctx.Assert(lag == 1, "e4's write took 6 s and then failed, yet group ledger's lag is %d instead of 1: e4 was acknowledged although its write never landed — disable enable.auto.commit and commitSync yourself, after the write", lag);
   ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down");
-  ingestRestart();
-  ingestRun(ctx);
-  j = ingestJournal(ctx);
+  hIngestRestart();
+  hIngestRun(ctx);
+  j = hIngestJournal(ctx);
   const auto e4 = j.find("e4");
-  ctx.Assert(e4 != j.end() && e4->second.entries.size() == 2, "after a restart e4 must be redelivered and written once, the journal holds %q", ingestKeys(j));
-  ingestFullyCommitted(ctx);
+  ctx.Assert(e4 != j.end() && e4->second.entries.size() == 2, "after a restart e4 must be redelivered and written once, the journal holds %q", hIngestKeys(j));
+  hIngestFullyCommitted(ctx);
 }
 
 void CheckMapping(harness::Ctx& ctx) {
-  ingestSeed(ctx, {
-                      ingestCaptured("e1", 4999),
-                      ingestEvent("e2", "payout.sent", 120000, "USD", ingestT0 + 5),
-                      ingestEvent("e3", "refund.issued", 999, "EUR", ingestT0 + 9),
+  hIngestSeed(ctx, {
+                      hIngestCaptured("e1", 4999),
+                      hIngestEvent("e2", "payout.sent", 120000, "USD", kHIngestT0 + 5),
+                      hIngestEvent("e3", "refund.issued", 999, "EUR", kHIngestT0 + 9),
                   });
-  ingestConsumer(ctx);
-  ingestRun(ctx);
-  auto j = ingestJournal(ctx);
-  ctx.Equal(ingestKeys(j), {"e1", "e2", "e3"}, "three mapped events must become three transactions keyed by their event id");
+  hIngestConsumer(ctx);
+  hIngestRun(ctx);
+  auto j = hIngestJournal(ctx);
+  ctx.Equal(hIngestKeys(j), {"e1", "e2", "e3"}, "three mapped events must become three transactions keyed by their event id");
   struct expectation {
     std::vector<std::string> entries;
     std::string description;
     int64_t occurredAt;
   };
   std::map<std::string, expectation> expected = {
-      {"e1", {{"cash:acquirer EUR 4999", "clearing:payments EUR -4999"}, "payment.captured", ingestT0}},
-      {"e2", {{"cash:bank USD -120000", "clearing:payouts USD 120000"}, "payout.sent", ingestT0 + 5}},
-      {"e3", {{"cash:acquirer EUR -999", "clearing:payments EUR 999"}, "refund.issued", ingestT0 + 9}},
+      {"e1", {{"cash:acquirer EUR 4999", "clearing:payments EUR -4999"}, "payment.captured", kHIngestT0}},
+      {"e2", {{"cash:bank USD -120000", "clearing:payouts USD 120000"}, "payout.sent", kHIngestT0 + 5}},
+      {"e3", {{"cash:acquirer EUR -999", "clearing:payments EUR 999"}, "refund.issued", kHIngestT0 + 9}},
   };
-  for (const auto& eventID : ingestKeys(j)) {
+  for (const auto& eventID : hIngestKeys(j)) {
     const auto& tx = j[eventID];
     const auto& want = expected[eventID];
     std::vector<std::string> got;
@@ -2265,22 +2265,22 @@ void CheckMapping(harness::Ctx& ctx) {
     for (const auto& at : postedAts) atOccurred = atOccurred && at == want.occurredAt;
     ctx.Assert(atOccurred, "%s: posted at %v / %v, expected the event's occurred_at %d", eventID, tx.row.at("posted_at"), postedAts, want.occurredAt);
   }
-  const auto got = to_entries(Event{"x", "payment.captured", 250, "EUR", ingestT0});
-  ctx.Equal(ingestEntries(got), ingestEntries(std::vector<Entry>{{"cash:acquirer", "EUR", 250}, {"clearing:payments", "EUR", -250}}), "to_entries of a 250 EUR payment.captured");
-  ctx.Assert(!to_entries(Event{"x", "dispute.opened", 4999, "EUR", ingestT0}).has_value(), "to_entries must return nullopt for a type without a mapping");
+  const auto got = to_entries(Event{"x", "payment.captured", 250, "EUR", kHIngestT0});
+  ctx.Equal(hIngestEntries(got), hIngestEntries(std::vector<Entry>{{"cash:acquirer", "EUR", 250}, {"clearing:payments", "EUR", -250}}), "to_entries of a 250 EUR payment.captured");
+  ctx.Assert(!to_entries(Event{"x", "dispute.opened", 4999, "EUR", kHIngestT0}).has_value(), "to_entries must return nullopt for a type without a mapping");
 }
 
 void CheckDeadLetter(harness::Ctx& ctx) {
-  const auto unknown = ingestEvent("e2", "dispute.opened", 4999, "EUR", ingestT0);
-  ingestSeed(ctx, {ingestCaptured("e1", 4999), unknown, "{not json", ingestCaptured("e4", 4999)});
-  ingestConsumer(ctx);
+  const auto unknown = hIngestEvent("e2", "dispute.opened", 4999, "EUR", kHIngestT0);
+  hIngestSeed(ctx, {hIngestCaptured("e1", 4999), unknown, "{not json", hIngestCaptured("e4", 4999)});
+  hIngestConsumer(ctx);
   // The dead-letter topic's leader is slow to acknowledge for the first 30 s of the run.
-  ctx.Kafka.StallFor(ingestDead, 30);
-  const auto commits = ingestWatch(ctx);
-  ingestRun(ctx);
-  auto j = ingestJournal(ctx);
-  ctx.Equal(ingestKeys(j), {"e1", "e4"}, "only the mapped events are written: the journal's event ids");
-  for (const auto& c : ingestNewlyCommitted(ctx, *commits)) {
+  ctx.Kafka.StallFor(kHIngestDead, 30);
+  const auto commits = hIngestWatch(ctx);
+  hIngestRun(ctx);
+  auto j = hIngestJournal(ctx);
+  ctx.Equal(hIngestKeys(j), {"e1", "e4"}, "only the mapped events are written: the journal's event ids");
+  for (const auto& c : hIngestNewlyCommitted(ctx, *commits)) {
     const std::string key = c.record.Key.value_or("");
     if (key == "e2" || key == "raw") {
       const std::string value = c.record.Value.value_or("");
@@ -2288,14 +2288,14 @@ void CheckDeadLetter(harness::Ctx& ctx) {
       ctx.Assert(parked, "the offset of %q was committed while its dead-letter copy was not on money-events.dead yet: wait for the broker's acknowledgement before committing, or a crash in between loses the only copy", value);
     }
   }
-  const auto parked = ctx.Kafka.Records(ingestDead);
+  const auto parked = ctx.Kafka.Records(kHIngestDead);
   ctx.Equal(parked.size(), 2, "the unmapped event and the malformed record must both be parked on money-events.dead: records there");
   std::map<std::string, bool> values;
   for (const auto& r : parked) values[r.Value.value_or("")] = true;
-  ctx.Assert(values[ingestJSON(unknown)], "the unmapped event must be parked with its original value, unchanged");
+  ctx.Assert(values[hIngestJSON(unknown)], "the unmapped event must be parked with its original value, unchanged");
   ctx.Assert(values["{not json"], "the malformed record must be parked with its original value, unchanged");
   for (const auto& r : parked) {
-    if (r.Value.value_or("") == ingestJSON(unknown)) ctx.Equal(r.Key.value_or(""), "e2", "the parked record must keep the original key");
+    if (r.Value.value_or("") == hIngestJSON(unknown)) ctx.Equal(r.Key.value_or(""), "e2", "the parked record must keep the original key");
   }
   for (const auto& r : parked) {
     const std::string reason = r.Header("reason").value_or("");
@@ -2306,49 +2306,49 @@ void CheckDeadLetter(harness::Ctx& ctx) {
 }
 
 void CheckContinuesAfterDead(harness::Ctx& ctx) {
-  ingestSeed(ctx, {
-                      ingestEvent("e1", "dispute.opened", 4999, "EUR", ingestT0),
-                      ingestCaptured("e2", 4999),
+  hIngestSeed(ctx, {
+                      hIngestEvent("e1", "dispute.opened", 4999, "EUR", kHIngestT0),
+                      hIngestCaptured("e2", 4999),
                       "{not json",
-                      ingestCaptured("e4", 4999),
-                      ingestEvent("e5", "chargeback.won", 4999, "EUR", ingestT0),
+                      hIngestCaptured("e4", 4999),
+                      hIngestEvent("e5", "chargeback.won", 4999, "EUR", kHIngestT0),
                   });
-  ingestConsumer(ctx);
-  if (const auto err = ingestRun(ctx)) {
+  hIngestConsumer(ctx);
+  if (const auto err = hIngestRun(ctx)) {
     ctx.Fatalf("an event that cannot be mapped must not stop the consumer, but run threw %v", *err);
   }
-  auto j = ingestJournal(ctx);
-  ctx.Equal(ingestKeys(j), {"e2", "e4"}, "the events after a parked one must still be written: the journal's event ids");
-  ctx.Equal(ctx.Kafka.Records(ingestDead).size(), 3, "three records must be parked: records on money-events.dead");
-  const int64_t lag = ctx.Kafka.Lag("ledger", ingestTopic);
+  auto j = hIngestJournal(ctx);
+  ctx.Equal(hIngestKeys(j), {"e2", "e4"}, "the events after a parked one must still be written: the journal's event ids");
+  ctx.Equal(ctx.Kafka.Records(kHIngestDead).size(), 3, "three records must be parked: records on money-events.dead");
+  const int64_t lag = ctx.Kafka.Lag("ledger", kHIngestTopic);
   ctx.Assert(lag == 0, "%d record(s) not committed: a parked record's offset must be committed too, or it is redelivered forever", lag);
 }
 
 void CheckCommitAfterWrite(harness::Ctx& ctx) {
-  ingestSeed(ctx, {ingestCaptured("e1", 4999), ingestCaptured("e2", 120)});
-  ingestConsumer(ctx);
-  const auto commits = ingestWatch(ctx);
-  ingestRun(ctx);
-  const auto committed = ingestNewlyCommitted(ctx, *commits);
+  hIngestSeed(ctx, {hIngestCaptured("e1", 4999), hIngestCaptured("e2", 120)});
+  hIngestConsumer(ctx);
+  const auto commits = hIngestWatch(ctx);
+  hIngestRun(ctx);
+  const auto committed = hIngestNewlyCommitted(ctx, *commits);
   ctx.Assert(!committed.empty(), "the offsets of e1 and e2 were never committed");
   for (const auto& c : committed) {
     const std::string eventID = c.record.Key.value_or("");
-    ctx.Assert(ingestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was committed in the journal: commit the offset only after write_transaction returned", eventID);
+    ctx.Assert(hIngestWriteCommitted(c.queries, eventID), "the offset of %s was committed before its transaction was committed in the journal: commit the offset only after write_transaction returned", eventID);
   }
   // The journal starts refusing: an entry of 7777 now violates a constraint, so e3's write rolls back.
   ctx.DB.Exec("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 7777) NOT VALID");
-  ingestSeed(ctx, {ingestCaptured("e3", 7777)});
-  ingestRun(ctx);  // the failed write surfaces here; what matters is what was committed
-  ctx.Assert(ingestJournal(ctx).count("e3") == 0, "e3's write failed in the database and must have left nothing in the journal");
-  ctx.Equal(ctx.Kafka.Lag("ledger", ingestTopic), 1, "a record whose write failed must not be committed: it has to come back");
-  ctx.Equal(ctx.Kafka.Records(ingestDead).size(), 0, "a failed write is not a dead letter: the record is retried, not parked");
+  hIngestSeed(ctx, {hIngestCaptured("e3", 7777)});
+  hIngestRun(ctx);  // the failed write surfaces here; what matters is what was committed
+  ctx.Assert(hIngestJournal(ctx).count("e3") == 0, "e3's write failed in the database and must have left nothing in the journal");
+  ctx.Equal(ctx.Kafka.Lag("ledger", kHIngestTopic), 1, "a record whose write failed must not be committed: it has to come back");
+  ctx.Equal(ctx.Kafka.Records(kHIngestDead).size(), 0, "a failed write is not a dead letter: the record is retried, not parked");
   ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down");
-  ingestRestart();
-  ingestRun(ctx);
-  auto j = ingestJournal(ctx);
-  ctx.Equal(ingestKeys(j), {"e1", "e2", "e3"}, "after a restart the consumer must redeliver e3 and write it: the journal's event ids");
+  hIngestRestart();
+  hIngestRun(ctx);
+  auto j = hIngestJournal(ctx);
+  ctx.Equal(hIngestKeys(j), {"e1", "e2", "e3"}, "after a restart the consumer must redeliver e3 and write it: the journal's event ids");
   ctx.Equal(j["e3"].entries.size(), 2, "e3 must be written exactly once: its entries in the journal");
-  ingestFullyCommitted(ctx);
+  hIngestFullyCommitted(ctx);
 }
 `,
   },

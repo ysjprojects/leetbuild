@@ -704,26 +704,26 @@ import (
 	"leetbuild/harness"
 )
 
-var shoeOrder = Order{OrderID: "o1", SKU: "shoe-42", Qty: 2, User: "ada"}
+var hShoeOrder = Order{OrderID: "o1", SKU: "shoe-42", Qty: 2, User: "ada"}
 
 // enqueued is enqueueOrder(order); an error fails the check.
-func enqueued(ctx *harness.Ctx, order Order) {
+func hEnqueued(ctx *harness.Ctx, order Order) {
 	ctx.NoError(enqueueOrder(context.Background(), order), "enqueueOrder(%s) returned an error", order.OrderID)
 }
 
 func CheckTopicKeyed(ctx *harness.Ctx) {
-	enqueued(ctx, shoeOrder)
+	hEnqueued(ctx, hShoeOrder)
 	produced := ctx.Kafka.Records("orders")
 	ctx.Equal(len(produced), 1, "records on the orders topic")
 	ctx.Equal(string(produced[0].Key), "shoe-42", "the record key must be the sku")
 	var value map[string]any
 	ctx.NoError(json.Unmarshal(produced[0].Value, &value), "the record value %q is not JSON", produced[0].Value)
 	ctx.Equal(value, map[string]any{"order_id": "o1", "sku": "shoe-42", "qty": float64(2), "user": "ada"}, "the record value must be the JSON of the order")
-	o2, o3 := shoeOrder, shoeOrder
+	o2, o3 := hShoeOrder, hShoeOrder
 	o2.OrderID, o2.User = "o2", "grace"
 	o3.OrderID, o3.SKU = "o3", "hat-7"
-	enqueued(ctx, o2)
-	enqueued(ctx, o3)
+	hEnqueued(ctx, o2)
+	hEnqueued(ctx, o3)
 	produced = ctx.Kafka.Records("orders")
 	ctx.Equal(ctx.Kafka.Keys("orders"), []string{"shoe-42", "shoe-42", "hat-7"}, "records must be keyed by sku")
 	ctx.Equal(produced[0].Partition, produced[1].Partition, "two orders for one sku must land on the same partition")
@@ -732,7 +732,7 @@ func CheckTopicKeyed(ctx *harness.Ctx) {
 func CheckDurableProducer(ctx *harness.Ctx) {
 	// The broker writes the record but its acknowledgement is lost: the producer retries.
 	ctx.Kafka.LoseAcks("orders", 1)
-	enqueued(ctx, shoeOrder)
+	hEnqueued(ctx, hShoeOrder)
 	// kafka-go has no idempotent producer (the step's Go text: the record carries the order id so
 	// downstream can dedupe): o1 must be there at least once, and every copy identical.
 	copies := ctx.Kafka.Records("orders")
@@ -741,9 +741,9 @@ func CheckDurableProducer(ctx *harness.Ctx) {
 		ctx.Assert(string(c.Key) == string(copies[0].Key) && string(c.Value) == string(copies[0].Value), "a retried send wrote %q=%q after %q=%q: every copy must be the same record so downstream can dedupe by order id", c.Key, c.Value, copies[0].Key, copies[0].Value)
 	}
 	// The partition leader fails right after the write: only a record replicated to the ISR (acks all) survives.
-	o2 := shoeOrder
+	o2 := hShoeOrder
 	o2.OrderID = "o2"
-	enqueued(ctx, o2)
+	hEnqueued(ctx, o2)
 	ctx.Kafka.Failover("orders")
 	distinct := map[string]bool{}
 	for _, r := range ctx.Kafka.Records("orders") {
@@ -756,7 +756,7 @@ func CheckAwaitsAck(ctx *harness.Ctx) {
 	// A dead broker: the request path must give up after at most 2 s, never return early, never hang.
 	ctx.Kafka.Stall("orders")
 	started := ctx.Clock.Now()
-	err := enqueueOrder(context.Background(), shoeOrder)
+	err := enqueueOrder(context.Background(), hShoeOrder)
 	failed := err != nil
 	if failed {
 		ctx.ErrorIs(err, errNotAcknowledged, "a broker that never acknowledges must surface as errNotAcknowledged")
@@ -770,9 +770,9 @@ func CheckAwaitsAck(ctx *harness.Ctx) {
 	// A broker that answers within the window: the send blocks until the ack and succeeds.
 	ctx.Kafka.StallFor("orders", 1)
 	before := ctx.Clock.Now()
-	o2 := shoeOrder
+	o2 := hShoeOrder
 	o2.OrderID = "o2"
-	enqueued(ctx, o2)
+	hEnqueued(ctx, o2)
 	ctx.Assert(ctx.Clock.Now()-before >= 900, "enqueueOrder returned before the broker acknowledged the record")
 	ctx.Equal(len(ctx.Kafka.Records("orders")), 1, "once the broker answers again the order must be on the topic: records")
 }
@@ -780,14 +780,14 @@ func CheckAwaitsAck(ctx *harness.Ctx) {
 func CheckFailsLoud(ctx *harness.Ctx) {
 	ctx.Assert(errNotAcknowledged != nil, "errNotAcknowledged must stay an error so the API can match it")
 	ctx.Kafka.FailNext("orders", 1)
-	err := enqueueOrder(context.Background(), shoeOrder)
+	err := enqueueOrder(context.Background(), hShoeOrder)
 	ctx.Assert(err != nil, "the broker reported a delivery error but enqueueOrder returned nil; it must return an error wrapping errNotAcknowledged")
 	ctx.ErrorIs(err, errNotAcknowledged, "the delivery error must surface as errNotAcknowledged")
 	ctx.Assert(strings.Contains(err.Error(), "o1"), "the error should name the order: %q", err.Error())
 	ctx.Equal(len(ctx.Kafka.Records("orders")), 0, "a failed delivery must not leave a record on the topic: records")
-	o2 := shoeOrder
+	o2 := hShoeOrder
 	o2.OrderID = "o2"
-	enqueued(ctx, o2)
+	hEnqueued(ctx, o2)
 	ctx.Equal(len(ctx.Kafka.Records("orders")), 1, "after the failure the next order must be acknowledged normally: records")
 }
 `,
@@ -797,16 +797,16 @@ func CheckFailsLoud(ctx *harness.Ctx) {
 
 namespace {
 
-const Order shoeOrder{"o1", "shoe-42", "ada", 2};
+const Order kHShoeOrder{"o1", "shoe-42", "ada", 2};
 
-Order with(const Order& base, const std::string& orderID) {
+Order hWith(const Order& base, const std::string& orderID) {
   Order o = base;
   o.order_id = orderID;
   return o;
 }
 
 // enqueued is enqueue_order(order); an exception fails the check.
-void enqueued(harness::Ctx& ctx, const Order& order) {
+void hEnqueued(harness::Ctx& ctx, const Order& order) {
   try {
     enqueue_order(order);
   } catch (const std::exception& e) {
@@ -816,37 +816,37 @@ void enqueued(harness::Ctx& ctx, const Order& order) {
 
 // enqueue_order's outcome: nullopt when it returned, else whether what it threw is an
 // OrderNotAcknowledged (Go's errors.Is(err, errNotAcknowledged)) and its message.
-struct enqueueError {
+struct HEnqueueError {
   bool notAcknowledged;
   std::string message;
 };
 
-std::optional<enqueueError> tryEnqueue(const Order& order) {
+std::optional<HEnqueueError> hTryEnqueue(const Order& order) {
   try {
     enqueue_order(order);
     return std::nullopt;
   } catch (const OrderNotAcknowledged& e) {
-    return enqueueError{true, e.what()};
+    return HEnqueueError{true, e.what()};
   } catch (const std::exception& e) {
-    return enqueueError{false, e.what()};
+    return HEnqueueError{false, e.what()};
   }
 }
 
 }  // namespace
 
 void CheckTopicKeyed(harness::Ctx& ctx) {
-  enqueued(ctx, shoeOrder);
+  hEnqueued(ctx, kHShoeOrder);
   auto produced = ctx.Kafka.Records("orders");
   ctx.Equal(produced.size(), 1, "records on the orders topic");
   ctx.Equal(produced[0].Key.value_or(""), "shoe-42", "the record key must be the sku");
   const auto value = harness::ParseJSON(produced[0].Value.value_or(""));
   if (!value) ctx.Fatalf("the record value %q is not JSON", produced[0].Value.value_or(""));
   ctx.Equal(*value, *harness::ParseJSON(R"({"order_id":"o1","sku":"shoe-42","qty":2,"user":"ada"})"), "the record value must be the JSON of the order");
-  Order o2 = with(shoeOrder, "o2"), o3 = with(shoeOrder, "o3");
+  Order o2 = hWith(kHShoeOrder, "o2"), o3 = hWith(kHShoeOrder, "o3");
   o2.user = "grace";
   o3.sku = "hat-7";
-  enqueued(ctx, o2);
-  enqueued(ctx, o3);
+  hEnqueued(ctx, o2);
+  hEnqueued(ctx, o3);
   produced = ctx.Kafka.Records("orders");
   ctx.Equal(ctx.Kafka.Keys("orders"), {"shoe-42", "shoe-42", "hat-7"}, "records must be keyed by sku");
   ctx.Equal(produced[0].Partition, produced[1].Partition, "two orders for one sku must land on the same partition");
@@ -855,7 +855,7 @@ void CheckTopicKeyed(harness::Ctx& ctx) {
 void CheckDurableProducer(harness::Ctx& ctx) {
   // The broker writes the record but its acknowledgement is lost: the producer retries.
   ctx.Kafka.LoseAcks("orders", 1);
-  enqueued(ctx, shoeOrder);
+  hEnqueued(ctx, kHShoeOrder);
   // o1 must be there at least once, and every copy identical (the record carries the order id so
   // downstream can dedupe).
   const auto copies = ctx.Kafka.Records("orders");
@@ -867,7 +867,7 @@ void CheckDurableProducer(harness::Ctx& ctx) {
                c.Key.value_or(""), c.Value.value_or(""), copies[0].Key.value_or(""), copies[0].Value.value_or(""));
   }
   // The partition leader fails right after the write: only a record replicated to the ISR (acks all) survives.
-  enqueued(ctx, with(shoeOrder, "o2"));
+  hEnqueued(ctx, hWith(kHShoeOrder, "o2"));
   ctx.Kafka.Failover("orders");
   std::set<std::string> distinct;
   for (const auto& r : ctx.Kafka.Records("orders")) distinct.insert(r.Key.value_or("") + "|" + r.Value.value_or(""));
@@ -878,7 +878,7 @@ void CheckAwaitsAck(harness::Ctx& ctx) {
   // A dead broker: the request path must give up after at most 2 s, never return early, never hang.
   ctx.Kafka.Stall("orders");
   const int64_t started = ctx.Clock.Now();
-  const auto err = tryEnqueue(shoeOrder);
+  const auto err = hTryEnqueue(kHShoeOrder);
   const bool failed = err.has_value();
   if (failed) {
     ctx.Assert(err->notAcknowledged, "a broker that never acknowledges must surface as OrderNotAcknowledged, got %q", err->message);
@@ -892,7 +892,7 @@ void CheckAwaitsAck(harness::Ctx& ctx) {
   // A broker that answers within the window: the send blocks until the ack and succeeds.
   ctx.Kafka.StallFor("orders", 1);
   const int64_t before = ctx.Clock.Now();
-  enqueued(ctx, with(shoeOrder, "o2"));
+  hEnqueued(ctx, hWith(kHShoeOrder, "o2"));
   ctx.Assert(ctx.Clock.Now() - before >= 900, "enqueueOrder returned before the broker acknowledged the record");
   ctx.Equal(ctx.Kafka.Records("orders").size(), 1, "once the broker answers again the order must be on the topic: records");
 }
@@ -900,12 +900,12 @@ void CheckAwaitsAck(harness::Ctx& ctx) {
 void CheckFailsLoud(harness::Ctx& ctx) {
   // Go's first assertion (errNotAcknowledged stays an error) holds by construction here: OrderNotAcknowledged is a type.
   ctx.Kafka.FailNext("orders", 1);
-  const auto err = tryEnqueue(shoeOrder);
+  const auto err = hTryEnqueue(kHShoeOrder);
   ctx.Assert(err.has_value(), "the broker reported a delivery error but enqueueOrder returned; it must throw OrderNotAcknowledged");
   ctx.Assert(err->notAcknowledged, "the delivery error must surface as OrderNotAcknowledged, got %q", err->message);
   ctx.Assert(err->message.find("o1") != std::string::npos, "the error should name the order: %q", err->message);
   ctx.Equal(ctx.Kafka.Records("orders").size(), 0, "a failed delivery must not leave a record on the topic: records");
-  enqueued(ctx, with(shoeOrder, "o2"));
+  hEnqueued(ctx, hWith(kHShoeOrder, "o2"));
   ctx.Equal(ctx.Kafka.Records("orders").size(), 1, "after the failure the next order must be acknowledged normally: records");
 }
 `,

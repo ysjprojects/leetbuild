@@ -558,7 +558,7 @@ import (
 )
 
 // cvSeed puts view events on partition 0 of image-views, so they are delivered in this order.
-func cvSeed(ctx *harness.Ctx, ids ...string) {
+func hCvSeed(ctx *harness.Ctx, ids ...string) {
 	for _, id := range ids {
 		value, _ := json.Marshal(map[string]any{"id": id, "w": 256, "hit": true})
 		ctx.Kafka.SeedPartition("image-views", 0, id, string(value))
@@ -566,12 +566,12 @@ func cvSeed(ctx *harness.Ctx, ids ...string) {
 }
 
 // cvRun runs the learner's consumer until it waits for records that will not come.
-func cvRun(ctx *harness.Ctx) {
+func hCvRun(ctx *harness.Ctx) {
 	ctx.Drain(func() { _ = run(context.Background()) })
 }
 
 // cvViews is the counter at key, nil when it does not exist.
-func cvViews(ctx *harness.Ctx, key string) any {
+func hCvViews(ctx *harness.Ctx, key string) any {
 	if v, ok := ctx.Redis.Get(key); ok {
 		return v
 	}
@@ -579,8 +579,8 @@ func cvViews(ctx *harness.Ctx, key string) any {
 }
 
 func CheckGroup(ctx *harness.Ctx) {
-	cvSeed(ctx, "cat")
-	cvRun(ctx)
+	hCvSeed(ctx, "cat")
+	hCvRun(ctx)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
 	last := subscriptions[len(subscriptions)-1]
@@ -593,26 +593,26 @@ func CheckGroup(ctx *harness.Ctx) {
 }
 
 func CheckManualCommit(ctx *harness.Ctx) {
-	cvSeed(ctx, "cat", "dog")
-	cvRun(ctx)
+	hCvSeed(ctx, "cat", "dog")
+	hCvRun(ctx)
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, before processing")
 	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened")
 	ctx.Equal(ctx.Kafka.Lag("view-counter", "image-views"), 0, "every processed record must be committed: the group's lag")
 }
 
 func CheckIncr(ctx *harness.Ctx) {
-	cvSeed(ctx, "cat", "cat", "dog", "cat")
-	cvRun(ctx)
-	ctx.Equal(cvViews(ctx, "views:cat"), "3", "views:cat")
-	ctx.Equal(cvViews(ctx, "views:dog"), "1", "views:dog")
+	hCvSeed(ctx, "cat", "cat", "dog", "cat")
+	hCvRun(ctx)
+	ctx.Equal(hCvViews(ctx, "views:cat"), "3", "views:cat")
+	ctx.Equal(hCvViews(ctx, "views:dog"), "1", "views:dog")
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	cvSeed(ctx, "cat")
+	hCvSeed(ctx, "cat")
 	ctx.Kafka.SeedPartition("image-views", 0, "bad", "not json")
 	var atCommit []any
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, cvViews(ctx, "views:cat")) })
-	cvRun(ctx)
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, hCvViews(ctx, "views:cat")) })
+	hCvRun(ctx)
 	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
 	ctx.Equal(atCommit[0], "1", "the commit must come after INCR: views:cat at commit time")
 	ctx.Equal(ctx.Kafka.Lag("view-counter", "image-views"), 0, "a malformed record must be skipped and committed, not left to replay forever: the group's lag")
@@ -627,20 +627,20 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 namespace {
 
 // cvSeed puts view events on partition 0 of image-views, so they are delivered in this order.
-void cvSeed(harness::Ctx& ctx, const std::vector<std::string>& ids) {
+void hCvSeed(harness::Ctx& ctx, const std::vector<std::string>& ids) {
   for (const auto& id : ids) {
     ctx.Kafka.SeedPartition("image-views", 0, id, R"({"id":")" + id + R"(","w":256,"hit":true})");
   }
 }
 
 // cvRun runs the learner's consumer until it waits for records that will not come.
-void cvRun(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+void hCvRun(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
 
 }  // namespace
 
 void CheckGroup(harness::Ctx& ctx) {
-  cvSeed(ctx, {"cat"});
-  cvRun(ctx);
+  hCvSeed(ctx, {"cat"});
+  hCvRun(ctx);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
   const auto& last = subscriptions.back();
@@ -651,8 +651,8 @@ void CheckGroup(harness::Ctx& ctx) {
 }
 
 void CheckManualCommit(harness::Ctx& ctx) {
-  cvSeed(ctx, {"cat", "dog"});
-  cvRun(ctx);
+  hCvSeed(ctx, {"cat", "dog"});
+  hCvRun(ctx);
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(),
              "auto-commit is on: offsets were committed on a timer, before processing");
   ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened");
@@ -660,18 +660,18 @@ void CheckManualCommit(harness::Ctx& ctx) {
 }
 
 void CheckIncr(harness::Ctx& ctx) {
-  cvSeed(ctx, {"cat", "cat", "dog", "cat"});
-  cvRun(ctx);
+  hCvSeed(ctx, {"cat", "cat", "dog", "cat"});
+  hCvRun(ctx);
   ctx.Equal(ctx.Redis.Get("views:cat"), std::optional<std::string>("3"), "views:cat");
   ctx.Equal(ctx.Redis.Get("views:dog"), std::optional<std::string>("1"), "views:dog");
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  cvSeed(ctx, {"cat"});
+  hCvSeed(ctx, {"cat"});
   ctx.Kafka.SeedPartition("image-views", 0, "bad", "not json");
   std::vector<std::optional<std::string>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(ctx.Redis.Get("views:cat")); });
-  cvRun(ctx);
+  hCvRun(ctx);
   ctx.Assert(!atCommit.empty(), "the offset was never committed");
   ctx.Equal(atCommit[0], std::optional<std::string>("1"), "the commit must come after INCR: views:cat at commit time");
   ctx.Equal(ctx.Kafka.Lag("view-counter", "image-views"), 0,

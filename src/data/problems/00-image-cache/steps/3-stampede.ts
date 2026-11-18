@@ -657,15 +657,15 @@ import (
 	"leetbuild/harness"
 )
 
-const spMissing = "__missing__"
+const kHSpMissing = "__missing__"
 
-var spBg = context.Background()
+var hSpBg = context.Background()
 
 // spJPEG is fake JPEG bytes: the real SOI marker (FF D8 FF, not valid UTF-8) and a label.
-func spJPEG(label string) []byte { return append([]byte{0xff, 0xd8, 0xff}, label...) }
+func hSpJPEG(label string) []byte { return append([]byte{0xff, 0xd8, 0xff}, label...) }
 
 // spHex shows bytes as hex, nil as nil.
-func spHex(b []byte) string {
+func hSpHex(b []byte) string {
 	if b == nil {
 		return "nil"
 	}
@@ -674,19 +674,19 @@ func spHex(b []byte) string {
 
 // spStandIns stands in for the resizer's render (step 4), answering JPEG bytes, and the cache's
 // store (step 2), writing the value (the sentinel for nil) with a day's TTL.
-func spStandIns(ctx *harness.Ctx) {
-	render = func(context.Context, string, int) ([]byte, error) { return spJPEG("JPEG"), nil }
+func hSpStandIns(ctx *harness.Ctx) {
+	render = func(context.Context, string, int) ([]byte, error) { return hSpJPEG("JPEG"), nil }
 	store = func(_ context.Context, key string, data []byte) {
 		var value any = data
 		if data == nil {
-			value = spMissing
+			value = kHSpMissing
 		}
 		ctx.Redis.Set(key, value, "EX", 86400)
 	}
 }
 
 // spRecorder stands in for render with one that records the image ids it is asked for and answers reply.
-func spRecorder(reply string) *[]string {
+func hSpRecorder(reply string) *[]string {
 	calls := &[]string{}
 	render = func(_ context.Context, id string, _ int) ([]byte, error) {
 		*calls = append(*calls, id)
@@ -695,14 +695,14 @@ func spRecorder(reply string) *[]string {
 	return calls
 }
 
-func spFill(ctx *harness.Ctx, key, id string, width int) []byte {
-	data, err := fill(spBg, key, id, width)
+func hSpFill(ctx *harness.Ctx, key, id string, width int) []byte {
+	data, err := fill(hSpBg, key, id, width)
 	ctx.NoError(err, "fill(ctx, %q, %q, %d) returned an error", key, id, width)
 	return data
 }
 
 // spStored is the bytes at key, nil when there is no such key.
-func spStored(ctx *harness.Ctx, key string) []byte {
+func hSpStored(ctx *harness.Ctx, key string) []byte {
 	if v, ok := ctx.Redis.Get(key); ok {
 		return []byte(v)
 	}
@@ -710,58 +710,58 @@ func spStored(ctx *harness.Ctx, key string) []byte {
 }
 
 func CheckLockNx(ctx *harness.Ctx) {
-	spStandIns(ctx)
+	hSpStandIns(ctx)
 	var held, ttl int64
 	render = func(context.Context, string, int) ([]byte, error) {
 		held = ctx.Redis.Exists("lock:thumb:cat:256")
 		ttl = ctx.Redis.TTL("lock:thumb:cat:256")
-		return spJPEG("JPEG"), nil
+		return hSpJPEG("JPEG"), nil
 	}
-	won := spFill(ctx, "thumb:cat:256", "cat", 256)
-	ctx.Assert(won != nil && bytes.Equal(won, spJPEG("JPEG")), "the winner returns the rendered bytes: got %s", spHex(won))
+	won := hSpFill(ctx, "thumb:cat:256", "cat", 256)
+	ctx.Assert(won != nil && bytes.Equal(won, hSpJPEG("JPEG")), "the winner returns the rendered bytes: got %s", hSpHex(won))
 	ctx.Equal(held, 1, "lock:thumb:cat:256 must be held while the winner renders")
 	ctx.Assert(0 < ttl && ttl <= 5, "the lock must expire within 5 s (TTL %d)", ttl)
 	// Someone else holds the lock: NX must fail and this caller must not render.
 	ctx.Redis.Set("lock:thumb:dog:256", "1", "EX", 5)
-	ctx.Redis.Set("thumb:dog:256", spJPEG("LEADER"))
-	calls := spRecorder("X")
-	followed := spFill(ctx, "thumb:dog:256", "dog", 256)
-	ctx.Assert(followed != nil && bytes.Equal(followed, spJPEG("LEADER")), "a caller that did not win the lock returns the leader's value verbatim: got %s, expected %s", spHex(followed), spHex(spJPEG("LEADER")))
+	ctx.Redis.Set("thumb:dog:256", hSpJPEG("LEADER"))
+	calls := hSpRecorder("X")
+	followed := hSpFill(ctx, "thumb:dog:256", "dog", 256)
+	ctx.Assert(followed != nil && bytes.Equal(followed, hSpJPEG("LEADER")), "a caller that did not win the lock returns the leader's value verbatim: got %s, expected %s", hSpHex(followed), hSpHex(hSpJPEG("LEADER")))
 	ctx.Equal(len(*calls), 0, "a caller that did not win the lock must not render")
 }
 
 func CheckRelease(ctx *harness.Ctx) {
-	spStandIns(ctx)
-	won := spFill(ctx, "thumb:cat:256", "cat", 256)
-	ctx.Assert(won != nil && bytes.Equal(won, spJPEG("JPEG")), "the winner returns the rendered bytes: got %s", spHex(won))
-	stored := spStored(ctx, "thumb:cat:256")
-	ctx.Assert(bytes.Equal(stored, spJPEG("JPEG")), "the winner must store() the rendered value: stored %s", spHex(stored))
+	hSpStandIns(ctx)
+	won := hSpFill(ctx, "thumb:cat:256", "cat", 256)
+	ctx.Assert(won != nil && bytes.Equal(won, hSpJPEG("JPEG")), "the winner returns the rendered bytes: got %s", hSpHex(won))
+	stored := hSpStored(ctx, "thumb:cat:256")
+	ctx.Assert(bytes.Equal(stored, hSpJPEG("JPEG")), "the winner must store() the rendered value: stored %s", hSpHex(stored))
 	ctx.Equal(ctx.Redis.Exists("lock:thumb:cat:256"), 0, "the lock must be released once the value is stored")
 	render = func(context.Context, string, int) ([]byte, error) { return nil, errors.New("origin down") }
-	_, err := fill(spBg, "thumb:bad:256", "bad", 256)
+	_, err := fill(hSpBg, "thumb:bad:256", "bad", 256)
 	ctx.Assert(err != nil && strings.Contains(err.Error(), "origin down"), "a failing render must propagate: fill returned the error %v", err)
 	ctx.Equal(ctx.Redis.Exists("lock:thumb:bad:256"), 0, "the lock must be released even when render fails")
 }
 
 func CheckWaitRecheck(ctx *harness.Ctx) {
-	spStandIns(ctx)
+	hSpStandIns(ctx)
 	ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5)
 	// The leader finishes right after the follower's first read of the key.
-	ctx.Redis.After("thumb:cat:256", func() any { return ctx.Redis.Set("thumb:cat:256", spJPEG("LEADER")) })
-	calls := spRecorder("X")
-	followed := spFill(ctx, "thumb:cat:256", "cat", 256)
-	ctx.Assert(followed != nil && bytes.Equal(followed, spJPEG("LEADER")), "the follower must return the value the leader stored, verbatim: got %s, expected %s", spHex(followed), spHex(spJPEG("LEADER")))
+	ctx.Redis.After("thumb:cat:256", func() any { return ctx.Redis.Set("thumb:cat:256", hSpJPEG("LEADER")) })
+	calls := hSpRecorder("X")
+	followed := hSpFill(ctx, "thumb:cat:256", "cat", 256)
+	ctx.Assert(followed != nil && bytes.Equal(followed, hSpJPEG("LEADER")), "the follower must return the value the leader stored, verbatim: got %s, expected %s", hSpHex(followed), hSpHex(hSpJPEG("LEADER")))
 	ctx.Equal(len(*calls), 0, "the follower must not render while the lock is held")
 	ctx.Assert(ctx.Clock.Sleeps() >= 1, "poll by sleeping briefly between reads, not in a tight loop")
 }
 
 func CheckBoundedWait(ctx *harness.Ctx) {
-	spStandIns(ctx)
+	hSpStandIns(ctx)
 	ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5) // the leader died holding the lock
-	calls := spRecorder("MINE")
+	calls := hSpRecorder("MINE")
 	var result []byte
 	var err error
-	returned := ctx.Drain(func() { result, err = fill(spBg, "thumb:cat:256", "cat", 256) })
+	returned := ctx.Drain(func() { result, err = fill(hSpBg, "thumb:cat:256", "cat", 256) })
 	ctx.Assert(returned, "waited through %d polls and never rendered: once the lock TTL passes the follower must render itself", ctx.Clock.Sleeps())
 	ctx.NoError(err, "fill(ctx, %q, %q, %d) returned an error", "thumb:cat:256", "cat", 256)
 	ctx.Equal(string(result), "MINE", "once the lock TTL passes the follower must render itself")
@@ -781,13 +781,13 @@ func CheckBoundedWait(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string spMissing = "__missing__";
+const std::string kHSpMissing = "__missing__";
 
 // spJPEG is fake JPEG bytes: the real SOI marker (FF D8 FF, not valid UTF-8) and a label.
-std::string spJPEG(const std::string& label) { return "\\xff\\xd8\\xff" + label; }
+std::string hSpJPEG(const std::string& label) { return "\\xff\\xd8\\xff" + label; }
 
 // spHex shows bytes as hex, nullopt as nil.
-std::string spHex(const std::optional<std::string>& b) {
+std::string hSpHex(const std::optional<std::string>& b) {
   if (!b) return "nil";
   static const char* digits = "0123456789abcdef";
   std::string out;
@@ -799,21 +799,21 @@ std::string spHex(const std::optional<std::string>& b) {
 }
 
 // What the render and store stand-ins do (Go reassigns the render and store variables).
-std::function<std::optional<std::string>(const std::string&, int)> spRender;
-harness::Ctx* spCtx = nullptr;
+std::function<std::optional<std::string>(const std::string&, int)> hSpRender;
+harness::Ctx* hSpCtx = nullptr;
 
 // spStandIns stands in for the resizer's render (step 4), answering JPEG bytes, and the cache's
 // store (step 2), writing the value (the sentinel for nullopt) with a day's TTL.
-void spStandIns(harness::Ctx& ctx) {
-  spCtx = &ctx;
-  spRender = [](const std::string&, int) { return std::optional<std::string>(spJPEG("JPEG")); };
+void hSpStandIns(harness::Ctx& ctx) {
+  hSpCtx = &ctx;
+  hSpRender = [](const std::string&, int) { return std::optional<std::string>(hSpJPEG("JPEG")); };
 }
 
 // spRecorder stands in for render with one that records the image ids it is asked for and answers reply.
-std::vector<std::string>& spRecorder(const std::string& reply) {
+std::vector<std::string>& hSpRecorder(const std::string& reply) {
   static std::vector<std::string> calls;
   calls.clear();
-  spRender = [reply](const std::string& id, int) {
+  hSpRender = [reply](const std::string& id, int) {
     calls.push_back(id);
     return std::optional<std::string>(reply);
   };
@@ -821,7 +821,7 @@ std::vector<std::string>& spRecorder(const std::string& reply) {
 }
 
 // fill, failing the check when it throws (Go's ctx.NoError on the returned error).
-std::optional<std::string> spFill(harness::Ctx& ctx, const std::string& key, const std::string& id, int width) {
+std::optional<std::string> hSpFill(harness::Ctx& ctx, const std::string& key, const std::string& id, int width) {
   try {
     return fill(key, id, width);
   } catch (const std::exception& e) {
@@ -831,44 +831,44 @@ std::optional<std::string> spFill(harness::Ctx& ctx, const std::string& key, con
 
 }  // namespace
 
-std::optional<std::string> render(const std::string& id, int width) { return spRender(id, width); }
+std::optional<std::string> render(const std::string& id, int width) { return hSpRender(id, width); }
 
 void store(const std::string& key, const std::optional<std::string>& data) {
-  spCtx->Redis.Set(key, data ? *data : spMissing, "EX", 86400);
+  hSpCtx->Redis.Set(key, data ? *data : kHSpMissing, "EX", 86400);
 }
 
 void CheckLockNx(harness::Ctx& ctx) {
-  spStandIns(ctx);
+  hSpStandIns(ctx);
   long long held = 0, ttl = 0;
-  spRender = [&](const std::string&, int) {
+  hSpRender = [&](const std::string&, int) {
     held = ctx.Redis.Exists("lock:thumb:cat:256");
     ttl = ctx.Redis.TTL("lock:thumb:cat:256");
-    return std::optional<std::string>(spJPEG("JPEG"));
+    return std::optional<std::string>(hSpJPEG("JPEG"));
   };
-  const auto won = spFill(ctx, "thumb:cat:256", "cat", 256);
-  ctx.Assert(won == spJPEG("JPEG"), "the winner returns the rendered bytes: got %s", spHex(won));
+  const auto won = hSpFill(ctx, "thumb:cat:256", "cat", 256);
+  ctx.Assert(won == hSpJPEG("JPEG"), "the winner returns the rendered bytes: got %s", hSpHex(won));
   ctx.Equal(held, 1, "lock:thumb:cat:256 must be held while the winner renders");
   ctx.Assert(0 < ttl && ttl <= 5, "the lock must expire within 5 s (TTL %d)", ttl);
   // Someone else holds the lock: NX must fail and this caller must not render.
   ctx.Redis.Set("lock:thumb:dog:256", "1", "EX", 5);
-  ctx.Redis.Set("thumb:dog:256", spJPEG("LEADER"));
-  auto& calls = spRecorder("X");
-  const auto followed = spFill(ctx, "thumb:dog:256", "dog", 256);
-  ctx.Assert(followed == spJPEG("LEADER"),
+  ctx.Redis.Set("thumb:dog:256", hSpJPEG("LEADER"));
+  auto& calls = hSpRecorder("X");
+  const auto followed = hSpFill(ctx, "thumb:dog:256", "dog", 256);
+  ctx.Assert(followed == hSpJPEG("LEADER"),
              "a caller that did not win the lock returns the leader's value verbatim: got %s, expected %s",
-             spHex(followed), spHex(spJPEG("LEADER")));
+             hSpHex(followed), hSpHex(hSpJPEG("LEADER")));
   ctx.Equal(calls.size(), 0, "a caller that did not win the lock must not render");
 }
 
 void CheckRelease(harness::Ctx& ctx) {
-  spStandIns(ctx);
-  const auto won = spFill(ctx, "thumb:cat:256", "cat", 256);
-  ctx.Assert(won == spJPEG("JPEG"), "the winner returns the rendered bytes: got %s", spHex(won));
+  hSpStandIns(ctx);
+  const auto won = hSpFill(ctx, "thumb:cat:256", "cat", 256);
+  ctx.Assert(won == hSpJPEG("JPEG"), "the winner returns the rendered bytes: got %s", hSpHex(won));
   const auto stored = ctx.Redis.Get("thumb:cat:256");
-  ctx.Assert(stored == spJPEG("JPEG"), "the winner must store() the rendered value: stored %s", spHex(stored));
+  ctx.Assert(stored == hSpJPEG("JPEG"), "the winner must store() the rendered value: stored %s", hSpHex(stored));
   ctx.Equal(ctx.Redis.Exists("lock:thumb:cat:256"), 0, "the lock must be released once the value is stored");
   // Go's render returns an error; here it throws, and fill must let the exception through.
-  spRender = [](const std::string&, int) -> std::optional<std::string> { throw std::runtime_error("origin down"); };
+  hSpRender = [](const std::string&, int) -> std::optional<std::string> { throw std::runtime_error("origin down"); };
   std::string err = "<nil>";
   try {
     fill("thumb:bad:256", "bad", 256);
@@ -880,25 +880,25 @@ void CheckRelease(harness::Ctx& ctx) {
 }
 
 void CheckWaitRecheck(harness::Ctx& ctx) {
-  spStandIns(ctx);
+  hSpStandIns(ctx);
   ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5);
   // The leader finishes right after the follower's first read of the key.
-  ctx.Redis.After("thumb:cat:256", [&ctx] { ctx.Redis.Set("thumb:cat:256", spJPEG("LEADER")); });
-  auto& calls = spRecorder("X");
-  const auto followed = spFill(ctx, "thumb:cat:256", "cat", 256);
-  ctx.Assert(followed == spJPEG("LEADER"),
-             "the follower must return the value the leader stored, verbatim: got %s, expected %s", spHex(followed),
-             spHex(spJPEG("LEADER")));
+  ctx.Redis.After("thumb:cat:256", [&ctx] { ctx.Redis.Set("thumb:cat:256", hSpJPEG("LEADER")); });
+  auto& calls = hSpRecorder("X");
+  const auto followed = hSpFill(ctx, "thumb:cat:256", "cat", 256);
+  ctx.Assert(followed == hSpJPEG("LEADER"),
+             "the follower must return the value the leader stored, verbatim: got %s, expected %s", hSpHex(followed),
+             hSpHex(hSpJPEG("LEADER")));
   ctx.Equal(calls.size(), 0, "the follower must not render while the lock is held");
   ctx.Assert(ctx.Clock.Sleeps() >= 1, "poll by sleeping briefly between reads, not in a tight loop");
 }
 
 void CheckBoundedWait(harness::Ctx& ctx) {
-  spStandIns(ctx);
+  hSpStandIns(ctx);
   ctx.Redis.Set("lock:thumb:cat:256", "1", "EX", 5);  // the leader died holding the lock
-  auto& calls = spRecorder("MINE");
+  auto& calls = hSpRecorder("MINE");
   std::optional<std::string> result;
-  const bool returned = ctx.Drain([&] { result = spFill(ctx, "thumb:cat:256", "cat", 256); });
+  const bool returned = ctx.Drain([&] { result = hSpFill(ctx, "thumb:cat:256", "cat", 256); });
   ctx.Assert(returned,
              "waited through %d polls and never rendered: once the lock TTL passes the follower must render itself",
              ctx.Clock.Sleeps());

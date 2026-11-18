@@ -579,29 +579,29 @@ import (
 	"leetbuild/harness"
 )
 
-var veBg = context.Background()
+var hVeBg = context.Background()
 
 // veLog records every line the learner logs (the delivery reports).
-type veLog struct {
+type HVeLog struct {
 	mu    sync.Mutex
 	lines int
 }
 
-func (l *veLog) Write(p []byte) (int, error) {
+func (l *HVeLog) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.lines++
 	return len(p), nil
 }
 
-func (l *veLog) count() int {
+func (l *HVeLog) count() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.lines
 }
 
 func CheckTopic(ctx *harness.Ctx) {
-	emitView(veBg, "cat", 256, true)
+	emitView(hVeBg, "cat", 256, true)
 	time.Sleep(10 * time.Millisecond) // the producer's background work gets a turn
 	produced := ctx.Kafka.Records("image-views")
 	ctx.Equal(len(produced), 1, "records on image-views")
@@ -613,8 +613,8 @@ func CheckTopic(ctx *harness.Ctx) {
 }
 
 func CheckKeyed(ctx *harness.Ctx) {
-	emitView(veBg, "cat", 256, true)
-	emitView(veBg, "cat", 64, false)
+	emitView(hVeBg, "cat", 256, true)
+	emitView(hVeBg, "cat", 64, false)
 	time.Sleep(10 * time.Millisecond)
 	ctx.Equal(ctx.Kafka.Keys("image-views"), []string{"cat", "cat"}, "records must be keyed by the image id")
 	produced := ctx.Kafka.Records("image-views")
@@ -624,7 +624,7 @@ func CheckKeyed(ctx *harness.Ctx) {
 func CheckNonBlocking(ctx *harness.Ctx) {
 	ctx.Kafka.StallFor("image-views", 2) // the broker answers 2 s later
 	started := ctx.Clock.Now()
-	emitView(veBg, "cat", 256, true)
+	emitView(hVeBg, "cat", 256, true)
 	waited := ctx.Clock.Now() - started
 	ctx.Assert(waited < 1000, "emitView took %d ms with the broker stalled: hand the record to the producer and return, do not wait for the ack", waited)
 	ctx.Equal(len(ctx.Kafka.Records("image-views")), 0, "emitView returned only after the broker acknowledged the record: hand it to the producer and return, do not wait for the ack")
@@ -633,13 +633,13 @@ func CheckNonBlocking(ctx *harness.Ctx) {
 }
 
 func CheckCallback(ctx *harness.Ctx) {
-	logged := &veLog{}
+	logged := &HVeLog{}
 	previous := log.Writer()
 	log.SetOutput(logged)
 	defer log.SetOutput(previous)
 	ctx.Kafka.FailNext("image-views", 1)
-	emitView(veBg, "cat", 256, true) // the failure arrives through the Completion callback, not as a return value
-	emitView(veBg, "cat", 256, true)
+	emitView(hVeBg, "cat", 256, true) // the failure arrives through the Completion callback, not as a return value
+	emitView(hVeBg, "cat", 256, true)
 	time.Sleep(10 * time.Millisecond)
 	ctx.Assert(logged.count() > 0, "a failed delivery must be logged by the Completion callback (log.Printf)")
 	ctx.Equal(len(ctx.Kafka.Records("image-views")), 1, "the second event must still be delivered after the first failed")
@@ -647,9 +647,9 @@ func CheckCallback(ctx *harness.Ctx) {
 
 func CheckFlush(ctx *harness.Ctx) {
 	ctx.Kafka.StallFor("image-views", 2) // the broker answers 2 s later
-	emitView(veBg, "cat", 256, true)
-	emitView(veBg, "dog", 256, true)
-	emitView(veBg, "cat", 64, false)
+	emitView(hVeBg, "cat", 256, true)
+	emitView(hVeBg, "dog", 256, true)
+	emitView(hVeBg, "cat", 64, false)
 	shutdown()
 	ctx.Equal(len(ctx.Kafka.Records("image-views")), 3, "shutdown() must flush: buffered events that had reached the broker when it returned")
 }
@@ -667,10 +667,10 @@ func CheckFlush(ctx *harness.Ctx) {
 namespace {
 
 // veLog records everything the learner writes to std::cerr (the delivery reports) while it lives.
-struct VeLog {
+struct HVeLog {
   std::ostringstream lines;
   std::streambuf* previous = std::cerr.rdbuf(lines.rdbuf());
-  ~VeLog() { std::cerr.rdbuf(previous); }
+  ~HVeLog() { std::cerr.rdbuf(previous); }
 };
 
 }  // namespace
@@ -716,7 +716,7 @@ void CheckNonBlocking(harness::Ctx& ctx) {
 }
 
 void CheckCallback(harness::Ctx& ctx) {
-  VeLog logged;
+  HVeLog logged;
   ctx.Kafka.FailNext("image-views", 1);
   emit_view("cat", 256, true);  // the failure arrives through the delivery report callback, not as a return value
   emit_view("cat", 256, true);

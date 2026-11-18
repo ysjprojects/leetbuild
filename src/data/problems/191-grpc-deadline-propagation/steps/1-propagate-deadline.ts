@@ -972,20 +972,20 @@ import (
 )
 
 const (
-	pricingPeerTarget = "pricing:50051"
-	timeoutTolerance  = 10 * time.Millisecond // slack on every recorded timeout
-	noDeadline        = -1.0                  // a GetQuote without any deadline
+	kHPricingPeerTarget = "pricing:50051"
+	kHTimeoutTolerance  = 10 * time.Millisecond // slack on every recorded timeout
+	kHNoDeadline        = -1.0                  // a GetQuote without any deadline
 )
 
-var unitPrices = map[string]int32{"kettle": 3499, "mug": 799}
+var hUnitPrices = map[string]int32{"kettle": 3499, "mug": 799}
 
 // pricingPeer is Pricing served at pricing:50051.
-type pricingPeer struct {
+type HPricingPeer struct {
 	pb.UnimplementedPricingServer
 }
 
-func (p *pricingPeer) GetPrice(_ context.Context, req *pb.PriceRequest) (*pb.Price, error) {
-	unit, ok := unitPrices[req.GetSku()]
+func (p *HPricingPeer) GetPrice(_ context.Context, req *pb.PriceRequest) (*pb.Price, error) {
+	unit, ok := hUnitPrices[req.GetSku()]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no price for %s", req.GetSku())
 	}
@@ -993,16 +993,16 @@ func (p *pricingPeer) GetPrice(_ context.Context, req *pb.PriceRequest) (*pb.Pri
 }
 
 // startQuotes serves pricing, runs the learner's server, and returns a Quotes client on it.
-func startQuotes(ctx *harness.Ctx) pb.QuotesClient {
-	pb.RegisterPricingServer(ctx.GRPC.Server(pricingPeerTarget), &pricingPeer{})
+func hStartQuotes(ctx *harness.Ctx) pb.QuotesClient {
+	pb.RegisterPricingServer(ctx.GRPC.Server(kHPricingPeerTarget), &HPricingPeer{})
 	ctx.Main(main)
 	return pb.NewQuotesClient(ctx.GRPC.Dial("quotes:50050"))
 }
 
 // callQuote is GetQuote with an incoming deadline of deadline seconds (noDeadline: none at all).
-func callQuote(client pb.QuotesClient, sku string, qty int32, deadline float64) (*pb.Quote, error) {
+func hCallQuote(client pb.QuotesClient, sku string, qty int32, deadline float64) (*pb.Quote, error) {
 	c := context.Background()
-	if deadline != noDeadline {
+	if deadline != kHNoDeadline {
 		var cancel context.CancelFunc
 		c, cancel = context.WithTimeout(c, time.Duration(deadline*float64(time.Second)))
 		defer cancel()
@@ -1010,11 +1010,11 @@ func callQuote(client pb.QuotesClient, sku string, qty int32, deadline float64) 
 	return client.GetQuote(c, &pb.QuoteRequest{Sku: sku, Qty: qty})
 }
 
-func mustQuote(ctx *harness.Ctx, client pb.QuotesClient, sku string, qty int32, deadline float64) *pb.Quote {
-	q, err := callQuote(client, sku, qty, deadline)
+func hMustQuote(ctx *harness.Ctx, client pb.QuotesClient, sku string, qty int32, deadline float64) *pb.Quote {
+	q, err := hCallQuote(client, sku, qty, deadline)
 	if err != nil {
 		within := fmt.Sprintf("with deadline %v s", deadline)
-		if deadline == noDeadline {
+		if deadline == kHNoDeadline {
 			within = "without a deadline"
 		}
 		ctx.Fatalf("GetQuote(%s, %d) %s failed with %v: %s", sku, qty, within, status.Code(err), status.Convert(err).Message())
@@ -1022,79 +1022,79 @@ func mustQuote(ctx *harness.Ctx, client pb.QuotesClient, sku string, qty int32, 
 	return q
 }
 
-func quoteCode(client pb.QuotesClient, sku string, qty int32, deadline float64) codes.Code {
-	_, err := callQuote(client, sku, qty, deadline)
+func hQuoteCode(client pb.QuotesClient, sku string, qty int32, deadline float64) codes.Code {
+	_, err := hCallQuote(client, sku, qty, deadline)
 	return status.Code(err)
 }
 
-func priceCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("GetPrice", "") }
+func hPriceCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("GetPrice", "") }
 
-func assertPriceTimeout(ctx *harness.Ctx, c harness.Call, expected time.Duration, why string) {
+func hAssertPriceTimeout(ctx *harness.Ctx, c harness.Call, expected time.Duration, why string) {
 	ctx.Assert(c.HasDeadline(), "the GetPrice call carries no deadline (%s): pricing could outlive the caller", why)
 	off := c.Timeout - expected
-	ctx.Assert(-timeoutTolerance <= off && off <= timeoutTolerance, "the GetPrice timeout was %.3f s, expected %v ± %v (%s)", c.Timeout.Seconds(), expected, timeoutTolerance, why)
+	ctx.Assert(-kHTimeoutTolerance <= off && off <= kHTimeoutTolerance, "the GetPrice timeout was %.3f s, expected %v ± %v (%s)", c.Timeout.Seconds(), expected, kHTimeoutTolerance, why)
 }
 
 func CheckPropagatesDeadline(ctx *harness.Ctx) {
-	client := startQuotes(ctx)
-	q := mustQuote(ctx, client, "kettle", 2, 0.8)
+	client := hStartQuotes(ctx)
+	q := hMustQuote(ctx, client, "kettle", 2, 0.8)
 	ctx.Equal([]any{q.GetSku(), q.GetQty(), q.GetTotalCents()}, []any{"kettle", int32(2), int32(6998)}, "GetQuote(kettle, 2): sku, qty and total_cents 3499 * 2 = 6998")
-	calls := priceCalls(ctx)
+	calls := hPriceCalls(ctx)
 	ctx.Equal(len(calls), 1, "the GetPrice calls one quote made")
-	ctx.Equal(calls[0].Target, pricingPeerTarget, "where GetPrice went")
+	ctx.Equal(calls[0].Target, kHPricingPeerTarget, "where GetPrice went")
 	req, _ := calls[0].Request.(*pb.PriceRequest)
 	ctx.Equal(req.GetSku(), "kettle", "the sku GetPrice was asked for")
-	assertPriceTimeout(ctx, calls[0], 750*time.Millisecond, "0.8 s incoming minus reserve 50 ms")
-	mug := mustQuote(ctx, client, "mug", 3, 0.3)
+	hAssertPriceTimeout(ctx, calls[0], 750*time.Millisecond, "0.8 s incoming minus reserve 50 ms")
+	mug := hMustQuote(ctx, client, "mug", 3, 0.3)
 	ctx.Equal(mug.GetTotalCents(), 2397, "GetQuote(mug, 3)'s total_cents (799 * 3)")
-	calls = priceCalls(ctx)
-	assertPriceTimeout(ctx, calls[len(calls)-1], 250*time.Millisecond, "0.3 s incoming minus reserve 50 ms: the timeout follows the caller, it is not a constant")
+	calls = hPriceCalls(ctx)
+	hAssertPriceTimeout(ctx, calls[len(calls)-1], 250*time.Millisecond, "0.3 s incoming minus reserve 50 ms: the timeout follows the caller, it is not a constant")
 }
 
 func CheckDefaultBudget(ctx *harness.Ctx) {
-	client := startQuotes(ctx)
-	mustQuote(ctx, client, "kettle", 2, noDeadline)
-	calls := priceCalls(ctx)
+	client := hStartQuotes(ctx)
+	hMustQuote(ctx, client, "kettle", 2, kHNoDeadline)
+	calls := hPriceCalls(ctx)
 	ctx.Equal(len(calls), 1, "the GetPrice calls one quote made")
-	assertPriceTimeout(ctx, calls[0], 950*time.Millisecond, "no incoming deadline: defaultBudget 1 s minus reserve 50 ms")
+	hAssertPriceTimeout(ctx, calls[0], 950*time.Millisecond, "no incoming deadline: defaultBudget 1 s minus reserve 50 ms")
 	ctx.Clock.Advance(30)
-	mustQuote(ctx, client, "kettle", 2, noDeadline)
-	calls = priceCalls(ctx)
-	assertPriceTimeout(ctx, calls[len(calls)-1], 950*time.Millisecond, "a second call 30 s later: the default is per request, not a deadline fixed at start-up")
+	hMustQuote(ctx, client, "kettle", 2, kHNoDeadline)
+	calls = hPriceCalls(ctx)
+	hAssertPriceTimeout(ctx, calls[len(calls)-1], 950*time.Millisecond, "a second call 30 s later: the default is per request, not a deadline fixed at start-up")
 }
 
 func CheckBudgetExhausted(ctx *harness.Ctx) {
-	client := startQuotes(ctx)
+	client := hStartQuotes(ctx)
 	for _, deadline := range []float64{0.04, 0} {
-		got := quoteCode(client, "kettle", 2, deadline)
+		got := hQuoteCode(client, "kettle", 2, deadline)
 		ctx.Equal(got, codes.DeadlineExceeded, "an incoming deadline of %v s (the budget is under reserve 50 ms)", deadline)
-		ctx.Equal(len(priceCalls(ctx)), 0, "with %v s left pricing was called: a call that cannot finish must not be started; GetPrice calls", deadline)
+		ctx.Equal(len(hPriceCalls(ctx)), 0, "with %v s left pricing was called: a call that cannot finish must not be started; GetPrice calls", deadline)
 	}
-	mustQuote(ctx, client, "kettle", 2, 0.1)
-	calls := priceCalls(ctx)
+	hMustQuote(ctx, client, "kettle", 2, 0.1)
+	calls := hPriceCalls(ctx)
 	ctx.Equal(len(calls), 1, "an incoming deadline of 0.1 s must still call pricing once: GetPrice calls")
-	assertPriceTimeout(ctx, calls[0], 50*time.Millisecond, "0.1 s incoming minus reserve 50 ms")
+	hAssertPriceTimeout(ctx, calls[0], 50*time.Millisecond, "0.1 s incoming minus reserve 50 ms")
 }
 
 func CheckSlowPricing(ctx *harness.Ctx) {
-	client := startQuotes(ctx)
-	ctx.GRPC.SetLatency("GetPrice", 0.9, pricingPeerTarget)
+	client := hStartQuotes(ctx)
+	ctx.GRPC.SetLatency("GetPrice", 0.9, kHPricingPeerTarget)
 	started := ctx.Clock.Now()
-	got := quoteCode(client, "kettle", 2, 0.8)
+	got := hQuoteCode(client, "kettle", 2, 0.8)
 	elapsed := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Equal(got, codes.DeadlineExceeded, "pricing takes 0.9 s and the caller allows 0.8 s: GetQuote's status")
-	calls := priceCalls(ctx)
+	calls := hPriceCalls(ctx)
 	ctx.Equal(len(calls), 1, "the times a timed-out pricing call was made: the budget is spent, never retry")
-	assertPriceTimeout(ctx, calls[0], 750*time.Millisecond, "0.8 s incoming minus reserve 50 ms")
-	ctx.Assert(elapsed <= 0.8+timeoutTolerance.Seconds(), "the failure took %.3f s, after the caller's 0.8 s deadline: nobody was waiting for it", elapsed)
-	q := mustQuote(ctx, client, "kettle", 2, noDeadline)
+	hAssertPriceTimeout(ctx, calls[0], 750*time.Millisecond, "0.8 s incoming minus reserve 50 ms")
+	ctx.Assert(elapsed <= 0.8+kHTimeoutTolerance.Seconds(), "the failure took %.3f s, after the caller's 0.8 s deadline: nobody was waiting for it", elapsed)
+	q := hMustQuote(ctx, client, "kettle", 2, kHNoDeadline)
 	ctx.Equal(q.GetTotalCents(), 6998, "with no incoming deadline the 0.9 s pricing call fits the 0.95 s default: total_cents")
-	ctx.Equal(len(priceCalls(ctx)), 2, "the GetPrice calls in total")
+	ctx.Equal(len(hPriceCalls(ctx)), 2, "the GetPrice calls in total")
 }
 
 func CheckStatusMapping(ctx *harness.Ctx) {
-	client := startQuotes(ctx)
-	got := quoteCode(client, "ghost", 2, 0.8)
+	client := hStartQuotes(ctx)
+	got := hQuoteCode(client, "ghost", 2, 0.8)
 	ctx.Equal(got, codes.NotFound, "pricing answered NotFound for ghost: GetQuote's status")
 	for _, c := range [][2]codes.Code{
 		{codes.Unavailable, codes.Unavailable},
@@ -1104,26 +1104,26 @@ func CheckStatusMapping(ctx *harness.Ctx) {
 		{codes.ResourceExhausted, codes.Internal},
 	} {
 		ctx.GRPC.Fail("GetPrice", c[0], "pricing broke", 1, "")
-		got = quoteCode(client, "kettle", 2, 0.8)
+		got = hQuoteCode(client, "kettle", 2, 0.8)
 		ctx.Equal(got, c[1], "pricing failed with %v: GetQuote's status", c[0])
 	}
-	ctx.Equal(len(priceCalls(ctx)), 6, "the GetPrice calls six failing quotes made: never retry, not even Unavailable")
-	q := mustQuote(ctx, client, "kettle", 2, 0.8)
+	ctx.Equal(len(hPriceCalls(ctx)), 6, "the GetPrice calls six failing quotes made: never retry, not even Unavailable")
+	q := hMustQuote(ctx, client, "kettle", 2, 0.8)
 	ctx.Equal(q.GetTotalCents(), 6998, "after the failures a healthy pricing must give total_cents 6998")
 }
 
 func CheckValidatesFirst(ctx *harness.Ctx) {
-	client := startQuotes(ctx)
+	client := hStartQuotes(ctx)
 	for _, c := range []struct {
 		sku      string
 		qty      int32
 		deadline float64
 	}{{"", 2, 0.8}, {"kettle", 0, 0.8}, {"kettle", -3, 0.8}, {"", 2, 0.04}} {
-		got := quoteCode(client, c.sku, c.qty, c.deadline)
+		got := hQuoteCode(client, c.sku, c.qty, c.deadline)
 		ctx.Equal(got, codes.InvalidArgument, "GetQuote(sku=%q, qty=%d) with deadline %v s (validation comes first)", c.sku, c.qty, c.deadline)
 	}
-	ctx.Equal(len(priceCalls(ctx)), 0, "the GetPrice calls invalid requests made")
-	q := mustQuote(ctx, client, "kettle", 1, 0.8)
+	ctx.Equal(len(hPriceCalls(ctx)), 0, "the GetPrice calls invalid requests made")
+	q := hMustQuote(ctx, client, "kettle", 1, 0.8)
 	ctx.Equal(q.GetTotalCents(), 3499, "GetQuote(kettle, 1) must still succeed: total_cents")
 }
 `,
@@ -1139,141 +1139,141 @@ func CheckValidatesFirst(ctx *harness.Ctx) {
 
 namespace {
 
-using QuotesStub = quotes::v1::Quotes::Stub;
+using HQuotesStub = quotes::v1::Quotes::Stub;
 
-const std::string kPricingPeerTarget = "pricing:50051";
-constexpr std::chrono::milliseconds kTimeoutTolerance{10};  // slack on every recorded timeout
-constexpr double kNoDeadline = -1.0;                       // a GetQuote without any deadline
+const std::string kHPricingPeerTarget = "pricing:50051";
+constexpr std::chrono::milliseconds kHTimeoutTolerance{10};  // slack on every recorded timeout
+constexpr double kHNoDeadline = -1.0;                       // a GetQuote without any deadline
 
-const std::map<std::string, int32_t> kUnitPrices = {{"kettle", 3499}, {"mug", 799}};
+const std::map<std::string, int32_t> kHUnitPrices = {{"kettle", 3499}, {"mug", 799}};
 
 // Pricing served at pricing:50051.
-class PricingPeer final : public quotes::v1::Pricing::Service {
+class HPricingPeer final : public quotes::v1::Pricing::Service {
  public:
   grpc::Status GetPrice(grpc::ServerContext*, const quotes::v1::PriceRequest* request, quotes::v1::Price* reply) override {
-    const auto unit = kUnitPrices.find(request->sku());
-    if (unit == kUnitPrices.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no price for " + request->sku());
+    const auto unit = kHUnitPrices.find(request->sku());
+    if (unit == kHUnitPrices.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no price for " + request->sku());
     reply->set_unit_cents(unit->second);
     return grpc::Status::OK;
   }
 };
 
-std::string ShowDuration(std::chrono::milliseconds d) { return std::to_string(d.count()) + "ms"; }
+std::string hShowDuration(std::chrono::milliseconds d) { return std::to_string(d.count()) + "ms"; }
 
 // Serves pricing, runs the learner's server, and returns a Quotes client on it.
-std::unique_ptr<QuotesStub> StartQuotes(harness::Ctx& ctx) {
-  ctx.GRPC.Server(kPricingPeerTarget)->RegisterService(new PricingPeer());
+std::unique_ptr<HQuotesStub> hStartQuotes(harness::Ctx& ctx) {
+  ctx.GRPC.Server(kHPricingPeerTarget)->RegisterService(new HPricingPeer());
   ctx.Main();
   return quotes::v1::Quotes::NewStub(ctx.GRPC.Dial("quotes:50050"));
 }
 
-struct QuoteResult {
+struct HQuoteResult {
   grpc::Status status;
   quotes::v1::Quote quote;
 };
 
 // GetQuote with an incoming deadline of deadline seconds (kNoDeadline: none at all).
-QuoteResult CallQuote(QuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
+HQuoteResult hCallQuote(HQuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
   grpc::ClientContext c;
-  if (deadline != kNoDeadline)
+  if (deadline != kHNoDeadline)
     c.set_deadline(std::chrono::system_clock::now() +
                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::duration<double>(deadline)));
   quotes::v1::QuoteRequest request;
   request.set_sku(sku);
   request.set_qty(qty);
-  QuoteResult r;
+  HQuoteResult r;
   r.status = client.GetQuote(&c, request, &r.quote);
   return r;
 }
 
-quotes::v1::Quote MustQuote(harness::Ctx& ctx, QuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
-  QuoteResult r = CallQuote(client, sku, qty, deadline);
+quotes::v1::Quote hMustQuote(harness::Ctx& ctx, HQuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
+  HQuoteResult r = hCallQuote(client, sku, qty, deadline);
   if (!r.status.ok()) {
     const std::string within =
-        deadline == kNoDeadline ? "without a deadline" : harness::Sprintf("with deadline %v s", deadline);
+        deadline == kHNoDeadline ? "without a deadline" : harness::Sprintf("with deadline %v s", deadline);
     ctx.Fatalf("GetQuote(%s, %d) %s failed with %v: %s", sku, qty, within, r.status.error_code(), r.status.error_message());
   }
   return r.quote;
 }
 
-grpc::StatusCode QuoteCode(QuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
-  return CallQuote(client, sku, qty, deadline).status.error_code();
+grpc::StatusCode hQuoteCode(HQuotesStub& client, const std::string& sku, int32_t qty, double deadline) {
+  return hCallQuote(client, sku, qty, deadline).status.error_code();
 }
 
-std::vector<harness::Call> PriceCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetPrice"); }
+std::vector<harness::Call> hPriceCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("GetPrice"); }
 
-void AssertPriceTimeout(harness::Ctx& ctx, const harness::Call& c, std::chrono::milliseconds expected, const std::string& why) {
+void hAssertPriceTimeout(harness::Ctx& ctx, const harness::Call& c, std::chrono::milliseconds expected, const std::string& why) {
   ctx.Assert(c.HasDeadline(), "the GetPrice call carries no deadline (%s): pricing could outlive the caller", why);
   const auto off = c.Timeout - expected;
-  ctx.Assert(-kTimeoutTolerance <= off && off <= kTimeoutTolerance, "the GetPrice timeout was %.3f s, expected %v ± %v (%s)",
-             c.TimeoutSeconds(), ShowDuration(expected), ShowDuration(kTimeoutTolerance), why);
+  ctx.Assert(-kHTimeoutTolerance <= off && off <= kHTimeoutTolerance, "the GetPrice timeout was %.3f s, expected %v ± %v (%s)",
+             c.TimeoutSeconds(), hShowDuration(expected), hShowDuration(kHTimeoutTolerance), why);
 }
 
 }  // namespace
 
 void CheckPropagatesDeadline(harness::Ctx& ctx) {
-  auto client = StartQuotes(ctx);
-  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 2, 0.8);
+  auto client = hStartQuotes(ctx);
+  quotes::v1::Quote q = hMustQuote(ctx, *client, "kettle", 2, 0.8);
   ctx.Equal(std::make_tuple(q.sku(), q.qty(), q.total_cents()), std::make_tuple("kettle", 2, 6998),
             "GetQuote(kettle, 2): sku, qty and total_cents 3499 * 2 = 6998");
-  auto calls = PriceCalls(ctx);
+  auto calls = hPriceCalls(ctx);
   ctx.Equal(calls.size(), 1, "the GetPrice calls one quote made");
-  ctx.Equal(calls[0].Target, kPricingPeerTarget, "where GetPrice went");
+  ctx.Equal(calls[0].Target, kHPricingPeerTarget, "where GetPrice went");
   ctx.Equal(calls[0].Request<quotes::v1::PriceRequest>().sku(), "kettle", "the sku GetPrice was asked for");
-  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(750), "0.8 s incoming minus reserve 50 ms");
-  quotes::v1::Quote mug = MustQuote(ctx, *client, "mug", 3, 0.3);
+  hAssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(750), "0.8 s incoming minus reserve 50 ms");
+  quotes::v1::Quote mug = hMustQuote(ctx, *client, "mug", 3, 0.3);
   ctx.Equal(mug.total_cents(), 2397, "GetQuote(mug, 3)'s total_cents (799 * 3)");
-  calls = PriceCalls(ctx);
-  AssertPriceTimeout(ctx, calls.back(), std::chrono::milliseconds(250),
+  calls = hPriceCalls(ctx);
+  hAssertPriceTimeout(ctx, calls.back(), std::chrono::milliseconds(250),
                      "0.3 s incoming minus reserve 50 ms: the timeout follows the caller, it is not a constant");
 }
 
 void CheckDefaultBudget(harness::Ctx& ctx) {
-  auto client = StartQuotes(ctx);
-  MustQuote(ctx, *client, "kettle", 2, kNoDeadline);
-  auto calls = PriceCalls(ctx);
+  auto client = hStartQuotes(ctx);
+  hMustQuote(ctx, *client, "kettle", 2, kHNoDeadline);
+  auto calls = hPriceCalls(ctx);
   ctx.Equal(calls.size(), 1, "the GetPrice calls one quote made");
-  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(950), "no incoming deadline: kDefaultBudget 1 s minus reserve 50 ms");
+  hAssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(950), "no incoming deadline: kDefaultBudget 1 s minus reserve 50 ms");
   ctx.Clock.Advance(30);
-  MustQuote(ctx, *client, "kettle", 2, kNoDeadline);
-  calls = PriceCalls(ctx);
-  AssertPriceTimeout(ctx, calls.back(), std::chrono::milliseconds(950),
+  hMustQuote(ctx, *client, "kettle", 2, kHNoDeadline);
+  calls = hPriceCalls(ctx);
+  hAssertPriceTimeout(ctx, calls.back(), std::chrono::milliseconds(950),
                      "a second call 30 s later: the default is per request, not a deadline fixed at start-up");
 }
 
 void CheckBudgetExhausted(harness::Ctx& ctx) {
-  auto client = StartQuotes(ctx);
+  auto client = hStartQuotes(ctx);
   for (const double deadline : {0.04, 0.0}) {
-    const grpc::StatusCode got = QuoteCode(*client, "kettle", 2, deadline);
+    const grpc::StatusCode got = hQuoteCode(*client, "kettle", 2, deadline);
     ctx.Equal(got, grpc::StatusCode::DEADLINE_EXCEEDED, "an incoming deadline of %v s (the budget is under reserve 50 ms)", deadline);
-    ctx.Equal(PriceCalls(ctx).size(), 0,
+    ctx.Equal(hPriceCalls(ctx).size(), 0,
               "with %v s left pricing was called: a call that cannot finish must not be started; GetPrice calls", deadline);
   }
-  MustQuote(ctx, *client, "kettle", 2, 0.1);
-  auto calls = PriceCalls(ctx);
+  hMustQuote(ctx, *client, "kettle", 2, 0.1);
+  auto calls = hPriceCalls(ctx);
   ctx.Equal(calls.size(), 1, "an incoming deadline of 0.1 s must still call pricing once: GetPrice calls");
-  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(50), "0.1 s incoming minus reserve 50 ms");
+  hAssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(50), "0.1 s incoming minus reserve 50 ms");
 }
 
 void CheckSlowPricing(harness::Ctx& ctx) {
-  auto client = StartQuotes(ctx);
-  ctx.GRPC.SetLatency("GetPrice", 0.9, kPricingPeerTarget);
+  auto client = hStartQuotes(ctx);
+  ctx.GRPC.SetLatency("GetPrice", 0.9, kHPricingPeerTarget);
   const int64_t started = ctx.Clock.Now();
-  const grpc::StatusCode got = QuoteCode(*client, "kettle", 2, 0.8);
+  const grpc::StatusCode got = hQuoteCode(*client, "kettle", 2, 0.8);
   const double elapsed = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Equal(got, grpc::StatusCode::DEADLINE_EXCEEDED, "pricing takes 0.9 s and the caller allows 0.8 s: GetQuote's status");
-  auto calls = PriceCalls(ctx);
+  auto calls = hPriceCalls(ctx);
   ctx.Equal(calls.size(), 1, "the times a timed-out pricing call was made: the budget is spent, never retry");
-  AssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(750), "0.8 s incoming minus reserve 50 ms");
+  hAssertPriceTimeout(ctx, calls[0], std::chrono::milliseconds(750), "0.8 s incoming minus reserve 50 ms");
   ctx.Assert(elapsed <= 0.8 + 0.01, "the failure took %.3f s, after the caller's 0.8 s deadline: nobody was waiting for it", elapsed);
-  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 2, kNoDeadline);
+  quotes::v1::Quote q = hMustQuote(ctx, *client, "kettle", 2, kHNoDeadline);
   ctx.Equal(q.total_cents(), 6998, "with no incoming deadline the 0.9 s pricing call fits the 0.95 s default: total_cents");
-  ctx.Equal(PriceCalls(ctx).size(), 2, "the GetPrice calls in total");
+  ctx.Equal(hPriceCalls(ctx).size(), 2, "the GetPrice calls in total");
 }
 
 void CheckStatusMapping(harness::Ctx& ctx) {
-  auto client = StartQuotes(ctx);
-  grpc::StatusCode got = QuoteCode(*client, "ghost", 2, 0.8);
+  auto client = hStartQuotes(ctx);
+  grpc::StatusCode got = hQuoteCode(*client, "ghost", 2, 0.8);
   ctx.Equal(got, grpc::StatusCode::NOT_FOUND, "pricing answered NOT_FOUND for ghost: GetQuote's status");
   const std::vector<std::pair<grpc::StatusCode, grpc::StatusCode>> cases = {
       {grpc::StatusCode::UNAVAILABLE, grpc::StatusCode::UNAVAILABLE},
@@ -1284,28 +1284,28 @@ void CheckStatusMapping(harness::Ctx& ctx) {
   };
   for (const auto& [pricing, want] : cases) {
     ctx.GRPC.Fail("GetPrice", pricing, "pricing broke", 1, "");
-    got = QuoteCode(*client, "kettle", 2, 0.8);
+    got = hQuoteCode(*client, "kettle", 2, 0.8);
     ctx.Equal(got, want, "pricing failed with %v: GetQuote's status", pricing);
   }
-  ctx.Equal(PriceCalls(ctx).size(), 6, "the GetPrice calls six failing quotes made: never retry, not even UNAVAILABLE");
-  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 2, 0.8);
+  ctx.Equal(hPriceCalls(ctx).size(), 6, "the GetPrice calls six failing quotes made: never retry, not even UNAVAILABLE");
+  quotes::v1::Quote q = hMustQuote(ctx, *client, "kettle", 2, 0.8);
   ctx.Equal(q.total_cents(), 6998, "after the failures a healthy pricing must give total_cents 6998");
 }
 
 void CheckValidatesFirst(harness::Ctx& ctx) {
-  auto client = StartQuotes(ctx);
+  auto client = hStartQuotes(ctx);
   struct Case {
     std::string sku;
     int32_t qty;
     double deadline;
   };
   for (const Case& c : std::vector<Case>{{"", 2, 0.8}, {"kettle", 0, 0.8}, {"kettle", -3, 0.8}, {"", 2, 0.04}}) {
-    const grpc::StatusCode got = QuoteCode(*client, c.sku, c.qty, c.deadline);
+    const grpc::StatusCode got = hQuoteCode(*client, c.sku, c.qty, c.deadline);
     ctx.Equal(got, grpc::StatusCode::INVALID_ARGUMENT, "GetQuote(sku=%q, qty=%d) with deadline %v s (validation comes first)",
               c.sku, c.qty, c.deadline);
   }
-  ctx.Equal(PriceCalls(ctx).size(), 0, "the GetPrice calls invalid requests made");
-  quotes::v1::Quote q = MustQuote(ctx, *client, "kettle", 1, 0.8);
+  ctx.Equal(hPriceCalls(ctx).size(), 0, "the GetPrice calls invalid requests made");
+  quotes::v1::Quote q = hMustQuote(ctx, *client, "kettle", 1, 0.8);
   ctx.Equal(q.total_cents(), 3499, "GetQuote(kettle, 1) must still succeed: total_cents");
 }
 `,

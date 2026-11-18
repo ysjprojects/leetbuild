@@ -785,23 +785,23 @@ import (
 	"leetbuild/harness"
 )
 
-const tbT0 int64 = 1_700_000_000_000 // the caller's clock in ms: the harness owns it, nothing here depends on wall time
+const kHTbT0 int64 = 1_700_000_000_000 // the caller's clock in ms: the harness owns it, nothing here depends on wall time
 
-var tbBg = context.Background()
+var hTbBg = context.Background()
 
 // tbTake is one take's answer: allowed, tokens left, ms until cost would be there.
-type tbTake struct {
+type HTbTake struct {
 	allowed bool
 	tokens  float64
 	wait    int64
 }
 
-func tbShow(t tbTake) string { return fmt.Sprintf("[%v, %v, %v]", t.allowed, t.tokens, t.wait) }
+func hTbShow(t HTbTake) string { return fmt.Sprintf("[%v, %v, %v]", t.allowed, t.tokens, t.wait) }
 
-func tbNear(value, expected float64) bool { return math.Abs(value-expected) < 1e-6 }
+func hTbNear(value, expected float64) bool { return math.Abs(value-expected) < 1e-6 }
 
 // tbNum parses a hash field as a number; a missing or malformed field is NaN, which is near nothing.
-func tbNum(s string, ok bool) float64 {
+func hTbNum(s string, ok bool) float64 {
 	if !ok {
 		return math.NaN()
 	}
@@ -812,34 +812,34 @@ func tbNum(s string, ok bool) float64 {
 	return f
 }
 
-func tbRun(ctx *harness.Ctx, bucket string, cost float64, nowMs int64) tbTake {
-	allowed, tokens, wait, err := Take(tbBg, bucket, cost, nowMs)
+func hTbRun(ctx *harness.Ctx, bucket string, cost float64, nowMs int64) HTbTake {
+	allowed, tokens, wait, err := Take(hTbBg, bucket, cost, nowMs)
 	ctx.NoError(err, "Take(%q, %v, %d) returned an error", bucket, cost, nowMs)
-	return tbTake{allowed, tokens, wait}
+	return HTbTake{allowed, tokens, wait}
 }
 
 func CheckBurstThenDeny(ctx *harness.Ctx) {
-	var results []tbTake
+	var results []HTbTake
 	for range 20 {
-		results = append(results, tbRun(ctx, "api:ana", 1, tbT0))
+		results = append(results, hTbRun(ctx, "api:ana", 1, kHTbT0))
 	}
 	allowed, left, waits := []bool{}, []float64{}, []int64{}
 	allAllowed, countsDown, noWaits := true, true, true
 	for i, r := range results {
 		allowed, left, waits = append(allowed, r.allowed), append(left, r.tokens), append(waits, r.wait)
 		allAllowed = allAllowed && r.allowed
-		countsDown = countsDown && tbNear(r.tokens, float64(19-i))
+		countsDown = countsDown && hTbNear(r.tokens, float64(19-i))
 		noWaits = noWaits && r.wait == 0
 	}
 	ctx.Assert(allAllowed, "a new bucket starts full: 20 unit takes at one instant must all be allowed, got %v", allowed)
 	ctx.Assert(countsDown, "tokens left after each unit take must count 19, 18 … 0, got %v", left)
 	ctx.Assert(noWaits, "an allowed take reports waitMs 0, got %v", waits)
-	denied := tbRun(ctx, "api:ana", 1, tbT0)
-	ctx.Assert(!denied.allowed, "the 21st unit take at the same instant must be denied, got %s", tbShow(denied))
-	ctx.Assert(tbNear(denied.tokens, 0), "a denied take takes nothing: tokens left must stay 0, got %v", denied.tokens)
+	denied := hTbRun(ctx, "api:ana", 1, kHTbT0)
+	ctx.Assert(!denied.allowed, "the 21st unit take at the same instant must be denied, got %s", hTbShow(denied))
+	ctx.Assert(hTbNear(denied.tokens, 0), "a denied take takes nothing: tokens left must stay 0, got %v", denied.tokens)
 	ctx.Equal(denied.wait, 200, "one token from an empty bucket is ceil((1 - 0) * 1000 / 5) = 200 ms away: waitMs")
-	ctx.Equal(tbRun(ctx, "api:ana", 3, tbT0).wait, 600, "three tokens from an empty bucket are 600 ms away: waitMs")
-	ctx.Assert(tbRun(ctx, "api:bo", 1, tbT0).allowed, "buckets are independent: api:bo is untouched by api:ana's spending")
+	ctx.Equal(hTbRun(ctx, "api:ana", 3, kHTbT0).wait, 600, "three tokens from an empty bucket are 600 ms away: waitMs")
+	ctx.Assert(hTbRun(ctx, "api:bo", 1, kHTbT0).allowed, "buckets are independent: api:bo is untouched by api:ana's spending")
 	kind := ctx.Redis.Type("tb:api:ana")
 	ctx.Assert(kind == "hash", "tb:api:ana is %q (keys: %q), expected a hash with tokens and updated_ms", kind, ctx.Redis.Keys("*"))
 	fields := ctx.Redis.HGetAll("tb:api:ana")
@@ -851,86 +851,86 @@ func CheckBurstThenDeny(ctx *harness.Ctx) {
 	_, hasUpdated := fields["updated_ms"]
 	ctx.Assert(len(fields) == 2 && hasTokens && hasUpdated, "tb:api:ana has fields %q, expected tokens and updated_ms", names)
 	tokens, ok := fields["tokens"]
-	ctx.Assert(tbNear(tbNum(tokens, ok), 0), "tb:api:ana holds %s tokens after 20 unit takes, expected 0", tokens)
+	ctx.Assert(hTbNear(hTbNum(tokens, ok), 0), "tb:api:ana holds %s tokens after 20 unit takes, expected 0", tokens)
 	updated, ok := fields["updated_ms"]
-	ctx.Equal(int64(math.Trunc(tbNum(updated, ok))), tbT0, "updated_ms must be the caller's nowMs")
+	ctx.Equal(int64(math.Trunc(hTbNum(updated, ok))), kHTbT0, "updated_ms must be the caller's nowMs")
 }
 
 func CheckLazyRefill(ctx *harness.Ctx) {
 	for range 20 {
-		tbRun(ctx, "k", 1, tbT0)
+		hTbRun(ctx, "k", 1, kHTbT0)
 	}
-	r := tbRun(ctx, "k", 1, tbT0+300)
-	ctx.Assert(r.allowed && tbNear(r.tokens, 0.5), "300 ms at 5 tokens/s earns 1.5 tokens: a unit take is allowed with 0.5 left, got %s", tbShow(r))
-	r = tbRun(ctx, "k", 1, tbT0+300)
-	ctx.Assert(!r.allowed && tbNear(r.tokens, 0.5) && r.wait == 100, "with 0.5 tokens a unit take is denied, keeps 0.5 and waits ceil(0.5 * 1000 / 5) = 100 ms, got %s", tbShow(r))
-	r = tbRun(ctx, "k", 1, tbT0+400)
-	ctx.Assert(r.allowed && tbNear(r.tokens, 0), "100 ms later the half token is whole: allowed with 0 left, got %s", tbShow(r))
-	r = tbRun(ctx, "k", 5, tbT0+1400)
-	ctx.Assert(r.allowed && tbNear(r.tokens, 0), "one second earns 5 tokens: a take of 5 is allowed with 0 left, got %s", tbShow(r))
-	r = tbRun(ctx, "k", 5, tbT0+2200)
-	ctx.Assert(!r.allowed && tbNear(r.tokens, 4) && r.wait == 200, "800 ms earns 4: a take of 5 is denied with 4 left and 200 ms to wait, got %s", tbShow(r))
+	r := hTbRun(ctx, "k", 1, kHTbT0+300)
+	ctx.Assert(r.allowed && hTbNear(r.tokens, 0.5), "300 ms at 5 tokens/s earns 1.5 tokens: a unit take is allowed with 0.5 left, got %s", hTbShow(r))
+	r = hTbRun(ctx, "k", 1, kHTbT0+300)
+	ctx.Assert(!r.allowed && hTbNear(r.tokens, 0.5) && r.wait == 100, "with 0.5 tokens a unit take is denied, keeps 0.5 and waits ceil(0.5 * 1000 / 5) = 100 ms, got %s", hTbShow(r))
+	r = hTbRun(ctx, "k", 1, kHTbT0+400)
+	ctx.Assert(r.allowed && hTbNear(r.tokens, 0), "100 ms later the half token is whole: allowed with 0 left, got %s", hTbShow(r))
+	r = hTbRun(ctx, "k", 5, kHTbT0+1400)
+	ctx.Assert(r.allowed && hTbNear(r.tokens, 0), "one second earns 5 tokens: a take of 5 is allowed with 0 left, got %s", hTbShow(r))
+	r = hTbRun(ctx, "k", 5, kHTbT0+2200)
+	ctx.Assert(!r.allowed && hTbNear(r.tokens, 4) && r.wait == 200, "800 ms earns 4: a take of 5 is denied with 4 left and 200 ms to wait, got %s", hTbShow(r))
 	fields := ctx.Redis.HGetAll("tb:k")
 	tokens, hasTokens := fields["tokens"]
 	updated, hasUpdated := fields["updated_ms"]
-	updatedMs := tbNum(updated, hasUpdated)
+	updatedMs := hTbNum(updated, hasUpdated)
 	if !hasUpdated {
 		updatedMs = 0
 	}
-	ctx.Assert(tbNear(tbNum(tokens, hasTokens), 4) && int64(math.Trunc(updatedMs)) == tbT0+2200, "a denied take must still write the refilled bucket back (tokens 4, updated_ms %d), the hash holds %v", tbT0+2200, fields)
-	r = tbRun(ctx, "k", 5, tbT0+2400)
-	ctx.Assert(r.allowed && tbNear(r.tokens, 0), "200 ms after the denial the 4 banked tokens plus 1 make 5: allowed, got %s", tbShow(r))
-	r = tbRun(ctx, "k", 20, tbT0+100_000)
-	ctx.Assert(r.allowed && tbNear(r.tokens, 0), "100 s idle fills the bucket to capacity (20), not 500: a take of 20 is allowed with 0 left, got %s", tbShow(r))
-	r = tbRun(ctx, "k", 1, tbT0+100_000)
-	ctx.Assert(!r.allowed && r.wait == 200, "the refill is capped at 20: nothing is left after taking 20, got %s", tbShow(r))
+	ctx.Assert(hTbNear(hTbNum(tokens, hasTokens), 4) && int64(math.Trunc(updatedMs)) == kHTbT0+2200, "a denied take must still write the refilled bucket back (tokens 4, updated_ms %d), the hash holds %v", kHTbT0+2200, fields)
+	r = hTbRun(ctx, "k", 5, kHTbT0+2400)
+	ctx.Assert(r.allowed && hTbNear(r.tokens, 0), "200 ms after the denial the 4 banked tokens plus 1 make 5: allowed, got %s", hTbShow(r))
+	r = hTbRun(ctx, "k", 20, kHTbT0+100_000)
+	ctx.Assert(r.allowed && hTbNear(r.tokens, 0), "100 s idle fills the bucket to capacity (20), not 500: a take of 20 is allowed with 0 left, got %s", hTbShow(r))
+	r = hTbRun(ctx, "k", 1, kHTbT0+100_000)
+	ctx.Assert(!r.allowed && r.wait == 200, "the refill is capped at 20: nothing is left after taking 20, got %s", hTbShow(r))
 }
 
 func CheckOversizedCost(ctx *harness.Ctx) {
-	r := tbRun(ctx, "k", 21, tbT0)
-	ctx.Assert(!r.allowed && r.wait == -1, "21 tokens never fit in a bucket of 20: expected [false, 20, -1], got %s", tbShow(r))
-	ctx.Assert(tbNear(r.tokens, 20), "an impossible take takes nothing: tokens left must be 20, got %v", r.tokens)
+	r := hTbRun(ctx, "k", 21, kHTbT0)
+	ctx.Assert(!r.allowed && r.wait == -1, "21 tokens never fit in a bucket of 20: expected [false, 20, -1], got %s", hTbShow(r))
+	ctx.Assert(hTbNear(r.tokens, 20), "an impossible take takes nothing: tokens left must be 20, got %v", r.tokens)
 	ctx.Equal(ctx.Redis.Exists("tb:k"), 1, "the bucket is written back even when the take is impossible: EXISTS tb:k")
-	r = tbRun(ctx, "k", 20, tbT0)
-	ctx.Assert(r.allowed && tbNear(r.tokens, 0), "the full bucket is still there: a take of exactly 20 is allowed, got %s", tbShow(r))
-	r = tbRun(ctx, "k", 25, tbT0+500)
-	ctx.Assert(!r.allowed && r.wait == -1, "an oversized cost on an empty bucket is -1, not a wait, got %s", tbShow(r))
-	ctx.Assert(tbNear(r.tokens, 2.5), "the refill still happens on an impossible take: 500 ms earns 2.5, tokens left was %v", r.tokens)
+	r = hTbRun(ctx, "k", 20, kHTbT0)
+	ctx.Assert(r.allowed && hTbNear(r.tokens, 0), "the full bucket is still there: a take of exactly 20 is allowed, got %s", hTbShow(r))
+	r = hTbRun(ctx, "k", 25, kHTbT0+500)
+	ctx.Assert(!r.allowed && r.wait == -1, "an oversized cost on an empty bucket is -1, not a wait, got %s", hTbShow(r))
+	ctx.Assert(hTbNear(r.tokens, 2.5), "the refill still happens on an impossible take: 500 ms earns 2.5, tokens left was %v", r.tokens)
 }
 
 func CheckKeyExpires(ctx *harness.Ctx) {
-	tbRun(ctx, "k", 1, tbT0)
+	hTbRun(ctx, "k", 1, kHTbT0)
 	pttl := ctx.Redis.PTTL("tb:k")
 	ctx.Assert(3500 < pttl && pttl <= 4000, "PTTL tb:k is %d ms after a take, expected capacity / rate * 1000 = 4000 (PEXPIRE)", pttl)
 	ctx.Clock.Advance(3.0)
-	tbRun(ctx, "k", 1, tbT0+3000)
+	hTbRun(ctx, "k", 1, kHTbT0+3000)
 	pttl = ctx.Redis.PTTL("tb:k")
 	ctx.Assert(3500 < pttl && pttl <= 4000, "every take renews the TTL: PTTL tb:k is %d ms right after the second take, expected 4000", pttl)
 	ctx.Clock.Advance(3.9)
 	ctx.Equal(ctx.Redis.Exists("tb:k"), 1, "3.9 s after the last take the key must still be there: EXISTS tb:k")
 	ctx.Clock.Advance(0.2)
 	ctx.Equal(ctx.Redis.Exists("tb:k"), 0, "4.1 s after the last take the key must be gone (a full bucket needs no key): EXISTS tb:k")
-	r := tbRun(ctx, "k", 20, tbT0+7100)
-	ctx.Assert(r.allowed && tbNear(r.tokens, 0), "a bucket whose key expired is a new, full bucket: a take of 20 is allowed, got %s", tbShow(r))
+	r := hTbRun(ctx, "k", 20, kHTbT0+7100)
+	ctx.Assert(r.allowed && hTbNear(r.tokens, 0), "a bucket whose key expired is a new, full bucket: a take of 20 is allowed, got %s", hTbShow(r))
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
 	for range 19 {
-		tbRun(ctx, "k", 1, tbT0)
+		hTbRun(ctx, "k", 1, kHTbT0)
 	}
 	// Another server's take lands right after this one's first command on the key — the window a
 	// client-side read-refill-write leaves open — and both see one token.
 	rival := ctx.Redis.After("tb:k", func() any {
-		allowed, tokens, wait, err := Take(tbBg, "k", 1, tbT0)
+		allowed, tokens, wait, err := Take(hTbBg, "k", 1, kHTbT0)
 		if err != nil {
 			panic(err)
 		}
-		return tbTake{allowed, tokens, wait}
+		return HTbTake{allowed, tokens, wait}
 	})
-	mine := tbRun(ctx, "k", 1, tbT0)
+	mine := hTbRun(ctx, "k", 1, kHTbT0)
 	ctx.Assert(rival.Fired, "Take never touched tb:k")
 	ctx.NoError(rival.Err, "the parallel Take returned an error")
-	theirs, _ := rival.Result.(tbTake)
+	theirs, _ := rival.Result.(HTbTake)
 	winners := 0
 	if mine.allowed {
 		winners++
@@ -942,23 +942,23 @@ func CheckAtomic(ctx *harness.Ctx) {
 	if winners == 2 {
 		verdict = "both were allowed — the second server read the bucket before the first wrote it back. Read, refill, compare and write must be one Lua script"
 	}
-	ctx.Assert(winners == 1, "two parallel unit takes on a bucket holding one token returned %s and %s: %s", tbShow(mine), tbShow(theirs), verdict)
+	ctx.Assert(winners == 1, "two parallel unit takes on a bucket holding one token returned %s and %s: %s", hTbShow(mine), hTbShow(theirs), verdict)
 	tokens, ok := ctx.Redis.HGet("tb:k", "tokens")
-	ctx.Assert(tbNear(tbNum(tokens, ok), 0), "tb:k holds %s tokens after the race, expected 0: a lost update left a token behind", tokens)
+	ctx.Assert(hTbNear(hTbNum(tokens, ok), 0), "tb:k holds %s tokens after the race, expected 0: a lost update left a token behind", tokens)
 	loser := mine
 	if mine.allowed {
 		loser = theirs
 	}
-	ctx.Assert(loser.wait == 200, "the denied take reports 200 ms (one token at 5/s), got %s", tbShow(loser))
-	third := tbRun(ctx, "k", 1, tbT0)
-	ctx.Assert(!third.allowed, "a third take at the same instant must be denied, got %s", tbShow(third))
+	ctx.Assert(loser.wait == 200, "the denied take reports 200 ms (one token at 5/s), got %s", hTbShow(loser))
+	third := hTbRun(ctx, "k", 1, kHTbT0)
+	ctx.Assert(!third.allowed, "a third take at the same instant must be denied, got %s", hTbShow(third))
 }
 
 func CheckOneRoundTrip(ctx *harness.Ctx) {
-	tbRun(ctx, "k", 1, tbT0) // warm-up: on a cold script cache Script.Run sends EVALSHA, then EVAL after NOSCRIPT
+	hTbRun(ctx, "k", 1, kHTbT0) // warm-up: on a cold script cache Script.Run sends EVALSHA, then EVAL after NOSCRIPT
 	before := len(ctx.Redis.RoundTrips())
 	for i := range 5 {
-		tbRun(ctx, "k", 1, tbT0+100*int64(i))
+		hTbRun(ctx, "k", 1, kHTbT0+100*int64(i))
 	}
 	trips := ctx.Redis.RoundTrips()[before:]
 	ctx.Assert(len(trips) == 5, "5 takes made %d round trip(s) (%v): each take is exactly one EVAL/EVALSHA — a pipeline of HMGET … HSET is still two commands and still a race", len(trips), trips)
@@ -983,33 +983,33 @@ func CheckOneRoundTrip(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr long long tbT0 = 1'700'000'000'000;  // the caller's clock in ms: the harness owns it, nothing here depends on wall time
+constexpr long long kHTbT0 = 1'700'000'000'000;  // the caller's clock in ms: the harness owns it, nothing here depends on wall time
 
-std::string tbShow(const Take& t) { return harness::Sprintf("[%v, %v, %v]", t.allowed, t.tokens_left, t.wait_ms); }
+std::string hTbShow(const Take& t) { return harness::Sprintf("[%v, %v, %v]", t.allowed, t.tokens_left, t.wait_ms); }
 
-bool tbNear(double value, double expected) { return std::abs(value - expected) < 1e-6; }
+bool hTbNear(double value, double expected) { return std::abs(value - expected) < 1e-6; }
 
 // tbNum parses a hash field as a number; a missing or malformed field is NaN, which is near nothing.
-double tbNum(const std::optional<std::string>& s) {
+double hTbNum(const std::optional<std::string>& s) {
   if (!s) return std::nan("");
   char* end = nullptr;
   const double f = std::strtod(s->c_str(), &end);
   return end != s->c_str() && *end == 0 ? f : std::nan("");
 }
 
-std::optional<std::string> tbField(const std::map<std::string, std::string>& fields, const std::string& name) {
+std::optional<std::string> hTbField(const std::map<std::string, std::string>& fields, const std::string& name) {
   const auto it = fields.find(name);
   if (it == fields.end()) return std::nullopt;
   return it->second;
 }
 
-Take tbRun(harness::Ctx&, const std::string& bucket, double cost, long long nowMs) { return take(bucket, cost, nowMs); }
+Take hTbRun(harness::Ctx&, const std::string& bucket, double cost, long long nowMs) { return take(bucket, cost, nowMs); }
 
 }  // namespace
 
 void CheckBurstThenDeny(harness::Ctx& ctx) {
   std::vector<Take> results;
-  for (int i = 0; i < 20; i++) results.push_back(tbRun(ctx, "api:ana", 1, tbT0));
+  for (int i = 0; i < 20; i++) results.push_back(hTbRun(ctx, "api:ana", 1, kHTbT0));
   std::vector<bool> allowed;
   std::vector<double> left;
   std::vector<long long> waits;
@@ -1020,18 +1020,18 @@ void CheckBurstThenDeny(harness::Ctx& ctx) {
     left.push_back(r.tokens_left);
     waits.push_back(r.wait_ms);
     allAllowed = allAllowed && r.allowed;
-    countsDown = countsDown && tbNear(r.tokens_left, static_cast<double>(19 - static_cast<int>(i)));
+    countsDown = countsDown && hTbNear(r.tokens_left, static_cast<double>(19 - static_cast<int>(i)));
     noWaits = noWaits && r.wait_ms == 0;
   }
   ctx.Assert(allAllowed, "a new bucket starts full: 20 unit takes at one instant must all be allowed, got %v", allowed);
   ctx.Assert(countsDown, "tokens left after each unit take must count 19, 18 … 0, got %v", left);
   ctx.Assert(noWaits, "an allowed take reports waitMs 0, got %v", waits);
-  const auto denied = tbRun(ctx, "api:ana", 1, tbT0);
-  ctx.Assert(!denied.allowed, "the 21st unit take at the same instant must be denied, got %s", tbShow(denied));
-  ctx.Assert(tbNear(denied.tokens_left, 0), "a denied take takes nothing: tokens left must stay 0, got %v", denied.tokens_left);
+  const auto denied = hTbRun(ctx, "api:ana", 1, kHTbT0);
+  ctx.Assert(!denied.allowed, "the 21st unit take at the same instant must be denied, got %s", hTbShow(denied));
+  ctx.Assert(hTbNear(denied.tokens_left, 0), "a denied take takes nothing: tokens left must stay 0, got %v", denied.tokens_left);
   ctx.Equal(denied.wait_ms, 200, "one token from an empty bucket is ceil((1 - 0) * 1000 / 5) = 200 ms away: waitMs");
-  ctx.Equal(tbRun(ctx, "api:ana", 3, tbT0).wait_ms, 600, "three tokens from an empty bucket are 600 ms away: waitMs");
-  ctx.Assert(tbRun(ctx, "api:bo", 1, tbT0).allowed, "buckets are independent: api:bo is untouched by api:ana's spending");
+  ctx.Equal(hTbRun(ctx, "api:ana", 3, kHTbT0).wait_ms, 600, "three tokens from an empty bucket are 600 ms away: waitMs");
+  ctx.Assert(hTbRun(ctx, "api:bo", 1, kHTbT0).allowed, "buckets are independent: api:bo is untouched by api:ana's spending");
   const std::string kind = ctx.Redis.Type("tb:api:ana");
   ctx.Assert(kind == "hash", "tb:api:ana is %q (keys: %q), expected a hash with tokens and updated_ms", kind, ctx.Redis.Keys("*"));
   const auto fields = ctx.Redis.HGetAll("tb:api:ana");
@@ -1039,66 +1039,66 @@ void CheckBurstThenDeny(harness::Ctx& ctx) {
   for (const auto& [name, _] : fields) names.push_back(name);
   ctx.Assert(fields.size() == 2 && fields.count("tokens") && fields.count("updated_ms"),
              "tb:api:ana has fields %q, expected tokens and updated_ms", names);
-  const auto tokens = tbField(fields, "tokens");
-  ctx.Assert(tbNear(tbNum(tokens), 0), "tb:api:ana holds %s tokens after 20 unit takes, expected 0", tokens.value_or(""));
-  ctx.Equal(static_cast<long long>(std::trunc(tbNum(tbField(fields, "updated_ms")))), tbT0, "updated_ms must be the caller's nowMs");
+  const auto tokens = hTbField(fields, "tokens");
+  ctx.Assert(hTbNear(hTbNum(tokens), 0), "tb:api:ana holds %s tokens after 20 unit takes, expected 0", tokens.value_or(""));
+  ctx.Equal(static_cast<long long>(std::trunc(hTbNum(hTbField(fields, "updated_ms")))), kHTbT0, "updated_ms must be the caller's nowMs");
 }
 
 void CheckLazyRefill(harness::Ctx& ctx) {
-  for (int i = 0; i < 20; i++) tbRun(ctx, "k", 1, tbT0);
-  auto r = tbRun(ctx, "k", 1, tbT0 + 300);
-  ctx.Assert(r.allowed && tbNear(r.tokens_left, 0.5), "300 ms at 5 tokens/s earns 1.5 tokens: a unit take is allowed with 0.5 left, got %s", tbShow(r));
-  r = tbRun(ctx, "k", 1, tbT0 + 300);
-  ctx.Assert(!r.allowed && tbNear(r.tokens_left, 0.5) && r.wait_ms == 100, "with 0.5 tokens a unit take is denied, keeps 0.5 and waits ceil(0.5 * 1000 / 5) = 100 ms, got %s", tbShow(r));
-  r = tbRun(ctx, "k", 1, tbT0 + 400);
-  ctx.Assert(r.allowed && tbNear(r.tokens_left, 0), "100 ms later the half token is whole: allowed with 0 left, got %s", tbShow(r));
-  r = tbRun(ctx, "k", 5, tbT0 + 1400);
-  ctx.Assert(r.allowed && tbNear(r.tokens_left, 0), "one second earns 5 tokens: a take of 5 is allowed with 0 left, got %s", tbShow(r));
-  r = tbRun(ctx, "k", 5, tbT0 + 2200);
-  ctx.Assert(!r.allowed && tbNear(r.tokens_left, 4) && r.wait_ms == 200, "800 ms earns 4: a take of 5 is denied with 4 left and 200 ms to wait, got %s", tbShow(r));
+  for (int i = 0; i < 20; i++) hTbRun(ctx, "k", 1, kHTbT0);
+  auto r = hTbRun(ctx, "k", 1, kHTbT0 + 300);
+  ctx.Assert(r.allowed && hTbNear(r.tokens_left, 0.5), "300 ms at 5 tokens/s earns 1.5 tokens: a unit take is allowed with 0.5 left, got %s", hTbShow(r));
+  r = hTbRun(ctx, "k", 1, kHTbT0 + 300);
+  ctx.Assert(!r.allowed && hTbNear(r.tokens_left, 0.5) && r.wait_ms == 100, "with 0.5 tokens a unit take is denied, keeps 0.5 and waits ceil(0.5 * 1000 / 5) = 100 ms, got %s", hTbShow(r));
+  r = hTbRun(ctx, "k", 1, kHTbT0 + 400);
+  ctx.Assert(r.allowed && hTbNear(r.tokens_left, 0), "100 ms later the half token is whole: allowed with 0 left, got %s", hTbShow(r));
+  r = hTbRun(ctx, "k", 5, kHTbT0 + 1400);
+  ctx.Assert(r.allowed && hTbNear(r.tokens_left, 0), "one second earns 5 tokens: a take of 5 is allowed with 0 left, got %s", hTbShow(r));
+  r = hTbRun(ctx, "k", 5, kHTbT0 + 2200);
+  ctx.Assert(!r.allowed && hTbNear(r.tokens_left, 4) && r.wait_ms == 200, "800 ms earns 4: a take of 5 is denied with 4 left and 200 ms to wait, got %s", hTbShow(r));
   const auto fields = ctx.Redis.HGetAll("tb:k");
-  const auto updated = tbField(fields, "updated_ms");
-  const double updatedMs = updated ? tbNum(updated) : 0;
-  ctx.Assert(tbNear(tbNum(tbField(fields, "tokens")), 4) && static_cast<long long>(std::trunc(updatedMs)) == tbT0 + 2200,
-             "a denied take must still write the refilled bucket back (tokens 4, updated_ms %d), the hash holds %v", tbT0 + 2200, fields);
-  r = tbRun(ctx, "k", 5, tbT0 + 2400);
-  ctx.Assert(r.allowed && tbNear(r.tokens_left, 0), "200 ms after the denial the 4 banked tokens plus 1 make 5: allowed, got %s", tbShow(r));
-  r = tbRun(ctx, "k", 20, tbT0 + 100'000);
-  ctx.Assert(r.allowed && tbNear(r.tokens_left, 0), "100 s idle fills the bucket to capacity (20), not 500: a take of 20 is allowed with 0 left, got %s", tbShow(r));
-  r = tbRun(ctx, "k", 1, tbT0 + 100'000);
-  ctx.Assert(!r.allowed && r.wait_ms == 200, "the refill is capped at 20: nothing is left after taking 20, got %s", tbShow(r));
+  const auto updated = hTbField(fields, "updated_ms");
+  const double updatedMs = updated ? hTbNum(updated) : 0;
+  ctx.Assert(hTbNear(hTbNum(hTbField(fields, "tokens")), 4) && static_cast<long long>(std::trunc(updatedMs)) == kHTbT0 + 2200,
+             "a denied take must still write the refilled bucket back (tokens 4, updated_ms %d), the hash holds %v", kHTbT0 + 2200, fields);
+  r = hTbRun(ctx, "k", 5, kHTbT0 + 2400);
+  ctx.Assert(r.allowed && hTbNear(r.tokens_left, 0), "200 ms after the denial the 4 banked tokens plus 1 make 5: allowed, got %s", hTbShow(r));
+  r = hTbRun(ctx, "k", 20, kHTbT0 + 100'000);
+  ctx.Assert(r.allowed && hTbNear(r.tokens_left, 0), "100 s idle fills the bucket to capacity (20), not 500: a take of 20 is allowed with 0 left, got %s", hTbShow(r));
+  r = hTbRun(ctx, "k", 1, kHTbT0 + 100'000);
+  ctx.Assert(!r.allowed && r.wait_ms == 200, "the refill is capped at 20: nothing is left after taking 20, got %s", hTbShow(r));
 }
 
 void CheckOversizedCost(harness::Ctx& ctx) {
-  auto r = tbRun(ctx, "k", 21, tbT0);
-  ctx.Assert(!r.allowed && r.wait_ms == -1, "21 tokens never fit in a bucket of 20: expected [false, 20, -1], got %s", tbShow(r));
-  ctx.Assert(tbNear(r.tokens_left, 20), "an impossible take takes nothing: tokens left must be 20, got %v", r.tokens_left);
+  auto r = hTbRun(ctx, "k", 21, kHTbT0);
+  ctx.Assert(!r.allowed && r.wait_ms == -1, "21 tokens never fit in a bucket of 20: expected [false, 20, -1], got %s", hTbShow(r));
+  ctx.Assert(hTbNear(r.tokens_left, 20), "an impossible take takes nothing: tokens left must be 20, got %v", r.tokens_left);
   ctx.Equal(ctx.Redis.Exists("tb:k"), 1, "the bucket is written back even when the take is impossible: EXISTS tb:k");
-  r = tbRun(ctx, "k", 20, tbT0);
-  ctx.Assert(r.allowed && tbNear(r.tokens_left, 0), "the full bucket is still there: a take of exactly 20 is allowed, got %s", tbShow(r));
-  r = tbRun(ctx, "k", 25, tbT0 + 500);
-  ctx.Assert(!r.allowed && r.wait_ms == -1, "an oversized cost on an empty bucket is -1, not a wait, got %s", tbShow(r));
-  ctx.Assert(tbNear(r.tokens_left, 2.5), "the refill still happens on an impossible take: 500 ms earns 2.5, tokens left was %v", r.tokens_left);
+  r = hTbRun(ctx, "k", 20, kHTbT0);
+  ctx.Assert(r.allowed && hTbNear(r.tokens_left, 0), "the full bucket is still there: a take of exactly 20 is allowed, got %s", hTbShow(r));
+  r = hTbRun(ctx, "k", 25, kHTbT0 + 500);
+  ctx.Assert(!r.allowed && r.wait_ms == -1, "an oversized cost on an empty bucket is -1, not a wait, got %s", hTbShow(r));
+  ctx.Assert(hTbNear(r.tokens_left, 2.5), "the refill still happens on an impossible take: 500 ms earns 2.5, tokens left was %v", r.tokens_left);
 }
 
 void CheckKeyExpires(harness::Ctx& ctx) {
-  tbRun(ctx, "k", 1, tbT0);
+  hTbRun(ctx, "k", 1, kHTbT0);
   auto pttl = ctx.Redis.PTTL("tb:k");
   ctx.Assert(3500 < pttl && pttl <= 4000, "PTTL tb:k is %d ms after a take, expected capacity / rate * 1000 = 4000 (PEXPIRE)", pttl);
   ctx.Clock.Advance(3.0);
-  tbRun(ctx, "k", 1, tbT0 + 3000);
+  hTbRun(ctx, "k", 1, kHTbT0 + 3000);
   pttl = ctx.Redis.PTTL("tb:k");
   ctx.Assert(3500 < pttl && pttl <= 4000, "every take renews the TTL: PTTL tb:k is %d ms right after the second take, expected 4000", pttl);
   ctx.Clock.Advance(3.9);
   ctx.Equal(ctx.Redis.Exists("tb:k"), 1, "3.9 s after the last take the key must still be there: EXISTS tb:k");
   ctx.Clock.Advance(0.2);
   ctx.Equal(ctx.Redis.Exists("tb:k"), 0, "4.1 s after the last take the key must be gone (a full bucket needs no key): EXISTS tb:k");
-  const auto r = tbRun(ctx, "k", 20, tbT0 + 7100);
-  ctx.Assert(r.allowed && tbNear(r.tokens_left, 0), "a bucket whose key expired is a new, full bucket: a take of 20 is allowed, got %s", tbShow(r));
+  const auto r = hTbRun(ctx, "k", 20, kHTbT0 + 7100);
+  ctx.Assert(r.allowed && hTbNear(r.tokens_left, 0), "a bucket whose key expired is a new, full bucket: a take of 20 is allowed, got %s", hTbShow(r));
 }
 
 void CheckAtomic(harness::Ctx& ctx) {
-  for (int i = 0; i < 19; i++) tbRun(ctx, "k", 1, tbT0);
+  for (int i = 0; i < 19; i++) hTbRun(ctx, "k", 1, kHTbT0);
   // Another server's take lands right after this one's first command on the key — the window a
   // client-side read-refill-write leaves open — and both see one token.
   bool fired = false;
@@ -1107,12 +1107,12 @@ void CheckAtomic(harness::Ctx& ctx) {
   ctx.Redis.After("tb:k", [&] {
     fired = true;
     try {
-      theirs = take("k", 1, tbT0);
+      theirs = take("k", 1, kHTbT0);
     } catch (const std::exception& e) {
       err = e.what();
     }
   });
-  const auto mine = tbRun(ctx, "k", 1, tbT0);
+  const auto mine = hTbRun(ctx, "k", 1, kHTbT0);
   ctx.Assert(fired, "Take never touched tb:k");
   ctx.Assert(!err, "the parallel Take returned an error: %s", err.value_or(""));
   int winners = 0;
@@ -1122,19 +1122,19 @@ void CheckAtomic(harness::Ctx& ctx) {
   if (winners == 2) {
     verdict = "both were allowed — the second server read the bucket before the first wrote it back. Read, refill, compare and write must be one Lua script";
   }
-  ctx.Assert(winners == 1, "two parallel unit takes on a bucket holding one token returned %s and %s: %s", tbShow(mine), tbShow(theirs), verdict);
+  ctx.Assert(winners == 1, "two parallel unit takes on a bucket holding one token returned %s and %s: %s", hTbShow(mine), hTbShow(theirs), verdict);
   const auto tokens = ctx.Redis.HGet("tb:k", "tokens");
-  ctx.Assert(tbNear(tbNum(tokens), 0), "tb:k holds %s tokens after the race, expected 0: a lost update left a token behind", tokens.value_or(""));
+  ctx.Assert(hTbNear(hTbNum(tokens), 0), "tb:k holds %s tokens after the race, expected 0: a lost update left a token behind", tokens.value_or(""));
   const Take loser = mine.allowed ? theirs : mine;
-  ctx.Assert(loser.wait_ms == 200, "the denied take reports 200 ms (one token at 5/s), got %s", tbShow(loser));
-  const auto third = tbRun(ctx, "k", 1, tbT0);
-  ctx.Assert(!third.allowed, "a third take at the same instant must be denied, got %s", tbShow(third));
+  ctx.Assert(loser.wait_ms == 200, "the denied take reports 200 ms (one token at 5/s), got %s", hTbShow(loser));
+  const auto third = hTbRun(ctx, "k", 1, kHTbT0);
+  ctx.Assert(!third.allowed, "a third take at the same instant must be denied, got %s", hTbShow(third));
 }
 
 void CheckOneRoundTrip(harness::Ctx& ctx) {
-  tbRun(ctx, "k", 1, tbT0);  // warm-up: on a cold script cache a script runner sends EVALSHA, then EVAL after NOSCRIPT
+  hTbRun(ctx, "k", 1, kHTbT0);  // warm-up: on a cold script cache a script runner sends EVALSHA, then EVAL after NOSCRIPT
   const size_t before = ctx.Redis.RoundTrips().size();
-  for (int i = 0; i < 5; i++) tbRun(ctx, "k", 1, tbT0 + 100 * static_cast<long long>(i));
+  for (int i = 0; i < 5; i++) hTbRun(ctx, "k", 1, kHTbT0 + 100 * static_cast<long long>(i));
   const auto all = ctx.Redis.RoundTrips();
   const std::vector<std::vector<std::string>> trips(all.begin() + static_cast<long>(before), all.end());
   ctx.Assert(trips.size() == 5, "5 takes made %d round trip(s) (%v): each take is exactly one EVAL/EVALSHA — a pipeline of HMGET … HSET is still two commands and still a race", trips.size(), trips);

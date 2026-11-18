@@ -1127,7 +1127,7 @@ import (
 	"leetbuild/harness"
 )
 
-const idemSchema = \`
+const kHIdemSchema = \`
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1144,9 +1144,9 @@ CREATE TABLE entries (
 );
 \`
 
-const idemDay = 86400
+const kHIdemDay = 86400
 
-func idemBody() map[string]any {
+func hIdemBody() map[string]any {
 	return map[string]any{
 		"description": "capture ch_1",
 		"entries": []any{
@@ -1157,9 +1157,9 @@ func idemBody() map[string]any {
 }
 
 // idemReordered is idemBody with its keys in another order, sent as it is written.
-const idemReordered = \`{"entries":[{"amount":4999,"currency":"EUR","account":"cash:acquirer"},{"amount":-4999,"currency":"EUR","account":"clearing:payments"}],"description":"capture ch_1"}\`
+const kHIdemReordered = \`{"entries":[{"amount":4999,"currency":"EUR","account":"cash:acquirer"},{"amount":-4999,"currency":"EUR","account":"clearing:payments"}],"description":"capture ch_1"}\`
 
-func idemUnbalanced() map[string]any {
+func hIdemUnbalanced() map[string]any {
 	return map[string]any{
 		"description": "oops",
 		"entries": []any{
@@ -1169,25 +1169,25 @@ func idemUnbalanced() map[string]any {
 	}
 }
 
-func idemOther() map[string]any {
-	body := idemBody()
+func hIdemOther() map[string]any {
+	body := hIdemBody()
 	body["description"] = "capture ch_2"
 	return body
 }
 
 // idemDigestOf is the SHA-256 hex digest of the canonical JSON (keys sorted, no whitespace).
-func idemDigestOf(body map[string]any) string {
+func hIdemDigestOf(body map[string]any) string {
 	canonical, _ := json.Marshal(body)
 	sum := sha256.Sum256(canonical)
 	return hex.EncodeToString(sum[:])
 }
 
-var idemCurrencyRe = regexp.MustCompile(\`^[A-Z]{3}$\`)
+var hIdemCurrencyRe = regexp.MustCompile(\`^[A-Z]{3}$\`)
 
 // idemLedgerHandle is step 1's handle (ledger_api.go) over step 4's journal writer: 422 with a
 // reason for anything but balanced double entry, otherwise one database transaction and 201. A
 // write that fails in the database panics, as the real writer's failure propagates out of handle.
-func idemLedgerHandle(ctx context.Context, body map[string]any) (int, map[string]any) {
+func hIdemLedgerHandle(ctx context.Context, body map[string]any) (int, map[string]any) {
 	rawEntries, _ := body["entries"].([]any)
 	if len(rawEntries) < 2 {
 		return 422, map[string]any{"error": "a transaction needs at least two entries"}
@@ -1207,7 +1207,7 @@ func idemLedgerHandle(ctx context.Context, body map[string]any) (int, map[string
 			return 422, map[string]any{"error": "amount must be a non-zero integer in minor units"}
 		}
 		currency, _ := obj["currency"].(string)
-		if !idemCurrencyRe.MatchString(currency) {
+		if !hIdemCurrencyRe.MatchString(currency) {
 			return 422, map[string]any{"error": "currency must be a three-letter ISO code"}
 		}
 		currencies[currency] = true
@@ -1246,14 +1246,14 @@ func idemLedgerHandle(ctx context.Context, body map[string]any) (int, map[string
 
 // idemAPI is the learner's idempotency layer over the real step 1 handler and the real journal
 // writer, on an empty ledger.
-func idemAPI(ctx *harness.Ctx) *harness.HTTP {
-	ctx.DB.Reset(idemSchema)
-	handle = idemLedgerHandle
+func hIdemAPI(ctx *harness.Ctx) *harness.HTTP {
+	ctx.DB.Reset(kHIdemSchema)
+	handle = hIdemLedgerHandle
 	return ctx.Main(main).HTTP()
 }
 
 // idemPost posts body ("" for no Idempotency-Key header); a string body goes as it is written.
-func idemPost(c *harness.HTTP, key string, body any) *harness.Response {
+func hIdemPost(c *harness.HTTP, key string, body any) *harness.Response {
 	header := []string{"Content-Type", "application/json"}
 	if key != "" {
 		header = append(header, "Idempotency-Key", key)
@@ -1265,52 +1265,52 @@ func idemPost(c *harness.HTTP, key string, body any) *harness.Response {
 	return c.Post("/transactions", data, header...)
 }
 
-func idemTransactions(ctx *harness.Ctx) []harness.Row {
+func hIdemTransactions(ctx *harness.Ctx) []harness.Row {
 	return ctx.DB.Query("SELECT id, description FROM transactions ORDER BY posted_at, id")
 }
 
-func idemJSON(r *harness.Response) map[string]any {
+func hIdemJSON(r *harness.Response) map[string]any {
 	var body map[string]any
 	json.Unmarshal(r.Body, &body)
 	return body
 }
 
 func CheckHeaderRequired(ctx *harness.Ctx) {
-	c := idemAPI(ctx)
-	r := idemPost(c, "", idemBody())
+	c := hIdemAPI(ctx)
+	r := hIdemPost(c, "", hIdemBody())
 	ctx.Equal(r.Status, 400, "POST /transactions without Idempotency-Key")
-	ctx.Equal(len(idemTransactions(ctx)), 0, "a request without a key must not reach the journal, but a transaction was written")
-	r = idemPost(c, "k1", idemBody())
+	ctx.Equal(len(hIdemTransactions(ctx)), 0, "a request without a key must not reach the journal, but a transaction was written")
+	r = hIdemPost(c, "k1", hIdemBody())
 	ctx.Equal(r.Status, 201, "POST /transactions with a fresh key")
-	rows := idemTransactions(ctx)
-	ctx.Assert(len(rows) == 1 && idemJSON(r)["transaction_id"] == rows[0]["id"], "a fresh key must post the transaction once: the journal holds %v, the answer was %s", rows, r.Text())
+	rows := hIdemTransactions(ctx)
+	ctx.Assert(len(rows) == 1 && hIdemJSON(r)["transaction_id"] == rows[0]["id"], "a fresh key must post the transaction once: the journal holds %v, the answer was %s", rows, r.Text())
 }
 
 func CheckFingerprintNx(ctx *harness.Ctx) {
-	c := idemAPI(ctx)
+	c := hIdemAPI(ctx)
 	// A retry from the client's other connection lands on another app server right after this
 	// request's first Redis command on idem:k1 — the window a check-then-set leaves open.
 	fired := false
 	racer := make(chan *harness.Response, 1)
 	ctx.Redis.After("idem:k1", func() any {
 		fired = true
-		go func() { racer <- idemPost(c, "k1", idemBody()) }()
+		go func() { racer <- hIdemPost(c, "k1", hIdemBody()) }()
 		return nil
 	})
-	first := idemPost(c, "k1", idemBody())
+	first := hIdemPost(c, "k1", hIdemBody())
 	ctx.Assert(fired, "idem:k1 was never touched: the key must be reserved in Redis as idem:{Idempotency-Key}")
 	other := <-racer
-	rows := idemTransactions(ctx)
+	rows := hIdemTransactions(ctx)
 	ctx.Equal(len(rows), 1, "two requests with key k1 arrived together and the journal booked that many transactions: reserving the key must be one atomic SetNX, so only one of them can win")
 	statuses := []int{first.Status, other.Status}
 	sort.Ints(statuses)
 	ctx.Equal(statuses, []int{201, 409}, "the two concurrent requests: one creates the transaction (201), the other finds the key reserved with no outcome yet (409)")
 	stored, ok := ctx.Redis.Get("idem:k1")
 	ctx.Assert(ok, "after the request idem:k1 must hold the fingerprint of the body")
-	ctx.Equal(stored, idemDigestOf(idemBody()), "idem:k1 must hold the SHA-256 hex digest of the canonical JSON body (keys sorted, no whitespace)")
+	ctx.Equal(stored, hIdemDigestOf(hIdemBody()), "idem:k1 must hold the SHA-256 hex digest of the canonical JSON body (keys sorted, no whitespace)")
 	ttl := ctx.Redis.TTL("idem:k1")
-	ctx.Assert(idemDay-400 <= ttl && ttl <= idemDay, "the reservation TTL was %d, expected %d s", ttl, idemDay)
-	ctx.Clock.Advance(idemDay - 60)
+	ctx.Assert(kHIdemDay-400 <= ttl && ttl <= kHIdemDay, "the reservation TTL was %d, expected %d s", ttl, kHIdemDay)
+	ctx.Clock.Advance(kHIdemDay - 60)
 	still, _ := ctx.Redis.Get("idem:k1")
 	ctx.Equal(still, stored, "the reservation must still be there just under 24 h later")
 	ctx.Clock.Advance(120)
@@ -1319,45 +1319,45 @@ func CheckFingerprintNx(ctx *harness.Ctx) {
 }
 
 func CheckMismatch409(ctx *harness.Ctx) {
-	c := idemAPI(ctx)
-	first := idemPost(c, "k1", idemBody())
+	c := hIdemAPI(ctx)
+	first := hIdemPost(c, "k1", hIdemBody())
 	ctx.Equal(first.Status, 201, "the first request")
-	r := idemPost(c, "k1", idemOther())
+	r := hIdemPost(c, "k1", hIdemOther())
 	ctx.Equal(r.Status, 409, "the same key with a different body")
 	descriptions := []string{}
-	for _, t := range idemTransactions(ctx) {
+	for _, t := range hIdemTransactions(ctx) {
 		description, _ := t["description"].(string)
 		descriptions = append(descriptions, description)
 	}
 	ctx.Equal(descriptions, []string{"capture ch_1"}, "a mismatching body must not be posted")
 	stored, _ := ctx.Redis.Get("idem:k1")
-	ctx.Equal(stored, idemDigestOf(idemBody()), "the mismatching request must not overwrite the stored fingerprint")
-	again := idemPost(c, "k1", idemBody())
+	ctx.Equal(stored, hIdemDigestOf(hIdemBody()), "the mismatching request must not overwrite the stored fingerprint")
+	again := hIdemPost(c, "k1", hIdemBody())
 	ctx.Assert(again.Status == 201 && again.Text() == first.Text(), "after the 409 the original request must still replay under its key, got %d %s", again.Status, again.Text())
 }
 
 func CheckReplay(ctx *harness.Ctx) {
-	c := idemAPI(ctx)
-	first := idemPost(c, "k1", idemBody())
+	c := hIdemAPI(ctx)
+	first := hIdemPost(c, "k1", hIdemBody())
 	ctx.Equal(first.Status, 201, "the first request")
 	ctx.Equal(first.Header.Get("Idempotent-Replayed"), "", "the first response is not a replay")
-	again := idemPost(c, "k1", idemBody())
+	again := hIdemPost(c, "k1", hIdemBody())
 	ctx.Equal(again.Status, 201, "the retry must answer the stored status")
 	ctx.Equal(again.JSON(), first.JSON(), "the replay must return the same body")
 	ctx.Equal(again.Header.Get("Idempotent-Replayed"), "true", "a replay carries Idempotent-Replayed: true (headers %v)", again.Header)
-	ctx.Equal(len(idemTransactions(ctx)), 1, "a retry must not post again: transactions in the journal after one request and its retry")
-	reordered := idemPost(c, "k1", idemReordered)
+	ctx.Equal(len(hIdemTransactions(ctx)), 1, "a retry must not post again: transactions in the journal after one request and its retry")
+	reordered := hIdemPost(c, "k1", kHIdemReordered)
 	ctx.Assert(reordered.Status == 201 && reordered.Header.Get("Idempotent-Replayed") == "true", "the same body with its keys in another order is the same request: canonical JSON before hashing")
 	ctx.Equal(reordered.JSON(), first.JSON(), "the reordered retry must replay the first outcome")
-	ctx.Equal(len(idemTransactions(ctx)), 1, "the reordered retry must not post again")
-	other := idemPost(c, "k2", idemBody())
-	ctx.Assert(other.Status == 201 && idemJSON(other)["transaction_id"] != idemJSON(first)["transaction_id"], "a different key is a new transaction")
-	ctx.Equal(len(idemTransactions(ctx)), 2, "a different key must post a second transaction")
+	ctx.Equal(len(hIdemTransactions(ctx)), 1, "the reordered retry must not post again")
+	other := hIdemPost(c, "k2", hIdemBody())
+	ctx.Assert(other.Status == 201 && hIdemJSON(other)["transaction_id"] != hIdemJSON(first)["transaction_id"], "a different key is a new transaction")
+	ctx.Equal(len(hIdemTransactions(ctx)), 2, "a different key must post a second transaction")
 }
 
 func CheckStoreOutcome(ctx *harness.Ctx) {
-	c := idemAPI(ctx)
-	r := idemPost(c, "k1", idemBody())
+	c := hIdemAPI(ctx)
+	r := hIdemPost(c, "k1", hIdemBody())
 	ctx.Equal(r.Status, 201, "POST /transactions with a fresh key")
 	stored := ctx.Redis.HGetAll("idem:k1:response")
 	ctx.Assert(len(stored) > 0, "after the response idem:k1:response must hold the outcome as a hash")
@@ -1366,36 +1366,36 @@ func CheckStoreOutcome(ctx *harness.Ctx) {
 	json.Unmarshal([]byte(stored["body"]), &storedBody)
 	ctx.Equal(storedBody, r.JSON(), "idem:k1:response body %q differs from the response body", stored["body"])
 	ttl := ctx.Redis.TTL("idem:k1:response")
-	ctx.Assert(idemDay-400 <= ttl && ttl <= idemDay, "the stored outcome has TTL %d, expected %d s (same as the reservation)", ttl, idemDay)
-	r = idemPost(c, "k2", idemUnbalanced())
+	ctx.Assert(kHIdemDay-400 <= ttl && ttl <= kHIdemDay, "the stored outcome has TTL %d, expected %d s (same as the reservation)", ttl, kHIdemDay)
+	r = hIdemPost(c, "k2", hIdemUnbalanced())
 	ctx.Equal(r.Status, 422, "an unbalanced body must be answered 422")
-	again := idemPost(c, "k2", idemUnbalanced())
+	again := hIdemPost(c, "k2", hIdemUnbalanced())
 	ctx.Equal(again.Status, 422, "the retry of a rejected request must replay the stored 422")
 	ctx.Equal(again.Header.Get("Idempotent-Replayed"), "true", "the replayed 422 is a replay too: error outcomes are stored as well")
 	ctx.Equal(again.JSON(), r.JSON(), "the replayed 422 must carry the stored reason")
 	// Two first requests with one key at once: the second finds the key reserved and no outcome yet.
 	both := make(chan int, 2)
 	for range 2 {
-		go func() { both <- idemPost(c, "k3", idemBody()).Status }()
+		go func() { both <- hIdemPost(c, "k3", hIdemBody()).Status }()
 	}
 	a := <-both
 	b := <-both
 	statuses := []int{a, b}
 	sort.Ints(statuses)
 	ctx.Equal(statuses, []int{201, 409}, "two simultaneous first requests with key k3: one posts (201), the other is still in progress (409)")
-	ctx.Equal(len(idemTransactions(ctx)), 2, "k1 and k3 must have posted one transaction each")
+	ctx.Equal(len(hIdemTransactions(ctx)), 2, "k1 and k3 must have posted one transaction each")
 	// The journal breaks mid-write: from now on an entry of 4999 violates a constraint and the database rolls back.
 	ctx.DB.Exec("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 4999) NOT VALID")
-	r = idemPost(c, "k4", idemBody())
+	r = hIdemPost(c, "k4", hIdemBody())
 	ctx.Assert(r.Status >= 500, "a write that failed in the database answered %d, expected a 5xx", r.Status)
-	ctx.Equal(len(idemTransactions(ctx)), 2, "the failed write must leave nothing in the journal")
+	ctx.Equal(len(hIdemTransactions(ctx)), 2, "the failed write must leave nothing in the journal")
 	_, reserved := ctx.Redis.Get("idem:k4")
 	ctx.Assert(!reserved, "when the write fails the reservation must be released (Del), or every retry gets 409 for a day")
 	ctx.Equal(ctx.Redis.Exists("idem:k4:response"), 0, "a failure is not an outcome: nothing may be stored for k4")
 	ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down")
-	retry := idemPost(c, "k4", idemBody())
+	retry := hIdemPost(c, "k4", hIdemBody())
 	ctx.Equal(retry.Status, 201, "once the database is back, the client's retry with the same key must go through (answer %s)", retry.Text())
-	ctx.Equal(len(idemTransactions(ctx)), 3, "the retry must post the k4 transaction exactly once")
+	ctx.Equal(len(hIdemTransactions(ctx)), 3, "the retry must post the k4 transaction exactly once")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1418,7 +1418,7 @@ func CheckStoreOutcome(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string idemSchema = R"(
+const std::string kHIdemSchema = R"(
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1435,9 +1435,9 @@ CREATE TABLE entries (
 );
 )";
 
-constexpr int64_t idemDay = 86400;
+constexpr int64_t kHIdemDay = 86400;
 
-nlohmann::json idemBody() {
+nlohmann::json hIdemBody() {
   return {
       {"description", "capture ch_1"},
       {"entries",
@@ -1449,10 +1449,10 @@ nlohmann::json idemBody() {
 }
 
 // idemReordered is idemBody with its keys in another order, sent as it is written.
-const std::string idemReordered =
+const std::string kHIdemReordered =
     R"({"entries":[{"amount":4999,"currency":"EUR","account":"cash:acquirer"},{"amount":-4999,"currency":"EUR","account":"clearing:payments"}],"description":"capture ch_1"})";
 
-nlohmann::json idemUnbalanced() {
+nlohmann::json hIdemUnbalanced() {
   return {
       {"description", "oops"},
       {"entries",
@@ -1463,16 +1463,16 @@ nlohmann::json idemUnbalanced() {
   };
 }
 
-nlohmann::json idemOther() {
-  auto body = idemBody();
+nlohmann::json hIdemOther() {
+  auto body = hIdemBody();
   body["description"] = "capture ch_2";
   return body;
 }
 
 // idemDigestOf is the SHA-256 hex digest of the canonical JSON (keys sorted, no whitespace).
-std::string idemDigestOf(const nlohmann::json& body) { return sha256_hex(body.dump()); }
+std::string hIdemDigestOf(const nlohmann::json& body) { return sha256_hex(body.dump()); }
 
-const std::regex idemCurrencyRe("^[A-Z]{3}$");
+const std::regex hIdemCurrencyRe("^[A-Z]{3}$");
 
 }  // namespace
 
@@ -1496,7 +1496,7 @@ std::pair<int, nlohmann::json> handle(const nlohmann::json& body) {
     const int64_t amount = integer ? obj["amount"].get<int64_t>() : 0;
     if (amount == 0) return {422, json{{"error", "amount must be a non-zero integer in minor units"}}};
     const std::string currency = obj.contains("currency") && obj["currency"].is_string() ? obj["currency"].get<std::string>() : "";
-    if (!std::regex_match(currency, idemCurrencyRe)) return {422, json{{"error", "currency must be a three-letter ISO code"}}};
+    if (!std::regex_match(currency, hIdemCurrencyRe)) return {422, json{{"error", "currency must be a three-letter ISO code"}}};
     currencies.insert(currency);
     sum += amount;
     entries.push_back(json{{"account", account}, {"currency", currency}, {"amount", amount}});
@@ -1523,13 +1523,13 @@ namespace {
 
 // idemAPI is the learner's idempotency layer over the real step 1 handler and the real journal
 // writer, on an empty ledger.
-harness::HTTP idemAPI(harness::Ctx& ctx) {
-  ctx.DB.Reset(idemSchema);
+harness::HTTP hIdemAPI(harness::Ctx& ctx) {
+  ctx.DB.Reset(kHIdemSchema);
   return ctx.Main().HTTP();
 }
 
 // idemPost posts body text as it is written ("" key for no Idempotency-Key header).
-harness::Response idemPostText(harness::HTTP& c, const std::string& key, const std::string& body) {
+harness::Response hIdemPostText(harness::HTTP& c, const std::string& key, const std::string& body) {
   std::vector<std::string> header = {"Content-Type", "application/json"};
   if (!key.empty()) {
     header.push_back("Idempotency-Key");
@@ -1538,64 +1538,64 @@ harness::Response idemPostText(harness::HTTP& c, const std::string& key, const s
   return c.Send("POST", "/transactions", body, header);
 }
 
-harness::Response idemPost(harness::HTTP& c, const std::string& key, const nlohmann::json& body) {
-  return idemPostText(c, key, body.dump());
+harness::Response hIdemPost(harness::HTTP& c, const std::string& key, const nlohmann::json& body) {
+  return hIdemPostText(c, key, body.dump());
 }
 
-std::vector<harness::Row> idemTransactions(harness::Ctx& ctx) {
+std::vector<harness::Row> hIdemTransactions(harness::Ctx& ctx) {
   return ctx.DB.Query("SELECT id, description FROM transactions ORDER BY posted_at, id");
 }
 
-harness::Any idemJSON(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
+harness::Any hIdemJSON(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
 
 // Go's goroutine: a thread joined when the check is done with it (or leaves early).
-struct idemThread {
+struct HIdemThread {
   std::thread t;
   void Join() {
     if (t.joinable()) t.join();
   }
-  ~idemThread() { Join(); }
+  ~HIdemThread() { Join(); }
 };
 
 }  // namespace
 
 void CheckHeaderRequired(harness::Ctx& ctx) {
-  auto c = idemAPI(ctx);
-  auto r = idemPost(c, "", idemBody());
+  auto c = hIdemAPI(ctx);
+  auto r = hIdemPost(c, "", hIdemBody());
   ctx.Equal(r.Status, 400, "POST /transactions without Idempotency-Key");
-  ctx.Equal(idemTransactions(ctx).size(), 0, "a request without a key must not reach the journal, but a transaction was written");
-  r = idemPost(c, "k1", idemBody());
+  ctx.Equal(hIdemTransactions(ctx).size(), 0, "a request without a key must not reach the journal, but a transaction was written");
+  r = hIdemPost(c, "k1", hIdemBody());
   ctx.Equal(r.Status, 201, "POST /transactions with a fresh key");
-  auto rows = idemTransactions(ctx);
-  ctx.Assert(rows.size() == 1 && idemJSON(r)["transaction_id"] == rows[0]["id"],
+  auto rows = hIdemTransactions(ctx);
+  ctx.Assert(rows.size() == 1 && hIdemJSON(r)["transaction_id"] == rows[0]["id"],
              "a fresh key must post the transaction once: the journal holds %v, the answer was %s", rows, r.Text());
 }
 
 void CheckFingerprintNx(harness::Ctx& ctx) {
-  auto c = idemAPI(ctx);
+  auto c = hIdemAPI(ctx);
   // A retry from the client's other connection lands on another app server right after this
   // request's first Redis command on idem:k1 — the window a check-then-set leaves open.
   bool fired = false;
   harness::Response other;
-  idemThread racer;
+  HIdemThread racer;
   ctx.Redis.After("idem:k1", [&] {
     fired = true;
-    racer.t = std::thread([&] { other = idemPost(c, "k1", idemBody()); });
+    racer.t = std::thread([&] { other = hIdemPost(c, "k1", hIdemBody()); });
   });
-  const auto first = idemPost(c, "k1", idemBody());
+  const auto first = hIdemPost(c, "k1", hIdemBody());
   ctx.Assert(fired, "idem:k1 was never touched: the key must be reserved in Redis as idem:{Idempotency-Key}");
   racer.Join();
-  const auto rows = idemTransactions(ctx);
+  const auto rows = hIdemTransactions(ctx);
   ctx.Equal(rows.size(), 1, "two requests with key k1 arrived together and the journal booked that many transactions: reserving the key must be one atomic SET NX, so only one of them can win");
   std::vector<int> statuses = {first.Status, other.Status};
   std::sort(statuses.begin(), statuses.end());
   ctx.Equal(statuses, {201, 409}, "the two concurrent requests: one creates the transaction (201), the other finds the key reserved with no outcome yet (409)");
   const auto stored = ctx.Redis.Get("idem:k1");
   ctx.Assert(stored.has_value(), "after the request idem:k1 must hold the fingerprint of the body");
-  ctx.Equal(stored, idemDigestOf(idemBody()), "idem:k1 must hold the SHA-256 hex digest of the canonical JSON body (keys sorted, no whitespace)");
+  ctx.Equal(stored, hIdemDigestOf(hIdemBody()), "idem:k1 must hold the SHA-256 hex digest of the canonical JSON body (keys sorted, no whitespace)");
   const auto ttl = ctx.Redis.TTL("idem:k1");
-  ctx.Assert(idemDay - 400 <= ttl && ttl <= idemDay, "the reservation TTL was %d, expected %d s", ttl, idemDay);
-  ctx.Clock.Advance(idemDay - 60);
+  ctx.Assert(kHIdemDay - 400 <= ttl && ttl <= kHIdemDay, "the reservation TTL was %d, expected %d s", ttl, kHIdemDay);
+  ctx.Clock.Advance(kHIdemDay - 60);
   const auto still = ctx.Redis.Get("idem:k1");
   ctx.Equal(still.value_or(""), *stored, "the reservation must still be there just under 24 h later");
   ctx.Clock.Advance(120);
@@ -1603,45 +1603,45 @@ void CheckFingerprintNx(harness::Ctx& ctx) {
 }
 
 void CheckMismatch409(harness::Ctx& ctx) {
-  auto c = idemAPI(ctx);
-  const auto first = idemPost(c, "k1", idemBody());
+  auto c = hIdemAPI(ctx);
+  const auto first = hIdemPost(c, "k1", hIdemBody());
   ctx.Equal(first.Status, 201, "the first request");
-  const auto r = idemPost(c, "k1", idemOther());
+  const auto r = hIdemPost(c, "k1", hIdemOther());
   ctx.Equal(r.Status, 409, "the same key with a different body");
   std::vector<std::string> descriptions;
-  for (const auto& t : idemTransactions(ctx)) descriptions.push_back(t.at("description").String());
+  for (const auto& t : hIdemTransactions(ctx)) descriptions.push_back(t.at("description").String());
   ctx.Equal(descriptions, {"capture ch_1"}, "a mismatching body must not be posted");
   const auto stored = ctx.Redis.Get("idem:k1");
-  ctx.Equal(stored.value_or(""), idemDigestOf(idemBody()), "the mismatching request must not overwrite the stored fingerprint");
-  const auto again = idemPost(c, "k1", idemBody());
+  ctx.Equal(stored.value_or(""), hIdemDigestOf(hIdemBody()), "the mismatching request must not overwrite the stored fingerprint");
+  const auto again = hIdemPost(c, "k1", hIdemBody());
   ctx.Assert(again.Status == 201 && again.Text() == first.Text(), "after the 409 the original request must still replay under its key, got %d %s",
              again.Status, again.Text());
 }
 
 void CheckReplay(harness::Ctx& ctx) {
-  auto c = idemAPI(ctx);
-  const auto first = idemPost(c, "k1", idemBody());
+  auto c = hIdemAPI(ctx);
+  const auto first = hIdemPost(c, "k1", hIdemBody());
   ctx.Equal(first.Status, 201, "the first request");
   ctx.Equal(first.HeaderValue("Idempotent-Replayed"), "", "the first response is not a replay");
-  const auto again = idemPost(c, "k1", idemBody());
+  const auto again = hIdemPost(c, "k1", hIdemBody());
   ctx.Equal(again.Status, 201, "the retry must answer the stored status");
   ctx.Equal(again.JSON(), first.JSON(), "the replay must return the same body");
   ctx.Equal(again.HeaderValue("Idempotent-Replayed"), "true", "a replay carries Idempotent-Replayed: true (headers %v)", again.Header);
-  ctx.Equal(idemTransactions(ctx).size(), 1, "a retry must not post again: transactions in the journal after one request and its retry");
-  const auto reordered = idemPostText(c, "k1", idemReordered);
+  ctx.Equal(hIdemTransactions(ctx).size(), 1, "a retry must not post again: transactions in the journal after one request and its retry");
+  const auto reordered = hIdemPostText(c, "k1", kHIdemReordered);
   ctx.Assert(reordered.Status == 201 && reordered.HeaderValue("Idempotent-Replayed") == "true",
              "the same body with its keys in another order is the same request: canonical JSON before hashing");
   ctx.Equal(reordered.JSON(), first.JSON(), "the reordered retry must replay the first outcome");
-  ctx.Equal(idemTransactions(ctx).size(), 1, "the reordered retry must not post again");
-  const auto other = idemPost(c, "k2", idemBody());
-  ctx.Assert(other.Status == 201 && !(idemJSON(other)["transaction_id"] == idemJSON(first)["transaction_id"]),
+  ctx.Equal(hIdemTransactions(ctx).size(), 1, "the reordered retry must not post again");
+  const auto other = hIdemPost(c, "k2", hIdemBody());
+  ctx.Assert(other.Status == 201 && !(hIdemJSON(other)["transaction_id"] == hIdemJSON(first)["transaction_id"]),
              "a different key is a new transaction");
-  ctx.Equal(idemTransactions(ctx).size(), 2, "a different key must post a second transaction");
+  ctx.Equal(hIdemTransactions(ctx).size(), 2, "a different key must post a second transaction");
 }
 
 void CheckStoreOutcome(harness::Ctx& ctx) {
-  auto c = idemAPI(ctx);
-  auto r = idemPost(c, "k1", idemBody());
+  auto c = hIdemAPI(ctx);
+  auto r = hIdemPost(c, "k1", hIdemBody());
   ctx.Equal(r.Status, 201, "POST /transactions with a fresh key");
   auto stored = ctx.Redis.HGetAll("idem:k1:response");
   ctx.Assert(!stored.empty(), "after the response idem:k1:response must hold the outcome as a hash");
@@ -1649,34 +1649,34 @@ void CheckStoreOutcome(harness::Ctx& ctx) {
   const auto storedBody = harness::ParseJSON(stored["body"]).value_or(harness::Any());
   ctx.Equal(storedBody, r.JSON(), "idem:k1:response body %q differs from the response body", stored["body"]);
   const auto ttl = ctx.Redis.TTL("idem:k1:response");
-  ctx.Assert(idemDay - 400 <= ttl && ttl <= idemDay, "the stored outcome has TTL %d, expected %d s (same as the reservation)", ttl, idemDay);
-  r = idemPost(c, "k2", idemUnbalanced());
+  ctx.Assert(kHIdemDay - 400 <= ttl && ttl <= kHIdemDay, "the stored outcome has TTL %d, expected %d s (same as the reservation)", ttl, kHIdemDay);
+  r = hIdemPost(c, "k2", hIdemUnbalanced());
   ctx.Equal(r.Status, 422, "an unbalanced body must be answered 422");
-  const auto again = idemPost(c, "k2", idemUnbalanced());
+  const auto again = hIdemPost(c, "k2", hIdemUnbalanced());
   ctx.Equal(again.Status, 422, "the retry of a rejected request must replay the stored 422");
   ctx.Equal(again.HeaderValue("Idempotent-Replayed"), "true", "the replayed 422 is a replay too: error outcomes are stored as well");
   ctx.Equal(again.JSON(), r.JSON(), "the replayed 422 must carry the stored reason");
   // Two first requests with one key at once: the second finds the key reserved and no outcome yet.
   std::vector<int> statuses(2);
   {
-    idemThread a, b;
-    a.t = std::thread([&] { statuses[0] = idemPost(c, "k3", idemBody()).Status; });
-    b.t = std::thread([&] { statuses[1] = idemPost(c, "k3", idemBody()).Status; });
+    HIdemThread a, b;
+    a.t = std::thread([&] { statuses[0] = hIdemPost(c, "k3", hIdemBody()).Status; });
+    b.t = std::thread([&] { statuses[1] = hIdemPost(c, "k3", hIdemBody()).Status; });
   }
   std::sort(statuses.begin(), statuses.end());
   ctx.Equal(statuses, {201, 409}, "two simultaneous first requests with key k3: one posts (201), the other is still in progress (409)");
-  ctx.Equal(idemTransactions(ctx).size(), 2, "k1 and k3 must have posted one transaction each");
+  ctx.Equal(hIdemTransactions(ctx).size(), 2, "k1 and k3 must have posted one transaction each");
   // The journal breaks mid-write: from now on an entry of 4999 violates a constraint and the database rolls back.
   ctx.DB.Exec("ALTER TABLE entries ADD CONSTRAINT journal_down CHECK (amount <> 4999) NOT VALID");
-  r = idemPost(c, "k4", idemBody());
+  r = hIdemPost(c, "k4", hIdemBody());
   ctx.Assert(r.Status >= 500, "a write that failed in the database answered %d, expected a 5xx", r.Status);
-  ctx.Equal(idemTransactions(ctx).size(), 2, "the failed write must leave nothing in the journal");
+  ctx.Equal(hIdemTransactions(ctx).size(), 2, "the failed write must leave nothing in the journal");
   ctx.Assert(!ctx.Redis.Get("idem:k4").has_value(), "when the write fails the reservation must be released (DEL), or every retry gets 409 for a day");
   ctx.Equal(ctx.Redis.Exists("idem:k4:response"), 0, "a failure is not an outcome: nothing may be stored for k4");
   ctx.DB.Exec("ALTER TABLE entries DROP CONSTRAINT journal_down");
-  const auto retry = idemPost(c, "k4", idemBody());
+  const auto retry = hIdemPost(c, "k4", hIdemBody());
   ctx.Equal(retry.Status, 201, "once the database is back, the client's retry with the same key must go through (answer %s)", retry.Text());
-  ctx.Equal(idemTransactions(ctx).size(), 3, "the retry must post the k4 transaction exactly once");
+  ctx.Equal(hIdemTransactions(ctx).size(), 3, "the retry must post the k4 transaction exactly once");
 }
 `,
   },

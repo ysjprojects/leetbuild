@@ -1252,44 +1252,44 @@ import (
 )
 
 const (
-	ldTS      = 1700000000000
-	ldLeaders = "place:leaders"
+	kHLdTS      = 1700000000000
+	kHLdLeaders = "place:leaders"
 )
 
 // ldTile is one placement to seed: user on (x, y) with color.
-type ldTile struct {
+type HLdTile struct {
 	user        string
 	x, y, color int
 }
 
 // ldEntry is a history entry as the checks read it.
-type ldEntry struct {
+type HLdEntry struct {
 	User  string \`json:"user"\`
 	Color int    \`json:"color"\`
 	Ts    int64  \`json:"ts"\`
 }
 
 // ldSeed puts placements on the topic as step 3's producer does; a bare user name is one tile on (3, 7).
-func ldSeed(ctx *harness.Ctx, tiles ...ldTile) {
+func hLdSeed(ctx *harness.Ctx, tiles ...HLdTile) {
 	for i, t := range tiles {
-		value, _ := json.Marshal(map[string]any{"user": t.user, "x": t.x, "y": t.y, "color": t.color, "ts": ldTS + i})
+		value, _ := json.Marshal(map[string]any{"user": t.user, "x": t.x, "y": t.y, "color": t.color, "ts": kHLdTS + i})
 		ctx.Kafka.Seed("placements", fmt.Sprintf("%d:%d", t.x, t.y), value)
 	}
 }
 
-func ldAt37(user string) ldTile { return ldTile{user, 3, 7, 12} }
+func hLdAt37(user string) HLdTile { return HLdTile{user, 3, 7, 12} }
 
 // ldRun runs the worker until it returns or waits for records that will not come; what it returned.
-func ldRun(ctx *harness.Ctx) error {
+func hLdRun(ctx *harness.Ctx) error {
 	var err error
 	ctx.Drain(func() { err = run(context.Background()) })
 	return err
 }
 
-func ldUsers(ctx *harness.Ctx, items []string) []string {
+func hLdUsers(ctx *harness.Ctx, items []string) []string {
 	users := []string{}
 	for _, item := range items {
-		var e ldEntry
+		var e HLdEntry
 		ctx.NoError(json.Unmarshal([]byte(item), &e), "a history entry is not JSON: %q", item)
 		users = append(users, e.User)
 	}
@@ -1297,10 +1297,10 @@ func ldUsers(ctx *harness.Ctx, items []string) []string {
 }
 
 func CheckConsumer(ctx *harness.Ctx) {
-	ldSeed(ctx, ldAt37("ana"), ldTile{"bo", 4, 7, 5})
+	hLdSeed(ctx, hLdAt37("ana"), HLdTile{"bo", 4, 7, 5})
 	bo := ctx.Kafka.Records("placements")[1]
 	ctx.Redis.Set("history:4:7", "corrupt") // bo's pixel: the worker's write fails while it handles her tile
-	ldRun(ctx)                              // the worker died on bo's placement
+	hLdRun(ctx)                              // the worker died on bo's placement
 	// The process is stopped (deploy, SIGTERM): its reader leaves the group.
 	config := reader.Config()
 	reader.Close()
@@ -1308,33 +1308,33 @@ func CheckConsumer(ctx *harness.Ctx) {
 	ctx.Assert(committed == -1 || committed <= bo.Offset, "bo's placement never reached her pixel's history, yet group leaderboard committed past it (offset %d) by the time the worker stopped: offsets were acknowledged for what was delivered, not for what was processed. Fetch, write, then CommitMessages", committed)
 	ctx.Redis.Del("history:4:7") // the fault is repaired and the worker restarts
 	reader = kafka.NewReader(config)
-	ctx.NoError(ldRun(ctx), "run returned an error after the restart")
+	ctx.NoError(hLdRun(ctx), "run returned an error after the restart")
 	history := ctx.Redis.LRange("history:4:7", 0, -1)
-	ctx.Assert(len(history) > 0 && ldUsers(ctx, history)[0] == "bo", "after the restart bo's placement must be replayed into history:4:7, which holds %s: it was lost", harness.Show(history))
+	ctx.Assert(len(history) > 0 && hLdUsers(ctx, history)[0] == "bo", "after the restart bo's placement must be replayed into history:4:7, which holds %s: it was lost", harness.Show(history))
 	lag := ctx.Kafka.Lag("leaderboard", "placements")
 	ctx.Assert(lag == 0, "group leaderboard on placements has %d uncommitted record(s) after the worker processed everything: commit each record once it is counted", lag)
 }
 
 func CheckZincrby(ctx *harness.Ctx) {
-	ldSeed(ctx, ldAt37("ana"), ldAt37("bo"), ldTile{"ana", 4, 7, 1}, ldTile{"ana", 5, 7, 2}, ldTile{"cy", 0, 0, 15})
-	ctx.NoError(ldRun(ctx), "run returned an error")
-	ctx.Equal(ctx.Redis.Type(ldLeaders), "zset", "%s must be a sorted set (keys: %s): its type", ldLeaders, harness.Show(ctx.Redis.Keys("*")))
+	hLdSeed(ctx, hLdAt37("ana"), hLdAt37("bo"), HLdTile{"ana", 4, 7, 1}, HLdTile{"ana", 5, 7, 2}, HLdTile{"cy", 0, 0, 15})
+	ctx.NoError(hLdRun(ctx), "run returned an error")
+	ctx.Equal(ctx.Redis.Type(kHLdLeaders), "zset", "%s must be a sorted set (keys: %s): its type", kHLdLeaders, harness.Show(ctx.Redis.Keys("*")))
 	for _, want := range []struct {
 		user  string
 		tiles int
 	}{{"ana", 3}, {"bo", 1}, {"cy", 1}} {
-		score, _ := ctx.Redis.ZScore(ldLeaders, want.user)
-		ctx.Equal(score, want.tiles, "%s's score in %s", want.user, ldLeaders)
+		score, _ := ctx.Redis.ZScore(kHLdLeaders, want.user)
+		ctx.Equal(score, want.tiles, "%s's score in %s", want.user, kHLdLeaders)
 	}
 }
 
 func CheckHistoryCapped(ctx *harness.Ctx) {
-	tiles := []ldTile{}
+	tiles := []HLdTile{}
 	for i := 0; i < 12; i++ {
-		tiles = append(tiles, ldTile{fmt.Sprintf("u%02d", i), 3, 7, i % 16})
+		tiles = append(tiles, HLdTile{fmt.Sprintf("u%02d", i), 3, 7, i % 16})
 	}
-	ldSeed(ctx, append(tiles, ldTile{"zed", 4, 7, 5})...)
-	ctx.NoError(ldRun(ctx), "run returned an error")
+	hLdSeed(ctx, append(tiles, HLdTile{"zed", 4, 7, 5})...)
+	ctx.NoError(hLdRun(ctx), "run returned an error")
 	key := historyKey(3, 7)
 	ctx.Equal(key, "history:3:7", "historyKey(3, 7)")
 	ctx.Equal(ctx.Redis.Type(key), "list", "%s must be a list (keys: %s): its type", key, harness.Show(ctx.Redis.Keys("*")))
@@ -1344,16 +1344,16 @@ func CheckHistoryCapped(ctx *harness.Ctx) {
 	for i := 11; i > 1; i-- {
 		want = append(want, fmt.Sprintf("u%02d", i))
 	}
-	ctx.Equal(ldUsers(ctx, items), want, "the list must be newest first and keep the last 10: its users")
-	var first ldEntry
+	ctx.Equal(hLdUsers(ctx, items), want, "the list must be newest first and keep the last 10: its users")
+	var first HLdEntry
 	ctx.NoError(json.Unmarshal([]byte(items[0]), &first), "a history entry is not JSON")
-	ctx.Assert(first.Color == 11 && first.Ts == ldTS+11, "each entry carries user, color and ts: %s", items[0])
+	ctx.Assert(first.Color == 11 && first.Ts == kHLdTS+11, "each entry carries user, color and ts: %s", items[0])
 	other := ctx.Redis.LRange("history:4:7", 0, -1)
-	ctx.Assert(len(other) > 0 && ldUsers(ctx, other)[0] == "zed", "every pixel has its own list")
+	ctx.Assert(len(other) > 0 && hLdUsers(ctx, other)[0] == "zed", "every pixel has its own list")
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	ldSeed(ctx, ldAt37("ana"))
+	hLdSeed(ctx, hLdAt37("ana"))
 	ctx.Kafka.Seed("placements", "bad", "not json")
 	ctx.Kafka.Seed("placements", "bad", \`{"user":"ghost"}\`)
 	placement := ctx.Kafka.Records("placements")[0]
@@ -1369,10 +1369,10 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 		for tp, offset := range offsets {
 			s.offsets[tp] = offset
 		}
-		s.score, s.scored = ctx.Redis.ZScore(ldLeaders, "ana")
+		s.score, s.scored = ctx.Redis.ZScore(kHLdLeaders, "ana")
 		atCommit = append(atCommit, s)
 	})
-	ctx.NoError(ldRun(ctx), "run returned an error")
+	ctx.NoError(hLdRun(ctx), "run returned an error")
 	ctx.Assert(len(atCommit) > 0, "no offset was ever committed")
 	var covering []snapshot
 	for _, s := range atCommit {
@@ -1384,17 +1384,17 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 	c := covering[0]
 	ctx.Assert(c.scored && c.score == 1 && c.history == 1, "the commit must come after ZINCRBY and LPUSH: when ana's placement was committed the score was %v (present: %v) and the history held %d entries", c.score, c.scored, c.history)
 	ctx.Equal(ctx.Kafka.Lag("leaderboard", "placements"), 0, "malformed records must be skipped and committed, not left to replay forever: the lag")
-	ctx.Assert(ctx.Redis.ZCard(ldLeaders) == 1, "malformed records must not be counted: %v", ctx.Redis.ZRangeWithScores(ldLeaders, 0, -1))
+	ctx.Assert(ctx.Redis.ZCard(kHLdLeaders) == 1, "malformed records must not be counted: %v", ctx.Redis.ZRangeWithScores(kHLdLeaders, 0, -1))
 }
 
 func CheckEndpoints(ctx *harness.Ctx) {
-	args := []any{"ZADD", ldLeaders}
+	args := []any{"ZADD", kHLdLeaders}
 	for i := 0; i < 12; i++ {
 		args = append(args, 100-i, fmt.Sprintf("user%02d", i))
 	}
 	ctx.Redis.Do(args...)
 	for i := 0; i < 3; i++ {
-		entry, _ := json.Marshal(ldEntry{User: fmt.Sprintf("u%d", i), Color: i, Ts: ldTS + int64(i)})
+		entry, _ := json.Marshal(HLdEntry{User: fmt.Sprintf("u%d", i), Color: i, Ts: kHLdTS + int64(i)})
 		ctx.Redis.Do("LPUSH", "history:3:7", string(entry))
 	}
 	api := ctx.Main(main).HTTP()
@@ -1420,7 +1420,7 @@ func CheckEndpoints(ctx *harness.Ctx) {
 		got = append(got, e["user"])
 	}
 	ctx.Equal(got, []any{"u2", "u1", "u0"}, "history must be newest first with user, color and ts (%s): its users", r.Text())
-	ctx.Equal(entries[0], map[string]any{"user": "u2", "color": 2.0, "ts": float64(ldTS + 2)}, "each entry is the stored document")
+	ctx.Equal(entries[0], map[string]any{"user": "u2", "color": 2.0, "ts": float64(kHLdTS + 2)}, "each entry is the stored document")
 	r = api.Get("/history?x=0&y=0")
 	ctx.Assert(r.Status == 200, "a pixel nobody painted has an empty history, got %d %s", r.Status, r.Text())
 	var empty []any
@@ -1438,29 +1438,29 @@ func CheckEndpoints(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr int64_t ldTS = 1700000000000LL;
-const std::string ldLeaders = "place:leaders";
+constexpr int64_t kHLdTS = 1700000000000LL;
+const std::string kHLdLeaders = "place:leaders";
 
 // ldTile is one placement to seed: user on (x, y) with color.
-struct ldTile {
+struct HLdTile {
   std::string user;
   int x, y, color;
 };
 
 // ldSeed puts placements on the topic as step 3's producer does.
-void ldSeed(harness::Ctx& ctx, const std::vector<ldTile>& tiles) {
+void hLdSeed(harness::Ctx& ctx, const std::vector<HLdTile>& tiles) {
   for (size_t i = 0; i < tiles.size(); i++) {
     const auto& t = tiles[i];
-    const nlohmann::json value = {{"user", t.user}, {"x", t.x}, {"y", t.y}, {"color", t.color}, {"ts", ldTS + static_cast<int64_t>(i)}};
+    const nlohmann::json value = {{"user", t.user}, {"x", t.x}, {"y", t.y}, {"color", t.color}, {"ts", kHLdTS + static_cast<int64_t>(i)}};
     ctx.Kafka.Seed("placements", std::to_string(t.x) + ":" + std::to_string(t.y), value.dump());
   }
 }
 
-ldTile ldAt37(const std::string& user) { return {user, 3, 7, 12}; }
+HLdTile hLdAt37(const std::string& user) { return {user, 3, 7, 12}; }
 
 // ldRun runs the worker until it returns or waits for records that will not come; what it threw
 // (Go's run returns an error; the C++ worker's failure is an exception escaping run).
-std::optional<std::string> ldRun(harness::Ctx& ctx) {
+std::optional<std::string> hLdRun(harness::Ctx& ctx) {
   // The worker polls with consume(1000): a few idle seconds, then it counts as waiting (Go's reader
   // blocks without a clock).
   ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 5);
@@ -1475,11 +1475,11 @@ std::optional<std::string> ldRun(harness::Ctx& ctx) {
   return err;
 }
 
-void ldNoError(harness::Ctx& ctx, const std::optional<std::string>& err, const char* what) {
+void hLdNoError(harness::Ctx& ctx, const std::optional<std::string>& err, const char* what) {
   if (err) ctx.Fatalf("%s: %s", what, *err);
 }
 
-std::vector<std::string> ldUsers(harness::Ctx& ctx, const std::vector<std::string>& items) {
+std::vector<std::string> hLdUsers(harness::Ctx& ctx, const std::vector<std::string>& items) {
   std::vector<std::string> users;
   for (const auto& item : items) {
     const auto e = nlohmann::json::parse(item, nullptr, false);
@@ -1492,39 +1492,39 @@ std::vector<std::string> ldUsers(harness::Ctx& ctx, const std::vector<std::strin
 }  // namespace
 
 void CheckConsumer(harness::Ctx& ctx) {
-  ldSeed(ctx, {ldAt37("ana"), {"bo", 4, 7, 5}});
+  hLdSeed(ctx, {hLdAt37("ana"), {"bo", 4, 7, 5}});
   const auto bo = ctx.Kafka.Records("placements")[1];
   ctx.Redis.Set("history:4:7", "corrupt");  // bo's pixel: the worker's write fails while it handles her tile
-  ldRun(ctx);                               // the worker died on bo's placement
+  hLdRun(ctx);                               // the worker died on bo's placement
   // The process is stopped (deploy, SIGTERM): its consumer leaves the group.
   consumer->close();
   const int64_t committed = ctx.Kafka.CommittedOffset("leaderboard", "placements", bo.Partition);
   ctx.Assert(committed == -1 || committed <= bo.Offset, "bo's placement never reached her pixel's history, yet group leaderboard committed past it (offset %d) by the time the worker stopped: offsets were acknowledged for what was delivered, not for what was processed. Consume, write, then commit", committed);
   ctx.Redis.Del("history:4:7");  // the fault is repaired and the worker restarts
   consumer = make_consumer();
-  ldNoError(ctx, ldRun(ctx), "run threw after the restart");
+  hLdNoError(ctx, hLdRun(ctx), "run threw after the restart");
   const auto history = ctx.Redis.LRange("history:4:7", 0, -1);
-  ctx.Assert(!history.empty() && ldUsers(ctx, history)[0] == "bo", "after the restart bo's placement must be replayed into history:4:7, which holds %v: it was lost", history);
+  ctx.Assert(!history.empty() && hLdUsers(ctx, history)[0] == "bo", "after the restart bo's placement must be replayed into history:4:7, which holds %v: it was lost", history);
   const int64_t lag = ctx.Kafka.Lag("leaderboard", "placements");
   ctx.Assert(lag == 0, "group leaderboard on placements has %d uncommitted record(s) after the worker processed everything: commit each record once it is counted", lag);
 }
 
 void CheckZincrby(harness::Ctx& ctx) {
-  ldSeed(ctx, {ldAt37("ana"), ldAt37("bo"), {"ana", 4, 7, 1}, {"ana", 5, 7, 2}, {"cy", 0, 0, 15}});
-  ldNoError(ctx, ldRun(ctx), "run threw");
-  ctx.Equal(ctx.Redis.Type(ldLeaders), "zset", "%s must be a sorted set (keys: %v): its type", ldLeaders, ctx.Redis.Keys("*"));
+  hLdSeed(ctx, {hLdAt37("ana"), hLdAt37("bo"), {"ana", 4, 7, 1}, {"ana", 5, 7, 2}, {"cy", 0, 0, 15}});
+  hLdNoError(ctx, hLdRun(ctx), "run threw");
+  ctx.Equal(ctx.Redis.Type(kHLdLeaders), "zset", "%s must be a sorted set (keys: %v): its type", kHLdLeaders, ctx.Redis.Keys("*"));
   for (const auto& [user, tiles] : std::vector<std::pair<std::string, int>>{{"ana", 3}, {"bo", 1}, {"cy", 1}}) {
-    const double score = ctx.Redis.ZScore(ldLeaders, user).value_or(0);
-    ctx.Equal(score, tiles, "%s's score in %s", user, ldLeaders);
+    const double score = ctx.Redis.ZScore(kHLdLeaders, user).value_or(0);
+    ctx.Equal(score, tiles, "%s's score in %s", user, kHLdLeaders);
   }
 }
 
 void CheckHistoryCapped(harness::Ctx& ctx) {
-  std::vector<ldTile> tiles;
+  std::vector<HLdTile> tiles;
   for (int i = 0; i < 12; i++) tiles.push_back({harness::Sprintf("u%02d", i), 3, 7, i % 16});
   tiles.push_back({"zed", 4, 7, 5});
-  ldSeed(ctx, tiles);
-  ldNoError(ctx, ldRun(ctx), "run threw");
+  hLdSeed(ctx, tiles);
+  hLdNoError(ctx, hLdRun(ctx), "run threw");
   const std::string key = history_key(3, 7);
   ctx.Equal(key, "history:3:7", "history_key(3, 7)");
   ctx.Equal(ctx.Redis.Type(key), "list", "%s must be a list (keys: %v): its type", key, ctx.Redis.Keys("*"));
@@ -1532,16 +1532,16 @@ void CheckHistoryCapped(harness::Ctx& ctx) {
   ctx.Assert(items.size() == 10, "%s holds %d entries after 12 placements, expected kHistoryLen = 10 (LPUSH + LTRIM 0 9)", key, items.size());
   std::vector<std::string> want;
   for (int i = 11; i > 1; i--) want.push_back(harness::Sprintf("u%02d", i));
-  ctx.Equal(ldUsers(ctx, items), want, "the list must be newest first and keep the last 10: its users");
+  ctx.Equal(hLdUsers(ctx, items), want, "the list must be newest first and keep the last 10: its users");
   const auto first = nlohmann::json::parse(items[0], nullptr, false);
   ctx.Assert(first.is_object(), "a history entry is not JSON");
-  ctx.Assert(first.value("color", -1) == 11 && first.value("ts", int64_t{0}) == ldTS + 11, "each entry carries user, color and ts: %s", items[0]);
+  ctx.Assert(first.value("color", -1) == 11 && first.value("ts", int64_t{0}) == kHLdTS + 11, "each entry carries user, color and ts: %s", items[0]);
   const auto other = ctx.Redis.LRange("history:4:7", 0, -1);
-  ctx.Assert(!other.empty() && ldUsers(ctx, other)[0] == "zed", "every pixel has its own list");
+  ctx.Assert(!other.empty() && hLdUsers(ctx, other)[0] == "zed", "every pixel has its own list");
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  ldSeed(ctx, {ldAt37("ana")});
+  hLdSeed(ctx, {hLdAt37("ana")});
   ctx.Kafka.Seed("placements", "bad", "not json");
   ctx.Kafka.Seed("placements", "bad", R"({"user":"ghost"})");
   const auto placement = ctx.Kafka.Records("placements")[0];
@@ -1552,9 +1552,9 @@ void CheckCommitAfter(harness::Ctx& ctx) {
   };
   std::vector<snapshot> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
-    atCommit.push_back({offsets, ctx.Redis.ZScore(ldLeaders, "ana"), ctx.Redis.LLen("history:3:7")});
+    atCommit.push_back({offsets, ctx.Redis.ZScore(kHLdLeaders, "ana"), ctx.Redis.LLen("history:3:7")});
   });
-  ldNoError(ctx, ldRun(ctx), "run threw");
+  hLdNoError(ctx, hLdRun(ctx), "run threw");
   ctx.Assert(!atCommit.empty(), "no offset was ever committed");
   std::vector<snapshot> covering;
   for (const auto& s : atCommit) {
@@ -1565,18 +1565,18 @@ void CheckCommitAfter(harness::Ctx& ctx) {
   const auto& c = covering[0];
   ctx.Assert(c.score && *c.score == 1 && c.history == 1, "the commit must come after ZINCRBY and LPUSH: when ana's placement was committed the score was %v (present: %v) and the history held %d entries", c.score.value_or(0), c.score.has_value(), c.history);
   ctx.Equal(ctx.Kafka.Lag("leaderboard", "placements"), 0, "malformed records must be skipped and committed, not left to replay forever: the lag");
-  ctx.Assert(ctx.Redis.ZCard(ldLeaders) == 1, "malformed records must not be counted: %v", ctx.Redis.ZRangeWithScores(ldLeaders, 0, -1));
+  ctx.Assert(ctx.Redis.ZCard(kHLdLeaders) == 1, "malformed records must not be counted: %v", ctx.Redis.ZRangeWithScores(kHLdLeaders, 0, -1));
 }
 
 void CheckEndpoints(harness::Ctx& ctx) {
-  std::vector<std::string> args = {"ZADD", ldLeaders};
+  std::vector<std::string> args = {"ZADD", kHLdLeaders};
   for (int i = 0; i < 12; i++) {
     args.push_back(std::to_string(100 - i));
     args.push_back(harness::Sprintf("user%02d", i));
   }
   ctx.Redis.Must(args);
   for (int i = 0; i < 3; i++) {
-    const nlohmann::json entry = {{"user", "u" + std::to_string(i)}, {"color", i}, {"ts", ldTS + i}};
+    const nlohmann::json entry = {{"user", "u" + std::to_string(i)}, {"color", i}, {"ts", kHLdTS + i}};
     ctx.Redis.Do("LPUSH", "history:3:7", entry.dump());
   }
   auto api = ctx.Main().HTTP();
@@ -1601,7 +1601,7 @@ void CheckEndpoints(harness::Ctx& ctx) {
   nlohmann::json got = nlohmann::json::array();
   for (const auto& e : entries) got.push_back(e.value("user", nlohmann::json()));
   ctx.Equal(got, nlohmann::json{"u2", "u1", "u0"}, "history must be newest first with user, color and ts (%s): its users", r.Text());
-  ctx.Equal(entries[0], nlohmann::json{{"user", "u2"}, {"color", 2}, {"ts", ldTS + 2}}, "each entry is the stored document");
+  ctx.Equal(entries[0], nlohmann::json{{"user", "u2"}, {"color", 2}, {"ts", kHLdTS + 2}}, "each entry is the stored document");
   r = api.Get("/history?x=0&y=0");
   ctx.Assert(r.Status == 200, "a pixel nobody painted has an empty history, got %d %s", r.Status, r.Text());
   const auto empty = nlohmann::json::parse(r.Text(), nullptr, false);

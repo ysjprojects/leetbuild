@@ -1045,13 +1045,13 @@ import (
 )
 
 var (
-	caBg      = context.Background()
-	caProduct = Product{"id": "42", "name": "Espresso machine", "price_cents": 24900, "tags": []string{"kitchen", "coffee"}}
+	hCaBg      = context.Background()
+	hCaProduct = Product{"id": "42", "name": "Espresso machine", "price_cents": 24900, "tags": []string{"kitchen", "coffee"}}
 )
 
 // caJSON is v as JSON decodes it (numbers float64, arrays []any), so a product compares the same
 // whether load returned it or the cache decoded it; a nil Product is nil.
-func caJSON(ctx *harness.Ctx, v any) any {
+func hCaJSON(ctx *harness.Ctx, v any) any {
 	body, err := json.Marshal(v)
 	ctx.NoError(err, "the product %v does not encode as JSON", v)
 	var out any
@@ -1060,7 +1060,7 @@ func caJSON(ctx *harness.Ctx, v any) any {
 }
 
 // caStored is the JSON value at key, decoded.
-func caStored(ctx *harness.Ctx, key string) any {
+func hCaStored(ctx *harness.Ctx, key string) any {
 	raw, ok := ctx.Redis.Get(key)
 	ctx.Assert(ok, "%s must hold the product's JSON, it does not exist", key)
 	var out any
@@ -1069,22 +1069,22 @@ func caStored(ctx *harness.Ctx, key string) any {
 }
 
 // caField is one field of a decoded product (nil when the product is nil).
-func caField(product any, field string) any {
+func hCaField(product any, field string) any {
 	fields, _ := product.(map[string]any)
 	return fields[field]
 }
 
-func caGet(ctx *harness.Ctx, productID string, load Load) any {
-	product, err := getProduct(caBg, productID, load)
+func hCaGet(ctx *harness.Ctx, productID string, load Load) any {
+	product, err := getProduct(hCaBg, productID, load)
 	ctx.NoError(err, "getProduct(%q) returned an error", productID)
-	return caJSON(ctx, product)
+	return hCaJSON(ctx, product)
 }
 
-func caInvalidate(ctx *harness.Ctx, productID string) {
-	ctx.NoError(invalidate(caBg, productID), "invalidate(%q) returned an error", productID)
+func hCaInvalidate(ctx *harness.Ctx, productID string) {
+	ctx.NoError(invalidate(hCaBg, productID), "invalidate(%q) returned an error", productID)
 }
 
-func caCached(ctx *harness.Ctx, key string) any {
+func hCaCached(ctx *harness.Ctx, key string) any {
 	if raw, ok := ctx.Redis.Get(key); ok {
 		return raw
 	}
@@ -1093,13 +1093,13 @@ func caCached(ctx *harness.Ctx, key string) any {
 
 // caSource is a slow source the harness can count: returns catalogue[id] (nil when absent); asserts
 // the fill lock is held while it runs.
-type caSource struct {
+type HCaSource struct {
 	ctx       *harness.Ctx
 	catalogue map[string]Product
 	calls     []string
 }
 
-func (s *caSource) load(productID string) (Product, error) {
+func (s *HCaSource) load(productID string) (Product, error) {
 	s.calls = append(s.calls, productID)
 	ttl := s.ctx.Redis.TTL("lock:product:" + productID)
 	s.ctx.Assert(0 < ttl && ttl <= 5, "load must run under lock:product:%s with SET NX EX 5; its TTL is %d (-2 = no lock, -1 = no expiry)", productID, ttl)
@@ -1107,7 +1107,7 @@ func (s *caSource) load(productID string) (Product, error) {
 }
 
 // caCall is a getProduct running in its own goroutine, as a second worker's request.
-type caCall struct {
+type HCaCall struct {
 	productID string
 	done      chan struct{}
 	product   Product
@@ -1115,18 +1115,18 @@ type caCall struct {
 	failure   any
 }
 
-func caGo(productID string, load Load) *caCall {
-	call := &caCall{productID: productID, done: make(chan struct{})}
+func hCaGo(productID string, load Load) *HCaCall {
+	call := &HCaCall{productID: productID, done: make(chan struct{})}
 	go func() {
 		defer close(call.done)
 		defer func() { call.failure = recover() }()
-		call.product, call.err = getProduct(caBg, productID, load)
+		call.product, call.err = getProduct(hCaBg, productID, load)
 	}()
 	return call
 }
 
 // result lets the call finish and returns what it returned, decoded as JSON.
-func (call *caCall) result(ctx *harness.Ctx) any {
+func (call *HCaCall) result(ctx *harness.Ctx) any {
 	ctx.Settle()
 	select {
 	case <-call.done:
@@ -1137,94 +1137,94 @@ func (call *caCall) result(ctx *harness.Ctx) any {
 		panic(call.failure)
 	}
 	ctx.NoError(call.err, "the concurrent getProduct(%q) returned an error", call.productID)
-	return caJSON(ctx, call.product)
+	return hCaJSON(ctx, call.product)
 }
 
 func CheckMissThenHit(ctx *harness.Ctx) {
-	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
-	want := caJSON(ctx, caProduct)
-	ctx.Equal(caGet(ctx, "42", src.load), want, "a miss must return what load returned")
+	src := &HCaSource{ctx: ctx, catalogue: map[string]Product{"42": hCaProduct}}
+	want := hCaJSON(ctx, hCaProduct)
+	ctx.Equal(hCaGet(ctx, "42", src.load), want, "a miss must return what load returned")
 	ctx.Equal(src.calls, []string{"42"}, "a miss calls load once with the product id: the load calls")
 	ctx.Assert(ctx.Redis.Exists("product:42") == 1, "the product must be written to product:42")
-	ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold exactly the JSON load returned")
+	ctx.Equal(hCaStored(ctx, "product:42"), want, "product:42 must hold exactly the JSON load returned")
 	ttl := ctx.Redis.TTL("product:42")
 	ctx.Assert(3590 < ttl && ttl <= 3600, "product:42 must expire in 3600 s (ttl); its TTL is %d", ttl)
-	ctx.Equal(caGet(ctx, "42", src.load), want, "a hit must return the cached product")
+	ctx.Equal(hCaGet(ctx, "42", src.load), want, "a hit must return the cached product")
 	ctx.Equal(len(src.calls), 1, "a hit must not call load: the number of load calls")
-	ctx.Equal(caGet(ctx, "42", src.load), want, "the second hit")
+	ctx.Equal(hCaGet(ctx, "42", src.load), want, "the second hit")
 	ctx.Equal(len(src.calls), 1, "the number of load calls after two hits")
 	ctx.Clock.Advance(3601)
-	ctx.Equal(caCached(ctx, "product:42"), nil, "after 3600 s the key must have expired")
-	ctx.Equal(caGet(ctx, "42", src.load), want, "the call after the TTL")
+	ctx.Equal(hCaCached(ctx, "product:42"), nil, "after 3600 s the key must have expired")
+	ctx.Equal(hCaGet(ctx, "42", src.load), want, "the call after the TTL")
 	ctx.Equal(src.calls, []string{"42", "42"}, "once the TTL has passed the next call must load again: the load calls")
 	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after a fill")
 }
 
 func CheckNegativeCache(ctx *harness.Ctx) {
-	src := &caSource{ctx: ctx, catalogue: map[string]Product{}}
-	ctx.Equal(caGet(ctx, "7", src.load), nil, "a product the source does not have is nil")
+	src := &HCaSource{ctx: ctx, catalogue: map[string]Product{}}
+	ctx.Equal(hCaGet(ctx, "7", src.load), nil, "a product the source does not have is nil")
 	ctx.Equal(src.calls, []string{"7"}, "the load calls")
-	ctx.Equal(caCached(ctx, "product:7"), "__missing__", "a missing product must be cached as the sentinel %q: product:7", "__missing__")
+	ctx.Equal(hCaCached(ctx, "product:7"), "__missing__", "a missing product must be cached as the sentinel %q: product:7", "__missing__")
 	ttl := ctx.Redis.TTL("product:7")
 	ctx.Assert(50 < ttl && ttl <= 60, "the sentinel must expire in 60 s (missingTTL); its TTL is %d", ttl)
-	ctx.Equal(caGet(ctx, "7", src.load), nil, "the sentinel must be served as nil")
-	ctx.Equal(caGet(ctx, "7", src.load), nil, "the sentinel served a second time")
+	ctx.Equal(hCaGet(ctx, "7", src.load), nil, "the sentinel must be served as nil")
+	ctx.Equal(hCaGet(ctx, "7", src.load), nil, "the sentinel served a second time")
 	ctx.Equal(len(src.calls), 1, "the sentinel must answer without calling load: the number of load calls")
 	src.catalogue["7"] = Product{"id": "7", "name": "Grinder"}
-	ctx.Equal(caGet(ctx, "7", src.load), nil, "while the sentinel lives a product that appeared in the source is still unseen")
+	ctx.Equal(hCaGet(ctx, "7", src.load), nil, "while the sentinel lives a product that appeared in the source is still unseen")
 	ctx.Clock.Advance(61)
-	grinder := caJSON(ctx, Product{"id": "7", "name": "Grinder"})
-	ctx.Equal(caGet(ctx, "7", src.load), grinder, "after 60 s the source is asked again")
+	grinder := hCaJSON(ctx, Product{"id": "7", "name": "Grinder"})
+	ctx.Equal(hCaGet(ctx, "7", src.load), grinder, "after 60 s the source is asked again")
 	ctx.Equal(src.calls, []string{"7", "7"}, "the load calls")
-	ctx.Equal(caStored(ctx, "product:7"), grinder, "product:7 must hold the product loaded after the sentinel expired")
+	ctx.Equal(hCaStored(ctx, "product:7"), grinder, "product:7 must hold the product loaded after the sentinel expired")
 }
 
 func CheckInvalidate(ctx *harness.Ctx) {
-	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
-	ctx.Equal(caGet(ctx, "42", src.load), caJSON(ctx, caProduct), "the first call returns the product")
+	src := &HCaSource{ctx: ctx, catalogue: map[string]Product{"42": hCaProduct}}
+	ctx.Equal(hCaGet(ctx, "42", src.load), hCaJSON(ctx, hCaProduct), "the first call returns the product")
 	src.catalogue["42"] = Product{"id": "42", "name": "Espresso machine", "price_cents": 19900, "tags": []string{"kitchen", "coffee"}}
-	ctx.Equal(caField(caGet(ctx, "42", src.load), "price_cents"), 24900, "until invalidated, the cached price is served")
-	caInvalidate(ctx, "42")
-	ctx.Equal(caCached(ctx, "product:42"), nil, "invalidate must delete product:42")
-	ctx.Equal(caField(caGet(ctx, "42", src.load), "price_cents"), 19900, "after invalidate the next call must load the new product")
+	ctx.Equal(hCaField(hCaGet(ctx, "42", src.load), "price_cents"), 24900, "until invalidated, the cached price is served")
+	hCaInvalidate(ctx, "42")
+	ctx.Equal(hCaCached(ctx, "product:42"), nil, "invalidate must delete product:42")
+	ctx.Equal(hCaField(hCaGet(ctx, "42", src.load), "price_cents"), 19900, "after invalidate the next call must load the new product")
 	ctx.Equal(src.calls, []string{"42", "42"}, "invalidate then get must load exactly once more: the load calls")
-	ctx.Equal(caField(caStored(ctx, "product:42"), "price_cents"), 19900, "the reloaded product must be cached")
-	ctx.Equal(caGet(ctx, "9", src.load), nil, "an unknown product is nil")
-	ctx.Equal(caCached(ctx, "product:9"), "__missing__", "product:9 must hold the sentinel")
+	ctx.Equal(hCaField(hCaStored(ctx, "product:42"), "price_cents"), 19900, "the reloaded product must be cached")
+	ctx.Equal(hCaGet(ctx, "9", src.load), nil, "an unknown product is nil")
+	ctx.Equal(hCaCached(ctx, "product:9"), "__missing__", "product:9 must hold the sentinel")
 	src.catalogue["9"] = Product{"id": "9"}
-	caInvalidate(ctx, "9")
-	ctx.Equal(caGet(ctx, "9", src.load), caJSON(ctx, Product{"id": "9"}), "invalidate must also clear a sentinel: a product created after a miss becomes visible")
-	caInvalidate(ctx, "never-cached")
+	hCaInvalidate(ctx, "9")
+	ctx.Equal(hCaGet(ctx, "9", src.load), hCaJSON(ctx, Product{"id": "9"}), "invalidate must also clear a sentinel: a product created after a miss becomes visible")
+	hCaInvalidate(ctx, "never-cached")
 	ctx.Equal(ctx.Redis.Keys("*"), []string{"product:42", "product:9"}, "invalidating an unknown id must touch nothing else: the keys")
 }
 
 func CheckSingleFlight(ctx *harness.Ctx) {
-	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
-	want := caJSON(ctx, caProduct)
+	src := &HCaSource{ctx: ctx, catalogue: map[string]Product{"42": hCaProduct}}
+	want := hCaJSON(ctx, hCaProduct)
 	// The second worker's request lands the instant the first one has taken the lock, before it has loaded anything.
-	var second *caCall
+	var second *HCaCall
 	probe := ctx.Redis.After("lock:product:42", func() any {
-		second = caGo("42", src.load)
+		second = hCaGo("42", src.load)
 		return nil
 	})
-	first := caGet(ctx, "42", src.load)
+	first := hCaGet(ctx, "42", src.load)
 	ctx.Assert(probe.Fired, "a miss must take lock:product:42")
 	ctx.Equal(first, want, "the first caller must return the product")
 	ctx.Equal(second.result(ctx), want, "the caller that lost the lock must return what the winner wrote")
 	ctx.Assert(len(src.calls) == 1, "two concurrent misses must call load once, it was called %d times: the loser polls product:42 every 50 ms instead of loading", len(src.calls))
 	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "lock:product:42 must be deleted once the fill is done")
-	ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold the product")
+	ctx.Equal(hCaStored(ctx, "product:42"), want, "product:42 must hold the product")
 	// The other order: the second request lands between the first one's miss and its lock, fills, and releases.
-	src2 := &caSource{ctx: ctx, catalogue: map[string]Product{"43": {"id": "43"}}}
-	want2 := caJSON(ctx, Product{"id": "43"})
+	src2 := &HCaSource{ctx: ctx, catalogue: map[string]Product{"43": {"id": "43"}}}
+	want2 := hCaJSON(ctx, Product{"id": "43"})
 	var third any
 	probe2 := ctx.Redis.After("product:43", func() any {
-		product, err := getProduct(caBg, "43", src2.load)
+		product, err := getProduct(hCaBg, "43", src2.load)
 		ctx.NoError(err, "the concurrent getProduct(%q) returned an error", "43")
-		third = caJSON(ctx, product)
+		third = hCaJSON(ctx, product)
 		return nil
 	})
-	ctx.Equal(caGet(ctx, "43", src2.load), want2, "the first caller must return product 43")
+	ctx.Equal(hCaGet(ctx, "43", src2.load), want2, "the first caller must return product 43")
 	ctx.Assert(probe2.Err == nil, "the concurrent getProduct(%q) failed: %v", "43", probe2.Err)
 	ctx.Equal(third, want2, "the concurrent caller must return product 43")
 	ctx.Assert(len(src2.calls) == 1, "when the other request fills the key between this one's miss and its lock, load must still run once (it ran %d times): GET the key again after winning the lock", len(src2.calls))
@@ -1237,14 +1237,14 @@ func CheckLockReleased(ctx *harness.Ctx) {
 		attempts = append(attempts, productID)
 		return nil, errors.New("catalogue unreachable")
 	}
-	_, err := getProduct(caBg, "42", failing)
+	_, err := getProduct(hCaBg, "42", failing)
 	ctx.Assert(err != nil && strings.Contains(err.Error(), "catalogue unreachable"), "when load fails, getProduct must return that error, not swallow it or cache anything: it returned %v", err)
 	ctx.Equal(attempts, []string{"42"}, "the load attempts")
-	ctx.Equal(caCached(ctx, "product:42"), nil, "a failed load must cache nothing, not the sentinel either")
+	ctx.Equal(hCaCached(ctx, "product:42"), nil, "a failed load must cache nothing, not the sentinel either")
 	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "a failed fill must delete lock:product:42: otherwise every caller waits 5 s for a fill that will never come")
-	src := &caSource{ctx: ctx, catalogue: map[string]Product{"42": caProduct}}
+	src := &HCaSource{ctx: ctx, catalogue: map[string]Product{"42": hCaProduct}}
 	sleeps := ctx.Clock.Sleeps()
-	ctx.Equal(caGet(ctx, "42", src.load), caJSON(ctx, caProduct), "the next call after a failure must take the lock and load")
+	ctx.Equal(hCaGet(ctx, "42", src.load), hCaJSON(ctx, hCaProduct), "the next call after a failure must take the lock and load")
 	ctx.Equal(src.calls, []string{"42"}, "the load calls")
 	ctx.Equal(ctx.Clock.Sleeps(), sleeps, "the next call after a failure must not have to wait: the lock was released, so it wins it at once (sleeps)")
 	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill")
@@ -1257,15 +1257,15 @@ func CheckStaleLock(ctx *harness.Ctx) {
 		calls = append(calls, productID)
 		held, _ := ctx.Redis.Get("lock:product:42")
 		ctx.Assert(held != "stale", "load ran while another worker's lock was still alive: a loser must wait for the lock's TTL, not load on its own")
-		return caProduct, nil
+		return hCaProduct, nil
 	}
 	started := ctx.Clock.Now()
-	ctx.Equal(caGet(ctx, "42", load), caJSON(ctx, caProduct), "once the stale lock has expired the caller must load and return the product")
+	ctx.Equal(hCaGet(ctx, "42", load), hCaJSON(ctx, hCaProduct), "once the stale lock has expired the caller must load and return the product")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(waited >= 4.9, "the caller must poll every 50 ms for the lock's TTL (5 s) before giving up on the holder; it waited %.2f s", waited)
 	ctx.Assert(waited < 12, "the wait is bounded by the lock's TTL; this took %.2f s of virtual time", waited)
 	ctx.Assert(len(calls) == 1, "the stale lock must cost exactly one load; load was called %d times", len(calls))
-	ctx.Equal(caStored(ctx, "product:42"), caJSON(ctx, caProduct), "product:42 must hold the product")
+	ctx.Equal(hCaStored(ctx, "product:42"), hCaJSON(ctx, hCaProduct), "product:42 must hold the product")
 	ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill")
 }
 `,
@@ -1285,17 +1285,17 @@ func CheckStaleLock(ctx *harness.Ctx) {
 
 namespace {
 
-const json caProduct = {{"id", "42"}, {"name", "Espresso machine"}, {"price_cents", 24900}, {"tags", {"kitchen", "coffee"}}};
+const json kHCaProduct = {{"id", "42"}, {"name", "Espresso machine"}, {"price_cents", 24900}, {"tags", {"kitchen", "coffee"}}};
 
 // caJSON is a product as its canonical JSON text, so a product compares the same whether load
 // returned it or the cache decoded it; no product is nullopt.
-std::optional<std::string> caJSON(const std::optional<json>& product) {
+std::optional<std::string> hCaJSON(const std::optional<json>& product) {
   if (!product) return std::nullopt;
   return product->dump();
 }
 
 // caStored is the JSON value at key, as canonical JSON text.
-std::string caStored(harness::Ctx& ctx, const std::string& key) {
+std::string hCaStored(harness::Ctx& ctx, const std::string& key) {
   const auto raw = ctx.Redis.Get(key);
   ctx.Assert(raw.has_value(), "%s must hold the product's JSON, it does not exist", key);
   const json out = json::parse(*raw, nullptr, false);
@@ -1304,7 +1304,7 @@ std::string caStored(harness::Ctx& ctx, const std::string& key) {
 }
 
 // caField is one numeric field of a product as canonical JSON text (nullopt when there is none).
-std::optional<double> caField(const std::optional<std::string>& product, const std::string& field) {
+std::optional<double> hCaField(const std::optional<std::string>& product, const std::string& field) {
   if (!product) return std::nullopt;
   const json fields = json::parse(*product);
   if (!fields.is_object() || !fields.contains(field) || !fields[field].is_number()) return std::nullopt;
@@ -1313,7 +1313,7 @@ std::optional<double> caField(const std::optional<std::string>& product, const s
 
 // caSource is a slow source the harness can count: returns catalogue[id] (nullopt when absent);
 // asserts the fill lock is held while it runs.
-struct caSource {
+struct HCaSource {
   harness::Ctx& ctx;
   std::map<std::string, json> catalogue;
   std::vector<std::string> calls;
@@ -1331,7 +1331,7 @@ struct caSource {
 };
 
 // caCall is a get_product running on its own thread, as a second worker's request.
-struct caCall {
+struct HCaCall {
   std::string productID;
   std::atomic<bool> done{false};
   std::optional<json> product;
@@ -1342,12 +1342,12 @@ struct caCall {
     ctx.Settle();
     if (!done) ctx.Fatalf("the concurrent getProduct(%q) never returned", productID);
     if (failure) std::rethrow_exception(failure);
-    return caJSON(product);
+    return hCaJSON(product);
   }
 };
 
-std::shared_ptr<caCall> caGo(const std::string& productID, Load load) {
-  auto call = std::make_shared<caCall>();
+std::shared_ptr<HCaCall> hCaGo(const std::string& productID, Load load) {
+  auto call = std::make_shared<HCaCall>();
   call->productID = productID;
   std::thread([call, load] {
     try {
@@ -1363,90 +1363,90 @@ std::shared_ptr<caCall> caGo(const std::string& productID, Load load) {
 }  // namespace
 
 void CheckMissThenHit(harness::Ctx& ctx) {
-  caSource src{ctx, {{"42", caProduct}}};
-  const auto want = caJSON(caProduct);
-  ctx.Equal(caJSON(get_product("42", src.load())), want, "a miss must return what load returned");
+  HCaSource src{ctx, {{"42", kHCaProduct}}};
+  const auto want = hCaJSON(kHCaProduct);
+  ctx.Equal(hCaJSON(get_product("42", src.load())), want, "a miss must return what load returned");
   ctx.Equal(src.calls, {"42"}, "a miss calls load once with the product id: the load calls");
   ctx.Assert(ctx.Redis.Exists("product:42") == 1, "the product must be written to product:42");
-  ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold exactly the JSON load returned");
+  ctx.Equal(hCaStored(ctx, "product:42"), want, "product:42 must hold exactly the JSON load returned");
   const long long ttl = ctx.Redis.TTL("product:42");
   ctx.Assert(3590 < ttl && ttl <= 3600, "product:42 must expire in 3600 s (ttl); its TTL is %d", ttl);
-  ctx.Equal(caJSON(get_product("42", src.load())), want, "a hit must return the cached product");
+  ctx.Equal(hCaJSON(get_product("42", src.load())), want, "a hit must return the cached product");
   ctx.Equal(src.calls.size(), 1, "a hit must not call load: the number of load calls");
-  ctx.Equal(caJSON(get_product("42", src.load())), want, "the second hit");
+  ctx.Equal(hCaJSON(get_product("42", src.load())), want, "the second hit");
   ctx.Equal(src.calls.size(), 1, "the number of load calls after two hits");
   ctx.Clock.Advance(3601);
   ctx.Equal(ctx.Redis.Get("product:42"), nullptr, "after 3600 s the key must have expired");
-  ctx.Equal(caJSON(get_product("42", src.load())), want, "the call after the TTL");
+  ctx.Equal(hCaJSON(get_product("42", src.load())), want, "the call after the TTL");
   ctx.Equal(src.calls, {"42", "42"}, "once the TTL has passed the next call must load again: the load calls");
   ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after a fill");
 }
 
 void CheckNegativeCache(harness::Ctx& ctx) {
-  caSource src{ctx, {}};
-  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "a product the source does not have is nil");
+  HCaSource src{ctx, {}};
+  ctx.Equal(hCaJSON(get_product("7", src.load())), nullptr, "a product the source does not have is nil");
   ctx.Equal(src.calls, {"7"}, "the load calls");
   ctx.Equal(ctx.Redis.Get("product:7"), "__missing__", "a missing product must be cached as the sentinel %q: product:7", "__missing__");
   const long long ttl = ctx.Redis.TTL("product:7");
   ctx.Assert(50 < ttl && ttl <= 60, "the sentinel must expire in 60 s (missingTTL); its TTL is %d", ttl);
-  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "the sentinel must be served as nil");
-  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "the sentinel served a second time");
+  ctx.Equal(hCaJSON(get_product("7", src.load())), nullptr, "the sentinel must be served as nil");
+  ctx.Equal(hCaJSON(get_product("7", src.load())), nullptr, "the sentinel served a second time");
   ctx.Equal(src.calls.size(), 1, "the sentinel must answer without calling load: the number of load calls");
   const json grinderProduct = {{"id", "7"}, {"name", "Grinder"}};
   src.catalogue["7"] = grinderProduct;
-  ctx.Equal(caJSON(get_product("7", src.load())), nullptr, "while the sentinel lives a product that appeared in the source is still unseen");
+  ctx.Equal(hCaJSON(get_product("7", src.load())), nullptr, "while the sentinel lives a product that appeared in the source is still unseen");
   ctx.Clock.Advance(61);
-  const auto grinder = caJSON(grinderProduct);
-  ctx.Equal(caJSON(get_product("7", src.load())), grinder, "after 60 s the source is asked again");
+  const auto grinder = hCaJSON(grinderProduct);
+  ctx.Equal(hCaJSON(get_product("7", src.load())), grinder, "after 60 s the source is asked again");
   ctx.Equal(src.calls, {"7", "7"}, "the load calls");
-  ctx.Equal(caStored(ctx, "product:7"), grinder, "product:7 must hold the product loaded after the sentinel expired");
+  ctx.Equal(hCaStored(ctx, "product:7"), grinder, "product:7 must hold the product loaded after the sentinel expired");
 }
 
 void CheckInvalidate(harness::Ctx& ctx) {
-  caSource src{ctx, {{"42", caProduct}}};
-  ctx.Equal(caJSON(get_product("42", src.load())), caJSON(caProduct), "the first call returns the product");
+  HCaSource src{ctx, {{"42", kHCaProduct}}};
+  ctx.Equal(hCaJSON(get_product("42", src.load())), hCaJSON(kHCaProduct), "the first call returns the product");
   src.catalogue["42"] = json{{"id", "42"}, {"name", "Espresso machine"}, {"price_cents", 19900}, {"tags", {"kitchen", "coffee"}}};
-  ctx.Equal(caField(caJSON(get_product("42", src.load())), "price_cents"), 24900, "until invalidated, the cached price is served");
+  ctx.Equal(hCaField(hCaJSON(get_product("42", src.load())), "price_cents"), 24900, "until invalidated, the cached price is served");
   invalidate("42");
   ctx.Equal(ctx.Redis.Get("product:42"), nullptr, "invalidate must delete product:42");
-  ctx.Equal(caField(caJSON(get_product("42", src.load())), "price_cents"), 19900, "after invalidate the next call must load the new product");
+  ctx.Equal(hCaField(hCaJSON(get_product("42", src.load())), "price_cents"), 19900, "after invalidate the next call must load the new product");
   ctx.Equal(src.calls, {"42", "42"}, "invalidate then get must load exactly once more: the load calls");
-  ctx.Equal(caField(caStored(ctx, "product:42"), "price_cents"), 19900, "the reloaded product must be cached");
-  ctx.Equal(caJSON(get_product("9", src.load())), nullptr, "an unknown product is nil");
+  ctx.Equal(hCaField(hCaStored(ctx, "product:42"), "price_cents"), 19900, "the reloaded product must be cached");
+  ctx.Equal(hCaJSON(get_product("9", src.load())), nullptr, "an unknown product is nil");
   ctx.Equal(ctx.Redis.Get("product:9"), "__missing__", "product:9 must hold the sentinel");
   src.catalogue["9"] = json{{"id", "9"}};
   invalidate("9");
-  ctx.Equal(caJSON(get_product("9", src.load())), caJSON(json{{"id", "9"}}), "invalidate must also clear a sentinel: a product created after a miss becomes visible");
+  ctx.Equal(hCaJSON(get_product("9", src.load())), hCaJSON(json{{"id", "9"}}), "invalidate must also clear a sentinel: a product created after a miss becomes visible");
   invalidate("never-cached");
   ctx.Equal(ctx.Redis.Keys("*"), {"product:42", "product:9"}, "invalidating an unknown id must touch nothing else: the keys");
 }
 
 void CheckSingleFlight(harness::Ctx& ctx) {
-  caSource src{ctx, {{"42", caProduct}}};
-  const auto want = caJSON(caProduct);
+  HCaSource src{ctx, {{"42", kHCaProduct}}};
+  const auto want = hCaJSON(kHCaProduct);
   // The second worker's request lands the instant the first one has taken the lock, before it has loaded anything.
-  std::shared_ptr<caCall> second;
-  ctx.Redis.After("lock:product:42", [&] { second = caGo("42", src.load()); });
-  const auto first = caJSON(get_product("42", src.load()));
+  std::shared_ptr<HCaCall> second;
+  ctx.Redis.After("lock:product:42", [&] { second = hCaGo("42", src.load()); });
+  const auto first = hCaJSON(get_product("42", src.load()));
   ctx.Assert(second != nullptr, "a miss must take lock:product:42");
   ctx.Equal(first, want, "the first caller must return the product");
   ctx.Equal(second->result(ctx), want, "the caller that lost the lock must return what the winner wrote");
   ctx.Assert(src.calls.size() == 1, "two concurrent misses must call load once, it was called %d times: the loser polls product:42 every 50 ms instead of loading", src.calls.size());
   ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "lock:product:42 must be deleted once the fill is done");
-  ctx.Equal(caStored(ctx, "product:42"), want, "product:42 must hold the product");
+  ctx.Equal(hCaStored(ctx, "product:42"), want, "product:42 must hold the product");
   // The other order: the second request lands between the first one's miss and its lock, fills, and releases.
-  caSource src2{ctx, {{"43", json{{"id", "43"}}}}};
-  const auto want2 = caJSON(json{{"id", "43"}});
+  HCaSource src2{ctx, {{"43", json{{"id", "43"}}}}};
+  const auto want2 = hCaJSON(json{{"id", "43"}});
   std::optional<std::string> third;
   std::exception_ptr thirdFailure;
   ctx.Redis.After("product:43", [&] {
     try {
-      third = caJSON(get_product("43", src2.load()));
+      third = hCaJSON(get_product("43", src2.load()));
     } catch (...) {
       thirdFailure = std::current_exception();
     }
   });
-  ctx.Equal(caJSON(get_product("43", src2.load())), want2, "the first caller must return product 43");
+  ctx.Equal(hCaJSON(get_product("43", src2.load())), want2, "the first caller must return product 43");
   if (thirdFailure) std::rethrow_exception(thirdFailure);
   ctx.Equal(third, want2, "the concurrent caller must return product 43");
   ctx.Assert(src2.calls.size() == 1, "when the other request fills the key between this one's miss and its lock, load must still run once (it ran %d times): GET the key again after winning the lock", src2.calls.size());
@@ -1469,9 +1469,9 @@ void CheckLockReleased(harness::Ctx& ctx) {
   ctx.Equal(attempts, {"42"}, "the load attempts");
   ctx.Equal(ctx.Redis.Get("product:42"), nullptr, "a failed load must cache nothing, not the sentinel either");
   ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "a failed fill must delete lock:product:42: otherwise every caller waits 5 s for a fill that will never come");
-  caSource src{ctx, {{"42", caProduct}}};
+  HCaSource src{ctx, {{"42", kHCaProduct}}};
   const int sleeps = ctx.Clock.Sleeps();
-  ctx.Equal(caJSON(get_product("42", src.load())), caJSON(caProduct), "the next call after a failure must take the lock and load");
+  ctx.Equal(hCaJSON(get_product("42", src.load())), hCaJSON(kHCaProduct), "the next call after a failure must take the lock and load");
   ctx.Equal(src.calls, {"42"}, "the load calls");
   ctx.Equal(ctx.Clock.Sleeps(), sleeps, "the next call after a failure must not have to wait: the lock was released, so it wins it at once (sleeps)");
   ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill");
@@ -1484,15 +1484,15 @@ void CheckStaleLock(harness::Ctx& ctx) {
     calls.push_back(productID);
     const auto held = ctx.Redis.Get("lock:product:42");
     ctx.Assert(held != "stale", "load ran while another worker's lock was still alive: a loser must wait for the lock's TTL, not load on its own");
-    return caProduct;
+    return kHCaProduct;
   };
   const int64_t started = ctx.Clock.Now();
-  ctx.Equal(caJSON(get_product("42", load)), caJSON(caProduct), "once the stale lock has expired the caller must load and return the product");
+  ctx.Equal(hCaJSON(get_product("42", load)), hCaJSON(kHCaProduct), "once the stale lock has expired the caller must load and return the product");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(waited >= 4.9, "the caller must poll every 50 ms for the lock's TTL (5 s) before giving up on the holder; it waited %.2f s", waited);
   ctx.Assert(waited < 12, "the wait is bounded by the lock's TTL; this took %.2f s of virtual time", waited);
   ctx.Assert(calls.size() == 1, "the stale lock must cost exactly one load; load was called %d times", calls.size());
-  ctx.Equal(caStored(ctx, "product:42"), caJSON(caProduct), "product:42 must hold the product");
+  ctx.Equal(hCaStored(ctx, "product:42"), hCaJSON(kHCaProduct), "product:42 must hold the product");
   ctx.Equal(ctx.Redis.Exists("lock:product:42"), 0, "no lock may remain after the fill");
 }
 `,

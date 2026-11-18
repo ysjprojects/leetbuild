@@ -1490,31 +1490,31 @@ import (
 )
 
 // gsSeed puts inbox records on one partition, so offsets and order are known.
-func gsSeed(ctx *harness.Ctx, keys ...string) {
+func hGsSeed(ctx *harness.Ctx, keys ...string) {
 	for _, key := range keys {
 		ctx.Kafka.SeedPartition(inbox, 0, key, "v-"+key)
 	}
 }
 
 // gsCalls records every key the handlers saw.
-type gsCalls struct {
+type HGsCalls struct {
 	mu   sync.Mutex
 	keys []string
 }
 
-func (c *gsCalls) add(key string) {
+func (c *HGsCalls) add(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.keys = append(c.keys, key)
 }
 
-func (c *gsCalls) list() []string {
+func (c *HGsCalls) list() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string{}, c.keys...)
 }
 
-func (c *gsCalls) has(key string) bool {
+func (c *HGsCalls) has(key string) bool {
 	for _, k := range c.list() {
 		if k == key {
 			return true
@@ -1526,7 +1526,7 @@ func (c *gsCalls) has(key string) bool {
 // gsHandler records every key it sees, sleeps (virtual) on the slow keys, stalls outbox when it sees
 // stallOn, and closes the returned channel the moment the handler of watch is entered — before any
 // clock moves — so a shutdown can be issued with that record in hand.
-func gsHandler(ctx *harness.Ctx, calls *gsCalls, slow map[string]time.Duration, stallOn, watch string) (Handler, chan struct{}) {
+func hGsHandler(ctx *harness.Ctx, calls *HGsCalls, slow map[string]time.Duration, stallOn, watch string) (Handler, chan struct{}) {
 	inHandNow := make(chan struct{})
 	var once sync.Once
 	return func(msg kafka.Message) ([]byte, error) {
@@ -1547,7 +1547,7 @@ func gsHandler(ctx *harness.Ctx, calls *gsCalls, slow map[string]time.Duration, 
 
 // gsStart runs the learner's loop in the background; it returns once the watched record is in hand
 // (or the loop died first), with a channel closed when the loop ends.
-func gsStart(handler Handler, watched chan struct{}) chan struct{} {
+func hGsStart(handler Handler, watched chan struct{}) chan struct{} {
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
@@ -1562,7 +1562,7 @@ func gsStart(handler Handler, watched chan struct{}) chan struct{} {
 
 // gsRestart is a fresh process over the same broker: the package state as the program starts it,
 // with the learner's reader and writer configuration.
-func gsRestart() {
+func hGsRestart() {
 	reader = kafka.NewReader(reader.Config())
 	old := writer
 	writer = &kafka.Writer{Addr: old.Addr, Topic: old.Topic, Balancer: old.Balancer, MaxAttempts: old.MaxAttempts,
@@ -1579,7 +1579,7 @@ func gsRestart() {
 	workCtx, abortWork = context.WithCancel(context.Background())
 }
 
-func gsOutbox(ctx *harness.Ctx) [][2]string {
+func hGsOutbox(ctx *harness.Ctx) [][2]string {
 	out := [][2]string{}
 	for _, r := range ctx.Kafka.Records(outbox) {
 		out = append(out, [2]string{string(r.Key), string(r.Value)})
@@ -1587,7 +1587,7 @@ func gsOutbox(ctx *harness.Ctx) [][2]string {
 	return out
 }
 
-func gsDelivered(ctx *harness.Ctx) int {
+func hGsDelivered(ctx *harness.Ctx) int {
 	n := 0
 	for _, e := range ctx.Kafka.EventsOf("deliver") {
 		if e.Group == groupID && e.Topic == inbox {
@@ -1597,7 +1597,7 @@ func gsDelivered(ctx *harness.Ctx) int {
 	return n
 }
 
-func gsStalledForwards(ctx *harness.Ctx) int {
+func hGsStalledForwards(ctx *harness.Ctx) int {
 	n := 0
 	for _, e := range ctx.Kafka.EventsOf("produce-stalled") {
 		if e.Topic == outbox {
@@ -1607,7 +1607,7 @@ func gsStalledForwards(ctx *harness.Ctx) int {
 	return n
 }
 
-func gsCloses(ctx *harness.Ctx) int {
+func hGsCloses(ctx *harness.Ctx) int {
 	n := 0
 	for _, e := range ctx.Kafka.EventsOf("close") {
 		if e.Group == groupID {
@@ -1617,11 +1617,11 @@ func gsCloses(ctx *harness.Ctx) int {
 	return n
 }
 
-func gsSeconds(ctx *harness.Ctx, before int64) float64 { return float64(ctx.Clock.Now()-before) / 1000 }
+func hGsSeconds(ctx *harness.Ctx, before int64) float64 { return float64(ctx.Clock.Now()-before) / 1000 }
 
 func CheckDrain(ctx *harness.Ctx) {
-	gsSeed(ctx, "a", "slow", "b")
-	calls := &gsCalls{}
+	hGsSeed(ctx, "a", "slow", "b")
+	calls := &HGsCalls{}
 	type commitSeen struct {
 		offsets map[harness.KafkaTopicPartition]int64
 		held    int
@@ -1638,15 +1638,15 @@ func CheckDrain(ctx *harness.Ctx) {
 		atCommit = append(atCommit, commitSeen{copied, held})
 		commitsMu.Unlock()
 	})
-	handler, watched := gsHandler(ctx, calls, map[string]time.Duration{"slow": 2 * time.Second}, "", "slow")
-	running := gsStart(handler, watched) // the handler of slow is in hand, sleeping 2 s (or the loop died first)
+	handler, watched := hGsHandler(ctx, calls, map[string]time.Duration{"slow": 2 * time.Second}, "", "slow")
+	running := hGsStart(handler, watched) // the handler of slow is in hand, sleeping 2 s (or the loop died first)
 	before := ctx.Clock.Now()
 	report := shutdown(5 * time.Second)
-	took := gsSeconds(ctx, before)
+	took := hGsSeconds(ctx, before)
 	ctx.Drain(func() { <-running })
 	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "auto-commit is on: offsets were committed on a timer, before the forward was acknowledged; auto-commits")
 	ctx.Assert(took <= 5.5, "shutdown(5s) with a healthy broker took %.1f s of clock time", took)
-	ctx.Equal(gsOutbox(ctx), [][2]string{{"a", "V-A"}, {"slow", "V-SLOW"}}, "shutdown must let the handler in hand finish and forward its record with the inbox key, then take no more: outbox")
+	ctx.Equal(hGsOutbox(ctx), [][2]string{{"a", "V-A"}, {"slow", "V-SLOW"}}, "shutdown must let the handler in hand finish and forward its record with the inbox key, then take no more: outbox")
 	ctx.Equal(calls.list(), []string{"a", "slow"}, "after shutdown no further record may be taken (b stays for the next process): keys the handler saw")
 	ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "after a clean shutdown every forwarded record is committed: the committed offset")
 	commitsMu.Lock()
@@ -1663,42 +1663,42 @@ func CheckDrain(ctx *harness.Ctx) {
 }
 
 func CheckStalled(ctx *harness.Ctx) {
-	gsSeed(ctx, "a", "b", "c", "d")
-	handler, watched := gsHandler(ctx, &gsCalls{}, nil, "c", "c")
-	running := gsStart(handler, watched) // the broker stops acknowledging outbox from c on
+	hGsSeed(ctx, "a", "b", "c", "d")
+	handler, watched := hGsHandler(ctx, &HGsCalls{}, nil, "c", "c")
+	running := hGsStart(handler, watched) // the broker stops acknowledging outbox from c on
 	before := ctx.Clock.Now()
 	report := shutdown(5 * time.Second)
-	took := gsSeconds(ctx, before)
+	took := hGsSeconds(ctx, before)
 	ctx.Drain(func() { <-running })
 	ctx.Assert(took <= 5.5, "shutdown(5s) took %.1f s with outbox stalled: give the forwards the time left, not the write's whole timeout", took)
 	ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "c's forward was never acknowledged, so nothing past it may be committed: the committed offset")
-	ctx.Equal(gsOutbox(ctx), [][2]string{{"a", "V-A"}, {"b", "V-B"}}, "nothing can reach outbox while it is stalled: outbox")
-	wantUndelivered := gsStalledForwards(ctx)
-	wantUncommitted := gsDelivered(ctx) - 2
+	ctx.Equal(hGsOutbox(ctx), [][2]string{{"a", "V-A"}, {"b", "V-B"}}, "nothing can reach outbox while it is stalled: outbox")
+	wantUndelivered := hGsStalledForwards(ctx)
+	wantUncommitted := hGsDelivered(ctx) - 2
 	ctx.Assert(wantUndelivered >= 1 && wantUncommitted >= 1, "the handler stalled outbox on c: at least c must be in flight")
 	ctx.Equal(report.Undelivered, wantUndelivered, "Undelivered must count the forwards the broker never acknowledged")
 	ctx.Equal(report.Uncommitted, wantUncommitted, "Uncommitted must count the records taken from inbox whose offset is not committed")
 	ctx.Equal(report.Forwarded, 2, "Forwarded counts acknowledged forwards only (a, b)")
 	ctx.Equal(report.CommittedOffsets[0], 2, "CommittedOffsets must say inbox partition 0 is committed to 2 (%v)", report.CommittedOffsets)
-	ctx.Assert(gsCloses(ctx) > 0, "the reader must be closed by the time shutdown returns")
+	ctx.Assert(hGsCloses(ctx) > 0, "the reader must be closed by the time shutdown returns")
 }
 
 func CheckRestart(ctx *harness.Ctx) {
-	gsSeed(ctx, "a", "b", "c", "d")
-	handler, watched := gsHandler(ctx, &gsCalls{}, nil, "c", "c")
-	running := gsStart(handler, watched)
+	hGsSeed(ctx, "a", "b", "c", "d")
+	handler, watched := hGsHandler(ctx, &HGsCalls{}, nil, "c", "c")
+	running := hGsStart(handler, watched)
 	shutdown(5 * time.Second)
 	ctx.Drain(func() { <-running })
 	resumable := map[string]bool{"c": true, "d": true} // taken past the committed offset 2: a restart may handle these again
 	ctx.Kafka.Resume(outbox)
-	gsRestart() // a fresh process over the same broker
-	calls2 := &gsCalls{}
-	handler2, _ := gsHandler(ctx, calls2, nil, "", "")
+	hGsRestart() // a fresh process over the same broker
+	calls2 := &HGsCalls{}
+	handler2, _ := hGsHandler(ctx, calls2, nil, "", "")
 	ctx.Drain(func() { run(handler2) })
 	report2 := shutdown(5 * time.Second)
 	ctx.Assert(!calls2.has("a") && !calls2.has("b"), "the restart handled %v: it must resume from the committed offset (2), not from the beginning", calls2.list())
 	ctx.Assert(calls2.has("c") && calls2.has("d"), "the restart handled %v: the records taken but not committed (c, d) must be handled again", calls2.list())
-	held := gsOutbox(ctx)
+	held := hGsOutbox(ctx)
 	counts := map[string]int{}
 	for _, kv := range held {
 		counts[kv[0]]++
@@ -1718,48 +1718,48 @@ func CheckRestart(ctx *harness.Ctx) {
 }
 
 func CheckOnce(ctx *harness.Ctx) {
-	gsSeed(ctx, "a", "b", "c")
-	calls := &gsCalls{}
-	handler, _ := gsHandler(ctx, calls, nil, "", "")
+	hGsSeed(ctx, "a", "b", "c")
+	calls := &HGsCalls{}
+	handler, _ := hGsHandler(ctx, calls, nil, "", "")
 	ctx.Drain(func() { run(handler) })
 	shutdown(5 * time.Second)
-	gsSeed(ctx, "d", "e")
-	gsRestart() // a fresh process over the same broker
-	handler2, _ := gsHandler(ctx, calls, nil, "", "")
+	hGsSeed(ctx, "d", "e")
+	hGsRestart() // a fresh process over the same broker
+	handler2, _ := hGsHandler(ctx, calls, nil, "", "")
 	ctx.Drain(func() { run(handler2) })
 	shutdown(5 * time.Second)
 	ctx.Equal(calls.list(), []string{"a", "b", "c", "d", "e"}, "across a clean shutdown and a restart each record reaches the handler once: keys the handler saw")
 	keys := []string{}
-	for _, kv := range gsOutbox(ctx) {
+	for _, kv := range hGsOutbox(ctx) {
 		keys = append(keys, kv[0])
 	}
 	ctx.Equal(keys, []string{"a", "b", "c", "d", "e"}, "outbox must hold each record once, in order")
 	ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 5, "the committed offset")
-	ctx.Equal(gsCloses(ctx), 2, "each process must close its reader on shutdown: closes seen for group forwarder")
+	ctx.Equal(hGsCloses(ctx), 2, "each process must close its reader on shutdown: closes seen for group forwarder")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	gsSeed(ctx, "a", "b")
-	calls := &gsCalls{}
+	hGsSeed(ctx, "a", "b")
+	calls := &HGsCalls{}
 	ctx.Kafka.StallFor(outbox, 2) // the broker is slow at the moment of the stop: it answers 2 s later
-	handler, watched := gsHandler(ctx, calls, nil, "", "a")
-	running := gsStart(handler, watched) // a is in hand, its forward about to wait for the slow broker
+	handler, watched := hGsHandler(ctx, calls, nil, "", "a")
+	running := hGsStart(handler, watched) // a is in hand, its forward about to wait for the slow broker
 	before := ctx.Clock.Now()
 	report := shutdown(5 * time.Second)
-	took := gsSeconds(ctx, before)
+	took := hGsSeconds(ctx, before)
 	ctx.Drain(func() { <-running })
-	ctx.Equal(gsOutbox(ctx), [][2]string{{"a", "V-A"}}, "the broker answered after 2 s, within the deadline: shutdown must wait for the forward in hand; outbox")
+	ctx.Equal(hGsOutbox(ctx), [][2]string{{"a", "V-A"}}, "the broker answered after 2 s, within the deadline: shutdown must wait for the forward in hand; outbox")
 	ctx.Assert(took <= 2.5, "the broker answered after 2 s yet shutdown(5s) took %.1f s: wait for the forward, not for the whole deadline", took)
 	ctx.Assert(report.Undelivered == 0 && report.Uncommitted == 0, "everything in hand was acknowledged and committed, the report must say so: %+v", report)
 	ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 1, "a's forward was acknowledged: its offset must be committed")
 
 	ctx.Kafka.Stall(outbox) // now the broker is down for good
-	gsRestart()
-	handler2, watched2 := gsHandler(ctx, calls, nil, "", "b")
-	running2 := gsStart(handler2, watched2) // b is in hand, its forward about to stall
+	hGsRestart()
+	handler2, watched2 := hGsHandler(ctx, calls, nil, "", "b")
+	running2 := hGsStart(handler2, watched2) // b is in hand, its forward about to stall
 	before = ctx.Clock.Now()
 	report = shutdown(3 * time.Second)
-	took = gsSeconds(ctx, before)
+	took = hGsSeconds(ctx, before)
 	ctx.Drain(func() { <-running2 })
 	ctx.Assert(took <= 3.5, "with outbox down, shutdown(3s) took %.1f s of clock time: the deadline is the bound", took)
 	ctx.Assert(took >= 2.5, "with outbox down, shutdown(3s) gave up after %.1f s: the broker may still answer within the deadline, wait with the time left", took)
@@ -1767,16 +1767,16 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 1, "b was not acknowledged: its offset must not be committed")
 
 	ctx.Kafka.Resume(outbox)
-	gsSeed(ctx, "stuck")
-	gsRestart()
-	handler3, watched3 := gsHandler(ctx, calls, map[string]time.Duration{"stuck": 10 * time.Second}, "", "stuck")
-	running3 := gsStart(handler3, watched3) // stuck is in hand, its handler sleeping 10 s
+	hGsSeed(ctx, "stuck")
+	hGsRestart()
+	handler3, watched3 := hGsHandler(ctx, calls, map[string]time.Duration{"stuck": 10 * time.Second}, "", "stuck")
+	running3 := hGsStart(handler3, watched3) // stuck is in hand, its handler sleeping 10 s
 	before = ctx.Clock.Now()
 	report = shutdown(3 * time.Second)
-	took = gsSeconds(ctx, before)
+	took = hGsSeconds(ctx, before)
 	ctx.Assert(took <= 3.5 && took >= 2.5, "the handler in hand takes 10 s: shutdown(3s) must give it the time left and return at the deadline, it took %.1f s", took)
 	ctx.Equal(report.Uncommitted, 1, "the record whose handler did not finish is uncommitted")
-	for _, kv := range gsOutbox(ctx) {
+	for _, kv := range hGsOutbox(ctx) {
 		ctx.Assert(kv[0] != "stuck", "the handler of stuck had not finished: its record cannot have been forwarded")
 	}
 	ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "stuck (offset 2) was not forwarded: its offset must not be committed; the committed offset")
@@ -1784,8 +1784,8 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckClosed(ctx *harness.Ctx) {
-	gsSeed(ctx, "a", "b")
-	handler, _ := gsHandler(ctx, &gsCalls{}, nil, "", "")
+	hGsSeed(ctx, "a", "b")
+	handler, _ := hGsHandler(ctx, &HGsCalls{}, nil, "", "")
 	ctx.Drain(func() { run(handler) })
 	shutdown(5 * time.Second)
 	lastCommit, closeAt := -1, -1
@@ -1821,28 +1821,28 @@ func CheckClosed(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string inbox = kInbox;
-const std::string outbox = kOutbox;
-const std::string groupID = kGroup;
+const std::string kHInbox = kInbox;
+const std::string kHOutbox = kOutbox;
+const std::string kHGroupID = kGroup;
 
-std::string showReport(const Report& r) {
+std::string hShowReport(const Report& r) {
   return harness::Sprintf("{forwarded:%d committed_offsets:%v undelivered:%d uncommitted:%d}", r.forwarded, r.committed_offsets,
                           r.undelivered, r.uncommitted);
 }
 
 // gsSeed puts inbox records on one partition, so offsets and order are known.
-void gsSeed(harness::Ctx& ctx, const std::vector<std::string>& keys) {
-  for (const auto& key : keys) ctx.Kafka.SeedPartition(inbox, 0, key, "v-" + key);
+void hGsSeed(harness::Ctx& ctx, const std::vector<std::string>& keys) {
+  for (const auto& key : keys) ctx.Kafka.SeedPartition(kHInbox, 0, key, "v-" + key);
 }
 
 // gsHandler records every key it sees, takes 2 s of clock on the slow keys, and stalls outbox when
 // it sees stallOn; it forwards the value upper-cased.
-Handler gsHandler(harness::Ctx& ctx, std::vector<std::string>& calls, const std::set<std::string>& slow, const std::string& stallOn) {
+Handler hGsHandler(harness::Ctx& ctx, std::vector<std::string>& calls, const std::set<std::string>& slow, const std::string& stallOn) {
   return [&ctx, &calls, slow, stallOn](const RdKafka::Message& msg) {
     const std::string key = msg.key() != nullptr ? *msg.key() : std::string();
     calls.push_back(key);
     if (slow.count(key)) ctx.Clock.Advance(2);
-    if (key == stallOn) ctx.Kafka.Stall(outbox);
+    if (key == stallOn) ctx.Kafka.Stall(kHOutbox);
     std::string value(static_cast<const char*>(msg.payload()), msg.len());
     for (char& c : value) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
     return value;
@@ -1851,29 +1851,29 @@ Handler gsHandler(harness::Ctx& ctx, std::vector<std::string>& calls, const std:
 
 // The learner's loop on a thread of its own: it takes every record there is (the clock held) and
 // waits for more; shutdown() stops it.
-struct gsRun {
+struct HGsRun {
   std::thread thread;
-  ~gsRun() {
+  ~HGsRun() {
     if (thread.joinable()) thread.detach();
   }
 };
 
-std::unique_ptr<gsRun> gsDrain(harness::Ctx& ctx, const Handler& handler) {
-  auto r = std::make_unique<gsRun>();
+std::unique_ptr<HGsRun> hGsDrain(harness::Ctx& ctx, const Handler& handler) {
+  auto r = std::make_unique<HGsRun>();
   r->thread = std::thread([handler] { run(handler); });
   ctx.Tick();
   return r;
 }
 
 // gsStop: shutdown(deadline) as the supervisor calls it, then the loop's end.
-Report gsStop(harness::Ctx& ctx, gsRun& r, int deadlineMs) {
+Report hGsStop(harness::Ctx& ctx, HGsRun& r, int deadlineMs) {
   const Report report = shutdown(deadlineMs);
   if (!ctx.Drain([&r] { r.thread.join(); })) r.thread.detach();
   return report;
 }
 
 // gsRestart is a fresh process over the same broker: the program's state as it starts it.
-void gsRestart() {
+void hGsRestart() {
   consumer = make_consumer();
   producer = make_producer();
   stopping = false;
@@ -1883,36 +1883,36 @@ void gsRestart() {
   committed.clear();
 }
 
-std::vector<std::pair<std::string, std::string>> gsOutbox(harness::Ctx& ctx) {
+std::vector<std::pair<std::string, std::string>> hGsOutbox(harness::Ctx& ctx) {
   std::vector<std::pair<std::string, std::string>> out;
-  for (const auto& r : ctx.Kafka.Records(outbox)) out.emplace_back(r.Key.value_or(""), r.Value.value_or(""));
+  for (const auto& r : ctx.Kafka.Records(kHOutbox)) out.emplace_back(r.Key.value_or(""), r.Value.value_or(""));
   return out;
 }
 
-size_t gsDelivered(harness::Ctx& ctx) {
+size_t hGsDelivered(harness::Ctx& ctx) {
   size_t n = 0;
   for (const auto& e : ctx.Kafka.EventsOf("deliver"))
-    if (e.Group == groupID && e.Topic == inbox) n++;
+    if (e.Group == kHGroupID && e.Topic == kHInbox) n++;
   return n;
 }
 
-size_t gsStalledForwards(harness::Ctx& ctx) {
+size_t hGsStalledForwards(harness::Ctx& ctx) {
   size_t n = 0;
   for (const auto& e : ctx.Kafka.EventsOf("produce-stalled"))
-    if (e.Topic == outbox) n++;
+    if (e.Topic == kHOutbox) n++;
   return n;
 }
 
-size_t gsCloses(harness::Ctx& ctx) {
+size_t hGsCloses(harness::Ctx& ctx) {
   size_t n = 0;
   for (const auto& e : ctx.Kafka.EventsOf("close"))
-    if (e.Group == groupID) n++;
+    if (e.Group == kHGroupID) n++;
   return n;
 }
 
-double gsSeconds(harness::Ctx& ctx, int64_t before) { return static_cast<double>(ctx.Clock.Now() - before) / 1000; }
+double hGsSeconds(harness::Ctx& ctx, int64_t before) { return static_cast<double>(ctx.Clock.Now() - before) / 1000; }
 
-int64_t committedAt(const Report& r, int partition) {
+int64_t hCommittedAt(const Report& r, int partition) {
   const auto it = r.committed_offsets.find(partition);
   return it == r.committed_offsets.end() ? -1 : it->second;
 }
@@ -1920,72 +1920,72 @@ int64_t committedAt(const Report& r, int partition) {
 }  // namespace
 
 void CheckDrain(harness::Ctx& ctx) {
-  gsSeed(ctx, {"a", "slow", "b"});
+  hGsSeed(ctx, {"a", "slow", "b"});
   std::vector<std::string> calls;
   std::vector<std::pair<harness::KafkaOffsets, size_t>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
-    atCommit.emplace_back(offsets, ctx.Kafka.Records(outbox).size());
+    atCommit.emplace_back(offsets, ctx.Kafka.Records(kHOutbox).size());
   });
-  auto running = gsDrain(ctx, gsHandler(ctx, calls, {"slow"}, ""));
+  auto running = hGsDrain(ctx, hGsHandler(ctx, calls, {"slow"}, ""));
   ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0,
             "auto-commit is on: offsets were committed on a timer, before the forward was acknowledged; auto-commits");
   const int64_t before = ctx.Clock.Now();
-  const Report report = gsStop(ctx, *running, 5000);
-  const double took = gsSeconds(ctx, before);
+  const Report report = hGsStop(ctx, *running, 5000);
+  const double took = hGsSeconds(ctx, before);
   ctx.Assert(took <= 5.5, "shutdown(5000) with a healthy broker took %.1f s of clock time", took);
-  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"slow", "V-SLOW"}, {"b", "V-B"}},
+  ctx.Equal(hGsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"slow", "V-SLOW"}, {"b", "V-B"}},
             "outbox must hold every forward with the inbox key and the handler's value, in order");
   ctx.Equal(calls, {"a", "slow", "b"}, "the handler must see a, slow, b once each: keys the handler saw");
-  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 3, "after a clean shutdown every forwarded record is committed: the committed offset");
+  ctx.Equal(ctx.Kafka.CommittedOffset(kHGroupID, kHInbox, 0), 3, "after a clean shutdown every forwarded record is committed: the committed offset");
   for (const auto& [offsets, held] : atCommit)
     for (const auto& [tp, offset] : offsets)
       ctx.Assert(static_cast<int64_t>(held) >= offset,
                  "%s was committed to %d when outbox held only %d records: commit after the forward's ack, never before", tp, offset, held);
   ctx.Assert(report.undelivered == 0 && report.uncommitted == 0, "a clean stop reports undelivered 0 and uncommitted 0, got %s",
-             showReport(report));
+             hShowReport(report));
   ctx.Equal(report.forwarded, 3, "forwarded must count the acknowledged forwards");
-  ctx.Equal(committedAt(report, 0), 3, "committed_offsets must say inbox partition 0 is committed to 3 (%v)", report.committed_offsets);
+  ctx.Equal(hCommittedAt(report, 0), 3, "committed_offsets must say inbox partition 0 is committed to 3 (%v)", report.committed_offsets);
 }
 
 void CheckStalled(harness::Ctx& ctx) {
-  gsSeed(ctx, {"a", "b", "c", "d"});
+  hGsSeed(ctx, {"a", "b", "c", "d"});
   std::vector<std::string> calls;
-  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, "c"));  // the broker stops acknowledging outbox from c on
-  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
+  auto running = hGsDrain(ctx, hGsHandler(ctx, calls, {}, "c"));  // the broker stops acknowledging outbox from c on
+  ctx.Equal(hGsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
             "with outbox stalled from c on, only a and b can be there: outbox");
   const int64_t before = ctx.Clock.Now();
-  const Report report = gsStop(ctx, *running, 5000);
-  const double took = gsSeconds(ctx, before);
+  const Report report = hGsStop(ctx, *running, 5000);
+  const double took = hGsSeconds(ctx, before);
   ctx.Assert(took <= 5.5, "shutdown(5000) took %.1f s with outbox stalled: flush with the time left, not message.timeout.ms", took);
-  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2,
+  ctx.Equal(ctx.Kafka.CommittedOffset(kHGroupID, kHInbox, 0), 2,
             "c's forward was never acknowledged, so nothing past it may be committed: the committed offset");
-  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
+  ctx.Equal(hGsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
             "nothing can reach outbox while it is stalled: outbox");
-  const size_t wantUndelivered = gsStalledForwards(ctx);
-  const size_t wantUncommitted = gsDelivered(ctx) - 2;
+  const size_t wantUndelivered = hGsStalledForwards(ctx);
+  const size_t wantUncommitted = hGsDelivered(ctx) - 2;
   ctx.Assert(wantUndelivered >= 1 && wantUncommitted >= 1, "the handler stalled outbox on c: at least c must be in flight");
   ctx.Equal(report.undelivered, wantUndelivered, "undelivered must count the forwards the broker never acknowledged");
   ctx.Equal(report.uncommitted, wantUncommitted, "uncommitted must count the records taken from inbox whose offset is not committed");
   ctx.Equal(report.forwarded, 2, "forwarded counts acknowledged forwards only (a, b)");
-  ctx.Equal(committedAt(report, 0), 2, "committed_offsets must say inbox partition 0 is committed to 2 (%v)", report.committed_offsets);
-  ctx.Assert(gsCloses(ctx) > 0, "the consumer must be closed by the time shutdown returns");
+  ctx.Equal(hCommittedAt(report, 0), 2, "committed_offsets must say inbox partition 0 is committed to 2 (%v)", report.committed_offsets);
+  ctx.Assert(hGsCloses(ctx) > 0, "the consumer must be closed by the time shutdown returns");
 }
 
 void CheckRestart(harness::Ctx& ctx) {
-  gsSeed(ctx, {"a", "b", "c", "d"});
+  hGsSeed(ctx, {"a", "b", "c", "d"});
   std::vector<std::string> calls;
-  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, "c"));
-  gsStop(ctx, *running, 5000);
+  auto running = hGsDrain(ctx, hGsHandler(ctx, calls, {}, "c"));
+  hGsStop(ctx, *running, 5000);
   const std::set<std::string> resumable = {"c", "d"};  // taken past the committed offset 2: a restart may handle these again
-  ctx.Kafka.Resume(outbox);
-  gsRestart();  // a fresh process over the same broker
+  ctx.Kafka.Resume(kHOutbox);
+  hGsRestart();  // a fresh process over the same broker
   std::vector<std::string> calls2;
-  auto running2 = gsDrain(ctx, gsHandler(ctx, calls2, {}, ""));
-  const Report report2 = gsStop(ctx, *running2, 5000);
+  auto running2 = hGsDrain(ctx, hGsHandler(ctx, calls2, {}, ""));
+  const Report report2 = hGsStop(ctx, *running2, 5000);
   const auto has = [&calls2](const std::string& key) { return std::find(calls2.begin(), calls2.end(), key) != calls2.end(); };
   ctx.Assert(!has("a") && !has("b"), "the restart handled %v: it must resume from the committed offset (2), not from the beginning", calls2);
   ctx.Assert(has("c") && has("d"), "the restart handled %v: the records taken but not committed (c, d) must be handled again", calls2);
-  const auto held = gsOutbox(ctx);
+  const auto held = hGsOutbox(ctx);
   std::map<std::string, int> counts;
   for (const auto& [k, v] : held) counts[k]++;
   for (const std::string key : {"a", "b", "c", "d"}) {
@@ -1997,75 +1997,75 @@ void CheckRestart(harness::Ctx& ctx) {
   for (const auto& [key, n] : counts)
     ctx.Assert(n == 1 || resumable.count(key),
                "%s reached outbox twice although it was committed: duplicates may only be the records reported uncommitted", key);
-  ctx.Equal(ctx.Kafka.Lag(groupID, inbox), 0, "after the restart's clean shutdown nothing may be left uncommitted: lag");
-  ctx.Assert(report2.undelivered == 0 && report2.uncommitted == 0, "the restart's clean stop must report zeros, got %s", showReport(report2));
+  ctx.Equal(ctx.Kafka.Lag(kHGroupID, kHInbox), 0, "after the restart's clean shutdown nothing may be left uncommitted: lag");
+  ctx.Assert(report2.undelivered == 0 && report2.uncommitted == 0, "the restart's clean stop must report zeros, got %s", hShowReport(report2));
 }
 
 void CheckOnce(harness::Ctx& ctx) {
-  gsSeed(ctx, {"a", "b", "c"});
+  hGsSeed(ctx, {"a", "b", "c"});
   std::vector<std::string> calls;
-  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
-  gsStop(ctx, *running, 5000);
-  gsSeed(ctx, {"d", "e"});
-  gsRestart();  // a fresh process over the same broker
-  auto running2 = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
-  gsStop(ctx, *running2, 5000);
+  auto running = hGsDrain(ctx, hGsHandler(ctx, calls, {}, ""));
+  hGsStop(ctx, *running, 5000);
+  hGsSeed(ctx, {"d", "e"});
+  hGsRestart();  // a fresh process over the same broker
+  auto running2 = hGsDrain(ctx, hGsHandler(ctx, calls, {}, ""));
+  hGsStop(ctx, *running2, 5000);
   ctx.Equal(calls, {"a", "b", "c", "d", "e"}, "across a clean shutdown and a restart each record reaches the handler once: keys the handler saw");
   std::vector<std::string> keys;
-  for (const auto& [k, v] : gsOutbox(ctx)) keys.push_back(k);
+  for (const auto& [k, v] : hGsOutbox(ctx)) keys.push_back(k);
   ctx.Equal(keys, {"a", "b", "c", "d", "e"}, "outbox must hold each record once, in order");
-  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 5, "the committed offset");
-  ctx.Equal(gsCloses(ctx), 2, "each process must close its consumer on shutdown: closes seen for group forwarder");
+  ctx.Equal(ctx.Kafka.CommittedOffset(kHGroupID, kHInbox, 0), 5, "the committed offset");
+  ctx.Equal(hGsCloses(ctx), 2, "each process must close its consumer on shutdown: closes seen for group forwarder");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  gsSeed(ctx, {"a", "b"});
+  hGsSeed(ctx, {"a", "b"});
   std::vector<std::string> calls;
-  ctx.Kafka.StallFor(outbox, 2);  // the broker is slow at the moment of the stop: it answers 2 s later
-  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
+  ctx.Kafka.StallFor(kHOutbox, 2);  // the broker is slow at the moment of the stop: it answers 2 s later
+  auto running = hGsDrain(ctx, hGsHandler(ctx, calls, {}, ""));
   int64_t before = ctx.Clock.Now();
-  Report report = gsStop(ctx, *running, 5000);
-  double took = gsSeconds(ctx, before);
-  ctx.Equal(gsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
+  Report report = hGsStop(ctx, *running, 5000);
+  double took = hGsSeconds(ctx, before);
+  ctx.Equal(hGsOutbox(ctx), std::vector<std::pair<std::string, std::string>>{{"a", "V-A"}, {"b", "V-B"}},
             "the broker answered after 2 s, within the deadline: shutdown must wait for the forwards; outbox");
   ctx.Assert(took <= 2.5, "the broker answered after 2 s yet shutdown(5000) took %.1f s: wait for the forwards, not for the whole deadline", took);
   ctx.Assert(report.undelivered == 0 && report.uncommitted == 0, "everything was acknowledged and committed, the report must say so: %s",
-             showReport(report));
-  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "both forwards were acknowledged: both offsets must be committed");
+             hShowReport(report));
+  ctx.Equal(ctx.Kafka.CommittedOffset(kHGroupID, kHInbox, 0), 2, "both forwards were acknowledged: both offsets must be committed");
 
-  gsSeed(ctx, {"c"});
-  ctx.Kafka.Stall(outbox);  // now the broker is down for good
-  gsRestart();
-  auto running2 = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
+  hGsSeed(ctx, {"c"});
+  ctx.Kafka.Stall(kHOutbox);  // now the broker is down for good
+  hGsRestart();
+  auto running2 = hGsDrain(ctx, hGsHandler(ctx, calls, {}, ""));
   before = ctx.Clock.Now();
-  report = gsStop(ctx, *running2, 3000);
-  took = gsSeconds(ctx, before);
+  report = hGsStop(ctx, *running2, 3000);
+  took = hGsSeconds(ctx, before);
   ctx.Assert(took <= 3.5, "with outbox down, shutdown(3000) took %.1f s of clock time: the deadline is the bound", took);
   ctx.Assert(took >= 2.5, "with outbox down, shutdown(3000) gave up after %.1f s: the broker may still answer within the deadline, flush with the time left", took);
   ctx.Assert(report.undelivered == 1 && report.uncommitted == 1, "c's forward never got an ack: expected undelivered 1, uncommitted 1, got %s",
-             showReport(report));
-  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "c was not acknowledged: its offset must not be committed");
+             hShowReport(report));
+  ctx.Equal(ctx.Kafka.CommittedOffset(kHGroupID, kHInbox, 0), 2, "c was not acknowledged: its offset must not be committed");
 }
 
 void CheckClosed(harness::Ctx& ctx) {
-  gsSeed(ctx, {"a", "b"});
+  hGsSeed(ctx, {"a", "b"});
   std::vector<std::string> calls;
-  auto running = gsDrain(ctx, gsHandler(ctx, calls, {}, ""));
-  gsStop(ctx, *running, 5000);
+  auto running = hGsDrain(ctx, hGsHandler(ctx, calls, {}, ""));
+  hGsStop(ctx, *running, 5000);
   int lastCommit = -1;
   int closeAt = -1;
   const auto events = ctx.Kafka.EventsOf("manual-commit", "close");
   for (size_t i = 0; i < events.size(); i++) {
     const auto& e = events[i];
-    if (e.Group != groupID) continue;
+    if (e.Group != kHGroupID) continue;
     if (e.Kind == "manual-commit") lastCommit = static_cast<int>(i);
     else if (closeAt == -1) closeAt = static_cast<int>(i);
   }
   ctx.Assert(closeAt != -1, "the consumer must be closed by the time shutdown returns");
   ctx.Assert(lastCommit != -1, "no explicit commit happened");
   ctx.Assert(lastCommit < closeAt, "the final commit must happen before the consumer is closed");
-  ctx.Equal(ctx.Kafka.CommittedOffset(groupID, inbox, 0), 2, "the committed offset");
-  std::vector<RdKafka::TopicPartition*> offsets{RdKafka::TopicPartition::create(inbox, 0, 1)};
+  ctx.Equal(ctx.Kafka.CommittedOffset(kHGroupID, kHInbox, 0), 2, "the committed offset");
+  std::vector<RdKafka::TopicPartition*> offsets{RdKafka::TopicPartition::create(kHInbox, 0, 1)};
   const RdKafka::ErrorCode err = consumer->commitSync(offsets);
   RdKafka::TopicPartition::destroy(offsets);
   ctx.Assert(err != RdKafka::ERR_NO_ERROR, "the consumer still commits after shutdown: close it");

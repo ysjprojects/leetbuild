@@ -1156,39 +1156,39 @@ import (
 	"leetbuild/harness"
 )
 
-const seededJobs = 200
+const kHSeededJobs = 200
 
 // jobTrace is what the harness's worker saw: stats() per job and every 10 ms, every job, and the
 // finished jobs per partition.
-type jobTrace struct {
+type HJobTrace struct {
 	mu      sync.Mutex
 	samples []Status
 	jobs    []Job
 	done    [3]int64
 }
 
-func (t *jobTrace) sample() {
+func (t *HJobTrace) sample() {
 	s := Stats()
 	t.mu.Lock()
 	t.samples = append(t.samples, s)
 	t.mu.Unlock()
 }
 
-func (t *jobTrace) finished(partition int) int64 {
+func (t *HJobTrace) finished(partition int) int64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.done[partition]
 }
 
-func seedJobs(ctx *harness.Ctx) {
-	for i := range seededJobs {
+func hSeedJobs(ctx *harness.Ctx) {
+	for i := range kHSeededJobs {
 		ctx.Kafka.SeedPartition("jobs", i%3, fmt.Sprintf("job-%d", i), fmt.Sprintf("job-%d", i))
 	}
 }
 
 // runJobs runs Run with the harness's worker until every job is committed (or the sleep budget
 // ends the run), then stops it.
-func runJobs(ctx *harness.Ctx, slow bool, t *jobTrace) {
+func hRunJobs(ctx *harness.Ctx, slow bool, t *HJobTrace) {
 	// Poll(10 ms) while paused and the 10 ms sampler each jump the clock: 200 jobs need far more than 500 jumps.
 	ctx.Clock.SetSleepLimit(5000)
 	worker := func(job Job) {
@@ -1233,13 +1233,13 @@ func runJobs(ctx *harness.Ctx, slow bool, t *jobTrace) {
 		ctx.Drain(func() { runErr = <-ran })
 	}
 	ctx.NoError(runErr, "Run returned an error")
-	ctx.Equal(Stats().Processed, seededJobs, "processed jobs")
+	ctx.Equal(Stats().Processed, kHSeededJobs, "processed jobs")
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	seedJobs(ctx)
-	t := &jobTrace{}
-	runJobs(ctx, true, t)
+	hSeedJobs(ctx)
+	t := &HJobTrace{}
+	hRunJobs(ctx, true, t)
 	peak := 0
 	for _, s := range t.samples {
 		peak = max(peak, s.Queued)
@@ -1249,9 +1249,9 @@ func CheckBounded(ctx *harness.Ctx) {
 }
 
 func CheckPauseResume(ctx *harness.Ctx) {
-	seedJobs(ctx)
-	t := &jobTrace{}
-	runJobs(ctx, true, t)
+	hSeedJobs(ctx)
+	t := &HJobTrace{}
+	hRunJobs(ctx, true, t)
 	first := -1
 	for i, s := range t.samples {
 		if s.Paused {
@@ -1276,15 +1276,15 @@ func CheckPauseResume(ctx *harness.Ctx) {
 }
 
 func CheckInOrder(ctx *harness.Ctx) {
-	seedJobs(ctx)
-	t := &jobTrace{}
-	runJobs(ctx, true, t)
-	ctx.Equal(len(t.jobs), seededJobs, "worker calls for 200 jobs")
+	hSeedJobs(ctx)
+	t := &HJobTrace{}
+	hRunJobs(ctx, true, t)
+	ctx.Equal(len(t.jobs), kHSeededJobs, "worker calls for 200 jobs")
 	seen := map[string]bool{}
 	for _, j := range t.jobs {
 		seen[fmt.Sprintf("%d@%d", j.Partition, j.Offset)] = true
 	}
-	ctx.Equal(len(seen), seededJobs, "some job reached the worker more than once: distinct jobs")
+	ctx.Equal(len(seen), kHSeededJobs, "some job reached the worker more than once: distinct jobs")
 	for p := range 3 {
 		var offsets []int64
 		for _, j := range t.jobs {
@@ -1302,8 +1302,8 @@ func CheckInOrder(ctx *harness.Ctx) {
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	seedJobs(ctx)
-	t := &jobTrace{}
+	hSeedJobs(ctx)
+	t := &HJobTrace{}
 	var violations []string
 	ctx.Kafka.OnCommit(func(g string, offsets harness.KafkaOffsets) {
 		for tp, o := range offsets {
@@ -1315,16 +1315,16 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 			}
 		}
 	})
-	runJobs(ctx, true, t)
+	hRunJobs(ctx, true, t)
 	ctx.Equal(len(ctx.Kafka.EventsOf("auto-commit")), 0, "auto-commit is on (offsets were committed on a timer, before the worker ran): auto-commit events")
 	ctx.Assert(len(violations) == 0, "%v", violations)
 	ctx.Equal(ctx.Kafka.Lag("workers", "jobs"), 0, "processed jobs never committed")
 }
 
 func CheckFastWorker(ctx *harness.Ctx) {
-	seedJobs(ctx)
-	t := &jobTrace{}
-	runJobs(ctx, false, t)
+	hSeedJobs(ctx)
+	t := &HJobTrace{}
+	hRunJobs(ctx, false, t)
 	peak := 0
 	for _, s := range t.samples {
 		ctx.Assert(!s.Paused, "the worker kept up, yet the consumer was paused: pause only when the queue reaches highWater")
@@ -1349,11 +1349,11 @@ func CheckFastWorker(ctx *harness.Ctx) {
 
 namespace {
 
-const int seededJobs = 200;
+const int kHSeededJobs = 200;
 
 // jobTrace is what the harness's worker saw: stats() per job and every 10 ms, every job, and the
 // finished jobs per partition.
-struct jobTrace {
+struct HJobTrace {
   std::mutex mu;
   std::vector<Status> samples;
   std::vector<Job> jobs;
@@ -1371,8 +1371,8 @@ struct jobTrace {
   }
 };
 
-void seedJobs(harness::Ctx& ctx) {
-  for (int i = 0; i < seededJobs; i++) {
+void hSeedJobs(harness::Ctx& ctx) {
+  for (int i = 0; i < kHSeededJobs; i++) {
     const std::string job = "job-" + std::to_string(i);
     ctx.Kafka.SeedPartition("jobs", i % 3, job, job);
   }
@@ -1380,7 +1380,7 @@ void seedJobs(harness::Ctx& ctx) {
 
 // runJobs runs run with the harness's worker until every job is committed (or the sleep budget
 // ends the run), then stops it.
-void runJobs(harness::Ctx& ctx, bool slow, jobTrace& t) {
+void hRunJobs(harness::Ctx& ctx, bool slow, HJobTrace& t) {
   // consume(10 ms) while paused and the 10 ms sampler each jump the clock: 200 jobs need far more than 500 jumps.
   ctx.Clock.SetSleepLimit(5000);
   auto worker = [&t, slow](const Job& job) {
@@ -1437,15 +1437,15 @@ void runJobs(harness::Ctx& ctx, bool slow, jobTrace& t) {
     sampler.detach();
   }
   ctx.Assert(runError.empty(), "run threw: %v", runError);
-  ctx.Equal(stats().processed, seededJobs, "processed jobs");
+  ctx.Equal(stats().processed, kHSeededJobs, "processed jobs");
 }
 
 }  // namespace
 
 void CheckBounded(harness::Ctx& ctx) {
-  seedJobs(ctx);
-  jobTrace t;
-  runJobs(ctx, true, t);
+  hSeedJobs(ctx);
+  HJobTrace t;
+  hRunJobs(ctx, true, t);
   size_t peak = 0;
   for (const auto& s : t.samples) peak = std::max(peak, s.queued);
   ctx.Assert(peak <= kHigh, "the queue held %d jobs at one point; it must never exceed kHigh = 20", peak);
@@ -1453,9 +1453,9 @@ void CheckBounded(harness::Ctx& ctx) {
 }
 
 void CheckPauseResume(harness::Ctx& ctx) {
-  seedJobs(ctx);
-  jobTrace t;
-  runJobs(ctx, true, t);
+  hSeedJobs(ctx);
+  HJobTrace t;
+  hRunJobs(ctx, true, t);
   int first = -1;
   for (size_t i = 0; i < t.samples.size(); i++) {
     if (t.samples[i].paused) {
@@ -1480,13 +1480,13 @@ void CheckPauseResume(harness::Ctx& ctx) {
 }
 
 void CheckInOrder(harness::Ctx& ctx) {
-  seedJobs(ctx);
-  jobTrace t;
-  runJobs(ctx, true, t);
-  ctx.Equal(t.jobs.size(), seededJobs, "worker calls for 200 jobs");
+  hSeedJobs(ctx);
+  HJobTrace t;
+  hRunJobs(ctx, true, t);
+  ctx.Equal(t.jobs.size(), kHSeededJobs, "worker calls for 200 jobs");
   std::set<std::string> seen;
   for (const auto& j : t.jobs) seen.insert(std::to_string(j.partition) + "@" + std::to_string(j.offset));
-  ctx.Equal(seen.size(), seededJobs, "some job reached the worker more than once: distinct jobs");
+  ctx.Equal(seen.size(), kHSeededJobs, "some job reached the worker more than once: distinct jobs");
   for (int p = 0; p < 3; p++) {
     std::vector<int64_t> offsets;
     for (const auto& j : t.jobs)
@@ -1501,8 +1501,8 @@ void CheckInOrder(harness::Ctx& ctx) {
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  seedJobs(ctx);
-  jobTrace t;
+  hSeedJobs(ctx);
+  HJobTrace t;
   std::vector<std::string> violations;
   ctx.Kafka.OnCommit([&](const std::string& g, const harness::KafkaOffsets& offsets) {
     for (const auto& [tp, o] : offsets) {
@@ -1513,7 +1513,7 @@ void CheckCommitAfter(harness::Ctx& ctx) {
                                               tp.Partition, o, t.finished(tp.Partition)));
     }
   });
-  runJobs(ctx, true, t);
+  hRunJobs(ctx, true, t);
   ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0,
             "auto-commit is on (offsets were committed on a timer, before the worker ran): auto-commit events");
   ctx.Assert(violations.empty(), "%v", violations);
@@ -1521,9 +1521,9 @@ void CheckCommitAfter(harness::Ctx& ctx) {
 }
 
 void CheckFastWorker(harness::Ctx& ctx) {
-  seedJobs(ctx);
-  jobTrace t;
-  runJobs(ctx, false, t);
+  hSeedJobs(ctx);
+  HJobTrace t;
+  hRunJobs(ctx, false, t);
   size_t peak = 0;
   for (const auto& s : t.samples) {
     ctx.Assert(!s.paused, "the worker kept up, yet the consumer was paused: pause only when the queue reaches kHigh");

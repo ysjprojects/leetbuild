@@ -963,157 +963,157 @@ import (
 	"leetbuild/harness"
 )
 
-const modelQuestion = "My payout has not arrived, when is it paid?"
+const kHModelQuestion = "My payout has not arrived, when is it paid?"
 
-var modelChunks = []prompt.Chunk{
+var hModelChunks = []prompt.Chunk{
 	{ID: "pay-0", Text: "Dasher earnings for a week are paid out every Monday by direct deposit and usually arrive within two to three business days, depending on the bank.", Score: 0.71},
 	{ID: "tips-0", Text: "Tips are included in the weekly payout and in Fast Pay.", Score: 0.52},
 	{ID: "undeliverable-0", Text: "If the timer runs out, the app allows the order to be marked as undeliverable and the Dasher is still paid in full for the delivery.", Score: 0.33},
 }
 
-var modelHistory = []prompt.Turn{
+var hModelHistory = []prompt.Turn{
 	{Role: "dasher", Text: "Hi, I dashed all of last week."},
 	{Role: "assistant", Text: "Hello! What can I help you with about last week's dashes?"},
 }
 
 // llmPeer is the stand-in model server, answering in mode.
-type llmPeer struct {
+type HLlmPeer struct {
 	pb.UnimplementedLlmServer
 	mode string
 }
 
-func (p *llmPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+func (p *HLlmPeer) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
 	text := model.Complete(req.GetPrompt(), int(req.GetMaxTokens()), p.mode)
 	return &pb.GenerateReply{Text: text, Tokens: int32(len(strings.Fields(text))), Model: req.GetModel()}, nil
 }
 
 // modelWorld is what a check compares against: the one prompt and the faithful model's answer to it.
-type modelWorld struct {
+type HModelWorld struct {
 	prompt   string
 	expected string
 }
 
 // serveModels serves both model addresses with the stand-in model in mode.
-func serveModels(ctx *harness.Ctx, mode string) modelWorld {
-	peer := &llmPeer{mode: mode}
+func hServeModels(ctx *harness.Ctx, mode string) HModelWorld {
+	peer := &HLlmPeer{mode: mode}
 	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMLarge), peer)
 	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMSmall), peer)
-	p := prompt.Build(modelQuestion, modelChunks, modelHistory)
-	return modelWorld{prompt: p, expected: model.Complete(p, config.MaxTokens, "faithful")}
+	p := prompt.Build(kHModelQuestion, hModelChunks, hModelHistory)
+	return HModelWorld{prompt: p, expected: model.Complete(p, config.MaxTokens, "faithful")}
 }
 
 // generateOK calls generate and requires a result.
-func generateOK(ctx *harness.Ctx) *Generated {
-	result, err := generate(context.Background(), modelQuestion, modelChunks, modelHistory)
+func hGenerateOK(ctx *harness.Ctx) *Generated {
+	result, err := generate(context.Background(), kHModelQuestion, hModelChunks, hModelHistory)
 	ctx.NoError(err, "generate(question, chunks, history) must return {Answer, Model, Tokens}")
 	ctx.Assert(result != nil, "generate must return a *Generated, got nil")
 	return result
 }
 
 // generateFails calls generate, requires an error and returns its status code.
-func generateFails(ctx *harness.Ctx, what string) codes.Code {
-	result, err := generate(context.Background(), modelQuestion, modelChunks, modelHistory)
+func hGenerateFails(ctx *harness.Ctx, what string) codes.Code {
+	result, err := generate(context.Background(), kHModelQuestion, hModelChunks, hModelHistory)
 	if err == nil {
 		ctx.Fatalf("%s must fail, generate returned %+v", what, result)
 	}
 	return status.Code(err)
 }
 
-func generateCalls(ctx *harness.Ctx, target string) []harness.Call {
+func hGenerateCalls(ctx *harness.Ctx, target string) []harness.Call {
 	return ctx.GRPC.CallsTo("Generate", target)
 }
 
-func generateRequest(call harness.Call) *pb.GenerateRequest {
+func hGenerateRequest(call harness.Call) *pb.GenerateRequest {
 	req, _ := call.Request.(*pb.GenerateRequest)
 	return req
 }
 
-func replyWords(text string) int { return len(strings.Fields(text)) }
+func hReplyWords(text string) int { return len(strings.Fields(text)) }
 
 func CheckPrompt(ctx *harness.Ctx) {
-	w := serveModels(ctx, "faithful")
-	result := generateOK(ctx)
-	calls := generateCalls(ctx, config.LLMLarge)
+	w := hServeModels(ctx, "faithful")
+	result := hGenerateOK(ctx)
+	calls := hGenerateCalls(ctx, config.LLMLarge)
 	ctx.Equal(len(calls), 1, "a healthy large model must be called exactly once: calls to %s", config.LLMLarge)
-	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 0, "the small model must not be called while the large one answers")
-	request := generateRequest(calls[0])
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMSmall)), 0, "the small model must not be called while the large one answers")
+	request := hGenerateRequest(calls[0])
 	ctx.Equal(request.GetModel(), "large", "the request to %s must say Model: \\"large\\"", config.LLMLarge)
-	for _, c := range modelChunks {
+	for _, c := range hModelChunks {
 		ctx.Assert(strings.Contains(request.GetPrompt(), "[kb:"+c.ID+"] "+c.Text), "the prompt has no '[kb:%s] <text>' line for a retrieved chunk; use prompt.Build", c.ID)
 	}
-	for _, turn := range modelHistory {
+	for _, turn := range hModelHistory {
 		ctx.Assert(strings.Contains(request.GetPrompt(), turn.Role+": "+turn.Text), "the prompt is missing the history turn %s: %q", turn.Role, turn.Text)
 	}
-	ctx.Assert(strings.Contains(request.GetPrompt(), "Question: "+modelQuestion), "the prompt is missing the 'Question: …' line")
+	ctx.Assert(strings.Contains(request.GetPrompt(), "Question: "+kHModelQuestion), "the prompt is missing the 'Question: …' line")
 	ctx.Equal(request.GetPrompt(), w.prompt, "the prompt must be exactly prompt.Build(question, chunks, history): the model parses that format")
 	ctx.Equal(result.Answer, w.expected, "Answer must be the reply's text")
 	ctx.Equal(result.Model, "large", "Model must be the reply's model")
-	ctx.Equal(result.Tokens, replyWords(w.expected), "Tokens must be the reply's token count")
+	ctx.Equal(result.Tokens, hReplyWords(w.expected), "Tokens must be the reply's token count")
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveModels(ctx, "faithful")
-	generateOK(ctx)
-	calls := generateCalls(ctx, config.LLMLarge)
+	hServeModels(ctx, "faithful")
+	hGenerateOK(ctx)
+	calls := hGenerateCalls(ctx, config.LLMLarge)
 	call := calls[len(calls)-1]
 	ctx.Assert(call.HasDeadline(), "the Generate call carries no deadline: a stalled model would hold the chat open forever")
 	ctx.Assert(1.5 <= call.Timeout.Seconds() && call.Timeout.Seconds() <= 2.0, "the deadline must be config.DeadlineS = %v s, got %v s", config.DeadlineS, call.Timeout.Seconds())
 	ctx.GRPC.SetLatency("Generate", 3.0, config.LLMLarge)
 	started := ctx.Clock.Now()
-	result := generateOK(ctx)
+	result := hGenerateOK(ctx)
 	elapsed := ctx.Clock.Now() - started
-	slow := generateCalls(ctx, config.LLMLarge)[1:]
+	slow := hGenerateCalls(ctx, config.LLMLarge)[1:]
 	for _, c := range slow {
 		ctx.Assert(c.Code == codes.DeadlineExceeded, "a large model slower than the deadline must be abandoned with DEADLINE_EXCEEDED, not waited for")
 	}
 	ctx.Equal(len(slow), 2, "a large model past its deadline earns one retry: calls to %s", config.LLMLarge)
 	ctx.Equal(result.Model, "small", "after two deadlines the small model must answer")
-	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 1, "calls to %s", config.LLMSmall)
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMSmall)), 1, "calls to %s", config.LLMSmall)
 	ctx.Assert(4000 <= elapsed && elapsed <= 4800, "two attempts of %v s plus one 200 ms backoff should take about 4200 ms of virtual time, took %d ms (6000 means the deadline was not attached to the call)", config.DeadlineS, elapsed)
 }
 
 func CheckRetryTransient(ctx *harness.Ctx) {
-	w := serveModels(ctx, "faithful")
+	w := hServeModels(ctx, "faithful")
 	ctx.GRPC.Fail("Generate", codes.Unavailable, "", 1, config.LLMLarge)
 	started := ctx.Clock.Now()
-	result := generateOK(ctx)
+	result := hGenerateOK(ctx)
 	elapsed := ctx.Clock.Now() - started
-	ctx.Equal(len(generateCalls(ctx, config.LLMLarge)), 2, "one UNAVAILABLE must be retried against the large model: calls to %s", config.LLMLarge)
-	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 0, "one UNAVAILABLE is a retry, not a fallback: the small model must not be called")
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMLarge)), 2, "one UNAVAILABLE must be retried against the large model: calls to %s", config.LLMLarge)
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMSmall)), 0, "one UNAVAILABLE is a retry, not a fallback: the small model must not be called")
 	ctx.Equal(result.Model, "large", "the retry must be answered by the large model")
 	ctx.Equal(result.Answer, w.expected, "the retried answer must be the reply's text")
 	ctx.Assert(150 <= elapsed && elapsed <= 500, "the retry must wait a 200 ms backoff (virtual), it waited %d ms", elapsed)
 	ctx.GRPC.Fail("Generate", codes.InvalidArgument, "prompt too long", 1, config.LLMLarge)
-	code := generateFails(ctx, "INVALID_ARGUMENT is not transient: it")
+	code := hGenerateFails(ctx, "INVALID_ARGUMENT is not transient: it")
 	ctx.Equal(code, codes.InvalidArgument, "INVALID_ARGUMENT must propagate as is")
-	ctx.Equal(len(generateCalls(ctx, config.LLMLarge)), 3, "INVALID_ARGUMENT must not be retried: it will fail the same way")
-	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 0, "INVALID_ARGUMENT must not fall back: the small model gets the same bad request")
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMLarge)), 3, "INVALID_ARGUMENT must not be retried: it will fail the same way")
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMSmall)), 0, "INVALID_ARGUMENT must not fall back: the small model gets the same bad request")
 }
 
 func CheckFallbackSmall(ctx *harness.Ctx) {
-	w := serveModels(ctx, "faithful")
+	w := hServeModels(ctx, "faithful")
 	ctx.GRPC.Stop(config.LLMLarge)
-	result := generateOK(ctx)
+	result := hGenerateOK(ctx)
 	ctx.Equal(result.Model, "small", "with the large model down the small one must answer")
 	ctx.Equal(result.Answer, w.expected, "the small model's reply must come back as the answer")
-	ctx.Equal(len(generateCalls(ctx, config.LLMLarge)), 2, "a large model that is down earns exactly one retry: calls to %s", config.LLMLarge)
-	ctx.Equal(len(generateCalls(ctx, config.LLMSmall)), 1, "calls to %s", config.LLMSmall)
-	request := generateRequest(generateCalls(ctx, config.LLMSmall)[0])
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMLarge)), 2, "a large model that is down earns exactly one retry: calls to %s", config.LLMLarge)
+	ctx.Equal(len(hGenerateCalls(ctx, config.LLMSmall)), 1, "calls to %s", config.LLMSmall)
+	request := hGenerateRequest(hGenerateCalls(ctx, config.LLMSmall)[0])
 	ctx.Assert(request.GetModel() == "small" && request.GetPrompt() == w.prompt && request.GetMaxTokens() == config.MaxTokens, "the fallback must send the same prompt and MaxTokens with Model: \\"small\\"")
 	ctx.GRPC.Stop(config.LLMSmall)
-	code := generateFails(ctx, "both models down")
+	code := hGenerateFails(ctx, "both models down")
 	ctx.Equal(code, codes.Unavailable, "both models down must surface UNAVAILABLE")
-	total := len(generateCalls(ctx, ""))
+	total := len(hGenerateCalls(ctx, ""))
 	ctx.Assert(total == 6, "never more than three model calls per generate: the second generate made %d", total-3)
 }
 
 func CheckMaxTokens(ctx *harness.Ctx) {
-	serveModels(ctx, "verbose")
-	result := generateOK(ctx)
-	request := generateRequest(generateCalls(ctx, config.LLMLarge)[0])
+	hServeModels(ctx, "verbose")
+	result := hGenerateOK(ctx)
+	request := hGenerateRequest(hGenerateCalls(ctx, config.LLMLarge)[0])
 	ctx.Equal(request.GetMaxTokens(), config.MaxTokens, "the request must carry MaxTokens: config.MaxTokens")
 	ctx.Equal(result.Model, "large", "Model")
-	ctx.Equal(replyWords(result.Answer), config.MaxTokens, "a verbose model is cut at max_tokens by the server: words in the answer")
+	ctx.Equal(hReplyWords(result.Answer), config.MaxTokens, "a verbose model is cut at max_tokens by the server: words in the answer")
 	ctx.Equal(result.Tokens, config.MaxTokens, "Tokens must be the reply's count")
 }
 `,
@@ -1125,29 +1125,29 @@ func CheckMaxTokens(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string modelQuestion = "My payout has not arrived, when is it paid?";
+const std::string kHModelQuestion = "My payout has not arrived, when is it paid?";
 
-const std::vector<assistant::Chunk> modelChunks = {
+const std::vector<assistant::Chunk> kHModelChunks = {
     {"pay-0", "Dasher earnings for a week are paid out every Monday by direct deposit and usually arrive within two to three business days, depending on the bank.", 0.71},
     {"tips-0", "Tips are included in the weekly payout and in Fast Pay.", 0.52},
     {"undeliverable-0", "If the timer runs out, the app allows the order to be marked as undeliverable and the Dasher is still paid in full for the delivery.", 0.33},
 };
 
-const std::vector<assistant::Turn> modelHistory = {
+const std::vector<assistant::Turn> kHModelHistory = {
     {"dasher", "Hi, I dashed all of last week."},
     {"assistant", "Hello! What can I help you with about last week's dashes?"},
 };
 
-int replyWords(const std::string& text) { return static_cast<int>(model::fields(text).size()); }
+int hReplyWords(const std::string& text) { return static_cast<int>(model::fields(text).size()); }
 
 // llmPeer is the stand-in model server, answering in mode.
-class llmPeer final : public support::Llm::Service {
+class HLlmPeer final : public support::Llm::Service {
  public:
-  explicit llmPeer(std::string mode) : mode_(std::move(mode)) {}
+  explicit HLlmPeer(std::string mode) : mode_(std::move(mode)) {}
   grpc::Status Generate(grpc::ServerContext*, const support::GenerateRequest* req, support::GenerateReply* reply) override {
     const std::string text = model::complete(req->prompt(), req->max_tokens(), mode_);
     reply->set_text(text);
-    reply->set_tokens(replyWords(text));
+    reply->set_tokens(hReplyWords(text));
     reply->set_model(req->model());
     return grpc::Status::OK;
   }
@@ -1157,41 +1157,41 @@ class llmPeer final : public support::Llm::Service {
 };
 
 // modelWorld is what a check compares against: the one prompt and the faithful model's answer to it.
-struct modelWorld {
+struct HModelWorld {
   std::string prompt;
   std::string expected;
 };
 
 // serveModels serves both model addresses with the stand-in model in mode.
-modelWorld serveModels(harness::Ctx& ctx, const std::string& mode) {
-  static std::unique_ptr<llmPeer> peer;
-  peer = std::make_unique<llmPeer>(mode);
+HModelWorld hServeModels(harness::Ctx& ctx, const std::string& mode) {
+  static std::unique_ptr<HLlmPeer> peer;
+  peer = std::make_unique<HLlmPeer>(mode);
   ctx.GRPC.Server(config::kLlmLarge)->RegisterService(peer.get());
   ctx.GRPC.Server(config::kLlmSmall)->RegisterService(peer.get());
-  const std::string p = assistant::build_prompt(modelQuestion, modelChunks, modelHistory);
-  return modelWorld{p, model::complete(p, config::kMaxTokens, "faithful")};
+  const std::string p = assistant::build_prompt(kHModelQuestion, kHModelChunks, kHModelHistory);
+  return HModelWorld{p, model::complete(p, config::kMaxTokens, "faithful")};
 }
 
 // generateOK calls generate and requires a result.
-Generated generateOK(harness::Ctx& ctx) {
+Generated hGenerateOK(harness::Ctx& ctx) {
   try {
-    return generate(modelQuestion, modelChunks, modelHistory);
+    return generate(kHModelQuestion, kHModelChunks, kHModelHistory);
   } catch (const std::exception& e) {
     ctx.Fatalf("generate(question, chunks, history) must return {Answer, Model, Tokens}: %v", std::string(e.what()));
   }
 }
 
-std::vector<harness::Call> generateCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("Generate", target); }
+std::vector<harness::Call> hGenerateCalls(harness::Ctx& ctx, const std::string& target) { return ctx.GRPC.CallsTo("Generate", target); }
 
 // generateFails calls generate, requires it to throw and returns the status code it failed with.
 // Go reads the code off the returned error; the C++ step throws a std::runtime_error carrying the
 // status message, so the code is the last model call's, and the exception must carry its message.
-grpc::StatusCode generateFails(harness::Ctx& ctx, const std::string& what) {
+grpc::StatusCode hGenerateFails(harness::Ctx& ctx, const std::string& what) {
   try {
-    const Generated result = generate(modelQuestion, modelChunks, modelHistory);
+    const Generated result = generate(kHModelQuestion, kHModelChunks, kHModelHistory);
     ctx.Fatalf("%s must fail, generate returned &{Answer:%s Model:%s Tokens:%d}", what, result.answer, result.model, result.tokens);
   } catch (const std::exception& e) {
-    const auto calls = generateCalls(ctx, "");
+    const auto calls = hGenerateCalls(ctx, "");
     ctx.Assert(!calls.empty(), "%s must fail after calling the model, no Generate call was made", what);
     const harness::Call& last = calls.back();
     ctx.Assert(std::string(e.what()).find(last.Message) != std::string::npos, "%s: the error must carry the model's status (%q), it was %q", what, last.Message, std::string(e.what()));
@@ -1202,91 +1202,91 @@ grpc::StatusCode generateFails(harness::Ctx& ctx, const std::string& what) {
 }  // namespace
 
 void CheckPrompt(harness::Ctx& ctx) {
-  const auto w = serveModels(ctx, "faithful");
-  const Generated result = generateOK(ctx);
-  const auto calls = generateCalls(ctx, config::kLlmLarge);
+  const auto w = hServeModels(ctx, "faithful");
+  const Generated result = hGenerateOK(ctx);
+  const auto calls = hGenerateCalls(ctx, config::kLlmLarge);
   ctx.Equal(calls.size(), 1, "a healthy large model must be called exactly once: calls to %s", config::kLlmLarge);
-  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 0, "the small model must not be called while the large one answers");
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmSmall).size(), 0, "the small model must not be called while the large one answers");
   const auto request = calls[0].Request<support::GenerateRequest>();
   ctx.Equal(request.model(), "large", "the request to %s must say Model: \\"large\\"", config::kLlmLarge);
-  for (const auto& c : modelChunks) {
+  for (const auto& c : kHModelChunks) {
     ctx.Assert(request.prompt().find("[kb:" + c.id + "] " + c.text) != std::string::npos, "the prompt has no '[kb:%s] <text>' line for a retrieved chunk; use prompt.Build", c.id);
   }
-  for (const auto& turn : modelHistory) {
+  for (const auto& turn : kHModelHistory) {
     ctx.Assert(request.prompt().find(turn.role + ": " + turn.text) != std::string::npos, "the prompt is missing the history turn %s: %q", turn.role, turn.text);
   }
-  ctx.Assert(request.prompt().find("Question: " + modelQuestion) != std::string::npos, "the prompt is missing the 'Question: …' line");
+  ctx.Assert(request.prompt().find("Question: " + kHModelQuestion) != std::string::npos, "the prompt is missing the 'Question: …' line");
   ctx.Equal(request.prompt(), w.prompt, "the prompt must be exactly prompt.Build(question, chunks, history): the model parses that format");
   ctx.Equal(result.answer, w.expected, "Answer must be the reply's text");
   ctx.Equal(result.model, "large", "Model must be the reply's model");
-  ctx.Equal(result.tokens, replyWords(w.expected), "Tokens must be the reply's token count");
+  ctx.Equal(result.tokens, hReplyWords(w.expected), "Tokens must be the reply's token count");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveModels(ctx, "faithful");
-  generateOK(ctx);
-  const auto calls = generateCalls(ctx, config::kLlmLarge);
+  hServeModels(ctx, "faithful");
+  hGenerateOK(ctx);
+  const auto calls = hGenerateCalls(ctx, config::kLlmLarge);
   const harness::Call& call = calls.back();
   ctx.Assert(call.HasDeadline(), "the Generate call carries no deadline: a stalled model would hold the chat open forever");
   const double deadlineS = config::kDeadline.count() / 1000.0;
   ctx.Assert(1.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 2.0, "the deadline must be config.DeadlineS = %v s, got %v s", deadlineS, call.TimeoutSeconds());
   ctx.GRPC.SetLatency("Generate", 3.0, config::kLlmLarge);
   const int64_t started = ctx.Clock.Now();
-  const Generated result = generateOK(ctx);
+  const Generated result = hGenerateOK(ctx);
   const int64_t elapsed = ctx.Clock.Now() - started;
-  const auto all = generateCalls(ctx, config::kLlmLarge);
+  const auto all = hGenerateCalls(ctx, config::kLlmLarge);
   const std::vector<harness::Call> slow(all.begin() + 1, all.end());
   for (const auto& c : slow) {
     ctx.Assert(c.Code == grpc::StatusCode::DEADLINE_EXCEEDED, "a large model slower than the deadline must be abandoned with DEADLINE_EXCEEDED, not waited for");
   }
   ctx.Equal(slow.size(), 2, "a large model past its deadline earns one retry: calls to %s", config::kLlmLarge);
   ctx.Equal(result.model, "small", "after two deadlines the small model must answer");
-  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 1, "calls to %s", config::kLlmSmall);
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmSmall).size(), 1, "calls to %s", config::kLlmSmall);
   ctx.Assert(4000 <= elapsed && elapsed <= 4800, "two attempts of %v s plus one 200 ms backoff should take about 4200 ms of virtual time, took %d ms (6000 means the deadline was not attached to the call)", deadlineS, elapsed);
 }
 
 void CheckRetryTransient(harness::Ctx& ctx) {
-  const auto w = serveModels(ctx, "faithful");
+  const auto w = hServeModels(ctx, "faithful");
   ctx.GRPC.Fail("Generate", grpc::StatusCode::UNAVAILABLE, "", 1, config::kLlmLarge);
   const int64_t started = ctx.Clock.Now();
-  const Generated result = generateOK(ctx);
+  const Generated result = hGenerateOK(ctx);
   const int64_t elapsed = ctx.Clock.Now() - started;
-  ctx.Equal(generateCalls(ctx, config::kLlmLarge).size(), 2, "one UNAVAILABLE must be retried against the large model: calls to %s", config::kLlmLarge);
-  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 0, "one UNAVAILABLE is a retry, not a fallback: the small model must not be called");
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmLarge).size(), 2, "one UNAVAILABLE must be retried against the large model: calls to %s", config::kLlmLarge);
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmSmall).size(), 0, "one UNAVAILABLE is a retry, not a fallback: the small model must not be called");
   ctx.Equal(result.model, "large", "the retry must be answered by the large model");
   ctx.Equal(result.answer, w.expected, "the retried answer must be the reply's text");
   ctx.Assert(150 <= elapsed && elapsed <= 500, "the retry must wait a 200 ms backoff (virtual), it waited %d ms", elapsed);
   ctx.GRPC.Fail("Generate", grpc::StatusCode::INVALID_ARGUMENT, "prompt too long", 1, config::kLlmLarge);
-  const auto code = generateFails(ctx, "INVALID_ARGUMENT is not transient: it");
+  const auto code = hGenerateFails(ctx, "INVALID_ARGUMENT is not transient: it");
   ctx.Assert(code == grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate as is, got code %d", static_cast<int>(code));
-  ctx.Equal(generateCalls(ctx, config::kLlmLarge).size(), 3, "INVALID_ARGUMENT must not be retried: it will fail the same way");
-  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 0, "INVALID_ARGUMENT must not fall back: the small model gets the same bad request");
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmLarge).size(), 3, "INVALID_ARGUMENT must not be retried: it will fail the same way");
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmSmall).size(), 0, "INVALID_ARGUMENT must not fall back: the small model gets the same bad request");
 }
 
 void CheckFallbackSmall(harness::Ctx& ctx) {
-  const auto w = serveModels(ctx, "faithful");
+  const auto w = hServeModels(ctx, "faithful");
   ctx.GRPC.Stop(config::kLlmLarge);
-  const Generated result = generateOK(ctx);
+  const Generated result = hGenerateOK(ctx);
   ctx.Equal(result.model, "small", "with the large model down the small one must answer");
   ctx.Equal(result.answer, w.expected, "the small model's reply must come back as the answer");
-  ctx.Equal(generateCalls(ctx, config::kLlmLarge).size(), 2, "a large model that is down earns exactly one retry: calls to %s", config::kLlmLarge);
-  ctx.Equal(generateCalls(ctx, config::kLlmSmall).size(), 1, "calls to %s", config::kLlmSmall);
-  const auto request = generateCalls(ctx, config::kLlmSmall)[0].Request<support::GenerateRequest>();
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmLarge).size(), 2, "a large model that is down earns exactly one retry: calls to %s", config::kLlmLarge);
+  ctx.Equal(hGenerateCalls(ctx, config::kLlmSmall).size(), 1, "calls to %s", config::kLlmSmall);
+  const auto request = hGenerateCalls(ctx, config::kLlmSmall)[0].Request<support::GenerateRequest>();
   ctx.Assert(request.model() == "small" && request.prompt() == w.prompt && request.max_tokens() == config::kMaxTokens, "the fallback must send the same prompt and MaxTokens with Model: \\"small\\"");
   ctx.GRPC.Stop(config::kLlmSmall);
-  const auto code = generateFails(ctx, "both models down");
+  const auto code = hGenerateFails(ctx, "both models down");
   ctx.Assert(code == grpc::StatusCode::UNAVAILABLE, "both models down must surface UNAVAILABLE, got code %d", static_cast<int>(code));
-  const size_t total = generateCalls(ctx, "").size();
+  const size_t total = hGenerateCalls(ctx, "").size();
   ctx.Assert(total == 6, "never more than three model calls per generate: the second generate made %d", total - 3);
 }
 
 void CheckMaxTokens(harness::Ctx& ctx) {
-  serveModels(ctx, "verbose");
-  const Generated result = generateOK(ctx);
-  const auto request = generateCalls(ctx, config::kLlmLarge)[0].Request<support::GenerateRequest>();
+  hServeModels(ctx, "verbose");
+  const Generated result = hGenerateOK(ctx);
+  const auto request = hGenerateCalls(ctx, config::kLlmLarge)[0].Request<support::GenerateRequest>();
   ctx.Equal(request.max_tokens(), config::kMaxTokens, "the request must carry MaxTokens: config.MaxTokens");
   ctx.Equal(result.model, "large", "Model");
-  ctx.Equal(replyWords(result.answer), config::kMaxTokens, "a verbose model is cut at max_tokens by the server: words in the answer");
+  ctx.Equal(hReplyWords(result.answer), config::kMaxTokens, "a verbose model is cut at max_tokens by the server: words in the answer");
   ctx.Equal(result.tokens, config::kMaxTokens, "Tokens must be the reply's count");
 }
 `,

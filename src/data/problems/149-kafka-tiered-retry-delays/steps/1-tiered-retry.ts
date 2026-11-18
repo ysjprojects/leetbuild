@@ -1311,20 +1311,20 @@ import (
 )
 
 var (
-	checkTiers       = []int64{5000, 30000, 300000}
-	checkRetryTopics = []string{"tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m"}
-	epochMillis      = regexp.MustCompile("^[0-9]+$")
+	hCheckTiers       = []int64{5000, 30000, 300000}
+	hCheckRetryTopics = []string{"tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m"}
+	hEpochMillis      = regexp.MustCompile("^[0-9]+$")
 )
 
-const checkGroup = "tasks-workers"
+const kHCheckGroup = "tasks-workers"
 
-type taskCall struct {
+type HTaskCall struct {
 	key, value string
 	at         int64
 }
 
 // recordHeader is a header's value as text, nil when absent.
-func recordHeader(r harness.KafkaRecord, name string) any {
+func hRecordHeader(r harness.KafkaRecord, name string) any {
 	if v, ok := r.Header(name); ok {
 		return string(v)
 	}
@@ -1332,7 +1332,7 @@ func recordHeader(r harness.KafkaRecord, name string) any {
 }
 
 // seedTask puts a record on partition 0 of topic, with the attempt and not_before headers when >= 0.
-func seedTask(ctx *harness.Ctx, topic, key, value string, attempt, notBefore int64) {
+func hSeedTask(ctx *harness.Ctx, topic, key, value string, attempt, notBefore int64) {
 	var headers []harness.KafkaHeader
 	if attempt >= 0 {
 		headers = append(headers, harness.KafkaHeader{Key: "attempt", Value: []byte(strconv.FormatInt(attempt, 10))})
@@ -1345,10 +1345,10 @@ func seedTask(ctx *harness.Ctx, topic, key, value string, attempt, notBefore int
 
 // taskWorker runs the learner's loop with a handler that records (key, value, clock ms), moves the
 // clock by advance[key] seconds, and fails with "boom" for keys in fails.
-func taskWorker(ctx *harness.Ctx, fails []string, advance map[string]float64) []taskCall {
-	var calls []taskCall
+func hTaskWorker(ctx *harness.Ctx, fails []string, advance map[string]float64) []HTaskCall {
+	var calls []HTaskCall
 	handler := func(key, value string) error {
-		calls = append(calls, taskCall{key, value, ctx.Clock.Now()})
+		calls = append(calls, HTaskCall{key, value, ctx.Clock.Now()})
 		if s, ok := advance[key]; ok {
 			ctx.Clock.Advance(s)
 		}
@@ -1363,8 +1363,8 @@ func taskWorker(ctx *harness.Ctx, fails []string, advance map[string]float64) []
 	return calls
 }
 
-func callsOf(calls []taskCall, key string) []taskCall {
-	var out []taskCall
+func hCallsOf(calls []HTaskCall, key string) []HTaskCall {
+	var out []HTaskCall
 	for _, c := range calls {
 		if c.key == key {
 			out = append(out, c)
@@ -1373,7 +1373,7 @@ func callsOf(calls []taskCall, key string) []taskCall {
 	return out
 }
 
-func touches(offsets harness.KafkaOffsets, topic string) bool {
+func hTouches(offsets harness.KafkaOffsets, topic string) bool {
 	for tp := range offsets {
 		if tp.Topic == topic {
 			return true
@@ -1382,20 +1382,20 @@ func touches(offsets harness.KafkaOffsets, topic string) bool {
 	return false
 }
 
-func allCommitted(ctx *harness.Ctx) {
-	for _, topic := range append([]string{"tasks"}, checkRetryTopics...) {
-		ctx.Equal(ctx.Kafka.Lag(checkGroup, topic), 0, "%s: handled record(s) left uncommitted", topic)
+func hAllCommitted(ctx *harness.Ctx) {
+	for _, topic := range append([]string{"tasks"}, hCheckRetryTopics...) {
+		ctx.Equal(ctx.Kafka.Lag(kHCheckGroup, topic), 0, "%s: handled record(s) left uncommitted", topic)
 	}
 }
 
 func CheckGroup(ctx *harness.Ctx) {
-	seedTask(ctx, "tasks", "a", "job-a", -1, -1)
-	calls := taskWorker(ctx, nil, nil)
+	hSeedTask(ctx, "tasks", "a", "job-a", -1, -1)
+	calls := hTaskWorker(ctx, nil, nil)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to the topics")
 	last := subscriptions[len(subscriptions)-1]
-	ctx.Equal(last.Group, checkGroup, "group.id")
-	for _, topic := range append([]string{"tasks"}, checkRetryTopics...) {
+	ctx.Equal(last.Group, kHCheckGroup, "group.id")
+	for _, topic := range append([]string{"tasks"}, hCheckRetryTopics...) {
 		found := false
 		for _, t := range last.Topics {
 			found = found || t == topic
@@ -1409,37 +1409,37 @@ func CheckGroup(ctx *harness.Ctx) {
 		seen = append(seen, c.key+"="+c.value)
 	}
 	ctx.Equal(seen, []string{"a=job-a"}, "the handler must see (key, value) once per record: key=value handled")
-	allCommitted(ctx)
+	hAllCommitted(ctx)
 }
 
 func CheckEscalates(ctx *harness.Ctx) {
-	seedTask(ctx, "tasks", "a", "job-a", -1, -1)
+	hSeedTask(ctx, "tasks", "a", "job-a", -1, -1)
 	for _, key := range []string{"f1", "f2", "f3"} {
-		seedTask(ctx, "tasks", key, "job-"+key, -1, -1)
+		hSeedTask(ctx, "tasks", key, "job-"+key, -1, -1)
 	}
-	calls := taskWorker(ctx, []string{"a"}, map[string]float64{"f1": 6, "f2": 40, "f3": 400})
-	tries := callsOf(calls, "a")
+	calls := hTaskWorker(ctx, []string{"a"}, map[string]float64{"f1": 6, "f2": 40, "f3": 400})
+	tries := hCallsOf(calls, "a")
 	ctx.Equal(len(tries), 4, "a record that always fails is tried once on tasks and once per tier: the handler's calls for it")
 	for _, c := range tries {
 		ctx.Equal(c.value, "job-a", "every retry must hand the handler the original value")
 	}
-	for i, topic := range checkRetryTopics {
+	for i, topic := range hCheckRetryTopics {
 		records := ctx.Kafka.Records(topic)
 		ctx.Equal(len(records), 1, "%s must hold the failed record exactly once: records", topic)
 		ctx.Equal([]string{string(records[0].Key), string(records[0].Value)}, []string{"a", "job-a"}, "%s: the hand-off must keep key a and value job-a", topic)
-		ctx.Equal(recordHeader(records[0], "attempt"), strconv.Itoa(i+1), "%s: the attempt header", topic)
-		raw, _ := recordHeader(records[0], "not_before").(string)
-		ctx.Assert(epochMillis.MatchString(raw), "%s: the hand-off needs a not_before header in epoch milliseconds, got %v", topic, recordHeader(records[0], "not_before"))
+		ctx.Equal(hRecordHeader(records[0], "attempt"), strconv.Itoa(i+1), "%s: the attempt header", topic)
+		raw, _ := hRecordHeader(records[0], "not_before").(string)
+		ctx.Assert(hEpochMillis.MatchString(raw), "%s: the hand-off needs a not_before header in epoch milliseconds, got %v", topic, hRecordHeader(records[0], "not_before"))
 		notBefore, _ := strconv.ParseInt(raw, 10, 64)
 		gap := notBefore - tries[i].at
-		ctx.Assert(gap >= checkTiers[i]-5 && gap <= checkTiers[i]+2000, "%s: not_before must be the failure time + %d ms, it is %d ms after the handler failed", topic, checkTiers[i], gap)
+		ctx.Assert(gap >= hCheckTiers[i]-5 && gap <= hCheckTiers[i]+2000, "%s: not_before must be the failure time + %d ms, it is %d ms after the handler failed", topic, hCheckTiers[i], gap)
 		ctx.Assert(tries[i+1].at >= notBefore-5, "%s: the record was handled %d ms before its not_before", topic, notBefore-tries[i+1].at)
 	}
 	dlq := ctx.Kafka.Records("tasks.dlq")
 	ctx.Equal(len(dlq), 1, "after the last tier the record is dead-lettered once: records on tasks.dlq")
 	ctx.Assert(string(dlq[0].Key) == "a" && string(dlq[0].Value) == "job-a", "the dead letter must keep the key and value")
-	ctx.Equal(recordHeader(dlq[0], "attempt"), "4", "the dead letter's attempt header")
-	ctx.Equal(recordHeader(dlq[0], "error"), "boom", "the dead letter's error header must carry the handler error's message")
+	ctx.Equal(hRecordHeader(dlq[0], "attempt"), "4", "the dead letter's attempt header")
+	ctx.Equal(hRecordHeader(dlq[0], "error"), "boom", "the dead letter's error header must carry the handler error's message")
 	var others []string
 	for _, c := range calls {
 		if c.key != "a" {
@@ -1448,26 +1448,26 @@ func CheckEscalates(ctx *harness.Ctx) {
 	}
 	sort.Strings(others)
 	ctx.Equal(others, []string{"f1", "f2", "f3"}, "the other tasks records must each be handled once")
-	allCommitted(ctx)
+	hAllCommitted(ctx)
 }
 
 // waitingWorld seeds one retry record due in 5 s on tasks.retry.5s and six tasks records whose
 // handlers each move the clock 1 s.
-func waitingWorld(ctx *harness.Ctx) (t0 int64, fillers []string, advance map[string]float64) {
+func hWaitingWorld(ctx *harness.Ctx) (t0 int64, fillers []string, advance map[string]float64) {
 	t0 = ctx.Clock.Now()
-	seedTask(ctx, "tasks.retry.5s", "x", "job-x", 1, t0+5000)
+	hSeedTask(ctx, "tasks.retry.5s", "x", "job-x", 1, t0+5000)
 	advance = map[string]float64{}
 	for i := 1; i <= 6; i++ {
 		key := "f" + strconv.Itoa(i)
 		fillers = append(fillers, key)
-		seedTask(ctx, "tasks", key, "job-"+key, -1, -1)
+		hSeedTask(ctx, "tasks", key, "job-"+key, -1, -1)
 		advance[key] = 1
 	}
 	return t0, fillers, advance
 }
 
 func CheckNotBefore(ctx *harness.Ctx) {
-	t0, _, advance := waitingWorld(ctx)
+	t0, _, advance := hWaitingWorld(ctx)
 	type commitAt struct {
 		offsets harness.KafkaOffsets
 		at      int64
@@ -1476,21 +1476,21 @@ func CheckNotBefore(ctx *harness.Ctx) {
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
 		commits = append(commits, commitAt{offsets, ctx.Clock.Now()})
 	})
-	calls := taskWorker(ctx, nil, advance)
-	xs := callsOf(calls, "x")
+	calls := hTaskWorker(ctx, nil, advance)
+	xs := hCallsOf(calls, "x")
 	ctx.Equal(len(xs), 1, "the retry record must be handled exactly once: the handler's calls for it")
 	ctx.Assert(xs[0].at >= t0+5000-5, "the retry record was handled %d ms before its not_before: a record that is not due is paused, not processed", t0+5000-xs[0].at)
 	for _, c := range commits {
-		ctx.Assert(!(touches(c.offsets, "tasks.retry.5s") && c.at < xs[0].at), "tasks.retry.5s was committed before its record was handled: a record that is not due must not be skipped")
+		ctx.Assert(!(hTouches(c.offsets, "tasks.retry.5s") && c.at < xs[0].at), "tasks.retry.5s was committed before its record was handled: a record that is not due must not be skipped")
 	}
 	ctx.Assert(len(ctx.Kafka.Records("tasks.retry.30s")) == 0 && len(ctx.Kafka.Records("tasks.dlq")) == 0, "a retry that succeeds is not forwarded")
-	allCommitted(ctx)
+	hAllCommitted(ctx)
 }
 
 func CheckNonBlocking(ctx *harness.Ctx) {
-	t0, fillers, advance := waitingWorld(ctx)
-	calls := taskWorker(ctx, nil, advance)
-	xs := callsOf(calls, "x")
+	t0, fillers, advance := hWaitingWorld(ctx)
+	calls := hTaskWorker(ctx, nil, advance)
+	xs := hCallsOf(calls, "x")
 	ctx.Assert(len(xs) == 1 && xs[0].at >= t0+5000-5, "the retry record must be handled exactly once, no earlier than its not_before")
 	var handled []string
 	before := 0
@@ -1514,12 +1514,12 @@ func CheckNonBlocking(ctx *harness.Ctx) {
 	}
 	moved := finished - t0
 	ctx.Assert(moved <= 6000+2000, "the clock moved %d ms while the handlers moved it 6000 ms: the worker slept the delay away instead of pausing the partition", moved)
-	allCommitted(ctx)
+	hAllCommitted(ctx)
 }
 
 func CheckFlushBeforeCommit(ctx *harness.Ctx) {
 	t0 := ctx.Clock.Now()
-	seedTask(ctx, "tasks", "a", "job-a", -1, -1)
+	hSeedTask(ctx, "tasks", "a", "job-a", -1, -1)
 	ctx.Kafka.StallFor("tasks.retry.5s", 2)
 	type commitAt struct {
 		offsets harness.KafkaOffsets
@@ -1530,7 +1530,7 @@ func CheckFlushBeforeCommit(ctx *harness.Ctx) {
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
 		commits = append(commits, commitAt{offsets, len(ctx.Kafka.Records("tasks.retry.5s")), ctx.Clock.Now()})
 	})
-	taskWorker(ctx, []string{"a"}, nil)
+	hTaskWorker(ctx, []string{"a"}, nil)
 	stalled := false
 	for _, e := range ctx.Kafka.EventsOf("produce-stalled") {
 		stalled = stalled || e.Topic == "tasks.retry.5s"
@@ -1538,20 +1538,20 @@ func CheckFlushBeforeCommit(ctx *harness.Ctx) {
 	ctx.Assert(stalled, "the failure must be produced to tasks.retry.5s (it was stalled)")
 	var source []commitAt
 	for _, c := range commits {
-		if touches(c.offsets, "tasks") {
+		if hTouches(c.offsets, "tasks") {
 			source = append(source, c)
 		}
 	}
 	ctx.Assert(len(source) > 0, "the tasks offset was never committed")
 	ctx.Equal(source[0].n, 1, "the tasks offset was committed while the hand-off was still in flight (Flush and check the delivery report first): records on tasks.retry.5s at the commit")
 	ctx.Assert(source[0].at >= t0+2000, "the commit must wait out the stall (2 s of virtual time) for the broker's acknowledgement")
-	ctx.Equal(ctx.Kafka.Lag(checkGroup, "tasks"), 0, "the failed record's offset must be committed once the hand-off is acknowledged: lag on tasks")
+	ctx.Equal(ctx.Kafka.Lag(kHCheckGroup, "tasks"), 0, "the failed record's offset must be committed once the hand-off is acknowledged: lag on tasks")
 }
 
 func CheckRetrySucceeds(ctx *harness.Ctx) {
-	seedTask(ctx, "tasks.retry.5s", "b", "job-b", 1, 0)
-	seedTask(ctx, "tasks", "c", "job-c", -1, -1)
-	calls := taskWorker(ctx, nil, nil)
+	hSeedTask(ctx, "tasks.retry.5s", "b", "job-b", 1, 0)
+	hSeedTask(ctx, "tasks", "c", "job-c", -1, -1)
+	calls := hTaskWorker(ctx, nil, nil)
 	var seen []string
 	for _, c := range calls {
 		seen = append(seen, c.key+"="+c.value)
@@ -1562,7 +1562,7 @@ func CheckRetrySucceeds(ctx *harness.Ctx) {
 		ctx.Equal(len(ctx.Kafka.Records(topic)), 0, "a record whose handler succeeds is not forwarded: records on %s", topic)
 	}
 	ctx.Equal(len(ctx.Kafka.Records("tasks.retry.5s")), 1, "a record whose handler succeeds is not re-produced: records on tasks.retry.5s")
-	allCommitted(ctx)
+	hAllCommitted(ctx)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1578,21 +1578,21 @@ func CheckRetrySucceeds(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<int64_t> checkTiers = {5000, 30000, 300000};
-const std::vector<std::string> checkRetryTopics = {"tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m"};
-const std::string checkGroup = "tasks-workers";
+const std::vector<int64_t> kHCheckTiers = {5000, 30000, 300000};
+const std::vector<std::string> kHCheckRetryTopics = {"tasks.retry.5s", "tasks.retry.30s", "tasks.retry.5m"};
+const std::string kHCheckGroup = "tasks-workers";
 
-struct taskCall {
+struct HTaskCall {
   std::string key, value;
   int64_t at;
 };
 
-bool epochMillis(const std::optional<std::string>& s) {
+bool hEpochMillis(const std::optional<std::string>& s) {
   return s && !s->empty() && std::all_of(s->begin(), s->end(), [](char c) { return c >= '0' && c <= '9'; });
 }
 
 // seedTask puts a record on partition 0 of topic, with the attempt and not_before headers when >= 0.
-void seedTask(harness::Ctx& ctx, const std::string& topic, const std::string& key, const std::string& value, int64_t attempt,
+void hSeedTask(harness::Ctx& ctx, const std::string& topic, const std::string& key, const std::string& value, int64_t attempt,
               int64_t notBefore) {
   std::vector<harness::KafkaHeader> headers;
   if (attempt >= 0) headers.push_back({"attempt", std::to_string(attempt)});
@@ -1602,9 +1602,9 @@ void seedTask(harness::Ctx& ctx, const std::string& topic, const std::string& ke
 
 // taskWorker runs the learner's loop with a handler that records (key, value, clock ms), moves the
 // clock by advance[key] seconds, and throws "boom" for keys in fails.
-std::vector<taskCall> taskWorker(harness::Ctx& ctx, const std::vector<std::string>& fails,
+std::vector<HTaskCall> hTaskWorker(harness::Ctx& ctx, const std::vector<std::string>& fails,
                                  const std::map<std::string, double>& advance) {
-  std::vector<taskCall> calls;
+  std::vector<HTaskCall> calls;
   const auto handler = [&](const std::string& key, const std::string& value) {
     calls.push_back({key, value, ctx.Clock.Now()});
     const auto it = advance.find(key);
@@ -1618,25 +1618,25 @@ std::vector<taskCall> taskWorker(harness::Ctx& ctx, const std::vector<std::strin
   return calls;
 }
 
-std::vector<taskCall> callsOf(const std::vector<taskCall>& calls, const std::string& key) {
-  std::vector<taskCall> out;
+std::vector<HTaskCall> hCallsOf(const std::vector<HTaskCall>& calls, const std::string& key) {
+  std::vector<HTaskCall> out;
   for (const auto& c : calls)
     if (c.key == key) out.push_back(c);
   return out;
 }
 
-bool touches(const harness::KafkaOffsets& offsets, const std::string& topic) {
+bool hTouches(const harness::KafkaOffsets& offsets, const std::string& topic) {
   return std::any_of(offsets.begin(), offsets.end(), [&](const auto& o) { return o.first.Topic == topic; });
 }
 
-void allCommitted(harness::Ctx& ctx) {
+void hAllCommitted(harness::Ctx& ctx) {
   std::vector<std::string> topics = {"tasks"};
-  topics.insert(topics.end(), checkRetryTopics.begin(), checkRetryTopics.end());
+  topics.insert(topics.end(), kHCheckRetryTopics.begin(), kHCheckRetryTopics.end());
   for (const auto& topic : topics)
-    ctx.Equal(ctx.Kafka.Lag(checkGroup, topic), 0, "%s: handled record(s) left uncommitted", topic);
+    ctx.Equal(ctx.Kafka.Lag(kHCheckGroup, topic), 0, "%s: handled record(s) left uncommitted", topic);
 }
 
-struct waiting {
+struct HWaiting {
   int64_t t0;
   std::vector<std::string> fillers;
   std::map<std::string, double> advance;
@@ -1644,14 +1644,14 @@ struct waiting {
 
 // waitingWorld seeds one retry record due in 5 s on tasks.retry.5s and six tasks records whose
 // handlers each move the clock 1 s.
-waiting waitingWorld(harness::Ctx& ctx) {
-  waiting w;
+HWaiting hWaitingWorld(harness::Ctx& ctx) {
+  HWaiting w;
   w.t0 = ctx.Clock.Now();
-  seedTask(ctx, "tasks.retry.5s", "x", "job-x", 1, w.t0 + 5000);
+  hSeedTask(ctx, "tasks.retry.5s", "x", "job-x", 1, w.t0 + 5000);
   for (int i = 1; i <= 6; i++) {
     const std::string key = "f" + std::to_string(i);
     w.fillers.push_back(key);
-    seedTask(ctx, "tasks", key, "job-" + key, -1, -1);
+    hSeedTask(ctx, "tasks", key, "job-" + key, -1, -1);
     w.advance[key] = 1;
   }
   return w;
@@ -1660,14 +1660,14 @@ waiting waitingWorld(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckGroup(harness::Ctx& ctx) {
-  seedTask(ctx, "tasks", "a", "job-a", -1, -1);
-  const auto calls = taskWorker(ctx, {}, {});
+  hSeedTask(ctx, "tasks", "a", "job-a", -1, -1);
+  const auto calls = hTaskWorker(ctx, {}, {});
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to the topics");
   const auto& last = subscriptions.back();
-  ctx.Equal(last.Group, checkGroup, "group.id");
+  ctx.Equal(last.Group, kHCheckGroup, "group.id");
   std::vector<std::string> topics = {"tasks"};
-  topics.insert(topics.end(), checkRetryTopics.begin(), checkRetryTopics.end());
+  topics.insert(topics.end(), kHCheckRetryTopics.begin(), kHCheckRetryTopics.end());
   for (const auto& topic : topics)
     ctx.Assert(std::find(last.Topics.begin(), last.Topics.end(), topic) != last.Topics.end(),
                "the consumer must subscribe to %s as well; it subscribed to %v", topic, last.Topics);
@@ -1676,29 +1676,29 @@ void CheckGroup(harness::Ctx& ctx) {
   std::vector<std::string> seen;
   for (const auto& c : calls) seen.push_back(c.key + "=" + c.value);
   ctx.Equal(seen, {"a=job-a"}, "the handler must see (key, value) once per record: key=value handled");
-  allCommitted(ctx);
+  hAllCommitted(ctx);
 }
 
 void CheckEscalates(harness::Ctx& ctx) {
-  seedTask(ctx, "tasks", "a", "job-a", -1, -1);
-  for (const std::string key : {"f1", "f2", "f3"}) seedTask(ctx, "tasks", key, "job-" + key, -1, -1);
-  const auto calls = taskWorker(ctx, {"a"}, {{"f1", 6}, {"f2", 40}, {"f3", 400}});
-  const auto tries = callsOf(calls, "a");
+  hSeedTask(ctx, "tasks", "a", "job-a", -1, -1);
+  for (const std::string key : {"f1", "f2", "f3"}) hSeedTask(ctx, "tasks", key, "job-" + key, -1, -1);
+  const auto calls = hTaskWorker(ctx, {"a"}, {{"f1", 6}, {"f2", 40}, {"f3", 400}});
+  const auto tries = hCallsOf(calls, "a");
   ctx.Equal(tries.size(), 4, "a record that always fails is tried once on tasks and once per tier: the handler's calls for it");
   for (const auto& c : tries) ctx.Equal(c.value, "job-a", "every retry must hand the handler the original value");
-  for (size_t i = 0; i < checkRetryTopics.size(); i++) {
-    const std::string& topic = checkRetryTopics[i];
+  for (size_t i = 0; i < kHCheckRetryTopics.size(); i++) {
+    const std::string& topic = kHCheckRetryTopics[i];
     const auto records = ctx.Kafka.Records(topic);
     ctx.Equal(records.size(), 1, "%s must hold the failed record exactly once: records", topic);
     ctx.Equal(std::vector<std::string>{records[0].Key.value_or(""), records[0].Value.value_or("")}, {"a", "job-a"},
               "%s: the hand-off must keep key a and value job-a", topic);
     ctx.Equal(records[0].Header("attempt"), std::to_string(i + 1), "%s: the attempt header", topic);
     const auto raw = records[0].Header("not_before");
-    ctx.Assert(epochMillis(raw), "%s: the hand-off needs a not_before header in epoch milliseconds, got %q", topic, raw);
+    ctx.Assert(hEpochMillis(raw), "%s: the hand-off needs a not_before header in epoch milliseconds, got %q", topic, raw);
     const int64_t notBefore = std::stoll(*raw);
     const int64_t gap = notBefore - tries[i].at;
-    ctx.Assert(gap >= checkTiers[i] - 5 && gap <= checkTiers[i] + 2000,
-               "%s: not_before must be the failure time + %d ms, it is %d ms after the handler failed", topic, checkTiers[i], gap);
+    ctx.Assert(gap >= kHCheckTiers[i] - 5 && gap <= kHCheckTiers[i] + 2000,
+               "%s: not_before must be the failure time + %d ms, it is %d ms after the handler failed", topic, kHCheckTiers[i], gap);
     ctx.Assert(tries[i + 1].at >= notBefore - 5, "%s: the record was handled %d ms before its not_before", topic,
                notBefore - tries[i + 1].at);
   }
@@ -1712,35 +1712,35 @@ void CheckEscalates(harness::Ctx& ctx) {
     if (c.key != "a") others.push_back(c.key);
   std::sort(others.begin(), others.end());
   ctx.Equal(others, {"f1", "f2", "f3"}, "the other tasks records must each be handled once");
-  allCommitted(ctx);
+  hAllCommitted(ctx);
 }
 
 void CheckNotBefore(harness::Ctx& ctx) {
-  const waiting w = waitingWorld(ctx);
+  const HWaiting w = hWaitingWorld(ctx);
   struct commitAt {
     harness::KafkaOffsets offsets;
     int64_t at;
   };
   std::vector<commitAt> commits;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) { commits.push_back({offsets, ctx.Clock.Now()}); });
-  const auto calls = taskWorker(ctx, {}, w.advance);
-  const auto xs = callsOf(calls, "x");
+  const auto calls = hTaskWorker(ctx, {}, w.advance);
+  const auto xs = hCallsOf(calls, "x");
   ctx.Equal(xs.size(), 1, "the retry record must be handled exactly once: the handler's calls for it");
   ctx.Assert(xs[0].at >= w.t0 + 5000 - 5,
              "the retry record was handled %d ms before its not_before: a record that is not due is paused, not processed",
              w.t0 + 5000 - xs[0].at);
   for (const auto& c : commits)
-    ctx.Assert(!(touches(c.offsets, "tasks.retry.5s") && c.at < xs[0].at),
+    ctx.Assert(!(hTouches(c.offsets, "tasks.retry.5s") && c.at < xs[0].at),
                "tasks.retry.5s was committed before its record was handled: a record that is not due must not be skipped");
   ctx.Assert(ctx.Kafka.Records("tasks.retry.30s").empty() && ctx.Kafka.Records("tasks.dlq").empty(),
              "a retry that succeeds is not forwarded");
-  allCommitted(ctx);
+  hAllCommitted(ctx);
 }
 
 void CheckNonBlocking(harness::Ctx& ctx) {
-  const waiting w = waitingWorld(ctx);
-  const auto calls = taskWorker(ctx, {}, w.advance);
-  const auto xs = callsOf(calls, "x");
+  const HWaiting w = hWaitingWorld(ctx);
+  const auto calls = hTaskWorker(ctx, {}, w.advance);
+  const auto xs = hCallsOf(calls, "x");
   ctx.Assert(xs.size() == 1 && xs[0].at >= w.t0 + 5000 - 5, "the retry record must be handled exactly once, no earlier than its not_before");
   std::vector<std::string> handled;
   int before = 0;
@@ -1765,12 +1765,12 @@ void CheckNonBlocking(harness::Ctx& ctx) {
   ctx.Assert(moved <= 6000 + 2000,
              "the clock moved %d ms while the handlers moved it 6000 ms: the worker slept the delay away instead of pausing the partition",
              moved);
-  allCommitted(ctx);
+  hAllCommitted(ctx);
 }
 
 void CheckFlushBeforeCommit(harness::Ctx& ctx) {
   const int64_t t0 = ctx.Clock.Now();
-  seedTask(ctx, "tasks", "a", "job-a", -1, -1);
+  hSeedTask(ctx, "tasks", "a", "job-a", -1, -1);
   ctx.Kafka.StallFor("tasks.retry.5s", 2);
   struct commitAt {
     harness::KafkaOffsets offsets;
@@ -1781,25 +1781,25 @@ void CheckFlushBeforeCommit(harness::Ctx& ctx) {
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
     commits.push_back({offsets, ctx.Kafka.Records("tasks.retry.5s").size(), ctx.Clock.Now()});
   });
-  taskWorker(ctx, {"a"}, {});
+  hTaskWorker(ctx, {"a"}, {});
   bool stalled = false;
   for (const auto& e : ctx.Kafka.EventsOf("produce-stalled")) stalled = stalled || e.Topic == "tasks.retry.5s";
   ctx.Assert(stalled, "the failure must be produced to tasks.retry.5s (it was stalled)");
   std::vector<commitAt> source;
   for (const auto& c : commits)
-    if (touches(c.offsets, "tasks")) source.push_back(c);
+    if (hTouches(c.offsets, "tasks")) source.push_back(c);
   ctx.Assert(!source.empty(), "the tasks offset was never committed");
   ctx.Equal(source[0].n, 1,
             "the tasks offset was committed while the hand-off was still in flight (flush and check the delivery report first): records on tasks.retry.5s at the commit");
   ctx.Assert(source[0].at >= t0 + 2000, "the commit must wait out the stall (2 s of virtual time) for the broker's acknowledgement");
-  ctx.Equal(ctx.Kafka.Lag(checkGroup, "tasks"), 0,
+  ctx.Equal(ctx.Kafka.Lag(kHCheckGroup, "tasks"), 0,
             "the failed record's offset must be committed once the hand-off is acknowledged: lag on tasks");
 }
 
 void CheckRetrySucceeds(harness::Ctx& ctx) {
-  seedTask(ctx, "tasks.retry.5s", "b", "job-b", 1, 0);
-  seedTask(ctx, "tasks", "c", "job-c", -1, -1);
-  const auto calls = taskWorker(ctx, {}, {});
+  hSeedTask(ctx, "tasks.retry.5s", "b", "job-b", 1, 0);
+  hSeedTask(ctx, "tasks", "c", "job-c", -1, -1);
+  const auto calls = hTaskWorker(ctx, {}, {});
   std::vector<std::string> seen;
   for (const auto& c : calls) seen.push_back(c.key + "=" + c.value);
   std::sort(seen.begin(), seen.end());
@@ -1807,7 +1807,7 @@ void CheckRetrySucceeds(harness::Ctx& ctx) {
   for (const std::string topic : {"tasks.retry.30s", "tasks.retry.5m", "tasks.dlq"})
     ctx.Equal(ctx.Kafka.Records(topic).size(), 0, "a record whose handler succeeds is not forwarded: records on %s", topic);
   ctx.Equal(ctx.Kafka.Records("tasks.retry.5s").size(), 1, "a record whose handler succeeds is not re-produced: records on tasks.retry.5s");
-  allCommitted(ctx);
+  hAllCommitted(ctx);
 }
 `,
   },

@@ -948,21 +948,21 @@ import (
 )
 
 var (
-	ridePickup  = map[string]any{"lat": 48.85, "lng": 2.35}
-	rideDropoff = map[string]any{"lat": 48.86, "lng": 2.34}
+	hRidePickup  = map[string]any{"lat": 48.85, "lng": 2.35}
+	hRideDropoff = map[string]any{"lat": 48.86, "lng": 2.34}
 )
 
-func rideBody(pickup, dropoff map[string]any) map[string]any {
+func hRideBody(pickup, dropoff map[string]any) map[string]any {
 	return map[string]any{"rider_id": "u-1", "pickup": pickup, "dropoff": dropoff}
 }
 
 // dispatchBook stands in for the provided dispatch.go: it records rides and the ids handed to matching.
-type dispatchBook struct {
+type HDispatchBook struct {
 	rides    map[string]Ride
 	matching []string
 }
 
-func (b *dispatchBook) setDriver(id, driverID string) {
+func (b *HDispatchBook) setDriver(id, driverID string) {
 	ride := b.rides[id]
 	ride.ID = id
 	ride.DriverID = driverID
@@ -971,8 +971,8 @@ func (b *dispatchBook) setDriver(id, driverID string) {
 }
 
 // rideAPI runs the learner's main with the provided hand-off stood in for.
-func rideAPI(ctx *harness.Ctx) (*harness.HTTP, *dispatchBook) {
-	book := &dispatchBook{rides: map[string]Ride{}}
+func hRideAPI(ctx *harness.Ctx) (*harness.HTTP, *HDispatchBook) {
+	book := &HDispatchBook{rides: map[string]Ride{}}
 	startMatching = func(ride *Ride) {
 		book.rides[ride.ID] = *ride
 		book.matching = append(book.matching, ride.ID)
@@ -988,23 +988,23 @@ func rideAPI(ctx *harness.Ctx) (*harness.HTTP, *dispatchBook) {
 }
 
 // rideField is a string field of the JSON body, "" when absent.
-func rideField(r *harness.Response, name string) string {
+func hRideField(r *harness.Response, name string) string {
 	body, _ := r.JSON().(map[string]any)
 	v, _ := body[name].(string)
 	return v
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c, book := rideAPI(ctx)
+	c, book := hRideAPI(ctx)
 	idem := []string{"Idempotency-Key", "k-valid"}
 	bad := []struct {
 		what string
 		body map[string]any
 	}{
-		{"pickup lat 90.5", rideBody(map[string]any{"lat": 90.5, "lng": 2.35}, rideDropoff)},
-		{"pickup lat -91", rideBody(map[string]any{"lat": -91, "lng": 2.35}, rideDropoff)},
-		{"dropoff lng 180.5", rideBody(ridePickup, map[string]any{"lat": 48.86, "lng": 180.5})},
-		{"dropoff lng -181", rideBody(ridePickup, map[string]any{"lat": 48.86, "lng": -181})},
+		{"pickup lat 90.5", hRideBody(map[string]any{"lat": 90.5, "lng": 2.35}, hRideDropoff)},
+		{"pickup lat -91", hRideBody(map[string]any{"lat": -91, "lng": 2.35}, hRideDropoff)},
+		{"dropoff lng 180.5", hRideBody(hRidePickup, map[string]any{"lat": 48.86, "lng": 180.5})},
+		{"dropoff lng -181", hRideBody(hRidePickup, map[string]any{"lat": 48.86, "lng": -181})},
 	}
 	for _, b := range bad {
 		r := c.Post("/rides", b.body, idem...)
@@ -1012,66 +1012,66 @@ func CheckValidate(ctx *harness.Ctx) {
 	}
 	ctx.Equal(ctx.Redis.Keys("idem:*"), []string{}, "a rejected request must not touch Redis (validation comes first): the idem keys")
 	ctx.Equal(book.matching, []string(nil), "a rejected request must not reach startMatching: the rides it saw")
-	r := c.Post("/rides", rideBody(map[string]any{"lat": 90, "lng": -180}, rideDropoff), idem...)
+	r := c.Post("/rides", hRideBody(map[string]any{"lat": 90, "lng": -180}, hRideDropoff), idem...)
 	ctx.Equal(r.Status, 202, "lat 90 / lng -180 are the bounds and valid")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c, book := rideAPI(ctx)
-	r := c.Post("/rides", rideBody(ridePickup, rideDropoff))
+	c, book := hRideAPI(ctx)
+	r := c.Post("/rides", hRideBody(hRidePickup, hRideDropoff))
 	ctx.Equal(r.Status, 400, "POST /rides without Idempotency-Key")
 	ctx.Equal(book.matching, []string(nil), "a request without Idempotency-Key must not start matching: the rides startMatching saw")
-	r = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
+	r = c.Post("/rides", hRideBody(hRidePickup, hRideDropoff), "Idempotency-Key", "k-1")
 	ctx.Equal(r.Status, 202, "POST /rides with Idempotency-Key")
 }
 
 func CheckDedupeNx(ctx *harness.Ctx) {
-	c, book := rideAPI(ctx)
+	c, book := hRideAPI(ctx)
 	ctx.Redis.Set("idem:k-old", "r-existing", "EX", 3600)
-	r := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-new")
+	r := c.Post("/rides", hRideBody(hRidePickup, hRideDropoff), "Idempotency-Key", "k-new")
 	ctx.Equal(r.Status, 202, "a fresh key")
-	rideID := rideField(r, "ride_id")
+	rideID := hRideField(r, "ride_id")
 	stored, ok := ctx.Redis.Get("idem:k-new")
 	ctx.Assert(ok, "idem:k-new was not written: SetNX idem:{key} rideID idemTTL")
 	ctx.Equal(stored, rideID, "idem:k-new must hold the ride id the response carries")
 	ttl := ctx.Redis.TTL("idem:k-new")
 	ctx.Assert(3500 < ttl && ttl <= 3600, "idem:k-new has TTL %d, expected idemTTL (3600 s)", ttl)
-	r = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-old")
+	r = c.Post("/rides", hRideBody(hRidePickup, hRideDropoff), "Idempotency-Key", "k-old")
 	old, _ := ctx.Redis.Get("idem:k-old")
 	ctx.Equal(old, "r-existing", "an existing idem key was overwritten: the SET must be NX")
 	ctx.Equal(r.Status, 200, "a key that already exists")
-	ctx.Equal(rideField(r, "ride_id"), "r-existing", "the replay must carry the stored ride id (body %s)", r.Text())
+	ctx.Equal(hRideField(r, "ride_id"), "r-existing", "the replay must carry the stored ride id (body %s)", r.Text())
 	ctx.Equal(book.matching, []string{rideID}, "startMatching must run only for the new ride")
 }
 
 func CheckReplayOrAccept(ctx *harness.Ctx) {
-	c, book := rideAPI(ctx)
-	first := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
+	c, book := hRideAPI(ctx)
+	first := c.Post("/rides", hRideBody(hRidePickup, hRideDropoff), "Idempotency-Key", "k-1")
 	ctx.Equal(first.Status, 202, "a new ride (accepted, not matched)")
-	rideID := rideField(first, "ride_id")
+	rideID := hRideField(first, "ride_id")
 	ctx.Assert(rideID != "", "the 202 body must carry ride_id, got %s", first.Text())
-	ctx.Equal(rideField(first, "status"), "matching", "the 202 body's status (body %s)", first.Text())
+	ctx.Equal(hRideField(first, "status"), "matching", "the 202 body's status (body %s)", first.Text())
 	ctx.Equal(book.matching, []string{rideID}, "startMatching must run exactly once for a new ride")
-	again := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
+	again := c.Post("/rides", hRideBody(hRidePickup, hRideDropoff), "Idempotency-Key", "k-1")
 	ctx.Equal(again.Status, 200, "the retry (replayed)")
-	ctx.Equal(rideField(again, "ride_id"), rideID, "the retry must return the same ride id (body %s)", again.Text())
+	ctx.Equal(hRideField(again, "ride_id"), rideID, "the retry must return the same ride id (body %s)", again.Text())
 	ctx.Equal(book.matching, []string{rideID}, "the retry must not start matching a second ride")
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	c, book := rideAPI(ctx)
+	c, book := hRideAPI(ctx)
 	r := c.Get("/rides/nope")
 	ctx.Equal(r.Status, 404, "GET /rides/nope")
-	created := c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1")
-	rideID := rideField(created, "ride_id")
+	created := c.Post("/rides", hRideBody(hRidePickup, hRideDropoff), "Idempotency-Key", "k-1")
+	rideID := hRideField(created, "ride_id")
 	r = c.Get("/rides/" + rideID)
 	ctx.Equal(r.Status, 200, "GET /rides/%s", rideID)
-	ctx.Equal(rideField(r, "status"), "matching", "the ride's status (body %s)", r.Text())
-	ctx.Equal(rideField(r, "driver_id"), "", "no driver yet: driver_id must be absent")
+	ctx.Equal(hRideField(r, "status"), "matching", "the ride's status (body %s)", r.Text())
+	ctx.Equal(hRideField(r, "driver_id"), "", "no driver yet: driver_id must be absent")
 	book.setDriver(rideID, "d-7")
 	r = c.Get("/rides/" + rideID)
 	ctx.Equal(r.Status, 200, "GET /rides/%s once matched", rideID)
-	ctx.Equal(rideField(r, "driver_id"), "d-7", "once matched the body must carry driver_id (body %s)", r.Text())
+	ctx.Equal(hRideField(r, "driver_id"), "d-7", "once matched the body must carry driver_id (body %s)", r.Text())
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1085,16 +1085,16 @@ func CheckNotFound(ctx *harness.Ctx) {
 
 namespace {
 
-const nlohmann::json ridePickup = {{"lat", 48.85}, {"lng", 2.35}};
-const nlohmann::json rideDropoff = {{"lat", 48.86}, {"lng", 2.34}};
+const nlohmann::json kHRidePickup = {{"lat", 48.85}, {"lng", 2.35}};
+const nlohmann::json kHRideDropoff = {{"lat", 48.86}, {"lng", 2.34}};
 
-std::string rideBody(const nlohmann::json& pickup, const nlohmann::json& dropoff) {
+std::string hRideBody(const nlohmann::json& pickup, const nlohmann::json& dropoff) {
   return nlohmann::json{{"rider_id", "u-1"}, {"pickup", pickup}, {"dropoff", dropoff}}.dump();
 }
 
 // dispatchBook stands in for the provided dispatcher (dispatch.h): it records rides and the ids
 // handed to matching.
-struct dispatchBook {
+struct HDispatchBook {
   std::map<std::string, Ride> rides;
   std::vector<std::string> matching;
 
@@ -1106,109 +1106,109 @@ struct dispatchBook {
   }
 };
 
-dispatchBook book;
+HDispatchBook hBook;
 
 // rideAPI runs the learner's main with the provided hand-off stood in for.
-harness::HTTP rideAPI(harness::Ctx& ctx) {
-  book = dispatchBook{};
+harness::HTTP hRideAPI(harness::Ctx& ctx) {
+  hBook = HDispatchBook{};
   return ctx.Main().HTTP();
 }
 
 // rideField is a string field of the JSON body, "" when absent.
-std::string rideField(const harness::Response& r, const std::string& name) {
+std::string hRideField(const harness::Response& r, const std::string& name) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   if (!body.is_object() || !body.contains(name) || !body[name].is_string()) return "";
   return body[name].get<std::string>();
 }
 
-const std::vector<std::string> noRides;
+const std::vector<std::string> kHNoRides;
 
 }  // namespace
 
 void start_matching(const Ride& ride) {
-  book.rides[ride.ride_id] = ride;
-  book.matching.push_back(ride.ride_id);
+  hBook.rides[ride.ride_id] = ride;
+  hBook.matching.push_back(ride.ride_id);
 }
 
 std::optional<Ride> get_ride(const std::string& ride_id) {
-  const auto it = book.rides.find(ride_id);
-  if (it == book.rides.end()) return std::nullopt;
+  const auto it = hBook.rides.find(ride_id);
+  if (it == hBook.rides.end()) return std::nullopt;
   return it->second;
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  harness::HTTP c = rideAPI(ctx);
+  harness::HTTP c = hRideAPI(ctx);
   const std::vector<std::pair<std::string, std::string>> bad = {
-      {"pickup lat 90.5", rideBody({{"lat", 90.5}, {"lng", 2.35}}, rideDropoff)},
-      {"pickup lat -91", rideBody({{"lat", -91}, {"lng", 2.35}}, rideDropoff)},
-      {"dropoff lng 180.5", rideBody(ridePickup, {{"lat", 48.86}, {"lng", 180.5}})},
-      {"dropoff lng -181", rideBody(ridePickup, {{"lat", 48.86}, {"lng", -181}})},
+      {"pickup lat 90.5", hRideBody({{"lat", 90.5}, {"lng", 2.35}}, kHRideDropoff)},
+      {"pickup lat -91", hRideBody({{"lat", -91}, {"lng", 2.35}}, kHRideDropoff)},
+      {"dropoff lng 180.5", hRideBody(kHRidePickup, {{"lat", 48.86}, {"lng", 180.5}})},
+      {"dropoff lng -181", hRideBody(kHRidePickup, {{"lat", 48.86}, {"lng", -181}})},
   };
   for (const auto& [what, body] : bad) {
     const harness::Response r = c.Post("/rides", body, "Idempotency-Key", "k-valid");
     ctx.Equal(r.Status, 400, "POST /rides with %s", what);
   }
-  ctx.Equal(ctx.Redis.Keys("idem:*"), noRides, "a rejected request must not touch Redis (validation comes first): the idem keys");
-  ctx.Equal(book.matching, noRides, "a rejected request must not reach start_matching: the rides it saw");
-  const harness::Response r = c.Post("/rides", rideBody({{"lat", 90}, {"lng", -180}}, rideDropoff), "Idempotency-Key", "k-valid");
+  ctx.Equal(ctx.Redis.Keys("idem:*"), kHNoRides, "a rejected request must not touch Redis (validation comes first): the idem keys");
+  ctx.Equal(hBook.matching, kHNoRides, "a rejected request must not reach start_matching: the rides it saw");
+  const harness::Response r = c.Post("/rides", hRideBody({{"lat", 90}, {"lng", -180}}, kHRideDropoff), "Idempotency-Key", "k-valid");
   ctx.Equal(r.Status, 202, "lat 90 / lng -180 are the bounds and valid");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  harness::HTTP c = rideAPI(ctx);
-  harness::Response r = c.Post("/rides", rideBody(ridePickup, rideDropoff));
+  harness::HTTP c = hRideAPI(ctx);
+  harness::Response r = c.Post("/rides", hRideBody(kHRidePickup, kHRideDropoff));
   ctx.Equal(r.Status, 400, "POST /rides without Idempotency-Key");
-  ctx.Equal(book.matching, noRides, "a request without Idempotency-Key must not start matching: the rides start_matching saw");
-  r = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1");
+  ctx.Equal(hBook.matching, kHNoRides, "a request without Idempotency-Key must not start matching: the rides start_matching saw");
+  r = c.Post("/rides", hRideBody(kHRidePickup, kHRideDropoff), "Idempotency-Key", "k-1");
   ctx.Equal(r.Status, 202, "POST /rides with Idempotency-Key");
 }
 
 void CheckDedupeNx(harness::Ctx& ctx) {
-  harness::HTTP c = rideAPI(ctx);
+  harness::HTTP c = hRideAPI(ctx);
   ctx.Redis.Set("idem:k-old", "r-existing", "EX", 3600);
-  harness::Response r = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-new");
+  harness::Response r = c.Post("/rides", hRideBody(kHRidePickup, kHRideDropoff), "Idempotency-Key", "k-new");
   ctx.Equal(r.Status, 202, "a fresh key");
-  const std::string rideID = rideField(r, "ride_id");
+  const std::string rideID = hRideField(r, "ride_id");
   const auto stored = ctx.Redis.Get("idem:k-new");
   ctx.Assert(stored.has_value(), "idem:k-new was not written: SET idem:{key} <ride_id> NX EX kIdemTtl");
   ctx.Equal(*stored, rideID, "idem:k-new must hold the ride id the response carries");
   const long long ttl = ctx.Redis.TTL("idem:k-new");
   ctx.Assert(3500 < ttl && ttl <= 3600, "idem:k-new has TTL %d, expected kIdemTtl (3600 s)", ttl);
-  r = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-old");
+  r = c.Post("/rides", hRideBody(kHRidePickup, kHRideDropoff), "Idempotency-Key", "k-old");
   ctx.Equal(ctx.Redis.Get("idem:k-old").value_or(""), "r-existing", "an existing idem key was overwritten: the SET must be NX");
   ctx.Equal(r.Status, 200, "a key that already exists");
-  ctx.Equal(rideField(r, "ride_id"), "r-existing", "the replay must carry the stored ride id (body %s)", r.Text());
-  ctx.Equal(book.matching, std::vector<std::string>{rideID}, "start_matching must run only for the new ride");
+  ctx.Equal(hRideField(r, "ride_id"), "r-existing", "the replay must carry the stored ride id (body %s)", r.Text());
+  ctx.Equal(hBook.matching, std::vector<std::string>{rideID}, "start_matching must run only for the new ride");
 }
 
 void CheckReplayOrAccept(harness::Ctx& ctx) {
-  harness::HTTP c = rideAPI(ctx);
-  const harness::Response first = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1");
+  harness::HTTP c = hRideAPI(ctx);
+  const harness::Response first = c.Post("/rides", hRideBody(kHRidePickup, kHRideDropoff), "Idempotency-Key", "k-1");
   ctx.Equal(first.Status, 202, "a new ride (accepted, not matched)");
-  const std::string rideID = rideField(first, "ride_id");
+  const std::string rideID = hRideField(first, "ride_id");
   ctx.Assert(rideID != "", "the 202 body must carry ride_id, got %s", first.Text());
-  ctx.Equal(rideField(first, "status"), "matching", "the 202 body's status (body %s)", first.Text());
-  ctx.Equal(book.matching, std::vector<std::string>{rideID}, "start_matching must run exactly once for a new ride");
-  const harness::Response again = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1");
+  ctx.Equal(hRideField(first, "status"), "matching", "the 202 body's status (body %s)", first.Text());
+  ctx.Equal(hBook.matching, std::vector<std::string>{rideID}, "start_matching must run exactly once for a new ride");
+  const harness::Response again = c.Post("/rides", hRideBody(kHRidePickup, kHRideDropoff), "Idempotency-Key", "k-1");
   ctx.Equal(again.Status, 200, "the retry (replayed)");
-  ctx.Equal(rideField(again, "ride_id"), rideID, "the retry must return the same ride id (body %s)", again.Text());
-  ctx.Equal(book.matching, std::vector<std::string>{rideID}, "the retry must not start matching a second ride");
+  ctx.Equal(hRideField(again, "ride_id"), rideID, "the retry must return the same ride id (body %s)", again.Text());
+  ctx.Equal(hBook.matching, std::vector<std::string>{rideID}, "the retry must not start matching a second ride");
 }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  harness::HTTP c = rideAPI(ctx);
+  harness::HTTP c = hRideAPI(ctx);
   harness::Response r = c.Get("/rides/nope");
   ctx.Equal(r.Status, 404, "GET /rides/nope");
-  const harness::Response created = c.Post("/rides", rideBody(ridePickup, rideDropoff), "Idempotency-Key", "k-1");
-  const std::string rideID = rideField(created, "ride_id");
+  const harness::Response created = c.Post("/rides", hRideBody(kHRidePickup, kHRideDropoff), "Idempotency-Key", "k-1");
+  const std::string rideID = hRideField(created, "ride_id");
   r = c.Get("/rides/" + rideID);
   ctx.Equal(r.Status, 200, "GET /rides/%s", rideID);
-  ctx.Equal(rideField(r, "status"), "matching", "the ride's status (body %s)", r.Text());
-  ctx.Equal(rideField(r, "driver_id"), "", "no driver yet: driver_id must be absent");
-  book.setDriver(rideID, "d-7");
+  ctx.Equal(hRideField(r, "status"), "matching", "the ride's status (body %s)", r.Text());
+  ctx.Equal(hRideField(r, "driver_id"), "", "no driver yet: driver_id must be absent");
+  hBook.setDriver(rideID, "d-7");
   r = c.Get("/rides/" + rideID);
   ctx.Equal(r.Status, 200, "GET /rides/%s once matched", rideID);
-  ctx.Equal(rideField(r, "driver_id"), "d-7", "once matched the body must carry driver_id (body %s)", r.Text());
+  ctx.Equal(hRideField(r, "driver_id"), "d-7", "once matched the body must carry driver_id (body %s)", r.Text());
 }
 `,
   },

@@ -1775,15 +1775,15 @@ import (
 	"leetbuild/harness"
 )
 
-const condStale = "\\"0000000000000000\\""
+const kHCondStale = "\\"0000000000000000\\""
 
-func condEtagOf(text string) string {
+func hCondEtagOf(text string) string {
 	sum := sha256.Sum256([]byte(text))
 	return "\\"" + hex.EncodeToString(sum[:])[:16] + "\\""
 }
 
 // condTS is the epoch seconds of an HTTP date, NaN when it does not parse.
-func condTS(httpDate string) float64 {
+func hCondTS(httpDate string) float64 {
 	t, err := http.ParseTime(httpDate)
 	if err != nil {
 		return math.NaN()
@@ -1792,16 +1792,16 @@ func condTS(httpDate string) float64 {
 }
 
 // condDate is epoch seconds as an IMF-fixdate.
-func condDate(seconds float64) string {
+func hCondDate(seconds float64) string {
 	return time.Unix(int64(seconds), 0).UTC().Format(http.TimeFormat)
 }
 
 // condIMF reports whether lm is an IMF-fixdate that survives a round trip.
-func condIMF(lm string) bool {
-	return lm != "" && !math.IsNaN(condTS(lm)) && condDate(condTS(lm)) == lm
+func hCondIMF(lm string) bool {
+	return lm != "" && !math.IsNaN(hCondTS(lm)) && hCondDate(hCondTS(lm)) == lm
 }
 
-func condCreate(ctx *harness.Ctx, c *harness.HTTP, id, text string) (string, string) {
+func hCondCreate(ctx *harness.Ctx, c *harness.HTTP, id, text string) (string, string) {
 	r := c.Put("/docs/"+id, map[string]any{"text": text})
 	ctx.Equal(r.Status, 201, "PUT /docs/%s on a missing doc without preconditions", id)
 	ok := c.Get("/docs/" + id)
@@ -1811,26 +1811,26 @@ func condCreate(ctx *harness.Ctx, c *harness.HTTP, id, text string) (string, str
 
 func CheckNotModified(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	condCreate(ctx, c, "readme", "hello")
+	hCondCreate(ctx, c, "readme", "hello")
 	ok := c.Get("/docs/readme")
 	ctx.Equal(ok.JSON(), map[string]any{"text": "hello"}, "GET /docs/readme")
 	etag := ok.Header.Get("ETag")
 	lm := ok.Header.Get("Last-Modified")
-	ctx.Equal(etag, condEtagOf("hello"), "ETag must be the quoted first 16 hex digits of sha256(text)")
-	ctx.Assert(condIMF(lm), "Last-Modified was %q, not an IMF-fixdate like 'Thu, 22 Oct 2026 10:00:00 GMT'", lm)
+	ctx.Equal(etag, hCondEtagOf("hello"), "ETag must be the quoted first 16 hex digits of sha256(text)")
+	ctx.Assert(hCondIMF(lm), "Last-Modified was %q, not an IMF-fixdate like 'Thu, 22 Oct 2026 10:00:00 GMT'", lm)
 	r := c.Get("/docs/readme", "If-None-Match", etag)
 	ctx.Equal(r.Status, 304, "If-None-Match with the current ETag")
 	ctx.Equal(r.Text(), "", "a 304 carries no body")
 	ctx.Equal(r.Header.Get("ETag"), etag, "the 304 must repeat ETag")
 	ctx.Equal(r.Header.Get("Last-Modified"), lm, "the 304 must repeat Last-Modified")
-	r = c.Get("/docs/readme", "If-None-Match", condStale)
+	r = c.Get("/docs/readme", "If-None-Match", kHCondStale)
 	ctx.Equal(r.Status, 200, "If-None-Match with a stale tag")
 	r = c.Get("/docs/readme", "If-Modified-Since", lm)
 	ctx.Equal(r.Status, 304, "If-Modified-Since equal to Last-Modified")
 	ctx.Assert(r.Text() == "" && r.Header.Get("ETag") == etag && r.Header.Get("Last-Modified") == lm, "the If-Modified-Since 304 must carry ETag and Last-Modified and no body")
-	r = c.Get("/docs/readme", "If-Modified-Since", condDate(condTS(lm)+3600))
+	r = c.Get("/docs/readme", "If-Modified-Since", hCondDate(hCondTS(lm)+3600))
 	ctx.Equal(r.Status, 304, "If-Modified-Since an hour after Last-Modified")
-	r = c.Get("/docs/readme", "If-Modified-Since", condDate(condTS(lm)-1))
+	r = c.Get("/docs/readme", "If-Modified-Since", hCondDate(hCondTS(lm)-1))
 	ctx.Equal(r.Status, 200, "If-Modified-Since one second before Last-Modified")
 	r = c.Get("/docs/ghost", "If-None-Match", "*")
 	ctx.Equal(r.Status, 404, "GET of a missing doc with If-None-Match: *")
@@ -1838,21 +1838,21 @@ func CheckNotModified(ctx *harness.Ctx) {
 
 func CheckPrecedence(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	etag, lm := condCreate(ctx, c, "log", "a")
-	t := condTS(lm)
-	r := c.Get("/docs/log", "If-None-Match", condStale, "If-Modified-Since", lm)
+	etag, lm := hCondCreate(ctx, c, "log", "a")
+	t := hCondTS(lm)
+	r := c.Get("/docs/log", "If-None-Match", kHCondStale, "If-Modified-Since", lm)
 	ctx.Equal(r.Status, 200, "a stale If-None-Match with a fresh If-Modified-Since (If-None-Match is present, so If-Modified-Since is ignored)")
-	r = c.Get("/docs/log", "If-None-Match", etag, "If-Modified-Since", condDate(t-3600))
+	r = c.Get("/docs/log", "If-None-Match", etag, "If-Modified-Since", hCondDate(t-3600))
 	ctx.Equal(r.Status, 304, "a matching If-None-Match with an old If-Modified-Since")
-	r = c.Get("/docs/log", "If-Unmodified-Since", condDate(t-1))
+	r = c.Get("/docs/log", "If-Unmodified-Since", hCondDate(t-1))
 	ctx.Equal(r.Status, 412, "If-Unmodified-Since one second before Last-Modified")
 	r = c.Get("/docs/log", "If-Unmodified-Since", lm)
 	ctx.Equal(r.Status, 200, "If-Unmodified-Since equal to Last-Modified")
-	r = c.Get("/docs/log", "If-Match", condStale, "If-None-Match", etag)
+	r = c.Get("/docs/log", "If-Match", kHCondStale, "If-None-Match", etag)
 	ctx.Equal(r.Status, 412, "a failing If-Match with a matching If-None-Match (If-Match is evaluated first)")
-	r = c.Put("/docs/log", map[string]any{"text": "b"}, "If-Match", etag, "If-Unmodified-Since", condDate(t-3600))
+	r = c.Put("/docs/log", map[string]any{"text": "b"}, "If-Match", etag, "If-Unmodified-Since", hCondDate(t-3600))
 	ctx.Equal(r.Status, 200, "a matching If-Match with an old If-Unmodified-Since (If-Match is present, so If-Unmodified-Since is ignored)")
-	r = c.Put("/docs/log", map[string]any{"text": "c"}, "If-Match", etag, "If-Unmodified-Since", condDate(t+3600))
+	r = c.Put("/docs/log", map[string]any{"text": "c"}, "If-Match", etag, "If-Unmodified-Since", hCondDate(t+3600))
 	ctx.Equal(r.Status, 412, "a stale If-Match with a passing If-Unmodified-Since")
 	r = c.Get("/docs/log")
 	ctx.Equal(r.JSON(), map[string]any{"text": "b"}, "the doc should hold 'b'")
@@ -1860,20 +1860,20 @@ func CheckPrecedence(ctx *harness.Ctx) {
 
 func CheckLostUpdate(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	condCreate(ctx, c, "plan", "v1")
+	hCondCreate(ctx, c, "plan", "v1")
 	alice := c.Get("/docs/plan")
 	bob := c.Get("/docs/plan")
 	e1 := alice.Header.Get("ETag")
 	ctx.Assert(e1 != "" && bob.Header.Get("ETag") == e1, "two reads of the same doc must see the same ETag")
-	lm1 := condTS(alice.Header.Get("Last-Modified"))
+	lm1 := hCondTS(alice.Header.Get("Last-Modified"))
 	ctx.Clock.Advance(30)
 	a := c.Put("/docs/plan", map[string]any{"text": "alice"}, "If-Match", e1)
 	ctx.Equal(a.Status, 200, "Alice's PUT with the current If-Match")
-	ctx.Equal(a.Header.Get("ETag"), condEtagOf("alice"), "a successful write returns the new ETag")
+	ctx.Equal(a.Header.Get("ETag"), hCondEtagOf("alice"), "a successful write returns the new ETag")
 	lm2 := a.Header.Get("Last-Modified")
 	moved := math.NaN()
 	if lm2 != "" {
-		moved = condTS(lm2) - lm1
+		moved = hCondTS(lm2) - lm1
 	}
 	ctx.Assert(moved >= 29 && moved <= 32, "30 s later the write's Last-Modified should move 30 s: was %q, now %q", alice.Header.Get("Last-Modified"), lm2)
 	b := c.Put("/docs/plan", map[string]any{"text": "bob"}, "If-Match", e1)
@@ -1892,12 +1892,12 @@ func CheckLostUpdate(ctx *harness.Ctx) {
 
 func CheckPreconditionRequired(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	_, lm := condCreate(ctx, c, "spec", "draft")
+	_, lm := hCondCreate(ctx, c, "spec", "draft")
 	r := c.Put("/docs/spec", map[string]any{"text": "blind"})
 	ctx.Equal(r.Status, 428, "PUT on an existing doc without If-Match")
 	r = c.Put("/docs/spec", map[string]any{"text": "blind"}, "If-Unmodified-Since", lm)
 	ctx.Equal(r.Status, 428, "PUT with only a passing If-Unmodified-Since (If-Match is required)")
-	r = c.Put("/docs/spec", map[string]any{"text": "blind"}, "If-None-Match", condStale)
+	r = c.Put("/docs/spec", map[string]any{"text": "blind"}, "If-None-Match", kHCondStale)
 	ctx.Equal(r.Status, 428, "PUT with only a non-matching If-None-Match")
 	r = c.Delete("/docs/spec")
 	ctx.Equal(r.Status, 428, "DELETE on an existing doc without If-Match")
@@ -1909,7 +1909,7 @@ func CheckPreconditionRequired(ctx *harness.Ctx) {
 		r.Decode(&got)
 	}
 	ctx.Assert(r.Status == 200 && got.Text == "draft", "a 428 must change nothing, the doc is now %d %s", r.Status, r.Text())
-	r = c.Delete("/docs/ghost", "If-Match", condStale)
+	r = c.Delete("/docs/ghost", "If-Match", kHCondStale)
 	ctx.Equal(r.Status, 404, "DELETE of a missing doc")
 	r = c.Put("/docs/fresh", map[string]any{"text": "new"})
 	ctx.Equal(r.Status, 201, "PUT on a missing doc without preconditions")
@@ -1919,9 +1919,9 @@ func CheckCreateOnly(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	r := c.Put("/docs/notes", map[string]any{"text": "first"}, "If-None-Match", "*")
 	ctx.Equal(r.Status, 201, "PUT with If-None-Match: * on a missing doc")
-	ctx.Equal(r.Header.Get("ETag"), condEtagOf("first"), "the 201's ETag")
+	ctx.Equal(r.Header.Get("ETag"), hCondEtagOf("first"), "the 201's ETag")
 	lm := r.Header.Get("Last-Modified")
-	ctx.Assert(condIMF(lm), "the 201 carries an IMF-fixdate Last-Modified, got %q", lm)
+	ctx.Assert(hCondIMF(lm), "the 201 carries an IMF-fixdate Last-Modified, got %q", lm)
 	r = c.Put("/docs/notes", map[string]any{"text": "second"}, "If-None-Match", "*")
 	ctx.Equal(r.Status, 412, "a second PUT with If-None-Match: *")
 	r = c.Get("/docs/notes")
@@ -1932,14 +1932,14 @@ func CheckCreateOnly(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 404, "If-Match: * on a missing doc must not create it")
 	r = c.Put("/docs/notes", map[string]any{"text": "third"}, "If-Match", "*")
 	ctx.Equal(r.Status, 200, "PUT with If-Match: * on an existing doc")
-	ctx.Equal(r.Header.Get("ETag"), condEtagOf("third"), "the 200's ETag")
+	ctx.Equal(r.Header.Get("ETag"), hCondEtagOf("third"), "the 200's ETag")
 	r = c.Get("/docs/notes", "If-None-Match", "*")
 	ctx.Equal(r.Status, 304, "GET with If-None-Match: * on an existing doc")
 }
 
 func CheckWeakStrong(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	etag, _ := condCreate(ctx, c, "faq", "q")
+	etag, _ := hCondCreate(ctx, c, "faq", "q")
 	weak := "W/" + etag
 	r := c.Put("/docs/faq", map[string]any{"text": "x"}, "If-Match", weak)
 	ctx.Equal(r.Status, 412, "PUT with If-Match: %s (a weak tag never matches strongly)", weak)
@@ -1949,9 +1949,9 @@ func CheckWeakStrong(ctx *harness.Ctx) {
 	ctx.Equal(r.Status, 304, "GET with If-None-Match: %s (weak comparison ignores W/)", weak)
 	r = c.Put("/docs/faq", map[string]any{"text": "x"}, "If-Match", etag, "If-None-Match", weak)
 	ctx.Equal(r.Status, 412, "PUT whose If-None-Match matches weakly")
-	r = c.Get("/docs/faq", "If-Match", condStale+", "+etag)
+	r = c.Get("/docs/faq", "If-Match", kHCondStale+", "+etag)
 	ctx.Equal(r.Status, 200, "If-Match listing the current tag second")
-	r = c.Get("/docs/faq", "If-None-Match", condStale+", "+weak)
+	r = c.Get("/docs/faq", "If-None-Match", kHCondStale+", "+weak)
 	ctx.Equal(r.Status, 304, "If-None-Match listing the weak current tag second")
 	r = c.Get("/docs/faq", "If-Modified-Since", "not a date")
 	ctx.Equal(r.Status, 200, "an unparseable If-Modified-Since (it is ignored)")
@@ -1979,16 +1979,16 @@ func CheckWeakStrong(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string condStale = R"("0000000000000000")";
+const std::string kHCondStale = R"("0000000000000000")";
 
-std::map<std::string, std::string> condText(const std::string& text) { return {{"text", text}}; }
+std::map<std::string, std::string> hCondText(const std::string& text) { return {{"text", text}}; }
 
-std::string condBody(const std::string& text) { return nlohmann::json{{"text", text}}.dump(); }
+std::string hCondBody(const std::string& text) { return nlohmann::json{{"text", text}}.dump(); }
 
-std::string condEtagOf(const std::string& text) { return "\\"" + sha256_hex(text).substr(0, 16) + "\\""; }
+std::string hCondEtagOf(const std::string& text) { return "\\"" + sha256_hex(text).substr(0, 16) + "\\""; }
 
 // condTS is the epoch seconds of an HTTP date, NaN when it does not parse.
-double condTS(const std::string& httpDate) {
+double hCondTS(const std::string& httpDate) {
   static const char* months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
   char wday[4] = {}, mon[4] = {};
   int day = 0, year = 0, h = 0, m = 0, s = 0, used = 0;
@@ -2011,7 +2011,7 @@ double condTS(const std::string& httpDate) {
 }
 
 // condDate is epoch seconds as an IMF-fixdate.
-std::string condDate(double seconds) {
+std::string hCondDate(double seconds) {
   std::time_t t = static_cast<std::time_t>(seconds);
   std::tm tm{};
   gmtime_r(&t, &tm);
@@ -2021,11 +2021,11 @@ std::string condDate(double seconds) {
 }
 
 // condIMF reports whether lm is an IMF-fixdate that survives a round trip.
-bool condIMF(const std::string& lm) { return !lm.empty() && !std::isnan(condTS(lm)) && condDate(condTS(lm)) == lm; }
+bool hCondIMF(const std::string& lm) { return !lm.empty() && !std::isnan(hCondTS(lm)) && hCondDate(hCondTS(lm)) == lm; }
 
-std::pair<std::string, std::string> condCreate(harness::Ctx& ctx, harness::HTTP& c, const std::string& id,
+std::pair<std::string, std::string> hCondCreate(harness::Ctx& ctx, harness::HTTP& c, const std::string& id,
                                                const std::string& text) {
-  auto r = c.Put("/docs/" + id, condBody(text));
+  auto r = c.Put("/docs/" + id, hCondBody(text));
   ctx.Equal(r.Status, 201, "PUT /docs/%s on a missing doc without preconditions", id);
   auto ok = c.Get("/docs/" + id);
   ctx.Equal(ok.Status, 200, "GET /docs/%s after creating it", id);
@@ -2036,27 +2036,27 @@ std::pair<std::string, std::string> condCreate(harness::Ctx& ctx, harness::HTTP&
 
 void CheckNotModified(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  condCreate(ctx, c, "readme", "hello");
+  hCondCreate(ctx, c, "readme", "hello");
   auto ok = c.Get("/docs/readme");
-  ctx.Equal(ok.JSON(), condText("hello"), "GET /docs/readme");
+  ctx.Equal(ok.JSON(), hCondText("hello"), "GET /docs/readme");
   const std::string etag = ok.HeaderValue("ETag");
   const std::string lm = ok.HeaderValue("Last-Modified");
-  ctx.Equal(etag, condEtagOf("hello"), "ETag must be the quoted first 16 hex digits of sha256(text)");
-  ctx.Assert(condIMF(lm), "Last-Modified was %q, not an IMF-fixdate like 'Thu, 22 Oct 2026 10:00:00 GMT'", lm);
+  ctx.Equal(etag, hCondEtagOf("hello"), "ETag must be the quoted first 16 hex digits of sha256(text)");
+  ctx.Assert(hCondIMF(lm), "Last-Modified was %q, not an IMF-fixdate like 'Thu, 22 Oct 2026 10:00:00 GMT'", lm);
   auto r = c.Get("/docs/readme", "If-None-Match", etag);
   ctx.Equal(r.Status, 304, "If-None-Match with the current ETag");
   ctx.Equal(r.Text(), "", "a 304 carries no body");
   ctx.Equal(r.HeaderValue("ETag"), etag, "the 304 must repeat ETag");
   ctx.Equal(r.HeaderValue("Last-Modified"), lm, "the 304 must repeat Last-Modified");
-  r = c.Get("/docs/readme", "If-None-Match", condStale);
+  r = c.Get("/docs/readme", "If-None-Match", kHCondStale);
   ctx.Equal(r.Status, 200, "If-None-Match with a stale tag");
   r = c.Get("/docs/readme", "If-Modified-Since", lm);
   ctx.Equal(r.Status, 304, "If-Modified-Since equal to Last-Modified");
   ctx.Assert(r.Text() == "" && r.HeaderValue("ETag") == etag && r.HeaderValue("Last-Modified") == lm,
              "the If-Modified-Since 304 must carry ETag and Last-Modified and no body");
-  r = c.Get("/docs/readme", "If-Modified-Since", condDate(condTS(lm) + 3600));
+  r = c.Get("/docs/readme", "If-Modified-Since", hCondDate(hCondTS(lm) + 3600));
   ctx.Equal(r.Status, 304, "If-Modified-Since an hour after Last-Modified");
-  r = c.Get("/docs/readme", "If-Modified-Since", condDate(condTS(lm) - 1));
+  r = c.Get("/docs/readme", "If-Modified-Since", hCondDate(hCondTS(lm) - 1));
   ctx.Equal(r.Status, 200, "If-Modified-Since one second before Last-Modified");
   r = c.Get("/docs/ghost", "If-None-Match", "*");
   ctx.Equal(r.Status, 404, "GET of a missing doc with If-None-Match: *");
@@ -2064,48 +2064,48 @@ void CheckNotModified(harness::Ctx& ctx) {
 
 void CheckPrecedence(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  const auto [etag, lm] = condCreate(ctx, c, "log", "a");
-  const double t = condTS(lm);
-  auto r = c.Get("/docs/log", "If-None-Match", condStale, "If-Modified-Since", lm);
+  const auto [etag, lm] = hCondCreate(ctx, c, "log", "a");
+  const double t = hCondTS(lm);
+  auto r = c.Get("/docs/log", "If-None-Match", kHCondStale, "If-Modified-Since", lm);
   ctx.Equal(r.Status, 200, "a stale If-None-Match with a fresh If-Modified-Since (If-None-Match is present, so If-Modified-Since is ignored)");
-  r = c.Get("/docs/log", "If-None-Match", etag, "If-Modified-Since", condDate(t - 3600));
+  r = c.Get("/docs/log", "If-None-Match", etag, "If-Modified-Since", hCondDate(t - 3600));
   ctx.Equal(r.Status, 304, "a matching If-None-Match with an old If-Modified-Since");
-  r = c.Get("/docs/log", "If-Unmodified-Since", condDate(t - 1));
+  r = c.Get("/docs/log", "If-Unmodified-Since", hCondDate(t - 1));
   ctx.Equal(r.Status, 412, "If-Unmodified-Since one second before Last-Modified");
   r = c.Get("/docs/log", "If-Unmodified-Since", lm);
   ctx.Equal(r.Status, 200, "If-Unmodified-Since equal to Last-Modified");
-  r = c.Get("/docs/log", "If-Match", condStale, "If-None-Match", etag);
+  r = c.Get("/docs/log", "If-Match", kHCondStale, "If-None-Match", etag);
   ctx.Equal(r.Status, 412, "a failing If-Match with a matching If-None-Match (If-Match is evaluated first)");
-  r = c.Put("/docs/log", condBody("b"), "If-Match", etag, "If-Unmodified-Since", condDate(t - 3600));
+  r = c.Put("/docs/log", hCondBody("b"), "If-Match", etag, "If-Unmodified-Since", hCondDate(t - 3600));
   ctx.Equal(r.Status, 200, "a matching If-Match with an old If-Unmodified-Since (If-Match is present, so If-Unmodified-Since is ignored)");
-  r = c.Put("/docs/log", condBody("c"), "If-Match", etag, "If-Unmodified-Since", condDate(t + 3600));
+  r = c.Put("/docs/log", hCondBody("c"), "If-Match", etag, "If-Unmodified-Since", hCondDate(t + 3600));
   ctx.Equal(r.Status, 412, "a stale If-Match with a passing If-Unmodified-Since");
   r = c.Get("/docs/log");
-  ctx.Equal(r.JSON(), condText("b"), "the doc should hold 'b'");
+  ctx.Equal(r.JSON(), hCondText("b"), "the doc should hold 'b'");
 }
 
 void CheckLostUpdate(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  condCreate(ctx, c, "plan", "v1");
+  hCondCreate(ctx, c, "plan", "v1");
   auto alice = c.Get("/docs/plan");
   auto bob = c.Get("/docs/plan");
   const std::string e1 = alice.HeaderValue("ETag");
   ctx.Assert(e1 != "" && bob.HeaderValue("ETag") == e1, "two reads of the same doc must see the same ETag");
-  const double lm1 = condTS(alice.HeaderValue("Last-Modified"));
+  const double lm1 = hCondTS(alice.HeaderValue("Last-Modified"));
   ctx.Clock.Advance(30);
-  auto a = c.Put("/docs/plan", condBody("alice"), "If-Match", e1);
+  auto a = c.Put("/docs/plan", hCondBody("alice"), "If-Match", e1);
   ctx.Equal(a.Status, 200, "Alice's PUT with the current If-Match");
-  ctx.Equal(a.HeaderValue("ETag"), condEtagOf("alice"), "a successful write returns the new ETag");
+  ctx.Equal(a.HeaderValue("ETag"), hCondEtagOf("alice"), "a successful write returns the new ETag");
   const std::string lm2 = a.HeaderValue("Last-Modified");
   double moved = std::nan("");
-  if (lm2 != "") moved = condTS(lm2) - lm1;
+  if (lm2 != "") moved = hCondTS(lm2) - lm1;
   ctx.Assert(moved >= 29 && moved <= 32, "30 s later the write's Last-Modified should move 30 s: was %q, now %q",
              alice.HeaderValue("Last-Modified"), lm2);
-  auto b = c.Put("/docs/plan", condBody("bob"), "If-Match", e1);
+  auto b = c.Put("/docs/plan", hCondBody("bob"), "If-Match", e1);
   ctx.Equal(b.Status, 412, "Bob's PUT with the ETag Alice already replaced (a lost update)");
   auto now = c.Get("/docs/plan");
-  ctx.Equal(now.JSON(), condText("alice"), "after Bob's refused write the doc must hold Alice's text");
-  auto retry = c.Put("/docs/plan", condBody("alice + bob"), "If-Match", now.HeaderValue("ETag"));
+  ctx.Equal(now.JSON(), hCondText("alice"), "after Bob's refused write the doc must hold Alice's text");
+  auto retry = c.Put("/docs/plan", hCondBody("alice + bob"), "If-Match", now.HeaderValue("ETag"));
   ctx.Equal(retry.Status, 200, "Bob's retry with the fresh ETag");
   auto r = c.Delete("/docs/plan", "If-Match", e1);
   ctx.Equal(r.Status, 412, "DELETE with a stale If-Match");
@@ -2117,12 +2117,12 @@ void CheckLostUpdate(harness::Ctx& ctx) {
 
 void CheckPreconditionRequired(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  const std::string lm = condCreate(ctx, c, "spec", "draft").second;
-  auto r = c.Put("/docs/spec", condBody("blind"));
+  const std::string lm = hCondCreate(ctx, c, "spec", "draft").second;
+  auto r = c.Put("/docs/spec", hCondBody("blind"));
   ctx.Equal(r.Status, 428, "PUT on an existing doc without If-Match");
-  r = c.Put("/docs/spec", condBody("blind"), "If-Unmodified-Since", lm);
+  r = c.Put("/docs/spec", hCondBody("blind"), "If-Unmodified-Since", lm);
   ctx.Equal(r.Status, 428, "PUT with only a passing If-Unmodified-Since (If-Match is required)");
-  r = c.Put("/docs/spec", condBody("blind"), "If-None-Match", condStale);
+  r = c.Put("/docs/spec", hCondBody("blind"), "If-None-Match", kHCondStale);
   ctx.Equal(r.Status, 428, "PUT with only a non-matching If-None-Match");
   r = c.Delete("/docs/spec");
   ctx.Equal(r.Status, 428, "DELETE on an existing doc without If-Match");
@@ -2133,58 +2133,58 @@ void CheckPreconditionRequired(harness::Ctx& ctx) {
     draft = got.is_object() && got.contains("text") && got["text"] == "draft";
   }
   ctx.Assert(r.Status == 200 && draft, "a 428 must change nothing, the doc is now %d %s", r.Status, r.Text());
-  r = c.Delete("/docs/ghost", "If-Match", condStale);
+  r = c.Delete("/docs/ghost", "If-Match", kHCondStale);
   ctx.Equal(r.Status, 404, "DELETE of a missing doc");
-  r = c.Put("/docs/fresh", condBody("new"));
+  r = c.Put("/docs/fresh", hCondBody("new"));
   ctx.Equal(r.Status, 201, "PUT on a missing doc without preconditions");
 }
 
 void CheckCreateOnly(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  auto r = c.Put("/docs/notes", condBody("first"), "If-None-Match", "*");
+  auto r = c.Put("/docs/notes", hCondBody("first"), "If-None-Match", "*");
   ctx.Equal(r.Status, 201, "PUT with If-None-Match: * on a missing doc");
-  ctx.Equal(r.HeaderValue("ETag"), condEtagOf("first"), "the 201's ETag");
+  ctx.Equal(r.HeaderValue("ETag"), hCondEtagOf("first"), "the 201's ETag");
   const std::string lm = r.HeaderValue("Last-Modified");
-  ctx.Assert(condIMF(lm), "the 201 carries an IMF-fixdate Last-Modified, got %q", lm);
-  r = c.Put("/docs/notes", condBody("second"), "If-None-Match", "*");
+  ctx.Assert(hCondIMF(lm), "the 201 carries an IMF-fixdate Last-Modified, got %q", lm);
+  r = c.Put("/docs/notes", hCondBody("second"), "If-None-Match", "*");
   ctx.Equal(r.Status, 412, "a second PUT with If-None-Match: *");
   r = c.Get("/docs/notes");
-  ctx.Equal(r.JSON(), condText("first"), "the refused create must not overwrite");
-  r = c.Put("/docs/other", condBody("x"), "If-Match", "*");
+  ctx.Equal(r.JSON(), hCondText("first"), "the refused create must not overwrite");
+  r = c.Put("/docs/other", hCondBody("x"), "If-Match", "*");
   ctx.Equal(r.Status, 412, "PUT with If-Match: * on a missing doc");
   r = c.Get("/docs/other");
   ctx.Equal(r.Status, 404, "If-Match: * on a missing doc must not create it");
-  r = c.Put("/docs/notes", condBody("third"), "If-Match", "*");
+  r = c.Put("/docs/notes", hCondBody("third"), "If-Match", "*");
   ctx.Equal(r.Status, 200, "PUT with If-Match: * on an existing doc");
-  ctx.Equal(r.HeaderValue("ETag"), condEtagOf("third"), "the 200's ETag");
+  ctx.Equal(r.HeaderValue("ETag"), hCondEtagOf("third"), "the 200's ETag");
   r = c.Get("/docs/notes", "If-None-Match", "*");
   ctx.Equal(r.Status, 304, "GET with If-None-Match: * on an existing doc");
 }
 
 void CheckWeakStrong(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  const std::string etag = condCreate(ctx, c, "faq", "q").first;
+  const std::string etag = hCondCreate(ctx, c, "faq", "q").first;
   const std::string weak = "W/" + etag;
-  auto r = c.Put("/docs/faq", condBody("x"), "If-Match", weak);
+  auto r = c.Put("/docs/faq", hCondBody("x"), "If-Match", weak);
   ctx.Equal(r.Status, 412, "PUT with If-Match: %s (a weak tag never matches strongly)", weak);
   r = c.Get("/docs/faq", "If-Match", weak);
   ctx.Equal(r.Status, 412, "GET with If-Match: %s", weak);
   r = c.Get("/docs/faq", "If-None-Match", weak);
   ctx.Equal(r.Status, 304, "GET with If-None-Match: %s (weak comparison ignores W/)", weak);
-  r = c.Put("/docs/faq", condBody("x"), "If-Match", etag, "If-None-Match", weak);
+  r = c.Put("/docs/faq", hCondBody("x"), "If-Match", etag, "If-None-Match", weak);
   ctx.Equal(r.Status, 412, "PUT whose If-None-Match matches weakly");
-  r = c.Get("/docs/faq", "If-Match", condStale + ", " + etag);
+  r = c.Get("/docs/faq", "If-Match", kHCondStale + ", " + etag);
   ctx.Equal(r.Status, 200, "If-Match listing the current tag second");
-  r = c.Get("/docs/faq", "If-None-Match", condStale + ", " + weak);
+  r = c.Get("/docs/faq", "If-None-Match", kHCondStale + ", " + weak);
   ctx.Equal(r.Status, 304, "If-None-Match listing the weak current tag second");
   r = c.Get("/docs/faq", "If-Modified-Since", "not a date");
   ctx.Equal(r.Status, 200, "an unparseable If-Modified-Since (it is ignored)");
   r = c.Get("/docs/faq", "If-Unmodified-Since", "yesterday");
   ctx.Equal(r.Status, 200, "an unparseable If-Unmodified-Since (it is ignored)");
-  r = c.Put("/docs/faq", condBody("a"), "If-Match", etag);
+  r = c.Put("/docs/faq", hCondBody("a"), "If-Match", etag);
   ctx.Equal(r.Status, 200, "PUT with the strong current tag");
   r = c.Get("/docs/faq");
-  ctx.Equal(r.JSON(), condText("a"), "the doc should hold 'a'");
+  ctx.Equal(r.JSON(), hCondText("a"), "the doc should hold 'a'");
 }
 `,
   },

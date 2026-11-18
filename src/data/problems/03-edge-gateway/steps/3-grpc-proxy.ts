@@ -748,11 +748,11 @@ import (
 )
 
 // catalogPeer is the internal catalog: knows every id but ghost (NOT_FOUND) and bad (INVALID_ARGUMENT).
-type catalogPeer struct {
+type HCatalogPeer struct {
 	pb.UnimplementedCatalogServer
 }
 
-func (catalogPeer) GetItem(_ context.Context, req *pb.GetItemRequest) (*pb.Item, error) {
+func (HCatalogPeer) GetItem(_ context.Context, req *pb.GetItemRequest) (*pb.Item, error) {
 	switch req.GetId() {
 	case "ghost":
 		return nil, status.Error(codes.NotFound, "no item ghost")
@@ -762,15 +762,15 @@ func (catalogPeer) GetItem(_ context.Context, req *pb.GetItemRequest) (*pb.Item,
 	return &pb.Item{Id: req.GetId(), Name: "Kettle", PriceCents: 3499}, nil
 }
 
-func catalogProxy(ctx *harness.Ctx) *harness.HTTP {
-	pb.RegisterCatalogServer(ctx.GRPC.Server(""), &catalogPeer{})
+func hCatalogProxy(ctx *harness.Ctx) *harness.HTTP {
+	pb.RegisterCatalogServer(ctx.GRPC.Server(""), &HCatalogPeer{})
 	mux := http.NewServeMux()
 	register(mux)
 	return ctx.HTTP(mux)
 }
 
 func CheckRouteCall(ctx *harness.Ctx) {
-	c := catalogProxy(ctx)
+	c := hCatalogProxy(ctx)
 	r := c.Get("/items/42")
 	ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text())
 	calls := ctx.GRPC.CallsTo("GetItem", "")
@@ -783,7 +783,7 @@ func CheckRouteCall(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	c := catalogProxy(ctx)
+	c := hCatalogProxy(ctx)
 	r := c.Get("/items/42")
 	ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text())
 	calls := ctx.GRPC.CallsTo("GetItem", "")
@@ -797,7 +797,7 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckRequestId(ctx *harness.Ctx) {
-	c := catalogProxy(ctx)
+	c := hCatalogProxy(ctx)
 	r := c.Get("/items/42", "X-Request-Id", "r-9")
 	ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text())
 	calls := ctx.GRPC.CallsTo("GetItem", "")
@@ -810,7 +810,7 @@ func CheckRequestId(ctx *harness.Ctx) {
 }
 
 func CheckStatusMap(ctx *harness.Ctx) {
-	c := catalogProxy(ctx)
+	c := hCatalogProxy(ctx)
 	r := c.Get("/items/ghost")
 	ctx.Equal(r.Status, 404, "NOT_FOUND from the catalog")
 	r = c.Get("/items/bad")
@@ -825,7 +825,7 @@ func CheckStatusMap(ctx *harness.Ctx) {
 }
 
 func CheckFallback502(ctx *harness.Ctx) {
-	c := catalogProxy(ctx)
+	c := hCatalogProxy(ctx)
 	for _, code := range []codes.Code{codes.Internal, codes.PermissionDenied, codes.Unknown} {
 		ctx.GRPC.Fail("GetItem", code, "upstream broke", 1, "")
 		r := c.Get("/items/42")
@@ -844,7 +844,7 @@ func CheckFallback502(ctx *harness.Ctx) {
 namespace {
 
 // The internal catalog: knows every id but ghost (NOT_FOUND) and bad (INVALID_ARGUMENT).
-class CatalogPeer final : public gateway::Catalog::Service {
+class HCatalogPeer final : public gateway::Catalog::Service {
  public:
   grpc::Status GetItem(grpc::ServerContext*, const gateway::GetItemRequest* req, gateway::Item* item) override {
     if (req->id() == "ghost") return grpc::Status(grpc::StatusCode::NOT_FOUND, "no item ghost");
@@ -856,15 +856,15 @@ class CatalogPeer final : public gateway::Catalog::Service {
   }
 };
 
-struct CatalogProxy {
-  CatalogPeer peer;
+struct HCatalogProxy {
+  HCatalogPeer peer;
   httplib::Server svr;
 };
 
-harness::HTTP catalogProxy(harness::Ctx& ctx) {
-  static CatalogProxy* proxy = nullptr;
+harness::HTTP hCatalogProxy(harness::Ctx& ctx) {
+  static HCatalogProxy* proxy = nullptr;
   delete proxy;
-  proxy = new CatalogProxy;
+  proxy = new HCatalogProxy;
   ctx.GRPC.Server("")->RegisterService(&proxy->peer);
   register_routes(proxy->svr);
   return ctx.HTTP(proxy->svr);
@@ -873,7 +873,7 @@ harness::HTTP catalogProxy(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckRouteCall(harness::Ctx& ctx) {
-  auto c = catalogProxy(ctx);
+  auto c = hCatalogProxy(ctx);
   auto r = c.Get("/items/42");
   ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text());
   const auto calls = ctx.GRPC.CallsTo("GetItem");
@@ -886,7 +886,7 @@ void CheckRouteCall(harness::Ctx& ctx) {
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  auto c = catalogProxy(ctx);
+  auto c = hCatalogProxy(ctx);
   auto r = c.Get("/items/42");
   ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text());
   const auto calls = ctx.GRPC.CallsTo("GetItem");
@@ -902,7 +902,7 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckRequestId(harness::Ctx& ctx) {
-  auto c = catalogProxy(ctx);
+  auto c = hCatalogProxy(ctx);
   auto r = c.Get("/items/42", "X-Request-Id", "r-9");
   ctx.Equal(r.Status, 200, "GET /items/42 (%s)", r.Text());
   const auto md = ctx.GRPC.CallsTo("GetItem").back().Metadata;
@@ -916,7 +916,7 @@ void CheckRequestId(harness::Ctx& ctx) {
 }
 
 void CheckStatusMap(harness::Ctx& ctx) {
-  auto c = catalogProxy(ctx);
+  auto c = hCatalogProxy(ctx);
   auto r = c.Get("/items/ghost");
   ctx.Equal(r.Status, 404, "NOT_FOUND from the catalog");
   r = c.Get("/items/bad");
@@ -932,7 +932,7 @@ void CheckStatusMap(harness::Ctx& ctx) {
 }
 
 void CheckFallback502(harness::Ctx& ctx) {
-  auto c = catalogProxy(ctx);
+  auto c = hCatalogProxy(ctx);
   const std::vector<std::pair<grpc::StatusCode, std::string>> codes = {
       {grpc::StatusCode::INTERNAL, "Internal"},
       {grpc::StatusCode::PERMISSION_DENIED, "PermissionDenied"},

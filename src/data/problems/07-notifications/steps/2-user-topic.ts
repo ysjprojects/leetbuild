@@ -692,18 +692,18 @@ import (
 )
 
 // busEnqueue enqueues a notification the way the API does.
-func busEnqueue(id, userID, priority string) error {
+func hBusEnqueue(id, userID, priority string) error {
 	return enqueue(context.Background(), Notification{ID: id, UserID: userID, Channel: "push", Title: "Shipped", Body: "On its way", Priority: priority})
 }
 
-func busHeader(r harness.KafkaRecord, name string) any {
+func hBusHeader(r harness.KafkaRecord, name string) any {
 	if v, ok := r.Header(name); ok {
 		return string(v)
 	}
 	return nil
 }
 
-func busHeaderKeys(r harness.KafkaRecord) []string {
+func hBusHeaderKeys(r harness.KafkaRecord) []string {
 	var keys []string
 	for _, h := range r.Headers {
 		keys = append(keys, h.Key)
@@ -712,7 +712,7 @@ func busHeaderKeys(r harness.KafkaRecord) []string {
 }
 
 // busIDs are the ids of the records on notifications; copies of one record (same key and value) count once.
-func busIDs(ctx *harness.Ctx) []string {
+func hBusIDs(ctx *harness.Ctx) []string {
 	seen := map[[2]string]bool{}
 	var ids []string
 	for _, r := range ctx.Kafka.Records("notifications") {
@@ -729,19 +729,19 @@ func busIDs(ctx *harness.Ctx) []string {
 }
 
 func CheckDurableProducer(ctx *harness.Ctx) {
-	ctx.NoError(busEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
+	ctx.NoError(hBusEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
 	ctx.Kafka.Failover("notifications")
-	ctx.Equal(len(busIDs(ctx)), 1, "enqueue returned (the API answered 202), then the partition leader failed and notifications lost the record: it had been acknowledged by the leader alone. The writer must wait for every in-sync replica (RequiredAcks: kafka.RequireAll)")
+	ctx.Equal(len(hBusIDs(ctx)), 1, "enqueue returned (the API answered 202), then the partition leader failed and notifications lost the record: it had been acknowledged by the leader alone. The writer must wait for every in-sync replica (RequiredAcks: kafka.RequireAll)")
 	ctx.Kafka.LoseAcks("notifications", 1)
-	ctx.NoError(busEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
+	ctx.NoError(hBusEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
 	// kafka-go has no idempotent producer (the step's Go detail): at least once, identical copies.
-	ctx.Equal(busIDs(ctx), []string{"n1", "n2"}, "the acknowledgement of n2 was lost and the writer retried: notifications must hold n1 and n2, every copy identical to the original")
+	ctx.Equal(hBusIDs(ctx), []string{"n1", "n2"}, "the acknowledgement of n2 was lost and the writer retried: notifications must hold n1 and n2, every copy identical to the original")
 }
 
 func CheckKeyed(ctx *harness.Ctx) {
-	ctx.NoError(busEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
-	ctx.NoError(busEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
-	ctx.NoError(busEnqueue("n3", "u7", "normal"), "enqueue(n3) returned an error")
+	ctx.NoError(hBusEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
+	ctx.NoError(hBusEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
+	ctx.NoError(hBusEnqueue("n3", "u7", "normal"), "enqueue(n3) returned an error")
 	produced := ctx.Kafka.Records("notifications")
 	ctx.Equal(len(produced), 3, "records on notifications")
 	ctx.Equal(ctx.Kafka.Keys("notifications"), []string{"u42", "u42", "u7"}, "records must be keyed by the user id")
@@ -752,23 +752,23 @@ func CheckKeyed(ctx *harness.Ctx) {
 }
 
 func CheckPriorityHeader(ctx *harness.Ctx) {
-	ctx.NoError(busEnqueue("n1", "u42", "high"), "enqueue(n1) returned an error")
-	ctx.NoError(busEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
+	ctx.NoError(hBusEnqueue("n1", "u42", "high"), "enqueue(n1) returned an error")
+	ctx.NoError(hBusEnqueue("n2", "u42", "normal"), "enqueue(n2) returned an error")
 	produced := ctx.Kafka.Records("notifications")
 	ctx.Equal(len(produced), 2, "records on notifications")
-	ctx.Equal(busHeader(produced[0], "priority"), "high", "the first record must carry a priority=high header, headers were %v", busHeaderKeys(produced[0]))
-	ctx.Equal(busHeader(produced[1], "priority"), "normal", "the second record must carry a priority=normal header, headers were %v", busHeaderKeys(produced[1]))
+	ctx.Equal(hBusHeader(produced[0], "priority"), "high", "the first record must carry a priority=high header, headers were %v", hBusHeaderKeys(produced[0]))
+	ctx.Equal(hBusHeader(produced[1], "priority"), "normal", "the second record must carry a priority=normal header, headers were %v", hBusHeaderKeys(produced[1]))
 }
 
 func CheckWaitAck(ctx *harness.Ctx) {
-	ctx.NoError(busEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
+	ctx.NoError(hBusEnqueue("n1", "u42", "normal"), "enqueue(n1) returned an error")
 	ctx.Equal(len(ctx.Kafka.Records("notifications")), 1, "the record must be in Kafka when enqueue returns: records on notifications")
 	ctx.Kafka.StallFor("notifications", 1) // the broker is slow but answers within the timeout
-	ctx.NoError(busEnqueue("n2", "u42", "normal"), "the broker acknowledged after 1 s, within the 2 s wait, yet enqueue returned an error")
+	ctx.NoError(hBusEnqueue("n2", "u42", "normal"), "the broker acknowledged after 1 s, within the 2 s wait, yet enqueue returned an error")
 	ctx.Equal(len(ctx.Kafka.Records("notifications")), 2, "the record must be in Kafka when enqueue returns: records on notifications")
 	ctx.Kafka.Stall("notifications") // the broker is down for good
 	started := ctx.Clock.Now()
-	down := busEnqueue("n3", "u42", "normal")
+	down := hBusEnqueue("n3", "u42", "normal")
 	waited := float64(ctx.Clock.Now()-started) / 1000
 	ctx.Assert(down != nil, "the broker never acknowledged, yet enqueue returned nil: the 202 was promised before the record was in Kafka")
 	ctx.Assert(1 <= waited && waited <= 2.5, "the acknowledgement wait must be bounded by about 2 s, enqueue gave up after %v s", waited)
@@ -776,14 +776,14 @@ func CheckWaitAck(ctx *harness.Ctx) {
 
 func CheckFailLoud(ctx *harness.Ctx) {
 	ctx.Kafka.FailNext("notifications", 1)
-	failed := busEnqueue("n1", "u42", "normal")
+	failed := hBusEnqueue("n1", "u42", "normal")
 	ctx.Assert(failed != nil, "a delivery error must return an error wrapping ErrBusUnavailable, enqueue returned nil")
 	ctx.ErrorIs(failed, ErrBusUnavailable, "a delivery error must return an error wrapping ErrBusUnavailable")
 	ctx.Equal(len(ctx.Kafka.Records("notifications")), 0, "the failed record must not be in the topic: records on notifications")
-	ctx.NoError(busEnqueue("n2", "u42", "normal"), "after the failure a new enqueue must work")
+	ctx.NoError(hBusEnqueue("n2", "u42", "normal"), "after the failure a new enqueue must work")
 	ctx.Equal(len(ctx.Kafka.Records("notifications")), 1, "after the failure a new enqueue must work: records on notifications")
 	ctx.Kafka.Stall("notifications") // no acknowledgement arrives before the timeout
-	timedOut := busEnqueue("n3", "u42", "normal")
+	timedOut := hBusEnqueue("n3", "u42", "normal")
 	ctx.Assert(timedOut != nil, "no acknowledgement within the timeout must return an error wrapping ErrBusUnavailable, enqueue returned nil")
 	ctx.ErrorIs(timedOut, ErrBusUnavailable, "no acknowledgement within the timeout must return an error wrapping ErrBusUnavailable")
 }
@@ -797,14 +797,14 @@ func CheckFailLoud(ctx *harness.Ctx) {
 namespace {
 
 // How enqueue ended: "" when it returned, else what it threw.
-struct BusResult {
+struct HBusResult {
   bool bus_unavailable = false;
   std::string error;
   bool failed() const { return !error.empty(); }
 };
 
 // Enqueues a notification the way the API does.
-BusResult busEnqueue(const std::string& id, const std::string& user_id, const std::string& priority) {
+HBusResult hBusEnqueue(const std::string& id, const std::string& user_id, const std::string& priority) {
   try {
     enqueue(Notification{id, user_id, "push", "Shipped", "On its way", priority});
     return {};
@@ -815,20 +815,20 @@ BusResult busEnqueue(const std::string& id, const std::string& user_id, const st
   }
 }
 
-void mustEnqueue(harness::Ctx& ctx, const std::string& id, const std::string& user_id, const std::string& priority,
+void hMustEnqueue(harness::Ctx& ctx, const std::string& id, const std::string& user_id, const std::string& priority,
                  const std::string& what) {
-  const BusResult r = busEnqueue(id, user_id, priority);
+  const HBusResult r = hBusEnqueue(id, user_id, priority);
   ctx.Assert(!r.failed(), "%s: enqueue threw %s", what, r.error);
 }
 
-std::vector<std::string> busHeaderKeys(const harness::KafkaRecord& r) {
+std::vector<std::string> hBusHeaderKeys(const harness::KafkaRecord& r) {
   std::vector<std::string> keys;
   for (const auto& h : r.Headers) keys.push_back(h.Key);
   return keys;
 }
 
 // The ids of the records on notifications, every copy.
-std::vector<std::string> busIDs(harness::Ctx& ctx) {
+std::vector<std::string> hBusIDs(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& v : ctx.Kafka.Values("notifications")) {
     const auto n = harness::ParseJSON(v);
@@ -841,25 +841,25 @@ std::vector<std::string> busIDs(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckDurableProducer(harness::Ctx& ctx) {
-  mustEnqueue(ctx, "n1", "u42", "normal", "enqueue(n1)");
+  hMustEnqueue(ctx, "n1", "u42", "normal", "enqueue(n1)");
   ctx.Kafka.Failover("notifications");
-  ctx.Equal(busIDs(ctx).size(), 1,
+  ctx.Equal(hBusIDs(ctx).size(), 1,
             "enqueue returned (the API answered 202), then the partition leader failed and notifications lost the "
             "record: it had been acknowledged by the leader alone. The producer must wait for every in-sync replica "
             "(acks=all)");
   ctx.Kafka.LoseAcks("notifications", 1);
-  mustEnqueue(ctx, "n2", "u42", "normal", "enqueue(n2)");
+  hMustEnqueue(ctx, "n2", "u42", "normal", "enqueue(n2)");
   // librdkafka has an idempotent producer (kafka-go, the Go harness's client, does not): the retry
   // after a lost acknowledgement must not write a second copy, as the TypeScript check demands.
-  ctx.Equal(busIDs(ctx), {"n1", "n2"},
+  ctx.Equal(hBusIDs(ctx), {"n1", "n2"},
             "the acknowledgement of n2 was lost and the producer retried: notifications must hold n1 and n2 once "
             "each — enable the idempotent producer (enable.idempotence=true)");
 }
 
 void CheckKeyed(harness::Ctx& ctx) {
-  mustEnqueue(ctx, "n1", "u42", "normal", "enqueue(n1)");
-  mustEnqueue(ctx, "n2", "u42", "normal", "enqueue(n2)");
-  mustEnqueue(ctx, "n3", "u7", "normal", "enqueue(n3)");
+  hMustEnqueue(ctx, "n1", "u42", "normal", "enqueue(n1)");
+  hMustEnqueue(ctx, "n2", "u42", "normal", "enqueue(n2)");
+  hMustEnqueue(ctx, "n3", "u7", "normal", "enqueue(n3)");
   const auto produced = ctx.Kafka.Records("notifications");
   ctx.Equal(produced.size(), 3, "records on notifications");
   ctx.Equal(ctx.Kafka.Keys("notifications"), {"u42", "u42", "u7"}, "records must be keyed by the user id");
@@ -870,27 +870,27 @@ void CheckKeyed(harness::Ctx& ctx) {
 }
 
 void CheckPriorityHeader(harness::Ctx& ctx) {
-  mustEnqueue(ctx, "n1", "u42", "high", "enqueue(n1)");
-  mustEnqueue(ctx, "n2", "u42", "normal", "enqueue(n2)");
+  hMustEnqueue(ctx, "n1", "u42", "high", "enqueue(n1)");
+  hMustEnqueue(ctx, "n2", "u42", "normal", "enqueue(n2)");
   const auto produced = ctx.Kafka.Records("notifications");
   ctx.Equal(produced.size(), 2, "records on notifications");
   ctx.Equal(produced[0].Header("priority"), "high", "the first record must carry a priority=high header, headers were %v",
-            busHeaderKeys(produced[0]));
+            hBusHeaderKeys(produced[0]));
   ctx.Equal(produced[1].Header("priority"), "normal",
-            "the second record must carry a priority=normal header, headers were %v", busHeaderKeys(produced[1]));
+            "the second record must carry a priority=normal header, headers were %v", hBusHeaderKeys(produced[1]));
 }
 
 void CheckWaitAck(harness::Ctx& ctx) {
-  mustEnqueue(ctx, "n1", "u42", "normal", "enqueue(n1)");
+  hMustEnqueue(ctx, "n1", "u42", "normal", "enqueue(n1)");
   ctx.Equal(ctx.Kafka.Records("notifications").size(), 1,
             "the record must be in Kafka when enqueue returns: records on notifications");
   ctx.Kafka.StallFor("notifications", 1);  // the broker is slow but answers within the timeout
-  mustEnqueue(ctx, "n2", "u42", "normal", "the broker acknowledged after 1 s, within the 2 s wait, yet enqueue(n2) failed");
+  hMustEnqueue(ctx, "n2", "u42", "normal", "the broker acknowledged after 1 s, within the 2 s wait, yet enqueue(n2) failed");
   ctx.Equal(ctx.Kafka.Records("notifications").size(), 2,
             "the record must be in Kafka when enqueue returns: records on notifications");
   ctx.Kafka.Stall("notifications");  // the broker is down for good
   const int64_t started = ctx.Clock.Now();
-  const BusResult down = busEnqueue("n3", "u42", "normal");
+  const HBusResult down = hBusEnqueue("n3", "u42", "normal");
   const double waited = static_cast<double>(ctx.Clock.Now() - started) / 1000;
   ctx.Assert(down.failed(),
              "the broker never acknowledged, yet enqueue returned normally: the 202 was promised before the record was "
@@ -901,16 +901,16 @@ void CheckWaitAck(harness::Ctx& ctx) {
 
 void CheckFailLoud(harness::Ctx& ctx) {
   ctx.Kafka.FailNext("notifications", 1);
-  const BusResult failed = busEnqueue("n1", "u42", "normal");
+  const HBusResult failed = hBusEnqueue("n1", "u42", "normal");
   ctx.Assert(failed.failed(), "a delivery error must throw BusUnavailable, enqueue returned normally");
   ctx.Assert(failed.bus_unavailable, "a delivery error must throw BusUnavailable, enqueue threw %s", failed.error);
   ctx.Equal(ctx.Kafka.Records("notifications").size(), 0,
             "the failed record must not be in the topic: records on notifications");
-  mustEnqueue(ctx, "n2", "u42", "normal", "after the failure a new enqueue must work");
+  hMustEnqueue(ctx, "n2", "u42", "normal", "after the failure a new enqueue must work");
   ctx.Equal(ctx.Kafka.Records("notifications").size(), 1,
             "after the failure a new enqueue must work: records on notifications");
   ctx.Kafka.Stall("notifications");  // no acknowledgement arrives before the timeout
-  const BusResult timedOut = busEnqueue("n3", "u42", "normal");
+  const HBusResult timedOut = hBusEnqueue("n3", "u42", "normal");
   ctx.Assert(timedOut.failed(),
              "no acknowledgement within the timeout must throw BusUnavailable, enqueue returned normally");
   ctx.Assert(timedOut.bus_unavailable, "no acknowledgement within the timeout must throw BusUnavailable, enqueue threw %s",

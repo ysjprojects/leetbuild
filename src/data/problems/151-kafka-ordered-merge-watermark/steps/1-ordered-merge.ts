@@ -1540,21 +1540,21 @@ import (
 )
 
 // omSeed puts readings of sensor s{part} on that partition, in this order (6 partitions, like production).
-func omSeed(ctx *harness.Ctx, part int, stamps ...int64) {
+func hOmSeed(ctx *harness.Ctx, part int, stamps ...int64) {
 	ctx.Kafka.CreateTopic(Topic, 6)
 	for _, ts := range stamps {
-		omReading(ctx, part, ts)
+		hOmReading(ctx, part, ts)
 	}
 }
 
-func omReading(ctx *harness.Ctx, part int, ts int64) {
+func hOmReading(ctx *harness.Ctx, part int, ts int64) {
 	value, _ := json.Marshal(map[string]any{"sensor": fmt.Sprintf("s%d", part), "ts": ts})
 	ctx.Kafka.SeedPartition(Topic, part, fmt.Sprintf("s%d", part), string(value))
 }
 
 // omDrain runs the learner's loop with emit; the loop ends when stop is called, and by itself
 // quiet after it started when quiet > 0 (the TypeScript consumer stops once the topic is drained).
-func omDrain(ctx *harness.Ctx, quiet time.Duration, emit func(r Reading, stop func())) {
+func hOmDrain(ctx *harness.Ctx, quiet time.Duration, emit func(r Reading, stop func())) {
 	runCtx, stop := context.WithCancel(context.Background())
 	defer stop()
 	if quiet > 0 {
@@ -1564,9 +1564,9 @@ func omDrain(ctx *harness.Ctx, quiet time.Duration, emit func(r Reading, stop fu
 }
 
 // omCollect drains the loop for 3 s of silence and returns what it emitted.
-func omCollect(ctx *harness.Ctx, also func(r Reading)) []Reading {
+func hOmCollect(ctx *harness.Ctx, also func(r Reading)) []Reading {
 	var emitted []Reading
-	omDrain(ctx, 3*time.Second, func(r Reading, _ func()) {
+	hOmDrain(ctx, 3*time.Second, func(r Reading, _ func()) {
 		emitted = append(emitted, r)
 		if also != nil {
 			also(r)
@@ -1575,7 +1575,7 @@ func omCollect(ctx *harness.Ctx, also func(r Reading)) []Reading {
 	return emitted
 }
 
-func omStamps(emitted []Reading) []int64 {
+func hOmStamps(emitted []Reading) []int64 {
 	out := []int64{}
 	for _, r := range emitted {
 		out = append(out, r.Ts)
@@ -1594,18 +1594,18 @@ func CheckInOrder(ctx *harness.Ctx) {
 		if part == 4 {
 			series[0] = 3000 // a tie with partition 5's first reading
 		}
-		omSeed(ctx, part, series...)
+		hOmSeed(ctx, part, series...)
 		for i, ts := range series {
 			seeded = append(seeded, [3]int64{ts, int64(part), int64(i)})
 		}
 	}
-	emitted := omCollect(ctx, nil)
+	emitted := hOmCollect(ctx, nil)
 	got := [][3]int64{}
 	for _, r := range emitted {
 		got = append(got, [3]int64{r.Ts, int64(r.Partition), r.Offset})
 	}
 	ctx.Assert(len(got) > 0, "nothing was emitted: 30 readings over six partitions, the slowest partition reaching 25000, must release everything up to 23000")
-	ts := omStamps(emitted)
+	ts := hOmStamps(emitted)
 	ctx.Assert(sort.SliceIsSorted(ts, func(i, j int) bool { return ts[i] < ts[j] }), "the emitted ts must be non-decreasing; got %v", ts)
 	// partition 1 tops out at 25000: watermark 25000, threshold 23000
 	want := [][3]int64{}
@@ -1633,47 +1633,47 @@ func CheckInOrder(ctx *harness.Ctx) {
 }
 
 func CheckWatermarkGates(ctx *harness.Ctx) {
-	omSeed(ctx, 0, 1000, 5000, 9000)
-	omSeed(ctx, 1, 3000, 7000, 11000)
-	omSeed(ctx, 2, 20000)
-	emitted := omCollect(ctx, nil)
-	ctx.Equal(omStamps(emitted), []int64{1000, 3000, 5000, 7000}, "the watermark is 9000 (partition 0's newest; partition 2 at 20000 does not pull it up) and the threshold 7000: emitted ts")
+	hOmSeed(ctx, 0, 1000, 5000, 9000)
+	hOmSeed(ctx, 1, 3000, 7000, 11000)
+	hOmSeed(ctx, 2, 20000)
+	emitted := hOmCollect(ctx, nil)
+	ctx.Equal(hOmStamps(emitted), []int64{1000, 3000, 5000, 7000}, "the watermark is 9000 (partition 0's newest; partition 2 at 20000 does not pull it up) and the threshold 7000: emitted ts")
 	s := GetStats()
 	ctx.Equal(s.Buffered, 3, "9000, 11000 and 20000 must stay buffered until the slowest partition passes them: GetStats().Buffered")
 	ctx.Assert(s.Emitted == 4 && s.Dropped == 0, "GetStats() must report emitted 4, dropped 0; got %+v", s)
 }
 
 func CheckLateDropped(ctx *harness.Ctx) {
-	omSeed(ctx, 0, 1000, 5000, 9000)
-	omSeed(ctx, 1, 3000, 7000, 11000)
-	emitted := omCollect(ctx, func(r Reading) {
+	hOmSeed(ctx, 0, 1000, 5000, 9000)
+	hOmSeed(ctx, 1, 3000, 7000, 11000)
+	emitted := hOmCollect(ctx, func(r Reading) {
 		if r.Ts == 5000 {
-			omReading(ctx, 0, 2000) // lands on partition 0 after the stream has passed 5000
+			hOmReading(ctx, 0, 2000) // lands on partition 0 after the stream has passed 5000
 		}
 	})
-	for _, ts := range omStamps(emitted) {
-		ctx.Assert(ts != 2000, "a reading with ts 2000 arriving after the frontier reached 5000 must never be emitted; got %v", omStamps(emitted))
+	for _, ts := range hOmStamps(emitted) {
+		ctx.Assert(ts != 2000, "a reading with ts 2000 arriving after the frontier reached 5000 must never be emitted; got %v", hOmStamps(emitted))
 	}
-	ctx.Equal(omStamps(emitted), []int64{1000, 3000, 5000, 7000}, "emitted ts")
+	ctx.Equal(hOmStamps(emitted), []int64{1000, 3000, 5000, 7000}, "emitted ts")
 	s := GetStats()
 	ctx.Equal(s.Dropped, 1, "GetStats().Dropped must count the late reading")
 	ctx.Assert(s.Emitted == 4 && s.Buffered == 2, "GetStats() must report emitted 4, buffered 2; got %+v", s)
 }
 
 func CheckWithinLateness(ctx *harness.Ctx) {
-	omSeed(ctx, 0, 1000, 5000)
-	omSeed(ctx, 1, 1000, 3000)
-	emitted := omCollect(ctx, func(r Reading) {
+	hOmSeed(ctx, 0, 1000, 5000)
+	hOmSeed(ctx, 1, 1000, 3000)
+	emitted := hOmCollect(ctx, func(r Reading) {
 		if r.Ts == 1000 && r.Partition == 1 && r.Offset == 0 {
 			// frontier 1000, watermark 3000: 1000 equals the frontier and 4000 is behind partition 0
 			// (already at 5000) — both are still in time
-			omReading(ctx, 1, 1000)
-			omReading(ctx, 0, 4000)
-			omReading(ctx, 0, 9000)
-			omReading(ctx, 1, 11000)
+			hOmReading(ctx, 1, 1000)
+			hOmReading(ctx, 0, 4000)
+			hOmReading(ctx, 0, 9000)
+			hOmReading(ctx, 1, 11000)
 		}
 	})
-	stamps := omStamps(emitted)
+	stamps := hOmStamps(emitted)
 	saw4000, at1000 := false, 0
 	for _, ts := range stamps {
 		saw4000 = saw4000 || ts == 4000
@@ -1690,23 +1690,23 @@ func CheckWithinLateness(ctx *harness.Ctx) {
 }
 
 func CheckIdlePartition(ctx *harness.Ctx) {
-	omSeed(ctx, 0, 1000, 5000, 9000, 13000)
-	omSeed(ctx, 1, 3000)
+	hOmSeed(ctx, 0, 1000, 5000, 9000, 13000)
+	hOmSeed(ctx, 1, 3000)
 	var emitted []Reading
 	at := map[int64]int64{}
 	// the consumer keeps polling through the quiet period; it may stop once 13000 is out
-	omDrain(ctx, 0, func(r Reading, stop func()) {
+	hOmDrain(ctx, 0, func(r Reading, stop func()) {
 		emitted = append(emitted, r)
 		at[r.Ts] = ctx.Clock.Now()
 		// partition 1 goes quiet; 6 s later (virtual) partition 0 delivers again
 		if r.Ts == 1000 {
-			time.AfterFunc(6*time.Second, func() { omReading(ctx, 0, 17000) })
+			time.AfterFunc(6*time.Second, func() { hOmReading(ctx, 0, 17000) })
 		}
 		if r.Ts == 13000 {
 			time.AfterFunc(1500*time.Millisecond, stop) // the topic is drained again
 		}
 	})
-	stamps := omStamps(emitted)
+	stamps := hOmStamps(emitted)
 	first := stamps
 	if len(first) > 1 {
 		first = first[:1]
@@ -1721,8 +1721,8 @@ func CheckIdlePartition(ctx *harness.Ctx) {
 }
 
 func CheckCommitAfterEmit(ctx *harness.Ctx) {
-	omSeed(ctx, 0, 1000, 5000, 12000, 8000, 13000)
-	omSeed(ctx, 1, 3000, 7000, 11000)
+	hOmSeed(ctx, 0, 1000, 5000, 12000, 8000, 13000)
+	hOmSeed(ctx, 1, 3000, 7000, 11000)
 	var mu sync.Mutex
 	done := map[string]bool{}
 	violations := []string{}
@@ -1741,7 +1741,7 @@ func CheckCommitAfterEmit(ctx *harness.Ctx) {
 			}
 		}
 	})
-	emitted := omCollect(ctx, func(r Reading) {
+	emitted := hOmCollect(ctx, func(r Reading) {
 		mu.Lock()
 		done[fmt.Sprintf("%d|%d", r.Partition, r.Offset)] = true
 		mu.Unlock()
@@ -1755,7 +1755,7 @@ func CheckCommitAfterEmit(ctx *harness.Ctx) {
 	ctx.Assert(joined, "the consumer must join group %s on %s; got %+v", Group, Topic, subscriptions)
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, ahead of the output")
 	ctx.Assert(len(ctx.Kafka.Commits(Group)) > 0, "nothing was ever committed: commit after each flush that emitted")
-	ctx.Equal(omStamps(emitted), []int64{1000, 3000, 5000, 7000, 8000}, "emitted ts (8000 at offset 3 emitted while 12000 at offset 2 waits)")
+	ctx.Equal(hOmStamps(emitted), []int64{1000, 3000, 5000, 7000, 8000}, "emitted ts (8000 at offset 3 emitted while 12000 at offset 2 waits)")
 	mu.Lock()
 	seen := append([]string{}, violations...)
 	mu.Unlock()
@@ -1783,41 +1783,41 @@ func CheckCommitAfterEmit(ctx *harness.Ctx) {
 
 namespace {
 
-std::string showStats(const Stats& s) {
+std::string hShowStats(const Stats& s) {
   return harness::Sprintf("{emitted:%d dropped:%d buffered:%d}", s.emitted, s.dropped, s.buffered);
 }
 
-void omReading(harness::Ctx& ctx, int part, int64_t ts) {
+void hOmReading(harness::Ctx& ctx, int part, int64_t ts) {
   const std::string sensor = "s" + std::to_string(part);
   ctx.Kafka.SeedPartition(kTopic, part, sensor, R"({"sensor":")" + sensor + R"(","ts":)" + std::to_string(ts) + "}");
 }
 
 // omSeed puts readings of sensor s{part} on that partition, in this order (6 partitions, like production).
-void omSeed(harness::Ctx& ctx, int part, const std::vector<int64_t>& stamps) {
+void hOmSeed(harness::Ctx& ctx, int part, const std::vector<int64_t>& stamps) {
   ctx.Kafka.CreateTopic(kTopic, 6);
-  for (const int64_t ts : stamps) omReading(ctx, part, ts);
+  for (const int64_t ts : stamps) hOmReading(ctx, part, ts);
 }
 
 // omDrain runs the learner's loop with emit; the loop is stopped (its waits end for good) when stop
 // is called, a second of polling later, and by itself once it polled quietSeconds without
 // anything new when quietSeconds > 0 (the TypeScript consumer stops once the topic is drained).
-void omDrain(harness::Ctx& ctx, int quietSeconds, const std::function<void(const Reading&, const std::function<void()>&)>& emit) {
+void hOmDrain(harness::Ctx& ctx, int quietSeconds, const std::function<void(const Reading&, const std::function<void()>&)>& emit) {
   if (quietSeconds > 0) ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + quietSeconds);
   const std::function<void()> stop = [&ctx] { ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 2); };
   ctx.Drain([&] { run([&](const Reading& r) { emit(r, stop); }); });
 }
 
 // omCollect drains the loop for 3 s of silence and returns what it emitted.
-std::vector<Reading> omCollect(harness::Ctx& ctx, const std::function<void(const Reading&)>& also) {
+std::vector<Reading> hOmCollect(harness::Ctx& ctx, const std::function<void(const Reading&)>& also) {
   std::vector<Reading> emitted;
-  omDrain(ctx, 3, [&](const Reading& r, const std::function<void()>&) {
+  hOmDrain(ctx, 3, [&](const Reading& r, const std::function<void()>&) {
     emitted.push_back(r);
     if (also) also(r);
   });
   return emitted;
 }
 
-std::vector<int64_t> omStamps(const std::vector<Reading>& emitted) {
+std::vector<int64_t> hOmStamps(const std::vector<Reading>& emitted) {
   std::vector<int64_t> out;
   for (const auto& r : emitted) out.push_back(r.ts);
   return out;
@@ -1832,15 +1832,15 @@ void CheckInOrder(harness::Ctx& ctx) {
     std::vector<int64_t> series;
     for (int64_t i = 0; i < 5; i++) series.push_back(1000 * (1 + order[part] + 6 * i));
     if (part == 4) series[0] = 3000;  // a tie with partition 5's first reading
-    omSeed(ctx, part, series);
+    hOmSeed(ctx, part, series);
     for (size_t i = 0; i < series.size(); i++) seeded.push_back({series[i], part, static_cast<int64_t>(i)});
   }
-  const auto emitted = omCollect(ctx, nullptr);
+  const auto emitted = hOmCollect(ctx, nullptr);
   std::vector<std::array<int64_t, 3>> got;
   for (const auto& r : emitted) got.push_back({r.ts, r.partition, r.offset});
   ctx.Assert(!got.empty(),
              "nothing was emitted: 30 readings over six partitions, the slowest partition reaching 25000, must release everything up to 23000");
-  const auto ts = omStamps(emitted);
+  const auto ts = hOmStamps(emitted);
   ctx.Assert(std::is_sorted(ts.begin(), ts.end()), "the emitted ts must be non-decreasing; got %v", ts);
   // partition 1 tops out at 25000: watermark 25000, threshold 23000
   std::vector<std::array<int64_t, 3>> want;
@@ -1852,49 +1852,49 @@ void CheckInOrder(harness::Ctx& ctx) {
     ctx.Assert(r.sensor == "s" + std::to_string(r.partition), "each emitted reading must carry the sensor from its payload");
   const Stats s = stats();
   ctx.Assert(s.emitted == 23 && s.buffered == 7 && s.dropped == 0, "stats() must report emitted 23, buffered 7, dropped 0; got %s",
-             showStats(s));
+             hShowStats(s));
 }
 
 void CheckWatermarkGates(harness::Ctx& ctx) {
-  omSeed(ctx, 0, {1000, 5000, 9000});
-  omSeed(ctx, 1, {3000, 7000, 11000});
-  omSeed(ctx, 2, {20000});
-  const auto emitted = omCollect(ctx, nullptr);
-  ctx.Equal(omStamps(emitted), {1000, 3000, 5000, 7000},
+  hOmSeed(ctx, 0, {1000, 5000, 9000});
+  hOmSeed(ctx, 1, {3000, 7000, 11000});
+  hOmSeed(ctx, 2, {20000});
+  const auto emitted = hOmCollect(ctx, nullptr);
+  ctx.Equal(hOmStamps(emitted), {1000, 3000, 5000, 7000},
             "the watermark is 9000 (partition 0's newest; partition 2 at 20000 does not pull it up) and the threshold 7000: emitted ts");
   const Stats s = stats();
   ctx.Equal(s.buffered, 3, "9000, 11000 and 20000 must stay buffered until the slowest partition passes them: stats().buffered");
-  ctx.Assert(s.emitted == 4 && s.dropped == 0, "stats() must report emitted 4, dropped 0; got %s", showStats(s));
+  ctx.Assert(s.emitted == 4 && s.dropped == 0, "stats() must report emitted 4, dropped 0; got %s", hShowStats(s));
 }
 
 void CheckLateDropped(harness::Ctx& ctx) {
-  omSeed(ctx, 0, {1000, 5000, 9000});
-  omSeed(ctx, 1, {3000, 7000, 11000});
-  const auto emitted = omCollect(ctx, [&](const Reading& r) {
-    if (r.ts == 5000) omReading(ctx, 0, 2000);  // lands on partition 0 after the stream has passed 5000
+  hOmSeed(ctx, 0, {1000, 5000, 9000});
+  hOmSeed(ctx, 1, {3000, 7000, 11000});
+  const auto emitted = hOmCollect(ctx, [&](const Reading& r) {
+    if (r.ts == 5000) hOmReading(ctx, 0, 2000);  // lands on partition 0 after the stream has passed 5000
   });
-  for (const int64_t ts : omStamps(emitted))
-    ctx.Assert(ts != 2000, "a reading with ts 2000 arriving after the frontier reached 5000 must never be emitted; got %v", omStamps(emitted));
-  ctx.Equal(omStamps(emitted), {1000, 3000, 5000, 7000}, "emitted ts");
+  for (const int64_t ts : hOmStamps(emitted))
+    ctx.Assert(ts != 2000, "a reading with ts 2000 arriving after the frontier reached 5000 must never be emitted; got %v", hOmStamps(emitted));
+  ctx.Equal(hOmStamps(emitted), {1000, 3000, 5000, 7000}, "emitted ts");
   const Stats s = stats();
   ctx.Equal(s.dropped, 1, "stats().dropped must count the late reading");
-  ctx.Assert(s.emitted == 4 && s.buffered == 2, "stats() must report emitted 4, buffered 2; got %s", showStats(s));
+  ctx.Assert(s.emitted == 4 && s.buffered == 2, "stats() must report emitted 4, buffered 2; got %s", hShowStats(s));
 }
 
 void CheckWithinLateness(harness::Ctx& ctx) {
-  omSeed(ctx, 0, {1000, 5000});
-  omSeed(ctx, 1, {1000, 3000});
-  const auto emitted = omCollect(ctx, [&](const Reading& r) {
+  hOmSeed(ctx, 0, {1000, 5000});
+  hOmSeed(ctx, 1, {1000, 3000});
+  const auto emitted = hOmCollect(ctx, [&](const Reading& r) {
     if (r.ts == 1000 && r.partition == 1 && r.offset == 0) {
       // frontier 1000, watermark 3000: 1000 equals the frontier and 4000 is behind partition 0
       // (already at 5000) — both are still in time
-      omReading(ctx, 1, 1000);
-      omReading(ctx, 0, 4000);
-      omReading(ctx, 0, 9000);
-      omReading(ctx, 1, 11000);
+      hOmReading(ctx, 1, 1000);
+      hOmReading(ctx, 0, 4000);
+      hOmReading(ctx, 0, 9000);
+      hOmReading(ctx, 1, 11000);
     }
   });
-  const auto stamps = omStamps(emitted);
+  const auto stamps = hOmStamps(emitted);
   const bool saw4000 = std::find(stamps.begin(), stamps.end(), 4000) != stamps.end();
   const auto at1000 = std::count(stamps.begin(), stamps.end(), 1000);
   ctx.Assert(saw4000,
@@ -1908,24 +1908,24 @@ void CheckWithinLateness(harness::Ctx& ctx) {
 }
 
 void CheckIdlePartition(harness::Ctx& ctx) {
-  omSeed(ctx, 0, {1000, 5000, 9000, 13000});
-  omSeed(ctx, 1, {3000});
+  hOmSeed(ctx, 0, {1000, 5000, 9000, 13000});
+  hOmSeed(ctx, 1, {3000});
   std::vector<Reading> emitted;
   std::map<int64_t, int64_t> at;
   // the consumer keeps polling through the quiet period; it may stop once 13000 is out
-  omDrain(ctx, 0, [&](const Reading& r, const std::function<void()>& stop) {
+  hOmDrain(ctx, 0, [&](const Reading& r, const std::function<void()>& stop) {
     emitted.push_back(r);
     at[r.ts] = ctx.Clock.Now();
     // partition 1 goes quiet; 6 s later (virtual) partition 0 delivers again
     if (r.ts == 1000) {
       std::thread([&ctx] {
         std::this_thread::sleep_for(std::chrono::seconds(6));
-        omReading(ctx, 0, 17000);
+        hOmReading(ctx, 0, 17000);
       }).detach();
     }
     if (r.ts == 13000) stop();  // the topic is drained again
   });
-  const auto stamps = omStamps(emitted);
+  const auto stamps = hOmStamps(emitted);
   const std::vector<int64_t> first(stamps.begin(), stamps.begin() + std::min<size_t>(1, stamps.size()));
   ctx.Equal(first, {1000}, "before any partition is idle only 1000 is below the threshold (emitted %v); first emit", stamps);
   ctx.Equal(stamps, {1000, 3000, 5000, 9000, 13000},
@@ -1939,8 +1939,8 @@ void CheckIdlePartition(harness::Ctx& ctx) {
 }
 
 void CheckCommitAfterEmit(harness::Ctx& ctx) {
-  omSeed(ctx, 0, {1000, 5000, 12000, 8000, 13000});
-  omSeed(ctx, 1, {3000, 7000, 11000});
+  hOmSeed(ctx, 0, {1000, 5000, 12000, 8000, 13000});
+  hOmSeed(ctx, 1, {3000, 7000, 11000});
   std::set<std::pair<int, int64_t>> done;
   std::vector<std::string> violations;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
@@ -1951,7 +1951,7 @@ void CheckCommitAfterEmit(harness::Ctx& ctx) {
       if (!missing.empty()) violations.push_back(harness::Sprintf("[%d, %d, %v]", tp.Partition, offset, missing));
     }
   });
-  const auto emitted = omCollect(ctx, [&](const Reading& r) { done.insert({r.partition, r.offset}); });
+  const auto emitted = hOmCollect(ctx, [&](const Reading& r) { done.insert({r.partition, r.offset}); });
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   bool joined = false;
   if (!subscriptions.empty()) {
@@ -1961,7 +1961,7 @@ void CheckCommitAfterEmit(harness::Ctx& ctx) {
   ctx.Assert(joined, "the consumer must join group %s on %s; got %v", kGroup, kTopic, subscriptions);
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, ahead of the output");
   ctx.Assert(!ctx.Kafka.Commits(kGroup).empty(), "nothing was ever committed: commit after each flush that emitted");
-  ctx.Equal(omStamps(emitted), {1000, 3000, 5000, 7000, 8000}, "emitted ts (8000 at offset 3 emitted while 12000 at offset 2 waits)");
+  ctx.Equal(hOmStamps(emitted), {1000, 3000, 5000, 7000, 8000}, "emitted ts (8000 at offset 3 emitted while 12000 at offset 2 waits)");
   ctx.Equal(violations.size(), 0,
             "a commit covered a reading that had not been emitted (partition, committed offset, unemitted offsets below it): %s — commit the lowest buffered offset, not the highest emitted + 1; violations",
             violations.empty() ? std::string() : violations[0]);

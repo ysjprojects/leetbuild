@@ -1296,34 +1296,34 @@ import (
 	"leetbuild/harness"
 )
 
-const guardQuestion = "My payout has not arrived, when is it paid?"
+const kHGuardQuestion = "My payout has not arrived, when is it paid?"
 
-var guardHistory = []prompt.Turn{{Role: "dasher", Text: "Hi, I dashed all of last week."}}
+var hGuardHistory = []prompt.Turn{{Role: "dasher", Text: "Hi, I dashed all of last week."}}
 
 // guardLLM is the stand-in model server at both addresses; the check may switch its mode.
-type guardLLM struct {
+type HGuardLLM struct {
 	pb.UnimplementedLlmServer
 	mode string
 }
 
-func (p *guardLLM) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
+func (p *HGuardLLM) Generate(_ context.Context, req *pb.GenerateRequest) (*pb.GenerateReply, error) {
 	text := model.Complete(req.GetPrompt(), int(req.GetMaxTokens()), p.mode)
 	return &pb.GenerateReply{Text: text, Tokens: int32(len(strings.Fields(text))), Model: req.GetModel()}, nil
 }
 
 // guardJudge is the stand-in judge: the deterministic rubric of assistant/model.
-type guardJudge struct {
+type HGuardJudge struct {
 	pb.UnimplementedJudgeServer
 }
 
-func (guardJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
+func (HGuardJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
 	s := model.Evaluate(req.GetQuestion(), req.GetAnswer(), req.GetContextIds())
 	return &pb.Scores{Groundedness: float32(s.Groundedness), Coherence: float32(s.Coherence), Compliance: float32(s.Compliance), Pass: s.Pass}, nil
 }
 
 // guardWorld is the real KB chunks the checks retrieve and the answers they send.
-type guardWorld struct {
-	llm      *guardLLM
+type HGuardWorld struct {
+	llm      *HGuardLLM
 	chunks   []prompt.Chunk
 	ids      []string
 	prompt   string
@@ -1334,7 +1334,7 @@ type guardWorld struct {
 }
 
 // kbChunk is a real KB chunk, as kb_search would have returned it.
-func kbChunk(id string) prompt.Chunk {
+func hKbChunk(id string) prompt.Chunk {
 	at := strings.LastIndex(id, "-")
 	a, _ := kb.Find(id[:at])
 	position, _ := strconv.Atoi(id[at+1:])
@@ -1343,19 +1343,19 @@ func kbChunk(id string) prompt.Chunk {
 
 // serveGuard serves both model addresses and the judge, and stands in for generate (step 3) with one
 // Generate on the large model.
-func serveGuard(ctx *harness.Ctx, mode string) *guardWorld {
-	w := &guardWorld{llm: &guardLLM{mode: mode}, ids: []string{"pay-0", "pay-1", "tips-0", "referrals-1"}}
+func hServeGuard(ctx *harness.Ctx, mode string) *HGuardWorld {
+	w := &HGuardWorld{llm: &HGuardLLM{mode: mode}, ids: []string{"pay-0", "pay-1", "tips-0", "referrals-1"}}
 	for _, id := range w.ids {
-		w.chunks = append(w.chunks, kbChunk(id))
+		w.chunks = append(w.chunks, hKbChunk(id))
 	}
-	w.prompt = prompt.Build(guardQuestion, w.chunks, guardHistory)
+	w.prompt = prompt.Build(kHGuardQuestion, w.chunks, hGuardHistory)
 	w.faithful = model.Complete(w.prompt, config.MaxTokens, "faithful")
 	w.stray = strings.Replace(w.faithful, "[kb:pay-1]", "[kb:policy-404]", 1)
 	w.offTopic = w.faithful + " Reboot the router and reinstall the firmware."
 	w.risky = w.faithful[:len(w.faithful)-1] + ", which we guarantee."
 	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMLarge), w.llm)
 	pb.RegisterLlmServer(ctx.GRPC.Server(config.LLMSmall), w.llm)
-	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), guardJudge{})
+	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), HGuardJudge{})
 	conn, err := grpc.NewClient(config.LLMLarge, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	ctx.NoError(err, "dial %s", config.LLMLarge)
 	llm := pb.NewLlmClient(conn)
@@ -1371,22 +1371,22 @@ func serveGuard(ctx *harness.Ctx, mode string) *guardWorld {
 	return w
 }
 
-func evaluations(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Evaluate", config.Judge) }
+func hEvaluations(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Evaluate", config.Judge) }
 
-func generations(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
+func hGenerations(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Generate", "") }
 
-func (w *guardWorld) verdict(answer string) Verdict {
-	return check(context.Background(), guardQuestion, answer, w.chunks)
+func (w *HGuardWorld) verdict(answer string) Verdict {
+	return check(context.Background(), kHGuardQuestion, answer, w.chunks)
 }
 
-func (w *guardWorld) outcome(ctx *harness.Ctx) Outcome {
-	result, err := answerOrEscalate(context.Background(), guardQuestion, w.chunks, guardHistory)
+func (w *HGuardWorld) outcome(ctx *harness.Ctx) Outcome {
+	result, err := answerOrEscalate(context.Background(), kHGuardQuestion, w.chunks, hGuardHistory)
 	ctx.NoError(err, "answerOrEscalate must return {Answer, Sources, Escalated, Model}")
 	return result
 }
 
 func CheckCitedChunksOnly(ctx *harness.Ctx) {
-	w := serveGuard(ctx, "faithful")
+	w := hServeGuard(ctx, "faithful")
 	v := w.verdict(w.stray)
 	ctx.Assert(!v.OK, "an answer citing [kb:policy-404], which was never retrieved, must fail: got %+v", v)
 	ctx.Assert(len(v.Reasons) > 0, "a failed check must say why: Reasons is empty")
@@ -1395,26 +1395,26 @@ func CheckCitedChunksOnly(ctx *harness.Ctx) {
 		named = named || strings.Contains(r, "policy-404")
 	}
 	ctx.Assert(named, "a reason must name the stray chunk id policy-404, got %q", v.Reasons)
-	ctx.Assert(len(evaluations(ctx)) == 0, "tier 1 failed, so the judge must not be called — it was called %d time(s)", len(evaluations(ctx)))
+	ctx.Assert(len(hEvaluations(ctx)) == 0, "tier 1 failed, so the judge must not be called — it was called %d time(s)", len(hEvaluations(ctx)))
 }
 
 func CheckSentenceSimilarity(ctx *harness.Ctx) {
-	w := serveGuard(ctx, "faithful")
+	w := hServeGuard(ctx, "faithful")
 	v := w.verdict(w.offTopic)
 	ctx.Assert(!v.OK, "a sentence unlike every retrieved chunk (cosine 0.00 < %v) must fail tier 1: got %+v", config.MinSimilarity, v)
 	ctx.Assert(len(v.Reasons) > 0, "a failed check must say why: Reasons is empty")
-	ctx.Assert(len(evaluations(ctx)) == 0, "tier 1 failed, so the judge must not be called — it was called %d time(s)", len(evaluations(ctx)))
+	ctx.Assert(len(hEvaluations(ctx)) == 0, "tier 1 failed, so the judge must not be called — it was called %d time(s)", len(hEvaluations(ctx)))
 	v = w.verdict(w.faithful)
 	ctx.Assert(v.OK, "the faithful answer cites retrieved chunks and its one sentence is the top chunk's (cosine 0.58): it must pass, got %+v", v)
 }
 
 func CheckJudgeVerdict(ctx *harness.Ctx) {
-	w := serveGuard(ctx, "faithful")
+	w := hServeGuard(ctx, "faithful")
 	v := w.verdict(w.faithful)
-	calls := evaluations(ctx)
+	calls := hEvaluations(ctx)
 	ctx.Equal(len(calls), 1, "an answer that clears tier 1 goes to the judge exactly once: Evaluate calls to %s", config.Judge)
 	request, _ := calls[0].Request.(*pb.EvaluateRequest)
-	ctx.Equal(request.GetQuestion(), guardQuestion, "Evaluate must carry the question")
+	ctx.Equal(request.GetQuestion(), kHGuardQuestion, "Evaluate must carry the question")
 	ctx.Equal(request.GetAnswer(), w.faithful, "Evaluate must carry the answer as generated")
 	ctx.Equal(request.GetContextIds(), w.ids, "ContextIds must be the retrieved chunk ids")
 	ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a stalled judge would hold the chat open forever")
@@ -1425,25 +1425,25 @@ func CheckJudgeVerdict(ctx *harness.Ctx) {
 }
 
 func CheckJudgeFailsClosed(ctx *harness.Ctx) {
-	w := serveGuard(ctx, "faithful")
+	w := hServeGuard(ctx, "faithful")
 	v := w.verdict(w.risky)
-	ctx.Equal(len(evaluations(ctx)), 1, "the promise is invisible to tier 1 (same citations, cosine 0.56): the judge must be asked once")
+	ctx.Equal(len(hEvaluations(ctx)), 1, "the promise is invisible to tier 1 (same citations, cosine 0.56): the judge must be asked once")
 	ctx.Assert(!v.OK, "the judge scores 'guarantee' as compliance 0.0 and does not pass it: OK must be false, got %+v", v)
 	ctx.Assert(math.Abs(v.Groundedness-1) < 1e-6, "Groundedness is the judge's score (1.0: every citation is in context), got %v", v.Groundedness)
 	ctx.Assert(len(v.Reasons) > 0, "a failed check must say why: Reasons is empty")
 	ctx.GRPC.Stop(config.Judge)
 	v = w.verdict(w.faithful)
 	ctx.Assert(!v.OK, "with the judge unreachable (UNAVAILABLE) nothing vouched for the answer: OK must be false, got %+v", v)
-	calls := evaluations(ctx)
+	calls := hEvaluations(ctx)
 	ctx.Equal(len(calls), 2, "the judge must still be asked when it is down (that is how the call fails): Evaluate calls")
 	ctx.Equal(calls[len(calls)-1].Code, codes.Unavailable, "the last Evaluate call's status")
 }
 
 func CheckEscalateAfterRetry(ctx *harness.Ctx) {
-	w := serveGuard(ctx, "hallucinate")
+	w := hServeGuard(ctx, "hallucinate")
 	result := w.outcome(ctx)
-	ctx.Equal(len(generations(ctx)), 2, "a failed check earns the model one more try: Generate calls")
-	ctx.Equal(len(evaluations(ctx)), 0, "the invented answer fails tier 1 both times: the judge must never be called")
+	ctx.Equal(len(hGenerations(ctx)), 2, "a failed check earns the model one more try: Generate calls")
+	ctx.Equal(len(hEvaluations(ctx)), 0, "the invented answer fails tier 1 both times: the judge must never be called")
 	ctx.Assert(result.Escalated, "two rejected answers must escalate, got %+v", result)
 	ctx.Equal(result.Answer, config.HandoffText, "an escalated turn answers with config.HandoffText")
 	ctx.Assert(!strings.Contains(result.Answer, "policy-404") && !strings.Contains(result.Answer, "resolved within 7 days"), "the rejected answer must never leave answerOrEscalate")
@@ -1452,9 +1452,9 @@ func CheckEscalateAfterRetry(ctx *harness.Ctx) {
 	ctx.Equal(result.Tokens, 0, "an escalated turn has no answer to count: Tokens")
 	w.llm.mode = "faithful"
 	result = w.outcome(ctx)
-	ctx.Assert(len(generations(ctx)) == 3, "a passing answer needs one Generate call, saw %d", len(generations(ctx))-2)
-	ctx.Equal(len(evaluations(ctx)), 1, "a passing answer is judged exactly once: Evaluate calls")
-	gens := generations(ctx)
+	ctx.Assert(len(hGenerations(ctx)) == 3, "a passing answer needs one Generate call, saw %d", len(hGenerations(ctx))-2)
+	ctx.Equal(len(hEvaluations(ctx)), 1, "a passing answer is judged exactly once: Evaluate calls")
+	gens := hGenerations(ctx)
 	last, _ := gens[len(gens)-1].Request.(*pb.GenerateRequest)
 	ctx.Assert(last.GetPrompt() == w.prompt, "generate must be given the question, chunks and history: the prompt differs from prompt.Build(question, chunks, history)")
 	ctx.Assert(result.Answer == w.faithful && strings.Join(result.Sources, ",") == "pay-0,pay-1" && !result.Escalated && result.Model == "large", "a passing answer comes back as generated with its cited ids as Sources (pay-0, pay-1), not escalated, model large; got %+v", result)
@@ -1462,7 +1462,7 @@ func CheckEscalateAfterRetry(ctx *harness.Ctx) {
 	ctx.GRPC.Stop(config.Judge)
 	result = w.outcome(ctx)
 	ctx.Assert(result.Escalated && result.Answer == config.HandoffText && len(result.Sources) == 0, "with the judge down an unjudged answer must not reach the Dasher: expected the handoff, got %+v", result)
-	ctx.Assert(len(generations(ctx)) == 5, "the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw %d", len(generations(ctx))-3)
+	ctx.Assert(len(hGenerations(ctx)) == 5, "the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw %d", len(hGenerations(ctx))-3)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1475,12 +1475,12 @@ func CheckEscalateAfterRetry(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string guardQuestion = "My payout has not arrived, when is it paid?";
+const std::string kHGuardQuestion = "My payout has not arrived, when is it paid?";
 
-const std::vector<assistant::Turn> guardHistory = {{"dasher", "Hi, I dashed all of last week."}};
+const std::vector<assistant::Turn> kHGuardHistory = {{"dasher", "Hi, I dashed all of last week."}};
 
 // guardLLM is the stand-in model server at both addresses; the check may switch its mode.
-class guardLLM final : public support::Llm::Service {
+class HGuardLLM final : public support::Llm::Service {
  public:
   std::string mode;
   grpc::Status Generate(grpc::ServerContext*, const support::GenerateRequest* req, support::GenerateReply* reply) override {
@@ -1493,7 +1493,7 @@ class guardLLM final : public support::Llm::Service {
 };
 
 // guardJudge is the stand-in judge: the deterministic rubric of assistant/model.h.
-class guardJudge final : public support::Judge::Service {
+class HGuardJudge final : public support::Judge::Service {
  public:
   grpc::Status Evaluate(grpc::ServerContext*, const support::EvaluateRequest* req, support::Scores* reply) override {
     const auto s = model::evaluate(req->question(), req->answer(), {req->context_ids().begin(), req->context_ids().end()});
@@ -1506,9 +1506,9 @@ class guardJudge final : public support::Judge::Service {
 };
 
 // guardWorld is the real KB chunks the checks retrieve and the answers they send.
-struct guardWorld {
-  guardLLM llm;
-  guardJudge judge;
+struct HGuardWorld {
+  HGuardLLM llm;
+  HGuardJudge judge;
   std::vector<assistant::Chunk> chunks;
   std::vector<std::string> ids;
   std::string prompt;
@@ -1518,10 +1518,10 @@ struct guardWorld {
   std::string risky;     // the faithful sentence with a promise in it: tier 1 cannot see it, the judge's compliance rule can
 };
 
-std::unique_ptr<guardWorld> world;
+std::unique_ptr<HGuardWorld> hWorld;
 
 // kbChunk is a real KB chunk, as kb_search would have returned it.
-assistant::Chunk kbChunk(const std::string& id) {
+assistant::Chunk hKbChunk(const std::string& id) {
   const size_t at = id.rfind('-');
   const auto a = assistant::find_article(id.substr(0, at));
   const int position = std::stoi(id.substr(at + 1));
@@ -1530,13 +1530,13 @@ assistant::Chunk kbChunk(const std::string& id) {
 
 // serveGuard serves both model addresses and the judge; generate (step 3) is stood in for below
 // with one Generate on the large model.
-guardWorld& serveGuard(harness::Ctx& ctx, const std::string& mode) {
-  world = std::make_unique<guardWorld>();
-  guardWorld& w = *world;
+HGuardWorld& hServeGuard(harness::Ctx& ctx, const std::string& mode) {
+  hWorld = std::make_unique<HGuardWorld>();
+  HGuardWorld& w = *hWorld;
   w.llm.mode = mode;
   w.ids = {"pay-0", "pay-1", "tips-0", "referrals-1"};
-  for (const auto& id : w.ids) w.chunks.push_back(kbChunk(id));
-  w.prompt = assistant::build_prompt(guardQuestion, w.chunks, guardHistory);
+  for (const auto& id : w.ids) w.chunks.push_back(hKbChunk(id));
+  w.prompt = assistant::build_prompt(kHGuardQuestion, w.chunks, kHGuardHistory);
   w.faithful = model::complete(w.prompt, config::kMaxTokens, "faithful");
   w.stray = w.faithful;
   w.stray.replace(w.stray.find("[kb:pay-1]"), 10, "[kb:policy-404]");
@@ -1548,30 +1548,30 @@ guardWorld& serveGuard(harness::Ctx& ctx, const std::string& mode) {
   return w;
 }
 
-std::vector<harness::Call> evaluations(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Evaluate", config::kJudge); }
+std::vector<harness::Call> hEvaluations(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Evaluate", config::kJudge); }
 
-std::vector<harness::Call> generations(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Generate", ""); }
+std::vector<harness::Call> hGenerations(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Generate", ""); }
 
 // showVerdict and showOutcome print a result the way Go's %+v prints the struct.
-std::string showVerdict(const Verdict& v) {
+std::string hShowVerdict(const Verdict& v) {
   return harness::Sprintf("{OK:%v Groundedness:%v Reasons:%v}", v.ok, v.groundedness, v.reasons);
 }
 
-std::string showOutcome(const Outcome& o) {
+std::string hShowOutcome(const Outcome& o) {
   return harness::Sprintf("{Answer:%s Sources:%v Escalated:%v Model:%s Tokens:%d}", o.answer, o.sources, o.escalated, o.model, o.tokens);
 }
 
-Verdict verdict(harness::Ctx& ctx, const std::string& answer) {
+Verdict hVerdict(harness::Ctx& ctx, const std::string& answer) {
   try {
-    return check(guardQuestion, answer, world->chunks);
+    return check(kHGuardQuestion, answer, hWorld->chunks);
   } catch (const std::exception& e) {
     ctx.Fatalf("check(question, answer, chunks) crashed: %v", std::string(e.what()));
   }
 }
 
-Outcome outcome(harness::Ctx& ctx) {
+Outcome hOutcome(harness::Ctx& ctx) {
   try {
-    return answer_or_escalate(guardQuestion, world->chunks, guardHistory);
+    return answer_or_escalate(kHGuardQuestion, hWorld->chunks, kHGuardHistory);
   } catch (const std::exception& e) {
     ctx.Fatalf("answerOrEscalate must return {Answer, Sources, Escalated, Model}: %v", std::string(e.what()));
   }
@@ -1595,81 +1595,81 @@ Generated generate(const std::string& question, const std::vector<prompt::Chunk>
 }
 
 void CheckCitedChunksOnly(harness::Ctx& ctx) {
-  auto& w = serveGuard(ctx, "faithful");
-  const Verdict v = verdict(ctx, w.stray);
-  ctx.Assert(!v.ok, "an answer citing [kb:policy-404], which was never retrieved, must fail: got %s", showVerdict(v));
+  auto& w = hServeGuard(ctx, "faithful");
+  const Verdict v = hVerdict(ctx, w.stray);
+  ctx.Assert(!v.ok, "an answer citing [kb:policy-404], which was never retrieved, must fail: got %s", hShowVerdict(v));
   ctx.Assert(!v.reasons.empty(), "a failed check must say why: Reasons is empty");
   bool named = false;
   for (const auto& r : v.reasons) named = named || r.find("policy-404") != std::string::npos;
   ctx.Assert(named, "a reason must name the stray chunk id policy-404, got %q", v.reasons);
-  ctx.Assert(evaluations(ctx).empty(), "tier 1 failed, so the judge must not be called — it was called %d time(s)", evaluations(ctx).size());
+  ctx.Assert(hEvaluations(ctx).empty(), "tier 1 failed, so the judge must not be called — it was called %d time(s)", hEvaluations(ctx).size());
 }
 
 void CheckSentenceSimilarity(harness::Ctx& ctx) {
-  auto& w = serveGuard(ctx, "faithful");
-  Verdict v = verdict(ctx, w.offTopic);
-  ctx.Assert(!v.ok, "a sentence unlike every retrieved chunk (cosine 0.00 < %v) must fail tier 1: got %s", config::kMinSimilarity, showVerdict(v));
+  auto& w = hServeGuard(ctx, "faithful");
+  Verdict v = hVerdict(ctx, w.offTopic);
+  ctx.Assert(!v.ok, "a sentence unlike every retrieved chunk (cosine 0.00 < %v) must fail tier 1: got %s", config::kMinSimilarity, hShowVerdict(v));
   ctx.Assert(!v.reasons.empty(), "a failed check must say why: Reasons is empty");
-  ctx.Assert(evaluations(ctx).empty(), "tier 1 failed, so the judge must not be called — it was called %d time(s)", evaluations(ctx).size());
-  v = verdict(ctx, w.faithful);
-  ctx.Assert(v.ok, "the faithful answer cites retrieved chunks and its one sentence is the top chunk's (cosine 0.58): it must pass, got %s", showVerdict(v));
+  ctx.Assert(hEvaluations(ctx).empty(), "tier 1 failed, so the judge must not be called — it was called %d time(s)", hEvaluations(ctx).size());
+  v = hVerdict(ctx, w.faithful);
+  ctx.Assert(v.ok, "the faithful answer cites retrieved chunks and its one sentence is the top chunk's (cosine 0.58): it must pass, got %s", hShowVerdict(v));
 }
 
 void CheckJudgeVerdict(harness::Ctx& ctx) {
-  auto& w = serveGuard(ctx, "faithful");
-  const Verdict v = verdict(ctx, w.faithful);
-  const auto calls = evaluations(ctx);
+  auto& w = hServeGuard(ctx, "faithful");
+  const Verdict v = hVerdict(ctx, w.faithful);
+  const auto calls = hEvaluations(ctx);
   ctx.Equal(calls.size(), 1, "an answer that clears tier 1 goes to the judge exactly once: Evaluate calls to %s", config::kJudge);
   const auto request = calls[0].Request<support::EvaluateRequest>();
-  ctx.Equal(request.question(), guardQuestion, "Evaluate must carry the question");
+  ctx.Equal(request.question(), kHGuardQuestion, "Evaluate must carry the question");
   ctx.Equal(request.answer(), w.faithful, "Evaluate must carry the answer as generated");
   ctx.Equal(std::vector<std::string>(request.context_ids().begin(), request.context_ids().end()), w.ids, "ContextIds must be the retrieved chunk ids");
   ctx.Assert(calls[0].HasDeadline(), "the Evaluate call carries no deadline: a stalled judge would hold the chat open forever");
   const double deadlineS = config::kDeadline.count() / 1000.0;
   ctx.Assert(1.5 <= calls[0].TimeoutSeconds() && calls[0].TimeoutSeconds() <= 2.0, "the deadline must be config.DeadlineS = %v s, got %v s", deadlineS, calls[0].TimeoutSeconds());
-  ctx.Assert(v.ok, "the judge passed this answer (groundedness 1.0, compliance 1.0): OK must be true, got %s", showVerdict(v));
+  ctx.Assert(v.ok, "the judge passed this answer (groundedness 1.0, compliance 1.0): OK must be true, got %s", hShowVerdict(v));
   ctx.Assert(std::fabs(v.groundedness - 1) < 1e-6, "Groundedness must be the judge's score 1.0, got %v", v.groundedness);
   ctx.Equal(v.reasons.size(), 0, "a passing verdict has no reasons, got %q: len(Reasons)", v.reasons);
 }
 
 void CheckJudgeFailsClosed(harness::Ctx& ctx) {
-  auto& w = serveGuard(ctx, "faithful");
-  Verdict v = verdict(ctx, w.risky);
-  ctx.Equal(evaluations(ctx).size(), 1, "the promise is invisible to tier 1 (same citations, cosine 0.56): the judge must be asked once");
-  ctx.Assert(!v.ok, "the judge scores 'guarantee' as compliance 0.0 and does not pass it: OK must be false, got %s", showVerdict(v));
+  auto& w = hServeGuard(ctx, "faithful");
+  Verdict v = hVerdict(ctx, w.risky);
+  ctx.Equal(hEvaluations(ctx).size(), 1, "the promise is invisible to tier 1 (same citations, cosine 0.56): the judge must be asked once");
+  ctx.Assert(!v.ok, "the judge scores 'guarantee' as compliance 0.0 and does not pass it: OK must be false, got %s", hShowVerdict(v));
   ctx.Assert(std::fabs(v.groundedness - 1) < 1e-6, "Groundedness is the judge's score (1.0: every citation is in context), got %v", v.groundedness);
   ctx.Assert(!v.reasons.empty(), "a failed check must say why: Reasons is empty");
   ctx.GRPC.Stop(config::kJudge);
-  v = verdict(ctx, w.faithful);
-  ctx.Assert(!v.ok, "with the judge unreachable (UNAVAILABLE) nothing vouched for the answer: OK must be false, got %s", showVerdict(v));
-  const auto calls = evaluations(ctx);
+  v = hVerdict(ctx, w.faithful);
+  ctx.Assert(!v.ok, "with the judge unreachable (UNAVAILABLE) nothing vouched for the answer: OK must be false, got %s", hShowVerdict(v));
+  const auto calls = hEvaluations(ctx);
   ctx.Equal(calls.size(), 2, "the judge must still be asked when it is down (that is how the call fails): Evaluate calls");
   ctx.Assert(calls.back().Code == grpc::StatusCode::UNAVAILABLE, "the last Evaluate call's status must be UNAVAILABLE, got code %d", static_cast<int>(calls.back().Code));
 }
 
 void CheckEscalateAfterRetry(harness::Ctx& ctx) {
-  auto& w = serveGuard(ctx, "hallucinate");
-  Outcome result = outcome(ctx);
-  ctx.Equal(generations(ctx).size(), 2, "a failed check earns the model one more try: Generate calls");
-  ctx.Equal(evaluations(ctx).size(), 0, "the invented answer fails tier 1 both times: the judge must never be called");
-  ctx.Assert(result.escalated, "two rejected answers must escalate, got %s", showOutcome(result));
+  auto& w = hServeGuard(ctx, "hallucinate");
+  Outcome result = hOutcome(ctx);
+  ctx.Equal(hGenerations(ctx).size(), 2, "a failed check earns the model one more try: Generate calls");
+  ctx.Equal(hEvaluations(ctx).size(), 0, "the invented answer fails tier 1 both times: the judge must never be called");
+  ctx.Assert(result.escalated, "two rejected answers must escalate, got %s", hShowOutcome(result));
   ctx.Equal(result.answer, config::kHandoffText, "an escalated turn answers with config.HandoffText");
   ctx.Assert(result.answer.find("policy-404") == std::string::npos && result.answer.find("resolved within 7 days") == std::string::npos, "the rejected answer must never leave answerOrEscalate");
   ctx.Equal(result.sources.size(), 0, "an escalated turn has no sources, got %q: len(Sources)", result.sources);
   ctx.Equal(result.model, "large", "Model must be the one that answered");
   ctx.Equal(result.tokens, 0, "an escalated turn has no answer to count: Tokens");
   w.llm.mode = "faithful";
-  result = outcome(ctx);
-  ctx.Assert(generations(ctx).size() == 3, "a passing answer needs one Generate call, saw %d", generations(ctx).size() - 2);
-  ctx.Equal(evaluations(ctx).size(), 1, "a passing answer is judged exactly once: Evaluate calls");
-  const auto last = generations(ctx).back().Request<support::GenerateRequest>();
+  result = hOutcome(ctx);
+  ctx.Assert(hGenerations(ctx).size() == 3, "a passing answer needs one Generate call, saw %d", hGenerations(ctx).size() - 2);
+  ctx.Equal(hEvaluations(ctx).size(), 1, "a passing answer is judged exactly once: Evaluate calls");
+  const auto last = hGenerations(ctx).back().Request<support::GenerateRequest>();
   ctx.Assert(last.prompt() == w.prompt, "generate must be given the question, chunks and history: the prompt differs from prompt.Build(question, chunks, history)");
-  ctx.Assert(result.answer == w.faithful && result.sources == std::vector<std::string>{"pay-0", "pay-1"} && !result.escalated && result.model == "large", "a passing answer comes back as generated with its cited ids as Sources (pay-0, pay-1), not escalated, model large; got %s", showOutcome(result));
+  ctx.Assert(result.answer == w.faithful && result.sources == std::vector<std::string>{"pay-0", "pay-1"} && !result.escalated && result.model == "large", "a passing answer comes back as generated with its cited ids as Sources (pay-0, pay-1), not escalated, model large; got %s", hShowOutcome(result));
   ctx.Equal(result.tokens, static_cast<int>(model::fields(w.faithful).size()), "Tokens must be the count generate reported");
   ctx.GRPC.Stop(config::kJudge);
-  result = outcome(ctx);
-  ctx.Assert(result.escalated && result.answer == config::kHandoffText && result.sources.empty(), "with the judge down an unjudged answer must not reach the Dasher: expected the handoff, got %s", showOutcome(result));
-  ctx.Assert(generations(ctx).size() == 5, "the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw %d", generations(ctx).size() - 3);
+  result = hOutcome(ctx);
+  ctx.Assert(result.escalated && result.answer == config::kHandoffText && result.sources.empty(), "with the judge down an unjudged answer must not reach the Dasher: expected the handoff, got %s", hShowOutcome(result));
+  ctx.Assert(hGenerations(ctx).size() == 5, "the judge down still earns one more generation before the handoff: expected 2 Generate calls, saw %d", hGenerations(ctx).size() - 3);
 }
 `,
   },

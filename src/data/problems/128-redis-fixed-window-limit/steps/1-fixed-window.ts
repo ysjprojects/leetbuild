@@ -654,38 +654,38 @@ import (
 )
 
 const (
-	fwLimit  = 100
-	fwWindow = 60
+	kHFwLimit  = 100
+	kHFwWindow = 60
 )
 
-var fwBg = context.Background()
+var hFwBg = context.Background()
 
 // fwAlign parks the clock one second into a window so a check's hundred calls never straddle a boundary; it returns the window number.
-func fwAlign(ctx *harness.Ctx) int64 {
+func hFwAlign(ctx *harness.Ctx) int64 {
 	nowS := float64(ctx.Clock.Now()) / 1000
-	ctx.Clock.Advance(fwWindow - math.Mod(nowS, fwWindow) + 1)
-	return ctx.Clock.Now() / 1000 / fwWindow
+	ctx.Clock.Advance(kHFwWindow - math.Mod(nowS, kHFwWindow) + 1)
+	return ctx.Clock.Now() / 1000 / kHFwWindow
 }
 
-func fwKey(client string, window int64) string { return fmt.Sprintf("rl:%s:%d", client, window) }
+func hFwKey(client string, window int64) string { return fmt.Sprintf("rl:%s:%d", client, window) }
 
-func fwAllow(ctx *harness.Ctx, client string) (bool, int) {
-	allowed, retry, err := allow(fwBg, client)
+func hFwAllow(ctx *harness.Ctx, client string) (bool, int) {
+	allowed, retry, err := allow(hFwBg, client)
 	ctx.NoError(err, "allow(%q) returned an error", client)
 	return allowed, retry
 }
 
 // fwFill makes fwLimit calls, every one of which must be allowed.
-func fwFill(ctx *harness.Ctx, client string) {
-	for i := range fwLimit {
-		allowed, retry := fwAllow(ctx, client)
-		ctx.Assert(allowed, "call %d of %d for %q in a fresh window must be allowed, it was denied (retryAfterS %d)", i+1, fwLimit, client, retry)
+func hFwFill(ctx *harness.Ctx, client string) {
+	for i := range kHFwLimit {
+		allowed, retry := hFwAllow(ctx, client)
+		ctx.Assert(allowed, "call %d of %d for %q in a fresh window must be allowed, it was denied (retryAfterS %d)", i+1, kHFwLimit, client, retry)
 		ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0; call %d for %q", i+1, client)
 	}
 }
 
 // fwHeld is the key's value, or nil when it does not exist.
-func fwHeld(ctx *harness.Ctx, k string) any {
+func hFwHeld(ctx *harness.Ctx, k string) any {
 	if v, ok := ctx.Redis.Get(k); ok {
 		return v
 	}
@@ -693,7 +693,7 @@ func fwHeld(ctx *harness.Ctx, k string) any {
 }
 
 // fwCount is the key's value as a number, and whether it is one.
-func fwCount(ctx *harness.Ctx, k string) (int64, bool) {
+func hFwCount(ctx *harness.Ctx, k string) (int64, bool) {
 	v, ok := ctx.Redis.Get(k)
 	if !ok {
 		return 0, false
@@ -702,7 +702,7 @@ func fwCount(ctx *harness.Ctx, k string) (int64, bool) {
 	return n, err == nil
 }
 
-func fwAbs(n int64) int64 {
+func hFwAbs(n int64) int64 {
 	if n < 0 {
 		return -n
 	}
@@ -710,102 +710,102 @@ func fwAbs(n int64) int64 {
 }
 
 func CheckLimit(ctx *harness.Ctx) {
-	window := fwAlign(ctx)
-	fwFill(ctx, "alice")
-	allowed, retry := fwAllow(ctx, "alice")
-	ctx.Equal(allowed, false, "call %d must be denied: the limit is %d per 60-second window", fwLimit+1, fwLimit)
+	window := hFwAlign(ctx)
+	hFwFill(ctx, "alice")
+	allowed, retry := hFwAllow(ctx, "alice")
+	ctx.Equal(allowed, false, "call %d must be denied: the limit is %d per 60-second window", kHFwLimit+1, kHFwLimit)
 	ctx.Assert(retry >= 1, "a denied call answers retryAfterS as an integer of at least 1, got %d", retry)
-	allowed, _ = fwAllow(ctx, "alice")
+	allowed, _ = hFwAllow(ctx, "alice")
 	ctx.Equal(allowed, false, "every call past the limit stays denied until the window ends")
-	count, ok := fwCount(ctx, fwKey("alice", window))
-	ctx.Assert(ok && count >= fwLimit, "the count must live in rl:alice:%d; it holds %s", window, harness.Show(fwHeld(ctx, fwKey("alice", window))))
+	count, ok := hFwCount(ctx, hFwKey("alice", window))
+	ctx.Assert(ok && count >= kHFwLimit, "the count must live in rl:alice:%d; it holds %s", window, harness.Show(hFwHeld(ctx, hFwKey("alice", window))))
 }
 
 func CheckRetryAfter(ctx *harness.Ctx) {
-	window := fwAlign(ctx)
-	k := fwKey("bob", window)
-	fwFill(ctx, "bob")
-	allowed, retry := fwAllow(ctx, "bob")
+	window := hFwAlign(ctx)
+	k := hFwKey("bob", window)
+	hFwFill(ctx, "bob")
+	allowed, retry := hFwAllow(ctx, "bob")
 	ttl := ctx.Redis.TTL(k)
-	ctx.Equal(allowed, false, "call %d must be denied", fwLimit+1)
-	ctx.Assert(fwAbs(int64(retry)-ttl) <= 1, "retryAfterS must be the key's TTL (%d s left on %s), it was %d", ttl, k, retry)
+	ctx.Equal(allowed, false, "call %d must be denied", kHFwLimit+1)
+	ctx.Assert(hFwAbs(int64(retry)-ttl) <= 1, "retryAfterS must be the key's TTL (%d s left on %s), it was %d", ttl, k, retry)
 	ctx.Clock.Advance(17)
-	allowed, retry = fwAllow(ctx, "bob")
+	allowed, retry = hFwAllow(ctx, "bob")
 	ttl = ctx.Redis.TTL(k)
 	ctx.Equal(allowed, false, "17 s into a full window the client is still denied")
-	ctx.Assert(fwAbs(int64(retry)-ttl) <= 1 && 41 <= retry && retry <= 44, "17 s later about 43 s are left; retryAfterS was %d (TTL %d)", retry, ttl)
-	ctx.Clock.Advance(fwWindow - 0.4 - math.Mod(float64(ctx.Clock.Now())/1000, fwWindow))
-	allowed, retry = fwAllow(ctx, "bob")
+	ctx.Assert(hFwAbs(int64(retry)-ttl) <= 1 && 41 <= retry && retry <= 44, "17 s later about 43 s are left; retryAfterS was %d (TTL %d)", retry, ttl)
+	ctx.Clock.Advance(kHFwWindow - 0.4 - math.Mod(float64(ctx.Clock.Now())/1000, kHFwWindow))
+	allowed, retry = hFwAllow(ctx, "bob")
 	ttl = ctx.Redis.TTL(k)
 	ctx.Equal(allowed, false, "400 ms before the window ends it is still full")
-	ctx.Assert(retry >= 1 && fwAbs(int64(retry)-ttl) <= 1, "in the window's last second retryAfterS is still the TTL (%d) and never 0 (a caller must not retry at once); got %d", ttl, retry)
+	ctx.Assert(retry >= 1 && hFwAbs(int64(retry)-ttl) <= 1, "in the window's last second retryAfterS is still the TTL (%d) and never 0 (a caller must not retry at once); got %d", ttl, retry)
 }
 
 func CheckWindowRolls(ctx *harness.Ctx) {
-	window := fwAlign(ctx)
-	fwFill(ctx, "carol")
-	allowed, _ := fwAllow(ctx, "carol")
-	ctx.Equal(allowed, false, "call %d must be denied", fwLimit+1)
-	ctx.Clock.Advance(fwWindow)
-	allowed, retry := fwAllow(ctx, "carol")
+	window := hFwAlign(ctx)
+	hFwFill(ctx, "carol")
+	allowed, _ := hFwAllow(ctx, "carol")
+	ctx.Equal(allowed, false, "call %d must be denied", kHFwLimit+1)
+	ctx.Clock.Advance(kHFwWindow)
+	allowed, retry := hFwAllow(ctx, "carol")
 	ctx.Equal(allowed, true, "60 s later a new window has started: carol's first call in it must be allowed")
 	ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0")
-	ctx.Equal(fwHeld(ctx, fwKey("carol", window+1)), "1", "the new window counts from 1 in its own key rl:carol:%d", window+1)
-	for i := range fwLimit - 1 {
-		allowed, _ = fwAllow(ctx, "carol")
-		ctx.Assert(allowed, "the new window admits a full %d again; call %d was denied", fwLimit, i+2)
+	ctx.Equal(hFwHeld(ctx, hFwKey("carol", window+1)), "1", "the new window counts from 1 in its own key rl:carol:%d", window+1)
+	for i := range kHFwLimit - 1 {
+		allowed, _ = hFwAllow(ctx, "carol")
+		ctx.Assert(allowed, "the new window admits a full %d again; call %d was denied", kHFwLimit, i+2)
 	}
-	allowed, _ = fwAllow(ctx, "carol")
-	ctx.Equal(allowed, false, "call %d of the new window is denied like the old one's", fwLimit+1)
+	allowed, _ = hFwAllow(ctx, "carol")
+	ctx.Equal(allowed, false, "call %d of the new window is denied like the old one's", kHFwLimit+1)
 }
 
 func CheckTtlSet(ctx *harness.Ctx) {
-	window := fwAlign(ctx)
-	k := fwKey("dan", window)
-	fwAllow(ctx, "dan")
-	ctx.Equal(fwHeld(ctx, k), "1", "after one call %s must hold 1", k)
+	window := hFwAlign(ctx)
+	k := hFwKey("dan", window)
+	hFwAllow(ctx, "dan")
+	ctx.Equal(hFwHeld(ctx, k), "1", "after one call %s must hold 1", k)
 	ttl := ctx.Redis.TTL(k)
 	ctx.Assert(ttl != -1, "%s has no TTL: a counter without an expiry never goes away, and the client it belongs to stays blocked forever once it fills", k)
-	ctx.Assert(0 < ttl && ttl <= fwWindow, "the first hit sets a TTL of %d s; %s has %d", fwWindow, k, ttl)
+	ctx.Assert(0 < ttl && ttl <= kHFwWindow, "the first hit sets a TTL of %d s; %s has %d", kHFwWindow, k, ttl)
 	ctx.Clock.Advance(30)
 	for range 10 {
-		fwAllow(ctx, "dan")
+		hFwAllow(ctx, "dan")
 	}
 	ttl = ctx.Redis.TTL(k)
-	ctx.Assert(0 < ttl && ttl <= fwWindow-30+1, "30 s and ten hits later about 30 s should be left on %s, not %d: only the hit that created the key sets the TTL, later hits must not re-arm it", k, ttl)
+	ctx.Assert(0 < ttl && ttl <= kHFwWindow-30+1, "30 s and ten hits later about 30 s should be left on %s, not %d: only the hit that created the key sets the TTL, later hits must not re-arm it", k, ttl)
 }
 
 func CheckPerClient(ctx *harness.Ctx) {
-	window := fwAlign(ctx)
-	fwFill(ctx, "erin")
-	allowed, _ := fwAllow(ctx, "erin")
-	ctx.Equal(allowed, false, "call %d must be denied", fwLimit+1)
-	allowed, retry := fwAllow(ctx, "frank")
+	window := hFwAlign(ctx)
+	hFwFill(ctx, "erin")
+	allowed, _ := hFwAllow(ctx, "erin")
+	ctx.Equal(allowed, false, "call %d must be denied", kHFwLimit+1)
+	allowed, retry := hFwAllow(ctx, "frank")
 	ctx.Equal(allowed, true, "frank has made no requests; erin's full window must not block him")
 	ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0")
-	ctx.Equal(fwHeld(ctx, fwKey("frank", window)), "1", "frank's count lives in rl:frank:%d and starts at 1", window)
-	count, ok := fwCount(ctx, fwKey("erin", window))
-	ctx.Assert(ok && count >= fwLimit, "frank's call must not touch erin's counter")
-	allowed, _ = fwAllow(ctx, "erin")
+	ctx.Equal(hFwHeld(ctx, hFwKey("frank", window)), "1", "frank's count lives in rl:frank:%d and starts at 1", window)
+	count, ok := hFwCount(ctx, hFwKey("erin", window))
+	ctx.Assert(ok && count >= kHFwLimit, "frank's call must not touch erin's counter")
+	allowed, _ = hFwAllow(ctx, "erin")
 	ctx.Equal(allowed, false, "erin stays denied after frank's call")
 }
 
 func CheckAtomicIncr(ctx *harness.Ctx) {
-	window := fwAlign(ctx)
-	k := fwKey("gus", window)
+	window := hFwAlign(ctx)
+	k := hFwKey("gus", window)
 	probe := ctx.Redis.After(k, func() any { return ctx.Redis.Do("INCR", k) })
-	allowed, _ := fwAllow(ctx, "gus")
+	allowed, _ := hFwAllow(ctx, "gus")
 	ctx.Assert(probe.Fired, "allow(ctx, %q) never touched %s: the count must live in that key", "gus", k)
 	ctx.Equal(allowed, true, "the first call of a window is allowed even when another worker's request lands right behind it")
-	ctx.Equal(fwHeld(ctx, k), "2", "after allow(ctx, %q) plus one concurrent request from another worker %s must hold 2: a GET-then-SET overwrote the other worker's increment", "gus", k)
-	for i := range fwLimit - 2 {
-		allowed, _ = fwAllow(ctx, "gus")
+	ctx.Equal(hFwHeld(ctx, k), "2", "after allow(ctx, %q) plus one concurrent request from another worker %s must hold 2: a GET-then-SET overwrote the other worker's increment", "gus", k)
+	for i := range kHFwLimit - 2 {
+		allowed, _ = hFwAllow(ctx, "gus")
 		ctx.Assert(allowed, "call %d of the window (counting the other worker's) must be allowed", i+3)
 	}
-	allowed, _ = fwAllow(ctx, "gus")
-	ctx.Equal(allowed, false, "the other worker used one slot, so this is request %d of the window: it must be denied (a lost update would let it through)", fwLimit+1)
-	count, ok := fwCount(ctx, k)
-	ctx.Assert(ok && count >= fwLimit, "%s must have counted every request, it holds %s", k, harness.Show(fwHeld(ctx, k)))
+	allowed, _ = hFwAllow(ctx, "gus")
+	ctx.Equal(allowed, false, "the other worker used one slot, so this is request %d of the window: it must be denied (a lost update would let it through)", kHFwLimit+1)
+	count, ok := hFwCount(ctx, k)
+	ctx.Assert(ok && count >= kHFwLimit, "%s must have counted every request, it holds %s", k, harness.Show(hFwHeld(ctx, k)))
 }
 `,
     cpp: `// redis-fixed-window-limit/fixed-window checks: limit, retry-after, window-rolls, ttl-set, per-client, atomic-incr
@@ -820,19 +820,19 @@ func CheckAtomicIncr(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr int fwLimit = 100;
-constexpr long long fwWindow = 60;
+constexpr int kHFwLimit = 100;
+constexpr long long kHFwWindow = 60;
 
 // fwAlign parks the clock one second into a window so a check's hundred calls never straddle a boundary; it returns the window number.
-long long fwAlign(harness::Ctx& ctx) {
+long long hFwAlign(harness::Ctx& ctx) {
   const double nowS = static_cast<double>(ctx.Clock.Now()) / 1000;
-  ctx.Clock.Advance(fwWindow - std::fmod(nowS, static_cast<double>(fwWindow)) + 1);
-  return ctx.Clock.Now() / 1000 / fwWindow;
+  ctx.Clock.Advance(kHFwWindow - std::fmod(nowS, static_cast<double>(kHFwWindow)) + 1);
+  return ctx.Clock.Now() / 1000 / kHFwWindow;
 }
 
-std::string fwKey(const std::string& client, long long window) { return harness::Sprintf("rl:%s:%d", client, window); }
+std::string hFwKey(const std::string& client, long long window) { return harness::Sprintf("rl:%s:%d", client, window); }
 
-std::pair<bool, int> fwAllow(harness::Ctx& ctx, const std::string& client) {
+std::pair<bool, int> hFwAllow(harness::Ctx& ctx, const std::string& client) {
   try {
     return allow(client);
   } catch (const std::exception& e) {
@@ -842,19 +842,19 @@ std::pair<bool, int> fwAllow(harness::Ctx& ctx, const std::string& client) {
 }
 
 // fwFill makes fwLimit calls, every one of which must be allowed.
-void fwFill(harness::Ctx& ctx, const std::string& client) {
-  for (int i = 0; i < fwLimit; i++) {
-    const auto [allowed, retry] = fwAllow(ctx, client);
-    ctx.Assert(allowed, "call %d of %d for %q in a fresh window must be allowed, it was denied (retryAfterS %d)", i + 1, fwLimit, client, retry);
+void hFwFill(harness::Ctx& ctx, const std::string& client) {
+  for (int i = 0; i < kHFwLimit; i++) {
+    const auto [allowed, retry] = hFwAllow(ctx, client);
+    ctx.Assert(allowed, "call %d of %d for %q in a fresh window must be allowed, it was denied (retryAfterS %d)", i + 1, kHFwLimit, client, retry);
     ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0; call %d for %q", i + 1, client);
   }
 }
 
 // fwHeld is the key's value, or nil when it does not exist.
-std::optional<std::string> fwHeld(harness::Ctx& ctx, const std::string& k) { return ctx.Redis.Get(k); }
+std::optional<std::string> hFwHeld(harness::Ctx& ctx, const std::string& k) { return ctx.Redis.Get(k); }
 
 // fwCount is the key's value as a number, if it is one.
-std::optional<long long> fwCount(harness::Ctx& ctx, const std::string& k) {
+std::optional<long long> hFwCount(harness::Ctx& ctx, const std::string& k) {
   const auto v = ctx.Redis.Get(k);
   if (!v || v->empty()) return std::nullopt;
   char* end = nullptr;
@@ -866,106 +866,106 @@ std::optional<long long> fwCount(harness::Ctx& ctx, const std::string& k) {
 }  // namespace
 
 void CheckLimit(harness::Ctx& ctx) {
-  const long long window = fwAlign(ctx);
-  fwFill(ctx, "alice");
-  auto [allowed, retry] = fwAllow(ctx, "alice");
-  ctx.Equal(allowed, false, "call %d must be denied: the limit is %d per 60-second window", fwLimit + 1, fwLimit);
+  const long long window = hFwAlign(ctx);
+  hFwFill(ctx, "alice");
+  auto [allowed, retry] = hFwAllow(ctx, "alice");
+  ctx.Equal(allowed, false, "call %d must be denied: the limit is %d per 60-second window", kHFwLimit + 1, kHFwLimit);
   ctx.Assert(retry >= 1, "a denied call answers retryAfterS as an integer of at least 1, got %d", retry);
-  allowed = fwAllow(ctx, "alice").first;
+  allowed = hFwAllow(ctx, "alice").first;
   ctx.Equal(allowed, false, "every call past the limit stays denied until the window ends");
-  const auto count = fwCount(ctx, fwKey("alice", window));
-  ctx.Assert(count && *count >= fwLimit, "the count must live in rl:alice:%d; it holds %s", window, harness::ShowValue(fwHeld(ctx, fwKey("alice", window))));
+  const auto count = hFwCount(ctx, hFwKey("alice", window));
+  ctx.Assert(count && *count >= kHFwLimit, "the count must live in rl:alice:%d; it holds %s", window, harness::ShowValue(hFwHeld(ctx, hFwKey("alice", window))));
 }
 
 void CheckRetryAfter(harness::Ctx& ctx) {
-  const long long window = fwAlign(ctx);
-  const std::string k = fwKey("bob", window);
-  fwFill(ctx, "bob");
-  auto [allowed, retry] = fwAllow(ctx, "bob");
+  const long long window = hFwAlign(ctx);
+  const std::string k = hFwKey("bob", window);
+  hFwFill(ctx, "bob");
+  auto [allowed, retry] = hFwAllow(ctx, "bob");
   long long ttl = ctx.Redis.TTL(k);
-  ctx.Equal(allowed, false, "call %d must be denied", fwLimit + 1);
+  ctx.Equal(allowed, false, "call %d must be denied", kHFwLimit + 1);
   ctx.Assert(std::llabs(retry - ttl) <= 1, "retryAfterS must be the key's TTL (%d s left on %s), it was %d", ttl, k, retry);
   ctx.Clock.Advance(17);
-  std::tie(allowed, retry) = fwAllow(ctx, "bob");
+  std::tie(allowed, retry) = hFwAllow(ctx, "bob");
   ttl = ctx.Redis.TTL(k);
   ctx.Equal(allowed, false, "17 s into a full window the client is still denied");
   ctx.Assert(std::llabs(retry - ttl) <= 1 && 41 <= retry && retry <= 44, "17 s later about 43 s are left; retryAfterS was %d (TTL %d)", retry, ttl);
-  ctx.Clock.Advance(fwWindow - 0.4 - std::fmod(static_cast<double>(ctx.Clock.Now()) / 1000, static_cast<double>(fwWindow)));
-  std::tie(allowed, retry) = fwAllow(ctx, "bob");
+  ctx.Clock.Advance(kHFwWindow - 0.4 - std::fmod(static_cast<double>(ctx.Clock.Now()) / 1000, static_cast<double>(kHFwWindow)));
+  std::tie(allowed, retry) = hFwAllow(ctx, "bob");
   ttl = ctx.Redis.TTL(k);
   ctx.Equal(allowed, false, "400 ms before the window ends it is still full");
   ctx.Assert(retry >= 1 && std::llabs(retry - ttl) <= 1, "in the window's last second retryAfterS is still the TTL (%d) and never 0 (a caller must not retry at once); got %d", ttl, retry);
 }
 
 void CheckWindowRolls(harness::Ctx& ctx) {
-  const long long window = fwAlign(ctx);
-  fwFill(ctx, "carol");
-  bool allowed = fwAllow(ctx, "carol").first;
-  ctx.Equal(allowed, false, "call %d must be denied", fwLimit + 1);
-  ctx.Clock.Advance(fwWindow);
+  const long long window = hFwAlign(ctx);
+  hFwFill(ctx, "carol");
+  bool allowed = hFwAllow(ctx, "carol").first;
+  ctx.Equal(allowed, false, "call %d must be denied", kHFwLimit + 1);
+  ctx.Clock.Advance(kHFwWindow);
   int retry = 0;
-  std::tie(allowed, retry) = fwAllow(ctx, "carol");
+  std::tie(allowed, retry) = hFwAllow(ctx, "carol");
   ctx.Equal(allowed, true, "60 s later a new window has started: carol's first call in it must be allowed");
   ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0");
-  ctx.Equal(fwHeld(ctx, fwKey("carol", window + 1)), "1", "the new window counts from 1 in its own key rl:carol:%d", window + 1);
-  for (int i = 0; i < fwLimit - 1; i++) {
-    allowed = fwAllow(ctx, "carol").first;
-    ctx.Assert(allowed, "the new window admits a full %d again; call %d was denied", fwLimit, i + 2);
+  ctx.Equal(hFwHeld(ctx, hFwKey("carol", window + 1)), "1", "the new window counts from 1 in its own key rl:carol:%d", window + 1);
+  for (int i = 0; i < kHFwLimit - 1; i++) {
+    allowed = hFwAllow(ctx, "carol").first;
+    ctx.Assert(allowed, "the new window admits a full %d again; call %d was denied", kHFwLimit, i + 2);
   }
-  allowed = fwAllow(ctx, "carol").first;
-  ctx.Equal(allowed, false, "call %d of the new window is denied like the old one's", fwLimit + 1);
+  allowed = hFwAllow(ctx, "carol").first;
+  ctx.Equal(allowed, false, "call %d of the new window is denied like the old one's", kHFwLimit + 1);
 }
 
 void CheckTtlSet(harness::Ctx& ctx) {
-  const long long window = fwAlign(ctx);
-  const std::string k = fwKey("dan", window);
-  fwAllow(ctx, "dan");
-  ctx.Equal(fwHeld(ctx, k), "1", "after one call %s must hold 1", k);
+  const long long window = hFwAlign(ctx);
+  const std::string k = hFwKey("dan", window);
+  hFwAllow(ctx, "dan");
+  ctx.Equal(hFwHeld(ctx, k), "1", "after one call %s must hold 1", k);
   long long ttl = ctx.Redis.TTL(k);
   ctx.Assert(ttl != -1, "%s has no TTL: a counter without an expiry never goes away, and the client it belongs to stays blocked forever once it fills", k);
-  ctx.Assert(0 < ttl && ttl <= fwWindow, "the first hit sets a TTL of %d s; %s has %d", fwWindow, k, ttl);
+  ctx.Assert(0 < ttl && ttl <= kHFwWindow, "the first hit sets a TTL of %d s; %s has %d", kHFwWindow, k, ttl);
   ctx.Clock.Advance(30);
-  for (int i = 0; i < 10; i++) fwAllow(ctx, "dan");
+  for (int i = 0; i < 10; i++) hFwAllow(ctx, "dan");
   ttl = ctx.Redis.TTL(k);
-  ctx.Assert(0 < ttl && ttl <= fwWindow - 30 + 1, "30 s and ten hits later about 30 s should be left on %s, not %d: only the hit that created the key sets the TTL, later hits must not re-arm it", k, ttl);
+  ctx.Assert(0 < ttl && ttl <= kHFwWindow - 30 + 1, "30 s and ten hits later about 30 s should be left on %s, not %d: only the hit that created the key sets the TTL, later hits must not re-arm it", k, ttl);
 }
 
 void CheckPerClient(harness::Ctx& ctx) {
-  const long long window = fwAlign(ctx);
-  fwFill(ctx, "erin");
-  bool allowed = fwAllow(ctx, "erin").first;
-  ctx.Equal(allowed, false, "call %d must be denied", fwLimit + 1);
+  const long long window = hFwAlign(ctx);
+  hFwFill(ctx, "erin");
+  bool allowed = hFwAllow(ctx, "erin").first;
+  ctx.Equal(allowed, false, "call %d must be denied", kHFwLimit + 1);
   int retry = 0;
-  std::tie(allowed, retry) = fwAllow(ctx, "frank");
+  std::tie(allowed, retry) = hFwAllow(ctx, "frank");
   ctx.Equal(allowed, true, "frank has made no requests; erin's full window must not block him");
   ctx.Equal(retry, 0, "an allowed call answers retryAfterS 0");
-  ctx.Equal(fwHeld(ctx, fwKey("frank", window)), "1", "frank's count lives in rl:frank:%d and starts at 1", window);
-  const auto count = fwCount(ctx, fwKey("erin", window));
-  ctx.Assert(count && *count >= fwLimit, "frank's call must not touch erin's counter");
-  allowed = fwAllow(ctx, "erin").first;
+  ctx.Equal(hFwHeld(ctx, hFwKey("frank", window)), "1", "frank's count lives in rl:frank:%d and starts at 1", window);
+  const auto count = hFwCount(ctx, hFwKey("erin", window));
+  ctx.Assert(count && *count >= kHFwLimit, "frank's call must not touch erin's counter");
+  allowed = hFwAllow(ctx, "erin").first;
   ctx.Equal(allowed, false, "erin stays denied after frank's call");
 }
 
 void CheckAtomicIncr(harness::Ctx& ctx) {
-  const long long window = fwAlign(ctx);
-  const std::string k = fwKey("gus", window);
+  const long long window = hFwAlign(ctx);
+  const std::string k = hFwKey("gus", window);
   bool fired = false;
   ctx.Redis.After(k, [&ctx, &fired, k] {
     fired = true;
     ctx.Redis.Do("INCR", k);
   });
-  bool allowed = fwAllow(ctx, "gus").first;
+  bool allowed = hFwAllow(ctx, "gus").first;
   ctx.Assert(fired, "allow(ctx, %q) never touched %s: the count must live in that key", "gus", k);
   ctx.Equal(allowed, true, "the first call of a window is allowed even when another worker's request lands right behind it");
-  ctx.Equal(fwHeld(ctx, k), "2", "after allow(ctx, %q) plus one concurrent request from another worker %s must hold 2: a GET-then-SET overwrote the other worker's increment", "gus", k);
-  for (int i = 0; i < fwLimit - 2; i++) {
-    allowed = fwAllow(ctx, "gus").first;
+  ctx.Equal(hFwHeld(ctx, k), "2", "after allow(ctx, %q) plus one concurrent request from another worker %s must hold 2: a GET-then-SET overwrote the other worker's increment", "gus", k);
+  for (int i = 0; i < kHFwLimit - 2; i++) {
+    allowed = hFwAllow(ctx, "gus").first;
     ctx.Assert(allowed, "call %d of the window (counting the other worker's) must be allowed", i + 3);
   }
-  allowed = fwAllow(ctx, "gus").first;
-  ctx.Equal(allowed, false, "the other worker used one slot, so this is request %d of the window: it must be denied (a lost update would let it through)", fwLimit + 1);
-  const auto count = fwCount(ctx, k);
-  ctx.Assert(count && *count >= fwLimit, "%s must have counted every request, it holds %s", k, harness::ShowValue(fwHeld(ctx, k)));
+  allowed = hFwAllow(ctx, "gus").first;
+  ctx.Equal(allowed, false, "the other worker used one slot, so this is request %d of the window: it must be denied (a lost update would let it through)", kHFwLimit + 1);
+  const auto count = hFwCount(ctx, k);
+  ctx.Assert(count && *count >= kHFwLimit, "%s must have counted every request, it holds %s", k, harness::ShowValue(hFwHeld(ctx, k)));
 }
 `,
   },

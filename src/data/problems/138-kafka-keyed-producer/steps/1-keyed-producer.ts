@@ -784,11 +784,11 @@ import (
 	"leetbuild/harness"
 )
 
-const keyedTopic = "order-events"
+const kHKeyedTopic = "order-events"
 
 // keyedStats is stats() as the TypeScript harness compares it, once the delivery-report goroutine
 // has counted what was reported.
-func keyedStats(ctx *harness.Ctx) map[string]int64 {
+func hKeyedStats(ctx *harness.Ctx) map[string]int64 {
 	ctx.Settle()
 	d, f := stats()
 	return map[string]int64{"delivered": d, "failed": f}
@@ -800,9 +800,9 @@ func CheckKeyed(ctx *harness.Ctx) {
 	}
 	emit("o-2", "placed")
 	shutdown()
-	produced := ctx.Kafka.Records(keyedTopic)
-	ctx.Equal(ctx.Kafka.Keys(keyedTopic), []string{"o-1", "o-1", "o-1", "o-2"}, "records must be keyed by the order id")
-	expected := ctx.Kafka.PartitionFor(keyedTopic, []byte("o-1"))
+	produced := ctx.Kafka.Records(kHKeyedTopic)
+	ctx.Equal(ctx.Kafka.Keys(kHKeyedTopic), []string{"o-1", "o-1", "o-1", "o-2"}, "records must be keyed by the order id")
+	expected := ctx.Kafka.PartitionFor(kHKeyedTopic, []byte("o-1"))
 	var types []string
 	for _, r := range produced[:3] {
 		ctx.Assert(r.Partition == expected, "every event of order o-1 must land on the partition its key hashes to")
@@ -819,8 +819,8 @@ func CheckValue(ctx *harness.Ctx) {
 	before := float64(ctx.Clock.Now()) / 1000
 	emit("o-7", "paid")
 	shutdown()
-	produced := ctx.Kafka.Records(keyedTopic)
-	ctx.Equal(len(produced), 1, "expected one record on %s", keyedTopic)
+	produced := ctx.Kafka.Records(kHKeyedTopic)
+	ctx.Equal(len(produced), 1, "expected one record on %s", kHKeyedTopic)
 	var event map[string]any
 	if err := json.Unmarshal(produced[0].Value, &event); err != nil {
 		ctx.Fatalf("the value must be JSON: %s (%v)", produced[0].Value, err)
@@ -831,19 +831,19 @@ func CheckValue(ctx *harness.Ctx) {
 }
 
 func CheckDelivered(ctx *harness.Ctx) {
-	ctx.Kafka.StallFor(keyedTopic, 2) // the broker answers 2 s later
+	ctx.Kafka.StallFor(kHKeyedTopic, 2) // the broker answers 2 s later
 	for i := range 4 {
 		emit(fmt.Sprintf("o-%d", i), "placed")
 	}
 	pending := shutdown()
 	ctx.Equal(pending, 0, "shutdown() must return 0 once everything is delivered")
-	n := len(ctx.Kafka.Records(keyedTopic))
+	n := len(ctx.Kafka.Records(kHKeyedTopic))
 	ctx.Assert(n == 4, "shutdown() must flush: %d of 4 records reached the broker", n)
-	ctx.Equal(keyedStats(ctx), map[string]int64{"delivered": 4, "failed": 0}, "the delivery reports must count 4 delivered, 0 failed")
+	ctx.Equal(hKeyedStats(ctx), map[string]int64{"delivered": 4, "failed": 0}, "the delivery reports must count 4 delivered, 0 failed")
 }
 
 func CheckCallback(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(keyedTopic, 1)
+	ctx.Kafka.FailNext(kHKeyedTopic, 1)
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -855,12 +855,12 @@ func CheckCallback(ctx *harness.Ctx) {
 	emit("o-1", "paid")
 	pending := shutdown()
 	ctx.Equal(pending, 0, "a failed record is not pending: shutdown()")
-	ctx.Equal(keyedStats(ctx), map[string]int64{"delivered": 1, "failed": 1}, "expected 1 delivered and 1 failed")
-	ctx.Equal(len(ctx.Kafka.Records(keyedTopic)), 1, "the second event must still be delivered after the first failed")
+	ctx.Equal(hKeyedStats(ctx), map[string]int64{"delivered": 1, "failed": 1}, "expected 1 delivered and 1 failed")
+	ctx.Equal(len(ctx.Kafka.Records(kHKeyedTopic)), 1, "the second event must still be delivered after the first failed")
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	ctx.Kafka.Stall(keyedTopic) // dead until resumed
+	ctx.Kafka.Stall(kHKeyedTopic) // dead until resumed
 	for i := range 3 {
 		emit("o-9", fmt.Sprintf("event-%d", i))
 	}
@@ -874,15 +874,15 @@ func CheckBounded(ctx *harness.Ctx) {
 }
 
 func CheckNonBlocking(ctx *harness.Ctx) {
-	ctx.Kafka.StallFor(keyedTopic, 2) // the broker answers 2 s later
+	ctx.Kafka.StallFor(kHKeyedTopic, 2) // the broker answers 2 s later
 	started := ctx.Clock.Now()
 	emit("o-3", "placed")
 	waited := ctx.Clock.Now() - started
 	ctx.Assert(waited < 1000, "emit() took %d ms with the broker stalled: hand the record to the producer and return", waited)
-	ctx.Equal(len(ctx.Kafka.Records(keyedTopic)), 0, "the record is in flight until the broker answers")
+	ctx.Equal(len(ctx.Kafka.Records(kHKeyedTopic)), 0, "the record is in flight until the broker answers")
 	ctx.Equal(shutdown(), 0, "shutdown()")
-	ctx.Equal(len(ctx.Kafka.Records(keyedTopic)), 1, "the in-flight record must reach the broker once it answers")
-	ctx.Equal(keyedStats(ctx), map[string]int64{"delivered": 1, "failed": 0}, "the delivery reports must count it")
+	ctx.Equal(len(ctx.Kafka.Records(kHKeyedTopic)), 1, "the in-flight record must reach the broker once it answers")
+	ctx.Equal(hKeyedStats(ctx), map[string]int64{"delivered": 1, "failed": 0}, "the delivery reports must count it")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -896,10 +896,10 @@ func CheckNonBlocking(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string keyedTopic = "order-events";
+const std::string kHKeyedTopic = "order-events";
 
 // keyedStats is stats() as the TypeScript harness compares it, once the delivery reports served so far are counted.
-std::map<std::string, int64_t> keyedStats(harness::Ctx& ctx) {
+std::map<std::string, int64_t> hKeyedStats(harness::Ctx& ctx) {
   ctx.Settle();
   const Stats s = stats();
   return {{"delivered", s.delivered}, {"failed", s.failed}};
@@ -911,9 +911,9 @@ void CheckKeyed(harness::Ctx& ctx) {
   for (const std::string t : {"placed", "paid", "shipped"}) emit("o-1", t);
   emit("o-2", "placed");
   shutdown();
-  const auto produced = ctx.Kafka.Records(keyedTopic);
-  ctx.Equal(ctx.Kafka.Keys(keyedTopic), {"o-1", "o-1", "o-1", "o-2"}, "records must be keyed by the order id");
-  const int expected = ctx.Kafka.PartitionFor(keyedTopic, "o-1");
+  const auto produced = ctx.Kafka.Records(kHKeyedTopic);
+  ctx.Equal(ctx.Kafka.Keys(kHKeyedTopic), {"o-1", "o-1", "o-1", "o-2"}, "records must be keyed by the order id");
+  const int expected = ctx.Kafka.PartitionFor(kHKeyedTopic, "o-1");
   std::vector<std::string> types;
   for (size_t i = 0; i < produced.size() && i < 3; i++) {
     const auto& r = produced[i];
@@ -929,8 +929,8 @@ void CheckValue(harness::Ctx& ctx) {
   const double before = static_cast<double>(ctx.Clock.Now()) / 1000;
   emit("o-7", "paid");
   shutdown();
-  const auto produced = ctx.Kafka.Records(keyedTopic);
-  ctx.Equal(produced.size(), 1, "expected one record on %s", keyedTopic);
+  const auto produced = ctx.Kafka.Records(kHKeyedTopic);
+  ctx.Equal(produced.size(), 1, "expected one record on %s", kHKeyedTopic);
   const std::string value = produced[0].Value.value_or("");
   const auto event = nlohmann::json::parse(value, nullptr, false);
   if (!event.is_object()) ctx.Fatalf("the value must be JSON: %s (%v)", value, "not a JSON object");
@@ -944,18 +944,18 @@ void CheckValue(harness::Ctx& ctx) {
 }
 
 void CheckDelivered(harness::Ctx& ctx) {
-  ctx.Kafka.StallFor(keyedTopic, 2);  // the broker answers 2 s later
+  ctx.Kafka.StallFor(kHKeyedTopic, 2);  // the broker answers 2 s later
   for (int i = 0; i < 4; i++) emit("o-" + std::to_string(i), "placed");
   const int pending = shutdown();
   ctx.Equal(pending, 0, "shutdown() must return 0 once everything is delivered");
-  const size_t n = ctx.Kafka.Records(keyedTopic).size();
+  const size_t n = ctx.Kafka.Records(kHKeyedTopic).size();
   ctx.Assert(n == 4, "shutdown() must flush: %d of 4 records reached the broker", n);
-  ctx.Equal(keyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 4}, {"failed", 0}},
+  ctx.Equal(hKeyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 4}, {"failed", 0}},
             "the delivery reports must count 4 delivered, 0 failed");
 }
 
 void CheckCallback(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(keyedTopic, 1);
+  ctx.Kafka.FailNext(kHKeyedTopic, 1);
   try {
     emit("o-1", "placed");
   } catch (const std::exception& e) {
@@ -964,13 +964,13 @@ void CheckCallback(harness::Ctx& ctx) {
   emit("o-1", "paid");
   const int pending = shutdown();
   ctx.Equal(pending, 0, "a failed record is not pending: shutdown()");
-  ctx.Equal(keyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 1}, {"failed", 1}},
+  ctx.Equal(hKeyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 1}, {"failed", 1}},
             "expected 1 delivered and 1 failed");
-  ctx.Equal(ctx.Kafka.Records(keyedTopic).size(), 1, "the second event must still be delivered after the first failed");
+  ctx.Equal(ctx.Kafka.Records(kHKeyedTopic).size(), 1, "the second event must still be delivered after the first failed");
 }
 
 void CheckBounded(harness::Ctx& ctx) {
-  ctx.Kafka.Stall(keyedTopic);  // dead until resumed
+  ctx.Kafka.Stall(kHKeyedTopic);  // dead until resumed
   for (int i = 0; i < 3; i++) emit("o-9", "event-" + std::to_string(i));
   const int64_t started = ctx.Clock.Now();
   const int pending = shutdown();
@@ -984,15 +984,15 @@ void CheckBounded(harness::Ctx& ctx) {
 }
 
 void CheckNonBlocking(harness::Ctx& ctx) {
-  ctx.Kafka.StallFor(keyedTopic, 2);  // the broker answers 2 s later
+  ctx.Kafka.StallFor(kHKeyedTopic, 2);  // the broker answers 2 s later
   const int64_t started = ctx.Clock.Now();
   emit("o-3", "placed");
   const int64_t waited = ctx.Clock.Now() - started;
   ctx.Assert(waited < 1000, "emit() took %d ms with the broker stalled: hand the record to the producer and return", waited);
-  ctx.Equal(ctx.Kafka.Records(keyedTopic).size(), 0, "the record is in flight until the broker answers");
+  ctx.Equal(ctx.Kafka.Records(kHKeyedTopic).size(), 0, "the record is in flight until the broker answers");
   ctx.Equal(shutdown(), 0, "shutdown()");
-  ctx.Equal(ctx.Kafka.Records(keyedTopic).size(), 1, "the in-flight record must reach the broker once it answers");
-  ctx.Equal(keyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 1}, {"failed", 0}},
+  ctx.Equal(ctx.Kafka.Records(kHKeyedTopic).size(), 1, "the in-flight record must reach the broker once it answers");
+  ctx.Equal(hKeyedStats(ctx), std::map<std::string, int64_t>{{"delivered", 1}, {"failed", 0}},
             "the delivery reports must count it");
 }
 `,

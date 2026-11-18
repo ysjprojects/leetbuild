@@ -833,13 +833,13 @@ import (
 	"leetbuild/harness"
 )
 
-type seededOrder struct {
+type HSeededOrder struct {
 	orderID, symbol, side string
 	price                 float64
 	qty                   int
 }
 
-func seedOrders(ctx *harness.Ctx, orders ...seededOrder) {
+func hSeedOrders(ctx *harness.Ctx, orders ...HSeededOrder) {
 	for _, o := range orders {
 		value := fmt.Sprintf("{%q:%q,%q:%q,%q:%q,%q:%v,%q:%d,%q:%q}", "order_id", o.orderID, "symbol", o.symbol, "side", o.side, "price", o.price, "qty", o.qty, "client_order_id", "c-"+o.orderID)
 		ctx.Kafka.Seed("orders", o.symbol, value)
@@ -847,11 +847,11 @@ func seedOrders(ctx *harness.Ctx, orders ...seededOrder) {
 }
 
 // runEngine drains the orders topic through the learner's loop.
-func runEngine(ctx *harness.Ctx) {
+func hRunEngine(ctx *harness.Ctx) {
 	ctx.Drain(func() { _ = run(context.Background()) })
 }
 
-func tradesOnBroker(ctx *harness.Ctx) []map[string]any {
+func hTradesOnBroker(ctx *harness.Ctx) []map[string]any {
 	var out []map[string]any
 	for _, v := range ctx.Kafka.Values("trades") {
 		var t map[string]any
@@ -862,8 +862,8 @@ func tradesOnBroker(ctx *harness.Ctx) []map[string]any {
 }
 
 func CheckGroup(ctx *harness.Ctx) {
-	seedOrders(ctx, seededOrder{"o-1", "ACME", "BUY", 10.05, 100})
-	runEngine(ctx)
+	hSeedOrders(ctx, HSeededOrder{"o-1", "ACME", "BUY", 10.05, 100})
+	hRunEngine(ctx)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer never subscribed")
 	last := subscriptions[len(subscriptions)-1]
@@ -879,8 +879,8 @@ func CheckGroup(ctx *harness.Ctx) {
 }
 
 func CheckManualCommit(ctx *harness.Ctx) {
-	seedOrders(ctx, seededOrder{"o-1", "ACME", "BUY", 10.05, 100})
-	runEngine(ctx)
+	hSeedOrders(ctx, HSeededOrder{"o-1", "ACME", "BUY", 10.05, 100})
+	hRunEngine(ctx)
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "offsets were auto-committed: FetchMessage, not ReadMessage, and no CommitInterval; the offset moves only when the engine says so")
 	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "the engine never committed the offset explicitly")
 	lag := ctx.Kafka.Lag("engine", "orders")
@@ -888,13 +888,13 @@ func CheckManualCommit(ctx *harness.Ctx) {
 }
 
 func CheckMatch(ctx *harness.Ctx) {
-	seedOrders(ctx,
-		seededOrder{"o-1", "ACME", "BUY", 10.05, 100},
-		seededOrder{"o-2", "BETA", "SELL", 9.0, 100}, // another symbol: must not cross with ACME
-		seededOrder{"o-3", "ACME", "SELL", 10.0, 60}, // crosses o-1 at the resting price
+	hSeedOrders(ctx,
+		HSeededOrder{"o-1", "ACME", "BUY", 10.05, 100},
+		HSeededOrder{"o-2", "BETA", "SELL", 9.0, 100}, // another symbol: must not cross with ACME
+		HSeededOrder{"o-3", "ACME", "SELL", 10.0, 60}, // crosses o-1 at the resting price
 	)
-	runEngine(ctx)
-	fills := tradesOnBroker(ctx)
+	hRunEngine(ctx)
+	fills := hTradesOnBroker(ctx)
 	ctx.Equal(len(fills), 1, "expected exactly one fill (ACME 60 @ 10.05), trades %v; trades", fills)
 	fill := fills[0]
 	ctx.Assert(fill["symbol"] == "ACME" && fill["qty"] == 60.0 && fill["price"] == 10.05, "the fill must be 60 ACME at the resting price 10.05, got %v", fill)
@@ -902,12 +902,12 @@ func CheckMatch(ctx *harness.Ctx) {
 }
 
 func CheckTrades(ctx *harness.Ctx) {
-	seedOrders(ctx,
-		seededOrder{"o-1", "ACME", "SELL", 10.05, 50},
-		seededOrder{"o-2", "ACME", "SELL", 10.06, 50},
-		seededOrder{"o-3", "ACME", "BUY", 10.1, 80}, // fills 50 @ 10.05 then 30 @ 10.06
+	hSeedOrders(ctx,
+		HSeededOrder{"o-1", "ACME", "SELL", 10.05, 50},
+		HSeededOrder{"o-2", "ACME", "SELL", 10.06, 50},
+		HSeededOrder{"o-3", "ACME", "BUY", 10.1, 80}, // fills 50 @ 10.05 then 30 @ 10.06
 	)
-	runEngine(ctx)
+	hRunEngine(ctx)
 	records := ctx.Kafka.Records("trades")
 	ctx.Equal(len(records), 2, "two fills must become two trades records")
 	keys := ctx.Kafka.Keys("trades")
@@ -916,23 +916,23 @@ func CheckTrades(ctx *harness.Ctx) {
 	}
 	ctx.Equal(records[0].Partition, records[1].Partition, "one symbol's trades must stay on one partition")
 	var fills [][2]any
-	for _, t := range tradesOnBroker(ctx) {
+	for _, t := range hTradesOnBroker(ctx) {
 		fills = append(fills, [2]any{t["price"], t["qty"]})
 	}
 	ctx.Equal(fills, [][2]any{{10.05, 50.0}, {10.06, 30.0}}, "expected fills [[10.05, 50], [10.06, 30]] in price-time order")
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	seedOrders(ctx, seededOrder{"o-1", "ACME", "BUY", 10.05, 100}, seededOrder{"o-2", "ACME", "SELL", 10.0, 40})
+	hSeedOrders(ctx, HSeededOrder{"o-1", "ACME", "BUY", 10.05, 100}, HSeededOrder{"o-2", "ACME", "SELL", 10.0, 40})
 	ctx.Kafka.Seed("orders", "ACME", "this is not an order")
 	// The trades topic's leader is slow to acknowledge: a trade is on the broker only once the write returned.
 	ctx.Kafka.StallFor("trades", 0.2)
 	var seen []int // trades on the broker at the moment of each commit
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { seen = append(seen, len(ctx.Kafka.Records("trades"))) })
-	runEngine(ctx)
+	hRunEngine(ctx)
 	ctx.Equal(len(seen), 3, "expected one commit per record (two orders and one malformed)")
 	ctx.Equal(seen[1], 1, "the offset of the crossing order was committed while its trade was still waiting for the broker's acknowledgement: WriteMessages before committing; trades on the broker at that commit")
-	ctx.Equal(len(tradesOnBroker(ctx)), 1, "expected one fill")
+	ctx.Equal(len(hTradesOnBroker(ctx)), 1, "expected one fill")
 	ctx.Equal(ctx.Kafka.Lag("engine", "orders"), 0, "the malformed record must be skipped and committed so the partition does not stall; uncommitted orders")
 }
 `,
@@ -944,13 +944,13 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 
 namespace {
 
-struct seededOrder {
+struct HSeededOrder {
   std::string orderID, symbol, side;
   double price;
   int qty;
 };
 
-void seedOrders(harness::Ctx& ctx, const std::vector<seededOrder>& orders) {
+void hSeedOrders(harness::Ctx& ctx, const std::vector<HSeededOrder>& orders) {
   for (const auto& o : orders) {
     const std::string value = harness::Sprintf("{%q:%q,%q:%q,%q:%q,%q:%v,%q:%d,%q:%q}", "order_id", o.orderID, "symbol", o.symbol, "side",
                                                o.side, "price", o.price, "qty", o.qty, "client_order_id", "c-" + o.orderID);
@@ -959,9 +959,9 @@ void seedOrders(harness::Ctx& ctx, const std::vector<seededOrder>& orders) {
 }
 
 // runEngine drains the orders topic through the learner's loop.
-void runEngine(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+void hRunEngine(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
 
-std::vector<harness::Any> tradesOnBroker(harness::Ctx& ctx) {
+std::vector<harness::Any> hTradesOnBroker(harness::Ctx& ctx) {
   std::vector<harness::Any> out;
   for (const auto& v : ctx.Kafka.Values("trades")) {
     const auto t = harness::ParseJSON(v);
@@ -974,8 +974,8 @@ std::vector<harness::Any> tradesOnBroker(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckGroup(harness::Ctx& ctx) {
-  seedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}});
-  runEngine(ctx);
+  hSeedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}});
+  hRunEngine(ctx);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer never subscribed");
   const auto& last = subscriptions.back();
@@ -988,8 +988,8 @@ void CheckGroup(harness::Ctx& ctx) {
 }
 
 void CheckManualCommit(harness::Ctx& ctx) {
-  seedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}});
-  runEngine(ctx);
+  hSeedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}});
+  hRunEngine(ctx);
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "offsets were auto-committed: enable.auto.commit false; the offset moves only when the engine says so");
   ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "the engine never committed the offset explicitly");
   const int64_t lag = ctx.Kafka.Lag("engine", "orders");
@@ -997,13 +997,13 @@ void CheckManualCommit(harness::Ctx& ctx) {
 }
 
 void CheckMatch(harness::Ctx& ctx) {
-  seedOrders(ctx, {
+  hSeedOrders(ctx, {
                       {"o-1", "ACME", "BUY", 10.05, 100},
                       {"o-2", "BETA", "SELL", 9.0, 100},  // another symbol: must not cross with ACME
                       {"o-3", "ACME", "SELL", 10.0, 60},  // crosses o-1 at the resting price
                   });
-  runEngine(ctx);
-  const auto fills = tradesOnBroker(ctx);
+  hRunEngine(ctx);
+  const auto fills = hTradesOnBroker(ctx);
   ctx.Equal(fills.size(), 1, "expected exactly one fill (ACME 60 @ 10.05), trades %v; trades", fills);
   const auto& fill = fills[0];
   ctx.Assert(fill["symbol"] == "ACME" && fill["qty"] == 60.0 && fill["price"] == 10.05,
@@ -1012,33 +1012,33 @@ void CheckMatch(harness::Ctx& ctx) {
 }
 
 void CheckTrades(harness::Ctx& ctx) {
-  seedOrders(ctx, {
+  hSeedOrders(ctx, {
                       {"o-1", "ACME", "SELL", 10.05, 50},
                       {"o-2", "ACME", "SELL", 10.06, 50},
                       {"o-3", "ACME", "BUY", 10.1, 80},  // fills 50 @ 10.05 then 30 @ 10.06
                   });
-  runEngine(ctx);
+  hRunEngine(ctx);
   const auto records = ctx.Kafka.Records("trades");
   ctx.Equal(records.size(), 2, "two fills must become two trades records");
   const auto keys = ctx.Kafka.Keys("trades");
   for (const auto& k : keys) ctx.Assert(k == "ACME", "trades must be keyed by the symbol, got %q", keys);
   ctx.Equal(records[0].Partition, records[1].Partition, "one symbol's trades must stay on one partition");
   std::vector<std::vector<harness::Any>> fills;
-  for (const auto& t : tradesOnBroker(ctx)) fills.push_back({t["price"], t["qty"]});
+  for (const auto& t : hTradesOnBroker(ctx)) fills.push_back({t["price"], t["qty"]});
   ctx.Equal(fills, std::vector<std::vector<double>>{{10.05, 50.0}, {10.06, 30.0}}, "expected fills [[10.05, 50], [10.06, 30]] in price-time order");
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  seedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}, {"o-2", "ACME", "SELL", 10.0, 40}});
+  hSeedOrders(ctx, {{"o-1", "ACME", "BUY", 10.05, 100}, {"o-2", "ACME", "SELL", 10.0, 40}});
   ctx.Kafka.Seed("orders", "ACME", "this is not an order");
   // The trades topic's leader is slow to acknowledge: a trade is on the broker only once it was acknowledged.
   ctx.Kafka.StallFor("trades", 0.2);
   std::vector<size_t> seen;  // trades on the broker at the moment of each commit
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) { seen.push_back(ctx.Kafka.Records("trades").size()); });
-  runEngine(ctx);
+  hRunEngine(ctx);
   ctx.Equal(seen.size(), 3, "expected one commit per record (two orders and one malformed)");
   ctx.Equal(seen[1], 1, "the offset of the crossing order was committed while its trade was still waiting for the broker's acknowledgement: flush the producer before committing; trades on the broker at that commit");
-  ctx.Equal(tradesOnBroker(ctx).size(), 1, "expected one fill");
+  ctx.Equal(hTradesOnBroker(ctx).size(), 1, "expected one fill");
   ctx.Equal(ctx.Kafka.Lag("engine", "orders"), 0, "the malformed record must be skipped and committed so the partition does not stall; uncommitted orders");
 }
 `,

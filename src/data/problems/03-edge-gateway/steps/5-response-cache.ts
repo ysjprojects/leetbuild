@@ -741,13 +741,13 @@ import (
 )
 
 // respCache is getItem with the step-3 proxy stood in for: it counts every fetch and answers per item id.
-type respCache struct {
+type HRespCache struct {
 	calls []string
 	http  *harness.HTTP
 }
 
-func newRespCache(ctx *harness.Ctx) *respCache {
-	rc := &respCache{}
+func hNewRespCache(ctx *harness.Ctx) *HRespCache {
+	rc := &HRespCache{}
 	upstream = func(r *http.Request) upstreamResponse {
 		rc.calls = append(rc.calls, r.URL.RequestURI())
 		id := r.PathValue("id")
@@ -768,13 +768,13 @@ func newRespCache(ctx *harness.Ctx) *respCache {
 	return rc
 }
 
-func respKey(target string) string {
+func hRespKey(target string) string {
 	sum := sha256.Sum256([]byte(target))
 	return "resp:" + hex.EncodeToString(sum[:])
 }
 
 // respFetch is the fetch number a JSON item body carries.
-func respFetch(r *harness.Response) any {
+func hRespFetch(r *harness.Response) any {
 	var body struct {
 		Fetch any \`json:"fetch"\`
 	}
@@ -783,35 +783,35 @@ func respFetch(r *harness.Response) any {
 }
 
 func CheckKeyHash(ctx *harness.Ctx) {
-	rc := newRespCache(ctx)
+	rc := hNewRespCache(ctx)
 	r := rc.http.Get("/items/42?fields=name")
 	ctx.Equal(r.Status, 200, "GET /items/42?fields=name")
 	rc.http.Get("/items/42")
 	keys := ctx.Redis.Keys("*")
 	for _, target := range []string{"/items/42?fields=name", "/items/42"} {
-		ctx.Assert(ctx.Redis.Exists(respKey(target)) == 1, "no entry under resp:sha256(%q) = %q; Redis holds %q", target, respKey(target), keys)
+		ctx.Assert(ctx.Redis.Exists(hRespKey(target)) == 1, "no entry under resp:sha256(%q) = %q; Redis holds %q", target, hRespKey(target), keys)
 	}
 	ctx.Equal(len(keys), 2, "two distinct targets must make two distinct keys (Redis holds %q); the key count", keys)
 }
 
 func CheckBypass(ctx *harness.Ctx) {
-	rc := newRespCache(ctx)
+	rc := hNewRespCache(ctx)
 	rc.http.Get("/items/42")
 	second := rc.http.Get("/items/42")
 	ctx.Assert(second.Header.Get("X-Cache") == "HIT" && len(rc.calls) == 1, "a second request within the TTL must be served from the cache")
 	bypass := rc.http.Get("/items/42", "Cache-Control", "no-cache")
 	ctx.Equal(len(rc.calls), 2, "Cache-Control: no-cache must reach the upstream, not the cached entry; upstream calls")
 	ctx.Equal(bypass.Header.Get("X-Cache"), "MISS", "a bypassed request's X-Cache")
-	ctx.Equal(respFetch(bypass), 2, "the bypassed request must answer with the fresh upstream response; its fetch")
+	ctx.Equal(hRespFetch(bypass), 2, "the bypassed request must answer with the fresh upstream response; its fetch")
 	after := rc.http.Get("/items/42")
 	ctx.Assert(after.Header.Get("X-Cache") == "HIT" && len(rc.calls) == 2, "the bypassed request still refreshes the entry: the next plain request is a hit")
-	ctx.Equal(respFetch(after), 2, "the entry must be refreshed by the bypassed request; the fetch served")
+	ctx.Equal(hRespFetch(after), 2, "the entry must be refreshed by the bypassed request; the fetch served")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	rc := newRespCache(ctx)
+	rc := hNewRespCache(ctx)
 	rc.http.Get("/items/42")
-	ttl := ctx.Redis.TTL(respKey("/items/42"))
+	ttl := ctx.Redis.TTL(hRespKey("/items/42"))
 	ctx.Assert(1 <= ttl && ttl <= 10, "the entry's TTL is %d (-1 means no expiry), expected EX 10", ttl)
 	ctx.Clock.Advance(9.0)
 	warm := rc.http.Get("/items/42")
@@ -822,7 +822,7 @@ func CheckTtl(ctx *harness.Ctx) {
 }
 
 func CheckOnly200(ctx *harness.Ctx) {
-	rc := newRespCache(ctx)
+	rc := hNewRespCache(ctx)
 	ghost := rc.http.Get("/items/ghost")
 	ctx.Equal(ghost.Status, 404, "a 404 from the upstream")
 	ctx.Equal(len(ctx.Redis.Keys("*")), 0, "a 404 was stored (%q); the keys", ctx.Redis.Keys("*"))
@@ -832,11 +832,11 @@ func CheckOnly200(ctx *harness.Ctx) {
 	ctx.Equal(down.Status, 503, "a 503 from the upstream")
 	ctx.Equal(len(ctx.Redis.Keys("*")), 0, "a 503 was stored (%q); the keys", ctx.Redis.Keys("*"))
 	ok := rc.http.Get("/items/42")
-	ctx.Assert(ok.Status == 200 && ctx.Redis.Exists(respKey("/items/42")) == 1, "a 200 must still be stored")
+	ctx.Assert(ok.Status == 200 && ctx.Redis.Exists(hRespKey("/items/42")) == 1, "a 200 must still be stored")
 }
 
 func CheckXCache(ctx *harness.Ctx) {
-	rc := newRespCache(ctx)
+	rc := hNewRespCache(ctx)
 	miss := rc.http.Get("/items/42")
 	hit := rc.http.Get("/items/42")
 	plainMiss := rc.http.Get("/items/plain")
@@ -860,23 +860,23 @@ func CheckXCache(ctx *harness.Ctx) {
 
 namespace {
 
-std::function<Upstream(const httplib::Request&)> upstream_stand_in;
+std::function<Upstream(const httplib::Request&)> hUpstream_stand_in;
 
 }  // namespace
 
 // The gRPC proxy from step 3, stood in for by the check.
-Upstream upstream(const httplib::Request& req) { return upstream_stand_in(req); }
+Upstream upstream(const httplib::Request& req) { return hUpstream_stand_in(req); }
 
 namespace {
 
 // get_item with the step-3 proxy stood in for: it counts every fetch and answers per item id.
-struct RespCache {
+struct HRespCache {
   std::vector<std::string> calls;
   httplib::Server svr;
   harness::HTTP http;
 
-  explicit RespCache(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
-    upstream_stand_in = [this](const httplib::Request& req) -> Upstream {
+  explicit HRespCache(harness::Ctx& ctx) : http(ctx.HTTP(svr)) {
+    hUpstream_stand_in = [this](const httplib::Request& req) -> Upstream {
       calls.push_back(req.target);
       const std::string id = req.matches[1];
       if (id == "ghost") return {404, "application/json", R"({"error": "no such item"})"};
@@ -889,10 +889,10 @@ struct RespCache {
   }
 };
 
-std::string respKey(const std::string& target) { return "resp:" + sha256_hex(target); }
+std::string hRespKey(const std::string& target) { return "resp:" + sha256_hex(target); }
 
 // The fetch number a JSON item body carries (null when there is none).
-nlohmann::json respFetch(const harness::Response& r) {
+nlohmann::json hRespFetch(const harness::Response& r) {
   const auto body = nlohmann::json::parse(r.Text(), nullptr, false);
   return body.is_object() && body.contains("fetch") ? body["fetch"] : nlohmann::json();
 }
@@ -900,20 +900,20 @@ nlohmann::json respFetch(const harness::Response& r) {
 }  // namespace
 
 void CheckKeyHash(harness::Ctx& ctx) {
-  RespCache rc(ctx);
+  HRespCache rc(ctx);
   auto r = rc.http.Get("/items/42?fields=name");
   ctx.Equal(r.Status, 200, "GET /items/42?fields=name");
   rc.http.Get("/items/42");
   const auto keys = ctx.Redis.Keys("*");
   for (const std::string target : {"/items/42?fields=name", "/items/42"}) {
-    ctx.Assert(ctx.Redis.Exists(respKey(target)) == 1, "no entry under resp:sha256(%q) = %q; Redis holds %q", target,
-               respKey(target), keys);
+    ctx.Assert(ctx.Redis.Exists(hRespKey(target)) == 1, "no entry under resp:sha256(%q) = %q; Redis holds %q", target,
+               hRespKey(target), keys);
   }
   ctx.Equal(keys.size(), 2, "two distinct targets must make two distinct keys (Redis holds %q); the key count", keys);
 }
 
 void CheckBypass(harness::Ctx& ctx) {
-  RespCache rc(ctx);
+  HRespCache rc(ctx);
   rc.http.Get("/items/42");
   auto second = rc.http.Get("/items/42");
   ctx.Assert(second.HeaderValue("X-Cache") == "HIT" && rc.calls.size() == 1,
@@ -921,19 +921,19 @@ void CheckBypass(harness::Ctx& ctx) {
   auto bypass = rc.http.Get("/items/42", "Cache-Control", "no-cache");
   ctx.Equal(rc.calls.size(), 2, "Cache-Control: no-cache must reach the upstream, not the cached entry; upstream calls");
   ctx.Equal(bypass.HeaderValue("X-Cache"), "MISS", "a bypassed request's X-Cache");
-  ctx.Assert(respFetch(bypass) == 2, "the bypassed request must answer with the fresh upstream response; its fetch is %s, want 2",
-             respFetch(bypass).dump());
+  ctx.Assert(hRespFetch(bypass) == 2, "the bypassed request must answer with the fresh upstream response; its fetch is %s, want 2",
+             hRespFetch(bypass).dump());
   auto after = rc.http.Get("/items/42");
   ctx.Assert(after.HeaderValue("X-Cache") == "HIT" && rc.calls.size() == 2,
              "the bypassed request still refreshes the entry: the next plain request is a hit");
-  ctx.Assert(respFetch(after) == 2, "the entry must be refreshed by the bypassed request; the fetch served is %s, want 2",
-             respFetch(after).dump());
+  ctx.Assert(hRespFetch(after) == 2, "the entry must be refreshed by the bypassed request; the fetch served is %s, want 2",
+             hRespFetch(after).dump());
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  RespCache rc(ctx);
+  HRespCache rc(ctx);
   rc.http.Get("/items/42");
-  const auto ttl = ctx.Redis.TTL(respKey("/items/42"));
+  const auto ttl = ctx.Redis.TTL(hRespKey("/items/42"));
   ctx.Assert(1 <= ttl && ttl <= 10, "the entry's TTL is %d (-1 means no expiry), expected EX 10", ttl);
   ctx.Clock.Advance(9.0);
   auto warm = rc.http.Get("/items/42");
@@ -945,7 +945,7 @@ void CheckTtl(harness::Ctx& ctx) {
 }
 
 void CheckOnly200(harness::Ctx& ctx) {
-  RespCache rc(ctx);
+  HRespCache rc(ctx);
   auto ghost = rc.http.Get("/items/ghost");
   ctx.Equal(ghost.Status, 404, "a 404 from the upstream");
   ctx.Equal(ctx.Redis.Keys("*").size(), 0, "a 404 was stored (%q); the keys", ctx.Redis.Keys("*"));
@@ -955,11 +955,11 @@ void CheckOnly200(harness::Ctx& ctx) {
   ctx.Equal(down.Status, 503, "a 503 from the upstream");
   ctx.Equal(ctx.Redis.Keys("*").size(), 0, "a 503 was stored (%q); the keys", ctx.Redis.Keys("*"));
   auto ok = rc.http.Get("/items/42");
-  ctx.Assert(ok.Status == 200 && ctx.Redis.Exists(respKey("/items/42")) == 1, "a 200 must still be stored");
+  ctx.Assert(ok.Status == 200 && ctx.Redis.Exists(hRespKey("/items/42")) == 1, "a 200 must still be stored");
 }
 
 void CheckXCache(harness::Ctx& ctx) {
-  RespCache rc(ctx);
+  HRespCache rc(ctx);
   auto miss = rc.http.Get("/items/42");
   auto hit = rc.http.Get("/items/42");
   auto plainMiss = rc.http.Get("/items/plain");

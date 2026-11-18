@@ -1102,7 +1102,7 @@ import (
 	"leetbuild/harness"
 )
 
-const balSchema = \`
+const kHBalSchema = \`
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1120,33 +1120,33 @@ CREATE TABLE entries (
 \`
 
 const (
-	balT0  = 1700000000000
-	balKey = "bal:cash:acquirer:EUR"
+	kHBalT0  = 1700000000000
+	kHBalKey = "bal:cash:acquirer:EUR"
 )
 
-type balEntry struct {
+type HBalEntry struct {
 	account, currency string
 	amount            int64
 }
 
-func balPair(debit, credit, currency string, amount int64) []balEntry {
-	return []balEntry{{debit, currency, amount}, {credit, currency, -amount}}
+func hBalPair(debit, credit, currency string, amount int64) []HBalEntry {
+	return []HBalEntry{{debit, currency, amount}, {credit, currency, -amount}}
 }
 
 // balJournal: a capture, a partial refund a second later, a USD capture.
-var balJournal = []struct {
+var hBalJournal = []struct {
 	eventID  string
-	entries  []balEntry
+	entries  []HBalEntry
 	postedAt int64
 }{
-	{"evt-capture", balPair("cash:acquirer", "clearing:payments", "EUR", 4999), balT0},
-	{"evt-refund", balPair("clearing:payments", "cash:acquirer", "EUR", 1500), balT0 + 1000},
-	{"evt-usd", balPair("cash:acquirer", "clearing:payments", "USD", 700), balT0 + 2000},
+	{"evt-capture", hBalPair("cash:acquirer", "clearing:payments", "EUR", 4999), kHBalT0},
+	{"evt-refund", hBalPair("clearing:payments", "cash:acquirer", "EUR", 1500), kHBalT0 + 1000},
+	{"evt-usd", hBalPair("cash:acquirer", "clearing:payments", "USD", 700), kHBalT0 + 2000},
 }
 
 // balWrite is the real journal writer (step 4): one database transaction, insert-or-skip on the
 // event id, then the learner's invalidate for every entry.
-func balWrite(ctx *harness.Ctx, entries []balEntry, description, eventID string, postedAt int64) {
+func hBalWrite(ctx *harness.Ctx, entries []HBalEntry, description, eventID string, postedAt int64) {
 	bg := context.Background()
 	transactionID := uuid.NewString()
 	duplicate := false
@@ -1181,10 +1181,10 @@ func balWrite(ctx *harness.Ctx, entries []balEntry, description, eventID string,
 
 // balStart fills the journal through the real writer (step 4), starts the learner's server and
 // returns a client on it.
-func balStart(ctx *harness.Ctx) pb.LedgerServiceClient {
-	ctx.DB.Reset(balSchema)
-	for _, j := range balJournal {
-		balWrite(ctx, j.entries, "seed", j.eventID, j.postedAt)
+func hBalStart(ctx *harness.Ctx) pb.LedgerServiceClient {
+	ctx.DB.Reset(kHBalSchema)
+	for _, j := range hBalJournal {
+		hBalWrite(ctx, j.entries, "seed", j.eventID, j.postedAt)
 	}
 	ctx.Main(main)
 	return pb.NewLedgerServiceClient(ctx.GRPC.Dial("ledger:9100"))
@@ -1192,14 +1192,14 @@ func balStart(ctx *harness.Ctx) pb.LedgerServiceClient {
 
 // balCorrectInSQL is a correction applied straight in SQL by an operator, outside the writer:
 // nothing invalidates the cache.
-func balCorrectInSQL(ctx *harness.Ctx, name, account string, amount, postedAt int64) {
+func hBalCorrectInSQL(ctx *harness.Ctx, name, account string, amount, postedAt int64) {
 	ctx.DB.Exec("INSERT INTO transactions (id, description, posted_at) VALUES ($1, 'correction', $2)", name, postedAt)
 	ctx.DB.Exec("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, 'EUR', $3, $4)", name, account, amount, postedAt)
 	ctx.DB.Exec("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, 'revenue:adjustments', 'EUR', $2, $3)", name, -amount, postedAt)
 }
 
 // balReads counts the reads of the entries table in the database's query log.
-func balReads(ctx *harness.Ctx) int {
+func hBalReads(ctx *harness.Ctx) int {
 	n := 0
 	for _, q := range ctx.DB.Queries() {
 		text := strings.ToLower(strings.TrimSpace(q.SQL))
@@ -1210,14 +1210,14 @@ func balReads(ctx *harness.Ctx) int {
 	return n
 }
 
-func balCall(client pb.LedgerServiceClient, account, currency string, asOf int64) (*pb.Balance, error) {
+func hBalCall(client pb.LedgerServiceClient, account, currency string, asOf int64) (*pb.Balance, error) {
 	deadline, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return client.GetBalance(deadline, &pb.BalanceRequest{Account: account, Currency: currency, AsOf: asOf})
 }
 
-func balBalance(ctx *harness.Ctx, client pb.LedgerServiceClient, account, currency string, asOf int64) *pb.Balance {
-	reply, err := balCall(client, account, currency, asOf)
+func hBalBalance(ctx *harness.Ctx, client pb.LedgerServiceClient, account, currency string, asOf int64) *pb.Balance {
+	reply, err := hBalCall(client, account, currency, asOf)
 	if err != nil {
 		ctx.Fatalf("GetBalance(%s, %s, as_of=%d) failed with %v: %s", account, currency, asOf, status.Code(err), status.Convert(err).Message())
 	}
@@ -1225,91 +1225,91 @@ func balBalance(ctx *harness.Ctx, client pb.LedgerServiceClient, account, curren
 	return reply
 }
 
-func balCode(client pb.LedgerServiceClient, account, currency string, asOf int64) codes.Code {
-	_, err := balCall(client, account, currency, asOf)
+func hBalCode(client pb.LedgerServiceClient, account, currency string, asOf int64) codes.Code {
+	_, err := hBalCall(client, account, currency, asOf)
 	return status.Code(err)
 }
 
 func CheckServesBalance(ctx *harness.Ctx) {
-	client := balStart(ctx)
-	reply := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	client := hBalStart(ctx)
+	reply := hBalBalance(ctx, client, "cash:acquirer", "EUR", 0)
 	ctx.Equal(reply.GetAmount(), 3499, "cash:acquirer EUR is 4999 - 1500")
 	ctx.Equal([]string{reply.GetAccount(), reply.GetCurrency()}, []string{"cash:acquirer", "EUR"}, "the reply must echo account and currency")
 	now := time.Now().UnixMilli()
 	ctx.Assert(reply.GetAsOf()-now < 5000 && now-reply.GetAsOf() < 5000, "for AsOf 0 the reply's AsOf is now (%d), got %d", now, reply.GetAsOf())
-	usd := balBalance(ctx, client, "cash:acquirer", "USD", 0)
+	usd := hBalBalance(ctx, client, "cash:acquirer", "USD", 0)
 	ctx.Equal(usd.GetAmount(), 700, "cash:acquirer USD")
-	clearing := balBalance(ctx, client, "clearing:payments", "EUR", 0)
+	clearing := hBalBalance(ctx, client, "clearing:payments", "EUR", 0)
 	ctx.Equal(clearing.GetAmount(), -3499, "clearing:payments EUR is -4999 + 1500")
 }
 
 func CheckInvalidArgument(ctx *harness.Ctx) {
-	client := balStart(ctx)
-	before := balReads(ctx)
+	client := hBalStart(ctx)
+	before := hBalReads(ctx)
 	for _, c := range [][2]string{{"cash:acquirer", "eur"}, {"cash:acquirer", "EURO"}, {"cash:acquirer", ""}, {"", "EUR"}} {
-		ctx.Equal(balCode(client, c[0], c[1], 0), codes.InvalidArgument, "account %q currency %q", c[0], c[1])
+		ctx.Equal(hBalCode(client, c[0], c[1], 0), codes.InvalidArgument, "account %q currency %q", c[0], c[1])
 	}
-	ctx.Equal(balReads(ctx), before, "a request rejected as InvalidArgument must not query the database: reads of entries")
+	ctx.Equal(hBalReads(ctx), before, "a request rejected as InvalidArgument must not query the database: reads of entries")
 	keys := ctx.Redis.Keys("bal:*")
 	ctx.Assert(len(keys) == 0, "a request rejected as InvalidArgument must not touch the cache, found %q", keys)
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	client := balStart(ctx)
-	ctx.Equal(balCode(client, "cash:nowhere", "EUR", 0), codes.NotFound, "an account with no entries")
+	client := hBalStart(ctx)
+	ctx.Equal(hBalCode(client, "cash:nowhere", "EUR", 0), codes.NotFound, "an account with no entries")
 	_, cached := ctx.Redis.Get("bal:cash:nowhere:EUR")
 	ctx.Assert(!cached, "a NotFound must not be cached as a balance")
-	gbp := balBalance(ctx, client, "cash:acquirer", "GBP", 0)
+	gbp := hBalBalance(ctx, client, "cash:acquirer", "GBP", 0)
 	ctx.Equal(gbp.GetAmount(), 0, "a known account with no GBP entries has a GBP balance of 0 (not NotFound)")
-	ctx.Equal(balCode(client, "cash:nowhere", "EUR", balT0), codes.NotFound, "an unknown account is NotFound at any AsOf")
+	ctx.Equal(hBalCode(client, "cash:nowhere", "EUR", kHBalT0), codes.NotFound, "an unknown account is NotFound at any AsOf")
 }
 
 func CheckCache(ctx *harness.Ctx) {
-	client := balStart(ctx)
-	before := balReads(ctx)
-	first := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	client := hBalStart(ctx)
+	before := hBalReads(ctx)
+	first := hBalBalance(ctx, client, "cash:acquirer", "EUR", 0)
 	ctx.Equal(first.GetAmount(), 3499, "cash:acquirer EUR")
-	ctx.Equal(balReads(ctx)-before, 1, "the first current balance is a cache miss: queries")
-	cached, ok := ctx.Redis.Get(balKey)
-	ctx.Assert(ok, "after a miss the balance must be stored under %s", balKey)
-	ctx.Equal(cached, "3499", "%s holds", balKey)
-	ttl := ctx.Redis.TTL(balKey)
-	ctx.Assert(1 <= ttl && ttl <= 5, "%s has TTL %d, expected 5 s", balKey, ttl)
+	ctx.Equal(hBalReads(ctx)-before, 1, "the first current balance is a cache miss: queries")
+	cached, ok := ctx.Redis.Get(kHBalKey)
+	ctx.Assert(ok, "after a miss the balance must be stored under %s", kHBalKey)
+	ctx.Equal(cached, "3499", "%s holds", kHBalKey)
+	ttl := ctx.Redis.TTL(kHBalKey)
+	ctx.Assert(1 <= ttl && ttl <= 5, "%s has TTL %d, expected 5 s", kHBalKey, ttl)
 	// An operator books +100 straight in SQL: no invalidation, so for up to 5 s the cache still answers.
-	balCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, balT0+3000)
-	second := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	hBalCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, kHBalT0+3000)
+	second := hBalBalance(ctx, client, "cash:acquirer", "EUR", 0)
 	ctx.Equal(second.GetAmount(), 3499, "within 5 s the current balance must come from the cache (3499), not from the database")
-	ctx.Equal(balReads(ctx), before+1, "the second current balance within 5 s must come from Redis, but the database was queried: reads of entries")
+	ctx.Equal(hBalReads(ctx), before+1, "the second current balance within 5 s must come from Redis, but the database was queried: reads of entries")
 	ctx.Clock.Advance(6)
-	third := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	third := hBalBalance(ctx, client, "cash:acquirer", "EUR", 0)
 	ctx.Equal(third.GetAmount(), 3599, "after the 5 s TTL the cached balance must have expired and be recomputed")
 	// A write through the journal writer invalidates: the very next read sees it.
-	balWrite(ctx, balPair("cash:acquirer", "revenue:fees", "EUR", 1), "fee", "evt-fee", balT0+4000)
-	_, ok = ctx.Redis.Get(balKey)
-	ctx.Assert(!ok, "after a write to cash:acquirer EUR, invalidate(ctx, account, currency) must have deleted %s", balKey)
-	fourth := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	hBalWrite(ctx, hBalPair("cash:acquirer", "revenue:fees", "EUR", 1), "fee", "evt-fee", kHBalT0+4000)
+	_, ok = ctx.Redis.Get(kHBalKey)
+	ctx.Assert(!ok, "after a write to cash:acquirer EUR, invalidate(ctx, account, currency) must have deleted %s", kHBalKey)
+	fourth := hBalBalance(ctx, client, "cash:acquirer", "EUR", 0)
 	ctx.Equal(fourth.GetAmount(), 3600, "right after a write the next read must hit the database")
 }
 
 func CheckAsOf(ctx *harness.Ctx) {
-	client := balStart(ctx)
-	atT0 := balBalance(ctx, client, "cash:acquirer", "EUR", balT0)
+	client := hBalStart(ctx)
+	atT0 := hBalBalance(ctx, client, "cash:acquirer", "EUR", kHBalT0)
 	ctx.Equal(atT0.GetAmount(), 4999, "as of T0 only the capture is posted")
-	ctx.Equal(atT0.GetAsOf(), balT0, "the reply's AsOf must be the requested time")
-	earlier := balBalance(ctx, client, "cash:acquirer", "EUR", balT0-1)
+	ctx.Equal(atT0.GetAsOf(), kHBalT0, "the reply's AsOf must be the requested time")
+	earlier := hBalBalance(ctx, client, "cash:acquirer", "EUR", kHBalT0-1)
 	ctx.Equal(earlier.GetAmount(), 0, "as of T0 - 1 nothing is posted yet")
-	later := balBalance(ctx, client, "cash:acquirer", "EUR", balT0+1000)
+	later := hBalBalance(ctx, client, "cash:acquirer", "EUR", kHBalT0+1000)
 	ctx.Equal(later.GetAmount(), 3499, "as of T0 + 1 s the refund is posted too")
 	keys := ctx.Redis.Keys("bal:*")
 	ctx.Assert(len(keys) == 0, "a point-in-time balance must not be cached, found %q", keys)
-	current := balBalance(ctx, client, "cash:acquirer", "EUR", 0)
-	_, cached := ctx.Redis.Get(balKey)
+	current := hBalBalance(ctx, client, "cash:acquirer", "EUR", 0)
+	_, cached := ctx.Redis.Get(kHBalKey)
 	ctx.Assert(current.GetAmount() == 3499 && cached, "the current balance must be cached")
 	// A backdated correction straight in SQL: the history changes, the cached current balance does not know.
-	balCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, balT0-500)
-	historical := balBalance(ctx, client, "cash:acquirer", "EUR", balT0)
+	hBalCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, kHBalT0-500)
+	historical := hBalBalance(ctx, client, "cash:acquirer", "EUR", kHBalT0)
 	ctx.Equal(historical.GetAmount(), 5099, "a point-in-time balance must come from the database (5099 as of T0 after the correction)")
-	still, _ := ctx.Redis.Get(balKey)
+	still, _ := ctx.Redis.Get(kHBalKey)
 	ctx.Equal(still, "3499", "a point-in-time balance must not overwrite the cached current balance")
 }
 `,
@@ -1327,9 +1327,9 @@ func CheckAsOf(ctx *harness.Ctx) {
 
 namespace {
 
-using LedgerStub = ledger::LedgerService::Stub;
+using HLedgerStub = ledger::LedgerService::Stub;
 
-const std::string balSchema = R"(
+const std::string kHBalSchema = R"(
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1346,34 +1346,34 @@ CREATE TABLE entries (
 );
 )";
 
-constexpr int64_t balT0 = 1700000000000LL;
-const std::string balKey = "bal:cash:acquirer:EUR";
+constexpr int64_t kHBalT0 = 1700000000000LL;
+const std::string kHBalKey = "bal:cash:acquirer:EUR";
 
-struct BalEntry {
+struct HBalEntry {
   std::string account, currency;
   int64_t amount;
 };
 
-std::vector<BalEntry> balPair(const std::string& debit, const std::string& credit, const std::string& currency, int64_t amount) {
+std::vector<HBalEntry> hBalPair(const std::string& debit, const std::string& credit, const std::string& currency, int64_t amount) {
   return {{debit, currency, amount}, {credit, currency, -amount}};
 }
 
-struct BalJournalItem {
+struct HBalJournalItem {
   std::string eventID;
-  std::vector<BalEntry> entries;
+  std::vector<HBalEntry> entries;
   int64_t postedAt;
 };
 
 // balJournal: a capture, a partial refund a second later, a USD capture.
-const std::vector<BalJournalItem> balJournal = {
-    {"evt-capture", balPair("cash:acquirer", "clearing:payments", "EUR", 4999), balT0},
-    {"evt-refund", balPair("clearing:payments", "cash:acquirer", "EUR", 1500), balT0 + 1000},
-    {"evt-usd", balPair("cash:acquirer", "clearing:payments", "USD", 700), balT0 + 2000},
+const std::vector<HBalJournalItem> kHBalJournal = {
+    {"evt-capture", hBalPair("cash:acquirer", "clearing:payments", "EUR", 4999), kHBalT0},
+    {"evt-refund", hBalPair("clearing:payments", "cash:acquirer", "EUR", 1500), kHBalT0 + 1000},
+    {"evt-usd", hBalPair("cash:acquirer", "clearing:payments", "USD", 700), kHBalT0 + 2000},
 };
 
 // balWrite is the real journal writer (step 4): one database transaction, insert-or-skip on the
 // event id, then the learner's invalidate for every entry.
-void balWrite(harness::Ctx& ctx, const std::vector<BalEntry>& entries, const std::string& description, const std::string& eventID,
+void hBalWrite(harness::Ctx& ctx, const std::vector<HBalEntry>& entries, const std::string& description, const std::string& eventID,
               int64_t postedAt) {
   const std::string transactionID = new_uuid();
   bool duplicate = false;
@@ -1399,23 +1399,23 @@ void balWrite(harness::Ctx& ctx, const std::vector<BalEntry>& entries, const std
 
 // balStart fills the journal through the real writer (step 4), starts the learner's server and
 // returns a client on it.
-std::unique_ptr<LedgerStub> balStart(harness::Ctx& ctx) {
-  ctx.DB.Reset(balSchema);
-  for (const auto& j : balJournal) balWrite(ctx, j.entries, "seed", j.eventID, j.postedAt);
+std::unique_ptr<HLedgerStub> hBalStart(harness::Ctx& ctx) {
+  ctx.DB.Reset(kHBalSchema);
+  for (const auto& j : kHBalJournal) hBalWrite(ctx, j.entries, "seed", j.eventID, j.postedAt);
   ctx.Main();
   return ledger::LedgerService::NewStub(ctx.GRPC.Dial("ledger:9100"));
 }
 
 // balCorrectInSQL is a correction applied straight in SQL by an operator, outside the writer:
 // nothing invalidates the cache.
-void balCorrectInSQL(harness::Ctx& ctx, const std::string& name, const std::string& account, int64_t amount, int64_t postedAt) {
+void hBalCorrectInSQL(harness::Ctx& ctx, const std::string& name, const std::string& account, int64_t amount, int64_t postedAt) {
   ctx.DB.Exec("INSERT INTO transactions (id, description, posted_at) VALUES ($1, 'correction', $2)", name, postedAt);
   ctx.DB.Exec("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, $2, 'EUR', $3, $4)", name, account, amount, postedAt);
   ctx.DB.Exec("INSERT INTO entries (transaction_id, account, currency, amount, posted_at) VALUES ($1, 'revenue:adjustments', 'EUR', $2, $3)", name, -amount, postedAt);
 }
 
 // balReads counts the reads of the entries table in the database's query log.
-int balReads(harness::Ctx& ctx) {
+int hBalReads(harness::Ctx& ctx) {
   int n = 0;
   for (const auto& q : ctx.DB.Queries()) {
     std::string text = q.SQL;
@@ -1426,115 +1426,115 @@ int balReads(harness::Ctx& ctx) {
   return n;
 }
 
-struct BalResult {
+struct HBalResult {
   grpc::Status status;
   ledger::Balance reply;
 };
 
-BalResult balCall(LedgerStub& client, const std::string& account, const std::string& currency, int64_t asOf) {
+HBalResult hBalCall(HLedgerStub& client, const std::string& account, const std::string& currency, int64_t asOf) {
   grpc::ClientContext c;
   c.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
   ledger::BalanceRequest request;
   request.set_account(account);
   request.set_currency(currency);
   request.set_as_of(asOf);
-  BalResult r;
+  HBalResult r;
   r.status = client.GetBalance(&c, request, &r.reply);
   return r;
 }
 
-ledger::Balance balBalance(harness::Ctx& ctx, LedgerStub& client, const std::string& account, const std::string& currency, int64_t asOf) {
-  BalResult r = balCall(client, account, currency, asOf);
+ledger::Balance hBalBalance(harness::Ctx& ctx, HLedgerStub& client, const std::string& account, const std::string& currency, int64_t asOf) {
+  HBalResult r = hBalCall(client, account, currency, asOf);
   if (!r.status.ok()) {
     ctx.Fatalf("GetBalance(%s, %s, as_of=%d) failed with %v: %s", account, currency, asOf, r.status.error_code(), r.status.error_message());
   }
   return r.reply;
 }
 
-grpc::StatusCode balCode(LedgerStub& client, const std::string& account, const std::string& currency, int64_t asOf) {
-  return balCall(client, account, currency, asOf).status.error_code();
+grpc::StatusCode hBalCode(HLedgerStub& client, const std::string& account, const std::string& currency, int64_t asOf) {
+  return hBalCall(client, account, currency, asOf).status.error_code();
 }
 
 }  // namespace
 
 void CheckServesBalance(harness::Ctx& ctx) {
-  auto client = balStart(ctx);
-  const auto reply = balBalance(ctx, *client, "cash:acquirer", "EUR", 0);
+  auto client = hBalStart(ctx);
+  const auto reply = hBalBalance(ctx, *client, "cash:acquirer", "EUR", 0);
   ctx.Equal(reply.amount(), 3499, "cash:acquirer EUR is 4999 - 1500");
   ctx.Equal(std::vector<std::string>{reply.account(), reply.currency()}, {"cash:acquirer", "EUR"}, "the reply must echo account and currency");
   const int64_t now = ctx.Clock.Now();
   ctx.Assert(reply.as_of() - now < 5000 && now - reply.as_of() < 5000, "for as_of 0 the reply's as_of is now (%d), got %d", now, reply.as_of());
-  const auto usd = balBalance(ctx, *client, "cash:acquirer", "USD", 0);
+  const auto usd = hBalBalance(ctx, *client, "cash:acquirer", "USD", 0);
   ctx.Equal(usd.amount(), 700, "cash:acquirer USD");
-  const auto clearing = balBalance(ctx, *client, "clearing:payments", "EUR", 0);
+  const auto clearing = hBalBalance(ctx, *client, "clearing:payments", "EUR", 0);
   ctx.Equal(clearing.amount(), -3499, "clearing:payments EUR is -4999 + 1500");
 }
 
 void CheckInvalidArgument(harness::Ctx& ctx) {
-  auto client = balStart(ctx);
-  const int before = balReads(ctx);
+  auto client = hBalStart(ctx);
+  const int before = hBalReads(ctx);
   const std::vector<std::pair<std::string, std::string>> cases = {{"cash:acquirer", "eur"}, {"cash:acquirer", "EURO"}, {"cash:acquirer", ""}, {"", "EUR"}};
   for (const auto& [account, currency] : cases) {
-    ctx.Equal(balCode(*client, account, currency, 0), grpc::StatusCode::INVALID_ARGUMENT, "account %q currency %q", account, currency);
+    ctx.Equal(hBalCode(*client, account, currency, 0), grpc::StatusCode::INVALID_ARGUMENT, "account %q currency %q", account, currency);
   }
-  ctx.Equal(balReads(ctx), before, "a request rejected as INVALID_ARGUMENT must not query the database: reads of entries");
+  ctx.Equal(hBalReads(ctx), before, "a request rejected as INVALID_ARGUMENT must not query the database: reads of entries");
   const auto keys = ctx.Redis.Keys("bal:*");
   ctx.Assert(keys.empty(), "a request rejected as INVALID_ARGUMENT must not touch the cache, found %q", keys);
 }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  auto client = balStart(ctx);
-  ctx.Equal(balCode(*client, "cash:nowhere", "EUR", 0), grpc::StatusCode::NOT_FOUND, "an account with no entries");
+  auto client = hBalStart(ctx);
+  ctx.Equal(hBalCode(*client, "cash:nowhere", "EUR", 0), grpc::StatusCode::NOT_FOUND, "an account with no entries");
   ctx.Assert(!ctx.Redis.Get("bal:cash:nowhere:EUR").has_value(), "a NOT_FOUND must not be cached as a balance");
-  const auto gbp = balBalance(ctx, *client, "cash:acquirer", "GBP", 0);
+  const auto gbp = hBalBalance(ctx, *client, "cash:acquirer", "GBP", 0);
   ctx.Equal(gbp.amount(), 0, "a known account with no GBP entries has a GBP balance of 0 (not NOT_FOUND)");
-  ctx.Equal(balCode(*client, "cash:nowhere", "EUR", balT0), grpc::StatusCode::NOT_FOUND, "an unknown account is NOT_FOUND at any as_of");
+  ctx.Equal(hBalCode(*client, "cash:nowhere", "EUR", kHBalT0), grpc::StatusCode::NOT_FOUND, "an unknown account is NOT_FOUND at any as_of");
 }
 
 void CheckCache(harness::Ctx& ctx) {
-  auto client = balStart(ctx);
-  const int before = balReads(ctx);
-  const auto first = balBalance(ctx, *client, "cash:acquirer", "EUR", 0);
+  auto client = hBalStart(ctx);
+  const int before = hBalReads(ctx);
+  const auto first = hBalBalance(ctx, *client, "cash:acquirer", "EUR", 0);
   ctx.Equal(first.amount(), 3499, "cash:acquirer EUR");
-  ctx.Equal(balReads(ctx) - before, 1, "the first current balance is a cache miss: queries");
-  const auto cached = ctx.Redis.Get(balKey);
-  ctx.Assert(cached.has_value(), "after a miss the balance must be stored under %s", balKey);
-  ctx.Equal(*cached, "3499", "%s holds", balKey);
-  const long long ttl = ctx.Redis.TTL(balKey);
-  ctx.Assert(1 <= ttl && ttl <= 5, "%s has TTL %d, expected 5 s", balKey, ttl);
+  ctx.Equal(hBalReads(ctx) - before, 1, "the first current balance is a cache miss: queries");
+  const auto cached = ctx.Redis.Get(kHBalKey);
+  ctx.Assert(cached.has_value(), "after a miss the balance must be stored under %s", kHBalKey);
+  ctx.Equal(*cached, "3499", "%s holds", kHBalKey);
+  const long long ttl = ctx.Redis.TTL(kHBalKey);
+  ctx.Assert(1 <= ttl && ttl <= 5, "%s has TTL %d, expected 5 s", kHBalKey, ttl);
   // An operator books +100 straight in SQL: no invalidation, so for up to 5 s the cache still answers.
-  balCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, balT0 + 3000);
-  const auto second = balBalance(ctx, *client, "cash:acquirer", "EUR", 0);
+  hBalCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, kHBalT0 + 3000);
+  const auto second = hBalBalance(ctx, *client, "cash:acquirer", "EUR", 0);
   ctx.Equal(second.amount(), 3499, "within 5 s the current balance must come from the cache (3499), not from the database");
-  ctx.Equal(balReads(ctx), before + 1, "the second current balance within 5 s must come from Redis, but the database was queried: reads of entries");
+  ctx.Equal(hBalReads(ctx), before + 1, "the second current balance within 5 s must come from Redis, but the database was queried: reads of entries");
   ctx.Clock.Advance(6);
-  const auto third = balBalance(ctx, *client, "cash:acquirer", "EUR", 0);
+  const auto third = hBalBalance(ctx, *client, "cash:acquirer", "EUR", 0);
   ctx.Equal(third.amount(), 3599, "after the 5 s TTL the cached balance must have expired and be recomputed");
   // A write through the journal writer invalidates: the very next read sees it.
-  balWrite(ctx, balPair("cash:acquirer", "revenue:fees", "EUR", 1), "fee", "evt-fee", balT0 + 4000);
-  ctx.Assert(!ctx.Redis.Get(balKey).has_value(), "after a write to cash:acquirer EUR, invalidate(account, currency) must have deleted %s", balKey);
-  const auto fourth = balBalance(ctx, *client, "cash:acquirer", "EUR", 0);
+  hBalWrite(ctx, hBalPair("cash:acquirer", "revenue:fees", "EUR", 1), "fee", "evt-fee", kHBalT0 + 4000);
+  ctx.Assert(!ctx.Redis.Get(kHBalKey).has_value(), "after a write to cash:acquirer EUR, invalidate(account, currency) must have deleted %s", kHBalKey);
+  const auto fourth = hBalBalance(ctx, *client, "cash:acquirer", "EUR", 0);
   ctx.Equal(fourth.amount(), 3600, "right after a write the next read must hit the database");
 }
 
 void CheckAsOf(harness::Ctx& ctx) {
-  auto client = balStart(ctx);
-  const auto atT0 = balBalance(ctx, *client, "cash:acquirer", "EUR", balT0);
+  auto client = hBalStart(ctx);
+  const auto atT0 = hBalBalance(ctx, *client, "cash:acquirer", "EUR", kHBalT0);
   ctx.Equal(atT0.amount(), 4999, "as of T0 only the capture is posted");
-  ctx.Equal(atT0.as_of(), balT0, "the reply's as_of must be the requested time");
-  const auto earlier = balBalance(ctx, *client, "cash:acquirer", "EUR", balT0 - 1);
+  ctx.Equal(atT0.as_of(), kHBalT0, "the reply's as_of must be the requested time");
+  const auto earlier = hBalBalance(ctx, *client, "cash:acquirer", "EUR", kHBalT0 - 1);
   ctx.Equal(earlier.amount(), 0, "as of T0 - 1 nothing is posted yet");
-  const auto later = balBalance(ctx, *client, "cash:acquirer", "EUR", balT0 + 1000);
+  const auto later = hBalBalance(ctx, *client, "cash:acquirer", "EUR", kHBalT0 + 1000);
   ctx.Equal(later.amount(), 3499, "as of T0 + 1 s the refund is posted too");
   const auto keys = ctx.Redis.Keys("bal:*");
   ctx.Assert(keys.empty(), "a point-in-time balance must not be cached, found %q", keys);
-  const auto current = balBalance(ctx, *client, "cash:acquirer", "EUR", 0);
-  ctx.Assert(current.amount() == 3499 && ctx.Redis.Get(balKey).has_value(), "the current balance must be cached");
+  const auto current = hBalBalance(ctx, *client, "cash:acquirer", "EUR", 0);
+  ctx.Assert(current.amount() == 3499 && ctx.Redis.Get(kHBalKey).has_value(), "the current balance must be cached");
   // A backdated correction straight in SQL: the history changes, the cached current balance does not know.
-  balCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, balT0 - 500);
-  const auto historical = balBalance(ctx, *client, "cash:acquirer", "EUR", balT0);
+  hBalCorrectInSQL(ctx, "fix-1", "cash:acquirer", 100, kHBalT0 - 500);
+  const auto historical = hBalBalance(ctx, *client, "cash:acquirer", "EUR", kHBalT0);
   ctx.Equal(historical.amount(), 5099, "a point-in-time balance must come from the database (5099 as of T0 after the correction)");
-  ctx.Equal(ctx.Redis.Get(balKey).value_or(""), "3499", "a point-in-time balance must not overwrite the cached current balance");
+  ctx.Equal(ctx.Redis.Get(kHBalKey).value_or(""), "3499", "a point-in-time balance must not overwrite the cached current balance");
 }
 `,
   },

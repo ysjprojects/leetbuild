@@ -1056,14 +1056,14 @@ import (
 
 // seedClicks puts clicks on partition 0 of clicks, delivered in this order (event time is in the
 // value, not the log).
-func seedClicks(ctx *harness.Ctx, events ...click) {
+func hSeedClicks(ctx *harness.Ctx, events ...click) {
 	for _, e := range events {
 		ctx.Kafka.SeedPartition("clicks", 0, e.Page, fmt.Sprintf(\`{"page":%q,"ts":%d}\`, e.Page, e.Ts))
 	}
 }
 
 // emittedCounts is page-counts as "page window_start count", sorted by page then window start.
-func emittedCounts(ctx *harness.Ctx) []string {
+func hEmittedCounts(ctx *harness.Ctx) []string {
 	var got []pageCount
 	for _, r := range ctx.Kafka.Records("page-counts") {
 		var v pageCount
@@ -1084,43 +1084,43 @@ func emittedCounts(ctx *harness.Ctx) []string {
 }
 
 // drainWindows runs the aggregator until it waits for clicks that will not come.
-func drainWindows(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
+func hDrainWindows(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
 
 func CheckWindows(ctx *harness.Ctx) {
-	seedClicks(ctx, click{"home", 1000}, click{"home", 2000}, click{"about", 3000}, click{"home", 61000}, click{"about", 62000}, click{"home", 125000})
-	drainWindows(ctx)
+	hSeedClicks(ctx, click{"home", 1000}, click{"home", 2000}, click{"about", 3000}, click{"home", 61000}, click{"about", 62000}, click{"home", 125000})
+	hDrainWindows(ctx)
 	expected := []string{"about 0 1", "about 60000 1", "home 0 2", "home 60000 1"}
-	ctx.Equal(emittedCounts(ctx), expected, "after ts 125000 (watermark 120000) windows 0 and 60000 must be emitted as page window_start count")
+	ctx.Equal(hEmittedCounts(ctx), expected, "after ts 125000 (watermark 120000) windows 0 and 60000 must be emitted as page window_start count")
 	ctx.Equal(stats().Open, 1, "the window starting at 120000 must stay open: stats().Open (stats() is %+v)", stats())
 	shutdown()
 	ctx.Settle()
-	ctx.Equal(emittedCounts(ctx), expected, "shutdown() must not emit open windows")
+	ctx.Equal(hEmittedCounts(ctx), expected, "shutdown() must not emit open windows")
 }
 
 func CheckBoundary(ctx *harness.Ctx) {
-	seedClicks(ctx, click{"home", 59999}, click{"home", 60000}, click{"home", 60001}, click{"home", 126000})
-	drainWindows(ctx)
-	ctx.Equal(emittedCounts(ctx), []string{"home 0 1", "home 60000 2"}, "ts 59999 belongs to window 0, ts 60000 and 60001 to window 60000")
+	hSeedClicks(ctx, click{"home", 59999}, click{"home", 60000}, click{"home", 60001}, click{"home", 126000})
+	hDrainWindows(ctx)
+	ctx.Equal(hEmittedCounts(ctx), []string{"home 0 1", "home 60000 2"}, "ts 59999 belongs to window 0, ts 60000 and 60001 to window 60000")
 }
 
 func CheckLate(ctx *harness.Ctx) {
-	seedClicks(ctx, click{"home", 1000}, click{"home", 70000}, click{"home", 50000}, click{"home", 130000})
-	drainWindows(ctx)
-	ctx.Equal(emittedCounts(ctx), []string{"home 0 1", "home 60000 1"}, "ts 50000 arrives behind the watermark 65000: it must neither reopen window 0 nor count")
+	hSeedClicks(ctx, click{"home", 1000}, click{"home", 70000}, click{"home", 50000}, click{"home", 130000})
+	hDrainWindows(ctx)
+	ctx.Equal(hEmittedCounts(ctx), []string{"home 0 1", "home 60000 1"}, "ts 50000 arrives behind the watermark 65000: it must neither reopen window 0 nor count")
 	ctx.Equal(stats().Late, 1, "one late event must be counted: stats().Late (stats() is %+v)", stats())
 }
 
 func CheckWithinLateness(ctx *harness.Ctx) {
-	seedClicks(ctx, click{"home", 61000}, click{"home", 124000}, click{"home", 119500}, click{"home", 118000}, click{"home", 126000})
-	drainWindows(ctx)
-	ctx.Equal(emittedCounts(ctx), []string{"home 60000 2"}, "ts 119500 is 4500 ms behind 124000, inside the lateness: it counts in window 60000")
+	hSeedClicks(ctx, click{"home", 61000}, click{"home", 124000}, click{"home", 119500}, click{"home", 118000}, click{"home", 126000})
+	hDrainWindows(ctx)
+	ctx.Equal(hEmittedCounts(ctx), []string{"home 60000 2"}, "ts 119500 is 4500 ms behind 124000, inside the lateness: it counts in window 60000")
 	ctx.Equal(stats().Late, 1, "ts 118000 is 6000 ms behind, late: stats().Late (stats() is %+v)", stats())
 	ctx.Equal(stats().Open, 1, "the window starting at 120000 must stay open: stats().Open (stats() is %+v)", stats())
 }
 
 func CheckKeyed(ctx *harness.Ctx) {
-	seedClicks(ctx, click{"home", 1000}, click{"about", 2000}, click{"home", 3000}, click{"pricing", 4000}, click{"home", 70000})
-	drainWindows(ctx)
+	hSeedClicks(ctx, click{"home", 1000}, click{"about", 2000}, click{"home", 3000}, click{"pricing", 4000}, click{"home", 70000})
+	hDrainWindows(ctx)
 	records := ctx.Kafka.Records("page-counts")
 	ctx.Equal(len(records), 3, "window 0 has three pages: records on page-counts")
 	for _, r := range records {
@@ -1144,7 +1144,7 @@ func CheckKeyed(ctx *harness.Ctx) {
 }
 
 func CheckCommitAfterEmit(ctx *harness.Ctx) {
-	seedClicks(ctx, click{"home", 1000}, click{"home", 70000})
+	hSeedClicks(ctx, click{"home", 1000}, click{"home", 70000})
 	ctx.Kafka.StallFor("page-counts", 2) // the broker acknowledges page-counts 2 s later
 	started := ctx.Clock.Now()
 	type commitSeen struct {
@@ -1154,9 +1154,9 @@ func CheckCommitAfterEmit(ctx *harness.Ctx) {
 	}
 	var seen []commitSeen
 	ctx.Kafka.OnCommit(func(group string, _ harness.KafkaOffsets) {
-		seen = append(seen, commitSeen{group, ctx.Clock.Now() - started, emittedCounts(ctx)})
+		seen = append(seen, commitSeen{group, ctx.Clock.Now() - started, hEmittedCounts(ctx)})
 	})
-	drainWindows(ctx)
+	hDrainWindows(ctx)
 	ctx.Assert(len(seen) > 0, "closing window 0 must commit the input offsets")
 	first := seen[0]
 	ctx.Equal(first.group, "windows", "the consumer must commit as group windows")
@@ -1178,19 +1178,19 @@ func CheckCommitAfterEmit(ctx *harness.Ctx) {
 
 namespace {
 
-using click = std::pair<std::string, int64_t>;
+using HClick = std::pair<std::string, int64_t>;
 
-std::string showStats(const Stats& s) { return harness::Sprintf("{Late:%d Open:%d}", s.late, s.open); }
+std::string hShowStats(const Stats& s) { return harness::Sprintf("{Late:%d Open:%d}", s.late, s.open); }
 
 // seedClicks puts clicks on partition 0 of clicks, delivered in this order (event time is in the
 // value, not the log).
-void seedClicks(harness::Ctx& ctx, const std::vector<click>& events) {
+void hSeedClicks(harness::Ctx& ctx, const std::vector<HClick>& events) {
   for (const auto& [page, ts] : events)
     ctx.Kafka.SeedPartition("clicks", 0, page, R"({"page":")" + page + R"(","ts":)" + std::to_string(ts) + "}");
 }
 
 // emittedCounts is page-counts as "page window_start count", sorted by page then window start.
-std::vector<std::string> emittedCounts(harness::Ctx& ctx) {
+std::vector<std::string> hEmittedCounts(harness::Ctx& ctx) {
   std::vector<std::tuple<std::string, int64_t, int64_t>> got;
   for (const auto& r : ctx.Kafka.Records("page-counts")) {
     const std::string value = r.Value.value_or("");
@@ -1206,48 +1206,48 @@ std::vector<std::string> emittedCounts(harness::Ctx& ctx) {
 }
 
 // drainWindows runs the aggregator until it waits for clicks that will not come.
-void drainWindows(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+void hDrainWindows(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
 
 }  // namespace
 
 void CheckWindows(harness::Ctx& ctx) {
-  seedClicks(ctx, {{"home", 1000}, {"home", 2000}, {"about", 3000}, {"home", 61000}, {"about", 62000}, {"home", 125000}});
-  drainWindows(ctx);
+  hSeedClicks(ctx, {{"home", 1000}, {"home", 2000}, {"about", 3000}, {"home", 61000}, {"about", 62000}, {"home", 125000}});
+  hDrainWindows(ctx);
   const std::vector<std::string> expected = {"about 0 1", "about 60000 1", "home 0 2", "home 60000 1"};
-  ctx.Equal(emittedCounts(ctx), expected,
+  ctx.Equal(hEmittedCounts(ctx), expected,
             "after ts 125000 (watermark 120000) windows 0 and 60000 must be emitted as page window_start count");
-  ctx.Equal(stats().open, 1, "the window starting at 120000 must stay open: stats().open (stats() is %v)", showStats(stats()));
+  ctx.Equal(stats().open, 1, "the window starting at 120000 must stay open: stats().open (stats() is %v)", hShowStats(stats()));
   shutdown();
   ctx.Settle();
-  ctx.Equal(emittedCounts(ctx), expected, "shutdown() must not emit open windows");
+  ctx.Equal(hEmittedCounts(ctx), expected, "shutdown() must not emit open windows");
 }
 
 void CheckBoundary(harness::Ctx& ctx) {
-  seedClicks(ctx, {{"home", 59999}, {"home", 60000}, {"home", 60001}, {"home", 126000}});
-  drainWindows(ctx);
-  ctx.Equal(emittedCounts(ctx), {"home 0 1", "home 60000 2"}, "ts 59999 belongs to window 0, ts 60000 and 60001 to window 60000");
+  hSeedClicks(ctx, {{"home", 59999}, {"home", 60000}, {"home", 60001}, {"home", 126000}});
+  hDrainWindows(ctx);
+  ctx.Equal(hEmittedCounts(ctx), {"home 0 1", "home 60000 2"}, "ts 59999 belongs to window 0, ts 60000 and 60001 to window 60000");
 }
 
 void CheckLate(harness::Ctx& ctx) {
-  seedClicks(ctx, {{"home", 1000}, {"home", 70000}, {"home", 50000}, {"home", 130000}});
-  drainWindows(ctx);
-  ctx.Equal(emittedCounts(ctx), {"home 0 1", "home 60000 1"},
+  hSeedClicks(ctx, {{"home", 1000}, {"home", 70000}, {"home", 50000}, {"home", 130000}});
+  hDrainWindows(ctx);
+  ctx.Equal(hEmittedCounts(ctx), {"home 0 1", "home 60000 1"},
             "ts 50000 arrives behind the watermark 65000: it must neither reopen window 0 nor count");
-  ctx.Equal(stats().late, 1, "one late event must be counted: stats().late (stats() is %v)", showStats(stats()));
+  ctx.Equal(stats().late, 1, "one late event must be counted: stats().late (stats() is %v)", hShowStats(stats()));
 }
 
 void CheckWithinLateness(harness::Ctx& ctx) {
-  seedClicks(ctx, {{"home", 61000}, {"home", 124000}, {"home", 119500}, {"home", 118000}, {"home", 126000}});
-  drainWindows(ctx);
-  ctx.Equal(emittedCounts(ctx), {"home 60000 2"},
+  hSeedClicks(ctx, {{"home", 61000}, {"home", 124000}, {"home", 119500}, {"home", 118000}, {"home", 126000}});
+  hDrainWindows(ctx);
+  ctx.Equal(hEmittedCounts(ctx), {"home 60000 2"},
             "ts 119500 is 4500 ms behind 124000, inside the lateness: it counts in window 60000");
-  ctx.Equal(stats().late, 1, "ts 118000 is 6000 ms behind, late: stats().late (stats() is %v)", showStats(stats()));
-  ctx.Equal(stats().open, 1, "the window starting at 120000 must stay open: stats().open (stats() is %v)", showStats(stats()));
+  ctx.Equal(stats().late, 1, "ts 118000 is 6000 ms behind, late: stats().late (stats() is %v)", hShowStats(stats()));
+  ctx.Equal(stats().open, 1, "the window starting at 120000 must stay open: stats().open (stats() is %v)", hShowStats(stats()));
 }
 
 void CheckKeyed(harness::Ctx& ctx) {
-  seedClicks(ctx, {{"home", 1000}, {"about", 2000}, {"home", 3000}, {"pricing", 4000}, {"home", 70000}});
-  drainWindows(ctx);
+  hSeedClicks(ctx, {{"home", 1000}, {"about", 2000}, {"home", 3000}, {"pricing", 4000}, {"home", 70000}});
+  hDrainWindows(ctx);
   const auto records = ctx.Kafka.Records("page-counts");
   ctx.Equal(records.size(), 3, "window 0 has three pages: records on page-counts");
   for (const auto& r : records) {
@@ -1268,7 +1268,7 @@ void CheckKeyed(harness::Ctx& ctx) {
 }
 
 void CheckCommitAfterEmit(harness::Ctx& ctx) {
-  seedClicks(ctx, {{"home", 1000}, {"home", 70000}});
+  hSeedClicks(ctx, {{"home", 1000}, {"home", 70000}});
   ctx.Kafka.StallFor("page-counts", 2);  // the broker acknowledges page-counts 2 s later
   const int64_t started = ctx.Clock.Now();
   struct commitSeen {
@@ -1278,9 +1278,9 @@ void CheckCommitAfterEmit(harness::Ctx& ctx) {
   };
   std::vector<commitSeen> seen;
   ctx.Kafka.OnCommit([&](const std::string& group, const harness::KafkaOffsets&) {
-    seen.push_back({group, ctx.Clock.Now() - started, emittedCounts(ctx)});
+    seen.push_back({group, ctx.Clock.Now() - started, hEmittedCounts(ctx)});
   });
-  drainWindows(ctx);
+  hDrainWindows(ctx);
   ctx.Assert(!seen.empty(), "closing window 0 must commit the input offsets");
   const auto& first = seen[0];
   ctx.Equal(first.group, "windows", "the consumer must commit as group windows");

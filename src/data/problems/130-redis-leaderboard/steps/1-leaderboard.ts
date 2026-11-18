@@ -982,38 +982,38 @@ import (
 	"leetbuild/harness"
 )
 
-type lbScore struct {
+type HLbScore struct {
 	player string
 	points int
 }
 
 var (
-	lbBg    = context.Background()
-	lbFive  = []lbScore{{"ana", 40}, {"bo", 75}, {"cy", 10}, {"dee", 60}, {"eli", 25}}
-	lbSeven = []lbScore{{"ana", 70}, {"bo", 60}, {"cy", 50}, {"dee", 40}, {"eli", 30}, {"fay", 20}, {"gus", 10}}
+	hLbBg    = context.Background()
+	hLbFive  = []HLbScore{{"ana", 40}, {"bo", 75}, {"cy", 10}, {"dee", 60}, {"eli", 25}}
+	hLbSeven = []HLbScore{{"ana", 70}, {"bo", 60}, {"cy", 50}, {"dee", 40}, {"eli", 30}, {"fay", 20}, {"gus", 10}}
 )
 
-func lbAdd(ctx *harness.Ctx, board, player string, points int) int {
-	total, err := addPoints(lbBg, board, player, points)
+func hLbAdd(ctx *harness.Ctx, board, player string, points int) int {
+	total, err := addPoints(hLbBg, board, player, points)
 	ctx.NoError(err, "addPoints(%q, %q, %d) returned an error", board, player, points)
 	return total
 }
 
-func lbSeed(ctx *harness.Ctx, board string, scores []lbScore) {
+func hLbSeed(ctx *harness.Ctx, board string, scores []HLbScore) {
 	for _, s := range scores {
-		lbAdd(ctx, board, s.player, s.points)
+		hLbAdd(ctx, board, s.player, s.points)
 	}
 }
 
-func lbTop(ctx *harness.Ctx, board string, n int) []Row {
-	rows, err := top(lbBg, board, n)
+func hLbTop(ctx *harness.Ctx, board string, n int) []Row {
+	rows, err := top(hLbBg, board, n)
 	ctx.NoError(err, "top(%q, %d) returned an error", board, n)
 	return rows
 }
 
 // lbRank is rankOf's answer as a value (a Standing, or nil when it returned nil), so it compares and prints.
-func lbRank(ctx *harness.Ctx, board, player string) any {
-	s, err := rankOf(lbBg, board, player)
+func hLbRank(ctx *harness.Ctx, board, player string) any {
+	s, err := rankOf(hLbBg, board, player)
 	ctx.NoError(err, "rankOf(%q, %q) returned an error", board, player)
 	if s == nil {
 		return nil
@@ -1021,21 +1021,21 @@ func lbRank(ctx *harness.Ctx, board, player string) any {
 	return *s
 }
 
-func lbAround(ctx *harness.Ctx, board, player string, k int) []Row {
-	rows, err := around(lbBg, board, player, k)
+func hLbAround(ctx *harness.Ctx, board, player string, k int) []Row {
+	rows, err := around(hLbBg, board, player, k)
 	ctx.NoError(err, "around(%q, %q, %d) returned an error", board, player, k)
 	return rows
 }
 
-func lbRemove(ctx *harness.Ctx, board, player string) bool {
-	removed, err := remove(lbBg, board, player)
+func hLbRemove(ctx *harness.Ctx, board, player string) bool {
+	removed, err := remove(hLbBg, board, player)
 	ctx.NoError(err, "remove(%q, %q) returned an error", board, player)
 	return removed
 }
 
 // lbExpected is the spec, independent of the learner: score descending, then member descending (Redis's ZREVRANGE rule).
-func lbExpected(scores []lbScore) []Row {
-	ordered := append([]lbScore(nil), scores...)
+func hLbExpected(scores []HLbScore) []Row {
+	ordered := append([]HLbScore(nil), scores...)
 	sort.Slice(ordered, func(i, j int) bool {
 		if ordered[i].points != ordered[j].points {
 			return ordered[i].points > ordered[j].points
@@ -1050,13 +1050,13 @@ func lbExpected(scores []lbScore) []Row {
 }
 
 func CheckTopOrder(ctx *harness.Ctx) {
-	ctx.Equal(len(lbTop(ctx, "weekly", 3)), 0, "an empty board has no rows: the number of rows top returned")
-	lbSeed(ctx, "weekly", lbFive)
-	ctx.Equal(lbTop(ctx, "weekly", 3), []Row{{"bo", 75, 1}, {"dee", 60, 2}, {"ana", 40, 3}}, "top(%q, 3) must be the three highest scorers, best first, as {Player Score Rank} with ranks 1, 2, 3", "weekly")
-	ctx.Equal(lbTop(ctx, "weekly", 1), []Row{{"bo", 75, 1}}, "top(%q, 1) is the leader alone", "weekly")
-	ctx.Equal(lbTop(ctx, "weekly", 10), lbExpected(lbFive), "n larger than the board returns everyone, still ranked 1..5")
+	ctx.Equal(len(hLbTop(ctx, "weekly", 3)), 0, "an empty board has no rows: the number of rows top returned")
+	hLbSeed(ctx, "weekly", hLbFive)
+	ctx.Equal(hLbTop(ctx, "weekly", 3), []Row{{"bo", 75, 1}, {"dee", 60, 2}, {"ana", 40, 3}}, "top(%q, 3) must be the three highest scorers, best first, as {Player Score Rank} with ranks 1, 2, 3", "weekly")
+	ctx.Equal(hLbTop(ctx, "weekly", 1), []Row{{"bo", 75, 1}}, "top(%q, 1) is the leader alone", "weekly")
+	ctx.Equal(hLbTop(ctx, "weekly", 10), hLbExpected(hLbFive), "n larger than the board returns everyone, still ranked 1..5")
 	before := len(ctx.Redis.RoundTrips())
-	lbTop(ctx, "weekly", 3)
+	hLbTop(ctx, "weekly", 3)
 	sent := []string{}
 	for _, trip := range ctx.Redis.RoundTrips()[before:] {
 		sent = append(sent, trip...)
@@ -1065,69 +1065,69 @@ func CheckTopOrder(ctx *harness.Ctx) {
 }
 
 func CheckRankOf(ctx *harness.Ctx) {
-	lbSeed(ctx, "weekly", lbFive)
-	lbSeed(ctx, "monthly", []lbScore{{"bo", 5}, {"zed", 90}})
-	for _, row := range lbTop(ctx, "weekly", 5) {
-		ctx.Equal(lbRank(ctx, "weekly", row.Player), Standing{Rank: row.Rank, Score: row.Score}, "top shows %s at rank %d with %d points, so rankOf(%q, %q) must agree: Rank = ZREVRANK + 1, Score = ZSCORE", row.Player, row.Rank, row.Score, "weekly", row.Player)
+	hLbSeed(ctx, "weekly", hLbFive)
+	hLbSeed(ctx, "monthly", []HLbScore{{"bo", 5}, {"zed", 90}})
+	for _, row := range hLbTop(ctx, "weekly", 5) {
+		ctx.Equal(hLbRank(ctx, "weekly", row.Player), Standing{Rank: row.Rank, Score: row.Score}, "top shows %s at rank %d with %d points, so rankOf(%q, %q) must agree: Rank = ZREVRANK + 1, Score = ZSCORE", row.Player, row.Rank, row.Score, "weekly", row.Player)
 	}
-	ctx.Equal(lbRank(ctx, "weekly", "ghost"), nil, "a player who never scored on the board has no rank: nil, not an error and not {0 0}")
-	ctx.Equal(lbRank(ctx, "monthly", "ana"), nil, "boards are independent: ana is on weekly, not on monthly")
-	ctx.Equal(lbRank(ctx, "monthly", "bo"), Standing{Rank: 2, Score: 5}, "bo leads weekly but is second on monthly with 5 points: rankOf(%q, %q)", "monthly", "bo")
+	ctx.Equal(hLbRank(ctx, "weekly", "ghost"), nil, "a player who never scored on the board has no rank: nil, not an error and not {0 0}")
+	ctx.Equal(hLbRank(ctx, "monthly", "ana"), nil, "boards are independent: ana is on weekly, not on monthly")
+	ctx.Equal(hLbRank(ctx, "monthly", "bo"), Standing{Rank: 2, Score: 5}, "bo leads weekly but is second on monthly with 5 points: rankOf(%q, %q)", "monthly", "bo")
 }
 
 func CheckAroundClips(ctx *harness.Ctx) {
-	lbSeed(ctx, "weekly", lbSeven)
-	rows := lbExpected(lbSeven)
-	ctx.Equal(lbAround(ctx, "weekly", "dee", 2), rows[1:6], "around(%q, %q, 2) is bo…fay with ranks 2..6 (two above, dee, two below)", "weekly", "dee")
-	ctx.Equal(lbAround(ctx, "weekly", "ana", 2), rows[0:3], "the leader has nobody above: around(%q, %q, 2) must clip to ranks 1..3, not read a negative start from the end of the set", "weekly", "ana")
-	ctx.Equal(lbAround(ctx, "weekly", "bo", 2), rows[0:4], "around(%q, %q, 2): one above (ana, rank 1), bo, two below", "weekly", "bo")
-	ctx.Equal(lbAround(ctx, "weekly", "gus", 2), rows[4:7], "the last player has nobody below: around(%q, %q, 2) is ranks 5..7", "weekly", "gus")
-	ctx.Equal(lbAround(ctx, "weekly", "fay", 3), rows[2:7], "around(%q, %q, 3) clips at the bottom: ranks 3..7", "weekly", "fay")
-	ctx.Equal(lbAround(ctx, "weekly", "dee", 0), rows[3:4], "k = 0 is the player alone with the absolute rank 4")
-	ctx.Equal(lbAround(ctx, "weekly", "dee", 100), rows, "a window wider than the board is the whole board, ranks 1..7")
-	ctx.Equal(len(lbAround(ctx, "weekly", "zed", 2)), 0, "a player not on the board has no neighbours: the number of rows around(%q, %q, 2) returned", "weekly", "zed")
+	hLbSeed(ctx, "weekly", hLbSeven)
+	rows := hLbExpected(hLbSeven)
+	ctx.Equal(hLbAround(ctx, "weekly", "dee", 2), rows[1:6], "around(%q, %q, 2) is bo…fay with ranks 2..6 (two above, dee, two below)", "weekly", "dee")
+	ctx.Equal(hLbAround(ctx, "weekly", "ana", 2), rows[0:3], "the leader has nobody above: around(%q, %q, 2) must clip to ranks 1..3, not read a negative start from the end of the set", "weekly", "ana")
+	ctx.Equal(hLbAround(ctx, "weekly", "bo", 2), rows[0:4], "around(%q, %q, 2): one above (ana, rank 1), bo, two below", "weekly", "bo")
+	ctx.Equal(hLbAround(ctx, "weekly", "gus", 2), rows[4:7], "the last player has nobody below: around(%q, %q, 2) is ranks 5..7", "weekly", "gus")
+	ctx.Equal(hLbAround(ctx, "weekly", "fay", 3), rows[2:7], "around(%q, %q, 3) clips at the bottom: ranks 3..7", "weekly", "fay")
+	ctx.Equal(hLbAround(ctx, "weekly", "dee", 0), rows[3:4], "k = 0 is the player alone with the absolute rank 4")
+	ctx.Equal(hLbAround(ctx, "weekly", "dee", 100), rows, "a window wider than the board is the whole board, ranks 1..7")
+	ctx.Equal(len(hLbAround(ctx, "weekly", "zed", 2)), 0, "a player not on the board has no neighbours: the number of rows around(%q, %q, 2) returned", "weekly", "zed")
 }
 
 func CheckTies(ctx *harness.Ctx) {
-	tied := []lbScore{{"mia", 50}, {"zed", 50}, {"abe", 50}, {"kim", 80}, {"lou", 20}, {"bea", 20}}
-	lbSeed(ctx, "weekly", tied)
-	rows := lbExpected(tied)
-	ctx.Equal(lbTop(ctx, "weekly", 6), rows, "equal scores are ordered by Redis: in the descending view the greater member comes first (zed, mia, abe at 50; lou before bea at 20)")
+	tied := []HLbScore{{"mia", 50}, {"zed", 50}, {"abe", 50}, {"kim", 80}, {"lou", 20}, {"bea", 20}}
+	hLbSeed(ctx, "weekly", tied)
+	rows := hLbExpected(tied)
+	ctx.Equal(hLbTop(ctx, "weekly", 6), rows, "equal scores are ordered by Redis: in the descending view the greater member comes first (zed, mia, abe at 50; lou before bea at 20)")
 	for _, row := range rows {
-		ctx.Equal(lbRank(ctx, "weekly", row.Player), Standing{Rank: row.Rank, Score: row.Score}, "rankOf(%q, %q) must agree with top", "weekly", row.Player)
+		ctx.Equal(hLbRank(ctx, "weekly", row.Player), Standing{Rank: row.Rank, Score: row.Score}, "rankOf(%q, %q) must agree with top", "weekly", row.Player)
 	}
-	ctx.Equal(lbAround(ctx, "weekly", "mia", 1), rows[1:4], "around(%q, %q, 1) is zed (2), mia (3), abe (4): the same tie order as top", "weekly", "mia")
-	ctx.Equal(lbAround(ctx, "weekly", "abe", 1), rows[2:5], "around(%q, %q, 1) is mia (3), abe (4), lou (5)", "weekly", "abe")
-	lbAdd(ctx, "weekly", "abe", 1)
-	ctx.Equal(lbRank(ctx, "weekly", "abe"), Standing{Rank: 2, Score: 51}, "one more point breaks the tie: abe moves to rank 2 with 51")
-	ctx.Equal(lbTop(ctx, "weekly", 3), []Row{{"kim", 80, 1}, {"abe", 51, 2}, {"zed", 50, 3}}, "after abe's point top is kim, abe, zed")
+	ctx.Equal(hLbAround(ctx, "weekly", "mia", 1), rows[1:4], "around(%q, %q, 1) is zed (2), mia (3), abe (4): the same tie order as top", "weekly", "mia")
+	ctx.Equal(hLbAround(ctx, "weekly", "abe", 1), rows[2:5], "around(%q, %q, 1) is mia (3), abe (4), lou (5)", "weekly", "abe")
+	hLbAdd(ctx, "weekly", "abe", 1)
+	ctx.Equal(hLbRank(ctx, "weekly", "abe"), Standing{Rank: 2, Score: 51}, "one more point breaks the tie: abe moves to rank 2 with 51")
+	ctx.Equal(hLbTop(ctx, "weekly", 3), []Row{{"kim", 80, 1}, {"abe", 51, 2}, {"zed", 50, 3}}, "after abe's point top is kim, abe, zed")
 }
 
 func CheckAccumulate(ctx *harness.Ctx) {
-	ctx.Equal(lbAdd(ctx, "weekly", "ana", 10), 10, "a new player starts from 0: the first addPoints returns the points given")
-	ctx.Equal(lbAdd(ctx, "weekly", "ana", 5), 15, "addPoints accumulates (ZINCRBY): 10 then 5 is 15, not 5 (ZADD would overwrite)")
-	ctx.Equal(lbAdd(ctx, "weekly", "ana", -3), 12, "negative points subtract: 15 − 3 is 12")
-	ctx.Equal(lbAdd(ctx, "weekly", "bo", 5), 5, "another player's first score is just their points")
+	ctx.Equal(hLbAdd(ctx, "weekly", "ana", 10), 10, "a new player starts from 0: the first addPoints returns the points given")
+	ctx.Equal(hLbAdd(ctx, "weekly", "ana", 5), 15, "addPoints accumulates (ZINCRBY): 10 then 5 is 15, not 5 (ZADD would overwrite)")
+	ctx.Equal(hLbAdd(ctx, "weekly", "ana", -3), 12, "negative points subtract: 15 − 3 is 12")
+	ctx.Equal(hLbAdd(ctx, "weekly", "bo", 5), 5, "another player's first score is just their points")
 	score, ok := ctx.Redis.ZScore("board:weekly", "ana")
 	ctx.Assert(ok && score == 12, "the board lives in the sorted set board:weekly with the player as member and the total as score; keys: %s, ana's score there: %v (present: %v)", harness.Show(ctx.Redis.Keys("*")), score, ok)
 	ctx.Equal(ctx.Redis.Keys("*"), []string{"board:weekly"}, "one key per board, named board:{board}: the keys")
-	ctx.Equal(lbAdd(ctx, "monthly", "ana", 100), 100, "the same player on another board starts from 0 there")
-	ctx.Equal(lbRank(ctx, "weekly", "ana"), Standing{Rank: 1, Score: 12}, "monthly points must not touch weekly: ana still leads weekly with 12")
-	ctx.Equal(lbRank(ctx, "monthly", "ana"), Standing{Rank: 1, Score: 100}, "ana's standing on monthly")
-	ctx.Equal(lbTop(ctx, "weekly", 5), []Row{{"ana", 12, 1}, {"bo", 5, 2}}, "top reflects the accumulated totals")
+	ctx.Equal(hLbAdd(ctx, "monthly", "ana", 100), 100, "the same player on another board starts from 0 there")
+	ctx.Equal(hLbRank(ctx, "weekly", "ana"), Standing{Rank: 1, Score: 12}, "monthly points must not touch weekly: ana still leads weekly with 12")
+	ctx.Equal(hLbRank(ctx, "monthly", "ana"), Standing{Rank: 1, Score: 100}, "ana's standing on monthly")
+	ctx.Equal(hLbTop(ctx, "weekly", 5), []Row{{"ana", 12, 1}, {"bo", 5, 2}}, "top reflects the accumulated totals")
 }
 
 func CheckRemove(ctx *harness.Ctx) {
-	lbSeed(ctx, "weekly", lbFive)
-	lbSeed(ctx, "monthly", []lbScore{{"bo", 5}})
-	ctx.Equal(lbRemove(ctx, "weekly", "bo"), true, "removing a player who is on the board returns true")
-	ctx.Equal(lbRank(ctx, "weekly", "bo"), nil, "after remove the player has no rank on that board")
-	ctx.Equal(lbTop(ctx, "weekly", 5), []Row{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}, {"cy", 10, 4}}, "with the leader gone everyone moves up one rank")
-	ctx.Equal(lbAround(ctx, "weekly", "ana", 1), []Row{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}}, "around reflects the new ranks too")
-	ctx.Equal(lbRemove(ctx, "weekly", "bo"), false, "removing a player a second time returns false: there was nothing to remove")
-	ctx.Equal(lbRemove(ctx, "weekly", "ghost"), false, "removing a player who never scored returns false")
-	ctx.Equal(lbRank(ctx, "monthly", "bo"), Standing{Rank: 1, Score: 5}, "remove touches one board only: bo is still on monthly")
-	ctx.Equal(lbAdd(ctx, "weekly", "bo", 1), 1, "a removed player who scores again starts from 0")
+	hLbSeed(ctx, "weekly", hLbFive)
+	hLbSeed(ctx, "monthly", []HLbScore{{"bo", 5}})
+	ctx.Equal(hLbRemove(ctx, "weekly", "bo"), true, "removing a player who is on the board returns true")
+	ctx.Equal(hLbRank(ctx, "weekly", "bo"), nil, "after remove the player has no rank on that board")
+	ctx.Equal(hLbTop(ctx, "weekly", 5), []Row{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}, {"cy", 10, 4}}, "with the leader gone everyone moves up one rank")
+	ctx.Equal(hLbAround(ctx, "weekly", "ana", 1), []Row{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}}, "around reflects the new ranks too")
+	ctx.Equal(hLbRemove(ctx, "weekly", "bo"), false, "removing a player a second time returns false: there was nothing to remove")
+	ctx.Equal(hLbRemove(ctx, "weekly", "ghost"), false, "removing a player who never scored returns false")
+	ctx.Equal(hLbRank(ctx, "monthly", "bo"), Standing{Rank: 1, Score: 5}, "remove touches one board only: bo is still on monthly")
+	ctx.Equal(hLbAdd(ctx, "weekly", "bo", 1), 1, "a removed player who scores again starts from 0")
 }
 `,
     cpp: `// redis-leaderboard/leaderboard checks: top-order, rank-of, around-clips, ties, accumulate, remove
@@ -1143,27 +1143,27 @@ func CheckRemove(ctx *harness.Ctx) {
 
 namespace {
 
-struct lbScore {
+struct HLbScore {
   std::string player;
   long long points;
 };
 
 // A Row as {Player Score Rank} and a Standing as {Rank Score}, so they compare and print like Go's structs.
-using LbRow = std::tuple<std::string, long long, long long>;
-using LbStanding = std::tuple<long long, long long>;
-using LbRows = std::vector<LbRow>;
+using HLbRow = std::tuple<std::string, long long, long long>;
+using HLbStanding = std::tuple<long long, long long>;
+using HLbRows = std::vector<HLbRow>;
 
-const std::vector<lbScore> lbFive = {{"ana", 40}, {"bo", 75}, {"cy", 10}, {"dee", 60}, {"eli", 25}};
-const std::vector<lbScore> lbSeven = {{"ana", 70}, {"bo", 60}, {"cy", 50}, {"dee", 40},
+const std::vector<HLbScore> kHLbFive = {{"ana", 40}, {"bo", 75}, {"cy", 10}, {"dee", 60}, {"eli", 25}};
+const std::vector<HLbScore> kHLbSeven = {{"ana", 70}, {"bo", 60}, {"cy", 50}, {"dee", 40},
                                       {"eli", 30}, {"fay", 20}, {"gus", 10}};
 
-LbRows lbRows(const std::vector<Row>& rows) {
-  LbRows out;
+HLbRows hLbRows(const std::vector<Row>& rows) {
+  HLbRows out;
   for (const auto& r : rows) out.emplace_back(r.player, r.score, r.rank);
   return out;
 }
 
-long long lbAdd(harness::Ctx& ctx, const std::string& board, const std::string& player, long long points) {
+long long hLbAdd(harness::Ctx& ctx, const std::string& board, const std::string& player, long long points) {
   try {
     return add_points(board, player, points);
   } catch (const std::exception& e) {
@@ -1172,13 +1172,13 @@ long long lbAdd(harness::Ctx& ctx, const std::string& board, const std::string& 
   return 0;
 }
 
-void lbSeed(harness::Ctx& ctx, const std::string& board, const std::vector<lbScore>& scores) {
-  for (const auto& s : scores) lbAdd(ctx, board, s.player, s.points);
+void hLbSeed(harness::Ctx& ctx, const std::string& board, const std::vector<HLbScore>& scores) {
+  for (const auto& s : scores) hLbAdd(ctx, board, s.player, s.points);
 }
 
-LbRows lbTop(harness::Ctx& ctx, const std::string& board, long long n) {
+HLbRows hLbTop(harness::Ctx& ctx, const std::string& board, long long n) {
   try {
-    return lbRows(top(board, n));
+    return hLbRows(top(board, n));
   } catch (const std::exception& e) {
     ctx.Fatalf("top(%q, %d) returned an error: %s", board, n, e.what());
   }
@@ -1186,27 +1186,27 @@ LbRows lbTop(harness::Ctx& ctx, const std::string& board, long long n) {
 }
 
 // lbRank is rankOf's answer as a value (a Standing, or nil when it returned nil), so it compares and prints.
-std::optional<LbStanding> lbRank(harness::Ctx& ctx, const std::string& board, const std::string& player) {
+std::optional<HLbStanding> hLbRank(harness::Ctx& ctx, const std::string& board, const std::string& player) {
   try {
     const auto s = rank_of(board, player);
     if (!s) return std::nullopt;
-    return LbStanding{s->rank, s->score};
+    return HLbStanding{s->rank, s->score};
   } catch (const std::exception& e) {
     ctx.Fatalf("rankOf(%q, %q) returned an error: %s", board, player, e.what());
   }
   return std::nullopt;
 }
 
-LbRows lbAround(harness::Ctx& ctx, const std::string& board, const std::string& player, long long k) {
+HLbRows hLbAround(harness::Ctx& ctx, const std::string& board, const std::string& player, long long k) {
   try {
-    return lbRows(around(board, player, k));
+    return hLbRows(around(board, player, k));
   } catch (const std::exception& e) {
     ctx.Fatalf("around(%q, %q, %d) returned an error: %s", board, player, k, e.what());
   }
   return {};
 }
 
-bool lbRemove(harness::Ctx& ctx, const std::string& board, const std::string& player) {
+bool hLbRemove(harness::Ctx& ctx, const std::string& board, const std::string& player) {
   try {
     return remove_player(board, player);
   } catch (const std::exception& e) {
@@ -1216,28 +1216,28 @@ bool lbRemove(harness::Ctx& ctx, const std::string& board, const std::string& pl
 }
 
 // lbExpected is the spec, independent of the learner: score descending, then member descending (Redis's ZREVRANGE rule).
-LbRows lbExpected(std::vector<lbScore> ordered) {
-  std::sort(ordered.begin(), ordered.end(), [](const lbScore& a, const lbScore& b) {
+HLbRows hLbExpected(std::vector<HLbScore> ordered) {
+  std::sort(ordered.begin(), ordered.end(), [](const HLbScore& a, const HLbScore& b) {
     if (a.points != b.points) return a.points > b.points;
     return a.player > b.player;
   });
-  LbRows out;
+  HLbRows out;
   for (size_t i = 0; i < ordered.size(); i++) out.emplace_back(ordered[i].player, ordered[i].points, static_cast<long long>(i) + 1);
   return out;
 }
 
-LbRows lbSlice(const LbRows& rows, size_t from, size_t to) { return LbRows(rows.begin() + from, rows.begin() + to); }
+HLbRows hLbSlice(const HLbRows& rows, size_t from, size_t to) { return HLbRows(rows.begin() + from, rows.begin() + to); }
 
 }  // namespace
 
 void CheckTopOrder(harness::Ctx& ctx) {
-  ctx.Equal(lbTop(ctx, "weekly", 3).size(), 0, "an empty board has no rows: the number of rows top returned");
-  lbSeed(ctx, "weekly", lbFive);
-  ctx.Equal(lbTop(ctx, "weekly", 3), LbRows{{"bo", 75, 1}, {"dee", 60, 2}, {"ana", 40, 3}}, "top(%q, 3) must be the three highest scorers, best first, as {Player Score Rank} with ranks 1, 2, 3", "weekly");
-  ctx.Equal(lbTop(ctx, "weekly", 1), LbRows{{"bo", 75, 1}}, "top(%q, 1) is the leader alone", "weekly");
-  ctx.Equal(lbTop(ctx, "weekly", 10), lbExpected(lbFive), "n larger than the board returns everyone, still ranked 1..5");
+  ctx.Equal(hLbTop(ctx, "weekly", 3).size(), 0, "an empty board has no rows: the number of rows top returned");
+  hLbSeed(ctx, "weekly", kHLbFive);
+  ctx.Equal(hLbTop(ctx, "weekly", 3), HLbRows{{"bo", 75, 1}, {"dee", 60, 2}, {"ana", 40, 3}}, "top(%q, 3) must be the three highest scorers, best first, as {Player Score Rank} with ranks 1, 2, 3", "weekly");
+  ctx.Equal(hLbTop(ctx, "weekly", 1), HLbRows{{"bo", 75, 1}}, "top(%q, 1) is the leader alone", "weekly");
+  ctx.Equal(hLbTop(ctx, "weekly", 10), hLbExpected(kHLbFive), "n larger than the board returns everyone, still ranked 1..5");
   const size_t before = ctx.Redis.RoundTrips().size();
-  lbTop(ctx, "weekly", 3);
+  hLbTop(ctx, "weekly", 3);
   std::vector<std::string> sent;
   const auto trips = ctx.Redis.RoundTrips();
   for (size_t i = before; i < trips.size(); i++) sent.insert(sent.end(), trips[i].begin(), trips[i].end());
@@ -1245,69 +1245,69 @@ void CheckTopOrder(harness::Ctx& ctx) {
 }
 
 void CheckRankOf(harness::Ctx& ctx) {
-  lbSeed(ctx, "weekly", lbFive);
-  lbSeed(ctx, "monthly", {{"bo", 5}, {"zed", 90}});
-  for (const auto& [player, score, rank] : lbTop(ctx, "weekly", 5)) {
-    ctx.Equal(lbRank(ctx, "weekly", player), std::optional<LbStanding>(LbStanding{rank, score}), "top shows %s at rank %d with %d points, so rankOf(%q, %q) must agree: Rank = ZREVRANK + 1, Score = ZSCORE", player, rank, score, "weekly", player);
+  hLbSeed(ctx, "weekly", kHLbFive);
+  hLbSeed(ctx, "monthly", {{"bo", 5}, {"zed", 90}});
+  for (const auto& [player, score, rank] : hLbTop(ctx, "weekly", 5)) {
+    ctx.Equal(hLbRank(ctx, "weekly", player), std::optional<HLbStanding>(HLbStanding{rank, score}), "top shows %s at rank %d with %d points, so rankOf(%q, %q) must agree: Rank = ZREVRANK + 1, Score = ZSCORE", player, rank, score, "weekly", player);
   }
-  ctx.Equal(lbRank(ctx, "weekly", "ghost"), std::optional<LbStanding>(), "a player who never scored on the board has no rank: nil, not an error and not {0 0}");
-  ctx.Equal(lbRank(ctx, "monthly", "ana"), std::optional<LbStanding>(), "boards are independent: ana is on weekly, not on monthly");
-  ctx.Equal(lbRank(ctx, "monthly", "bo"), std::optional<LbStanding>(LbStanding{2, 5}), "bo leads weekly but is second on monthly with 5 points: rankOf(%q, %q)", "monthly", "bo");
+  ctx.Equal(hLbRank(ctx, "weekly", "ghost"), std::optional<HLbStanding>(), "a player who never scored on the board has no rank: nil, not an error and not {0 0}");
+  ctx.Equal(hLbRank(ctx, "monthly", "ana"), std::optional<HLbStanding>(), "boards are independent: ana is on weekly, not on monthly");
+  ctx.Equal(hLbRank(ctx, "monthly", "bo"), std::optional<HLbStanding>(HLbStanding{2, 5}), "bo leads weekly but is second on monthly with 5 points: rankOf(%q, %q)", "monthly", "bo");
 }
 
 void CheckAroundClips(harness::Ctx& ctx) {
-  lbSeed(ctx, "weekly", lbSeven);
-  const LbRows rows = lbExpected(lbSeven);
-  ctx.Equal(lbAround(ctx, "weekly", "dee", 2), lbSlice(rows, 1, 6), "around(%q, %q, 2) is bo…fay with ranks 2..6 (two above, dee, two below)", "weekly", "dee");
-  ctx.Equal(lbAround(ctx, "weekly", "ana", 2), lbSlice(rows, 0, 3), "the leader has nobody above: around(%q, %q, 2) must clip to ranks 1..3, not read a negative start from the end of the set", "weekly", "ana");
-  ctx.Equal(lbAround(ctx, "weekly", "bo", 2), lbSlice(rows, 0, 4), "around(%q, %q, 2): one above (ana, rank 1), bo, two below", "weekly", "bo");
-  ctx.Equal(lbAround(ctx, "weekly", "gus", 2), lbSlice(rows, 4, 7), "the last player has nobody below: around(%q, %q, 2) is ranks 5..7", "weekly", "gus");
-  ctx.Equal(lbAround(ctx, "weekly", "fay", 3), lbSlice(rows, 2, 7), "around(%q, %q, 3) clips at the bottom: ranks 3..7", "weekly", "fay");
-  ctx.Equal(lbAround(ctx, "weekly", "dee", 0), lbSlice(rows, 3, 4), "k = 0 is the player alone with the absolute rank 4");
-  ctx.Equal(lbAround(ctx, "weekly", "dee", 100), rows, "a window wider than the board is the whole board, ranks 1..7");
-  ctx.Equal(lbAround(ctx, "weekly", "zed", 2).size(), 0, "a player not on the board has no neighbours: the number of rows around(%q, %q, 2) returned", "weekly", "zed");
+  hLbSeed(ctx, "weekly", kHLbSeven);
+  const HLbRows rows = hLbExpected(kHLbSeven);
+  ctx.Equal(hLbAround(ctx, "weekly", "dee", 2), hLbSlice(rows, 1, 6), "around(%q, %q, 2) is bo…fay with ranks 2..6 (two above, dee, two below)", "weekly", "dee");
+  ctx.Equal(hLbAround(ctx, "weekly", "ana", 2), hLbSlice(rows, 0, 3), "the leader has nobody above: around(%q, %q, 2) must clip to ranks 1..3, not read a negative start from the end of the set", "weekly", "ana");
+  ctx.Equal(hLbAround(ctx, "weekly", "bo", 2), hLbSlice(rows, 0, 4), "around(%q, %q, 2): one above (ana, rank 1), bo, two below", "weekly", "bo");
+  ctx.Equal(hLbAround(ctx, "weekly", "gus", 2), hLbSlice(rows, 4, 7), "the last player has nobody below: around(%q, %q, 2) is ranks 5..7", "weekly", "gus");
+  ctx.Equal(hLbAround(ctx, "weekly", "fay", 3), hLbSlice(rows, 2, 7), "around(%q, %q, 3) clips at the bottom: ranks 3..7", "weekly", "fay");
+  ctx.Equal(hLbAround(ctx, "weekly", "dee", 0), hLbSlice(rows, 3, 4), "k = 0 is the player alone with the absolute rank 4");
+  ctx.Equal(hLbAround(ctx, "weekly", "dee", 100), rows, "a window wider than the board is the whole board, ranks 1..7");
+  ctx.Equal(hLbAround(ctx, "weekly", "zed", 2).size(), 0, "a player not on the board has no neighbours: the number of rows around(%q, %q, 2) returned", "weekly", "zed");
 }
 
 void CheckTies(harness::Ctx& ctx) {
-  const std::vector<lbScore> tied = {{"mia", 50}, {"zed", 50}, {"abe", 50}, {"kim", 80}, {"lou", 20}, {"bea", 20}};
-  lbSeed(ctx, "weekly", tied);
-  const LbRows rows = lbExpected(tied);
-  ctx.Equal(lbTop(ctx, "weekly", 6), rows, "equal scores are ordered by Redis: in the descending view the greater member comes first (zed, mia, abe at 50; lou before bea at 20)");
+  const std::vector<HLbScore> tied = {{"mia", 50}, {"zed", 50}, {"abe", 50}, {"kim", 80}, {"lou", 20}, {"bea", 20}};
+  hLbSeed(ctx, "weekly", tied);
+  const HLbRows rows = hLbExpected(tied);
+  ctx.Equal(hLbTop(ctx, "weekly", 6), rows, "equal scores are ordered by Redis: in the descending view the greater member comes first (zed, mia, abe at 50; lou before bea at 20)");
   for (const auto& [player, score, rank] : rows) {
-    ctx.Equal(lbRank(ctx, "weekly", player), std::optional<LbStanding>(LbStanding{rank, score}), "rankOf(%q, %q) must agree with top", "weekly", player);
+    ctx.Equal(hLbRank(ctx, "weekly", player), std::optional<HLbStanding>(HLbStanding{rank, score}), "rankOf(%q, %q) must agree with top", "weekly", player);
   }
-  ctx.Equal(lbAround(ctx, "weekly", "mia", 1), lbSlice(rows, 1, 4), "around(%q, %q, 1) is zed (2), mia (3), abe (4): the same tie order as top", "weekly", "mia");
-  ctx.Equal(lbAround(ctx, "weekly", "abe", 1), lbSlice(rows, 2, 5), "around(%q, %q, 1) is mia (3), abe (4), lou (5)", "weekly", "abe");
-  lbAdd(ctx, "weekly", "abe", 1);
-  ctx.Equal(lbRank(ctx, "weekly", "abe"), std::optional<LbStanding>(LbStanding{2, 51}), "one more point breaks the tie: abe moves to rank 2 with 51");
-  ctx.Equal(lbTop(ctx, "weekly", 3), LbRows{{"kim", 80, 1}, {"abe", 51, 2}, {"zed", 50, 3}}, "after abe's point top is kim, abe, zed");
+  ctx.Equal(hLbAround(ctx, "weekly", "mia", 1), hLbSlice(rows, 1, 4), "around(%q, %q, 1) is zed (2), mia (3), abe (4): the same tie order as top", "weekly", "mia");
+  ctx.Equal(hLbAround(ctx, "weekly", "abe", 1), hLbSlice(rows, 2, 5), "around(%q, %q, 1) is mia (3), abe (4), lou (5)", "weekly", "abe");
+  hLbAdd(ctx, "weekly", "abe", 1);
+  ctx.Equal(hLbRank(ctx, "weekly", "abe"), std::optional<HLbStanding>(HLbStanding{2, 51}), "one more point breaks the tie: abe moves to rank 2 with 51");
+  ctx.Equal(hLbTop(ctx, "weekly", 3), HLbRows{{"kim", 80, 1}, {"abe", 51, 2}, {"zed", 50, 3}}, "after abe's point top is kim, abe, zed");
 }
 
 void CheckAccumulate(harness::Ctx& ctx) {
-  ctx.Equal(lbAdd(ctx, "weekly", "ana", 10), 10, "a new player starts from 0: the first addPoints returns the points given");
-  ctx.Equal(lbAdd(ctx, "weekly", "ana", 5), 15, "addPoints accumulates (ZINCRBY): 10 then 5 is 15, not 5 (ZADD would overwrite)");
-  ctx.Equal(lbAdd(ctx, "weekly", "ana", -3), 12, "negative points subtract: 15 − 3 is 12");
-  ctx.Equal(lbAdd(ctx, "weekly", "bo", 5), 5, "another player's first score is just their points");
+  ctx.Equal(hLbAdd(ctx, "weekly", "ana", 10), 10, "a new player starts from 0: the first addPoints returns the points given");
+  ctx.Equal(hLbAdd(ctx, "weekly", "ana", 5), 15, "addPoints accumulates (ZINCRBY): 10 then 5 is 15, not 5 (ZADD would overwrite)");
+  ctx.Equal(hLbAdd(ctx, "weekly", "ana", -3), 12, "negative points subtract: 15 − 3 is 12");
+  ctx.Equal(hLbAdd(ctx, "weekly", "bo", 5), 5, "another player's first score is just their points");
   const auto score = ctx.Redis.ZScore("board:weekly", "ana");
   ctx.Assert(score && *score == 12, "the board lives in the sorted set board:weekly with the player as member and the total as score; keys: %s, ana's score there: %v (present: %v)", harness::ShowValue(ctx.Redis.Keys("*")), score.value_or(0), score.has_value());
   ctx.Equal(ctx.Redis.Keys("*"), std::vector<std::string>{"board:weekly"}, "one key per board, named board:{board}: the keys");
-  ctx.Equal(lbAdd(ctx, "monthly", "ana", 100), 100, "the same player on another board starts from 0 there");
-  ctx.Equal(lbRank(ctx, "weekly", "ana"), std::optional<LbStanding>(LbStanding{1, 12}), "monthly points must not touch weekly: ana still leads weekly with 12");
-  ctx.Equal(lbRank(ctx, "monthly", "ana"), std::optional<LbStanding>(LbStanding{1, 100}), "ana's standing on monthly");
-  ctx.Equal(lbTop(ctx, "weekly", 5), LbRows{{"ana", 12, 1}, {"bo", 5, 2}}, "top reflects the accumulated totals");
+  ctx.Equal(hLbAdd(ctx, "monthly", "ana", 100), 100, "the same player on another board starts from 0 there");
+  ctx.Equal(hLbRank(ctx, "weekly", "ana"), std::optional<HLbStanding>(HLbStanding{1, 12}), "monthly points must not touch weekly: ana still leads weekly with 12");
+  ctx.Equal(hLbRank(ctx, "monthly", "ana"), std::optional<HLbStanding>(HLbStanding{1, 100}), "ana's standing on monthly");
+  ctx.Equal(hLbTop(ctx, "weekly", 5), HLbRows{{"ana", 12, 1}, {"bo", 5, 2}}, "top reflects the accumulated totals");
 }
 
 void CheckRemove(harness::Ctx& ctx) {
-  lbSeed(ctx, "weekly", lbFive);
-  lbSeed(ctx, "monthly", {{"bo", 5}});
-  ctx.Equal(lbRemove(ctx, "weekly", "bo"), true, "removing a player who is on the board returns true");
-  ctx.Equal(lbRank(ctx, "weekly", "bo"), std::optional<LbStanding>(), "after remove the player has no rank on that board");
-  ctx.Equal(lbTop(ctx, "weekly", 5), LbRows{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}, {"cy", 10, 4}}, "with the leader gone everyone moves up one rank");
-  ctx.Equal(lbAround(ctx, "weekly", "ana", 1), LbRows{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}}, "around reflects the new ranks too");
-  ctx.Equal(lbRemove(ctx, "weekly", "bo"), false, "removing a player a second time returns false: there was nothing to remove");
-  ctx.Equal(lbRemove(ctx, "weekly", "ghost"), false, "removing a player who never scored returns false");
-  ctx.Equal(lbRank(ctx, "monthly", "bo"), std::optional<LbStanding>(LbStanding{1, 5}), "remove touches one board only: bo is still on monthly");
-  ctx.Equal(lbAdd(ctx, "weekly", "bo", 1), 1, "a removed player who scores again starts from 0");
+  hLbSeed(ctx, "weekly", kHLbFive);
+  hLbSeed(ctx, "monthly", {{"bo", 5}});
+  ctx.Equal(hLbRemove(ctx, "weekly", "bo"), true, "removing a player who is on the board returns true");
+  ctx.Equal(hLbRank(ctx, "weekly", "bo"), std::optional<HLbStanding>(), "after remove the player has no rank on that board");
+  ctx.Equal(hLbTop(ctx, "weekly", 5), HLbRows{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}, {"cy", 10, 4}}, "with the leader gone everyone moves up one rank");
+  ctx.Equal(hLbAround(ctx, "weekly", "ana", 1), HLbRows{{"dee", 60, 1}, {"ana", 40, 2}, {"eli", 25, 3}}, "around reflects the new ranks too");
+  ctx.Equal(hLbRemove(ctx, "weekly", "bo"), false, "removing a player a second time returns false: there was nothing to remove");
+  ctx.Equal(hLbRemove(ctx, "weekly", "ghost"), false, "removing a player who never scored returns false");
+  ctx.Equal(hLbRank(ctx, "monthly", "bo"), std::optional<HLbStanding>(HLbStanding{1, 5}), "remove touches one board only: bo is still on monthly");
+  ctx.Equal(hLbAdd(ctx, "weekly", "bo", 1), 1, "a removed player who scores again starts from 0");
 }
 `,
   },

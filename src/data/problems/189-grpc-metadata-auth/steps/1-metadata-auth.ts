@@ -1003,19 +1003,19 @@ import (
 )
 
 const (
-	readerAuth = "Bearer reader-7f3a"
-	adminAuth  = "Bearer admin-91c2"
+	kHReaderAuth = "Bearer reader-7f3a"
+	kHAdminAuth  = "Bearer admin-91c2"
 )
 
-var notesSeed = map[string]string{"n-1": "buy milk", "n-2": "ship the release notes", "n-3": "rotate the admin token"}
+var hNotesSeed = map[string]string{"n-1": "buy milk", "n-2": "ship the release notes", "n-3": "rotate the admin token"}
 
 // badCredential is what a caller sent: every one of them must be Unauthenticated.
-type badCredential struct {
+type HBadCredential struct {
 	label string
 	md    []string // metadata pairs
 }
 
-var badCredentials = []badCredential{
+var hBadCredentials = []HBadCredential{
 	{"no authorization", nil},
 	{"an empty authorization", []string{"authorization", ""}},
 	{"a bare token", []string{"authorization", "reader-7f3a"}},
@@ -1024,29 +1024,29 @@ var badCredentials = []badCredential{
 	{"'Bearer ' with no token", []string{"authorization", "Bearer "}},
 	{"an unknown token", []string{"authorization", "Bearer guest-0000"}},
 	{"a known token with a suffix", []string{"authorization", "Bearer admin-91c2x"}},
-	{"the admin credentials under another key", []string{"token", adminAuth}},
+	{"the admin credentials under another key", []string{"token", kHAdminAuth}},
 }
 
 // notesAt is the learner's server, its notes seeded, served on notes:50051, and a client on it.
-type notesAt struct {
+type HNotesAt struct {
 	srv    *notesServer
 	client pb.NotesClient
 }
 
-func startNotes(ctx *harness.Ctx) *notesAt {
-	srv := &notesServer{notes: copyNotes(notesSeed)}
+func hStartNotes(ctx *harness.Ctx) *HNotesAt {
+	srv := &notesServer{notes: hCopyNotes(hNotesSeed)}
 	pb.RegisterNotesServer(ctx.GRPC.Server("notes:50051"), srv)
-	return &notesAt{srv: srv, client: pb.NewNotesClient(ctx.GRPC.Dial("notes:50051"))}
+	return &HNotesAt{srv: srv, client: pb.NewNotesClient(ctx.GRPC.Dial("notes:50051"))}
 }
 
 // stored is the server's notes now.
-func (n *notesAt) stored() map[string]string {
+func (n *HNotesAt) stored() map[string]string {
 	n.srv.mu.Lock()
 	defer n.srv.mu.Unlock()
-	return copyNotes(n.srv.notes)
+	return hCopyNotes(n.srv.notes)
 }
 
-func copyNotes(notes map[string]string) map[string]string {
+func hCopyNotes(notes map[string]string) map[string]string {
 	out := make(map[string]string, len(notes))
 	for id, text := range notes {
 		out[id] = text
@@ -1055,17 +1055,17 @@ func copyNotes(notes map[string]string) map[string]string {
 }
 
 // notesReply is the outcome of one call: its code, details, and the reply when it is OK.
-type notesReply struct {
+type HNotesReply struct {
 	code    codes.Code
 	details string
 	note    *pb.Note
 	deleted *pb.DeleteNoteResponse
 }
 
-func (n *notesAt) call(method, id string, pairs ...string) notesReply {
+func (n *HNotesAt) call(method, id string, pairs ...string) HNotesReply {
 	c, cancel := context.WithTimeout(metadata.NewOutgoingContext(context.Background(), metadata.Pairs(pairs...)), 2*time.Second)
 	defer cancel()
-	var r notesReply
+	var r HNotesReply
 	var err error
 	if method == "GetNote" {
 		r.note, err = n.client.GetNote(c, &pb.GetNoteRequest{Id: id})
@@ -1077,50 +1077,50 @@ func (n *notesAt) call(method, id string, pairs ...string) notesReply {
 }
 
 func CheckReaderReads(ctx *harness.Ctx) {
-	n := startNotes(ctx)
+	n := hStartNotes(ctx)
 	for _, id := range []string{"n-1", "n-2"} {
-		r := n.call("GetNote", id, "authorization", readerAuth)
-		ctx.Equal(r.code, codes.OK, "GetNote(%s) with %q (%s)", id, readerAuth, r.details)
-		ctx.Equal([]string{r.note.GetId(), r.note.GetText()}, []string{id, notesSeed[id]}, "GetNote(%s) must answer Note{%s, %q}; id and text", id, id, notesSeed[id])
+		r := n.call("GetNote", id, "authorization", kHReaderAuth)
+		ctx.Equal(r.code, codes.OK, "GetNote(%s) with %q (%s)", id, kHReaderAuth, r.details)
+		ctx.Equal([]string{r.note.GetId(), r.note.GetText()}, []string{id, hNotesSeed[id]}, "GetNote(%s) must answer Note{%s, %q}; id and text", id, id, hNotesSeed[id])
 	}
-	r := n.call("GetNote", "n-3", "authorization", adminAuth)
+	r := n.call("GetNote", "n-3", "authorization", kHAdminAuth)
 	ctx.Equal(r.code, codes.OK, "the admin token holds notes.read too, but GetNote(n-3) failed (%s)", r.details)
-	ctx.Equal(r.note.GetText(), notesSeed["n-3"], "GetNote(n-3)'s text")
-	ctx.Equal(n.stored(), notesSeed, "reading must not change the notes")
+	ctx.Equal(r.note.GetText(), hNotesSeed["n-3"], "GetNote(n-3)'s text")
+	ctx.Equal(n.stored(), hNotesSeed, "reading must not change the notes")
 }
 
 func CheckUnauthenticated(ctx *harness.Ctx) {
-	n := startNotes(ctx)
-	for _, bad := range badCredentials {
+	n := hStartNotes(ctx)
+	for _, bad := range hBadCredentials {
 		for _, method := range []string{"GetNote", "DeleteNote"} {
 			r := n.call(method, "n-1", bad.md...)
 			ctx.Equal(r.code, codes.Unauthenticated, "%s(n-1) with %s %q (%s)", method, bad.label, bad.md, r.details)
 		}
 	}
-	ctx.Equal(n.stored(), notesSeed, "no unauthenticated call may delete anything: the notes")
+	ctx.Equal(n.stored(), hNotesSeed, "no unauthenticated call may delete anything: the notes")
 }
 
 func CheckPermissionDenied(ctx *harness.Ctx) {
-	n := startNotes(ctx)
-	r := n.call("DeleteNote", "n-2", "authorization", readerAuth)
+	n := hStartNotes(ctx)
+	r := n.call("DeleteNote", "n-2", "authorization", kHReaderAuth)
 	ctx.Equal(r.code, codes.PermissionDenied, "DeleteNote(n-2) with the reader token (%s): the token is known, it lacks notes.write", r.details)
-	ctx.Equal(n.stored()["n-2"], notesSeed["n-2"], "a PermissionDenied delete must leave the note in the notes")
-	read := n.call("GetNote", "n-2", "authorization", readerAuth)
-	ctx.Assert(read.code == codes.OK && read.note.GetText() == notesSeed["n-2"], "after the refused delete the reader must still read n-2, got %v (%s)", read.code, read.details)
+	ctx.Equal(n.stored()["n-2"], hNotesSeed["n-2"], "a PermissionDenied delete must leave the note in the notes")
+	read := n.call("GetNote", "n-2", "authorization", kHReaderAuth)
+	ctx.Assert(read.code == codes.OK && read.note.GetText() == hNotesSeed["n-2"], "after the refused delete the reader must still read n-2, got %v (%s)", read.code, read.details)
 	for _, c := range [][2]string{{"ghost", "a missing note"}, {"", "an empty id"}} {
-		r = n.call("DeleteNote", c[0], "authorization", readerAuth)
+		r = n.call("DeleteNote", c[0], "authorization", kHReaderAuth)
 		ctx.Equal(r.code, codes.PermissionDenied, "the reader's DeleteNote of %s (%s): authorize before you validate or look up", c[1], r.details)
 	}
-	ctx.Equal(n.stored(), notesSeed, "the reader must not be able to delete anything: the notes")
+	ctx.Equal(n.stored(), hNotesSeed, "the reader must not be able to delete anything: the notes")
 }
 
 func CheckAuthFirst(ctx *harness.Ctx) {
-	n := startNotes(ctx)
-	r := n.call("GetNote", "", "authorization", readerAuth)
+	n := hStartNotes(ctx)
+	r := n.call("GetNote", "", "authorization", kHReaderAuth)
 	ctx.Equal(r.code, codes.InvalidArgument, "GetNote with an empty id and valid credentials (%s)", r.details)
-	r = n.call("GetNote", "ghost", "authorization", readerAuth)
+	r = n.call("GetNote", "ghost", "authorization", kHReaderAuth)
 	ctx.Equal(r.code, codes.NotFound, "GetNote(ghost) with valid credentials (%s)", r.details)
-	for _, bad := range []badCredential{badCredentials[0], badCredentials[2], badCredentials[6]} {
+	for _, bad := range []HBadCredential{hBadCredentials[0], hBadCredentials[2], hBadCredentials[6]} {
 		for _, method := range []string{"GetNote", "DeleteNote"} {
 			exists := n.call(method, "n-1", bad.md...)
 			for _, c := range [][2]string{{"ghost", "a missing note"}, {"", "an empty id"}} {
@@ -1130,24 +1130,24 @@ func CheckAuthFirst(ctx *harness.Ctx) {
 			}
 		}
 	}
-	ctx.Equal(n.stored(), notesSeed, "no unauthenticated call may delete anything: the notes")
+	ctx.Equal(n.stored(), hNotesSeed, "no unauthenticated call may delete anything: the notes")
 }
 
 func CheckAdminDeletes(ctx *harness.Ctx) {
-	n := startNotes(ctx)
-	r := n.call("DeleteNote", "n-3", "authorization", adminAuth)
+	n := hStartNotes(ctx)
+	r := n.call("DeleteNote", "n-3", "authorization", kHAdminAuth)
 	ctx.Equal(r.code, codes.OK, "DeleteNote(n-3) with the admin token (%s)", r.details)
 	ctx.Equal(r.deleted.GetDeleted(), true, "DeleteNote must answer Deleted: true, got %v", r.deleted)
 	_, kept := n.stored()["n-3"]
 	ctx.Assert(!kept, "after the admin's delete n-3 must be gone from the notes")
-	ctx.Equal(n.stored(), map[string]string{"n-1": notesSeed["n-1"], "n-2": notesSeed["n-2"]}, "only n-3 may be deleted: the notes")
-	for _, token := range []string{adminAuth, readerAuth} {
+	ctx.Equal(n.stored(), map[string]string{"n-1": hNotesSeed["n-1"], "n-2": hNotesSeed["n-2"]}, "only n-3 may be deleted: the notes")
+	for _, token := range []string{kHAdminAuth, kHReaderAuth} {
 		r = n.call("GetNote", "n-3", "authorization", token)
 		ctx.Equal(r.code, codes.NotFound, "GetNote(n-3) after the delete with %q (%s)", token, r.details)
 	}
-	r = n.call("DeleteNote", "n-3", "authorization", adminAuth)
+	r = n.call("DeleteNote", "n-3", "authorization", kHAdminAuth)
 	ctx.Equal(r.code, codes.NotFound, "deleting n-3 a second time (%s)", r.details)
-	r = n.call("DeleteNote", "", "authorization", adminAuth)
+	r = n.call("DeleteNote", "", "authorization", kHAdminAuth)
 	ctx.Equal(r.code, codes.InvalidArgument, "the admin's DeleteNote with an empty id (%s)", r.details)
 }
 `,
@@ -1162,20 +1162,20 @@ func CheckAdminDeletes(ctx *harness.Ctx) {
 
 namespace {
 
-using NotesMap = std::map<std::string, std::string>;
+using HNotesMap = std::map<std::string, std::string>;
 
-const std::string kReaderAuth = "Bearer reader-7f3a";
-const std::string kAdminAuth = "Bearer admin-91c2";
+const std::string kHReaderAuth = "Bearer reader-7f3a";
+const std::string kHAdminAuth = "Bearer admin-91c2";
 
-const NotesMap kNotesSeed = {{"n-1", "buy milk"}, {"n-2", "ship the release notes"}, {"n-3", "rotate the admin token"}};
+const HNotesMap kHNotesSeed = {{"n-1", "buy milk"}, {"n-2", "ship the release notes"}, {"n-3", "rotate the admin token"}};
 
 // What a caller sent: every one of them must be UNAUTHENTICATED.
-struct BadCredential {
+struct HBadCredential {
   std::string label;
   std::vector<std::string> md;  // metadata pairs
 };
 
-const std::vector<BadCredential> kBadCredentials = {
+const std::vector<HBadCredential> kHBadCredentials = {
     {"no authorization", {}},
     {"an empty authorization", {"authorization", ""}},
     {"a bare token", {"authorization", "reader-7f3a"}},
@@ -1184,51 +1184,51 @@ const std::vector<BadCredential> kBadCredentials = {
     {"'Bearer ' with no token", {"authorization", "Bearer "}},
     {"an unknown token", {"authorization", "Bearer guest-0000"}},
     {"a known token with a suffix", {"authorization", "Bearer admin-91c2x"}},
-    {"the admin credentials under another key", {"token", kAdminAuth}},
+    {"the admin credentials under another key", {"token", kHAdminAuth}},
 };
 
 // NotesImpl keeps its notes private; the harness seeds and reads them as whoever runs the server does.
-NotesMap NotesImpl::* NotesField();
-std::mutex NotesImpl::* NotesMutex();
-template <NotesMap NotesImpl::* Notes, std::mutex NotesImpl::* Mu>
-struct NotesAccess {
-  friend NotesMap NotesImpl::* NotesField() { return Notes; }
-  friend std::mutex NotesImpl::* NotesMutex() { return Mu; }
+HNotesMap NotesImpl::* hNotesField();
+std::mutex NotesImpl::* hNotesMutex();
+template <HNotesMap NotesImpl::* Notes, std::mutex NotesImpl::* Mu>
+struct HNotesAccess {
+  friend HNotesMap NotesImpl::* hNotesField() { return Notes; }
+  friend std::mutex NotesImpl::* hNotesMutex() { return Mu; }
 };
-template struct NotesAccess<&NotesImpl::notes_, &NotesImpl::mu_>;
+template struct HNotesAccess<&NotesImpl::notes_, &NotesImpl::mu_>;
 
 // The learner's server, its notes seeded, served on notes:50051, and a client on it.
-struct NotesAt {
+struct HNotesAt {
   NotesImpl* srv;
   std::unique_ptr<notes::v1::Notes::Stub> client;
 
   // The server's notes now.
-  NotesMap Stored() {
-    std::lock_guard<std::mutex> lock(srv->*NotesMutex());
-    return srv->*NotesField();
+  HNotesMap Stored() {
+    std::lock_guard<std::mutex> lock(srv->*hNotesMutex());
+    return srv->*hNotesField();
   }
 };
 
-NotesAt StartNotes(harness::Ctx& ctx) {
+HNotesAt hStartNotes(harness::Ctx& ctx) {
   auto* srv = new NotesImpl();
-  srv->*NotesField() = kNotesSeed;
+  srv->*hNotesField() = kHNotesSeed;
   ctx.GRPC.Server("notes:50051")->RegisterService(srv);
   return {srv, notes::v1::Notes::NewStub(ctx.GRPC.Dial("notes:50051"))};
 }
 
 // The outcome of one call: its code, details, and the reply when it is OK.
-struct NotesReply {
+struct HNotesReply {
   grpc::StatusCode code;
   std::string details;
   notes::v1::Note note;
   notes::v1::DeleteNoteResponse deleted;
 };
 
-NotesReply CallNotes(NotesAt& n, const std::string& method, const std::string& id, const std::vector<std::string>& pairs) {
+HNotesReply hCallNotes(HNotesAt& n, const std::string& method, const std::string& id, const std::vector<std::string>& pairs) {
   grpc::ClientContext c;
   for (size_t i = 0; i + 1 < pairs.size(); i += 2) c.AddMetadata(pairs[i], pairs[i + 1]);
   c.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
-  NotesReply r;
+  HNotesReply r;
   grpc::Status status;
   if (method == "GetNote") {
     notes::v1::GetNoteRequest request;
@@ -1247,58 +1247,58 @@ NotesReply CallNotes(NotesAt& n, const std::string& method, const std::string& i
 }  // namespace
 
 void CheckReaderReads(harness::Ctx& ctx) {
-  NotesAt n = StartNotes(ctx);
+  HNotesAt n = hStartNotes(ctx);
   for (const std::string id : {"n-1", "n-2"}) {
-    NotesReply r = CallNotes(n, "GetNote", id, {"authorization", kReaderAuth});
-    ctx.Equal(r.code, grpc::StatusCode::OK, "GetNote(%s) with %q (%s)", id, kReaderAuth, r.details);
-    ctx.Equal(std::vector<std::string>{r.note.id(), r.note.text()}, std::vector<std::string>{id, kNotesSeed.at(id)},
-              "GetNote(%s) must answer Note{%s, %q}; id and text", id, id, kNotesSeed.at(id));
+    HNotesReply r = hCallNotes(n, "GetNote", id, {"authorization", kHReaderAuth});
+    ctx.Equal(r.code, grpc::StatusCode::OK, "GetNote(%s) with %q (%s)", id, kHReaderAuth, r.details);
+    ctx.Equal(std::vector<std::string>{r.note.id(), r.note.text()}, std::vector<std::string>{id, kHNotesSeed.at(id)},
+              "GetNote(%s) must answer Note{%s, %q}; id and text", id, id, kHNotesSeed.at(id));
   }
-  NotesReply r = CallNotes(n, "GetNote", "n-3", {"authorization", kAdminAuth});
+  HNotesReply r = hCallNotes(n, "GetNote", "n-3", {"authorization", kHAdminAuth});
   ctx.Equal(r.code, grpc::StatusCode::OK, "the admin token holds notes.read too, but GetNote(n-3) failed (%s)", r.details);
-  ctx.Equal(r.note.text(), kNotesSeed.at("n-3"), "GetNote(n-3)'s text");
-  ctx.Equal(n.Stored(), kNotesSeed, "reading must not change the notes");
+  ctx.Equal(r.note.text(), kHNotesSeed.at("n-3"), "GetNote(n-3)'s text");
+  ctx.Equal(n.Stored(), kHNotesSeed, "reading must not change the notes");
 }
 
 void CheckUnauthenticated(harness::Ctx& ctx) {
-  NotesAt n = StartNotes(ctx);
-  for (const BadCredential& bad : kBadCredentials) {
+  HNotesAt n = hStartNotes(ctx);
+  for (const HBadCredential& bad : kHBadCredentials) {
     for (const std::string method : {"GetNote", "DeleteNote"}) {
-      NotesReply r = CallNotes(n, method, "n-1", bad.md);
+      HNotesReply r = hCallNotes(n, method, "n-1", bad.md);
       ctx.Equal(r.code, grpc::StatusCode::UNAUTHENTICATED, "%s(n-1) with %s %q (%s)", method, bad.label, bad.md, r.details);
     }
   }
-  ctx.Equal(n.Stored(), kNotesSeed, "no unauthenticated call may delete anything: the notes");
+  ctx.Equal(n.Stored(), kHNotesSeed, "no unauthenticated call may delete anything: the notes");
 }
 
 void CheckPermissionDenied(harness::Ctx& ctx) {
-  NotesAt n = StartNotes(ctx);
-  NotesReply r = CallNotes(n, "DeleteNote", "n-2", {"authorization", kReaderAuth});
+  HNotesAt n = hStartNotes(ctx);
+  HNotesReply r = hCallNotes(n, "DeleteNote", "n-2", {"authorization", kHReaderAuth});
   ctx.Equal(r.code, grpc::StatusCode::PERMISSION_DENIED,
             "DeleteNote(n-2) with the reader token (%s): the token is known, it lacks notes.write", r.details);
-  ctx.Equal(n.Stored()["n-2"], kNotesSeed.at("n-2"), "a PERMISSION_DENIED delete must leave the note in the notes");
-  NotesReply read = CallNotes(n, "GetNote", "n-2", {"authorization", kReaderAuth});
-  ctx.Assert(read.code == grpc::StatusCode::OK && read.note.text() == kNotesSeed.at("n-2"),
+  ctx.Equal(n.Stored()["n-2"], kHNotesSeed.at("n-2"), "a PERMISSION_DENIED delete must leave the note in the notes");
+  HNotesReply read = hCallNotes(n, "GetNote", "n-2", {"authorization", kHReaderAuth});
+  ctx.Assert(read.code == grpc::StatusCode::OK && read.note.text() == kHNotesSeed.at("n-2"),
              "after the refused delete the reader must still read n-2, got %v (%s)", read.code, read.details);
   for (const auto& [id, what] : std::vector<std::pair<std::string, std::string>>{{"ghost", "a missing note"}, {"", "an empty id"}}) {
-    r = CallNotes(n, "DeleteNote", id, {"authorization", kReaderAuth});
+    r = hCallNotes(n, "DeleteNote", id, {"authorization", kHReaderAuth});
     ctx.Equal(r.code, grpc::StatusCode::PERMISSION_DENIED,
               "the reader's DeleteNote of %s (%s): authorize before you validate or look up", what, r.details);
   }
-  ctx.Equal(n.Stored(), kNotesSeed, "the reader must not be able to delete anything: the notes");
+  ctx.Equal(n.Stored(), kHNotesSeed, "the reader must not be able to delete anything: the notes");
 }
 
 void CheckAuthFirst(harness::Ctx& ctx) {
-  NotesAt n = StartNotes(ctx);
-  NotesReply r = CallNotes(n, "GetNote", "", {"authorization", kReaderAuth});
+  HNotesAt n = hStartNotes(ctx);
+  HNotesReply r = hCallNotes(n, "GetNote", "", {"authorization", kHReaderAuth});
   ctx.Equal(r.code, grpc::StatusCode::INVALID_ARGUMENT, "GetNote with an empty id and valid credentials (%s)", r.details);
-  r = CallNotes(n, "GetNote", "ghost", {"authorization", kReaderAuth});
+  r = hCallNotes(n, "GetNote", "ghost", {"authorization", kHReaderAuth});
   ctx.Equal(r.code, grpc::StatusCode::NOT_FOUND, "GetNote(ghost) with valid credentials (%s)", r.details);
-  for (const BadCredential& bad : {kBadCredentials[0], kBadCredentials[2], kBadCredentials[6]}) {
+  for (const HBadCredential& bad : {kHBadCredentials[0], kHBadCredentials[2], kHBadCredentials[6]}) {
     for (const std::string method : {"GetNote", "DeleteNote"}) {
-      NotesReply exists = CallNotes(n, method, "n-1", bad.md);
+      HNotesReply exists = hCallNotes(n, method, "n-1", bad.md);
       for (const auto& [id, what] : std::vector<std::pair<std::string, std::string>>{{"ghost", "a missing note"}, {"", "an empty id"}}) {
-        r = CallNotes(n, method, id, bad.md);
+        r = hCallNotes(n, method, id, bad.md);
         ctx.Equal(r.code, grpc::StatusCode::UNAUTHENTICATED,
                   "%s of %s with %s (%s): authenticate before you validate or look up", method, what, bad.label, r.details);
         ctx.Equal(std::vector<std::string>{grpc::EnumName(r.code), r.details},
@@ -1307,23 +1307,23 @@ void CheckAuthFirst(harness::Ctx& ctx) {
       }
     }
   }
-  ctx.Equal(n.Stored(), kNotesSeed, "no unauthenticated call may delete anything: the notes");
+  ctx.Equal(n.Stored(), kHNotesSeed, "no unauthenticated call may delete anything: the notes");
 }
 
 void CheckAdminDeletes(harness::Ctx& ctx) {
-  NotesAt n = StartNotes(ctx);
-  NotesReply r = CallNotes(n, "DeleteNote", "n-3", {"authorization", kAdminAuth});
+  HNotesAt n = hStartNotes(ctx);
+  HNotesReply r = hCallNotes(n, "DeleteNote", "n-3", {"authorization", kHAdminAuth});
   ctx.Equal(r.code, grpc::StatusCode::OK, "DeleteNote(n-3) with the admin token (%s)", r.details);
   ctx.Equal(r.deleted.deleted(), true, "DeleteNote must answer deleted: true, got {%s}", r.deleted.ShortDebugString());
   ctx.Assert(n.Stored().count("n-3") == 0, "after the admin's delete n-3 must be gone from the notes");
-  ctx.Equal(n.Stored(), NotesMap{{"n-1", kNotesSeed.at("n-1")}, {"n-2", kNotesSeed.at("n-2")}}, "only n-3 may be deleted: the notes");
-  for (const std::string& token : {kAdminAuth, kReaderAuth}) {
-    r = CallNotes(n, "GetNote", "n-3", {"authorization", token});
+  ctx.Equal(n.Stored(), HNotesMap{{"n-1", kHNotesSeed.at("n-1")}, {"n-2", kHNotesSeed.at("n-2")}}, "only n-3 may be deleted: the notes");
+  for (const std::string& token : {kHAdminAuth, kHReaderAuth}) {
+    r = hCallNotes(n, "GetNote", "n-3", {"authorization", token});
     ctx.Equal(r.code, grpc::StatusCode::NOT_FOUND, "GetNote(n-3) after the delete with %q (%s)", token, r.details);
   }
-  r = CallNotes(n, "DeleteNote", "n-3", {"authorization", kAdminAuth});
+  r = hCallNotes(n, "DeleteNote", "n-3", {"authorization", kHAdminAuth});
   ctx.Equal(r.code, grpc::StatusCode::NOT_FOUND, "deleting n-3 a second time (%s)", r.details);
-  r = CallNotes(n, "DeleteNote", "", {"authorization", kAdminAuth});
+  r = hCallNotes(n, "DeleteNote", "", {"authorization", kHAdminAuth});
   ctx.Equal(r.code, grpc::StatusCode::INVALID_ARGUMENT, "the admin's DeleteNote with an empty id (%s)", r.details);
 }
 `,

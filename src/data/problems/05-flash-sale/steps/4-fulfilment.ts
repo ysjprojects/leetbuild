@@ -1229,40 +1229,40 @@ import (
 	pb "flashsale/gen/warehouse"
 )
 
-const phantomSKU = "phantom-9"
+const kHPhantomSKU = "phantom-9"
 
 // allocation is what the warehouse peer was asked to allocate.
-type allocation struct {
+type HAllocation struct {
 	orderID string
 	sku     string
 	qty     uint32
 }
 
 // warehousePeer has no physical stock for phantom-9 and allocates everything else.
-type warehousePeer struct {
+type HWarehousePeer struct {
 	pb.UnimplementedWarehouseServer
-	allocated []allocation
+	allocated []HAllocation
 }
 
-func (w *warehousePeer) Allocate(_ context.Context, req *pb.AllocateRequest) (*pb.AllocateReply, error) {
-	if req.Sku == phantomSKU {
+func (w *HWarehousePeer) Allocate(_ context.Context, req *pb.AllocateRequest) (*pb.AllocateReply, error) {
+	if req.Sku == kHPhantomSKU {
 		return nil, status.Error(codes.FailedPrecondition, "no physical stock")
 	}
-	w.allocated = append(w.allocated, allocation{req.OrderId, req.Sku, req.Qty})
+	w.allocated = append(w.allocated, HAllocation{req.OrderId, req.Sku, req.Qty})
 	return &pb.AllocateReply{ShipmentId: "ship-" + req.OrderId}, nil
 }
 
 // outcome is one call the consumer made to confirm, release or publishFailed.
-type outcome struct {
+type HOutcome struct {
 	kind    string
 	orderID string
 	order   Order
 }
 
 // fulfilmentLog records the calls to the stand-ins for confirm, release (step 5) and publishFailed.
-type fulfilmentLog struct{ entries []outcome }
+type HFulfilmentLog struct{ entries []HOutcome }
 
-func (l *fulfilmentLog) ids(kind string) []string {
+func (l *HFulfilmentLog) ids(kind string) []string {
 	var out []string
 	for _, e := range l.entries {
 		if e.kind == kind {
@@ -1272,31 +1272,31 @@ func (l *fulfilmentLog) ids(kind string) []string {
 	return out
 }
 
-func orderFor(orderID, sku string) Order { return Order{OrderID: orderID, SKU: sku, Qty: 2} }
+func hOrderFor(orderID, sku string) Order { return Order{OrderID: orderID, SKU: sku, Qty: 2} }
 
 // seedOrders puts orders on the orders topic as the checkout API writes them: keyed by sku.
-func seedOrders(ctx *harness.Ctx, orders ...Order) {
+func hSeedOrders(ctx *harness.Ctx, orders ...Order) {
 	for _, o := range orders {
 		ctx.Kafka.Seed("orders", o.SKU, map[string]any{"order_id": o.OrderID, "sku": o.SKU, "qty": o.Qty, "user": "ada"})
 	}
 }
 
 // fulfilment seeds orders, serves the warehouse peer and records the provided services.
-func fulfilment(ctx *harness.Ctx, orders ...Order) (*warehousePeer, *fulfilmentLog) {
-	seedOrders(ctx, orders...)
-	peer := &warehousePeer{}
+func hFulfilment(ctx *harness.Ctx, orders ...Order) (*HWarehousePeer, *HFulfilmentLog) {
+	hSeedOrders(ctx, orders...)
+	peer := &HWarehousePeer{}
 	pb.RegisterWarehouseServer(ctx.GRPC.Server(""), peer)
-	l := &fulfilmentLog{}
+	l := &HFulfilmentLog{}
 	confirm = func(_ context.Context, orderID string) error {
-		l.entries = append(l.entries, outcome{kind: "confirm", orderID: orderID})
+		l.entries = append(l.entries, HOutcome{kind: "confirm", orderID: orderID})
 		return nil
 	}
 	release = func(_ context.Context, orderID string) error {
-		l.entries = append(l.entries, outcome{kind: "release", orderID: orderID})
+		l.entries = append(l.entries, HOutcome{kind: "release", orderID: orderID})
 		return nil
 	}
 	publishFailed = func(_ context.Context, order Order) error {
-		l.entries = append(l.entries, outcome{kind: "failed", orderID: order.OrderID, order: order})
+		l.entries = append(l.entries, HOutcome{kind: "failed", orderID: order.OrderID, order: order})
 		return nil
 	}
 	return peer, l
@@ -1305,7 +1305,7 @@ func fulfilment(ctx *harness.Ctx, orders ...Order) (*warehousePeer, *fulfilmentL
 // drainRun runs the consume loop until it returns or waits for records that will not come, then
 // stops it (cancelling its context) so a later run is the only one reading. It returns run's error
 // when run returned by itself.
-func drainRun(ctx *harness.Ctx) error {
+func hDrainRun(ctx *harness.Ctx) error {
 	runCtx, cancel := context.WithCancel(context.Background())
 	var err error
 	returned := ctx.Drain(func() { err = run(runCtx) })
@@ -1318,8 +1318,8 @@ func drainRun(ctx *harness.Ctx) error {
 }
 
 func CheckGroupManualCommit(ctx *harness.Ctx) {
-	fulfilment(ctx, orderFor("o1", "shoe-42"))
-	drainRun(ctx)
+	hFulfilment(ctx, hOrderFor("o1", "shoe-42"))
+	hDrainRun(ctx)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
 	last := subscriptions[len(subscriptions)-1]
@@ -1331,8 +1331,8 @@ func CheckGroupManualCommit(ctx *harness.Ctx) {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	fulfilment(ctx, orderFor("o1", "shoe-42"))
-	drainRun(ctx)
+	hFulfilment(ctx, hOrderFor("o1", "shoe-42"))
+	hDrainRun(ctx)
 	calls := ctx.GRPC.CallsTo("Allocate", "")
 	ctx.Assert(len(calls) > 0, "no Allocate RPC reached the warehouse")
 	last := calls[len(calls)-1]
@@ -1341,34 +1341,34 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(4 < timeout && timeout <= 5, "the deadline is %v s, expected 5 s", timeout)
 	ctx.GRPC.SetLatency("Allocate", 30, "")
 	before := len(calls)
-	_, err := allocate(context.Background(), orderFor("o2", "shoe-42"))
+	_, err := allocate(context.Background(), hOrderFor("o2", "shoe-42"))
 	ctx.Assert(err != nil, "a warehouse slower than the deadline must fail with DeadlineExceeded, not succeed")
 	ctx.Equal(status.Code(err), codes.DeadlineExceeded, "the code a slow warehouse failed with")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), before+1, "DeadlineExceeded must not be retried: Allocate calls")
 }
 
 func CheckBackoffBounded(ctx *harness.Ctx) {
-	peer, _ := fulfilment(ctx)
+	peer, _ := hFulfilment(ctx)
 	ctx.GRPC.Fail("Allocate", codes.Unavailable, "", 2, "")
 	started := ctx.Clock.Now()
-	ok, err := allocate(context.Background(), orderFor("o1", "shoe-42"))
+	ok, err := allocate(context.Background(), hOrderFor("o1", "shoe-42"))
 	ctx.NoError(err, "two Unavailable answers followed by success must end as allocated")
 	ctx.Equal(ok, true, "two Unavailable answers followed by success must end as allocated")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), 3, "Allocate calls (two Unavailable, then success)")
 	ctx.Equal(ctx.Clock.Sleeps(), 2, "sleeps before the retries (never before the first call)")
 	waited := ctx.Clock.Now() - started
 	ctx.Assert(740 <= waited && waited <= 900, "waited %d ms across two retries, expected 250 + 500 = 750 ms (backoff << (attempt-1))", waited)
-	ctx.Equal(peer.allocated, []allocation{{"o1", "shoe-42", 2}}, "the warehouse must see the order's id, sku and qty")
+	ctx.Equal(peer.allocated, []HAllocation{{"o1", "shoe-42", 2}}, "the warehouse must see the order's id, sku and qty")
 
 	ctx.GRPC.Fail("Allocate", codes.InvalidArgument, "qty", 1, "")
-	_, err = allocate(context.Background(), orderFor("o2", "shoe-42"))
+	_, err = allocate(context.Background(), hOrderFor("o2", "shoe-42"))
 	ctx.Assert(err != nil, "InvalidArgument must propagate, not be retried or swallowed")
 	ctx.Equal(status.Code(err), codes.InvalidArgument, "InvalidArgument must propagate unchanged: the code")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", "")), 4, "InvalidArgument must not be retried: Allocate calls")
 
 	ctx.GRPC.Fail("Allocate", codes.Unavailable, "", 50, "")
 	started = ctx.Clock.Now()
-	_, err = allocate(context.Background(), orderFor("o3", "shoe-42"))
+	_, err = allocate(context.Background(), hOrderFor("o3", "shoe-42"))
 	ctx.Assert(err != nil, "a warehouse that stays Unavailable must fail after maxAttempts, not succeed")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Allocate", ""))-4, 4, "attempts against a down warehouse")
 	waited = ctx.Clock.Now() - started
@@ -1376,9 +1376,9 @@ func CheckBackoffBounded(ctx *harness.Ctx) {
 }
 
 func CheckNoStock(ctx *harness.Ctx) {
-	ghost := orderFor("o2", phantomSKU)
-	_, l := fulfilment(ctx, orderFor("o1", "shoe-42"), ghost)
-	drainRun(ctx)
+	ghost := hOrderFor("o2", kHPhantomSKU)
+	_, l := hFulfilment(ctx, hOrderFor("o1", "shoe-42"), ghost)
+	hDrainRun(ctx)
 	ctx.Equal(l.ids("release"), []string{"o2"}, "release calls (only the order without physical stock)")
 	var failed []Order
 	for _, e := range l.entries {
@@ -1393,10 +1393,10 @@ func CheckNoStock(ctx *harness.Ctx) {
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	_, l := fulfilment(ctx, orderFor("o1", "shoe-42"))
-	var atCommit [][]outcome
-	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, append([]outcome(nil), l.entries...)) })
-	drainRun(ctx)
+	_, l := hFulfilment(ctx, hOrderFor("o1", "shoe-42"))
+	var atCommit [][]HOutcome
+	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) { atCommit = append(atCommit, append([]HOutcome(nil), l.entries...)) })
+	hDrainRun(ctx)
 	ctx.Equal(l.ids("confirm"), []string{"o1"}, "a successful allocation must confirm the sale: confirm calls")
 	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
 	confirmedFirst := false
@@ -1407,8 +1407,8 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "the handled record must be committed: lag")
 
 	ctx.GRPC.Fail("Allocate", codes.Internal, "warehouse bug", 1, "")
-	seedOrders(ctx, orderFor("o2", "shoe-42"))
-	err := drainRun(ctx)
+	hSeedOrders(ctx, hOrderFor("o2", "shoe-42"))
+	err := hDrainRun(ctx)
 	ctx.Assert(err != nil, "an unexpected status must propagate out of the loop, not be swallowed")
 	ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 1, "a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart: lag")
 	ctx.Assert(!slices.Contains(l.ids("confirm"), "o2") && !slices.Contains(l.ids("release"), "o2"), "an unexpected status must neither confirm nor release the hold")
@@ -1422,18 +1422,18 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string phantomSKU = "phantom-9";
+const std::string kHPhantomSKU = "phantom-9";
 
 // allocation is what the warehouse peer was asked to allocate.
-using allocation = std::tuple<std::string, std::string, uint32_t>;
+using HAllocation = std::tuple<std::string, std::string, uint32_t>;
 
 // warehousePeer has no physical stock for phantom-9 and allocates everything else.
-class warehousePeer final : public flashsale::Warehouse::Service {
+class HWarehousePeer final : public flashsale::Warehouse::Service {
  public:
-  std::vector<allocation> allocated;
+  std::vector<HAllocation> allocated;
 
   grpc::Status Allocate(grpc::ServerContext*, const flashsale::AllocateRequest* req, flashsale::AllocateReply* reply) override {
-    if (req->sku() == phantomSKU) return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "no physical stock");
+    if (req->sku() == kHPhantomSKU) return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION, "no physical stock");
     allocated.emplace_back(req->order_id(), req->sku(), req->qty());
     reply->set_shipment_id("ship-" + req->order_id());
     return grpc::Status::OK;
@@ -1441,15 +1441,15 @@ class warehousePeer final : public flashsale::Warehouse::Service {
 };
 
 // outcome is one call the consumer made to confirm, release or publish_failed.
-struct outcome {
+struct HOutcome {
   std::string kind;
   std::string orderID;
   Order order;
 };
 
 // fulfilmentLog records the calls to the stand-ins for confirm, release (step 5) and publish_failed.
-struct fulfilmentLog {
-  std::vector<outcome> entries;
+struct HFulfilmentLog {
+  std::vector<HOutcome> entries;
   std::vector<std::string> ids(const std::string& kind) const {
     std::vector<std::string> out;
     for (const auto& e : entries) {
@@ -1459,26 +1459,26 @@ struct fulfilmentLog {
   }
 };
 
-fulfilmentLog* activeLog = nullptr;
+HFulfilmentLog* hActiveLog = nullptr;
 
-Order orderFor(const std::string& orderID, const std::string& sku) { return Order{orderID, sku, 2}; }
+Order hOrderFor(const std::string& orderID, const std::string& sku) { return Order{orderID, sku, 2}; }
 
-std::tuple<std::string, std::string, int> orderFields(const Order& o) { return {o.order_id, o.sku, o.qty}; }
+std::tuple<std::string, std::string, int> hOrderFields(const Order& o) { return {o.order_id, o.sku, o.qty}; }
 
 // seedOrders puts orders on the orders topic as the checkout API writes them: keyed by sku.
-void seedOrders(harness::Ctx& ctx, const std::vector<Order>& orders) {
+void hSeedOrders(harness::Ctx& ctx, const std::vector<Order>& orders) {
   for (const auto& o : orders) {
     ctx.Kafka.Seed("orders", o.sku, nlohmann::json{{"order_id", o.order_id}, {"sku", o.sku}, {"qty", o.qty}, {"user", "ada"}}.dump());
   }
 }
 
 // fulfilment seeds orders, serves the warehouse peer and records the provided services.
-std::pair<warehousePeer*, fulfilmentLog*> fulfilment(harness::Ctx& ctx, const std::vector<Order>& orders) {
-  seedOrders(ctx, orders);
-  auto* peer = new warehousePeer();  // the harness owns the implementation for the rest of the check
+std::pair<HWarehousePeer*, HFulfilmentLog*> hFulfilment(harness::Ctx& ctx, const std::vector<Order>& orders) {
+  hSeedOrders(ctx, orders);
+  auto* peer = new HWarehousePeer();  // the harness owns the implementation for the rest of the check
   ctx.GRPC.Server("")->RegisterService(peer);
-  activeLog = new fulfilmentLog();
-  return {peer, activeLog};
+  hActiveLog = new HFulfilmentLog();
+  return {peer, hActiveLog};
 }
 
 // drainRun runs the consume loop until it returns or waits for records that will not come, then
@@ -1486,7 +1486,7 @@ std::pair<warehousePeer*, fulfilmentLog*> fulfilment(harness::Ctx& ctx, const st
 // run() takes no context to cancel (Go's run(ctx) does): destroying the consumer stops the loop for
 // good inside its consume, and the next drain reads with a fresh consumer of the group, from the
 // committed offsets.
-std::optional<std::string> drainRun(harness::Ctx& ctx) {
+std::optional<std::string> hDrainRun(harness::Ctx& ctx) {
   if (!consumer) consumer = make_consumer();
   bool returned = false;
   std::optional<std::string> err;
@@ -1505,12 +1505,12 @@ std::optional<std::string> drainRun(harness::Ctx& ctx) {
 }
 
 // allocate's outcome: whether it allocated, or what it threw (Go's (bool, error)).
-struct allocated {
+struct HAllocated {
   bool ok = false;
   std::optional<std::string> err;
 };
 
-allocated allocateOrder(const Order& order) {
+HAllocated hAllocateOrder(const Order& order) {
   try {
     return {allocate(order), std::nullopt};
   } catch (const std::exception& e) {
@@ -1520,42 +1520,42 @@ allocated allocateOrder(const Order& order) {
 
 // The status the last Allocate call ended with: allocate throws a plain exception, so the code Go
 // reads with status.Code(err) is read off the call itself.
-grpc::StatusCode lastAllocateCode(harness::Ctx& ctx) {
+grpc::StatusCode hLastAllocateCode(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("Allocate", "");
   return calls.empty() ? grpc::StatusCode::OK : calls.back().Code;
 }
 
-bool contains(const std::vector<std::string>& items, const std::string& item) {
+bool hContains(const std::vector<std::string>& items, const std::string& item) {
   return std::find(items.begin(), items.end(), item) != items.end();
 }
 
 }  // namespace
 
 // The provided services, stood in for by the check.
-void confirm(const std::string& order_id) { activeLog->entries.push_back({"confirm", order_id, {}}); }
-void release(const std::string& order_id) { activeLog->entries.push_back({"release", order_id, {}}); }
-void publish_failed(const Order& order) { activeLog->entries.push_back({"failed", order.order_id, order}); }
+void confirm(const std::string& order_id) { hActiveLog->entries.push_back({"confirm", order_id, {}}); }
+void release(const std::string& order_id) { hActiveLog->entries.push_back({"release", order_id, {}}); }
+void publish_failed(const Order& order) { hActiveLog->entries.push_back({"failed", order.order_id, order}); }
 Order parse_order(const RdKafka::Message& msg) {
   const auto doc = nlohmann::json::parse(std::string(static_cast<const char*>(msg.payload()), msg.len()));
   return Order{doc.value("order_id", ""), doc.value("sku", ""), doc.value("qty", 0)};
 }
 
 void CheckGroupManualCommit(harness::Ctx& ctx) {
-  fulfilment(ctx, {orderFor("o1", "shoe-42")});
-  drainRun(ctx);
+  hFulfilment(ctx, {hOrderFor("o1", "shoe-42")});
+  hDrainRun(ctx);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
   const auto& last = subscriptions.back();
   ctx.Equal(last.Group, "fulfilment", "group.id");
-  ctx.Assert(contains(last.Topics, "orders"), "the consumer must read orders, got %q", last.Topics);
+  ctx.Assert(hContains(last.Topics, "orders"), "the consumer must read orders, got %q", last.Topics);
   ctx.Equal(ctx.Kafka.EventsOf("auto-commit").size(), 0, "offsets were committed on a timer, before the outcome is handled: auto-commits");
   ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "the consumer never committed an offset itself");
   ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "the handled record must be committed: lag");
 }
 
 void CheckDeadline(harness::Ctx& ctx) {
-  fulfilment(ctx, {orderFor("o1", "shoe-42")});
-  drainRun(ctx);
+  hFulfilment(ctx, {hOrderFor("o1", "shoe-42")});
+  hDrainRun(ctx);
   const auto calls = ctx.GRPC.CallsTo("Allocate", "");
   ctx.Assert(!calls.empty(), "no Allocate RPC reached the warehouse");
   const auto& last = calls.back();
@@ -1564,34 +1564,34 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(4 < timeout && timeout <= 5, "the deadline is %v s, expected 5 s", timeout);
   ctx.GRPC.SetLatency("Allocate", 30, "");
   const size_t before = calls.size();
-  const auto got = allocateOrder(orderFor("o2", "shoe-42"));
+  const auto got = hAllocateOrder(hOrderFor("o2", "shoe-42"));
   ctx.Assert(got.err.has_value(), "a warehouse slower than the deadline must fail with DEADLINE_EXCEEDED, not succeed");
-  ctx.Equal(lastAllocateCode(ctx), grpc::StatusCode::DEADLINE_EXCEEDED, "the code a slow warehouse failed with");
+  ctx.Equal(hLastAllocateCode(ctx), grpc::StatusCode::DEADLINE_EXCEEDED, "the code a slow warehouse failed with");
   ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), before + 1, "DEADLINE_EXCEEDED must not be retried: Allocate calls");
 }
 
 void CheckBackoffBounded(harness::Ctx& ctx) {
-  auto [peer, log] = fulfilment(ctx, {});
+  auto [peer, log] = hFulfilment(ctx, {});
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::UNAVAILABLE, "", 2, "");
   int64_t started = ctx.Clock.Now();
-  auto got = allocateOrder(orderFor("o1", "shoe-42"));
+  auto got = hAllocateOrder(hOrderFor("o1", "shoe-42"));
   if (got.err) ctx.Fatalf("two UNAVAILABLE answers followed by success must end as allocated: %v", *got.err);
   ctx.Equal(got.ok, true, "two UNAVAILABLE answers followed by success must end as allocated");
   ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), 3, "Allocate calls (two UNAVAILABLE, then success)");
   ctx.Equal(ctx.Clock.Sleeps(), 2, "sleeps before the retries (never before the first call)");
   int64_t waited = ctx.Clock.Now() - started;
   ctx.Assert(740 <= waited && waited <= 900, "waited %d ms across two retries, expected 250 + 500 = 750 ms (kBackoff << (attempt-1))", waited);
-  ctx.Equal(peer->allocated, std::vector<allocation>{{"o1", "shoe-42", 2}}, "the warehouse must see the order's id, sku and qty");
+  ctx.Equal(peer->allocated, std::vector<HAllocation>{{"o1", "shoe-42", 2}}, "the warehouse must see the order's id, sku and qty");
 
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::INVALID_ARGUMENT, "qty", 1, "");
-  got = allocateOrder(orderFor("o2", "shoe-42"));
+  got = hAllocateOrder(hOrderFor("o2", "shoe-42"));
   ctx.Assert(got.err.has_value(), "INVALID_ARGUMENT must propagate, not be retried or swallowed");
-  ctx.Equal(lastAllocateCode(ctx), grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate unchanged: the code");
+  ctx.Equal(hLastAllocateCode(ctx), grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate unchanged: the code");
   ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), 4, "INVALID_ARGUMENT must not be retried: Allocate calls");
 
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::UNAVAILABLE, "", 50, "");
   started = ctx.Clock.Now();
-  got = allocateOrder(orderFor("o3", "shoe-42"));
+  got = hAllocateOrder(hOrderFor("o3", "shoe-42"));
   ctx.Assert(got.err.has_value(), "a warehouse that stays UNAVAILABLE must fail after kMaxAttempts, not succeed");
   ctx.Equal(static_cast<int>(ctx.GRPC.CallsTo("Allocate", "").size()) - 4, 4, "attempts against a down warehouse");
   waited = ctx.Clock.Now() - started;
@@ -1600,15 +1600,15 @@ void CheckBackoffBounded(harness::Ctx& ctx) {
 }
 
 void CheckNoStock(harness::Ctx& ctx) {
-  const Order ghost = orderFor("o2", phantomSKU);
-  auto [peer, l] = fulfilment(ctx, {orderFor("o1", "shoe-42"), ghost});
-  drainRun(ctx);
+  const Order ghost = hOrderFor("o2", kHPhantomSKU);
+  auto [peer, l] = hFulfilment(ctx, {hOrderFor("o1", "shoe-42"), ghost});
+  hDrainRun(ctx);
   ctx.Equal(l->ids("release"), {"o2"}, "release calls (only the order without physical stock)");
   std::vector<std::tuple<std::string, std::string, int>> failed;
   for (const auto& e : l->entries) {
-    if (e.kind == "failed") failed.push_back(orderFields(e.order));
+    if (e.kind == "failed") failed.push_back(hOrderFields(e.order));
   }
-  ctx.Equal(failed, std::vector<std::tuple<std::string, std::string, int>>{orderFields(ghost)}, "publish_failed calls (the whole order o2)");
+  ctx.Equal(failed, std::vector<std::tuple<std::string, std::string, int>>{hOrderFields(ghost)}, "publish_failed calls (the whole order o2)");
   ctx.Equal(l->ids("confirm"), {"o1"}, "confirm calls");
   ctx.Equal(ctx.GRPC.CallsTo("Allocate", "").size(), 2, "FAILED_PRECONDITION is final, it must not be retried: Allocate calls");
   ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "a no-stock order is handled (released and dead-lettered) and must be committed: lag");
@@ -1616,10 +1616,10 @@ void CheckNoStock(harness::Ctx& ctx) {
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  auto [peer, l] = fulfilment(ctx, {orderFor("o1", "shoe-42")});
-  std::vector<std::vector<outcome>> atCommit;
+  auto [peer, l] = hFulfilment(ctx, {hOrderFor("o1", "shoe-42")});
+  std::vector<std::vector<HOutcome>> atCommit;
   ctx.Kafka.OnCommit([&atCommit, l = l](const std::string&, const harness::KafkaOffsets&) { atCommit.push_back(l->entries); });
-  drainRun(ctx);
+  hDrainRun(ctx);
   ctx.Equal(l->ids("confirm"), {"o1"}, "a successful allocation must confirm the sale: confirm calls");
   ctx.Assert(!atCommit.empty(), "the offset was never committed");
   bool confirmedFirst = false;
@@ -1628,11 +1628,11 @@ void CheckCommitAfter(harness::Ctx& ctx) {
   ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 0, "the handled record must be committed: lag");
 
   ctx.GRPC.Fail("Allocate", grpc::StatusCode::INTERNAL, "warehouse bug", 1, "");
-  seedOrders(ctx, {orderFor("o2", "shoe-42")});
-  const auto err = drainRun(ctx);
+  hSeedOrders(ctx, {hOrderFor("o2", "shoe-42")});
+  const auto err = hDrainRun(ctx);
   ctx.Assert(err.has_value(), "an unexpected status must propagate out of the loop, not be swallowed");
   ctx.Equal(ctx.Kafka.Lag("fulfilment", "orders"), 1, "a record whose outcome is unknown must stay uncommitted so it is redelivered after a restart: lag");
-  ctx.Assert(!contains(l->ids("confirm"), "o2") && !contains(l->ids("release"), "o2"), "an unexpected status must neither confirm nor release the hold");
+  ctx.Assert(!hContains(l->ids("confirm"), "o2") && !hContains(l->ids("release"), "o2"), "an unexpected status must neither confirm nor release the hold");
   (void)peer;
 }
 `,

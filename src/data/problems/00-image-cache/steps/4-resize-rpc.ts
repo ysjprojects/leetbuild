@@ -558,15 +558,15 @@ import (
 	pb "thumbs/gen/resizer"
 )
 
-var rzBg = context.Background()
+var hRzBg = context.Background()
 
 // resizerPeer is the resizer: it knows every image but ghost and counts its calls.
-type resizerPeer struct {
+type HResizerPeer struct {
 	pb.UnimplementedResizerServer
 	calls int
 }
 
-func (p *resizerPeer) Resize(_ context.Context, req *pb.ResizeRequest) (*pb.ResizeReply, error) {
+func (p *HResizerPeer) Resize(_ context.Context, req *pb.ResizeRequest) (*pb.ResizeReply, error) {
 	p.calls++
 	if req.GetImageId() == "ghost" {
 		return nil, status.Error(codes.NotFound, "no such image")
@@ -574,17 +574,17 @@ func (p *resizerPeer) Resize(_ context.Context, req *pb.ResizeRequest) (*pb.Resi
 	return &pb.ResizeReply{Jpeg: []byte(fmt.Sprintf("JPEG-%s-%d", req.GetImageId(), req.GetWidth()))}, nil
 }
 
-func servePeer(ctx *harness.Ctx) *resizerPeer {
-	peer := &resizerPeer{}
+func hServePeer(ctx *harness.Ctx) *HResizerPeer {
+	peer := &HResizerPeer{}
 	pb.RegisterResizerServer(ctx.GRPC.Server(""), peer)
 	return peer
 }
 
-func resizeCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Resize", "")) }
+func hResizeCalls(ctx *harness.Ctx) int { return len(ctx.GRPC.CallsTo("Resize", "")) }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	servePeer(ctx)
-	got, err := render(rzBg, "cat", 256)
+	hServePeer(ctx)
+	got, err := render(hRzBg, "cat", 256)
 	ctx.NoError(err, "render(ctx, %q, 256) returned an error", "cat")
 	ctx.Equal(string(got), "JPEG-cat-256", "render must return the resizer's bytes")
 	calls := ctx.GRPC.CallsTo("Resize", "")
@@ -593,41 +593,41 @@ func CheckDeadline(ctx *harness.Ctx) {
 	ctx.Assert(call.HasDeadline(), "the RPC carries no deadline")
 	ctx.Assert(0.5 <= call.Timeout.Seconds() && call.Timeout.Seconds() <= 1.0, "the deadline must be about 800 ms, got %v", call.Timeout)
 	ctx.GRPC.SetLatency("Resize", 3.0, "")
-	_, err = render(rzBg, "cat", 128)
+	_, err = render(hRzBg, "cat", 128)
 	ctx.Assert(err != nil, "a resizer slower than the deadline must surface DEADLINE_EXCEEDED")
 	ctx.Equal(status.Code(err), codes.DeadlineExceeded, "the status a slow resizer surfaces")
-	ctx.Equal(resizeCalls(ctx), 2, "DEADLINE_EXCEEDED must not be retried: Resize calls")
+	ctx.Equal(hResizeCalls(ctx), 2, "DEADLINE_EXCEEDED must not be retried: Resize calls")
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	peer := servePeer(ctx)
-	got, err := render(rzBg, "ghost", 256)
+	peer := hServePeer(ctx)
+	got, err := render(hRzBg, "ghost", 256)
 	ctx.NoError(err, "NOT_FOUND means the origin has no such image: render must return nil, nil")
 	ctx.Assert(got == nil, "NOT_FOUND means the origin has no such image: return nil, got %q", got)
 	ctx.Equal(peer.calls, 1, "NOT_FOUND must not be retried: Resize calls")
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
-	servePeer(ctx)
+	hServePeer(ctx)
 	ctx.GRPC.Fail("Resize", codes.Unavailable, "", 1, "")
-	got, err := render(rzBg, "cat", 256)
+	got, err := render(hRzBg, "cat", 256)
 	ctx.NoError(err, "one UNAVAILABLE must be retried and succeed")
 	ctx.Equal(string(got), "JPEG-cat-256", "one UNAVAILABLE must be retried and succeed")
-	ctx.Equal(resizeCalls(ctx), 2, "exactly one retry after UNAVAILABLE: Resize calls")
+	ctx.Equal(hResizeCalls(ctx), 2, "exactly one retry after UNAVAILABLE: Resize calls")
 	ctx.GRPC.Fail("Resize", codes.InvalidArgument, "width", 1, "")
-	_, err = render(rzBg, "cat", 256)
+	_, err = render(hRzBg, "cat", 256)
 	ctx.Assert(err != nil, "INVALID_ARGUMENT must propagate, not be retried or swallowed")
 	ctx.Equal(status.Code(err), codes.InvalidArgument, "INVALID_ARGUMENT must propagate as is")
-	ctx.Equal(resizeCalls(ctx), 3, "INVALID_ARGUMENT must not be retried: Resize calls")
+	ctx.Equal(hResizeCalls(ctx), 3, "INVALID_ARGUMENT must not be retried: Resize calls")
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	servePeer(ctx)
+	hServePeer(ctx)
 	ctx.GRPC.Fail("Resize", codes.Unavailable, "", 50, "")
-	_, err := render(rzBg, "cat", 256)
+	_, err := render(hRzBg, "cat", 256)
 	ctx.Assert(err != nil, "a resizer that stays UNAVAILABLE must make render return an error")
 	ctx.Equal(status.Code(err), codes.Unavailable, "a resizer that stays down must surface UNAVAILABLE")
-	ctx.Equal(resizeCalls(ctx), 2, "attempts against a down resizer: retries must stop after the second")
+	ctx.Equal(hResizeCalls(ctx), 2, "attempts against a down resizer: retries must stop after the second")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -639,7 +639,7 @@ func CheckBounded(ctx *harness.Ctx) {
 namespace {
 
 // resizerPeer is the resizer: it knows every image but ghost and counts its calls.
-class ResizerPeer final : public thumbs::Resizer::Service {
+class HResizerPeer final : public thumbs::Resizer::Service {
  public:
   int calls = 0;
 
@@ -651,23 +651,23 @@ class ResizerPeer final : public thumbs::Resizer::Service {
   }
 };
 
-ResizerPeer* servePeer(harness::Ctx& ctx) {
-  auto* peer = new ResizerPeer();
+HResizerPeer* hServePeer(harness::Ctx& ctx) {
+  auto* peer = new HResizerPeer();
   ctx.GRPC.Server("")->RegisterService(peer);
   return peer;
 }
 
-int resizeCalls(harness::Ctx& ctx) { return static_cast<int>(ctx.GRPC.CallsTo("Resize", "").size()); }
+int hResizeCalls(harness::Ctx& ctx) { return static_cast<int>(ctx.GRPC.CallsTo("Resize", "").size()); }
 
 // The C++ render reports a failed RPC by throwing; Go reads the code off the returned error. Here the
 // code is the one the last Resize call ended with.
-grpc::StatusCode lastCode(harness::Ctx& ctx) {
+grpc::StatusCode hLastCode(harness::Ctx& ctx) {
   const auto calls = ctx.GRPC.CallsTo("Resize", "");
   return calls.empty() ? grpc::StatusCode::OK : calls.back().Code;
 }
 
 // render, failing the check when it throws (Go's ctx.NoError on the returned error).
-std::optional<std::string> mustRender(harness::Ctx& ctx, const std::string& id, int width, const std::string& why) {
+std::optional<std::string> hMustRender(harness::Ctx& ctx, const std::string& id, int width, const std::string& why) {
   try {
     return render(id, width);
   } catch (const std::exception& e) {
@@ -676,7 +676,7 @@ std::optional<std::string> mustRender(harness::Ctx& ctx, const std::string& id, 
 }
 
 // Whether render threw.
-bool renderThrows(const std::string& id, int width) {
+bool hRenderThrows(const std::string& id, int width) {
   try {
     render(id, width);
   } catch (const std::exception&) {
@@ -688,8 +688,8 @@ bool renderThrows(const std::string& id, int width) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  servePeer(ctx);
-  const auto got = mustRender(ctx, "cat", 256, "render(\\"cat\\", 256)");
+  hServePeer(ctx);
+  const auto got = hMustRender(ctx, "cat", 256, "render(\\"cat\\", 256)");
   ctx.Equal(got.value_or(""), "JPEG-cat-256", "render must return the resizer's bytes");
   const auto calls = ctx.GRPC.CallsTo("Resize", "");
   ctx.Assert(!calls.empty(), "render never called Resize");
@@ -698,36 +698,36 @@ void CheckDeadline(harness::Ctx& ctx) {
   ctx.Assert(0.5 <= call.TimeoutSeconds() && call.TimeoutSeconds() <= 1.0, "the deadline must be about 800 ms, got %vs",
              call.TimeoutSeconds());
   ctx.GRPC.SetLatency("Resize", 3.0, "");
-  ctx.Assert(renderThrows("cat", 128), "a resizer slower than the deadline must surface DEADLINE_EXCEEDED");
-  ctx.Equal(lastCode(ctx), grpc::StatusCode::DEADLINE_EXCEEDED, "the status a slow resizer surfaces");
-  ctx.Equal(resizeCalls(ctx), 2, "DEADLINE_EXCEEDED must not be retried: Resize calls");
+  ctx.Assert(hRenderThrows("cat", 128), "a resizer slower than the deadline must surface DEADLINE_EXCEEDED");
+  ctx.Equal(hLastCode(ctx), grpc::StatusCode::DEADLINE_EXCEEDED, "the status a slow resizer surfaces");
+  ctx.Equal(hResizeCalls(ctx), 2, "DEADLINE_EXCEEDED must not be retried: Resize calls");
 }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  auto* peer = servePeer(ctx);
-  const auto got = mustRender(ctx, "ghost", 256, "NOT_FOUND means the origin has no such image: render must return nullopt");
+  auto* peer = hServePeer(ctx);
+  const auto got = hMustRender(ctx, "ghost", 256, "NOT_FOUND means the origin has no such image: render must return nullopt");
   ctx.Assert(!got, "NOT_FOUND means the origin has no such image: return nullopt, got %q", got);
   ctx.Equal(peer->calls, 1, "NOT_FOUND must not be retried: Resize calls");
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
-  servePeer(ctx);
+  hServePeer(ctx);
   ctx.GRPC.Fail("Resize", grpc::StatusCode::UNAVAILABLE, "", 1, "");
-  const auto got = mustRender(ctx, "cat", 256, "one UNAVAILABLE must be retried and succeed");
+  const auto got = hMustRender(ctx, "cat", 256, "one UNAVAILABLE must be retried and succeed");
   ctx.Equal(got.value_or(""), "JPEG-cat-256", "one UNAVAILABLE must be retried and succeed");
-  ctx.Equal(resizeCalls(ctx), 2, "exactly one retry after UNAVAILABLE: Resize calls");
+  ctx.Equal(hResizeCalls(ctx), 2, "exactly one retry after UNAVAILABLE: Resize calls");
   ctx.GRPC.Fail("Resize", grpc::StatusCode::INVALID_ARGUMENT, "width", 1, "");
-  ctx.Assert(renderThrows("cat", 256), "INVALID_ARGUMENT must propagate, not be retried or swallowed");
-  ctx.Equal(lastCode(ctx), grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate as is");
-  ctx.Equal(resizeCalls(ctx), 3, "INVALID_ARGUMENT must not be retried: Resize calls");
+  ctx.Assert(hRenderThrows("cat", 256), "INVALID_ARGUMENT must propagate, not be retried or swallowed");
+  ctx.Equal(hLastCode(ctx), grpc::StatusCode::INVALID_ARGUMENT, "INVALID_ARGUMENT must propagate as is");
+  ctx.Equal(hResizeCalls(ctx), 3, "INVALID_ARGUMENT must not be retried: Resize calls");
 }
 
 void CheckBounded(harness::Ctx& ctx) {
-  servePeer(ctx);
+  hServePeer(ctx);
   ctx.GRPC.Fail("Resize", grpc::StatusCode::UNAVAILABLE, "", 50, "");
-  ctx.Assert(renderThrows("cat", 256), "a resizer that stays UNAVAILABLE must make render throw");
-  ctx.Equal(lastCode(ctx), grpc::StatusCode::UNAVAILABLE, "a resizer that stays down must surface UNAVAILABLE");
-  ctx.Equal(resizeCalls(ctx), 2, "attempts against a down resizer: retries must stop after the second");
+  ctx.Assert(hRenderThrows("cat", 256), "a resizer that stays UNAVAILABLE must make render throw");
+  ctx.Equal(hLastCode(ctx), grpc::StatusCode::UNAVAILABLE, "a resizer that stays down must surface UNAVAILABLE");
+  ctx.Equal(hResizeCalls(ctx), 2, "attempts against a down resizer: retries must stop after the second");
 }
 `,
   },

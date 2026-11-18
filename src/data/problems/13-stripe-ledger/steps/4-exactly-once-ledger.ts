@@ -1012,7 +1012,7 @@ import (
 	"leetbuild/harness"
 )
 
-const eoSchema = \`
+const kHEoSchema = \`
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1029,43 +1029,43 @@ CREATE TABLE entries (
 );
 \`
 
-const eoT0 = 1700000000000
+const kHEoT0 = 1700000000000
 
 var (
-	eoEntries = []Entry{{Account: "cash:acquirer", Currency: "EUR", Amount: 4999}, {Account: "clearing:payments", Currency: "EUR", Amount: -4999}}
-	eoPayout  = []Entry{{Account: "clearing:payments", Currency: "EUR", Amount: 4999}, {Account: "cash:bank", Currency: "EUR", Amount: -4999}}
-	eoUUID    = regexp.MustCompile(\`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$\`)
+	hEoEntries = []Entry{{Account: "cash:acquirer", Currency: "EUR", Amount: 4999}, {Account: "clearing:payments", Currency: "EUR", Amount: -4999}}
+	hEoPayout  = []Entry{{Account: "clearing:payments", Currency: "EUR", Amount: 4999}, {Account: "cash:bank", Currency: "EUR", Amount: -4999}}
+	hEoUUID    = regexp.MustCompile(\`(?i)^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$\`)
 )
 
 // eoRedis is the connection of the real clearing tracker (step 5) and balance service (step 6).
-var eoRedis = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+var hEoRedis = redis.NewClient(&redis.Options{Addr: "redis:6379"})
 
 // eoTrack is step 5's track (clearing_tracker.go): a settling transaction closes the item it
 // names; otherwise a transaction touching a clearing account opens one at its own time.
-func eoTrack(ctx context.Context, transactionID string, postedAt int64, entries []Entry, settles *string) {
+func hEoTrack(ctx context.Context, transactionID string, postedAt int64, entries []Entry, settles *string) {
 	if settles != nil {
-		eoRedis.ZRem(ctx, "clearing:open", *settles)
+		hEoRedis.ZRem(ctx, "clearing:open", *settles)
 		return
 	}
 	for _, e := range entries {
 		if strings.HasPrefix(e.Account, "clearing:") {
-			eoRedis.ZAdd(ctx, "clearing:open", redis.Z{Score: float64(postedAt), Member: transactionID})
+			hEoRedis.ZAdd(ctx, "clearing:open", redis.Z{Score: float64(postedAt), Member: transactionID})
 			return
 		}
 	}
 }
 
 // eoInvalidate is step 6's invalidate (balance_service.go): the cached current balance is stale.
-func eoInvalidate(ctx context.Context, account, currency string) {
-	eoRedis.Del(ctx, "bal:"+account+":"+currency)
+func hEoInvalidate(ctx context.Context, account, currency string) {
+	hEoRedis.Del(ctx, "bal:"+account+":"+currency)
 }
 
 // eoBalance is the real balance service (step 6) answering GetBalance(account, currency, as_of 0):
 // bal:{account}:{currency} when cached, else the sum of the entries up to now, cached for 5 s.
-func eoBalance(ctx *harness.Ctx, account, currency string) int64 {
+func hEoBalance(ctx *harness.Ctx, account, currency string) int64 {
 	bg := context.Background()
 	key := "bal:" + account + ":" + currency
-	if cached, err := eoRedis.Get(bg, key).Result(); err == nil {
+	if cached, err := hEoRedis.Get(bg, key).Result(); err == nil {
 		amount, _ := strconv.ParseInt(cached, 10, 64)
 		return amount
 	}
@@ -1073,21 +1073,21 @@ func eoBalance(ctx *harness.Ctx, account, currency string) int64 {
 		currency, time.Now().UnixMilli(), account)[0]
 	ctx.Assert(row["n"] != any(int64(0)), "GetBalance(%s, %s) answered NOT_FOUND: the journal holds no entries for the account", account, currency)
 	amount, _ := row["amount"].(int64)
-	eoRedis.Set(bg, key, amount, 5*time.Second)
+	hEoRedis.Set(bg, key, amount, 5*time.Second)
 	return amount
 }
 
 // eoWriter is the learner's writer on an empty ledger; its track (step 5) and invalidate (step 6)
 // are the real ones.
-func eoWriter(ctx *harness.Ctx) {
-	ctx.DB.Reset(eoSchema)
-	track = eoTrack
-	invalidate = eoInvalidate
+func hEoWriter(ctx *harness.Ctx) {
+	ctx.DB.Reset(kHEoSchema)
+	track = hEoTrack
+	invalidate = hEoInvalidate
 }
 
 // eoWrite calls writeTransaction ("" for no event id, 0 for no posted_at, "" for no settles); an
 // error fails the check.
-func eoWrite(ctx *harness.Ctx, entries []Entry, description, eventID string, postedAt int64, settles string) string {
+func hEoWrite(ctx *harness.Ctx, entries []Entry, description, eventID string, postedAt int64, settles string) string {
 	var event, settled *string
 	if eventID != "" {
 		event = &eventID
@@ -1100,7 +1100,7 @@ func eoWrite(ctx *harness.Ctx, entries []Entry, description, eventID string, pos
 	return id
 }
 
-func eoRows(ctx *harness.Ctx, table string) []harness.Row {
+func hEoRows(ctx *harness.Ctx, table string) []harness.Row {
 	order := "posted_at, id"
 	if table == "entries" {
 		order = "posted_at, account, amount"
@@ -1108,7 +1108,7 @@ func eoRows(ctx *harness.Ctx, table string) []harness.Row {
 	return ctx.DB.Query("SELECT * FROM " + table + " ORDER BY " + order)
 }
 
-func eoOpen(ctx *harness.Ctx) map[string]float64 {
+func hEoOpen(ctx *harness.Ctx) map[string]float64 {
 	out := map[string]float64{}
 	for _, z := range ctx.Redis.ZRangeWithScores("clearing:open", 0, -1) {
 		out[z.Member] = z.Score
@@ -1119,7 +1119,7 @@ func eoOpen(ctx *harness.Ctx) map[string]float64 {
 // eoIngest is the real step 3 consumer (event_consumer.go) in group ledger, run until it waits for
 // more: each event becomes a balanced transaction through writeTransaction, then its offset is
 // committed.
-func eoIngest(ctx *harness.Ctx) {
+func hEoIngest(ctx *harness.Ctx) {
 	mapping := map[string][2]string{
 		"payment.captured": {"cash:acquirer", "clearing:payments"},
 		"payout.sent":      {"clearing:payouts", "cash:bank"},
@@ -1155,36 +1155,36 @@ func eoIngest(ctx *harness.Ctx) {
 }
 
 func CheckUniqueEventId(ctx *harness.Ctx) {
-	eoWriter(ctx)
-	first := eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "")
+	hEoWriter(ctx)
+	first := hEoWrite(ctx, hEoEntries, "payment.captured", "evt_01", kHEoT0, "")
 	ctx.Assert(first != "", "the first write must return the new transaction id, got %q", first)
-	ctx.Assert(eoUUID.MatchString(first), "the transaction id must be a UUID, got %q", first)
-	again := eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "")
+	ctx.Assert(hEoUUID.MatchString(first), "the transaction id must be a UUID, got %q", first)
+	again := hEoWrite(ctx, hEoEntries, "payment.captured", "evt_01", kHEoT0, "")
 	ctx.Equal(again, "", "a second write of evt_01 must return an empty id (already recorded)")
-	transactions := eoRows(ctx, "transactions")
+	transactions := hEoRows(ctx, "transactions")
 	ctx.Equal(len(transactions), 1, "two writes of one event must leave one transactions row")
 	ctx.Assert(transactions[0]["id"] == any(first) && transactions[0]["event_id"] == any("evt_01"), "the row must be the first write's, got %v", transactions[0])
-	api1 := eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "")
-	api2 := eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "")
+	api1 := hEoWrite(ctx, hEoEntries, "manual adjustment", "", 0, "")
+	api2 := hEoWrite(ctx, hEoEntries, "manual adjustment", "", 0, "")
 	ctx.Assert(api1 != "" && api2 != "" && api1 != api2, "API-originated transactions have no event id and never conflict: both must be written")
-	ctx.Equal(len(eoRows(ctx, "transactions")), 3, "transactions rows after evt_01 and two API writes")
+	ctx.Equal(len(hEoRows(ctx, "transactions")), 3, "transactions rows after evt_01 and two API writes")
 }
 
 func CheckNoDoubleEntries(ctx *harness.Ctx) {
-	eoWriter(ctx)
+	hEoWriter(ctx)
 	for range 3 {
-		eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "")
+		hEoWrite(ctx, hEoEntries, "payment.captured", "evt_01", kHEoT0, "")
 	}
-	entries := eoRows(ctx, "entries")
+	entries := hEoRows(ctx, "entries")
 	ctx.Equal(len(entries), 2, "three deliveries of one event must leave exactly two entries: the duplicate must return before the entries loop")
 	// End to end: the real step 3 consumer meets evt_02 twice (a producer retry: a second record with a new offset).
 	for _, eventID := range []string{"evt_02", "evt_03", "evt_02"} {
-		event, _ := json.Marshal(map[string]any{"event_id": eventID, "type": "payout.sent", "amount": 120000, "currency": "USD", "occurred_at": eoT0 + 10})
+		event, _ := json.Marshal(map[string]any{"event_id": eventID, "type": "payout.sent", "amount": 120000, "currency": "USD", "occurred_at": kHEoT0 + 10})
 		ctx.Kafka.Seed("money-events", eventID, string(event))
 	}
-	eoIngest(ctx)
-	transactions := eoRows(ctx, "transactions")
-	entries = eoRows(ctx, "entries")
+	hEoIngest(ctx)
+	transactions := hEoRows(ctx, "transactions")
+	entries = hEoRows(ctx, "entries")
 	eventIDs := []string{}
 	for _, t := range transactions {
 		eventID, _ := t["event_id"].(string)
@@ -1203,16 +1203,16 @@ func CheckNoDoubleEntries(ctx *harness.Ctx) {
 }
 
 func CheckEventTime(ctx *harness.Ctx) {
-	eoWriter(ctx)
+	hEoWriter(ctx)
 	yesterday := time.Now().UnixMilli() - 86400000
-	late := eoWrite(ctx, eoEntries, "payment.captured", "evt_late", yesterday, "")
-	nowID := eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "")
+	late := hEoWrite(ctx, hEoEntries, "payment.captured", "evt_late", yesterday, "")
+	nowID := hEoWrite(ctx, hEoEntries, "manual adjustment", "", 0, "")
 	transactions := map[any]harness.Row{}
-	for _, t := range eoRows(ctx, "transactions") {
+	for _, t := range hEoRows(ctx, "transactions") {
 		transactions[t["id"]] = t
 	}
 	ctx.Equal(transactions[late]["posted_at"], yesterday, "a late event's transaction must carry its own occurred_at")
-	entries := eoRows(ctx, "entries")
+	entries := hEoRows(ctx, "entries")
 	lateAts := []any{}
 	for _, e := range entries {
 		if e["transaction_id"] == any(late) {
@@ -1237,33 +1237,33 @@ func CheckEventTime(ctx *harness.Ctx) {
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	eoWriter(ctx)
-	first := eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "")
+	hEoWriter(ctx)
+	first := hEoWrite(ctx, hEoEntries, "payment.captured", "evt_01", kHEoT0, "")
 	ctx.Equal(ctx.DB.Events(), []string{"BEGIN", "COMMIT"}, "the transaction row and its entries must be written in one database transaction; the database saw")
-	ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR") // now cached by the balance service
+	ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR") // now cached by the balance service
 	ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "the balance service must have cached cash:acquirer EUR")
 	// The second entry violates entries.amount <> 0: the transaction row must roll back with it.
 	broken := []Entry{{Account: "cash:acquirer", Currency: "EUR", Amount: 4999}, {Account: "clearing:payments", Currency: "EUR", Amount: 0}}
 	evt02 := "evt_02"
-	_, err := writeTransaction(context.Background(), broken, "payment.captured", &evt02, eoT0+1, nil)
+	_, err := writeTransaction(context.Background(), broken, "payment.captured", &evt02, kHEoT0+1, nil)
 	ctx.Assert(err != nil, "a failed entry insert must propagate (the transaction rolls back), not be swallowed")
 	events := ctx.DB.Events()
 	ctx.Equal(events[len(events)-1], "ROLLBACK", "the failed write must roll back (the database saw %q)", events)
 	eventIDs := []any{}
-	for _, t := range eoRows(ctx, "transactions") {
+	for _, t := range hEoRows(ctx, "transactions") {
 		eventIDs = append(eventIDs, t["event_id"])
 	}
 	ctx.Equal(eventIDs, []any{"evt_01"}, "evt_02's entry failed but its transactions row was committed: the two inserts are not in one transaction")
-	ctx.Equal(len(eoRows(ctx, "entries")), 2, "no entry of the failed transaction may survive")
-	ctx.Equal(eoOpen(ctx), map[string]float64{first: eoT0}, "only evt_01 is in the journal, so only it may be open in clearing — a rolled-back transaction must not be tracked; clearing:open")
+	ctx.Equal(len(hEoRows(ctx, "entries")), 2, "no entry of the failed transaction may survive")
+	ctx.Equal(hEoOpen(ctx), map[string]float64{first: kHEoT0}, "only evt_01 is in the journal, so only it may be open in clearing — a rolled-back transaction must not be tracked; clearing:open")
 	ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "the rolled-back write changed no balance, yet the cached cash:acquirer EUR balance was dropped: the hooks must run only after a commit")
 }
 
 func CheckAfterCommitHooks(ctx *harness.Ctx) {
-	eoWriter(ctx)
-	eoWrite(ctx, eoEntries, "payment.captured", "evt_00", eoT0-1000, "")
-	ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR")
-	ctx.Equal(eoBalance(ctx, "clearing:payments", "EUR"), -4999, "the balance service's clearing:payments EUR")
+	hEoWriter(ctx)
+	hEoWrite(ctx, hEoEntries, "payment.captured", "evt_00", kHEoT0-1000, "")
+	ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR")
+	ctx.Equal(hEoBalance(ctx, "clearing:payments", "EUR"), -4999, "the balance service's clearing:payments EUR")
 	before := len(ctx.DB.Events())
 	// Snapshots of what the database had been through at the moment each Redis side effect happened.
 	var tracked, dropped []string
@@ -1278,27 +1278,27 @@ func CheckAfterCommitHooks(ctx *harness.Ctx) {
 		droppedSeen = true
 		return nil
 	})
-	tx := eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "")
+	tx := hEoWrite(ctx, hEoEntries, "payment.captured", "evt_01", kHEoT0, "")
 	ctx.Assert(trackedSeen, "the written transaction touches clearing:payments but clearing:open was never updated: call track after the commit")
 	ctx.Equal(tracked, []string{"BEGIN", "COMMIT"}, "track must run after the commit; clearing:open was updated when the database had seen")
 	ctx.Assert(droppedSeen && ctx.Redis.Exists("bal:clearing:payments:EUR") == 0, "the cached clearing:payments EUR balance survived the write: invalidate(ctx, account, currency) for every entry")
 	ctx.Equal(dropped, []string{"BEGIN", "COMMIT"}, "invalidate must run after the commit; the cached balance was dropped when the database had seen")
 	ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 0, "the cached cash:acquirer EUR balance survived the write: invalidate every entry's account")
-	ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 9998, "right after the write the balance service must answer the new cash:acquirer balance")
-	opened := eoOpen(ctx)
+	ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 9998, "right after the write the balance service must answer the new cash:acquirer balance")
+	opened := hEoOpen(ctx)
 	score, ok := opened[tx]
-	ctx.Assert(ok && score == eoT0, "the transaction must be open in clearing:open at its posted_at %d, clearing:open holds %v", eoT0, opened)
-	payout := eoWrite(ctx, eoPayout, "payout.sent", "evt_02", eoT0+5000, tx)
-	opened = eoOpen(ctx)
+	ctx.Assert(ok && score == kHEoT0, "the transaction must be open in clearing:open at its posted_at %d, clearing:open holds %v", kHEoT0, opened)
+	payout := hEoWrite(ctx, hEoPayout, "payout.sent", "evt_02", kHEoT0+5000, tx)
+	opened = hEoOpen(ctx)
 	_, txOpen := opened[tx]
 	_, payoutOpen := opened[payout]
 	ctx.Assert(!txOpen && !payoutOpen, "the payout settles %s: track must get settles, close that item and open none, clearing:open holds %v", tx, opened)
 	// A redelivery of evt_01 is skipped: nothing changed, so nothing may be tracked or invalidated.
-	ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 9998, "the balance service's cash:acquirer EUR")
-	openBefore := eoOpen(ctx)
-	again := eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "")
+	ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 9998, "the balance service's cash:acquirer EUR")
+	openBefore := hEoOpen(ctx)
+	again := hEoWrite(ctx, hEoEntries, "payment.captured", "evt_01", kHEoT0, "")
 	ctx.Equal(again, "", "the duplicate must return an empty id")
-	ctx.Equal(eoOpen(ctx), openBefore, "a skipped duplicate must not be tracked: clearing:open")
+	ctx.Equal(hEoOpen(ctx), openBefore, "a skipped duplicate must not be tracked: clearing:open")
 	ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "a skipped duplicate changed no balance, yet the cached cash:acquirer EUR balance was dropped")
 }
 `,
@@ -1313,7 +1313,7 @@ func CheckAfterCommitHooks(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string eoSchema = R"(
+const std::string kHEoSchema = R"(
 CREATE TABLE transactions (
     id text PRIMARY KEY,
     event_id text UNIQUE,
@@ -1330,14 +1330,14 @@ CREATE TABLE entries (
 );
 )";
 
-constexpr int64_t eoT0 = 1700000000000LL;
+constexpr int64_t kHEoT0 = 1700000000000LL;
 
-const std::vector<Entry> eoEntries = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", -4999}};
-const std::vector<Entry> eoPayout = {{"clearing:payments", "EUR", 4999}, {"cash:bank", "EUR", -4999}};
-const std::regex eoUUID("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", std::regex::icase);
+const std::vector<Entry> kHEoEntries = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", -4999}};
+const std::vector<Entry> kHEoPayout = {{"clearing:payments", "EUR", 4999}, {"cash:bank", "EUR", -4999}};
+const std::regex hEoUUID("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", std::regex::icase);
 
 // eoRedis is the connection of the real clearing tracker (step 5) and balance service (step 6).
-sw::redis::Redis& eoRedis() {
+sw::redis::Redis& hEoRedis() {
   static sw::redis::Redis redis("tcp://redis:6379");
   return redis;
 }
@@ -1348,42 +1348,42 @@ sw::redis::Redis& eoRedis() {
 // transaction touching a clearing account opens one at its own time.
 void track(const std::string& transaction_id, int64_t posted_at, const std::vector<Entry>& entries, std::optional<std::string> settles) {
   if (settles) {
-    eoRedis().zrem("clearing:open", *settles);
+    hEoRedis().zrem("clearing:open", *settles);
     return;
   }
   for (const auto& e : entries) {
     if (e.account.rfind("clearing:", 0) == 0) {
-      eoRedis().zadd("clearing:open", transaction_id, static_cast<double>(posted_at));
+      hEoRedis().zadd("clearing:open", transaction_id, static_cast<double>(posted_at));
       return;
     }
   }
 }
 
 // Step 6's invalidate (balance_service.cpp): the cached current balance is stale.
-void invalidate(const std::string& account, const std::string& currency) { eoRedis().del("bal:" + account + ":" + currency); }
+void invalidate(const std::string& account, const std::string& currency) { hEoRedis().del("bal:" + account + ":" + currency); }
 
 namespace {
 
 // eoBalance is the real balance service (step 6) answering GetBalance(account, currency, as_of 0):
 // bal:{account}:{currency} when cached, else the sum of the entries up to now, cached for 5 s.
-int64_t eoBalance(harness::Ctx& ctx, const std::string& account, const std::string& currency) {
+int64_t hEoBalance(harness::Ctx& ctx, const std::string& account, const std::string& currency) {
   const std::string key = "bal:" + account + ":" + currency;
-  if (const auto cached = eoRedis().get(key)) return std::stoll(*cached);
+  if (const auto cached = hEoRedis().get(key)) return std::stoll(*cached);
   auto row = ctx.DB.Query("SELECT COALESCE(SUM(amount) FILTER (WHERE currency = $1 AND posted_at <= $2), 0)::bigint AS amount, COUNT(*) AS n FROM entries WHERE account = $3",
                           currency, ctx.Clock.Now(), account)[0];
   ctx.Assert(row["n"] != 0, "GetBalance(%s, %s) answered NOT_FOUND: the journal holds no entries for the account", account, currency);
   const int64_t amount = row["amount"].Int();
-  eoRedis().set(key, std::to_string(amount), std::chrono::seconds(5));
+  hEoRedis().set(key, std::to_string(amount), std::chrono::seconds(5));
   return amount;
 }
 
 // eoWriter is the learner's writer on an empty ledger; its track (step 5) and invalidate (step 6)
 // are the real ones (defined above).
-void eoWriter(harness::Ctx& ctx) { ctx.DB.Reset(eoSchema); }
+void hEoWriter(harness::Ctx& ctx) { ctx.DB.Reset(kHEoSchema); }
 
 // eoWrite calls write_transaction ("" for no event id, 0 for no posted_at, "" for no settles) and
 // returns the id ("" when it was already recorded); an exception fails the check.
-std::string eoWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, const std::string& description, const std::string& eventID,
+std::string hEoWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, const std::string& description, const std::string& eventID,
                     int64_t postedAt, const std::string& settles) {
   std::optional<std::string> event, settled;
   if (!eventID.empty()) event = eventID;
@@ -1395,12 +1395,12 @@ std::string eoWrite(harness::Ctx& ctx, const std::vector<Entry>& entries, const 
   }
 }
 
-std::vector<harness::Row> eoRows(harness::Ctx& ctx, const std::string& table) {
+std::vector<harness::Row> hEoRows(harness::Ctx& ctx, const std::string& table) {
   const std::string order = table == "entries" ? "posted_at, account, amount" : "posted_at, id";
   return ctx.DB.Query("SELECT * FROM " + table + " ORDER BY " + order);
 }
 
-std::map<std::string, double> eoOpen(harness::Ctx& ctx) {
+std::map<std::string, double> hEoOpen(harness::Ctx& ctx) {
   std::map<std::string, double> out;
   for (const auto& z : ctx.Redis.ZRangeWithScores("clearing:open", 0, -1)) out[z.Member] = z.Score;
   return out;
@@ -1409,7 +1409,7 @@ std::map<std::string, double> eoOpen(harness::Ctx& ctx) {
 // eoIngest is the real step 3 consumer (event_consumer.cpp) in group ledger, run until it waits for
 // more: each event becomes a balanced transaction through write_transaction, then its offset is
 // committed.
-void eoIngest(harness::Ctx& ctx) {
+void hEoIngest(harness::Ctx& ctx) {
   const std::map<std::string, std::pair<std::string, std::string>> mapping = {
       {"payment.captured", {"cash:acquirer", "clearing:payments"}},
       {"payout.sent", {"clearing:payouts", "cash:bank"}},
@@ -1450,34 +1450,34 @@ void eoIngest(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckUniqueEventId(harness::Ctx& ctx) {
-  eoWriter(ctx);
-  const std::string first = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  hEoWriter(ctx);
+  const std::string first = hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_01", kHEoT0, "");
   ctx.Assert(!first.empty(), "the first write must return the new transaction id, got %q", first);
-  ctx.Assert(std::regex_match(first, eoUUID), "the transaction id must be a UUID, got %q", first);
-  const std::string again = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  ctx.Assert(std::regex_match(first, hEoUUID), "the transaction id must be a UUID, got %q", first);
+  const std::string again = hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_01", kHEoT0, "");
   ctx.Equal(again, "", "a second write of evt_01 must return an empty id (already recorded)");
-  auto transactions = eoRows(ctx, "transactions");
+  auto transactions = hEoRows(ctx, "transactions");
   ctx.Equal(transactions.size(), 1, "two writes of one event must leave one transactions row");
   ctx.Assert(transactions[0]["id"] == first && transactions[0]["event_id"] == "evt_01", "the row must be the first write's, got %v", transactions[0]);
-  const std::string api1 = eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "");
-  const std::string api2 = eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "");
+  const std::string api1 = hEoWrite(ctx, kHEoEntries, "manual adjustment", "", 0, "");
+  const std::string api2 = hEoWrite(ctx, kHEoEntries, "manual adjustment", "", 0, "");
   ctx.Assert(!api1.empty() && !api2.empty() && api1 != api2, "API-originated transactions have no event id and never conflict: both must be written");
-  ctx.Equal(eoRows(ctx, "transactions").size(), 3, "transactions rows after evt_01 and two API writes");
+  ctx.Equal(hEoRows(ctx, "transactions").size(), 3, "transactions rows after evt_01 and two API writes");
 }
 
 void CheckNoDoubleEntries(harness::Ctx& ctx) {
-  eoWriter(ctx);
-  for (int i = 0; i < 3; i++) eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
-  auto entries = eoRows(ctx, "entries");
+  hEoWriter(ctx);
+  for (int i = 0; i < 3; i++) hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_01", kHEoT0, "");
+  auto entries = hEoRows(ctx, "entries");
   ctx.Equal(entries.size(), 2, "three deliveries of one event must leave exactly two entries: the duplicate must return before the entries loop");
   // End to end: the real step 3 consumer meets evt_02 twice (a producer retry: a second record with a new offset).
   for (const std::string eventID : {"evt_02", "evt_03", "evt_02"}) {
-    const std::string event = nlohmann::json{{"event_id", eventID}, {"type", "payout.sent"}, {"amount", 120000}, {"currency", "USD"}, {"occurred_at", eoT0 + 10}}.dump();
+    const std::string event = nlohmann::json{{"event_id", eventID}, {"type", "payout.sent"}, {"amount", 120000}, {"currency", "USD"}, {"occurred_at", kHEoT0 + 10}}.dump();
     ctx.Kafka.Seed("money-events", eventID, event);
   }
-  eoIngest(ctx);
-  auto transactions = eoRows(ctx, "transactions");
-  entries = eoRows(ctx, "entries");
+  hEoIngest(ctx);
+  auto transactions = hEoRows(ctx, "transactions");
+  entries = hEoRows(ctx, "entries");
   std::vector<std::string> eventIDs;
   for (auto& t : transactions) eventIDs.push_back(t["event_id"].String());
   std::sort(eventIDs.begin(), eventIDs.end());
@@ -1490,14 +1490,14 @@ void CheckNoDoubleEntries(harness::Ctx& ctx) {
 }
 
 void CheckEventTime(harness::Ctx& ctx) {
-  eoWriter(ctx);
+  hEoWriter(ctx);
   const int64_t yesterday = ctx.Clock.Now() - 86400000;
-  const std::string late = eoWrite(ctx, eoEntries, "payment.captured", "evt_late", yesterday, "");
-  const std::string nowID = eoWrite(ctx, eoEntries, "manual adjustment", "", 0, "");
+  const std::string late = hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_late", yesterday, "");
+  const std::string nowID = hEoWrite(ctx, kHEoEntries, "manual adjustment", "", 0, "");
   std::map<std::string, harness::Row> transactions;
-  for (auto& t : eoRows(ctx, "transactions")) transactions[t["id"].String()] = t;
+  for (auto& t : hEoRows(ctx, "transactions")) transactions[t["id"].String()] = t;
   ctx.Equal(transactions[late]["posted_at"], yesterday, "a late event's transaction must carry its own occurred_at");
-  auto entries = eoRows(ctx, "entries");
+  auto entries = hEoRows(ctx, "entries");
   std::vector<harness::Any> lateAts;
   for (auto& e : entries) {
     if (e["transaction_id"] == late) lateAts.push_back(e["posted_at"]);
@@ -1516,16 +1516,16 @@ void CheckEventTime(harness::Ctx& ctx) {
 }
 
 void CheckAtomic(harness::Ctx& ctx) {
-  eoWriter(ctx);
-  const std::string first = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  hEoWriter(ctx);
+  const std::string first = hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_01", kHEoT0, "");
   ctx.Equal(ctx.DB.Events(), {"BEGIN", "COMMIT"}, "the transaction row and its entries must be written in one database transaction; the database saw");
-  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR");  // now cached by the balance service
+  ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR");  // now cached by the balance service
   ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "the balance service must have cached cash:acquirer EUR");
   // The second entry violates entries.amount <> 0: the transaction row must roll back with it.
   const std::vector<Entry> broken = {{"cash:acquirer", "EUR", 4999}, {"clearing:payments", "EUR", 0}};
   bool failed = false;
   try {
-    write_transaction(broken, "payment.captured", std::string("evt_02"), eoT0 + 1, std::nullopt);
+    write_transaction(broken, "payment.captured", std::string("evt_02"), kHEoT0 + 1, std::nullopt);
   } catch (const std::exception&) {
     failed = true;
   }
@@ -1533,18 +1533,18 @@ void CheckAtomic(harness::Ctx& ctx) {
   const auto events = ctx.DB.Events();
   ctx.Equal(events.back(), "ROLLBACK", "the failed write must roll back (the database saw %q)", events);
   std::vector<harness::Any> eventIDs;
-  for (auto& t : eoRows(ctx, "transactions")) eventIDs.push_back(t["event_id"]);
+  for (auto& t : hEoRows(ctx, "transactions")) eventIDs.push_back(t["event_id"]);
   ctx.Equal(eventIDs, {"evt_01"}, "evt_02's entry failed but its transactions row was committed: the two inserts are not in one transaction");
-  ctx.Equal(eoRows(ctx, "entries").size(), 2, "no entry of the failed transaction may survive");
-  ctx.Equal(eoOpen(ctx), std::map<std::string, double>{{first, static_cast<double>(eoT0)}}, "only evt_01 is in the journal, so only it may be open in clearing — a rolled-back transaction must not be tracked; clearing:open");
+  ctx.Equal(hEoRows(ctx, "entries").size(), 2, "no entry of the failed transaction may survive");
+  ctx.Equal(hEoOpen(ctx), std::map<std::string, double>{{first, static_cast<double>(kHEoT0)}}, "only evt_01 is in the journal, so only it may be open in clearing — a rolled-back transaction must not be tracked; clearing:open");
   ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "the rolled-back write changed no balance, yet the cached cash:acquirer EUR balance was dropped: the hooks must run only after a commit");
 }
 
 void CheckAfterCommitHooks(harness::Ctx& ctx) {
-  eoWriter(ctx);
-  eoWrite(ctx, eoEntries, "payment.captured", "evt_00", eoT0 - 1000, "");
-  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR");
-  ctx.Equal(eoBalance(ctx, "clearing:payments", "EUR"), -4999, "the balance service's clearing:payments EUR");
+  hEoWriter(ctx);
+  hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_00", kHEoT0 - 1000, "");
+  ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 4999, "the balance service's cash:acquirer EUR");
+  ctx.Equal(hEoBalance(ctx, "clearing:payments", "EUR"), -4999, "the balance service's clearing:payments EUR");
   const size_t before = ctx.DB.Events().size();
   // Snapshots of what the database had been through at the moment each Redis side effect happened.
   std::vector<std::string> tracked, dropped;
@@ -1559,24 +1559,24 @@ void CheckAfterCommitHooks(harness::Ctx& ctx) {
     dropped.assign(events.begin() + static_cast<long>(before), events.end());
     droppedSeen = true;
   });
-  const std::string tx = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  const std::string tx = hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_01", kHEoT0, "");
   ctx.Assert(trackedSeen, "the written transaction touches clearing:payments but clearing:open was never updated: call track after the commit");
   ctx.Equal(tracked, {"BEGIN", "COMMIT"}, "track must run after the commit; clearing:open was updated when the database had seen");
   ctx.Assert(droppedSeen && ctx.Redis.Exists("bal:clearing:payments:EUR") == 0, "the cached clearing:payments EUR balance survived the write: invalidate(ctx, account, currency) for every entry");
   ctx.Equal(dropped, {"BEGIN", "COMMIT"}, "invalidate must run after the commit; the cached balance was dropped when the database had seen");
   ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 0, "the cached cash:acquirer EUR balance survived the write: invalidate every entry's account");
-  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 9998, "right after the write the balance service must answer the new cash:acquirer balance");
-  auto opened = eoOpen(ctx);
-  ctx.Assert(opened.count(tx) == 1 && opened[tx] == eoT0, "the transaction must be open in clearing:open at its posted_at %d, clearing:open holds %v", eoT0, opened);
-  const std::string payout = eoWrite(ctx, eoPayout, "payout.sent", "evt_02", eoT0 + 5000, tx);
-  opened = eoOpen(ctx);
+  ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 9998, "right after the write the balance service must answer the new cash:acquirer balance");
+  auto opened = hEoOpen(ctx);
+  ctx.Assert(opened.count(tx) == 1 && opened[tx] == kHEoT0, "the transaction must be open in clearing:open at its posted_at %d, clearing:open holds %v", kHEoT0, opened);
+  const std::string payout = hEoWrite(ctx, kHEoPayout, "payout.sent", "evt_02", kHEoT0 + 5000, tx);
+  opened = hEoOpen(ctx);
   ctx.Assert(opened.count(tx) == 0 && opened.count(payout) == 0, "the payout settles %s: track must get settles, close that item and open none, clearing:open holds %v", tx, opened);
   // A redelivery of evt_01 is skipped: nothing changed, so nothing may be tracked or invalidated.
-  ctx.Equal(eoBalance(ctx, "cash:acquirer", "EUR"), 9998, "the balance service's cash:acquirer EUR");
-  const auto openBefore = eoOpen(ctx);
-  const std::string again = eoWrite(ctx, eoEntries, "payment.captured", "evt_01", eoT0, "");
+  ctx.Equal(hEoBalance(ctx, "cash:acquirer", "EUR"), 9998, "the balance service's cash:acquirer EUR");
+  const auto openBefore = hEoOpen(ctx);
+  const std::string again = hEoWrite(ctx, kHEoEntries, "payment.captured", "evt_01", kHEoT0, "");
   ctx.Equal(again, "", "the duplicate must return an empty id");
-  ctx.Equal(eoOpen(ctx), openBefore, "a skipped duplicate must not be tracked: clearing:open");
+  ctx.Equal(hEoOpen(ctx), openBefore, "a skipped duplicate must not be tracked: clearing:open");
   ctx.Assert(ctx.Redis.Exists("bal:cash:acquirer:EUR") == 1, "a skipped duplicate changed no balance, yet the cached cash:acquirer EUR balance was dropped");
 }
 `,

@@ -996,11 +996,11 @@ import (
 	pb "counters/gen/counters"
 )
 
-const csKey = "total:plays:stranger-things"
+const kHCsKey = "total:plays:stranger-things"
 
 // csService runs the learner's CounterService on the real stores of steps 2 and 4 (the best-effort
 // counter counter:{ns}:{name}, the minute buckets of rollup:{ns}:{name}) and returns a client on it.
-func csService(ctx *harness.Ctx) pb.CounterServiceClient {
+func hCsService(ctx *harness.Ctx) pb.CounterServiceClient {
 	getBestEffort = func(_ context.Context, ns, name string) (int64, error) {
 		v, ok := ctx.Redis.Get("counter:" + ns + ":" + name)
 		if !ok {
@@ -1009,13 +1009,13 @@ func csService(ctx *harness.Ctx) pb.CounterServiceClient {
 		return strconv.ParseInt(v, 10, 64)
 	}
 	getRolledUp = func(_ context.Context, ns, name string) (int64, error) {
-		return csSum(ctx, "rollup:"+ns+":"+name), nil
+		return hCsSum(ctx, "rollup:"+ns+":"+name), nil
 	}
 	ctx.Main(main)
 	return pb.NewCounterServiceClient(ctx.GRPC.Dial("counters:9000"))
 }
 
-func csSum(ctx *harness.Ctx, key string) int64 {
+func hCsSum(ctx *harness.Ctx, key string) int64 {
 	var sum int64
 	for _, v := range ctx.Redis.HGetAll(key) {
 		n, _ := strconv.ParseInt(v, 10, 64)
@@ -1025,7 +1025,7 @@ func csSum(ctx *harness.Ctx, key string) int64 {
 }
 
 // csAddBestEffort is step 2's addCount: SET NX with the hour's TTL, then INCRBY.
-func csAddBestEffort(ctx *harness.Ctx, ns, name string, delta int64) {
+func hCsAddBestEffort(ctx *harness.Ctx, ns, name string, delta int64) {
 	key := "counter:" + ns + ":" + name
 	ctx.Redis.Set(key, 0, "NX", "EX", 3600)
 	ctx.Redis.Do("INCRBY", key, delta)
@@ -1033,7 +1033,7 @@ func csAddBestEffort(ctx *harness.Ctx, ns, name string, delta int64) {
 
 // csPlays makes eventually-consistent adds to plays/stranger-things as production does: each event is
 // claimed under seen:{token} and folded into its minute bucket (steps 3 and 4).
-func csPlays(ctx *harness.Ctx, adds ...csAdd) {
+func hCsPlays(ctx *harness.Ctx, adds ...HCsAdd) {
 	bucket := strconv.FormatInt(ctx.Clock.Now()/1000/60*60, 10)
 	for _, a := range adds {
 		if ctx.Redis.Set("seen:"+a.token, 1, "NX", "EX", 86400) {
@@ -1042,25 +1042,25 @@ func csPlays(ctx *harness.Ctx, adds ...csAdd) {
 	}
 }
 
-type csAdd struct {
+type HCsAdd struct {
 	token string
 	delta int64
 }
 
-func csGet(stub pb.CounterServiceClient, ns, name string) (*pb.GetCountReply, error) {
+func hCsGet(stub pb.CounterServiceClient, ns, name string) (*pb.GetCountReply, error) {
 	callCtx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	return stub.GetCount(callCtx, &pb.GetCountRequest{Namespace: ns, Name: name})
 }
 
-func csMustGet(ctx *harness.Ctx, stub pb.CounterServiceClient, ns, name string) *pb.GetCountReply {
-	reply, err := csGet(stub, ns, name)
+func hCsMustGet(ctx *harness.Ctx, stub pb.CounterServiceClient, ns, name string) *pb.GetCountReply {
+	reply, err := hCsGet(stub, ns, name)
 	ctx.NoError(err, "GetCount(%q, %q) failed", ns, name)
 	return reply
 }
 
-func csFailsWith(ctx *harness.Ctx, stub pb.CounterServiceClient, ns, name string, code codes.Code) {
-	reply, err := csGet(stub, ns, name)
+func hCsFailsWith(ctx *harness.Ctx, stub pb.CounterServiceClient, ns, name string, code codes.Code) {
+	reply, err := hCsGet(stub, ns, name)
 	if err != nil {
 		ctx.Equal(status.Code(err).String(), code.String(), "GetCount(%q, %q) failed with the wrong code", ns, name)
 		return
@@ -1069,68 +1069,68 @@ func csFailsWith(ctx *harness.Ctx, stub pb.CounterServiceClient, ns, name string
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	stub := csService(ctx)
-	csFailsWith(ctx, stub, "likes", "stranger-things", codes.NotFound)
-	csFailsWith(ctx, stub, "", "stranger-things", codes.NotFound)
+	stub := hCsService(ctx)
+	hCsFailsWith(ctx, stub, "likes", "stranger-things", codes.NotFound)
+	hCsFailsWith(ctx, stub, "", "stranger-things", codes.NotFound)
 	keys := ctx.Redis.Keys("*")
 	ctx.Assert(len(keys) == 0, "an unknown namespace must not leave anything in the cache, Redis holds %q", keys)
 }
 
 func CheckInvalidArgument(ctx *harness.Ctx) {
-	stub := csService(ctx)
+	stub := hCsService(ctx)
 	for _, bad := range []string{"bad name", "", strings.Repeat("a", 65), "dots.are.out"} {
-		csFailsWith(ctx, stub, "plays", bad, codes.InvalidArgument)
-		csFailsWith(ctx, stub, "views", bad, codes.InvalidArgument)
+		hCsFailsWith(ctx, stub, "plays", bad, codes.InvalidArgument)
+		hCsFailsWith(ctx, stub, "views", bad, codes.InvalidArgument)
 	}
 	keys := ctx.Redis.Keys("*")
 	ctx.Assert(len(keys) == 0, "a bad name must be refused before any store is consulted, yet Redis holds %q", keys)
-	csFailsWith(ctx, stub, "likes", "bad name", codes.NotFound) // the namespace is checked first
+	hCsFailsWith(ctx, stub, "likes", "bad name", codes.NotFound) // the namespace is checked first
 }
 
 func CheckCacheKeyTtl(ctx *harness.Ctx) {
-	stub := csService(ctx)
-	csPlays(ctx, csAdd{"t-1", 1200}, csAdd{"t-2", 7})
-	reply := csMustGet(ctx, stub, "plays", "stranger-things")
+	stub := hCsService(ctx)
+	hCsPlays(ctx, HCsAdd{"t-1", 1200}, HCsAdd{"t-2", 7})
+	reply := hCsMustGet(ctx, stub, "plays", "stranger-things")
 	ctx.Equal(reply.GetCount(), 1207, "GetCount must answer the rolled-up total")
-	cached, ok := ctx.Redis.Get(csKey)
-	ctx.Assert(ok, "the total must be cached under %s, keys are %q", csKey, ctx.Redis.Keys("*"))
+	cached, ok := ctx.Redis.Get(kHCsKey)
+	ctx.Assert(ok, "the total must be cached under %s, keys are %q", kHCsKey, ctx.Redis.Keys("*"))
 	var doc map[string]any
 	json.Unmarshal([]byte(cached), &doc)
-	ctx.Assert(doc["count"] == 1207.0 && doc["as_of"] == float64(reply.GetAsOf()), "%s must hold JSON {count, as_of} matching the reply, got %s", csKey, cached)
-	ttl := ctx.Redis.TTL(csKey)
-	ctx.Assert(1 <= ttl && ttl <= 2, "%s expires in %d s, expected cacheTTL (2 s)", csKey, ttl)
+	ctx.Assert(doc["count"] == 1207.0 && doc["as_of"] == float64(reply.GetAsOf()), "%s must hold JSON {count, as_of} matching the reply, got %s", kHCsKey, cached)
+	ttl := ctx.Redis.TTL(kHCsKey)
+	ctx.Assert(1 <= ttl && ttl <= 2, "%s expires in %d s, expected cacheTTL (2 s)", kHCsKey, ttl)
 	ctx.Clock.Advance(3)
-	ctx.Equal(ctx.Redis.Exists(csKey), 0, "%s must be gone after 2 s: EXISTS", csKey)
+	ctx.Equal(ctx.Redis.Exists(kHCsKey), 0, "%s must be gone after 2 s: EXISTS", kHCsKey)
 }
 
 func CheckCacheAside(ctx *harness.Ctx) {
-	stub := csService(ctx)
-	csPlays(ctx, csAdd{"t-1", 1200}, csAdd{"t-2", 7})
-	first := csMustGet(ctx, stub, "plays", "stranger-things")
+	stub := hCsService(ctx)
+	hCsPlays(ctx, HCsAdd{"t-1", 1200}, HCsAdd{"t-2", 7})
+	first := hCsMustGet(ctx, stub, "plays", "stranger-things")
 	ctx.Equal(first.GetCount(), 1207, "GetCount must answer the rolled-up total")
-	csPlays(ctx, csAdd{"t-3", 93}) // the buckets move on to 1300
+	hCsPlays(ctx, HCsAdd{"t-3", 93}) // the buckets move on to 1300
 	ctx.Clock.Advance(1)
-	second := csMustGet(ctx, stub, "plays", "stranger-things")
-	ctx.Equal([]int64{second.GetCount(), second.GetAsOf()}, []int64{first.GetCount(), first.GetAsOf()}, "1 s after the first read the buckets moved to 1300, but a read within cacheTTL is served from %s: [count, as_of]", csKey)
+	second := hCsMustGet(ctx, stub, "plays", "stranger-things")
+	ctx.Equal([]int64{second.GetCount(), second.GetAsOf()}, []int64{first.GetCount(), first.GetAsOf()}, "1 s after the first read the buckets moved to 1300, but a read within cacheTTL is served from %s: [count, as_of]", kHCsKey)
 	ctx.Clock.Advance(1.5)
-	third := csMustGet(ctx, stub, "plays", "stranger-things")
+	third := hCsMustGet(ctx, stub, "plays", "stranger-things")
 	ctx.Equal(third.GetCount(), 1300, "2.5 s after the total was cached the entry has expired and the next read must sum the buckets again")
 	ctx.Assert(third.GetAsOf() >= first.GetAsOf()+2, "as_of must be the time of the recomputation (%d or later), got %d", first.GetAsOf()+2, third.GetAsOf())
 }
 
 func CheckReply(ctx *harness.Ctx) {
-	stub := csService(ctx)
-	csAddBestEffort(ctx, "views", "trailer-7", 42)
-	reply := csMustGet(ctx, stub, "views", "trailer-7")
+	stub := hCsService(ctx)
+	hCsAddBestEffort(ctx, "views", "trailer-7", 42)
+	reply := hCsMustGet(ctx, stub, "views", "trailer-7")
 	ctx.Equal(reply.GetCount(), 42, "a best-effort namespace answers the counter's count")
 	now := ctx.Clock.Now() / 1000
 	ctx.Assert(reply.GetAsOf()-now <= 1 && now-reply.GetAsOf() <= 1, "a best-effort reply's as_of is now (%d), got %d", now, reply.GetAsOf())
 	ctx.Equal(ctx.Redis.Exists("total:views:trailer-7"), 0, "best-effort counters are not cached (they are already one GET away): EXISTS total:views:trailer-7")
-	csAddBestEffort(ctx, "views", "trailer-7", 8)
-	reply = csMustGet(ctx, stub, "views", "trailer-7")
+	hCsAddBestEffort(ctx, "views", "trailer-7", 8)
+	reply = hCsMustGet(ctx, stub, "views", "trailer-7")
 	ctx.Equal(reply.GetCount(), 50, "a best-effort read goes straight to the counter: right after another add of 8 GetCount must answer 50")
-	csPlays(ctx, csAdd{"t-1", 1200}, csAdd{"t-2", 7})
-	reply = csMustGet(ctx, stub, "plays", "stranger-things")
+	hCsPlays(ctx, HCsAdd{"t-1", 1200}, HCsAdd{"t-2", 7})
+	reply = hCsMustGet(ctx, stub, "plays", "stranger-things")
 	now = ctx.Clock.Now() / 1000
 	ctx.Assert(reply.GetCount() == 1207 && reply.GetAsOf()-now <= 1 && now-reply.GetAsOf() <= 1, "an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got [%d, %d]", reply.GetCount(), reply.GetAsOf())
 }
@@ -1141,11 +1141,11 @@ func CheckReply(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string csKey = "total:plays:stranger-things";
+const std::string kHCsKey = "total:plays:stranger-things";
 
-harness::Ctx* csCtx = nullptr;
+harness::Ctx* hCsCtx = nullptr;
 
-long long csSum(harness::Ctx& ctx, const std::string& key) {
+long long hCsSum(harness::Ctx& ctx, const std::string& key) {
   long long sum = 0;
   for (const auto& [field, v] : ctx.Redis.HGetAll(key)) sum += std::atoll(v.c_str());
   return sum;
@@ -1153,34 +1153,34 @@ long long csSum(harness::Ctx& ctx, const std::string& key) {
 
 // csService runs the learner's CounterService on the real stores of steps 2 and 4 (the best-effort
 // counter counter:{ns}:{name}, the minute buckets of rollup:{ns}:{name}) and returns a client on it.
-std::unique_ptr<counters::CounterService::Stub> csService(harness::Ctx& ctx) {
-  csCtx = &ctx;
+std::unique_ptr<counters::CounterService::Stub> hCsService(harness::Ctx& ctx) {
+  hCsCtx = &ctx;
   ctx.Main();
   return counters::CounterService::NewStub(ctx.GRPC.Dial("counters:9000"));
 }
 
 // csAddBestEffort is step 2's add_count: SET NX with the hour's TTL, then INCRBY.
-void csAddBestEffort(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta) {
+void hCsAddBestEffort(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta) {
   const std::string key = "counter:" + ns + ":" + name;
   ctx.Redis.Set(key, 0, "NX", "EX", 3600);
   ctx.Redis.Do("INCRBY", key, delta);
 }
 
-struct csAdd {
+struct HCsAdd {
   std::string token;
   long long delta;
 };
 
 // csPlays makes eventually-consistent adds to plays/stranger-things as production does: each event is
 // claimed under seen:{token} and folded into its minute bucket (steps 3 and 4).
-void csPlays(harness::Ctx& ctx, const std::vector<csAdd>& adds) {
+void hCsPlays(harness::Ctx& ctx, const std::vector<HCsAdd>& adds) {
   const std::string bucket = std::to_string(ctx.Clock.Now() / 1000 / 60 * 60);
   for (const auto& a : adds) {
     if (ctx.Redis.Set("seen:" + a.token, 1, "NX", "EX", 86400)) ctx.Redis.Do("HINCRBY", "rollup:plays:stranger-things", bucket, a.delta);
   }
 }
 
-std::pair<grpc::Status, counters::GetCountReply> csGet(counters::CounterService::Stub& stub, const std::string& ns, const std::string& name) {
+std::pair<grpc::Status, counters::GetCountReply> hCsGet(counters::CounterService::Stub& stub, const std::string& ns, const std::string& name) {
   grpc::ClientContext call;
   call.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(1));
   counters::GetCountRequest req;
@@ -1191,14 +1191,14 @@ std::pair<grpc::Status, counters::GetCountReply> csGet(counters::CounterService:
   return {st, reply};
 }
 
-counters::GetCountReply csMustGet(harness::Ctx& ctx, counters::CounterService::Stub& stub, const std::string& ns, const std::string& name) {
-  const auto [st, reply] = csGet(stub, ns, name);
+counters::GetCountReply hCsMustGet(harness::Ctx& ctx, counters::CounterService::Stub& stub, const std::string& ns, const std::string& name) {
+  const auto [st, reply] = hCsGet(stub, ns, name);
   if (!st.ok()) ctx.Fatalf("GetCount(%q, %q) failed: %v: %s", ns, name, st.error_code(), st.error_message());
   return reply;
 }
 
-void csFailsWith(harness::Ctx& ctx, counters::CounterService::Stub& stub, const std::string& ns, const std::string& name, grpc::StatusCode code) {
-  const auto [st, reply] = csGet(stub, ns, name);
+void hCsFailsWith(harness::Ctx& ctx, counters::CounterService::Stub& stub, const std::string& ns, const std::string& name, grpc::StatusCode code) {
+  const auto [st, reply] = hCsGet(stub, ns, name);
   if (!st.ok()) {
     ctx.Equal(st.error_code(), code, "GetCount(%q, %q) failed with the wrong code", ns, name);
     return;
@@ -1210,74 +1210,74 @@ void csFailsWith(harness::Ctx& ctx, counters::CounterService::Stub& stub, const 
 
 // The stand-ins for steps 2 and 4, as the Go harness swaps in its function variables.
 long long get_best_effort(const std::string& ns, const std::string& name) {
-  const auto v = csCtx->Redis.Get("counter:" + ns + ":" + name);
+  const auto v = hCsCtx->Redis.Get("counter:" + ns + ":" + name);
   return v ? std::stoll(*v) : 0;
 }
 
-long long get_rolled_up(const std::string& ns, const std::string& name) { return csSum(*csCtx, "rollup:" + ns + ":" + name); }
+long long get_rolled_up(const std::string& ns, const std::string& name) { return hCsSum(*hCsCtx, "rollup:" + ns + ":" + name); }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  auto stub = csService(ctx);
-  csFailsWith(ctx, *stub, "likes", "stranger-things", grpc::StatusCode::NOT_FOUND);
-  csFailsWith(ctx, *stub, "", "stranger-things", grpc::StatusCode::NOT_FOUND);
+  auto stub = hCsService(ctx);
+  hCsFailsWith(ctx, *stub, "likes", "stranger-things", grpc::StatusCode::NOT_FOUND);
+  hCsFailsWith(ctx, *stub, "", "stranger-things", grpc::StatusCode::NOT_FOUND);
   const auto keys = ctx.Redis.Keys("*");
   ctx.Assert(keys.empty(), "an unknown namespace must not leave anything in the cache, Redis holds %q", keys);
 }
 
 void CheckInvalidArgument(harness::Ctx& ctx) {
-  auto stub = csService(ctx);
+  auto stub = hCsService(ctx);
   for (const std::string bad : {std::string("bad name"), std::string(""), std::string(65, 'a'), std::string("dots.are.out")}) {
-    csFailsWith(ctx, *stub, "plays", bad, grpc::StatusCode::INVALID_ARGUMENT);
-    csFailsWith(ctx, *stub, "views", bad, grpc::StatusCode::INVALID_ARGUMENT);
+    hCsFailsWith(ctx, *stub, "plays", bad, grpc::StatusCode::INVALID_ARGUMENT);
+    hCsFailsWith(ctx, *stub, "views", bad, grpc::StatusCode::INVALID_ARGUMENT);
   }
   const auto keys = ctx.Redis.Keys("*");
   ctx.Assert(keys.empty(), "a bad name must be refused before any store is consulted, yet Redis holds %q", keys);
-  csFailsWith(ctx, *stub, "likes", "bad name", grpc::StatusCode::NOT_FOUND);  // the namespace is checked first
+  hCsFailsWith(ctx, *stub, "likes", "bad name", grpc::StatusCode::NOT_FOUND);  // the namespace is checked first
 }
 
 void CheckCacheKeyTtl(harness::Ctx& ctx) {
-  auto stub = csService(ctx);
-  csPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
-  const auto reply = csMustGet(ctx, *stub, "plays", "stranger-things");
+  auto stub = hCsService(ctx);
+  hCsPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
+  const auto reply = hCsMustGet(ctx, *stub, "plays", "stranger-things");
   ctx.Equal(reply.count(), 1207, "GetCount must answer the rolled-up total");
-  const auto cached = ctx.Redis.Get(csKey);
-  ctx.Assert(cached.has_value(), "the total must be cached under %s, keys are %q", csKey, ctx.Redis.Keys("*"));
+  const auto cached = ctx.Redis.Get(kHCsKey);
+  ctx.Assert(cached.has_value(), "the total must be cached under %s, keys are %q", kHCsKey, ctx.Redis.Keys("*"));
   const auto doc = nlohmann::json::parse(*cached, nullptr, false);
-  ctx.Assert(doc.is_object() && doc.value("count", nlohmann::json()) == 1207 && doc.value("as_of", nlohmann::json()) == reply.as_of(), "%s must hold JSON {count, as_of} matching the reply, got %s", csKey, *cached);
-  const long long ttl = ctx.Redis.TTL(csKey);
-  ctx.Assert(1 <= ttl && ttl <= 2, "%s expires in %d s, expected kCacheTtl (2 s)", csKey, ttl);
+  ctx.Assert(doc.is_object() && doc.value("count", nlohmann::json()) == 1207 && doc.value("as_of", nlohmann::json()) == reply.as_of(), "%s must hold JSON {count, as_of} matching the reply, got %s", kHCsKey, *cached);
+  const long long ttl = ctx.Redis.TTL(kHCsKey);
+  ctx.Assert(1 <= ttl && ttl <= 2, "%s expires in %d s, expected kCacheTtl (2 s)", kHCsKey, ttl);
   ctx.Clock.Advance(3);
-  ctx.Equal(ctx.Redis.Exists(csKey), 0, "%s must be gone after 2 s: EXISTS", csKey);
+  ctx.Equal(ctx.Redis.Exists(kHCsKey), 0, "%s must be gone after 2 s: EXISTS", kHCsKey);
 }
 
 void CheckCacheAside(harness::Ctx& ctx) {
-  auto stub = csService(ctx);
-  csPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
-  const auto first = csMustGet(ctx, *stub, "plays", "stranger-things");
+  auto stub = hCsService(ctx);
+  hCsPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
+  const auto first = hCsMustGet(ctx, *stub, "plays", "stranger-things");
   ctx.Equal(first.count(), 1207, "GetCount must answer the rolled-up total");
-  csPlays(ctx, {{"t-3", 93}});  // the buckets move on to 1300
+  hCsPlays(ctx, {{"t-3", 93}});  // the buckets move on to 1300
   ctx.Clock.Advance(1);
-  const auto second = csMustGet(ctx, *stub, "plays", "stranger-things");
-  ctx.Equal(std::vector<int64_t>{second.count(), second.as_of()}, std::vector<int64_t>{first.count(), first.as_of()}, "1 s after the first read the buckets moved to 1300, but a read within kCacheTtl is served from %s: [count, as_of]", csKey);
+  const auto second = hCsMustGet(ctx, *stub, "plays", "stranger-things");
+  ctx.Equal(std::vector<int64_t>{second.count(), second.as_of()}, std::vector<int64_t>{first.count(), first.as_of()}, "1 s after the first read the buckets moved to 1300, but a read within kCacheTtl is served from %s: [count, as_of]", kHCsKey);
   ctx.Clock.Advance(1.5);
-  const auto third = csMustGet(ctx, *stub, "plays", "stranger-things");
+  const auto third = hCsMustGet(ctx, *stub, "plays", "stranger-things");
   ctx.Equal(third.count(), 1300, "2.5 s after the total was cached the entry has expired and the next read must sum the buckets again");
   ctx.Assert(third.as_of() >= first.as_of() + 2, "as_of must be the time of the recomputation (%d or later), got %d", first.as_of() + 2, third.as_of());
 }
 
 void CheckReply(harness::Ctx& ctx) {
-  auto stub = csService(ctx);
-  csAddBestEffort(ctx, "views", "trailer-7", 42);
-  auto reply = csMustGet(ctx, *stub, "views", "trailer-7");
+  auto stub = hCsService(ctx);
+  hCsAddBestEffort(ctx, "views", "trailer-7", 42);
+  auto reply = hCsMustGet(ctx, *stub, "views", "trailer-7");
   ctx.Equal(reply.count(), 42, "a best-effort namespace answers the counter's count");
   int64_t now = ctx.Clock.Now() / 1000;
   ctx.Assert(reply.as_of() - now <= 1 && now - reply.as_of() <= 1, "a best-effort reply's as_of is now (%d), got %d", now, reply.as_of());
   ctx.Equal(ctx.Redis.Exists("total:views:trailer-7"), 0, "best-effort counters are not cached (they are already one GET away): EXISTS total:views:trailer-7");
-  csAddBestEffort(ctx, "views", "trailer-7", 8);
-  reply = csMustGet(ctx, *stub, "views", "trailer-7");
+  hCsAddBestEffort(ctx, "views", "trailer-7", 8);
+  reply = hCsMustGet(ctx, *stub, "views", "trailer-7");
   ctx.Equal(reply.count(), 50, "a best-effort read goes straight to the counter: right after another add of 8 GetCount must answer 50");
-  csPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
-  reply = csMustGet(ctx, *stub, "plays", "stranger-things");
+  hCsPlays(ctx, {{"t-1", 1200}, {"t-2", 7}});
+  reply = hCsMustGet(ctx, *stub, "plays", "stranger-things");
   now = ctx.Clock.Now() / 1000;
   ctx.Assert(reply.count() == 1207 && reply.as_of() - now <= 1 && now - reply.as_of() <= 1, "an eventually-consistent reply carries the rolled-up 1207 and a current as_of, got [%d, %d]", reply.count(), reply.as_of());
 }

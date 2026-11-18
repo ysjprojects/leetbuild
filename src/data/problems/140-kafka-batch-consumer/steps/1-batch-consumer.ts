@@ -913,24 +913,24 @@ import (
 	"leetbuild/harness"
 )
 
-const rollupGroup, metricsTopic = "rollup", "metrics"
+const kHRollupGroup, kHMetricsTopic = "rollup", "metrics"
 
-func seedMetrics(ctx *harness.Ctx, n int, partition func(int) int) {
+func hSeedMetrics(ctx *harness.Ctx, n int, partition func(int) int) {
 	for i := range n {
 		host := fmt.Sprintf("host-%d", i)
-		ctx.Kafka.SeedPartition(metricsTopic, partition(i), host, fmt.Sprintf("{%q:%q,%q:%d}", "host", host, "cpu", i))
+		ctx.Kafka.SeedPartition(kHMetricsTopic, partition(i), host, fmt.Sprintf("{%q:%q,%q:%d}", "host", host, "cpu", i))
 	}
 }
 
-func roundRobin3(i int) int { return i % 3 }
+func hRoundRobin3(i int) int { return i % 3 }
 
 // metricPlace is a flushed record: its partition and offset.
-type metricPlace struct {
+type HMetricPlace struct {
 	partition int
 	offset    int64
 }
 
-type rollupCommit struct {
+type HRollupCommit struct {
 	group   string
 	offsets map[string]int64
 	at      int64
@@ -938,23 +938,23 @@ type rollupCommit struct {
 
 // rollupRecorder is what the learner's loop did: every flush as places, every commit with the clock
 // at that moment, and their order.
-type rollupRecorder struct {
-	flushes [][]metricPlace
-	commits []rollupCommit
+type HRollupRecorder struct {
+	flushes [][]HMetricPlace
+	commits []HRollupCommit
 	log     []string
 }
 
-func (rec *rollupRecorder) flush(records []kafka.Message) error {
-	places := make([]metricPlace, 0, len(records))
+func (rec *HRollupRecorder) flush(records []kafka.Message) error {
+	places := make([]HMetricPlace, 0, len(records))
 	for _, r := range records {
-		places = append(places, metricPlace{r.Partition, r.Offset})
+		places = append(places, HMetricPlace{r.Partition, r.Offset})
 	}
 	rec.flushes = append(rec.flushes, places)
 	rec.log = append(rec.log, fmt.Sprintf("flush %d", len(records)))
 	return nil
 }
 
-func (rec *rollupRecorder) sizes() []int {
+func (rec *HRollupRecorder) sizes() []int {
 	sizes := []int{}
 	for _, f := range rec.flushes {
 		sizes = append(sizes, len(f))
@@ -962,14 +962,14 @@ func (rec *rollupRecorder) sizes() []int {
 	return sizes
 }
 
-func recordRollup(ctx *harness.Ctx) *rollupRecorder {
-	rec := &rollupRecorder{}
+func hRecordRollup(ctx *harness.Ctx) *HRollupRecorder {
+	rec := &HRollupRecorder{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		byKey := map[string]int64{}
 		for tp, o := range offsets {
 			byKey[tp.String()] = o
 		}
-		rec.commits = append(rec.commits, rollupCommit{group, byKey, ctx.Clock.Now()})
+		rec.commits = append(rec.commits, HRollupCommit{group, byKey, ctx.Clock.Now()})
 		rec.log = append(rec.log, "commit")
 	})
 	return rec
@@ -977,45 +977,45 @@ func recordRollup(ctx *harness.Ctx) *rollupRecorder {
 
 // runRollup runs the learner's loop over everything seeded, then 2 s of silence: a window still
 // open closes on the way, and the operator stops the loop.
-func runRollup(ctx *harness.Ctx, rec *rollupRecorder) {
+func hRunRollup(ctx *harness.Ctx, rec *HRollupRecorder) {
 	c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	ctx.Drain(func() { _ = run(c, rec.flush) })
 }
 
-func expectedRollupCommit(flush []metricPlace) map[string]int64 {
+func hExpectedRollupCommit(flush []HMetricPlace) map[string]int64 {
 	last := map[string]int64{}
 	for _, p := range flush {
-		key := fmt.Sprintf("%s|%d", metricsTopic, p.partition)
+		key := fmt.Sprintf("%s|%d", kHMetricsTopic, p.partition)
 		last[key] = max(last[key], p.offset+1)
 	}
 	return last
 }
 
 func CheckGroup(ctx *harness.Ctx) {
-	seedMetrics(ctx, 50, roundRobin3)
-	rec := recordRollup(ctx)
-	runRollup(ctx, rec)
+	hSeedMetrics(ctx, 50, hRoundRobin3)
+	rec := hRecordRollup(ctx)
+	hRunRollup(ctx, rec)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to a topic")
 	last := subscriptions[len(subscriptions)-1]
-	ctx.Equal(last.Group, rollupGroup, "GroupID must be %s", rollupGroup)
-	ctx.Assert(slices.Contains(last.Topics, metricsTopic), "the consumer must read %s, got %q", metricsTopic, last.Topics)
+	ctx.Equal(last.Group, kHRollupGroup, "GroupID must be %s", kHRollupGroup)
+	ctx.Assert(slices.Contains(last.Topics, kHMetricsTopic), "the consumer must read %s, got %q", kHMetricsTopic, last.Topics)
 	consumers := ctx.Kafka.Consumers()
 	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "auto-commit is on (ReadMessage or a CommitInterval): offsets would be committed as read, not once per flushed batch")
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "offsets were auto-committed")
 	ctx.Assert(len(ctx.Kafka.EventsOf("manual-commit")) > 0, "no explicit commit happened after the flush")
-	lag := ctx.Kafka.Lag(rollupGroup, metricsTopic)
+	lag := ctx.Kafka.Lag(kHRollupGroup, kHMetricsTopic)
 	ctx.Equal(lag, 0, "%d flushed record(s) are not committed", lag)
 }
 
 func CheckBatchSize(ctx *harness.Ctx) {
-	seedMetrics(ctx, 120, roundRobin3)
-	rec := recordRollup(ctx)
-	runRollup(ctx, rec)
+	hSeedMetrics(ctx, 120, hRoundRobin3)
+	rec := hRecordRollup(ctx)
+	hRunRollup(ctx, rec)
 	ctx.Equal(rec.sizes(), []int{50, 50, 20}, "120 records must flush as [50, 50, 20]")
 	ctx.Equal(rec.log, []string{"flush 50", "commit", "flush 50", "commit", "flush 20", "commit"}, "expected flush, commit, flush, commit, flush, commit — one commit right after each flush")
-	seen := map[metricPlace]bool{}
+	seen := map[HMetricPlace]bool{}
 	total := 0
 	for _, f := range rec.flushes {
 		for _, p := range f {
@@ -1025,9 +1025,9 @@ func CheckBatchSize(ctx *harness.Ctx) {
 	}
 	ctx.Equal(len(seen), total, "a record was flushed twice: the batch must start empty after a flush; distinct records flushed")
 	missing := 0
-	seeded := ctx.Kafka.Records(metricsTopic)
+	seeded := ctx.Kafka.Records(kHMetricsTopic)
 	for _, r := range seeded {
-		if !seen[metricPlace{r.Partition, r.Offset}] {
+		if !seen[HMetricPlace{r.Partition, r.Offset}] {
 			missing++
 		}
 	}
@@ -1052,9 +1052,9 @@ func CheckBatchSize(ctx *harness.Ctx) {
 }
 
 func CheckBatchWait(ctx *harness.Ctx) {
-	seedMetrics(ctx, 70, roundRobin3)
-	rec := recordRollup(ctx)
-	runRollup(ctx, rec)
+	hSeedMetrics(ctx, 70, hRoundRobin3)
+	rec := hRecordRollup(ctx)
+	hRunRollup(ctx, rec)
 	ctx.Equal(rec.sizes(), []int{50, 20}, "70 records must flush as [50, 20] — the 20 once 500 ms pass with nothing new")
 	ctx.Equal(len(rec.commits), 2, "expected one commit per batch")
 	// Measured from the previous commit (the batch starts right after it); a few real ms of slack.
@@ -1063,29 +1063,29 @@ func CheckBatchWait(ctx *harness.Ctx) {
 }
 
 func CheckCommitOffsets(ctx *harness.Ctx) {
-	seedMetrics(ctx, 55, func(i int) int {
+	hSeedMetrics(ctx, 55, func(i int) int {
 		if i < 50 {
 			return 1
 		}
 		return 2
 	})
-	rec := recordRollup(ctx)
-	runRollup(ctx, rec)
+	rec := hRecordRollup(ctx)
+	hRunRollup(ctx, rec)
 	ctx.Equal(len(rec.flushes), 2, "55 records on partitions 1 and 2 must flush as two batches, got sizes %v; batches", rec.sizes())
 	ctx.Equal(len(rec.commits), len(rec.flushes), "expected one commit per flush")
 	for i, flush := range rec.flushes {
 		commit := rec.commits[i]
-		ctx.Equal(commit.group, rollupGroup, "commit %d came from the wrong group", i+1)
-		ctx.Equal(commit.offsets, expectedRollupCommit(flush), "commit %d must be the batch's highest offset + 1 per partition it touched", i+1)
+		ctx.Equal(commit.group, kHRollupGroup, "commit %d came from the wrong group", i+1)
+		ctx.Equal(commit.offsets, hExpectedRollupCommit(flush), "commit %d must be the batch's highest offset + 1 per partition it touched", i+1)
 	}
-	ctx.Assert(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 1) == 50 && ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 2) == 5, "after both batches partition 1 must be committed at 50 and partition 2 at 5")
-	ctx.Equal(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 0), -1, "partition 0 had no records: it must not appear in any commit (-1: no committed offset)")
+	ctx.Assert(ctx.Kafka.CommittedOffset(kHRollupGroup, kHMetricsTopic, 1) == 50 && ctx.Kafka.CommittedOffset(kHRollupGroup, kHMetricsTopic, 2) == 5, "after both batches partition 1 must be committed at 50 and partition 2 at 5")
+	ctx.Equal(ctx.Kafka.CommittedOffset(kHRollupGroup, kHMetricsTopic, 0), -1, "partition 0 had no records: it must not appear in any commit (-1: no committed offset)")
 }
 
 func CheckNoEmptyFlush(ctx *harness.Ctx) {
-	seedMetrics(ctx, 50, roundRobin3)
-	rec := recordRollup(ctx)
-	runRollup(ctx, rec)
+	hSeedMetrics(ctx, 50, hRoundRobin3)
+	rec := hRecordRollup(ctx)
+	hRunRollup(ctx, rec)
 	for _, f := range rec.flushes {
 		ctx.Assert(len(f) > 0, "flush was called with an empty batch: flushes of sizes %v", rec.sizes())
 	}
@@ -1106,23 +1106,23 @@ func CheckNoEmptyFlush(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string rollupGroup = "rollup";
-const std::string metricsTopic = "metrics";
+const std::string kHRollupGroup = "rollup";
+const std::string kHMetricsTopic = "metrics";
 
-void seedMetrics(harness::Ctx& ctx, int n, const std::function<int(int)>& partition) {
+void hSeedMetrics(harness::Ctx& ctx, int n, const std::function<int(int)>& partition) {
   for (int i = 0; i < n; i++) {
     const std::string host = "host-" + std::to_string(i);
-    ctx.Kafka.SeedPartition(metricsTopic, partition(i), host,
+    ctx.Kafka.SeedPartition(kHMetricsTopic, partition(i), host,
                             R"({"host":")" + host + R"(","cpu":)" + std::to_string(i) + "}");
   }
 }
 
-int roundRobin3(int i) { return i % 3; }
+int hRoundRobin3(int i) { return i % 3; }
 
 // metricPlace is a flushed record: its partition and offset.
-using metricPlace = std::pair<int, int64_t>;
+using HMetricPlace = std::pair<int, int64_t>;
 
-struct rollupCommit {
+struct HRollupCommit {
   std::string group;
   std::map<std::string, int64_t> offsets;
   int64_t at;
@@ -1130,13 +1130,13 @@ struct rollupCommit {
 
 // rollupRecorder is what the learner's loop did: every flush as places, every commit with the clock
 // at that moment, and their order.
-struct rollupRecorder {
-  std::vector<std::vector<metricPlace>> flushes;
-  std::vector<rollupCommit> commits;
+struct HRollupRecorder {
+  std::vector<std::vector<HMetricPlace>> flushes;
+  std::vector<HRollupCommit> commits;
   std::vector<std::string> log;
 
   void flush(const Batch& records) {
-    std::vector<metricPlace> places;
+    std::vector<HMetricPlace> places;
     for (const auto& r : records) places.emplace_back(r->partition(), r->offset());
     flushes.push_back(places);
     log.push_back("flush " + std::to_string(records.size()));
@@ -1149,7 +1149,7 @@ struct rollupRecorder {
   }
 };
 
-void recordRollup(harness::Ctx& ctx, rollupRecorder& rec) {
+void hRecordRollup(harness::Ctx& ctx, HRollupRecorder& rec) {
   ctx.Kafka.OnCommit([&ctx, &rec](const std::string& group, const harness::KafkaOffsets& offsets) {
     std::map<std::string, int64_t> byKey;
     for (const auto& [tp, o] : offsets) byKey[tp.String()] = o;
@@ -1160,14 +1160,14 @@ void recordRollup(harness::Ctx& ctx, rollupRecorder& rec) {
 
 // runRollup runs the learner's loop over everything seeded, until it waits for records that will not
 // come: a window still open closes on the way.
-void runRollup(harness::Ctx& ctx, rollupRecorder& rec) {
+void hRunRollup(harness::Ctx& ctx, HRollupRecorder& rec) {
   ctx.Drain([&] { run([&](const Batch& batch) { rec.flush(batch); }); });
 }
 
-std::map<std::string, int64_t> expectedRollupCommit(const std::vector<metricPlace>& flush) {
+std::map<std::string, int64_t> hExpectedRollupCommit(const std::vector<HMetricPlace>& flush) {
   std::map<std::string, int64_t> last;
   for (const auto& [partition, offset] : flush) {
-    const std::string key = metricsTopic + "|" + std::to_string(partition);
+    const std::string key = kHMetricsTopic + "|" + std::to_string(partition);
     last[key] = std::max(last[key], offset + 1);
   }
   return last;
@@ -1176,34 +1176,34 @@ std::map<std::string, int64_t> expectedRollupCommit(const std::vector<metricPlac
 }  // namespace
 
 void CheckGroup(harness::Ctx& ctx) {
-  seedMetrics(ctx, 50, roundRobin3);
-  rollupRecorder rec;
-  recordRollup(ctx, rec);
-  runRollup(ctx, rec);
+  hSeedMetrics(ctx, 50, hRoundRobin3);
+  HRollupRecorder rec;
+  hRecordRollup(ctx, rec);
+  hRunRollup(ctx, rec);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to a topic");
   const auto& last = subscriptions.back();
-  ctx.Equal(last.Group, rollupGroup, "group.id must be %s", rollupGroup);
-  ctx.Assert(std::find(last.Topics.begin(), last.Topics.end(), metricsTopic) != last.Topics.end(),
-             "the consumer must read %s, got %q", metricsTopic, last.Topics);
+  ctx.Equal(last.Group, kHRollupGroup, "group.id must be %s", kHRollupGroup);
+  ctx.Assert(std::find(last.Topics.begin(), last.Topics.end(), kHMetricsTopic) != last.Topics.end(),
+             "the consumer must read %s, got %q", kHMetricsTopic, last.Topics);
   const auto consumers = ctx.Kafka.Consumers();
   ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit,
              "auto-commit is on (enable.auto.commit): offsets would be committed as read, not once per flushed batch");
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "offsets were auto-committed");
   ctx.Assert(!ctx.Kafka.EventsOf("manual-commit").empty(), "no explicit commit happened after the flush");
-  const int64_t lag = ctx.Kafka.Lag(rollupGroup, metricsTopic);
+  const int64_t lag = ctx.Kafka.Lag(kHRollupGroup, kHMetricsTopic);
   ctx.Equal(lag, 0, "%d flushed record(s) are not committed", lag);
 }
 
 void CheckBatchSize(harness::Ctx& ctx) {
-  seedMetrics(ctx, 120, roundRobin3);
-  rollupRecorder rec;
-  recordRollup(ctx, rec);
-  runRollup(ctx, rec);
+  hSeedMetrics(ctx, 120, hRoundRobin3);
+  HRollupRecorder rec;
+  hRecordRollup(ctx, rec);
+  hRunRollup(ctx, rec);
   ctx.Equal(rec.sizes(), {50, 50, 20}, "120 records must flush as [50, 50, 20]");
   ctx.Equal(rec.log, {"flush 50", "commit", "flush 50", "commit", "flush 20", "commit"},
             "expected flush, commit, flush, commit, flush, commit — one commit right after each flush");
-  std::set<metricPlace> seen;
+  std::set<HMetricPlace> seen;
   size_t total = 0;
   for (const auto& f : rec.flushes) {
     for (const auto& p : f) {
@@ -1213,7 +1213,7 @@ void CheckBatchSize(harness::Ctx& ctx) {
   }
   ctx.Equal(seen.size(), total, "a record was flushed twice: the batch must start empty after a flush; distinct records flushed");
   size_t missing = 0;
-  const auto seeded = ctx.Kafka.Records(metricsTopic);
+  const auto seeded = ctx.Kafka.Records(kHMetricsTopic);
   for (const auto& r : seeded)
     if (!seen.count({r.Partition, r.Offset})) missing++;
   ctx.Equal(seeded.size() - missing, seeded.size(), "%d seeded record(s) never reached flush; seeded records flushed", missing);
@@ -1234,10 +1234,10 @@ void CheckBatchSize(harness::Ctx& ctx) {
 }
 
 void CheckBatchWait(harness::Ctx& ctx) {
-  seedMetrics(ctx, 70, roundRobin3);
-  rollupRecorder rec;
-  recordRollup(ctx, rec);
-  runRollup(ctx, rec);
+  hSeedMetrics(ctx, 70, hRoundRobin3);
+  HRollupRecorder rec;
+  hRecordRollup(ctx, rec);
+  hRunRollup(ctx, rec);
   ctx.Equal(rec.sizes(), {50, 20}, "70 records must flush as [50, 20] — the 20 once 500 ms pass with nothing new");
   ctx.Equal(rec.commits.size(), 2, "expected one commit per batch");
   // Measured from the previous commit (the batch starts right after it); a few real ms of slack.
@@ -1246,30 +1246,30 @@ void CheckBatchWait(harness::Ctx& ctx) {
 }
 
 void CheckCommitOffsets(harness::Ctx& ctx) {
-  seedMetrics(ctx, 55, [](int i) { return i < 50 ? 1 : 2; });
-  rollupRecorder rec;
-  recordRollup(ctx, rec);
-  runRollup(ctx, rec);
+  hSeedMetrics(ctx, 55, [](int i) { return i < 50 ? 1 : 2; });
+  HRollupRecorder rec;
+  hRecordRollup(ctx, rec);
+  hRunRollup(ctx, rec);
   ctx.Equal(rec.flushes.size(), 2, "55 records on partitions 1 and 2 must flush as two batches, got sizes %v; batches", rec.sizes());
   ctx.Equal(rec.commits.size(), rec.flushes.size(), "expected one commit per flush");
   for (size_t i = 0; i < rec.flushes.size(); i++) {
     const auto& commit = rec.commits[i];
-    ctx.Equal(commit.group, rollupGroup, "commit %d came from the wrong group", i + 1);
-    ctx.Equal(commit.offsets, expectedRollupCommit(rec.flushes[i]),
+    ctx.Equal(commit.group, kHRollupGroup, "commit %d came from the wrong group", i + 1);
+    ctx.Equal(commit.offsets, hExpectedRollupCommit(rec.flushes[i]),
               "commit %d must be the batch's highest offset + 1 per partition it touched", i + 1);
   }
-  ctx.Assert(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 1) == 50 &&
-                 ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 2) == 5,
+  ctx.Assert(ctx.Kafka.CommittedOffset(kHRollupGroup, kHMetricsTopic, 1) == 50 &&
+                 ctx.Kafka.CommittedOffset(kHRollupGroup, kHMetricsTopic, 2) == 5,
              "after both batches partition 1 must be committed at 50 and partition 2 at 5");
-  ctx.Equal(ctx.Kafka.CommittedOffset(rollupGroup, metricsTopic, 0), -1,
+  ctx.Equal(ctx.Kafka.CommittedOffset(kHRollupGroup, kHMetricsTopic, 0), -1,
             "partition 0 had no records: it must not appear in any commit (-1: no committed offset)");
 }
 
 void CheckNoEmptyFlush(harness::Ctx& ctx) {
-  seedMetrics(ctx, 50, roundRobin3);
-  rollupRecorder rec;
-  recordRollup(ctx, rec);
-  runRollup(ctx, rec);
+  hSeedMetrics(ctx, 50, hRoundRobin3);
+  HRollupRecorder rec;
+  hRecordRollup(ctx, rec);
+  hRunRollup(ctx, rec);
   for (const auto& f : rec.flushes) ctx.Assert(!f.empty(), "flush was called with an empty batch: flushes of sizes %v", rec.sizes());
   ctx.Equal(rec.flushes.size(), 1, "exactly 50 records then silence must flush once; flushes");
   ctx.Equal(rec.commits.size(), 1, "one batch, one commit; commits");

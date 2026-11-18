@@ -747,101 +747,101 @@ import (
 	"leetbuild/harness"
 )
 
-const longURL = "https://example.com/launch"
+const kHLongURL = "https://example.com/launch"
 
 // fakeLinks is the links table: knows g9Xc, records every lookup. Assigned to the learner's store.
-type fakeLinks struct {
+type HFakeLinks struct {
 	urls    map[string]string
 	lookups []string
 }
 
-func (f *fakeLinks) Exists(_ context.Context, code string) (bool, error) {
+func (f *HFakeLinks) Exists(_ context.Context, code string) (bool, error) {
 	_, ok := f.urls[code]
 	return ok, nil
 }
 
-func (f *fakeLinks) Save(_ context.Context, code, url string) error {
+func (f *HFakeLinks) Save(_ context.Context, code, url string) error {
 	f.urls[code] = url
 	return nil
 }
 
-func (f *fakeLinks) Lookup(_ context.Context, code string) (string, error) {
+func (f *HFakeLinks) Lookup(_ context.Context, code string) (string, error) {
 	f.lookups = append(f.lookups, code)
 	return f.urls[code], nil
 }
 
-func standInLinks() *fakeLinks {
-	f := &fakeLinks{urls: map[string]string{"g9Xc": longURL}}
+func hStandInLinks() *HFakeLinks {
+	f := &HFakeLinks{urls: map[string]string{"g9Xc": kHLongURL}}
 	store = f
 	return f
 }
 
 // resolveOK is resolve(code); an error fails the check.
-func resolveOK(ctx *harness.Ctx, code string) string {
+func hResolveOK(ctx *harness.Ctx, code string) string {
 	target, err := resolve(context.Background(), code)
 	ctx.NoError(err, "resolve(ctx, %q)", code)
 	return target
 }
 
 func CheckKey(ctx *harness.Ctx) {
-	standInLinks()
-	ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve must return the long url the store knows")
+	hStandInLinks()
+	ctx.Equal(hResolveOK(ctx, "g9Xc"), kHLongURL, "resolve must return the long url the store knows")
 	cached, _ := ctx.Redis.Get("url:g9Xc")
-	ctx.Equal(cached, longURL, "after a miss the url must be cached under url:g9Xc (keys are %q)", ctx.Redis.Keys("*"))
+	ctx.Equal(cached, kHLongURL, "after a miss the url must be cached under url:g9Xc (keys are %q)", ctx.Redis.Keys("*"))
 	ctx.Redis.Set("url:abcd", "https://example.com/cached")
-	ctx.Equal(resolveOK(ctx, "abcd"), "https://example.com/cached", "a value cached under url:{code} must be returned as the long url")
+	ctx.Equal(hResolveOK(ctx, "abcd"), "https://example.com/cached", "a value cached under url:{code} must be returned as the long url")
 }
 
 func CheckReadFirst(ctx *harness.Ctx) {
-	links := standInLinks()
-	ctx.Redis.Set("url:g9Xc", longURL)
-	ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve of a cached code")
+	links := hStandInLinks()
+	ctx.Redis.Set("url:g9Xc", kHLongURL)
+	ctx.Equal(hResolveOK(ctx, "g9Xc"), kHLongURL, "resolve of a cached code")
 	ctx.Equal(links.lookups, []string(nil), "a cache hit is the whole request: the store was asked")
 	links.urls["zz12"] = "https://example.com/z"
-	ctx.Equal(resolveOK(ctx, "zz12"), "https://example.com/z", "a miss must fall through to the store")
+	ctx.Equal(hResolveOK(ctx, "zz12"), "https://example.com/z", "a miss must fall through to the store")
 	ctx.Equal(links.lookups, []string{"zz12"}, "the store must be asked once on a miss")
-	ctx.Equal(resolveOK(ctx, "zz12"), "https://example.com/z", "resolve of a code cached by the previous miss")
+	ctx.Equal(hResolveOK(ctx, "zz12"), "https://example.com/z", "resolve of a code cached by the previous miss")
 	ctx.Equal(links.lookups, []string{"zz12"}, "the second resolve must be served from the cache, not the store again")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	links := standInLinks()
-	resolveOK(ctx, "g9Xc")
+	links := hStandInLinks()
+	hResolveOK(ctx, "g9Xc")
 	ttl := ctx.Redis.TTL("url:g9Xc")
 	ctx.Assert(ttl > 0, "url:g9Xc was cached without an expiry (TTL %d): the cache would only grow", ttl)
 	ctx.Assert(86000 <= ttl && ttl <= 86400, "url:g9Xc expires in %d s, expected 86400", ttl)
 	ctx.Clock.Advance(86401)
 	_, ok := ctx.Redis.Get("url:g9Xc")
 	ctx.Assert(!ok, "url:g9Xc must be gone once its TTL has passed")
-	ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve after the entry expired")
+	ctx.Equal(hResolveOK(ctx, "g9Xc"), kHLongURL, "resolve after the entry expired")
 	ctx.Equal(links.lookups, []string{"g9Xc", "g9Xc"}, "once the entry has expired the next resolve goes back to the store")
 }
 
 func CheckNegative(ctx *harness.Ctx) {
-	links := standInLinks()
-	ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
+	links := hStandInLinks()
+	ctx.Equal(hResolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
 	ctx.Equal(links.lookups, []string{"ghost"}, "the store lookups")
 	sentinel, ok := ctx.Redis.Get("url:ghost")
 	ctx.Assert(ok, "an unknown code must be cached as the missing sentinel")
 	ctx.Equal(sentinel, missing, "url:ghost must hold the missing sentinel")
 	ttl := ctx.Redis.TTL("url:ghost")
 	ctx.Assert(1 <= ttl && ttl <= 60, "the sentinel expires in %d s, expected 60", ttl)
-	ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
+	ctx.Equal(hResolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
 	ctx.Equal(links.lookups, []string{"ghost"}, "a hit on the sentinel must not touch the store")
 	r := ctx.Main(main).HTTP().Get("/ghost")
 	ctx.Equal(r.Status, 404, "GET /ghost")
 	ctx.Equal(links.lookups, []string{"ghost"}, "the 404 is answered from the sentinel, not from a store lookup")
 	ctx.Clock.Advance(61)
-	ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
+	ctx.Equal(hResolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing")
 	ctx.Equal(links.lookups, []string{"ghost", "ghost"}, "after 60 s the sentinel is gone and the store is asked again")
 }
 
 func CheckRedirect(ctx *harness.Ctx) {
-	standInLinks()
+	hStandInLinks()
 	r := ctx.Main(main).HTTP().Get("/g9Xc")
 	ctx.Assert(r.Status != 301 && r.Status != 308, "GET /g9Xc answered %d: a permanent redirect is cached by the browser and later clicks never come back", r.Status)
 	ctx.Assert(r.Status == 302 || r.Status == 307, "GET /g9Xc answered %d, expected 302", r.Status)
-	ctx.Equal(r.Header.Get("Location"), longURL, "Location must be the long url")
+	ctx.Equal(r.Header.Get("Location"), kHLongURL, "Location must be the long url")
 	cacheControl := r.Header.Get("Cache-Control")
 	ctx.Assert(strings.Contains(cacheControl, "private") && strings.Contains(cacheControl, "max-age=0"), "Cache-Control is %q, expected %q", cacheControl, "private, max-age=0")
 }
@@ -856,13 +856,13 @@ func CheckRedirect(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string longURL = "https://example.com/launch";
+const std::string kHLongURL = "https://example.com/launch";
 
 // fakeLinks is the links table: knows g9Xc, records every lookup. It takes the place of
 // links::table, which every Store goes through (Go assigns it to the learner's store).
-class fakeLinks : public links::Table {
+class HFakeLinks : public links::Table {
  public:
-  std::map<std::string, std::string> urls{{"g9Xc", longURL}};
+  std::map<std::string, std::string> urls{{"g9Xc", kHLongURL}};
   std::vector<std::string> lookups;
 
   bool exists(const std::string& code) override { return urls.count(code) > 0; }
@@ -877,14 +877,14 @@ class fakeLinks : public links::Table {
   }
 };
 
-fakeLinks& standInLinks() {
-  auto* f = new fakeLinks();  // lives for the check: the program's threads may still use it
+HFakeLinks& hStandInLinks() {
+  auto* f = new HFakeLinks();  // lives for the check: the program's threads may still use it
   links::table = f;
   return *f;
 }
 
 // resolveOK is resolve(code), "" for no link (Go's resolve returns ""); an exception fails the check.
-std::string resolveOK(harness::Ctx& ctx, const std::string& code) {
+std::string hResolveOK(harness::Ctx& ctx, const std::string& code) {
   try {
     return resolve(code).value_or("");
   } catch (const std::exception& e) {
@@ -895,63 +895,63 @@ std::string resolveOK(harness::Ctx& ctx, const std::string& code) {
 }  // namespace
 
 void CheckKey(harness::Ctx& ctx) {
-  standInLinks();
-  ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve must return the long url the store knows");
+  hStandInLinks();
+  ctx.Equal(hResolveOK(ctx, "g9Xc"), kHLongURL, "resolve must return the long url the store knows");
   const std::string cached = ctx.Redis.Get("url:g9Xc").value_or("");
-  ctx.Equal(cached, longURL, "after a miss the url must be cached under url:g9Xc (keys are %q)", ctx.Redis.Keys("*"));
+  ctx.Equal(cached, kHLongURL, "after a miss the url must be cached under url:g9Xc (keys are %q)", ctx.Redis.Keys("*"));
   ctx.Redis.Set("url:abcd", "https://example.com/cached");
-  ctx.Equal(resolveOK(ctx, "abcd"), "https://example.com/cached", "a value cached under url:{code} must be returned as the long url");
+  ctx.Equal(hResolveOK(ctx, "abcd"), "https://example.com/cached", "a value cached under url:{code} must be returned as the long url");
 }
 
 void CheckReadFirst(harness::Ctx& ctx) {
-  fakeLinks& links = standInLinks();
-  ctx.Redis.Set("url:g9Xc", longURL);
-  ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve of a cached code");
+  HFakeLinks& links = hStandInLinks();
+  ctx.Redis.Set("url:g9Xc", kHLongURL);
+  ctx.Equal(hResolveOK(ctx, "g9Xc"), kHLongURL, "resolve of a cached code");
   ctx.Equal(links.lookups, std::vector<std::string>{}, "a cache hit is the whole request: the store was asked");
   links.urls["zz12"] = "https://example.com/z";
-  ctx.Equal(resolveOK(ctx, "zz12"), "https://example.com/z", "a miss must fall through to the store");
+  ctx.Equal(hResolveOK(ctx, "zz12"), "https://example.com/z", "a miss must fall through to the store");
   ctx.Equal(links.lookups, std::vector<std::string>{"zz12"}, "the store must be asked once on a miss");
-  ctx.Equal(resolveOK(ctx, "zz12"), "https://example.com/z", "resolve of a code cached by the previous miss");
+  ctx.Equal(hResolveOK(ctx, "zz12"), "https://example.com/z", "resolve of a code cached by the previous miss");
   ctx.Equal(links.lookups, std::vector<std::string>{"zz12"}, "the second resolve must be served from the cache, not the store again");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  fakeLinks& links = standInLinks();
-  resolveOK(ctx, "g9Xc");
+  HFakeLinks& links = hStandInLinks();
+  hResolveOK(ctx, "g9Xc");
   const long long ttl = ctx.Redis.TTL("url:g9Xc");
   ctx.Assert(ttl > 0, "url:g9Xc was cached without an expiry (TTL %d): the cache would only grow", ttl);
   ctx.Assert(86000 <= ttl && ttl <= 86400, "url:g9Xc expires in %d s, expected 86400", ttl);
   ctx.Clock.Advance(86401);
   ctx.Assert(!ctx.Redis.Get("url:g9Xc").has_value(), "url:g9Xc must be gone once its TTL has passed");
-  ctx.Equal(resolveOK(ctx, "g9Xc"), longURL, "resolve after the entry expired");
+  ctx.Equal(hResolveOK(ctx, "g9Xc"), kHLongURL, "resolve after the entry expired");
   ctx.Equal(links.lookups, std::vector<std::string>{"g9Xc", "g9Xc"}, "once the entry has expired the next resolve goes back to the store");
 }
 
 void CheckNegative(harness::Ctx& ctx) {
-  fakeLinks& links = standInLinks();
-  ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing");
+  HFakeLinks& links = hStandInLinks();
+  ctx.Equal(hResolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing");
   ctx.Equal(links.lookups, std::vector<std::string>{"ghost"}, "the store lookups");
   const auto sentinel = ctx.Redis.Get("url:ghost");
   ctx.Assert(sentinel.has_value(), "an unknown code must be cached as the missing sentinel");
   ctx.Equal(*sentinel, kMissing, "url:ghost must hold the missing sentinel");
   const long long ttl = ctx.Redis.TTL("url:ghost");
   ctx.Assert(1 <= ttl && ttl <= 60, "the sentinel expires in %d s, expected 60", ttl);
-  ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing");
+  ctx.Equal(hResolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing");
   ctx.Equal(links.lookups, std::vector<std::string>{"ghost"}, "a hit on the sentinel must not touch the store");
   const auto r = ctx.Main().HTTP().Get("/ghost");
   ctx.Equal(r.Status, 404, "GET /ghost");
   ctx.Equal(links.lookups, std::vector<std::string>{"ghost"}, "the 404 is answered from the sentinel, not from a store lookup");
   ctx.Clock.Advance(61);
-  ctx.Equal(resolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing");
+  ctx.Equal(hResolveOK(ctx, "ghost"), "", "an unknown code resolves to nothing");
   ctx.Equal(links.lookups, std::vector<std::string>{"ghost", "ghost"}, "after 60 s the sentinel is gone and the store is asked again");
 }
 
 void CheckRedirect(harness::Ctx& ctx) {
-  standInLinks();
+  hStandInLinks();
   const auto r = ctx.Main().HTTP().Get("/g9Xc");
   ctx.Assert(r.Status != 301 && r.Status != 308, "GET /g9Xc answered %d: a permanent redirect is cached by the browser and later clicks never come back", r.Status);
   ctx.Assert(r.Status == 302 || r.Status == 307, "GET /g9Xc answered %d, expected 302", r.Status);
-  ctx.Equal(r.HeaderValue("Location"), longURL, "Location must be the long url");
+  ctx.Equal(r.HeaderValue("Location"), kHLongURL, "Location must be the long url");
   const std::string cacheControl = r.HeaderValue("Cache-Control");
   ctx.Assert(cacheControl.find("private") != std::string::npos && cacheControl.find("max-age=0") != std::string::npos,
              "Cache-Control is %q, expected %q", cacheControl, "private, max-age=0");

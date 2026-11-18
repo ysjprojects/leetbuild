@@ -1055,7 +1055,7 @@ import (
 )
 
 // checkoutBody is the valid request, with fields replaced (or removed, for nil) by overrides.
-func checkoutBody(overrides map[string]any) map[string]any {
+func hCheckoutBody(overrides map[string]any) map[string]any {
 	body := map[string]any{"sku": "shoe-42", "qty": 2, "user": "ada"}
 	for k, v := range overrides {
 		if v == nil {
@@ -1068,7 +1068,7 @@ func checkoutBody(overrides map[string]any) map[string]any {
 }
 
 // serviceCall is one call the endpoint made to reserve, release or enqueueOrder.
-type serviceCall struct {
+type HServiceCall struct {
 	kind    string
 	sku     string
 	orderID string
@@ -1077,10 +1077,10 @@ type serviceCall struct {
 }
 
 // serviceLog records the calls to the stand-ins for steps 1, 5 and 3.
-type serviceLog struct{ entries []serviceCall }
+type HServiceLog struct{ entries []HServiceCall }
 
-func (l *serviceLog) of(kind string) []serviceCall {
-	var out []serviceCall
+func (l *HServiceLog) of(kind string) []HServiceCall {
+	var out []HServiceCall
 	for _, e := range l.entries {
 		if e.kind == kind {
 			out = append(out, e)
@@ -1091,18 +1091,18 @@ func (l *serviceLog) of(kind string) []serviceCall {
 
 // standIns swaps steps 1, 5 and 3 for recording fakes: reserve answers !soldOut, enqueueOrder
 // fails when brokerDown.
-func standIns(soldOut, brokerDown bool) *serviceLog {
-	l := &serviceLog{}
+func hStandIns(soldOut, brokerDown bool) *HServiceLog {
+	l := &HServiceLog{}
 	reserve = func(_ context.Context, sku, orderID string, qty int) (bool, error) {
-		l.entries = append(l.entries, serviceCall{kind: "reserve", sku: sku, orderID: orderID, qty: qty})
+		l.entries = append(l.entries, HServiceCall{kind: "reserve", sku: sku, orderID: orderID, qty: qty})
 		return !soldOut, nil
 	}
 	release = func(_ context.Context, orderID string) error {
-		l.entries = append(l.entries, serviceCall{kind: "release", orderID: orderID})
+		l.entries = append(l.entries, HServiceCall{kind: "release", orderID: orderID})
 		return nil
 	}
 	enqueueOrder = func(_ context.Context, order Order) error {
-		l.entries = append(l.entries, serviceCall{kind: "enqueue", order: order})
+		l.entries = append(l.entries, HServiceCall{kind: "enqueue", order: order})
 		if brokerDown {
 			return errors.New("no ack within 2s")
 		}
@@ -1112,28 +1112,28 @@ func standIns(soldOut, brokerDown bool) *serviceLog {
 }
 
 // checkoutServer is the learner's server with the provided services stood in for.
-func checkoutServer(ctx *harness.Ctx, soldOut, brokerDown bool) (*serviceLog, *harness.HTTP) {
-	l := standIns(soldOut, brokerDown)
+func hCheckoutServer(ctx *harness.Ctx, soldOut, brokerDown bool) (*HServiceLog, *harness.HTTP) {
+	l := hStandIns(soldOut, brokerDown)
 	return l, ctx.Main(main).HTTP()
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	_, c := checkoutServer(ctx, false, false)
-	r := c.Post("/checkout", checkoutBody(nil))
+	_, c := hCheckoutServer(ctx, false, false)
+	r := c.Post("/checkout", hCheckoutBody(nil))
 	ctx.Assert(r.Status != 404, "no handler is registered for POST /checkout")
 	ctx.Equal(r.Status, 202, "POST /checkout with a valid body")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	l, c := checkoutServer(ctx, false, false)
+	l, c := hCheckoutServer(ctx, false, false)
 	bad := []struct {
 		label string
 		body  map[string]any
 	}{
-		{"a missing sku", checkoutBody(map[string]any{"sku": nil})},
-		{"a missing user", checkoutBody(map[string]any{"user": nil})},
-		{"qty 0", checkoutBody(map[string]any{"qty": 0})},
-		{"qty 6", checkoutBody(map[string]any{"qty": 6})},
+		{"a missing sku", hCheckoutBody(map[string]any{"sku": nil})},
+		{"a missing user", hCheckoutBody(map[string]any{"user": nil})},
+		{"qty 0", hCheckoutBody(map[string]any{"qty": 0})},
+		{"qty 6", hCheckoutBody(map[string]any{"qty": 6})},
 	}
 	for _, b := range bad {
 		r := c.Post("/checkout", b.body)
@@ -1141,15 +1141,15 @@ func CheckValidate(ctx *harness.Ctx) {
 	}
 	ctx.Equal(len(l.of("reserve")), 0, "a 400 must be decided before stock is touched: reserve calls for a bad body")
 	ctx.Equal(len(ctx.Redis.Keys("attempts:*")), 0, "a 400 must be decided before the attempt counter is touched: attempts:* keys")
-	r := c.Post("/checkout", checkoutBody(map[string]any{"qty": 5}))
+	r := c.Post("/checkout", hCheckoutBody(map[string]any{"qty": 5}))
 	ctx.Equal(r.Status, 202, "qty 5 is the maximum and must be accepted")
-	r = c.Post("/checkout", checkoutBody(map[string]any{"qty": 1}))
+	r = c.Post("/checkout", hCheckoutBody(map[string]any{"qty": 1}))
 	ctx.Equal(r.Status, 202, "qty 1 is the minimum and must be accepted")
 }
 
 func CheckAttemptLimit(ctx *harness.Ctx) {
-	l, c := checkoutServer(ctx, false, false)
-	body := checkoutBody(map[string]any{"user": "bot"})
+	l, c := hCheckoutServer(ctx, false, false)
+	body := hCheckoutBody(map[string]any{"user": "bot"})
 	r := c.Post("/checkout", body)
 	ctx.Equal(r.Status, 202, "the first attempt")
 	count, _ := ctx.Redis.Get("attempts:bot")
@@ -1168,13 +1168,13 @@ func CheckAttemptLimit(ctx *harness.Ctx) {
 	ctx.Clock.Advance(61)
 	r = c.Post("/checkout", body)
 	ctx.Equal(r.Status, 202, "after the 60 s window the counter must have expired")
-	r = c.Post("/checkout", checkoutBody(map[string]any{"user": "grace"}))
+	r = c.Post("/checkout", hCheckoutBody(map[string]any{"user": "grace"}))
 	ctx.Equal(r.Status, 202, "the limit is per user: another user must not be throttled")
 }
 
 func CheckSoldOut(ctx *harness.Ctx) {
-	l, c := checkoutServer(ctx, true, false)
-	r := c.Post("/checkout", checkoutBody(nil))
+	l, c := hCheckoutServer(ctx, true, false)
+	r := c.Post("/checkout", hCheckoutBody(nil))
 	ctx.Equal(r.Status, 409, "a reservation that returned false")
 	var body struct {
 		Error string \`json:"error"\`
@@ -1186,8 +1186,8 @@ func CheckSoldOut(ctx *harness.Ctx) {
 }
 
 func CheckAccepted(ctx *harness.Ctx) {
-	l, c := checkoutServer(ctx, false, false)
-	r := c.Post("/checkout", checkoutBody(nil))
+	l, c := hCheckoutServer(ctx, false, false)
+	r := c.Post("/checkout", hCheckoutBody(nil))
 	ctx.Equal(r.Status, 202, "a reserved and enqueued order")
 	reserves, enqueues := l.of("reserve"), l.of("enqueue")
 	ctx.Equal(len(reserves), 1, "reserve calls")
@@ -1215,8 +1215,8 @@ func CheckAccepted(ctx *harness.Ctx) {
 	ctx.Equal(body.Status, "reserved", "the 202 body's status must be reserved, nothing is paid yet (body %s)", r.Text())
 	ctx.Equal(len(l.of("release")), 0, "a successful enqueue must not release the hold: release calls")
 
-	down := standIns(false, true)
-	r = c.Post("/checkout", checkoutBody(nil))
+	down := hStandIns(false, true)
+	r = c.Post("/checkout", hCheckoutBody(nil))
 	ctx.Equal(r.Status, 503, "when enqueueOrder fails the endpoint")
 	downReserves := down.of("reserve")
 	ctx.Assert(len(downReserves) > 0, "reserve was never called")
@@ -1235,7 +1235,7 @@ func CheckAccepted(ctx *harness.Ctx) {
 namespace {
 
 // checkoutBody is the valid request, with fields replaced (or removed, for null) by overrides.
-std::string checkoutBody(const nlohmann::json& overrides = nlohmann::json::object()) {
+std::string hCheckoutBody(const nlohmann::json& overrides = nlohmann::json::object()) {
   nlohmann::json body = {{"sku", "shoe-42"}, {"qty", 2}, {"user", "ada"}};
   for (const auto& [k, v] : overrides.items()) {
     if (v.is_null()) body.erase(k);
@@ -1245,7 +1245,7 @@ std::string checkoutBody(const nlohmann::json& overrides = nlohmann::json::objec
 }
 
 // serviceCall is one call the endpoint made to reserve, release or enqueue_order.
-struct serviceCall {
+struct HServiceCall {
   std::string kind;
   std::string sku;
   std::string orderID;
@@ -1254,12 +1254,12 @@ struct serviceCall {
 };
 
 // serviceLog records the calls to the stand-ins for steps 1, 5 and 3.
-struct serviceLog {
-  std::vector<serviceCall> entries;
+struct HServiceLog {
+  std::vector<HServiceCall> entries;
   bool soldOut = false;
   bool brokerDown = false;
-  std::vector<serviceCall> of(const std::string& kind) const {
-    std::vector<serviceCall> out;
+  std::vector<HServiceCall> of(const std::string& kind) const {
+    std::vector<HServiceCall> out;
     for (const auto& e : entries) {
       if (e.kind == kind) out.push_back(e);
     }
@@ -1267,28 +1267,28 @@ struct serviceLog {
   }
 };
 
-serviceLog* services = nullptr;
+HServiceLog* hServices = nullptr;
 
 // standIns swaps steps 1, 5 and 3 for recording fakes: reserve answers !soldOut, enqueue_order
 // throws when brokerDown.
-serviceLog* standIns(bool soldOut, bool brokerDown) {
-  services = new serviceLog();
-  services->soldOut = soldOut;
-  services->brokerDown = brokerDown;
-  return services;
+HServiceLog* hStandIns(bool soldOut, bool brokerDown) {
+  hServices = new HServiceLog();
+  hServices->soldOut = soldOut;
+  hServices->brokerDown = brokerDown;
+  return hServices;
 }
 
 // checkoutServer is the learner's server with the provided services stood in for.
-std::pair<serviceLog*, harness::HTTP> checkoutServer(harness::Ctx& ctx, bool soldOut, bool brokerDown) {
-  serviceLog* l = standIns(soldOut, brokerDown);
+std::pair<HServiceLog*, harness::HTTP> hCheckoutServer(harness::Ctx& ctx, bool soldOut, bool brokerDown) {
+  HServiceLog* l = hStandIns(soldOut, brokerDown);
   return {l, ctx.Main().HTTP()};
 }
 
-harness::Response post(harness::HTTP& c, const std::string& body) {
+harness::Response hPost(harness::HTTP& c, const std::string& body) {
   return c.Post("/checkout", body, "Content-Type", "application/json");
 }
 
-harness::Any decode(const harness::Response& r) {
+harness::Any hDecode(const harness::Response& r) {
   const auto doc = harness::ParseJSON(r.Text());
   return doc ? *doc : harness::Any();
 }
@@ -1297,77 +1297,77 @@ harness::Any decode(const harness::Response& r) {
 
 // The stand-ins for steps 1, 5 and 3.
 bool reserve(const std::string& sku, const std::string& order_id, int qty) {
-  services->entries.push_back({"reserve", sku, order_id, qty, {}});
-  return !services->soldOut;
+  hServices->entries.push_back({"reserve", sku, order_id, qty, {}});
+  return !hServices->soldOut;
 }
-void release(const std::string& order_id) { services->entries.push_back({"release", "", order_id, 0, {}}); }
+void release(const std::string& order_id) { hServices->entries.push_back({"release", "", order_id, 0, {}}); }
 void enqueue_order(const Order& order) {
-  services->entries.push_back({"enqueue", "", "", 0, order});
-  if (services->brokerDown) throw std::runtime_error("no ack within 2s");
+  hServices->entries.push_back({"enqueue", "", "", 0, order});
+  if (hServices->brokerDown) throw std::runtime_error("no ack within 2s");
 }
 
 void CheckRoute(harness::Ctx& ctx) {
-  auto [l, c] = checkoutServer(ctx, false, false);
-  const auto r = post(c, checkoutBody());
+  auto [l, c] = hCheckoutServer(ctx, false, false);
+  const auto r = hPost(c, hCheckoutBody());
   ctx.Assert(r.Status != 404, "no handler is registered for POST /checkout");
   ctx.Equal(r.Status, 202, "POST /checkout with a valid body");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto [l, c] = checkoutServer(ctx, false, false);
+  auto [l, c] = hCheckoutServer(ctx, false, false);
   const std::vector<std::pair<std::string, std::string>> bad = {
-      {"a missing sku", checkoutBody({{"sku", nullptr}})},
-      {"a missing user", checkoutBody({{"user", nullptr}})},
-      {"qty 0", checkoutBody({{"qty", 0}})},
-      {"qty 6", checkoutBody({{"qty", 6}})},
+      {"a missing sku", hCheckoutBody({{"sku", nullptr}})},
+      {"a missing user", hCheckoutBody({{"user", nullptr}})},
+      {"qty 0", hCheckoutBody({{"qty", 0}})},
+      {"qty 6", hCheckoutBody({{"qty", 6}})},
   };
   for (const auto& [label, body] : bad) {
-    const auto r = post(c, body);
+    const auto r = hPost(c, body);
     ctx.Equal(r.Status, 400, "%s", label);
   }
   ctx.Equal(l->of("reserve").size(), 0, "a 400 must be decided before stock is touched: reserve calls for a bad body");
   ctx.Equal(ctx.Redis.Keys("attempts:*").size(), 0, "a 400 must be decided before the attempt counter is touched: attempts:* keys");
-  auto r = post(c, checkoutBody({{"qty", 5}}));
+  auto r = hPost(c, hCheckoutBody({{"qty", 5}}));
   ctx.Equal(r.Status, 202, "qty 5 is the maximum and must be accepted");
-  r = post(c, checkoutBody({{"qty", 1}}));
+  r = hPost(c, hCheckoutBody({{"qty", 1}}));
   ctx.Equal(r.Status, 202, "qty 1 is the minimum and must be accepted");
 }
 
 void CheckAttemptLimit(harness::Ctx& ctx) {
-  auto [l, c] = checkoutServer(ctx, false, false);
-  const std::string body = checkoutBody({{"user", "bot"}});
-  auto r = post(c, body);
+  auto [l, c] = hCheckoutServer(ctx, false, false);
+  const std::string body = hCheckoutBody({{"user", "bot"}});
+  auto r = hPost(c, body);
   ctx.Equal(r.Status, 202, "the first attempt");
   ctx.Equal(ctx.Redis.Get("attempts:bot").value_or(""), "1", "attempts:bot after one request");
   const long long ttl = ctx.Redis.TTL("attempts:bot");
   ctx.Assert(0 < ttl && ttl <= 60, "attempts:bot has TTL %d; the window must be set to 60 s when the counter is created", ttl);
-  post(c, body);
+  hPost(c, body);
   ctx.Equal(ctx.Redis.Get("attempts:bot").value_or(""), "2", "every request must INCR attempts:{user}");
   const size_t reserves = l->of("reserve").size();
   ctx.Redis.Set("attempts:bot", 20, "KEEPTTL");
-  r = post(c, body);
+  r = hPost(c, body);
   ctx.Equal(r.Status, 429, "the 21st attempt in the window");
   ctx.Equal(r.HeaderValue("Retry-After"), "60", "the Retry-After header");
   ctx.Equal(l->of("reserve").size(), reserves, "a 429 must be decided before reserve is called (a bot must not cost a Lua call): reserve calls");
   ctx.Clock.Advance(61);
-  r = post(c, body);
+  r = hPost(c, body);
   ctx.Equal(r.Status, 202, "after the 60 s window the counter must have expired");
-  r = post(c, checkoutBody({{"user", "grace"}}));
+  r = hPost(c, hCheckoutBody({{"user", "grace"}}));
   ctx.Equal(r.Status, 202, "the limit is per user: another user must not be throttled");
 }
 
 void CheckSoldOut(harness::Ctx& ctx) {
-  auto [l, c] = checkoutServer(ctx, true, false);
-  const auto r = post(c, checkoutBody());
+  auto [l, c] = hCheckoutServer(ctx, true, false);
+  const auto r = hPost(c, hCheckoutBody());
   ctx.Equal(r.Status, 409, "a reservation that returned false");
-  ctx.Equal(decode(r)["error"].String(), "SOLD_OUT", "the 409 body's error (body %s)", r.Text());
+  ctx.Equal(hDecode(r)["error"].String(), "SOLD_OUT", "the 409 body's error (body %s)", r.Text());
   ctx.Equal(l->of("enqueue").size(), 0, "a sold-out order must not be enqueued: enqueue_order calls");
   ctx.Equal(l->of("release").size(), 0, "nothing was reserved, so nothing must be released: release calls");
 }
 
 void CheckAccepted(harness::Ctx& ctx) {
-  auto [l, c] = checkoutServer(ctx, false, false);
-  auto r = post(c, checkoutBody());
+  auto [l, c] = hCheckoutServer(ctx, false, false);
+  auto r = hPost(c, hCheckoutBody());
   ctx.Equal(r.Status, 202, "a reserved and enqueued order");
   const auto reserves = l->of("reserve");
   const auto enqueues = l->of("enqueue");
@@ -1386,13 +1386,13 @@ void CheckAccepted(harness::Ctx& ctx) {
   const Order& got = enqueues[0].order;
   ctx.Equal(std::make_tuple(got.order_id, got.sku, got.qty, got.user), std::make_tuple(first.orderID, std::string("shoe-42"), 2, std::string("ada")),
             "the order enqueue_order received {order_id sku qty user}");
-  const auto body = decode(r);
+  const auto body = hDecode(r);
   ctx.Equal(body["order_id"].String(), first.orderID, "the 202 body's order_id must be the id that was reserved (body %s)", r.Text());
   ctx.Equal(body["status"].String(), "reserved", "the 202 body's status must be reserved, nothing is paid yet (body %s)", r.Text());
   ctx.Equal(l->of("release").size(), 0, "a successful enqueue must not release the hold: release calls");
 
-  serviceLog* down = standIns(false, true);
-  r = post(c, checkoutBody());
+  HServiceLog* down = hStandIns(false, true);
+  r = hPost(c, hCheckoutBody());
   ctx.Equal(r.Status, 503, "when enqueue_order fails the endpoint");
   const auto downReserves = down->of("reserve");
   ctx.Assert(!downReserves.empty(), "reserve was never called");

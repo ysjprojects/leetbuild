@@ -1151,7 +1151,7 @@ import (
 )
 
 // seedDelivery puts a notification on topic from another producer, with an attempt header unless attempt < 0; it returns the value.
-func seedDelivery(ctx *harness.Ctx, nid, userID, priority, topic string, attempt int) string {
+func hSeedDelivery(ctx *harness.Ctx, nid, userID, priority, topic string, attempt int) string {
 	value, _ := json.Marshal(map[string]string{"id": nid, "user_id": userID, "channel": "push", "title": "Shipped", "body": "On its way", "priority": priority})
 	var headers []harness.KafkaHeader
 	if attempt >= 0 {
@@ -1163,7 +1163,7 @@ func seedDelivery(ctx *harness.Ctx, nid, userID, priority, topic string, attempt
 
 // deliveryWorld is what the push gateway saw: the notification ids it delivered, and the
 // DEADLINE_EXCEEDED answers it still owes each notification id.
-type deliveryWorld struct {
+type HDeliveryWorld struct {
 	mu       sync.Mutex
 	sent     []string
 	failures map[string]int
@@ -1171,19 +1171,19 @@ type deliveryWorld struct {
 	awake    db.Prefs
 }
 
-func (w *deliveryWorld) delivered() []string {
+func (w *HDeliveryWorld) delivered() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]string(nil), w.sent...)
 }
 
 // deliveryGateway delivers (recording the notification id) or answers DEADLINE_EXCEEDED while a notification has failures left.
-type deliveryGateway struct {
+type HDeliveryGateway struct {
 	pb.UnimplementedPushGatewayServer
-	w *deliveryWorld
+	w *HDeliveryWorld
 }
 
-func (g *deliveryGateway) Send(ctx context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
+func (g *HDeliveryGateway) Send(ctx context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
 	g.w.mu.Lock()
 	defer g.w.mu.Unlock()
 	id := req.GetCollapseKey()
@@ -1202,15 +1202,15 @@ func (g *deliveryGateway) Send(ctx context.Context, req *pb.SendRequest) (*pb.Se
 }
 
 var (
-	deliveryRedis   = redis.NewClient(&redis.Options{Addr: "redis:6379"})
-	deliveryConn, _ = grpc.NewClient("push-gateway:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	hDeliveryRedis   = redis.NewClient(&redis.Options{Addr: "redis:6379"})
+	hDeliveryConn, _ = grpc.NewClient("push-gateway:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
 )
 
 // startDelivery is the worker with the real rate limit, preferences and push client of the previous
 // steps behind it; preferences rows are seeded so no user is in quiet hours unless a check says so.
-func startDelivery(ctx *harness.Ctx) *deliveryWorld {
-	w := &deliveryWorld{failures: map[string]int{}}
-	pb.RegisterPushGatewayServer(ctx.GRPC.Server(""), &deliveryGateway{w: w})
+func hStartDelivery(ctx *harness.Ctx) *HDeliveryWorld {
+	w := &HDeliveryWorld{failures: map[string]int{}}
+	pb.RegisterPushGatewayServer(ctx.GRPC.Server(""), &HDeliveryGateway{w: w})
 	w.hour = time.Now().Hour()
 	w.awake = db.Prefs{Push: true, QuietStart: (w.hour + 2) % 24, QuietEnd: (w.hour + 3) % 24} // never quiet right now
 	for _, user := range []string{"u1", "u2", "u-ok", "u-limited", "u-off"} {
@@ -1220,7 +1220,7 @@ func startDelivery(ctx *harness.Ctx) *deliveryWorld {
 	allowed = func(c context.Context, userID, notificationID string) (bool, error) {
 		nowMs := time.Now().UnixMilli()
 		key := "rl:" + userID
-		pipe := deliveryRedis.TxPipeline()
+		pipe := hDeliveryRedis.TxPipeline()
 		pipe.ZAdd(c, key, redis.Z{Score: float64(nowMs), Member: notificationID})
 		pipe.ZRemRangeByScore(c, key, "-inf", strconv.FormatInt(nowMs-3_600_000, 10))
 		count := pipe.ZCard(c, key)
@@ -1229,7 +1229,7 @@ func startDelivery(ctx *harness.Ctx) *deliveryWorld {
 			return false, err
 		}
 		if count.Val() > 20 {
-			deliveryRedis.Incr(c, "dropped:"+userID)
+			hDeliveryRedis.Incr(c, "dropped:"+userID)
 			return false, nil
 		}
 		return true, nil
@@ -1238,7 +1238,7 @@ func startDelivery(ctx *harness.Ctx) *deliveryWorld {
 	getPrefs = func(c context.Context, userID string) (Prefs, error) {
 		key := "prefs:" + userID
 		var p Prefs
-		cached, err := deliveryRedis.Get(c, key).Bytes()
+		cached, err := hDeliveryRedis.Get(c, key).Bytes()
 		if err == nil && json.Unmarshal(cached, &p) == nil {
 			return p, nil
 		}
@@ -1250,13 +1250,13 @@ func startDelivery(ctx *harness.Ctx) *deliveryWorld {
 			return Prefs{}, err
 		}
 		encoded, _ := json.Marshal(p)
-		deliveryRedis.Set(c, key, encoded, 10*time.Minute)
+		hDeliveryRedis.Set(c, key, encoded, 10*time.Minute)
 		return p, nil
 	}
 	// Step 5: one device per user (the token is the user id, the collapse key the notification id),
 	// a 3 s deadline, three attempts with jittered backoff.
 	sendPush = func(c context.Context, n Notification) error {
-		client := pb.NewPushGatewayClient(deliveryConn)
+		client := pb.NewPushGatewayClient(hDeliveryConn)
 		req := &pb.SendRequest{DeviceToken: n.UserID, Title: n.Title, Body: n.Body, CollapseKey: n.ID}
 		var lastErr error
 		for attempt := range 3 {
@@ -1284,11 +1284,11 @@ func startDelivery(ctx *harness.Ctx) *deliveryWorld {
 	return w
 }
 
-func drainDelivery(ctx *harness.Ctx) {
+func hDrainDelivery(ctx *harness.Ctx) {
 	ctx.Drain(func() { _ = run(context.Background()) })
 }
 
-func deliveryHeader(r harness.KafkaRecord, name string) any {
+func hDeliveryHeader(r harness.KafkaRecord, name string) any {
 	if v, ok := r.Header(name); ok {
 		return string(v)
 	}
@@ -1296,10 +1296,10 @@ func deliveryHeader(r harness.KafkaRecord, name string) any {
 }
 
 func CheckGroupTopics(ctx *harness.Ctx) {
-	seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
-	seedDelivery(ctx, "n2", "u1", "normal", "notifications-retry", 1)
-	w := startDelivery(ctx)
-	drainDelivery(ctx)
+	hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	hSeedDelivery(ctx, "n2", "u1", "normal", "notifications-retry", 1)
+	w := hStartDelivery(ctx)
+	hDrainDelivery(ctx)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer must subscribe to its topics")
 	last := subscriptions[len(subscriptions)-1]
@@ -1311,10 +1311,10 @@ func CheckGroupTopics(ctx *harness.Ctx) {
 }
 
 func CheckManualCommit(ctx *harness.Ctx) {
-	seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
-	seedDelivery(ctx, "n2", "u2", "normal", "notifications", -1)
-	startDelivery(ctx)
-	drainDelivery(ctx)
+	hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	hSeedDelivery(ctx, "n2", "u2", "normal", "notifications", -1)
+	hStartDelivery(ctx)
+	hDrainDelivery(ctx)
 	consumers := ctx.Kafka.Consumers()
 	ctx.Assert(len(consumers) > 0 && !consumers[len(consumers)-1].AutoCommit, "the reader commits on its own (ReadMessage, or a CommitInterval): offsets would be committed before the outcome, not after it")
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on their own, before the outcome")
@@ -1323,12 +1323,12 @@ func CheckManualCommit(ctx *harness.Ctx) {
 }
 
 func CheckGate(ctx *harness.Ctx) {
-	seedDelivery(ctx, "n-ok", "u-ok", "normal", "notifications", -1)
-	seedDelivery(ctx, "n-limited", "u-limited", "normal", "notifications", -1)
-	seedDelivery(ctx, "n-off", "u-off", "normal", "notifications", -1)
-	seedDelivery(ctx, "n-quiet", "u-quiet", "normal", "notifications", -1)
-	seedDelivery(ctx, "n-urgent", "u-quiet", "high", "notifications", -1)
-	w := startDelivery(ctx)
+	hSeedDelivery(ctx, "n-ok", "u-ok", "normal", "notifications", -1)
+	hSeedDelivery(ctx, "n-limited", "u-limited", "normal", "notifications", -1)
+	hSeedDelivery(ctx, "n-off", "u-off", "normal", "notifications", -1)
+	hSeedDelivery(ctx, "n-quiet", "u-quiet", "normal", "notifications", -1)
+	hSeedDelivery(ctx, "n-urgent", "u-quiet", "high", "notifications", -1)
+	w := hStartDelivery(ctx)
 	for i := range 20 {
 		ctx.Redis.Do("ZADD", "rl:u-limited", ctx.Clock.Now(), fmt.Sprintf("earlier-%d", i)) // the hourly budget is spent
 	}
@@ -1336,7 +1336,7 @@ func CheckGate(ctx *harness.Ctx) {
 	off.Push = false
 	db.Rows["u-off"] = off
 	db.Rows["u-quiet"] = db.Prefs{Push: true, QuietStart: w.hour, QuietEnd: w.hour + 1} // quiet hours right now
-	drainDelivery(ctx)
+	hDrainDelivery(ctx)
 	_, scored := ctx.Redis.ZScore("rl:u-ok", "n-ok")
 	ctx.Assert(scored, "allowed(ctx, userID, id) must be consulted for every record: rl:u-ok holds %v, expected n-ok", ctx.Redis.ZRangeWithScores("rl:u-ok", 0, -1))
 	_, cached := ctx.Redis.Get("prefs:u-ok")
@@ -1351,12 +1351,12 @@ func CheckGate(ctx *harness.Ctx) {
 }
 
 func CheckRetryTopic(ctx *harness.Ctx) {
-	original := seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
-	seedDelivery(ctx, "n2", "u2", "normal", "notifications-retry", 4)
-	w := startDelivery(ctx)
+	original := hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	hSeedDelivery(ctx, "n2", "u2", "normal", "notifications-retry", 4)
+	w := hStartDelivery(ctx)
 	w.failures["n1"] = 1
 	w.failures["n2"] = 1
-	drainDelivery(ctx)
+	hDrainDelivery(ctx)
 	retried := ctx.Kafka.Records("notifications-retry")
 	keys := ctx.Kafka.Keys("notifications-retry")
 	var requeued []harness.KafkaRecord
@@ -1368,7 +1368,7 @@ func CheckRetryTopic(ctx *harness.Ctx) {
 	ctx.Assert(len(requeued) > 0, "n1 failed once: it must be re-queued on notifications-retry, found keys %v", keys)
 	ctx.Equal(len(requeued), 1, "n1 failed once: times it was re-queued")
 	ctx.Equal(string(requeued[0].Value), original, "the re-queued value must be the original record")
-	ctx.Equal(deliveryHeader(requeued[0], "attempt"), "1", "the re-queued record must carry attempt=1")
+	ctx.Equal(hDeliveryHeader(requeued[0], "attempt"), "1", "the re-queued record must carry attempt=1")
 	sent := w.delivered()
 	n1Deliveries := 0
 	for _, id := range sent {
@@ -1380,7 +1380,7 @@ func CheckRetryTopic(ctx *harness.Ctx) {
 	dead := ctx.Kafka.Records("notifications-dlq")
 	deadKeys := ctx.Kafka.Keys("notifications-dlq")
 	ctx.Assert(len(dead) == 1 && deadKeys[0] == "u2", "n2 failing on attempt 4 must land on notifications-dlq, found keys %v", deadKeys)
-	ctx.Equal(deliveryHeader(dead[0], "attempt"), "5", "the dead-lettered record must carry attempt=5")
+	ctx.Equal(hDeliveryHeader(dead[0], "attempt"), "5", "the dead-lettered record must carry attempt=5")
 	u2Retries := 0
 	for _, k := range keys {
 		if k == "u2" {
@@ -1392,29 +1392,29 @@ func CheckRetryTopic(ctx *harness.Ctx) {
 }
 
 // deliveryCommit is the world at one commit: the topics committed, the records on the retry topic, the deliveries.
-type deliveryCommit struct {
+type HDeliveryCommit struct {
 	topics  []string
 	retried int
 	sent    []string
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
-	w := startDelivery(ctx)
+	hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1)
+	w := hStartDelivery(ctx)
 	w.failures["n1"] = 1
 	ctx.Kafka.StallFor("notifications-retry", 1) // the retry topic's leader acknowledges after 1 s
-	var atCommit []deliveryCommit
+	var atCommit []HDeliveryCommit
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		var topics []string
 		for tp := range offsets {
 			topics = append(topics, tp.Topic)
 		}
 		sort.Strings(topics)
-		atCommit = append(atCommit, deliveryCommit{topics: topics, retried: len(ctx.Kafka.Records("notifications-retry")), sent: w.delivered()})
+		atCommit = append(atCommit, HDeliveryCommit{topics: topics, retried: len(ctx.Kafka.Records("notifications-retry")), sent: w.delivered()})
 	})
-	drainDelivery(ctx)
+	hDrainDelivery(ctx)
 	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
-	var first, second []deliveryCommit
+	var first, second []HDeliveryCommit
 	for _, c := range atCommit {
 		if slices.Contains(c.topics, "notifications") {
 			first = append(first, c)
@@ -1452,7 +1452,7 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 namespace {
 
 // A notification on topic from another producer, with an attempt header unless attempt < 0; the value.
-std::string seedDelivery(harness::Ctx& ctx, const std::string& nid, const std::string& user_id,
+std::string hSeedDelivery(harness::Ctx& ctx, const std::string& nid, const std::string& user_id,
                          const std::string& priority, const std::string& topic, int attempt) {
   const std::string value = nlohmann::json{{"id", nid},          {"user_id", user_id}, {"channel", "push"},
                                            {"title", "Shipped"}, {"body", "On its way"}, {"priority", priority}}
@@ -1465,7 +1465,7 @@ std::string seedDelivery(harness::Ctx& ctx, const std::string& nid, const std::s
 
 // What the push gateway saw: the notification ids it delivered, and the DEADLINE_EXCEEDED answers
 // it still owes each notification id.
-struct DeliveryWorld {
+struct HDeliveryWorld {
   std::mutex mu;
   std::vector<std::string> sent;
   std::map<std::string, int> failures;
@@ -1479,9 +1479,9 @@ struct DeliveryWorld {
 };
 
 // Delivers (recording the notification id) or answers DEADLINE_EXCEEDED while a notification has failures left.
-class DeliveryGateway final : public notify::PushGateway::Service {
+class HDeliveryGateway final : public notify::PushGateway::Service {
  public:
-  explicit DeliveryGateway(DeliveryWorld& w) : w_(w) {}
+  explicit HDeliveryGateway(HDeliveryWorld& w) : w_(w) {}
   grpc::Status Send(grpc::ServerContext*, const notify::SendRequest* req, notify::SendReply* reply) override {
     std::lock_guard<std::mutex> lock(w_.mu);
     std::string id = req->collapse_key();
@@ -1501,37 +1501,37 @@ class DeliveryGateway final : public notify::PushGateway::Service {
   }
 
  private:
-  DeliveryWorld& w_;
+  HDeliveryWorld& w_;
 };
 
-sw::redis::Redis& deliveryRedis() {
+sw::redis::Redis& hDeliveryRedis() {
   static sw::redis::Redis redis("tcp://redis:6379");
   return redis;
 }
 
-DeliveryWorld world;
-DeliveryGateway gateway{world};
+HDeliveryWorld hWorld;
+HDeliveryGateway hGateway{hWorld};
 
-int currentHour() {
+int hCurrentHour() {
   const std::time_t now = std::time(nullptr);
   return std::localtime(&now)->tm_hour;
 }
 
 // The worker with the real rate limit, preferences and push client of the previous steps behind it
 // (defined below); preferences rows are seeded so no user is in quiet hours unless a check says so.
-DeliveryWorld& startDelivery(harness::Ctx& ctx) {
-  ctx.GRPC.Server("")->RegisterService(&gateway);
-  world.hour = currentHour();
-  world.awake = Prefs{true, (world.hour + 2) % 24, (world.hour + 3) % 24};  // never quiet right now
-  for (const std::string user : {"u1", "u2", "u-ok", "u-limited", "u-off"}) db::rows[user] = world.awake;
-  return world;
+HDeliveryWorld& hStartDelivery(harness::Ctx& ctx) {
+  ctx.GRPC.Server("")->RegisterService(&hGateway);
+  hWorld.hour = hCurrentHour();
+  hWorld.awake = Prefs{true, (hWorld.hour + 2) % 24, (hWorld.hour + 3) % 24};  // never quiet right now
+  for (const std::string user : {"u1", "u2", "u-ok", "u-limited", "u-off"}) db::rows[user] = hWorld.awake;
+  return hWorld;
 }
 
-void drainDelivery(harness::Ctx& ctx) {
+void hDrainDelivery(harness::Ctx& ctx) {
   ctx.Drain([] { run(); });
 }
 
-bool contains(const std::vector<std::string>& items, const std::string& item) {
+bool hContains(const std::vector<std::string>& items, const std::string& item) {
   return std::find(items.begin(), items.end(), item) != items.end();
 }
 
@@ -1543,14 +1543,14 @@ bool allowed(const std::string& user_id, const std::string& notification_id) {
   const long long now_ms =
       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
   const std::string key = "rl:" + user_id;
-  auto tx = deliveryRedis().transaction();
+  auto tx = hDeliveryRedis().transaction();
   tx.zadd(key, notification_id, static_cast<double>(now_ms))
       .zremrangebyscore(key, sw::redis::RightBoundedInterval<double>(now_ms - 3'600'000, sw::redis::BoundType::CLOSED))
       .zcard(key)
       .expire(key, std::chrono::seconds(3600));
   auto replies = tx.exec();
   if (replies.get<long long>(2) > 20) {
-    deliveryRedis().incr("dropped:" + user_id);
+    hDeliveryRedis().incr("dropped:" + user_id);
     return false;
   }
   return true;
@@ -1559,9 +1559,9 @@ bool allowed(const std::string& user_id, const std::string& notification_id) {
 // Step 4: cache-aside in prefs:{user} over the provided database.
 Prefs get_prefs(const std::string& user_id) {
   const std::string key = "prefs:" + user_id;
-  if (const auto cached = deliveryRedis().get(key)) return nlohmann::json::parse(*cached).get<Prefs>();
+  if (const auto cached = hDeliveryRedis().get(key)) return nlohmann::json::parse(*cached).get<Prefs>();
   const Prefs prefs = db::load_prefs(user_id);
-  deliveryRedis().set(key, nlohmann::json(prefs).dump(), std::chrono::seconds(600));
+  hDeliveryRedis().set(key, nlohmann::json(prefs).dump(), std::chrono::seconds(600));
   return prefs;
 }
 
@@ -1605,15 +1605,15 @@ void send_push(const Notification& n) {
 }
 
 void CheckGroupTopics(harness::Ctx& ctx) {
-  seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
-  seedDelivery(ctx, "n2", "u1", "normal", "notifications-retry", 1);
-  DeliveryWorld& w = startDelivery(ctx);
-  drainDelivery(ctx);
+  hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  hSeedDelivery(ctx, "n2", "u1", "normal", "notifications-retry", 1);
+  HDeliveryWorld& w = hStartDelivery(ctx);
+  hDrainDelivery(ctx);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer must subscribe to its topics");
   const auto& last = subscriptions.back();
   ctx.Equal(last.Group, "delivery", "group.id must be delivery");
-  ctx.Assert(contains(last.Topics, "notifications") && contains(last.Topics, "notifications-retry"),
+  ctx.Assert(hContains(last.Topics, "notifications") && hContains(last.Topics, "notifications-retry"),
              "the consumer must subscribe to notifications and notifications-retry, got %v", last.Topics);
   auto sent = w.delivered();
   std::sort(sent.begin(), sent.end());
@@ -1621,10 +1621,10 @@ void CheckGroupTopics(harness::Ctx& ctx) {
 }
 
 void CheckManualCommit(harness::Ctx& ctx) {
-  seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
-  seedDelivery(ctx, "n2", "u2", "normal", "notifications", -1);
-  startDelivery(ctx);
-  drainDelivery(ctx);
+  hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  hSeedDelivery(ctx, "n2", "u2", "normal", "notifications", -1);
+  hStartDelivery(ctx);
+  hDrainDelivery(ctx);
   const auto consumers = ctx.Kafka.Consumers();
   ctx.Assert(!consumers.empty() && !consumers.back().AutoCommit,
              "the consumer commits on its own (enable.auto.commit): offsets would be committed before the outcome, not "
@@ -1636,12 +1636,12 @@ void CheckManualCommit(harness::Ctx& ctx) {
 }
 
 void CheckGate(harness::Ctx& ctx) {
-  seedDelivery(ctx, "n-ok", "u-ok", "normal", "notifications", -1);
-  seedDelivery(ctx, "n-limited", "u-limited", "normal", "notifications", -1);
-  seedDelivery(ctx, "n-off", "u-off", "normal", "notifications", -1);
-  seedDelivery(ctx, "n-quiet", "u-quiet", "normal", "notifications", -1);
-  seedDelivery(ctx, "n-urgent", "u-quiet", "high", "notifications", -1);
-  DeliveryWorld& w = startDelivery(ctx);
+  hSeedDelivery(ctx, "n-ok", "u-ok", "normal", "notifications", -1);
+  hSeedDelivery(ctx, "n-limited", "u-limited", "normal", "notifications", -1);
+  hSeedDelivery(ctx, "n-off", "u-off", "normal", "notifications", -1);
+  hSeedDelivery(ctx, "n-quiet", "u-quiet", "normal", "notifications", -1);
+  hSeedDelivery(ctx, "n-urgent", "u-quiet", "high", "notifications", -1);
+  HDeliveryWorld& w = hStartDelivery(ctx);
   for (int i = 0; i < 20; i++) {
     ctx.Redis.Do("ZADD", "rl:u-limited", ctx.Clock.Now(), "earlier-" + std::to_string(i));  // the hourly budget is spent
   }
@@ -1649,32 +1649,32 @@ void CheckGate(harness::Ctx& ctx) {
   off.push = false;
   db::rows["u-off"] = off;
   db::rows["u-quiet"] = Prefs{true, w.hour, w.hour + 1};  // quiet hours right now
-  drainDelivery(ctx);
+  hDrainDelivery(ctx);
   ctx.Assert(ctx.Redis.ZScore("rl:u-ok", "n-ok").has_value(),
              "allowed(user_id, id) must be consulted for every record: rl:u-ok holds %v, expected n-ok",
              ctx.Redis.ZRangeWithScores("rl:u-ok", 0, -1));
   ctx.Assert(ctx.Redis.Get("prefs:u-ok").has_value(),
              "get_prefs(user_id) must be consulted: prefs:u-ok was never cached, keys are %v", ctx.Redis.Keys("prefs:*"));
   const auto sent = w.delivered();
-  ctx.Assert(contains(sent, "n-ok"), "an allowed notification with push on outside quiet hours must be sent, sent %v", sent);
-  ctx.Assert(!contains(sent, "n-limited"), "a rate-limited notification must not be sent");
-  ctx.Assert(!contains(sent, "n-off"), "a user with push off must not get a notification");
-  ctx.Assert(!contains(sent, "n-quiet"),
+  ctx.Assert(hContains(sent, "n-ok"), "an allowed notification with push on outside quiet hours must be sent, sent %v", sent);
+  ctx.Assert(!hContains(sent, "n-limited"), "a rate-limited notification must not be sent");
+  ctx.Assert(!hContains(sent, "n-off"), "a user with push off must not get a notification");
+  ctx.Assert(!hContains(sent, "n-quiet"),
              "a normal notification in quiet hours must not be sent: u-quiet's quiet window is the current hour (%d), "
              "pass quiet(prefs, hour) the current hour (0-23)",
              w.hour);
-  ctx.Assert(contains(sent, "n-urgent"), "a high-priority notification ignores quiet hours, sent %v", sent);
+  ctx.Assert(hContains(sent, "n-urgent"), "a high-priority notification ignores quiet hours, sent %v", sent);
   ctx.Equal(ctx.Kafka.Lag("delivery", "notifications"), 0,
             "skipped notifications are an outcome too (they must be committed): lag of notifications");
 }
 
 void CheckRetryTopic(harness::Ctx& ctx) {
-  const std::string original = seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
-  seedDelivery(ctx, "n2", "u2", "normal", "notifications-retry", 4);
-  DeliveryWorld& w = startDelivery(ctx);
+  const std::string original = hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  hSeedDelivery(ctx, "n2", "u2", "normal", "notifications-retry", 4);
+  HDeliveryWorld& w = hStartDelivery(ctx);
   w.failures["n1"] = 1;
   w.failures["n2"] = 1;
-  drainDelivery(ctx);
+  hDrainDelivery(ctx);
   const auto retried = ctx.Kafka.Records("notifications-retry");
   const auto keys = ctx.Kafka.Keys("notifications-retry");
   std::vector<harness::KafkaRecord> requeued;
@@ -1694,38 +1694,38 @@ void CheckRetryTopic(harness::Ctx& ctx) {
   ctx.Equal(dead[0].Header("attempt"), "5", "the dead-lettered record must carry attempt=5");
   ctx.Equal(std::count(keys.begin(), keys.end(), "u2"), 1,
             "a record on its fifth attempt goes to the DLQ, not back to the retry topic: u2 records on notifications-retry");
-  ctx.Assert(!contains(sent, "n2"), "a dead-lettered notification is not delivered");
+  ctx.Assert(!hContains(sent, "n2"), "a dead-lettered notification is not delivered");
 }
 
 // The world at one commit: the topics committed, the records on the retry topic, the deliveries.
-struct DeliveryCommit {
+struct HDeliveryCommit {
   std::vector<std::string> topics;
   size_t retried = 0;
   std::vector<std::string> sent;
-  friend std::ostream& operator<<(std::ostream& out, const DeliveryCommit& c) {
+  friend std::ostream& operator<<(std::ostream& out, const HDeliveryCommit& c) {
     return out << "{topics:" << harness::Value(c.topics) << " retried:" << c.retried << " sent:" << harness::Value(c.sent)
                << "}";
   }
 };
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  seedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
-  DeliveryWorld& w = startDelivery(ctx);
+  hSeedDelivery(ctx, "n1", "u1", "normal", "notifications", -1);
+  HDeliveryWorld& w = hStartDelivery(ctx);
   w.failures["n1"] = 1;
   ctx.Kafka.StallFor("notifications-retry", 1);  // the retry topic's leader acknowledges after 1 s
-  std::vector<DeliveryCommit> atCommit;
+  std::vector<HDeliveryCommit> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) {
     std::vector<std::string> topics;
     for (const auto& [tp, _] : offsets) topics.push_back(tp.Topic);
     std::sort(topics.begin(), topics.end());
     atCommit.push_back({topics, ctx.Kafka.Records("notifications-retry").size(), w.delivered()});
   });
-  drainDelivery(ctx);
+  hDrainDelivery(ctx);
   ctx.Assert(!atCommit.empty(), "the offset was never committed");
-  std::vector<DeliveryCommit> first, second;
+  std::vector<HDeliveryCommit> first, second;
   for (const auto& c : atCommit) {
-    if (contains(c.topics, "notifications")) first.push_back(c);
-    if (contains(c.topics, "notifications-retry")) second.push_back(c);
+    if (hContains(c.topics, "notifications")) first.push_back(c);
+    if (hContains(c.topics, "notifications-retry")) second.push_back(c);
   }
   ctx.Assert(!first.empty(), "the record on notifications was never committed, commits were %v", atCommit);
   ctx.Equal(first[0].retried, 1,

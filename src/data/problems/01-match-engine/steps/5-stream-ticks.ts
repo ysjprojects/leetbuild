@@ -846,37 +846,37 @@ import (
 )
 
 // tickClient seeds book:ACME, runs the learner's server and returns a client talking to it.
-func tickClient(ctx *harness.Ctx) pb.TickServiceClient {
+func hTickClient(ctx *harness.Ctx) pb.TickServiceClient {
 	ctx.Redis.Do("HSET", "book:ACME", "bid", "10.05", "ask", "10.06", "last", "10.05")
 	ctx.Main(main)
 	return pb.NewTickServiceClient(ctx.GRPC.Dial("ticks:9100"))
 }
 
 // tickItem is what the stream delivered: a tick, or the error that ended it (io.EOF: a normal end).
-type tickItem struct {
+type HTickItem struct {
 	tick *pb.Tick
 	err  error
 }
 
 // tickCall is one SubscribeTicks call, read item by item.
-type tickCall struct {
+type HTickCall struct {
 	ctx    *harness.Ctx
 	cancel context.CancelFunc
-	items  chan tickItem
+	items  chan HTickItem
 }
 
-func openTicks(ctx *harness.Ctx, client pb.TickServiceClient, symbol string) *tickCall {
+func hOpenTicks(ctx *harness.Ctx, client pb.TickServiceClient, symbol string) *HTickCall {
 	c, cancel := context.WithCancel(context.Background())
-	call := &tickCall{ctx: ctx, cancel: cancel, items: make(chan tickItem, 64)}
+	call := &HTickCall{ctx: ctx, cancel: cancel, items: make(chan HTickItem, 64)}
 	stream, err := client.SubscribeTicks(c, &pb.SubscribeRequest{Symbol: symbol})
 	if err != nil {
-		call.items <- tickItem{err: err}
+		call.items <- HTickItem{err: err}
 		return call
 	}
 	go func() {
 		for {
 			tick, err := stream.Recv()
-			call.items <- tickItem{tick, err}
+			call.items <- HTickItem{tick, err}
 			if err != nil {
 				return
 			}
@@ -885,17 +885,17 @@ func openTicks(ctx *harness.Ctx, client pb.TickServiceClient, symbol string) *ti
 	return call
 }
 
-func (t *tickCall) read(what string) tickItem {
+func (t *HTickCall) read(what string) HTickItem {
 	select {
 	case item := <-t.items:
 		return item
 	case <-time.After(500 * time.Millisecond):
 		t.ctx.Fatalf("the stream sent nothing within 0.5s: expected %s", what)
-		return tickItem{}
+		return HTickItem{}
 	}
 }
 
-func assertTick(ctx *harness.Ctx, item tickItem, what string, bid, ask, last float64) {
+func hAssertTick(ctx *harness.Ctx, item HTickItem, what string, bid, ask, last float64) {
 	ctx.Assert(item.err != io.EOF, "the stream ended before sending %s", what)
 	ctx.Assert(item.err == nil, "the call failed with %v before sending %s", item.err, what)
 	tick := item.tick
@@ -905,7 +905,7 @@ func assertTick(ctx *harness.Ctx, item tickItem, what string, bid, ask, last flo
 
 // tickSubscribers counts the subscribers of ticks:{symbol}. Compared as deltas: a subscription leaked
 // by an earlier call stays on the server.
-func tickSubscribers(ctx *harness.Ctx, symbol string) int64 {
+func hTickSubscribers(ctx *harness.Ctx, symbol string) int64 {
 	reply, _ := ctx.Redis.Do("PUBSUB", "NUMSUB", "ticks:"+symbol).([]any)
 	ctx.Assert(len(reply) == 2, "PUBSUB NUMSUB answered %v", reply)
 	n, _ := reply[1].(int64)
@@ -913,30 +913,30 @@ func tickSubscribers(ctx *harness.Ctx, symbol string) int64 {
 }
 
 // subscribedSince waits for the handler to add its subscription on top of the count before the call.
-func subscribedSince(ctx *harness.Ctx, symbol string, before int64) int64 {
-	for i := 0; i < 50 && tickSubscribers(ctx, symbol) <= before; i++ {
+func hSubscribedSince(ctx *harness.Ctx, symbol string, before int64) int64 {
+	for i := 0; i < 50 && hTickSubscribers(ctx, symbol) <= before; i++ {
 		ctx.Settle()
 	}
-	return tickSubscribers(ctx, symbol) - before
+	return hTickSubscribers(ctx, symbol) - before
 }
 
 func CheckSnapshotFirst(ctx *harness.Ctx) {
-	client := tickClient(ctx)
+	client := hTickClient(ctx)
 	ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":1,"ask":2,"last":3}\`) // before this client subscribed: must not reach it
 	// The engine publishes a tick the moment the handler has read the hash: a handler that subscribed first forwards it before its snapshot.
 	ctx.Redis.After("book:ACME", func() any {
 		return ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":1,"ask":2,"last":3}\`)
 	})
-	call := openTicks(ctx, client, "ACME")
+	call := hOpenTicks(ctx, client, "ACME")
 	first := call.read("the snapshot of book:ACME")
-	assertTick(ctx, first, "the first tick (the snapshot from the hash, before any Pub/Sub message)", 10.05, 10.06, 10.05)
+	hAssertTick(ctx, first, "the first tick (the snapshot from the hash, before any Pub/Sub message)", 10.05, 10.06, 10.05)
 	call.cancel()
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	client := tickClient(ctx)
-	before := tickSubscribers(ctx, "GHOST")
-	call := openTicks(ctx, client, "GHOST")
+	client := hTickClient(ctx)
+	before := hTickSubscribers(ctx, "GHOST")
+	call := hOpenTicks(ctx, client, "GHOST")
 	item := call.read("a NOT_FOUND status")
 	outcome := "sent a tick"
 	if item.err == io.EOF {
@@ -945,33 +945,33 @@ func CheckNotFound(ctx *harness.Ctx) {
 	ctx.Assert(item.err != nil && item.err != io.EOF, "an unknown symbol must end the call with NOT_FOUND; the stream %s", outcome)
 	ctx.Equal(status.Code(item.err), codes.NotFound, "an unknown symbol ended the call with status %v", item.err)
 	ctx.Settle()
-	ctx.Equal(tickSubscribers(ctx, "GHOST"), before, "nothing must be subscribed for a symbol that does not exist; subscribers of ticks:GHOST")
+	ctx.Equal(hTickSubscribers(ctx, "GHOST"), before, "nothing must be subscribed for a symbol that does not exist; subscribers of ticks:GHOST")
 }
 
 func CheckForward(ctx *harness.Ctx) {
-	client := tickClient(ctx)
-	before := tickSubscribers(ctx, "ACME")
-	call := openTicks(ctx, client, "ACME")
+	client := hTickClient(ctx)
+	before := hTickSubscribers(ctx, "ACME")
+	call := hOpenTicks(ctx, client, "ACME")
 	call.read("the snapshot")
-	ctx.Equal(subscribedSince(ctx, "ACME", before), 1, "after the snapshot the handler must SUBSCRIBE to ticks:ACME; new subscribers")
+	ctx.Equal(hSubscribedSince(ctx, "ACME", before), 1, "after the snapshot the handler must SUBSCRIBE to ticks:ACME; new subscribers")
 	ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":10.07,"ask":10.08,"last":10.07}\`)
-	assertTick(ctx, call.read("the published tick"), "the forwarded tick", 10.07, 10.08, 10.07)
+	hAssertTick(ctx, call.read("the published tick"), "the forwarded tick", 10.07, 10.08, 10.07)
 	ctx.Redis.Publish("ticks:ACME", \`{"symbol":"ACME","bid":10.09,"ask":10.1,"last":10.09}\`)
-	assertTick(ctx, call.read("the second published tick"), "the second forwarded tick", 10.09, 10.1, 10.09)
+	hAssertTick(ctx, call.read("the second published tick"), "the second forwarded tick", 10.09, 10.1, 10.09)
 	call.cancel()
 }
 
 func CheckCancel(ctx *harness.Ctx) {
-	client := tickClient(ctx)
-	before := tickSubscribers(ctx, "ACME")
-	call := openTicks(ctx, client, "ACME")
+	client := hTickClient(ctx)
+	before := hTickSubscribers(ctx, "ACME")
+	call := hOpenTicks(ctx, client, "ACME")
 	call.read("the snapshot")
-	ctx.Equal(subscribedSince(ctx, "ACME", before), 1, "the handler must be subscribed to ticks:ACME while the client is connected; new subscribers")
+	ctx.Equal(hSubscribedSince(ctx, "ACME", before), 1, "the handler must be subscribed to ticks:ACME while the client is connected; new subscribers")
 	call.cancel()
-	for i := 0; i < 20 && tickSubscribers(ctx, "ACME") > before; i++ {
+	for i := 0; i < 20 && hTickSubscribers(ctx, "ACME") > before; i++ {
 		ctx.Settle()
 	}
-	leaked := tickSubscribers(ctx, "ACME") - before
+	leaked := hTickSubscribers(ctx, "ACME") - before
 	ctx.Equal(leaked, 0, "the client went away but ticks:ACME still has subscribers from this call: unsubscribe on the way out (defer sub.Close()); leaked subscribers")
 }
 `,
@@ -990,50 +990,50 @@ func CheckCancel(ctx *harness.Ctx) {
 namespace {
 
 // tickClient seeds book:ACME, runs the learner's server and returns a client talking to it.
-std::unique_ptr<exchange::TickService::Stub> tickClient(harness::Ctx& ctx) {
+std::unique_ptr<exchange::TickService::Stub> hTickClient(harness::Ctx& ctx) {
   ctx.Redis.Do("HSET", "book:ACME", "bid", "10.05", "ask", "10.06", "last", "10.05");
   ctx.Main();
   return exchange::TickService::NewStub(ctx.GRPC.Dial("ticks:9100"));
 }
 
 // tickItem is what the stream delivered: a tick, or the status that ended it (ended: OK, a normal end).
-struct tickItem {
+struct HTickItem {
   std::optional<exchange::Tick> tick;
   grpc::Status status;
   bool ended = false;
 };
 
 // The status as grpc-go prints an error.
-std::string describe(const grpc::Status& s) {
+std::string hDescribe(const grpc::Status& s) {
   return harness::Sprintf("rpc error: code = %v desc = %s", s.error_code(), s.error_message());
 }
 
 // tickCall is one SubscribeTicks call, read item by item (a reader thread fills items, as the Go
 // harness's goroutine fills its channel).
-struct tickCall {
+struct HTickCall {
   harness::Ctx* ctx = nullptr;
   grpc::ClientContext context;
   std::unique_ptr<grpc::ClientReader<exchange::Tick>> stream;
   std::mutex mu;
   std::condition_variable arrived;
-  std::deque<tickItem> items;
+  std::deque<HTickItem> items;
 
   void cancel() { context.TryCancel(); }
 
-  tickItem read(const std::string& what) {
+  HTickItem read(const std::string& what) {
     std::unique_lock<std::mutex> lock(mu);
     if (!arrived.wait_for(lock, std::chrono::milliseconds(500), [&] { return !items.empty(); })) {
       lock.unlock();
       ctx->Fatalf("the stream sent nothing within 0.5s: expected %s", what);
     }
-    tickItem item = items.front();
+    HTickItem item = items.front();
     items.pop_front();
     return item;
   }
 };
 
-std::shared_ptr<tickCall> openTicks(harness::Ctx& ctx, exchange::TickService::Stub& client, const std::string& symbol) {
-  auto call = std::make_shared<tickCall>();
+std::shared_ptr<HTickCall> hOpenTicks(harness::Ctx& ctx, exchange::TickService::Stub& client, const std::string& symbol) {
+  auto call = std::make_shared<HTickCall>();
   call->ctx = &ctx;
   exchange::SubscribeRequest request;
   request.set_symbol(symbol);
@@ -1041,7 +1041,7 @@ std::shared_ptr<tickCall> openTicks(harness::Ctx& ctx, exchange::TickService::St
   std::thread([call] {
     for (;;) {
       exchange::Tick tick;
-      tickItem item;
+      HTickItem item;
       const bool got = call->stream->Read(&tick);
       if (got) {
         item.tick = tick;
@@ -1060,9 +1060,9 @@ std::shared_ptr<tickCall> openTicks(harness::Ctx& ctx, exchange::TickService::St
   return call;
 }
 
-void assertTick(harness::Ctx& ctx, const tickItem& item, const std::string& what, double bid, double ask, double last) {
+void hAssertTick(harness::Ctx& ctx, const HTickItem& item, const std::string& what, double bid, double ask, double last) {
   ctx.Assert(!item.ended, "the stream ended before sending %s", what);
-  ctx.Assert(item.tick.has_value(), "the call failed with %v before sending %s", describe(item.status), what);
+  ctx.Assert(item.tick.has_value(), "the call failed with %v before sending %s", hDescribe(item.status), what);
   const exchange::Tick& tick = *item.tick;
   ctx.Equal(tick.symbol(), "ACME", "%s names the wrong symbol", what);
   ctx.Equal(std::vector<double>{tick.bid(), tick.ask(), tick.last()}, {bid, ask, last}, "%s: bid, ask, last", what);
@@ -1070,65 +1070,65 @@ void assertTick(harness::Ctx& ctx, const tickItem& item, const std::string& what
 
 // tickSubscribers counts the subscribers of ticks:{symbol}. Compared as deltas: a subscription leaked
 // by an earlier call stays on the server.
-long long tickSubscribers(harness::Ctx& ctx, const std::string& symbol) {
+long long hTickSubscribers(harness::Ctx& ctx, const std::string& symbol) {
   const auto reply = ctx.Redis.Do("PUBSUB", "NUMSUB", "ticks:" + symbol).Array();
   ctx.Assert(reply.size() == 2, "PUBSUB NUMSUB answered %v", reply);
   return reply[1].Int();
 }
 
 // subscribedSince waits for the handler to add its subscription on top of the count before the call.
-long long subscribedSince(harness::Ctx& ctx, const std::string& symbol, long long before) {
-  for (int i = 0; i < 50 && tickSubscribers(ctx, symbol) <= before; i++) ctx.Settle();
-  return tickSubscribers(ctx, symbol) - before;
+long long hSubscribedSince(harness::Ctx& ctx, const std::string& symbol, long long before) {
+  for (int i = 0; i < 50 && hTickSubscribers(ctx, symbol) <= before; i++) ctx.Settle();
+  return hTickSubscribers(ctx, symbol) - before;
 }
 
 }  // namespace
 
 void CheckSnapshotFirst(harness::Ctx& ctx) {
-  auto client = tickClient(ctx);
+  auto client = hTickClient(ctx);
   ctx.Redis.Publish("ticks:ACME", R"({"symbol":"ACME","bid":1,"ask":2,"last":3})");  // before this client subscribed: must not reach it
   // The engine publishes a tick the moment the handler has read the hash: a handler that subscribed first forwards it before its snapshot.
   ctx.Redis.After("book:ACME", [&] { ctx.Redis.Publish("ticks:ACME", R"({"symbol":"ACME","bid":1,"ask":2,"last":3})"); });
-  auto call = openTicks(ctx, *client, "ACME");
-  const tickItem first = call->read("the snapshot of book:ACME");
-  assertTick(ctx, first, "the first tick (the snapshot from the hash, before any Pub/Sub message)", 10.05, 10.06, 10.05);
+  auto call = hOpenTicks(ctx, *client, "ACME");
+  const HTickItem first = call->read("the snapshot of book:ACME");
+  hAssertTick(ctx, first, "the first tick (the snapshot from the hash, before any Pub/Sub message)", 10.05, 10.06, 10.05);
   call->cancel();
 }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  auto client = tickClient(ctx);
-  const long long before = tickSubscribers(ctx, "GHOST");
-  auto call = openTicks(ctx, *client, "GHOST");
-  const tickItem item = call->read("a NOT_FOUND status");
+  auto client = hTickClient(ctx);
+  const long long before = hTickSubscribers(ctx, "GHOST");
+  auto call = hOpenTicks(ctx, *client, "GHOST");
+  const HTickItem item = call->read("a NOT_FOUND status");
   const std::string outcome = item.ended ? "ended normally" : "sent a tick";
   ctx.Assert(!item.tick.has_value() && !item.ended, "an unknown symbol must end the call with NOT_FOUND; the stream %s", outcome);
-  ctx.Equal(item.status.error_code(), grpc::StatusCode::NOT_FOUND, "an unknown symbol ended the call with status %v", describe(item.status));
+  ctx.Equal(item.status.error_code(), grpc::StatusCode::NOT_FOUND, "an unknown symbol ended the call with status %v", hDescribe(item.status));
   ctx.Settle();
-  ctx.Equal(tickSubscribers(ctx, "GHOST"), before, "nothing must be subscribed for a symbol that does not exist; subscribers of ticks:GHOST");
+  ctx.Equal(hTickSubscribers(ctx, "GHOST"), before, "nothing must be subscribed for a symbol that does not exist; subscribers of ticks:GHOST");
 }
 
 void CheckForward(harness::Ctx& ctx) {
-  auto client = tickClient(ctx);
-  const long long before = tickSubscribers(ctx, "ACME");
-  auto call = openTicks(ctx, *client, "ACME");
+  auto client = hTickClient(ctx);
+  const long long before = hTickSubscribers(ctx, "ACME");
+  auto call = hOpenTicks(ctx, *client, "ACME");
   call->read("the snapshot");
-  ctx.Equal(subscribedSince(ctx, "ACME", before), 1, "after the snapshot the handler must SUBSCRIBE to ticks:ACME; new subscribers");
+  ctx.Equal(hSubscribedSince(ctx, "ACME", before), 1, "after the snapshot the handler must SUBSCRIBE to ticks:ACME; new subscribers");
   ctx.Redis.Publish("ticks:ACME", R"({"symbol":"ACME","bid":10.07,"ask":10.08,"last":10.07})");
-  assertTick(ctx, call->read("the published tick"), "the forwarded tick", 10.07, 10.08, 10.07);
+  hAssertTick(ctx, call->read("the published tick"), "the forwarded tick", 10.07, 10.08, 10.07);
   ctx.Redis.Publish("ticks:ACME", R"({"symbol":"ACME","bid":10.09,"ask":10.1,"last":10.09})");
-  assertTick(ctx, call->read("the second published tick"), "the second forwarded tick", 10.09, 10.1, 10.09);
+  hAssertTick(ctx, call->read("the second published tick"), "the second forwarded tick", 10.09, 10.1, 10.09);
   call->cancel();
 }
 
 void CheckCancel(harness::Ctx& ctx) {
-  auto client = tickClient(ctx);
-  const long long before = tickSubscribers(ctx, "ACME");
-  auto call = openTicks(ctx, *client, "ACME");
+  auto client = hTickClient(ctx);
+  const long long before = hTickSubscribers(ctx, "ACME");
+  auto call = hOpenTicks(ctx, *client, "ACME");
   call->read("the snapshot");
-  ctx.Equal(subscribedSince(ctx, "ACME", before), 1, "the handler must be subscribed to ticks:ACME while the client is connected; new subscribers");
+  ctx.Equal(hSubscribedSince(ctx, "ACME", before), 1, "the handler must be subscribed to ticks:ACME while the client is connected; new subscribers");
   call->cancel();
-  for (int i = 0; i < 20 && tickSubscribers(ctx, "ACME") > before; i++) ctx.Settle();
-  const long long leaked = tickSubscribers(ctx, "ACME") - before;
+  for (int i = 0; i < 20 && hTickSubscribers(ctx, "ACME") > before; i++) ctx.Settle();
+  const long long leaked = hTickSubscribers(ctx, "ACME") - before;
   ctx.Equal(leaked, 0, "the client went away but ticks:ACME still has subscribers from this call: unsubscribe on the way out (sub.unsubscribe()); leaked subscribers");
 }
 `,

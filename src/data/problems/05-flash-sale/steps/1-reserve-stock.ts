@@ -664,22 +664,22 @@ import (
 )
 
 const (
-	shoeSKU   = "shoe-42"
-	shoeStock = "stock:shoe-42"
+	kHShoeSKU   = "shoe-42"
+	kHShoeStock = "stock:shoe-42"
 )
 
 // stockUp puts stock units of shoe-42 on sale.
-func stockUp(ctx *harness.Ctx, stock int) { ctx.Redis.Set(shoeStock, stock) }
+func hStockUp(ctx *harness.Ctx, stock int) { ctx.Redis.Set(kHShoeStock, stock) }
 
 // reserved is reserve(sku, orderID, qty); an error fails the check.
-func reserved(ctx *harness.Ctx, sku, orderID string, qty int) bool {
+func hReserved(ctx *harness.Ctx, sku, orderID string, qty int) bool {
 	ok, err := reserve(context.Background(), sku, orderID, qty)
 	ctx.NoError(err, "reserve(%q, %q, %d) returned an error", sku, orderID, qty)
 	return ok
 }
 
 // valueAt is the string at key, nil when it does not exist.
-func valueAt(ctx *harness.Ctx, key string) any {
+func hValueAt(ctx *harness.Ctx, key string) any {
 	if v, ok := ctx.Redis.Get(key); ok {
 		return v
 	}
@@ -687,63 +687,63 @@ func valueAt(ctx *harness.Ctx, key string) any {
 }
 
 func CheckIdempotentRetry(ctx *harness.Ctx) {
-	stockUp(ctx, 3)
-	ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true")
-	ctx.Equal(valueAt(ctx, shoeStock), "1", "stock after reserving 2 of 3")
-	ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "a retried order whose hold exists must return true")
-	ctx.Equal(valueAt(ctx, shoeStock), "1", "the retry must not decrement stock again")
+	hStockUp(ctx, 3)
+	ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true")
+	ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "stock after reserving 2 of 3")
+	ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "a retried order whose hold exists must return true")
+	ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "the retry must not decrement stock again")
 	ctx.Equal(ctx.Redis.ZCard("holds"), 1, "members of holds after a retry")
-	ctx.Equal(valueAt(ctx, "hold:o1"), "o1:shoe-42:2", "the retry must leave the existing hold in place")
+	ctx.Equal(hValueAt(ctx, "hold:o1"), "o1:shoe-42:2", "the retry must leave the existing hold in place")
 }
 
 func CheckCheckThenDecrement(ctx *harness.Ctx) {
-	stockUp(ctx, 3)
-	ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true")
-	ctx.Equal(valueAt(ctx, shoeStock), "1", "stock after reserving 2 of 3")
-	ctx.Assert(!reserved(ctx, shoeSKU, "o2", 2), "1 left cannot cover an order of 2: expected false (sold out)")
-	ctx.Equal(valueAt(ctx, shoeStock), "1", "a refused reservation must leave stock at 1")
+	hStockUp(ctx, 3)
+	ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true")
+	ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "stock after reserving 2 of 3")
+	ctx.Assert(!hReserved(ctx, kHShoeSKU, "o2", 2), "1 left cannot cover an order of 2: expected false (sold out)")
+	ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "a refused reservation must leave stock at 1")
 	ctx.Equal(ctx.Redis.Exists("hold:o2"), 0, "a refused reservation must not write hold:o2")
-	ctx.Assert(reserved(ctx, shoeSKU, "o3", 1), "1 left must cover an order of 1")
-	ctx.Equal(valueAt(ctx, shoeStock), "0", "stock after the last unit is reserved")
-	ctx.Assert(!reserved(ctx, shoeSKU, "o4", 1), "stock 0 must refuse every further order; the counter may never go negative")
-	ctx.Equal(valueAt(ctx, shoeStock), "0", "the script must not decrement stock below zero")
-	ctx.Assert(!reserved(ctx, "never-stocked", "o5", 1), "a missing stock key counts as 0: expected false")
+	ctx.Assert(hReserved(ctx, kHShoeSKU, "o3", 1), "1 left must cover an order of 1")
+	ctx.Equal(hValueAt(ctx, kHShoeStock), "0", "stock after the last unit is reserved")
+	ctx.Assert(!hReserved(ctx, kHShoeSKU, "o4", 1), "stock 0 must refuse every further order; the counter may never go negative")
+	ctx.Equal(hValueAt(ctx, kHShoeStock), "0", "the script must not decrement stock below zero")
+	ctx.Assert(!hReserved(ctx, "never-stocked", "o5", 1), "a missing stock key counts as 0: expected false")
 }
 
 func CheckHoldTtl(ctx *harness.Ctx) {
-	stockUp(ctx, 5)
-	ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "5 in stock must cover an order of 2")
-	ctx.Equal(valueAt(ctx, "hold:o1"), "o1:shoe-42:2", "hold:o1 must hold the member")
+	hStockUp(ctx, 5)
+	ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "5 in stock must cover an order of 2")
+	ctx.Equal(hValueAt(ctx, "hold:o1"), "o1:shoe-42:2", "hold:o1 must hold the member")
 	ttl := ctx.Redis.TTL("hold:o1")
 	ctx.Assert(ttl > 0, "hold:o1 has no TTL: a crashed sweeper would leave it forever")
 	ctx.Assert(1190 <= ttl && ttl <= 1200, "hold:o1 TTL is %d s, expected 2 x holdTTL = 1200 s", ttl)
 	ctx.Clock.Advance(1201)
-	ctx.Equal(valueAt(ctx, "hold:o1"), nil, "hold:o1 must be gone once its TTL has passed")
+	ctx.Equal(hValueAt(ctx, "hold:o1"), nil, "hold:o1 must be gone once its TTL has passed")
 }
 
 func CheckExpiryIndex(ctx *harness.Ctx) {
-	stockUp(ctx, 5)
+	hStockUp(ctx, 5)
 	before := ctx.Clock.Now() / 1000
-	ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "5 in stock must cover an order of 2")
+	ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "5 in stock must cover an order of 2")
 	score, ok := ctx.Redis.ZScore("holds", "o1:shoe-42:2")
 	ctx.Assert(ok, "holds contains %q, expected the member o1:shoe-42:2", ctx.Redis.Do("ZRANGE", "holds", 0, -1))
 	ctx.Assert(float64(before+599) <= score && score <= float64(ctx.Clock.Now())/1000+601, "the member's score is %v, expected now + 600 s (%d)", score, before+600)
-	ctx.Assert(!reserved(ctx, shoeSKU, "o2", 9), "9 of 3 left must be refused")
+	ctx.Assert(!hReserved(ctx, kHShoeSKU, "o2", 9), "9 of 3 left must be refused")
 	ctx.Equal(ctx.Redis.ZCard("holds"), 1, "a refused reservation must not be indexed in holds")
 }
 
 func CheckScriptOnce(ctx *harness.Ctx) {
-	stockUp(ctx, 5)
+	hStockUp(ctx, 5)
 	for i := range 3 {
-		ctx.Assert(reserved(ctx, shoeSKU, fmt.Sprintf("o%d", i), 1), "order o%d must be reserved", i)
+		ctx.Assert(hReserved(ctx, kHShoeSKU, fmt.Sprintf("o%d", i), 1), "order o%d must be reserved", i)
 	}
-	ctx.Equal(valueAt(ctx, shoeStock), "2", "stock after three reservations of 1")
+	ctx.Equal(hValueAt(ctx, kHShoeStock), "2", "stock after three reservations of 1")
 	// Another API replica takes the last unit right after the first command that touches stock:
 	// inside one script nothing can land there; a client-side Get then DecrBy goes negative.
-	stockUp(ctx, 1)
-	ctx.Redis.After(shoeStock, func() any { return ctx.Redis.Set(shoeStock, 0) })
-	reserved(ctx, shoeSKU, "o9", 1)
-	got, _ := ctx.Redis.Get(shoeStock)
+	hStockUp(ctx, 1)
+	ctx.Redis.After(kHShoeStock, func() any { return ctx.Redis.Set(kHShoeStock, 0) })
+	hReserved(ctx, kHShoeSKU, "o9", 1)
+	got, _ := ctx.Redis.Get(kHShoeStock)
 	stock, _ := strconv.Atoi(got)
 	ctx.Assert(stock >= 0, "stock is %d after another worker took the last unit between your read and your decrement: the check and the DECRBY must run inside one script", stock)
 	holds, keys := ctx.Redis.ZCard("holds"), len(ctx.Redis.Keys("hold:*"))
@@ -754,14 +754,14 @@ func CheckScriptOnce(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string shoeSKU = "shoe-42";
-const std::string shoeStock = "stock:shoe-42";
+const std::string kHShoeSKU = "shoe-42";
+const std::string kHShoeStock = "stock:shoe-42";
 
 // stockUp puts stock units of shoe-42 on sale.
-void stockUp(harness::Ctx& ctx, int stock) { ctx.Redis.Set(shoeStock, stock); }
+void hStockUp(harness::Ctx& ctx, int stock) { ctx.Redis.Set(kHShoeStock, stock); }
 
 // reserved is reserve(sku, orderID, qty); an exception fails the check.
-bool reserved(harness::Ctx& ctx, const std::string& sku, const std::string& orderID, int qty) {
+bool hReserved(harness::Ctx& ctx, const std::string& sku, const std::string& orderID, int qty) {
   try {
     return reserve(sku, orderID, qty);
   } catch (const std::exception& e) {
@@ -770,69 +770,69 @@ bool reserved(harness::Ctx& ctx, const std::string& sku, const std::string& orde
 }
 
 // valueAt is the string at key, nil when it does not exist.
-std::optional<std::string> valueAt(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key); }
+std::optional<std::string> hValueAt(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key); }
 
 }  // namespace
 
 void CheckIdempotentRetry(harness::Ctx& ctx) {
-  stockUp(ctx, 3);
-  ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true");
-  ctx.Equal(valueAt(ctx, shoeStock), "1", "stock after reserving 2 of 3");
-  ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "a retried order whose hold exists must return true");
-  ctx.Equal(valueAt(ctx, shoeStock), "1", "the retry must not decrement stock again");
+  hStockUp(ctx, 3);
+  ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true");
+  ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "stock after reserving 2 of 3");
+  ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "a retried order whose hold exists must return true");
+  ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "the retry must not decrement stock again");
   ctx.Equal(ctx.Redis.ZCard("holds"), 1, "members of holds after a retry");
-  ctx.Equal(valueAt(ctx, "hold:o1"), "o1:shoe-42:2", "the retry must leave the existing hold in place");
+  ctx.Equal(hValueAt(ctx, "hold:o1"), "o1:shoe-42:2", "the retry must leave the existing hold in place");
 }
 
 void CheckCheckThenDecrement(harness::Ctx& ctx) {
-  stockUp(ctx, 3);
-  ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true");
-  ctx.Equal(valueAt(ctx, shoeStock), "1", "stock after reserving 2 of 3");
-  ctx.Assert(!reserved(ctx, shoeSKU, "o2", 2), "1 left cannot cover an order of 2: expected false (sold out)");
-  ctx.Equal(valueAt(ctx, shoeStock), "1", "a refused reservation must leave stock at 1");
+  hStockUp(ctx, 3);
+  ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "3 in stock must cover an order of 2: expected true");
+  ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "stock after reserving 2 of 3");
+  ctx.Assert(!hReserved(ctx, kHShoeSKU, "o2", 2), "1 left cannot cover an order of 2: expected false (sold out)");
+  ctx.Equal(hValueAt(ctx, kHShoeStock), "1", "a refused reservation must leave stock at 1");
   ctx.Equal(ctx.Redis.Exists("hold:o2"), 0, "a refused reservation must not write hold:o2");
-  ctx.Assert(reserved(ctx, shoeSKU, "o3", 1), "1 left must cover an order of 1");
-  ctx.Equal(valueAt(ctx, shoeStock), "0", "stock after the last unit is reserved");
-  ctx.Assert(!reserved(ctx, shoeSKU, "o4", 1), "stock 0 must refuse every further order; the counter may never go negative");
-  ctx.Equal(valueAt(ctx, shoeStock), "0", "the script must not decrement stock below zero");
-  ctx.Assert(!reserved(ctx, "never-stocked", "o5", 1), "a missing stock key counts as 0: expected false");
+  ctx.Assert(hReserved(ctx, kHShoeSKU, "o3", 1), "1 left must cover an order of 1");
+  ctx.Equal(hValueAt(ctx, kHShoeStock), "0", "stock after the last unit is reserved");
+  ctx.Assert(!hReserved(ctx, kHShoeSKU, "o4", 1), "stock 0 must refuse every further order; the counter may never go negative");
+  ctx.Equal(hValueAt(ctx, kHShoeStock), "0", "the script must not decrement stock below zero");
+  ctx.Assert(!hReserved(ctx, "never-stocked", "o5", 1), "a missing stock key counts as 0: expected false");
 }
 
 void CheckHoldTtl(harness::Ctx& ctx) {
-  stockUp(ctx, 5);
-  ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "5 in stock must cover an order of 2");
-  ctx.Equal(valueAt(ctx, "hold:o1"), "o1:shoe-42:2", "hold:o1 must hold the member");
+  hStockUp(ctx, 5);
+  ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "5 in stock must cover an order of 2");
+  ctx.Equal(hValueAt(ctx, "hold:o1"), "o1:shoe-42:2", "hold:o1 must hold the member");
   const long long ttl = ctx.Redis.TTL("hold:o1");
   ctx.Assert(ttl > 0, "hold:o1 has no TTL: a crashed sweeper would leave it forever");
   ctx.Assert(1190 <= ttl && ttl <= 1200, "hold:o1 TTL is %d s, expected 2 x kHoldTtl = 1200 s", ttl);
   ctx.Clock.Advance(1201);
-  ctx.Equal(valueAt(ctx, "hold:o1"), nullptr, "hold:o1 must be gone once its TTL has passed");
+  ctx.Equal(hValueAt(ctx, "hold:o1"), nullptr, "hold:o1 must be gone once its TTL has passed");
 }
 
 void CheckExpiryIndex(harness::Ctx& ctx) {
-  stockUp(ctx, 5);
+  hStockUp(ctx, 5);
   const int64_t before = ctx.Clock.Now() / 1000;
-  ctx.Assert(reserved(ctx, shoeSKU, "o1", 2), "5 in stock must cover an order of 2");
+  ctx.Assert(hReserved(ctx, kHShoeSKU, "o1", 2), "5 in stock must cover an order of 2");
   const auto score = ctx.Redis.ZScore("holds", "o1:shoe-42:2");
   ctx.Assert(score.has_value(), "holds contains %q, expected the member o1:shoe-42:2", ctx.Redis.Do("ZRANGE", "holds", 0, -1).Strings());
   ctx.Assert(static_cast<double>(before + 599) <= *score && *score <= static_cast<double>(ctx.Clock.Now()) / 1000 + 601,
              "the member's score is %v, expected now + 600 s (%d)", *score, before + 600);
-  ctx.Assert(!reserved(ctx, shoeSKU, "o2", 9), "9 of 3 left must be refused");
+  ctx.Assert(!hReserved(ctx, kHShoeSKU, "o2", 9), "9 of 3 left must be refused");
   ctx.Equal(ctx.Redis.ZCard("holds"), 1, "a refused reservation must not be indexed in holds");
 }
 
 void CheckScriptOnce(harness::Ctx& ctx) {
-  stockUp(ctx, 5);
+  hStockUp(ctx, 5);
   for (int i = 0; i < 3; i++) {
-    ctx.Assert(reserved(ctx, shoeSKU, "o" + std::to_string(i), 1), "order o%d must be reserved", i);
+    ctx.Assert(hReserved(ctx, kHShoeSKU, "o" + std::to_string(i), 1), "order o%d must be reserved", i);
   }
-  ctx.Equal(valueAt(ctx, shoeStock), "2", "stock after three reservations of 1");
+  ctx.Equal(hValueAt(ctx, kHShoeStock), "2", "stock after three reservations of 1");
   // Another API replica takes the last unit right after the first command that touches stock:
   // inside one script nothing can land there; a client-side GET then DECRBY goes negative.
-  stockUp(ctx, 1);
-  ctx.Redis.After(shoeStock, [&] { ctx.Redis.Set(shoeStock, 0); });
-  reserved(ctx, shoeSKU, "o9", 1);
-  const int stock = std::atoi(ctx.Redis.Get(shoeStock).value_or("").c_str());
+  hStockUp(ctx, 1);
+  ctx.Redis.After(kHShoeStock, [&] { ctx.Redis.Set(kHShoeStock, 0); });
+  hReserved(ctx, kHShoeSKU, "o9", 1);
+  const int stock = std::atoi(ctx.Redis.Get(kHShoeStock).value_or("").c_str());
   ctx.Assert(stock >= 0, "stock is %d after another worker took the last unit between your read and your decrement: the check and the DECRBY must run inside one script", stock);
   const long long holds = ctx.Redis.ZCard("holds");
   const size_t keys = ctx.Redis.Keys("hold:*").size();

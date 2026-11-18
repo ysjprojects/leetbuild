@@ -1013,27 +1013,27 @@ import (
 	"leetbuild/harness"
 )
 
-const eventsTopic = "events"
+const kHEventsTopic = "events"
 
 // producerStats is stats() typed.
-type producerStats struct {
+type HProducerStats struct {
 	delivered, retried, pending int
 	dead                        []string
 }
 
-func readStats(ctx *harness.Ctx) producerStats {
+func hReadStats(ctx *harness.Ctx) HProducerStats {
 	s := stats()
 	delivered, ok1 := s["delivered"].(int)
 	retried, ok2 := s["retried"].(int)
 	pending, ok3 := s["pending"].(int)
 	dead, ok4 := s["dead"].([]string)
 	ctx.Assert(ok1 && ok2 && ok3 && (ok4 || s["dead"] == nil), "stats() must hold ints delivered, retried, pending and a []string dead, got %v", s)
-	return producerStats{delivered, retried, pending, dead}
+	return HProducerStats{delivered, retried, pending, dead}
 }
 
 // serveReportsFor is the 10 ms the TypeScript check sleeps while e1's retry chain runs: the delivery
 // reports that arrive meanwhile are served as a poll loop would, through handle.
-func serveReportsFor(d time.Duration) {
+func hServeReportsFor(d time.Duration) {
 	over := time.After(d)
 	for {
 		select {
@@ -1046,40 +1046,40 @@ func serveReportsFor(d time.Duration) {
 }
 
 func CheckLoseAcks(ctx *harness.Ctx) {
-	ctx.Kafka.LoseAcks(eventsTopic, 1)
+	ctx.Kafka.LoseAcks(kHEventsTopic, 1)
 	send("e1", "p1")
 	shutdown()
-	records := ctx.Kafka.Records(eventsTopic)
-	ctx.Equal(len(records), 1, "a lost ack must not duplicate the record (enable.idempotence): copies on %s", eventsTopic)
-	s := readStats(ctx)
+	records := ctx.Kafka.Records(kHEventsTopic)
+	ctx.Equal(len(records), 1, "a lost ack must not duplicate the record (enable.idempotence): copies on %s", kHEventsTopic)
+	s := hReadStats(ctx)
 	ctx.Equal(s.delivered, 1, "the record was written once and must count as delivered once: delivered")
 	ctx.Assert(len(s.dead) == 0, "a lost ack is not a failure: dead=%q", s.dead)
 	ctx.Equal(s.pending, 0, "nothing is in flight after shutdown: pending")
 }
 
 func CheckRetries(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 2)
+	ctx.Kafka.FailNext(kHEventsTopic, 2)
 	send("e1", "p1")
 	shutdown()
-	s := readStats(ctx)
+	s := hReadStats(ctx)
 	ctx.Equal(s.retried, 2, "two retriable failures mean two retries: retried")
 	ctx.Equal(s.delivered, 1, "the third attempt succeeds: delivered")
 	ctx.Assert(len(s.dead) == 0, "a record that eventually delivered must not be in dead: %q", s.dead)
-	ctx.Equal(ctx.Kafka.Keys(eventsTopic), []string{"e1"}, "exactly one record with key e1 on %s", eventsTopic)
-	ctx.Equal(ctx.Kafka.Values(eventsTopic), []string{"p1"}, "the retry must carry the same value")
+	ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), []string{"e1"}, "exactly one record with key e1 on %s", kHEventsTopic)
+	ctx.Equal(ctx.Kafka.Values(kHEventsTopic), []string{"p1"}, "the retry must carry the same value")
 }
 
 func CheckDead(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(eventsTopic, 4)
+	ctx.Kafka.FailNext(kHEventsTopic, 4)
 	send("e1", "p1")
-	serveReportsFor(10 * time.Millisecond) // the retry chain runs
+	hServeReportsFor(10 * time.Millisecond) // the retry chain runs
 	send("e2", "p2")
 	shutdown()
-	s := readStats(ctx)
+	s := hReadStats(ctx)
 	ctx.Equal(s.dead, []string{"e1"}, "a record that failed maxRetries + 1 times belongs in dead")
 	ctx.Equal(s.retried, 3, "maxRetries retries, no more: retried")
 	ctx.Equal(s.delivered, 1, "e2 still delivers: delivered")
-	keys := ctx.Kafka.Keys(eventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	e1 := 0
 	e2 := 0
 	for _, k := range keys {
@@ -1096,7 +1096,7 @@ func CheckDead(ctx *harness.Ctx) {
 }
 
 func CheckBackpressure(ctx *harness.Ctx) {
-	ctx.Kafka.StallFor(eventsTopic, 5) // the broker answers again after 5 s
+	ctx.Kafka.StallFor(kHEventsTopic, 5) // the broker answers again after 5 s
 	ids := make([]string, 0, 150)
 	for i := range 150 {
 		ids = append(ids, fmt.Sprintf("e%d", i))
@@ -1112,11 +1112,11 @@ func CheckBackpressure(ctx *harness.Ctx) {
 	stalled := len(ctx.Kafka.EventsOf("produce-stalled"))
 	ctx.Assert(stalled <= 100, "%d records were handed to the stalled broker: send must wait once maxPending are in flight", stalled)
 	ctx.Assert(stalled > 0, "with the broker stalled the first maxPending records must still be handed to the producer")
-	pending := readStats(ctx).pending
+	pending := hReadStats(ctx).pending
 	ctx.Assert(pending <= 100, "pending is %d during the stall: maxPending is 100", pending)
 	<-sent
 	shutdown()
-	keys := ctx.Kafka.Keys(eventsTopic)
+	keys := ctx.Kafka.Keys(kHEventsTopic)
 	distinct := map[string]bool{}
 	for _, k := range keys {
 		distinct[k] = true
@@ -1125,7 +1125,7 @@ func CheckBackpressure(ctx *harness.Ctx) {
 	sort.Strings(sortedKeys)
 	sort.Strings(ids)
 	ctx.Equal(sortedKeys, ids, "every record must land once the broker answers: %d of 150, %d distinct", len(keys), len(distinct))
-	s := readStats(ctx)
+	s := hReadStats(ctx)
 	ctx.Assert(s.delivered == 150 && len(s.dead) == 0, "delivered=%d dead=%q: waiting is not dropping", s.delivered, s.dead)
 }
 
@@ -1134,7 +1134,7 @@ func CheckKeyed(ctx *harness.Ctx) {
 		send(id, "p")
 	}
 	shutdown()
-	records := ctx.Kafka.Records(eventsTopic)
+	records := ctx.Kafka.Records(kHEventsTopic)
 	keys := []any{}
 	for _, r := range records {
 		if r.Key == nil {
@@ -1145,19 +1145,19 @@ func CheckKeyed(ctx *harness.Ctx) {
 	}
 	ctx.Equal(keys, []any{"order-1", "order-2", "order-3"}, "keys must be the event ids")
 	for _, r := range records {
-		ctx.Equal(r.Partition, ctx.Kafka.PartitionFor(eventsTopic, r.Key), "%s sits on a partition other than the one its key hashes to", r.Key)
+		ctx.Equal(r.Partition, ctx.Kafka.PartitionFor(kHEventsTopic, r.Key), "%s sits on a partition other than the one its key hashes to", r.Key)
 	}
 }
 
 func CheckFlushBound(ctx *harness.Ctx) {
-	ctx.Kafka.Stall(eventsTopic) // dead broker
+	ctx.Kafka.Stall(kHEventsTopic) // dead broker
 	send("e1", "p1")
 	started := ctx.Clock.Now()
 	left := shutdown()
 	waited := ctx.Clock.Now() - started
 	ctx.Assert(waited >= 2500 && waited <= 10_000, "shutdown waited %d ms on a dead broker: flush must be bounded by flushTimeoutMs = 3000", waited)
 	ctx.Equal(left, 1, "shutdown must return how many records are still in flight")
-	s := readStats(ctx)
+	s := hReadStats(ctx)
 	ctx.Assert(s.delivered == 0 && s.pending == 1, "nothing was delivered and one record is still in flight: %v", stats())
 }
 `,
@@ -1175,15 +1175,15 @@ func CheckFlushBound(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string eventsTopic = "events";
+const std::string kHEventsTopic = "events";
 
-std::string showStats(const Stats& s) {
+std::string hShowStats(const Stats& s) {
   return harness::Sprintf("{delivered:%d retried:%d dead:%q pending:%d}", s.delivered, s.retried, s.dead, s.pending);
 }
 
 // serveReportsFor is the 10 ms the TypeScript check sleeps while e1's retry chain runs: the delivery
 // reports that arrive meanwhile are served as a poll loop would.
-void serveReportsFor(harness::Ctx& ctx, int64_t ms) {
+void hServeReportsFor(harness::Ctx& ctx, int64_t ms) {
   const int64_t over = ctx.Clock.Now() + ms;
   for (int64_t left = ms; left > 0; left = over - ctx.Clock.Now()) producer->poll(static_cast<int>(left));
 }
@@ -1191,11 +1191,11 @@ void serveReportsFor(harness::Ctx& ctx, int64_t ms) {
 }  // namespace
 
 void CheckLoseAcks(harness::Ctx& ctx) {
-  ctx.Kafka.LoseAcks(eventsTopic, 1);
+  ctx.Kafka.LoseAcks(kHEventsTopic, 1);
   send("e1", "p1");
   shutdown();
-  const auto records = ctx.Kafka.Records(eventsTopic);
-  ctx.Equal(records.size(), 1, "a lost ack must not duplicate the record (enable.idempotence): copies on %s", eventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
+  ctx.Equal(records.size(), 1, "a lost ack must not duplicate the record (enable.idempotence): copies on %s", kHEventsTopic);
   const Stats s = stats();
   ctx.Equal(s.delivered, 1, "the record was written once and must count as delivered once: delivered");
   ctx.Assert(s.dead.empty(), "a lost ack is not a failure: dead=%q", s.dead);
@@ -1203,28 +1203,28 @@ void CheckLoseAcks(harness::Ctx& ctx) {
 }
 
 void CheckRetries(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(eventsTopic, 2);
+  ctx.Kafka.FailNext(kHEventsTopic, 2);
   send("e1", "p1");
   shutdown();
   const Stats s = stats();
   ctx.Equal(s.retried, 2, "two retriable failures mean two retries: retried");
   ctx.Equal(s.delivered, 1, "the third attempt succeeds: delivered");
   ctx.Assert(s.dead.empty(), "a record that eventually delivered must not be in dead: %q", s.dead);
-  ctx.Equal(ctx.Kafka.Keys(eventsTopic), {"e1"}, "exactly one record with key e1 on %s", eventsTopic);
-  ctx.Equal(ctx.Kafka.Values(eventsTopic), {"p1"}, "the retry must carry the same value");
+  ctx.Equal(ctx.Kafka.Keys(kHEventsTopic), {"e1"}, "exactly one record with key e1 on %s", kHEventsTopic);
+  ctx.Equal(ctx.Kafka.Values(kHEventsTopic), {"p1"}, "the retry must carry the same value");
 }
 
 void CheckDead(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(eventsTopic, 4);
+  ctx.Kafka.FailNext(kHEventsTopic, 4);
   send("e1", "p1");
-  serveReportsFor(ctx, 10);  // the retry chain runs
+  hServeReportsFor(ctx, 10);  // the retry chain runs
   send("e2", "p2");
   shutdown();
   const Stats s = stats();
   ctx.Equal(s.dead, {"e1"}, "a record that failed maxRetries + 1 times belongs in dead");
   ctx.Equal(s.retried, 3, "maxRetries retries, no more: retried");
   ctx.Equal(s.delivered, 1, "e2 still delivers: delivered");
-  const auto keys = ctx.Kafka.Keys(eventsTopic);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopic);
   const auto e1 = std::count(keys.begin(), keys.end(), "e1");
   const auto e2 = std::count(keys.begin(), keys.end(), "e2");
   ctx.Assert(e1 <= 1, "e1 is on the topic %d times", e1);
@@ -1233,7 +1233,7 @@ void CheckDead(harness::Ctx& ctx) {
 }
 
 void CheckBackpressure(harness::Ctx& ctx) {
-  ctx.Kafka.StallFor(eventsTopic, 5);  // the broker answers again after 5 s
+  ctx.Kafka.StallFor(kHEventsTopic, 5);  // the broker answers again after 5 s
   std::vector<std::string> ids;
   for (int i = 0; i < 150; i++) ids.push_back("e" + std::to_string(i));
   std::thread sender([&ids] {
@@ -1253,7 +1253,7 @@ void CheckBackpressure(harness::Ctx& ctx) {
   ctx.Assert(pending <= 100, "pending is %d during the stall: maxPending is 100", pending);
   sender.join();
   shutdown();
-  const auto keys = ctx.Kafka.Keys(eventsTopic);
+  const auto keys = ctx.Kafka.Keys(kHEventsTopic);
   const std::set<std::string> distinct(keys.begin(), keys.end());
   auto sortedKeys = keys;
   std::sort(sortedKeys.begin(), sortedKeys.end());
@@ -1266,17 +1266,17 @@ void CheckBackpressure(harness::Ctx& ctx) {
 void CheckKeyed(harness::Ctx& ctx) {
   for (const std::string id : {"order-1", "order-2", "order-3"}) send(id, "p");
   shutdown();
-  const auto records = ctx.Kafka.Records(eventsTopic);
+  const auto records = ctx.Kafka.Records(kHEventsTopic);
   std::vector<std::optional<std::string>> keys;
   for (const auto& r : records) keys.push_back(r.Key);
   ctx.Equal(keys, {"order-1", "order-2", "order-3"}, "keys must be the event ids");
   for (const auto& r : records)
-    ctx.Equal(r.Partition, ctx.Kafka.PartitionFor(eventsTopic, r.Key),
+    ctx.Equal(r.Partition, ctx.Kafka.PartitionFor(kHEventsTopic, r.Key),
               "%s sits on a partition other than the one its key hashes to", r.Key);
 }
 
 void CheckFlushBound(harness::Ctx& ctx) {
-  ctx.Kafka.Stall(eventsTopic);  // dead broker
+  ctx.Kafka.Stall(kHEventsTopic);  // dead broker
   send("e1", "p1");
   const int64_t started = ctx.Clock.Now();
   const int left = shutdown();
@@ -1285,7 +1285,7 @@ void CheckFlushBound(harness::Ctx& ctx) {
              "shutdown waited %d ms on a dead broker: flush must be bounded by flushTimeoutMs = 3000", waited);
   ctx.Equal(left, 1, "shutdown must return how many records are still in flight");
   const Stats s = stats();
-  ctx.Assert(s.delivered == 0 && s.pending == 1, "nothing was delivered and one record is still in flight: %v", showStats(s));
+  ctx.Assert(s.delivered == 0 && s.pending == 1, "nothing was delivered and one record is still in flight: %v", hShowStats(s));
 }
 `,
   },

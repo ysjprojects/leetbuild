@@ -673,15 +673,15 @@ import (
 )
 
 const (
-	ceTopic        = "counter-events"
-	ceFlushTimeout = 1.0 // seconds
+	kHCeTopic        = "counter-events"
+	kHCeFlushTimeout = 1.0 // seconds
 )
 
-var ceBg = context.Background()
+var hCeBg = context.Background()
 
 // ceAttempt is whether appendEvent returned nil, or the ErrNotDurable it returned; any other error fails the check.
-func ceAttempt(ctx *harness.Ctx, ns, name string, delta int64, token string) (bool, error) {
-	err := appendEvent(ceBg, ns, name, delta, token)
+func hCeAttempt(ctx *harness.Ctx, ns, name string, delta int64, token string) (bool, error) {
+	err := appendEvent(hCeBg, ns, name, delta, token)
 	if err == nil {
 		return true, nil
 	}
@@ -689,24 +689,24 @@ func ceAttempt(ctx *harness.Ctx, ns, name string, delta int64, token string) (bo
 	return false, err
 }
 
-func ceAppend(ctx *harness.Ctx, ns, name string, delta int64, token string) {
-	ctx.NoError(appendEvent(ceBg, ns, name, delta, token), "appendEvent(ctx, %q, %q, %d, %q) returned an error", ns, name, delta, token)
+func hCeAppend(ctx *harness.Ctx, ns, name string, delta int64, token string) {
+	ctx.NoError(appendEvent(hCeBg, ns, name, delta, token), "appendEvent(ctx, %q, %q, %d, %q) returned an error", ns, name, delta, token)
 }
 
 func CheckTopicKey(ctx *harness.Ctx) {
-	ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3")
-	ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4")
-	ceAppend(ctx, "plays", "the-crown", 1, "t-9f5")
-	produced := ctx.Kafka.Records(ceTopic)
-	ctx.Assert(len(produced) == 3, "expected three records on %s, found %d (topics: %q)", ceTopic, len(produced), ctx.Kafka.Topics())
-	ctx.Equal(ctx.Kafka.Keys(ceTopic), []string{"plays:stranger-things", "plays:stranger-things", "plays:the-crown"}, "records must be keyed by ns:name")
+	hCeAppend(ctx, "plays", "stranger-things", 1, "t-9f3")
+	hCeAppend(ctx, "plays", "stranger-things", 2, "t-9f4")
+	hCeAppend(ctx, "plays", "the-crown", 1, "t-9f5")
+	produced := ctx.Kafka.Records(kHCeTopic)
+	ctx.Assert(len(produced) == 3, "expected three records on %s, found %d (topics: %q)", kHCeTopic, len(produced), ctx.Kafka.Topics())
+	ctx.Equal(ctx.Kafka.Keys(kHCeTopic), []string{"plays:stranger-things", "plays:stranger-things", "plays:the-crown"}, "records must be keyed by ns:name")
 	ctx.Equal(produced[0].Partition, produced[1].Partition, "the same counter must land on the same partition")
 }
 
 func CheckEventShape(ctx *harness.Ctx) {
-	ceAppend(ctx, "plays", "stranger-things", -2, "t-9f3")
-	produced := ctx.Kafka.Values(ceTopic)
-	ctx.Equal(len(produced), 1, "the number of records on %s", ceTopic)
+	hCeAppend(ctx, "plays", "stranger-things", -2, "t-9f3")
+	produced := ctx.Kafka.Values(kHCeTopic)
+	ctx.Equal(len(produced), 1, "the number of records on %s", kHCeTopic)
 	var event map[string]any
 	ctx.NoError(json.Unmarshal([]byte(produced[0]), &event), "the value must be JSON: %s", produced[0])
 	ctx.Assert(event["ns"] == "plays" && event["name"] == "stranger-things", "the value must carry ns and name: %s", produced[0])
@@ -718,16 +718,16 @@ func CheckEventShape(ctx *harness.Ctx) {
 
 func CheckAcksAll(ctx *harness.Ctx) {
 	// The partition leader fails right after acknowledging: only an event every in-sync replica has survives.
-	ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3")
-	ctx.Kafka.Failover(ceTopic)
-	held := len(ctx.Kafka.Records(ceTopic))
-	ctx.Assert(held == 1, "appendEvent returned (the API would answer 202), then the partition leader failed and %s holds %d record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs RequiredAcks: kafka.RequireAll", ceTopic, held)
+	hCeAppend(ctx, "plays", "stranger-things", 1, "t-9f3")
+	ctx.Kafka.Failover(kHCeTopic)
+	held := len(ctx.Kafka.Records(kHCeTopic))
+	ctx.Assert(held == 1, "appendEvent returned (the API would answer 202), then the partition leader failed and %s holds %d record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs RequiredAcks: kafka.RequireAll", kHCeTopic, held)
 	// The broker writes the next event but its acknowledgement is lost: the producer retries it.
-	ctx.Kafka.LoseAcks(ceTopic, 1)
-	ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4")
+	ctx.Kafka.LoseAcks(kHCeTopic, 1)
+	hCeAppend(ctx, "plays", "stranger-things", 2, "t-9f4")
 	// kafka-go has no idempotent producer (the step's Go code): at least once, identical copies.
-	copies := ctx.Kafka.Records(ceTopic)[1:]
-	ctx.Assert(len(copies) >= 1, "the broker wrote the second event and its acknowledgement was lost, yet %s does not hold it", ceTopic)
+	copies := ctx.Kafka.Records(kHCeTopic)[1:]
+	ctx.Assert(len(copies) >= 1, "the broker wrote the second event and its acknowledgement was lost, yet %s does not hold it", kHCeTopic)
 	for _, c := range copies {
 		ctx.Assert(string(c.Key) == string(copies[0].Key) && string(c.Value) == string(copies[0].Value), "the producer's retry after a lost ack must be an identical copy (same key and value, the same token) so the rollup can drop it: got %s %s and %s %s", copies[0].Key, copies[0].Value, c.Key, c.Value)
 	}
@@ -735,37 +735,37 @@ func CheckAcksAll(ctx *harness.Ctx) {
 
 func CheckBoundedFlush(ctx *harness.Ctx) {
 	// The broker is slow but answers within flushTimeout: the add waits for the ack and succeeds.
-	ctx.Kafka.StallFor(ceTopic, 0.8)
-	returned, err := ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3")
+	ctx.Kafka.StallFor(kHCeTopic, 0.8)
+	returned, err := hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f3")
 	ctx.Assert(returned, "the broker acknowledged after 0.8 s, within flushTimeout (1 s), but appendEvent returned %v: it must wait for the acknowledgement up to the bound", err)
-	held := len(ctx.Kafka.Records(ceTopic))
-	ctx.Assert(held == 1, "appendEvent returned while the event was still unacknowledged (%s holds %d record(s)): it must not return (and the API must not answer 202) before the broker has the event, exactly once", ceTopic, held)
+	held := len(ctx.Kafka.Records(kHCeTopic))
+	ctx.Assert(held == 1, "appendEvent returned while the event was still unacknowledged (%s holds %d record(s)): it must not return (and the API must not answer 202) before the broker has the event, exactly once", kHCeTopic, held)
 	// The broker is down: the add gives up after flushTimeout instead of hanging the request.
-	ctx.Kafka.Stall(ceTopic)
+	ctx.Kafka.Stall(kHCeTopic)
 	start := ctx.Clock.Now()
-	returned, _ = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4")
+	returned, _ = hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f4")
 	waited := float64(ctx.Clock.Now()-start) / 1000
-	ctx.Assert(waited <= ceFlushTimeout+0.05, "with the broker down appendEvent waited %.0f s before giving up (an unbounded send waits for the whole write timeout while the client's request hangs): bound it with context.WithTimeout(ctx, flushTimeout)", waited)
+	ctx.Assert(waited <= kHCeFlushTimeout+0.05, "with the broker down appendEvent waited %.0f s before giving up (an unbounded send waits for the whole write timeout while the client's request hangs): bound it with context.WithTimeout(ctx, flushTimeout)", waited)
 	ctx.Assert(!returned, "with the broker down appendEvent returned nil after %.1f s without an acknowledgement: the API would answer 202 for an event that may never be written", waited)
-	held = len(ctx.Kafka.Records(ceTopic))
-	ctx.Assert(held == 1, "nothing can be written while the broker is down, yet %s holds %d record(s)", ceTopic, held)
+	held = len(ctx.Kafka.Records(kHCeTopic))
+	ctx.Assert(held == 1, "nothing can be written while the broker is down, yet %s holds %d record(s)", kHCeTopic, held)
 }
 
 func CheckNotDurableRaises(ctx *harness.Ctx) {
-	ctx.Kafka.FailNext(ceTopic, 1)
-	returned, _ := ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3")
+	ctx.Kafka.FailNext(kHCeTopic, 1)
+	returned, _ := hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f3")
 	ctx.Assert(!returned, "the broker refused the record (delivery error) but appendEvent returned nil: the API would answer 202 for an event that was lost")
-	ctx.Equal(len(ctx.Kafka.Records(ceTopic)), 0, "records on %s after the refused produce", ceTopic)
-	ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3") // the client's retry, same token
+	ctx.Equal(len(ctx.Kafka.Records(kHCeTopic)), 0, "records on %s after the refused produce", kHCeTopic)
+	hCeAppend(ctx, "plays", "stranger-things", 1, "t-9f3") // the client's retry, same token
 	tokens := []any{}
-	for _, v := range ctx.Kafka.Values(ceTopic) {
+	for _, v := range ctx.Kafka.Values(kHCeTopic) {
 		var event map[string]any
 		ctx.NoError(json.Unmarshal([]byte(v), &event), "the value must be JSON: %s", v)
 		tokens = append(tokens, event["token"])
 	}
-	ctx.Equal(tokens, []any{"t-9f3"}, "after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: the tokens on %s", ceTopic)
-	ctx.Kafka.Stall(ceTopic)
-	returned, _ = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4")
+	ctx.Equal(tokens, []any{"t-9f3"}, "after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: the tokens on %s", kHCeTopic)
+	ctx.Kafka.Stall(kHCeTopic)
+	returned, _ = hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f4")
 	ctx.Assert(!returned, "the broker did not acknowledge the record within the flush (it is still pending) but appendEvent returned nil: the API would answer 202 for an event that may never be written")
 }
 `,
@@ -777,11 +777,11 @@ func CheckNotDurableRaises(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string ceTopic = "counter-events";
-constexpr double ceFlushTimeout = 1.0;  // seconds
+const std::string kHCeTopic = "counter-events";
+constexpr double kHCeFlushTimeout = 1.0;  // seconds
 
 // ceAttempt is whether append_event returned, or the EventNotDurable it threw; anything else it throws fails the check.
-std::pair<bool, std::string> ceAttempt(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta, const std::string& token) {
+std::pair<bool, std::string> hCeAttempt(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta, const std::string& token) {
   try {
     append_event(ns, name, delta, token);
     return {true, ""};
@@ -792,7 +792,7 @@ std::pair<bool, std::string> ceAttempt(harness::Ctx& ctx, const std::string& ns,
   }
 }
 
-void ceAppend(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta, const std::string& token) {
+void hCeAppend(harness::Ctx& ctx, const std::string& ns, const std::string& name, long long delta, const std::string& token) {
   try {
     append_event(ns, name, delta, token);
   } catch (const std::exception& e) {
@@ -800,7 +800,7 @@ void ceAppend(harness::Ctx& ctx, const std::string& ns, const std::string& name,
   }
 }
 
-nlohmann::json ceParse(harness::Ctx& ctx, const std::string& v) {
+nlohmann::json hCeParse(harness::Ctx& ctx, const std::string& v) {
   auto event = nlohmann::json::parse(v, nullptr, false);
   ctx.Assert(event.is_object(), "the value must be JSON: %s", v);
   return event;
@@ -809,20 +809,20 @@ nlohmann::json ceParse(harness::Ctx& ctx, const std::string& v) {
 }  // namespace
 
 void CheckTopicKey(harness::Ctx& ctx) {
-  ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3");
-  ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4");
-  ceAppend(ctx, "plays", "the-crown", 1, "t-9f5");
-  const auto produced = ctx.Kafka.Records(ceTopic);
-  ctx.Assert(produced.size() == 3, "expected three records on %s, found %d (topics: %q)", ceTopic, produced.size(), ctx.Kafka.Topics());
-  ctx.Equal(ctx.Kafka.Keys(ceTopic), std::vector<std::string>{"plays:stranger-things", "plays:stranger-things", "plays:the-crown"}, "records must be keyed by ns:name");
+  hCeAppend(ctx, "plays", "stranger-things", 1, "t-9f3");
+  hCeAppend(ctx, "plays", "stranger-things", 2, "t-9f4");
+  hCeAppend(ctx, "plays", "the-crown", 1, "t-9f5");
+  const auto produced = ctx.Kafka.Records(kHCeTopic);
+  ctx.Assert(produced.size() == 3, "expected three records on %s, found %d (topics: %q)", kHCeTopic, produced.size(), ctx.Kafka.Topics());
+  ctx.Equal(ctx.Kafka.Keys(kHCeTopic), std::vector<std::string>{"plays:stranger-things", "plays:stranger-things", "plays:the-crown"}, "records must be keyed by ns:name");
   ctx.Equal(produced[0].Partition, produced[1].Partition, "the same counter must land on the same partition");
 }
 
 void CheckEventShape(harness::Ctx& ctx) {
-  ceAppend(ctx, "plays", "stranger-things", -2, "t-9f3");
-  const auto produced = ctx.Kafka.Values(ceTopic);
-  ctx.Equal(produced.size(), 1, "the number of records on %s", ceTopic);
-  const auto event = ceParse(ctx, produced[0]);
+  hCeAppend(ctx, "plays", "stranger-things", -2, "t-9f3");
+  const auto produced = ctx.Kafka.Values(kHCeTopic);
+  ctx.Equal(produced.size(), 1, "the number of records on %s", kHCeTopic);
+  const auto event = hCeParse(ctx, produced[0]);
   ctx.Assert(event.value("ns", nlohmann::json()) == "plays" && event.value("name", nlohmann::json()) == "stranger-things", "the value must carry ns and name: %s", produced[0]);
   ctx.Assert(event.value("delta", nlohmann::json()) == -2, "the value must carry the delta as an integer: %s", produced[0]);
   ctx.Equal(event.value("token", nlohmann::json()), "t-9f3", "the value must carry the client's token unchanged (the rollup dedupes on it): %s", produced[0]);
@@ -832,17 +832,17 @@ void CheckEventShape(harness::Ctx& ctx) {
 
 void CheckAcksAll(harness::Ctx& ctx) {
   // The partition leader fails right after acknowledging: only an event every in-sync replica has survives.
-  ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3");
-  ctx.Kafka.Failover(ceTopic);
-  const size_t held = ctx.Kafka.Records(ceTopic).size();
-  ctx.Assert(held == 1, "append_event returned (the API would answer 202), then the partition leader failed and %s holds %d record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs acks=all", ceTopic, held);
+  hCeAppend(ctx, "plays", "stranger-things", 1, "t-9f3");
+  ctx.Kafka.Failover(kHCeTopic);
+  const size_t held = ctx.Kafka.Records(kHCeTopic).size();
+  ctx.Assert(held == 1, "append_event returned (the API would answer 202), then the partition leader failed and %s holds %d record(s) instead of the event: it had been acknowledged by the leader alone. A durability promise needs acks=all", kHCeTopic, held);
   // The broker writes the next event but its acknowledgement is lost: the producer retries it.
-  ctx.Kafka.LoseAcks(ceTopic, 1);
-  ceAppend(ctx, "plays", "stranger-things", 2, "t-9f4");
+  ctx.Kafka.LoseAcks(kHCeTopic, 1);
+  hCeAppend(ctx, "plays", "stranger-things", 2, "t-9f4");
   // At least once: any copies the retry wrote must be identical (an idempotent producer writes one).
-  const auto all = ctx.Kafka.Records(ceTopic);
+  const auto all = ctx.Kafka.Records(kHCeTopic);
   const std::vector<harness::KafkaRecord> copies(all.begin() + 1, all.end());
-  ctx.Assert(!copies.empty(), "the broker wrote the second event and its acknowledgement was lost, yet %s does not hold it", ceTopic);
+  ctx.Assert(!copies.empty(), "the broker wrote the second event and its acknowledgement was lost, yet %s does not hold it", kHCeTopic);
   for (const auto& c : copies) {
     ctx.Assert(c.Key == copies[0].Key && c.Value == copies[0].Value, "the producer's retry after a lost ack must be an identical copy (same key and value, the same token) so the rollup can drop it: got %s %s and %s %s", copies[0].Key, copies[0].Value, c.Key, c.Value);
   }
@@ -850,33 +850,33 @@ void CheckAcksAll(harness::Ctx& ctx) {
 
 void CheckBoundedFlush(harness::Ctx& ctx) {
   // The broker is slow but answers within kFlushTimeoutMs: the add waits for the ack and succeeds.
-  ctx.Kafka.StallFor(ceTopic, 0.8);
-  auto [returned, err] = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3");
+  ctx.Kafka.StallFor(kHCeTopic, 0.8);
+  auto [returned, err] = hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f3");
   ctx.Assert(returned, "the broker acknowledged after 0.8 s, within kFlushTimeoutMs (1 s), but append_event threw %s: it must wait for the acknowledgement up to the bound", err);
-  size_t held = ctx.Kafka.Records(ceTopic).size();
-  ctx.Assert(held == 1, "append_event returned while the event was still unacknowledged (%s holds %d record(s)): it must not return (and the API must not answer 202) before the broker has the event, exactly once", ceTopic, held);
+  size_t held = ctx.Kafka.Records(kHCeTopic).size();
+  ctx.Assert(held == 1, "append_event returned while the event was still unacknowledged (%s holds %d record(s)): it must not return (and the API must not answer 202) before the broker has the event, exactly once", kHCeTopic, held);
   // The broker is down: the add gives up after kFlushTimeoutMs instead of hanging the request.
-  ctx.Kafka.Stall(ceTopic);
+  ctx.Kafka.Stall(kHCeTopic);
   const int64_t start = ctx.Clock.Now();
-  returned = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4").first;
+  returned = hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f4").first;
   const double waited = static_cast<double>(ctx.Clock.Now() - start) / 1000;
-  ctx.Assert(waited <= ceFlushTimeout + 0.05, "with the broker down append_event waited %.0f s before giving up (an unbounded flush waits for the whole message timeout while the client's request hangs): bound it with flush(kFlushTimeoutMs)", waited);
+  ctx.Assert(waited <= kHCeFlushTimeout + 0.05, "with the broker down append_event waited %.0f s before giving up (an unbounded flush waits for the whole message timeout while the client's request hangs): bound it with flush(kFlushTimeoutMs)", waited);
   ctx.Assert(!returned, "with the broker down append_event returned after %.1f s without an acknowledgement: the API would answer 202 for an event that may never be written", waited);
-  held = ctx.Kafka.Records(ceTopic).size();
-  ctx.Assert(held == 1, "nothing can be written while the broker is down, yet %s holds %d record(s)", ceTopic, held);
+  held = ctx.Kafka.Records(kHCeTopic).size();
+  ctx.Assert(held == 1, "nothing can be written while the broker is down, yet %s holds %d record(s)", kHCeTopic, held);
 }
 
 void CheckNotDurableRaises(harness::Ctx& ctx) {
-  ctx.Kafka.FailNext(ceTopic, 1);
-  bool returned = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f3").first;
+  ctx.Kafka.FailNext(kHCeTopic, 1);
+  bool returned = hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f3").first;
   ctx.Assert(!returned, "the broker refused the record (delivery error) but append_event returned: the API would answer 202 for an event that was lost");
-  ctx.Equal(ctx.Kafka.Records(ceTopic).size(), 0, "records on %s after the refused produce", ceTopic);
-  ceAppend(ctx, "plays", "stranger-things", 1, "t-9f3");  // the client's retry, same token
+  ctx.Equal(ctx.Kafka.Records(kHCeTopic).size(), 0, "records on %s after the refused produce", kHCeTopic);
+  hCeAppend(ctx, "plays", "stranger-things", 1, "t-9f3");  // the client's retry, same token
   nlohmann::json tokens = nlohmann::json::array();
-  for (const auto& v : ctx.Kafka.Values(ceTopic)) tokens.push_back(ceParse(ctx, v).value("token", nlohmann::json()));
-  ctx.Equal(tokens, nlohmann::json::array({"t-9f3"}), "after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: the tokens on %s", ceTopic);
-  ctx.Kafka.Stall(ceTopic);
-  returned = ceAttempt(ctx, "plays", "stranger-things", 1, "t-9f4").first;
+  for (const auto& v : ctx.Kafka.Values(kHCeTopic)) tokens.push_back(hCeParse(ctx, v).value("token", nlohmann::json()));
+  ctx.Equal(tokens, nlohmann::json::array({"t-9f3"}), "after the failure the retry must be produced normally, carrying the same token, which is what makes it safe: the tokens on %s", kHCeTopic);
+  ctx.Kafka.Stall(kHCeTopic);
+  returned = hCeAttempt(ctx, "plays", "stranger-things", 1, "t-9f4").first;
   ctx.Assert(!returned, "the broker did not acknowledge the record within the flush (it is still pending) but append_event returned: the API would answer 202 for an event that may never be written");
 }
 `,

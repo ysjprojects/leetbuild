@@ -641,17 +641,17 @@ import (
 )
 
 // thumbCall is one getThumb call the stand-in saw.
-type thumbCall struct {
+type HThumbCall struct {
 	id string
 	w  int
 }
 
 // thumbServer runs the learner's server with getThumb stood in for by the thumbnail cache (built in
 // the next steps): it knows cat and records every call.
-func thumbServer(ctx *harness.Ctx) (*harness.HTTP, *[]thumbCall) {
-	calls := &[]thumbCall{}
+func hThumbServer(ctx *harness.Ctx) (*harness.HTTP, *[]HThumbCall) {
+	calls := &[]HThumbCall{}
 	getThumb = func(id string, w int) []byte {
-		*calls = append(*calls, thumbCall{id, w})
+		*calls = append(*calls, HThumbCall{id, w})
 		if id != "cat" {
 			return nil
 		}
@@ -661,16 +661,16 @@ func thumbServer(ctx *harness.Ctx) (*harness.HTTP, *[]thumbCall) {
 }
 
 func CheckRoute(ctx *harness.Ctx) {
-	c, calls := thumbServer(ctx)
+	c, calls := hThumbServer(ctx)
 	r := c.Get("/img/cat?w=256")
 	ctx.Equal(r.Status, 200, "GET /img/cat?w=256")
 	ctx.Equal(r.Text(), "JPEG-cat-256", "the body must be exactly the bytes getThumb returned")
 	ctx.Assert(strings.HasPrefix(r.Header.Get("Content-Type"), "image/jpeg"), "Content-Type was %q, not image/jpeg", r.Header.Get("Content-Type"))
-	ctx.Equal(*calls, []thumbCall{{"cat", 256}}, "getThumb must be called once with (%q, 256)", "cat")
+	ctx.Equal(*calls, []HThumbCall{{"cat", 256}}, "getThumb must be called once with (%q, 256)", "cat")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c, calls := thumbServer(ctx)
+	c, calls := hThumbServer(ctx)
 	ctx.Equal(c.Get("/img/cat?w=8").Status, 400, "w=8 is below 16")
 	ctx.Equal(c.Get("/img/cat?w=4096").Status, 400, "w=4096 is above 2048")
 	ctx.Equal(len(*calls), 0, "a rejected width must not reach getThumb")
@@ -678,19 +678,19 @@ func CheckValidate(ctx *harness.Ctx) {
 	ctx.Equal(c.Get("/img/cat").Status, 200, "without w the default width (256) applies")
 	defaulted := false
 	for _, call := range *calls {
-		defaulted = defaulted || call == thumbCall{"cat", 256}
+		defaulted = defaulted || call == HThumbCall{"cat", 256}
 	}
 	ctx.Assert(defaulted, "the default width is 256: getThumb was called with %v", *calls)
 }
 
 func CheckNotFound(ctx *harness.Ctx) {
-	c, _ := thumbServer(ctx)
+	c, _ := hThumbServer(ctx)
 	r := c.Get("/img/ghost?w=256")
 	ctx.Equal(r.Status, 404, "an image getThumb does not know")
 }
 
 func CheckCacheHeaders(ctx *harness.Ctx) {
-	c, _ := thumbServer(ctx)
+	c, _ := hThumbServer(ctx)
 	r1 := c.Get("/img/cat?w=256")
 	r2 := c.Get("/img/cat?w=256")
 	r3 := c.Get("/img/cat?w=128")
@@ -703,7 +703,7 @@ func CheckCacheHeaders(ctx *harness.Ctx) {
 }
 
 func CheckNotModified(ctx *harness.Ctx) {
-	c, _ := thumbServer(ctx)
+	c, _ := hThumbServer(ctx)
 	first := c.Get("/img/cat?w=256")
 	etag := first.Header.Get("ETag")
 	ctx.Assert(etag != "", "no ETag to revalidate against")
@@ -724,13 +724,13 @@ func CheckNotModified(ctx *harness.Ctx) {
 namespace {
 
 // One get_thumb call the stand-in saw: (id, width).
-using ThumbCall = std::pair<std::string, int>;
-std::vector<ThumbCall>* thumbCalls = nullptr;
+using HThumbCall = std::pair<std::string, int>;
+std::vector<HThumbCall>* hThumbCalls = nullptr;
 
 // thumbServer runs the learner's server with get_thumb stood in for by the thumbnail cache (built in
 // the next steps): it knows cat and records every call.
-harness::HTTP thumbServer(harness::Ctx& ctx, std::vector<ThumbCall>& calls) {
-  thumbCalls = &calls;
+harness::HTTP hThumbServer(harness::Ctx& ctx, std::vector<HThumbCall>& calls) {
+  hThumbCalls = &calls;
   return ctx.Main().HTTP();
 }
 
@@ -738,44 +738,44 @@ harness::HTTP thumbServer(harness::Ctx& ctx, std::vector<ThumbCall>& calls) {
 
 // The thumbnail cache the next steps build, stood in for (Go swaps the getThumb variable instead).
 std::optional<std::string> get_thumb(const std::string& id, int width) {
-  if (thumbCalls) thumbCalls->push_back({id, width});
+  if (hThumbCalls) hThumbCalls->push_back({id, width});
   if (id != "cat") return std::nullopt;
   return "JPEG-" + id + "-" + std::to_string(width);
 }
 
 void CheckRoute(harness::Ctx& ctx) {
-  std::vector<ThumbCall> calls;
-  auto c = thumbServer(ctx, calls);
+  std::vector<HThumbCall> calls;
+  auto c = hThumbServer(ctx, calls);
   const auto r = c.Get("/img/cat?w=256");
   ctx.Equal(r.Status, 200, "GET /img/cat?w=256");
   ctx.Equal(r.Text(), "JPEG-cat-256", "the body must be exactly the bytes getThumb returned");
   const std::string type = r.HeaderValue("Content-Type");
   ctx.Assert(type.rfind("image/jpeg", 0) == 0, "Content-Type was %q, not image/jpeg", type);
-  ctx.Equal(calls, std::vector<ThumbCall>{{"cat", 256}}, "getThumb must be called once with (%q, 256)", "cat");
+  ctx.Equal(calls, std::vector<HThumbCall>{{"cat", 256}}, "getThumb must be called once with (%q, 256)", "cat");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  std::vector<ThumbCall> calls;
-  auto c = thumbServer(ctx, calls);
+  std::vector<HThumbCall> calls;
+  auto c = hThumbServer(ctx, calls);
   ctx.Equal(c.Get("/img/cat?w=8").Status, 400, "w=8 is below 16");
   ctx.Equal(c.Get("/img/cat?w=4096").Status, 400, "w=4096 is above 2048");
   ctx.Equal(calls.size(), 0, "a rejected width must not reach getThumb");
   ctx.Equal(c.Get("/img/cat?w=16").Status, 200, "w=16 is the lower bound and valid");
   ctx.Equal(c.Get("/img/cat").Status, 200, "without w the default width (256) applies");
   bool defaulted = false;
-  for (const auto& call : calls) defaulted = defaulted || call == ThumbCall{"cat", 256};
+  for (const auto& call : calls) defaulted = defaulted || call == HThumbCall{"cat", 256};
   ctx.Assert(defaulted, "the default width is 256: getThumb was called with %v", calls);
 }
 
 void CheckNotFound(harness::Ctx& ctx) {
-  std::vector<ThumbCall> calls;
-  auto c = thumbServer(ctx, calls);
+  std::vector<HThumbCall> calls;
+  auto c = hThumbServer(ctx, calls);
   ctx.Equal(c.Get("/img/ghost?w=256").Status, 404, "an image getThumb does not know");
 }
 
 void CheckCacheHeaders(harness::Ctx& ctx) {
-  std::vector<ThumbCall> calls;
-  auto c = thumbServer(ctx, calls);
+  std::vector<HThumbCall> calls;
+  auto c = hThumbServer(ctx, calls);
   const auto r1 = c.Get("/img/cat?w=256");
   const auto r2 = c.Get("/img/cat?w=256");
   const auto r3 = c.Get("/img/cat?w=128");
@@ -789,8 +789,8 @@ void CheckCacheHeaders(harness::Ctx& ctx) {
 }
 
 void CheckNotModified(harness::Ctx& ctx) {
-  std::vector<ThumbCall> calls;
-  auto c = thumbServer(ctx, calls);
+  std::vector<HThumbCall> calls;
+  auto c = hThumbServer(ctx, calls);
   const auto first = c.Get("/img/cat?w=256");
   const std::string etag = first.HeaderValue("ETag");
   ctx.Assert(etag != "", "no ETag to revalidate against");

@@ -1145,7 +1145,7 @@ import (
 )
 
 // bookIDs is b-0001, b-0002, … (or b-0010, b-0020, … with step 10).
-func bookIDs(n, step int) []string {
+func hBookIDs(n, step int) []string {
 	out := make([]string, n)
 	for i := range out {
 		out[i] = fmt.Sprintf("b-%04d", (i+1)*step)
@@ -1153,17 +1153,17 @@ func bookIDs(n, step int) []string {
 	return out
 }
 
-func showBooks(list []string) string {
+func hShowBooks(list []string) string {
 	if len(list) <= 6 {
 		return fmt.Sprintf("%q", list)
 	}
 	return fmt.Sprintf("%d books %q … %q", len(list), list[:3], list[len(list)-2:])
 }
 
-func rawB64(text string) string { return base64.RawURLEncoding.EncodeToString([]byte(text)) }
+func hRawB64(text string) string { return base64.RawURLEncoding.EncodeToString([]byte(text)) }
 
 // setShelf puts a book on a shelf (or takes it off with an empty title), as the catalogue does.
-func setShelf(shelf, id, title string) {
+func hSetShelf(shelf, id, title string) {
 	mu.Lock()
 	defer mu.Unlock()
 	if title == "" {
@@ -1174,7 +1174,7 @@ func setShelf(shelf, id, title string) {
 }
 
 // startLibrary seeds shelves in place, runs the learner's server and returns a client on it.
-func startLibrary(ctx *harness.Ctx, seed map[string][]string) pb.LibraryClient {
+func hStartLibrary(ctx *harness.Ctx, seed map[string][]string) pb.LibraryClient {
 	mu.Lock()
 	for name := range shelves {
 		delete(shelves, name)
@@ -1191,26 +1191,26 @@ func startLibrary(ctx *harness.Ctx, seed map[string][]string) pb.LibraryClient {
 	return pb.NewLibraryClient(ctx.GRPC.Dial("library:9000"))
 }
 
-func listCall(client pb.LibraryClient, shelf string, pageSize int32, pageToken string) (*pb.ListBooksResponse, error) {
+func hListCall(client pb.LibraryClient, shelf string, pageSize int32, pageToken string) (*pb.ListBooksResponse, error) {
 	c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return client.ListBooks(c, &pb.ListBooksRequest{Shelf: shelf, PageSize: pageSize, PageToken: pageToken})
 }
 
-func listBooks(ctx *harness.Ctx, client pb.LibraryClient, shelf string, pageSize int32, pageToken string) *pb.ListBooksResponse {
-	reply, err := listCall(client, shelf, pageSize, pageToken)
+func hListBooks(ctx *harness.Ctx, client pb.LibraryClient, shelf string, pageSize int32, pageToken string) *pb.ListBooksResponse {
+	reply, err := hListCall(client, shelf, pageSize, pageToken)
 	if err != nil {
 		ctx.Fatalf("ListBooks(shelf=%q, page_size=%d, page_token=%q) failed with %v: %s", shelf, pageSize, pageToken, status.Code(err), status.Convert(err).Message())
 	}
 	return reply
 }
 
-func listCode(client pb.LibraryClient, shelf string, pageSize int32, pageToken string) codes.Code {
-	_, err := listCall(client, shelf, pageSize, pageToken)
+func hListCode(client pb.LibraryClient, shelf string, pageSize int32, pageToken string) codes.Code {
+	_, err := hListCall(client, shelf, pageSize, pageToken)
 	return status.Code(err)
 }
 
-func idsOf(reply *pb.ListBooksResponse) []string {
+func hIdsOf(reply *pb.ListBooksResponse) []string {
 	out := []string{}
 	for _, b := range reply.GetBooks() {
 		out = append(out, b.GetId())
@@ -1219,21 +1219,21 @@ func idsOf(reply *pb.ListBooksResponse) []string {
 }
 
 // walkShelf is every page from pageToken to the one carrying NextPageToken "".
-func walkShelf(ctx *harness.Ctx, client pb.LibraryClient, shelf string, pageSize int32, pageToken string) [][]string {
+func hWalkShelf(ctx *harness.Ctx, client pb.LibraryClient, shelf string, pageSize int32, pageToken string) [][]string {
 	var pages [][]string
 	for range 20 {
-		reply := listBooks(ctx, client, shelf, pageSize, pageToken)
-		pages = append(pages, idsOf(reply))
+		reply := hListBooks(ctx, client, shelf, pageSize, pageToken)
+		pages = append(pages, hIdsOf(reply))
 		pageToken = reply.GetNextPageToken()
 		if pageToken == "" {
 			return pages
 		}
 	}
-	ctx.Fatalf("shelf %q at page_size %d: still a next_page_token after 20 pages, sizes %v", shelf, pageSize, pageSizes(pages))
+	ctx.Fatalf("shelf %q at page_size %d: still a next_page_token after 20 pages, sizes %v", shelf, pageSize, hPageSizes(pages))
 	return nil
 }
 
-func pageSizes(pages [][]string) []int {
+func hPageSizes(pages [][]string) []int {
 	sizes := make([]int, len(pages))
 	for i, p := range pages {
 		sizes[i] = len(p)
@@ -1241,7 +1241,7 @@ func pageSizes(pages [][]string) []int {
 	return sizes
 }
 
-func flattenPages(pages [][]string) []string {
+func hFlattenPages(pages [][]string) []string {
 	out := []string{}
 	for _, p := range pages {
 		out = append(out, p...)
@@ -1250,76 +1250,76 @@ func flattenPages(pages [][]string) []string {
 }
 
 func CheckPageSize(ctx *harness.Ctx) {
-	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(250, 1)})
-	every := bookIDs(250, 1)
+	client := hStartLibrary(ctx, map[string][]string{"fiction": hBookIDs(250, 1)})
+	every := hBookIDs(250, 1)
 	for _, c := range [][2]int{{0, 50}, {7, 7}, {100, 100}, {101, 100}, {500, 100}} {
 		size, want := c[0], c[1]
-		reply := listBooks(ctx, client, "fiction", int32(size), "")
-		got := idsOf(reply)
+		reply := hListBooks(ctx, client, "fiction", int32(size), "")
+		got := hIdsOf(reply)
 		ctx.Equal(len(got), want, "the books page_size %d returns on a shelf of 250", size)
-		ctx.Assert(slices.Equal(got, every[:want]), "page_size %d: the first page is the %d lowest ids in ascending order (%s to %s), got %s", size, want, every[0], every[want-1], showBooks(got))
+		ctx.Assert(slices.Equal(got, every[:want]), "page_size %d: the first page is the %d lowest ids in ascending order (%s to %s), got %s", size, want, every[0], every[want-1], hShowBooks(got))
 		ctx.Assert(reply.GetNextPageToken() != "", "page_size %d: %d books remain after the first page, so next_page_token must not be empty", size, 250-want)
 	}
-	books := listBooks(ctx, client, "fiction", 1, "").GetBooks()
+	books := hListBooks(ctx, client, "fiction", 1, "").GetBooks()
 	ctx.Assert(len(books) > 0, "page_size 1 returned no book")
 	ctx.Equal(books[0].GetTitle(), "Title b-0001", "each Book carries its title from shelves")
 }
 
 func CheckRejectBadRequest(ctx *harness.Ctx) {
-	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(20, 1)})
+	client := hStartLibrary(ctx, map[string][]string{"fiction": hBookIDs(20, 1)})
 	for _, c := range []struct {
 		shelf string
 		size  int32
 	}{{"poetry", 0}, {"poetry", 10}, {"", 0}} {
-		ctx.Equal(listCode(client, c.shelf, c.size, ""), codes.NotFound, "shelf %q does not exist", c.shelf)
+		ctx.Equal(hListCode(client, c.shelf, c.size, ""), codes.NotFound, "shelf %q does not exist", c.shelf)
 	}
 	for _, size := range []int32{-1, -100} {
-		ctx.Equal(listCode(client, "fiction", size, ""), codes.InvalidArgument, "page_size %d", size)
+		ctx.Equal(hListCode(client, "fiction", size, ""), codes.InvalidArgument, "page_size %d", size)
 	}
-	token := listBooks(ctx, client, "fiction", 5, "").GetNextPageToken()
+	token := hListBooks(ctx, client, "fiction", 5, "").GetNextPageToken()
 	ctx.Assert(token != "", "5 of 20 books listed: next_page_token must not be empty")
-	ctx.Equal(listCode(client, "fiction", -1, token), codes.InvalidArgument, "page_size -1 with a valid page_token")
+	ctx.Equal(hListCode(client, "fiction", -1, token), codes.InvalidArgument, "page_size -1 with a valid page_token")
 }
 
 func CheckFullWalk(ctx *harness.Ctx) {
-	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(120, 1), "history": bookIDs(100, 1), "trilogy": bookIDs(3, 1), "empty": nil})
-	pages := walkShelf(ctx, client, "fiction", 0, "")
-	ctx.Equal(pageSizes(pages), []int{50, 50, 20}, "120 books at the default page size: the page sizes")
-	flat := flattenPages(pages)
-	ctx.Assert(slices.Equal(flat, bookIDs(120, 1)), "the walk must return every book once in ascending id order, got %s", showBooks(flat))
-	pages = walkShelf(ctx, client, "history", 50, "")
-	ctx.Equal(pageSizes(pages), []int{50, 50}, "100 books at page_size 50 are exactly two pages, the second with next_page_token %q because nothing follows it; the page sizes", "")
-	ctx.Assert(slices.Equal(flattenPages(pages), bookIDs(100, 1)), "the history walk must return b-0001 to b-0100 in order")
-	pages = walkShelf(ctx, client, "trilogy", 1, "")
+	client := hStartLibrary(ctx, map[string][]string{"fiction": hBookIDs(120, 1), "history": hBookIDs(100, 1), "trilogy": hBookIDs(3, 1), "empty": nil})
+	pages := hWalkShelf(ctx, client, "fiction", 0, "")
+	ctx.Equal(hPageSizes(pages), []int{50, 50, 20}, "120 books at the default page size: the page sizes")
+	flat := hFlattenPages(pages)
+	ctx.Assert(slices.Equal(flat, hBookIDs(120, 1)), "the walk must return every book once in ascending id order, got %s", hShowBooks(flat))
+	pages = hWalkShelf(ctx, client, "history", 50, "")
+	ctx.Equal(hPageSizes(pages), []int{50, 50}, "100 books at page_size 50 are exactly two pages, the second with next_page_token %q because nothing follows it; the page sizes", "")
+	ctx.Assert(slices.Equal(hFlattenPages(pages), hBookIDs(100, 1)), "the history walk must return b-0001 to b-0100 in order")
+	pages = hWalkShelf(ctx, client, "trilogy", 1, "")
 	ctx.Equal(pages, [][]string{{"b-0001"}, {"b-0002"}, {"b-0003"}}, "3 books at page_size 1 are three pages of one")
-	reply := listBooks(ctx, client, "empty", 0, "")
-	ctx.Assert(len(idsOf(reply)) == 0 && reply.GetNextPageToken() == "", "an empty shelf is one empty page with next_page_token %q, got %q and %q", "", idsOf(reply), reply.GetNextPageToken())
+	reply := hListBooks(ctx, client, "empty", 0, "")
+	ctx.Assert(len(hIdsOf(reply)) == 0 && reply.GetNextPageToken() == "", "an empty shelf is one empty page with next_page_token %q, got %q and %q", "", hIdsOf(reply), reply.GetNextPageToken())
 }
 
 func CheckKeyset(ctx *harness.Ctx) {
-	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(20, 10)}) // b-0010 … b-0200
-	page := listBooks(ctx, client, "fiction", 5, "")
-	seen := idsOf(page)
+	client := hStartLibrary(ctx, map[string][]string{"fiction": hBookIDs(20, 10)}) // b-0010 … b-0200
+	page := hListBooks(ctx, client, "fiction", 5, "")
+	seen := hIdsOf(page)
 	ctx.Equal(seen, []string{"b-0010", "b-0020", "b-0030", "b-0040", "b-0050"}, "page 1 at page_size 5")
 	// Two books already listed are removed: an offset into the shorter list would skip b-0060 and b-0070.
-	setShelf("fiction", "b-0020", "")
-	setShelf("fiction", "b-0030", "")
-	page = listBooks(ctx, client, "fiction", 5, page.GetNextPageToken())
-	got := idsOf(page)
+	hSetShelf("fiction", "b-0020", "")
+	hSetShelf("fiction", "b-0030", "")
+	page = hListBooks(ctx, client, "fiction", 5, page.GetNextPageToken())
+	got := hIdsOf(page)
 	ctx.Equal(got, []string{"b-0060", "b-0070", "b-0080", "b-0090", "b-0100"}, "b-0020 and b-0030 (already listed) were removed: page 2 must continue after b-0050 (an offset skips survivors)")
 	seen = append(seen, got...)
 	// Three books added before the cursor, and the cursor's own book removed: an offset would repeat books.
 	for _, id := range []string{"b-0005", "b-0025", "b-0045"} {
-		setShelf("fiction", id, "Title "+id)
+		hSetShelf("fiction", id, "Title "+id)
 	}
-	setShelf("fiction", "b-0100", "")
-	page = listBooks(ctx, client, "fiction", 5, page.GetNextPageToken())
-	got = idsOf(page)
+	hSetShelf("fiction", "b-0100", "")
+	page = hListBooks(ctx, client, "fiction", 5, page.GetNextPageToken())
+	got = hIdsOf(page)
 	ctx.Equal(got, []string{"b-0110", "b-0120", "b-0130", "b-0140", "b-0150"}, "three books were added before the cursor and the cursor's own book (b-0100) was removed: page 3 must continue strictly after b-0100")
 	seen = append(seen, got...)
 	// A book added ahead of the cursor is simply part of the rest of the walk.
-	setShelf("fiction", "b-0155", "Title b-0155")
-	rest := flattenPages(walkShelf(ctx, client, "fiction", 5, page.GetNextPageToken()))
+	hSetShelf("fiction", "b-0155", "Title b-0155")
+	rest := hFlattenPages(hWalkShelf(ctx, client, "fiction", 5, page.GetNextPageToken()))
 	ctx.Equal(rest, []string{"b-0155", "b-0160", "b-0170", "b-0180", "b-0190", "b-0200"}, "the rest of the walk is everything now after b-0150 (b-0155 was added ahead of the cursor)")
 	seen = append(seen, rest...)
 	twice := []string{}
@@ -1331,41 +1331,41 @@ func CheckKeyset(ctx *harness.Ctx) {
 	sort.Strings(twice)
 	ctx.Assert(len(twice) == 0, "no book may come back twice in one walk, but %q did", twice)
 	missing := []string{}
-	for _, id := range bookIDs(20, 10) {
+	for _, id := range hBookIDs(20, 10) {
 		if !slices.Contains([]string{"b-0020", "b-0030", "b-0100"}, id) && !slices.Contains(seen, id) {
 			missing = append(missing, id)
 		}
 	}
 	ctx.Assert(len(missing) == 0, "every book present for the whole walk must be listed, but %q never was", missing)
-	ctx.Assert(sort.StringsAreSorted(seen), "one walk lists books in ascending id order, got %s", showBooks(seen))
+	ctx.Assert(sort.StringsAreSorted(seen), "one walk lists books in ascending id order, got %s", hShowBooks(seen))
 }
 
 func CheckBoundToShelf(ctx *harness.Ctx) {
-	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(30, 1), "history": bookIDs(30, 1)})
-	token := listBooks(ctx, client, "fiction", 10, "").GetNextPageToken()
+	client := hStartLibrary(ctx, map[string][]string{"fiction": hBookIDs(30, 1), "history": hBookIDs(30, 1)})
+	token := hListBooks(ctx, client, "fiction", 10, "").GetNextPageToken()
 	ctx.Assert(token != "", "10 of 30 fiction books listed: next_page_token must not be empty")
 	ctx.Assert(!slices.Contains([]string{"b-0010", "b-0011", "10"}, token), "the token must be opaque and carry the shelf, not the bare position %q", token)
-	ctx.Equal(listCode(client, "history", 10, token), codes.InvalidArgument, "a token issued for shelf %q sent with shelf %q", "fiction", "history")
-	page := idsOf(listBooks(ctx, client, "fiction", 10, token))
-	ctx.Equal(page, bookIDs(20, 1)[10:], "the fiction token still continues fiction with b-0011 to b-0020")
-	history := listBooks(ctx, client, "history", 10, "")
-	ctx.Equal(listCode(client, "fiction", 10, history.GetNextPageToken()), codes.InvalidArgument, "a token issued for shelf %q sent with shelf %q", "history", "fiction")
-	page = idsOf(listBooks(ctx, client, "history", 10, history.GetNextPageToken()))
-	ctx.Equal(page, bookIDs(20, 1)[10:], "the history token still continues history with b-0011 to b-0020")
+	ctx.Equal(hListCode(client, "history", 10, token), codes.InvalidArgument, "a token issued for shelf %q sent with shelf %q", "fiction", "history")
+	page := hIdsOf(hListBooks(ctx, client, "fiction", 10, token))
+	ctx.Equal(page, hBookIDs(20, 1)[10:], "the fiction token still continues fiction with b-0011 to b-0020")
+	history := hListBooks(ctx, client, "history", 10, "")
+	ctx.Equal(hListCode(client, "fiction", 10, history.GetNextPageToken()), codes.InvalidArgument, "a token issued for shelf %q sent with shelf %q", "history", "fiction")
+	page = hIdsOf(hListBooks(ctx, client, "history", 10, history.GetNextPageToken()))
+	ctx.Equal(page, hBookIDs(20, 1)[10:], "the history token still continues history with b-0011 to b-0020")
 }
 
 func CheckMalformedToken(ctx *harness.Ctx) {
-	client := startLibrary(ctx, map[string][]string{"fiction": bookIDs(30, 1)})
-	for _, token := range []string{"not a token", "%%%", rawB64("not json"), rawB64("[1, 2]"), rawB64("42"), rawB64("{}"), rawB64(fmt.Sprintf("%q", "b-0010"))} {
-		got := listCode(client, "fiction", 10, token)
+	client := hStartLibrary(ctx, map[string][]string{"fiction": hBookIDs(30, 1)})
+	for _, token := range []string{"not a token", "%%%", hRawB64("not json"), hRawB64("[1, 2]"), hRawB64("42"), hRawB64("{}"), hRawB64(fmt.Sprintf("%q", "b-0010"))} {
+		got := hListCode(client, "fiction", 10, token)
 		hint := ""
 		if got == codes.Unknown {
 			hint = " (a panic escaped the handler)"
 		}
 		ctx.Assert(got == codes.InvalidArgument, "page_token %q is not a token this server issued: expected InvalidArgument, got %v%s", token, got, hint)
 	}
-	page := idsOf(listBooks(ctx, client, "fiction", 10, ""))
-	ctx.Equal(page, bookIDs(10, 1), "an empty page_token is the first page, b-0001 to b-0010")
+	page := hIdsOf(hListBooks(ctx, client, "fiction", 10, ""))
+	ctx.Equal(page, hBookIDs(10, 1), "an empty page_token is the first page, b-0001 to b-0010")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1383,27 +1383,27 @@ func CheckMalformedToken(ctx *harness.Ctx) {
 
 namespace {
 
-using LibraryStub = library::v1::Library::Stub;
-using Pages = std::vector<std::vector<std::string>>;
+using HLibraryStub = library::v1::Library::Stub;
+using HPages = std::vector<std::vector<std::string>>;
 
 // b-0001, b-0002, … (or b-0010, b-0020, … with step 10).
-std::vector<std::string> BookIds(int n, int step) {
+std::vector<std::string> hBookIds(int n, int step) {
   std::vector<std::string> out;
   for (int i = 0; i < n; ++i) out.push_back(harness::Sprintf("b-%04d", (i + 1) * step));
   return out;
 }
 
-std::vector<std::string> Slice(const std::vector<std::string>& list, size_t from, size_t to) {
+std::vector<std::string> hSlice(const std::vector<std::string>& list, size_t from, size_t to) {
   return std::vector<std::string>(list.begin() + static_cast<long>(from), list.begin() + static_cast<long>(to));
 }
 
-std::string ShowBooks(const std::vector<std::string>& list) {
+std::string hShowBooks(const std::vector<std::string>& list) {
   if (list.size() <= 6) return harness::Sprintf("%q", list);
-  return harness::Sprintf("%d books %q … %q", list.size(), Slice(list, 0, 3), Slice(list, list.size() - 2, list.size()));
+  return harness::Sprintf("%d books %q … %q", list.size(), hSlice(list, 0, 3), hSlice(list, list.size() - 2, list.size()));
 }
 
 // Puts a book on a shelf (or takes it off with an empty title), as the catalogue does.
-void SetShelf(const std::string& shelf, const std::string& id, const std::string& title) {
+void hSetShelf(const std::string& shelf, const std::string& id, const std::string& title) {
   std::unique_lock lock(shelves_mu);
   if (title.empty()) {
     SHELVES[shelf].erase(id);
@@ -1413,7 +1413,7 @@ void SetShelf(const std::string& shelf, const std::string& id, const std::string
 }
 
 // Seeds SHELVES in place, runs the learner's server and returns a client on it.
-std::unique_ptr<LibraryStub> StartLibrary(harness::Ctx& ctx, const std::map<std::string, std::vector<std::string>>& seed) {
+std::unique_ptr<HLibraryStub> hStartLibrary(harness::Ctx& ctx, const std::map<std::string, std::vector<std::string>>& seed) {
   {
     std::unique_lock lock(shelves_mu);
     SHELVES.clear();
@@ -1426,7 +1426,7 @@ std::unique_ptr<LibraryStub> StartLibrary(harness::Ctx& ctx, const std::map<std:
   return library::v1::Library::NewStub(ctx.GRPC.Dial("library:9000"));
 }
 
-grpc::Status ListCall(LibraryStub& client, const std::string& shelf, int32_t page_size, const std::string& page_token,
+grpc::Status hListCall(HLibraryStub& client, const std::string& shelf, int32_t page_size, const std::string& page_token,
                       library::v1::ListBooksResponse* reply) {
   grpc::ClientContext c;
   c.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(2));
@@ -1437,165 +1437,165 @@ grpc::Status ListCall(LibraryStub& client, const std::string& shelf, int32_t pag
   return client.ListBooks(&c, request, reply);
 }
 
-library::v1::ListBooksResponse ListBooks(harness::Ctx& ctx, LibraryStub& client, const std::string& shelf, int32_t page_size,
+library::v1::ListBooksResponse hListBooks(harness::Ctx& ctx, HLibraryStub& client, const std::string& shelf, int32_t page_size,
                                          const std::string& page_token) {
   library::v1::ListBooksResponse reply;
-  const grpc::Status status = ListCall(client, shelf, page_size, page_token, &reply);
+  const grpc::Status status = hListCall(client, shelf, page_size, page_token, &reply);
   if (!status.ok())
     ctx.Fatalf("ListBooks(shelf=%q, page_size=%d, page_token=%q) failed with %v: %s", shelf, page_size, page_token,
                status.error_code(), status.error_message());
   return reply;
 }
 
-grpc::StatusCode ListCode(LibraryStub& client, const std::string& shelf, int32_t page_size, const std::string& page_token) {
+grpc::StatusCode hListCode(HLibraryStub& client, const std::string& shelf, int32_t page_size, const std::string& page_token) {
   library::v1::ListBooksResponse reply;
-  return ListCall(client, shelf, page_size, page_token, &reply).error_code();
+  return hListCall(client, shelf, page_size, page_token, &reply).error_code();
 }
 
-std::vector<std::string> IdsOf(const library::v1::ListBooksResponse& reply) {
+std::vector<std::string> hIdsOf(const library::v1::ListBooksResponse& reply) {
   std::vector<std::string> out;
   for (const auto& b : reply.books()) out.push_back(b.id());
   return out;
 }
 
-std::vector<int> PageSizes(const Pages& pages) {
+std::vector<int> hPageSizes(const HPages& pages) {
   std::vector<int> sizes;
   for (const auto& p : pages) sizes.push_back(static_cast<int>(p.size()));
   return sizes;
 }
 
-std::vector<std::string> FlattenPages(const Pages& pages) {
+std::vector<std::string> hFlattenPages(const HPages& pages) {
   std::vector<std::string> out;
   for (const auto& p : pages) out.insert(out.end(), p.begin(), p.end());
   return out;
 }
 
 // Every page from page_token to the one carrying next_page_token "".
-Pages WalkShelf(harness::Ctx& ctx, LibraryStub& client, const std::string& shelf, int32_t page_size, std::string page_token) {
-  Pages pages;
+HPages hWalkShelf(harness::Ctx& ctx, HLibraryStub& client, const std::string& shelf, int32_t page_size, std::string page_token) {
+  HPages pages;
   for (int i = 0; i < 20; ++i) {
-    const auto reply = ListBooks(ctx, client, shelf, page_size, page_token);
-    pages.push_back(IdsOf(reply));
+    const auto reply = hListBooks(ctx, client, shelf, page_size, page_token);
+    pages.push_back(hIdsOf(reply));
     page_token = reply.next_page_token();
     if (page_token.empty()) return pages;
   }
-  ctx.Fatalf("shelf %q at page_size %d: still a next_page_token after 20 pages, sizes %v", shelf, page_size, PageSizes(pages));
+  ctx.Fatalf("shelf %q at page_size %d: still a next_page_token after 20 pages, sizes %v", shelf, page_size, hPageSizes(pages));
 }
 
-bool Contains(const std::vector<std::string>& list, const std::string& item) {
+bool hContains(const std::vector<std::string>& list, const std::string& item) {
   return std::find(list.begin(), list.end(), item) != list.end();
 }
 
 }  // namespace
 
 void CheckPageSize(harness::Ctx& ctx) {
-  auto client = StartLibrary(ctx, {{"fiction", BookIds(250, 1)}});
-  const auto every = BookIds(250, 1);
+  auto client = hStartLibrary(ctx, {{"fiction", hBookIds(250, 1)}});
+  const auto every = hBookIds(250, 1);
   for (const auto& [size, want] : std::vector<std::pair<int, size_t>>{{0, 50}, {7, 7}, {100, 100}, {101, 100}, {500, 100}}) {
-    const auto reply = ListBooks(ctx, *client, "fiction", size, "");
-    const auto got = IdsOf(reply);
+    const auto reply = hListBooks(ctx, *client, "fiction", size, "");
+    const auto got = hIdsOf(reply);
     ctx.Equal(got.size(), want, "the books page_size %d returns on a shelf of 250", size);
-    ctx.Assert(got == Slice(every, 0, want), "page_size %d: the first page is the %d lowest ids in ascending order (%s to %s), got %s",
-               size, want, every[0], every[want - 1], ShowBooks(got));
+    ctx.Assert(got == hSlice(every, 0, want), "page_size %d: the first page is the %d lowest ids in ascending order (%s to %s), got %s",
+               size, want, every[0], every[want - 1], hShowBooks(got));
     ctx.Assert(!reply.next_page_token().empty(), "page_size %d: %d books remain after the first page, so next_page_token must not be empty",
                size, 250 - want);
   }
-  const auto books = ListBooks(ctx, *client, "fiction", 1, "");
+  const auto books = hListBooks(ctx, *client, "fiction", 1, "");
   ctx.Assert(books.books_size() > 0, "page_size 1 returned no book");
   ctx.Equal(books.books(0).title(), "Title b-0001", "each Book carries its title from SHELVES");
 }
 
 void CheckRejectBadRequest(harness::Ctx& ctx) {
-  auto client = StartLibrary(ctx, {{"fiction", BookIds(20, 1)}});
+  auto client = hStartLibrary(ctx, {{"fiction", hBookIds(20, 1)}});
   for (const auto& [shelf, size] : std::vector<std::pair<std::string, int32_t>>{{"poetry", 0}, {"poetry", 10}, {"", 0}}) {
-    ctx.Equal(ListCode(*client, shelf, size, ""), grpc::StatusCode::NOT_FOUND, "shelf %q does not exist", shelf);
+    ctx.Equal(hListCode(*client, shelf, size, ""), grpc::StatusCode::NOT_FOUND, "shelf %q does not exist", shelf);
   }
   for (const int32_t size : {-1, -100}) {
-    ctx.Equal(ListCode(*client, "fiction", size, ""), grpc::StatusCode::INVALID_ARGUMENT, "page_size %d", size);
+    ctx.Equal(hListCode(*client, "fiction", size, ""), grpc::StatusCode::INVALID_ARGUMENT, "page_size %d", size);
   }
-  const std::string token = ListBooks(ctx, *client, "fiction", 5, "").next_page_token();
+  const std::string token = hListBooks(ctx, *client, "fiction", 5, "").next_page_token();
   ctx.Assert(!token.empty(), "5 of 20 books listed: next_page_token must not be empty");
-  ctx.Equal(ListCode(*client, "fiction", -1, token), grpc::StatusCode::INVALID_ARGUMENT, "page_size -1 with a valid page_token");
+  ctx.Equal(hListCode(*client, "fiction", -1, token), grpc::StatusCode::INVALID_ARGUMENT, "page_size -1 with a valid page_token");
 }
 
 void CheckFullWalk(harness::Ctx& ctx) {
-  auto client = StartLibrary(
-      ctx, {{"fiction", BookIds(120, 1)}, {"history", BookIds(100, 1)}, {"trilogy", BookIds(3, 1)}, {"empty", {}}});
-  Pages pages = WalkShelf(ctx, *client, "fiction", 0, "");
-  ctx.Equal(PageSizes(pages), {50, 50, 20}, "120 books at the default page size: the page sizes");
-  const auto flat = FlattenPages(pages);
-  ctx.Assert(flat == BookIds(120, 1), "the walk must return every book once in ascending id order, got %s", ShowBooks(flat));
-  pages = WalkShelf(ctx, *client, "history", 50, "");
-  ctx.Equal(PageSizes(pages), {50, 50},
+  auto client = hStartLibrary(
+      ctx, {{"fiction", hBookIds(120, 1)}, {"history", hBookIds(100, 1)}, {"trilogy", hBookIds(3, 1)}, {"empty", {}}});
+  HPages pages = hWalkShelf(ctx, *client, "fiction", 0, "");
+  ctx.Equal(hPageSizes(pages), {50, 50, 20}, "120 books at the default page size: the page sizes");
+  const auto flat = hFlattenPages(pages);
+  ctx.Assert(flat == hBookIds(120, 1), "the walk must return every book once in ascending id order, got %s", hShowBooks(flat));
+  pages = hWalkShelf(ctx, *client, "history", 50, "");
+  ctx.Equal(hPageSizes(pages), {50, 50},
             "100 books at page_size 50 are exactly two pages, the second with next_page_token %q because nothing follows it; the page sizes", "");
-  ctx.Assert(FlattenPages(pages) == BookIds(100, 1), "the history walk must return b-0001 to b-0100 in order");
-  pages = WalkShelf(ctx, *client, "trilogy", 1, "");
-  ctx.Equal(pages, Pages{{"b-0001"}, {"b-0002"}, {"b-0003"}}, "3 books at page_size 1 are three pages of one");
-  const auto reply = ListBooks(ctx, *client, "empty", 0, "");
-  ctx.Assert(IdsOf(reply).empty() && reply.next_page_token().empty(), "an empty shelf is one empty page with next_page_token %q, got %q and %q",
-             "", IdsOf(reply), reply.next_page_token());
+  ctx.Assert(hFlattenPages(pages) == hBookIds(100, 1), "the history walk must return b-0001 to b-0100 in order");
+  pages = hWalkShelf(ctx, *client, "trilogy", 1, "");
+  ctx.Equal(pages, HPages{{"b-0001"}, {"b-0002"}, {"b-0003"}}, "3 books at page_size 1 are three pages of one");
+  const auto reply = hListBooks(ctx, *client, "empty", 0, "");
+  ctx.Assert(hIdsOf(reply).empty() && reply.next_page_token().empty(), "an empty shelf is one empty page with next_page_token %q, got %q and %q",
+             "", hIdsOf(reply), reply.next_page_token());
 }
 
 void CheckKeyset(harness::Ctx& ctx) {
-  auto client = StartLibrary(ctx, {{"fiction", BookIds(20, 10)}});  // b-0010 … b-0200
-  auto page = ListBooks(ctx, *client, "fiction", 5, "");
-  std::vector<std::string> seen = IdsOf(page);
+  auto client = hStartLibrary(ctx, {{"fiction", hBookIds(20, 10)}});  // b-0010 … b-0200
+  auto page = hListBooks(ctx, *client, "fiction", 5, "");
+  std::vector<std::string> seen = hIdsOf(page);
   ctx.Equal(seen, {"b-0010", "b-0020", "b-0030", "b-0040", "b-0050"}, "page 1 at page_size 5");
   // Two books already listed are removed: an offset into the shorter list would skip b-0060 and b-0070.
-  SetShelf("fiction", "b-0020", "");
-  SetShelf("fiction", "b-0030", "");
-  page = ListBooks(ctx, *client, "fiction", 5, page.next_page_token());
-  auto got = IdsOf(page);
+  hSetShelf("fiction", "b-0020", "");
+  hSetShelf("fiction", "b-0030", "");
+  page = hListBooks(ctx, *client, "fiction", 5, page.next_page_token());
+  auto got = hIdsOf(page);
   ctx.Equal(got, {"b-0060", "b-0070", "b-0080", "b-0090", "b-0100"},
             "b-0020 and b-0030 (already listed) were removed: page 2 must continue after b-0050 (an offset skips survivors)");
   seen.insert(seen.end(), got.begin(), got.end());
   // Three books added before the cursor, and the cursor's own book removed: an offset would repeat books.
-  for (const std::string id : {"b-0005", "b-0025", "b-0045"}) SetShelf("fiction", id, "Title " + id);
-  SetShelf("fiction", "b-0100", "");
-  page = ListBooks(ctx, *client, "fiction", 5, page.next_page_token());
-  got = IdsOf(page);
+  for (const std::string id : {"b-0005", "b-0025", "b-0045"}) hSetShelf("fiction", id, "Title " + id);
+  hSetShelf("fiction", "b-0100", "");
+  page = hListBooks(ctx, *client, "fiction", 5, page.next_page_token());
+  got = hIdsOf(page);
   ctx.Equal(got, {"b-0110", "b-0120", "b-0130", "b-0140", "b-0150"},
             "three books were added before the cursor and the cursor's own book (b-0100) was removed: page 3 must continue strictly after b-0100");
   seen.insert(seen.end(), got.begin(), got.end());
   // A book added ahead of the cursor is simply part of the rest of the walk.
-  SetShelf("fiction", "b-0155", "Title b-0155");
-  const auto rest = FlattenPages(WalkShelf(ctx, *client, "fiction", 5, page.next_page_token()));
+  hSetShelf("fiction", "b-0155", "Title b-0155");
+  const auto rest = hFlattenPages(hWalkShelf(ctx, *client, "fiction", 5, page.next_page_token()));
   ctx.Equal(rest, {"b-0155", "b-0160", "b-0170", "b-0180", "b-0190", "b-0200"},
             "the rest of the walk is everything now after b-0150 (b-0155 was added ahead of the cursor)");
   seen.insert(seen.end(), rest.begin(), rest.end());
   std::vector<std::string> twice;
   for (size_t i = 0; i < seen.size(); ++i) {
     const auto first = static_cast<size_t>(std::find(seen.begin(), seen.end(), seen[i]) - seen.begin());
-    if (first != i && !Contains(twice, seen[i])) twice.push_back(seen[i]);
+    if (first != i && !hContains(twice, seen[i])) twice.push_back(seen[i]);
   }
   std::sort(twice.begin(), twice.end());
   ctx.Assert(twice.empty(), "no book may come back twice in one walk, but %q did", twice);
   std::vector<std::string> missing;
-  for (const auto& id : BookIds(20, 10)) {
-    if (!Contains({"b-0020", "b-0030", "b-0100"}, id) && !Contains(seen, id)) missing.push_back(id);
+  for (const auto& id : hBookIds(20, 10)) {
+    if (!hContains({"b-0020", "b-0030", "b-0100"}, id) && !hContains(seen, id)) missing.push_back(id);
   }
   ctx.Assert(missing.empty(), "every book present for the whole walk must be listed, but %q never was", missing);
-  ctx.Assert(std::is_sorted(seen.begin(), seen.end()), "one walk lists books in ascending id order, got %s", ShowBooks(seen));
+  ctx.Assert(std::is_sorted(seen.begin(), seen.end()), "one walk lists books in ascending id order, got %s", hShowBooks(seen));
 }
 
 void CheckBoundToShelf(harness::Ctx& ctx) {
-  auto client = StartLibrary(ctx, {{"fiction", BookIds(30, 1)}, {"history", BookIds(30, 1)}});
-  const std::string token = ListBooks(ctx, *client, "fiction", 10, "").next_page_token();
+  auto client = hStartLibrary(ctx, {{"fiction", hBookIds(30, 1)}, {"history", hBookIds(30, 1)}});
+  const std::string token = hListBooks(ctx, *client, "fiction", 10, "").next_page_token();
   ctx.Assert(!token.empty(), "10 of 30 fiction books listed: next_page_token must not be empty");
-  ctx.Assert(!Contains({"b-0010", "b-0011", "10"}, token), "the token must be opaque and carry the shelf, not the bare position %q", token);
-  ctx.Equal(ListCode(*client, "history", 10, token), grpc::StatusCode::INVALID_ARGUMENT, "a token issued for shelf %q sent with shelf %q",
+  ctx.Assert(!hContains({"b-0010", "b-0011", "10"}, token), "the token must be opaque and carry the shelf, not the bare position %q", token);
+  ctx.Equal(hListCode(*client, "history", 10, token), grpc::StatusCode::INVALID_ARGUMENT, "a token issued for shelf %q sent with shelf %q",
             "fiction", "history");
-  auto page = IdsOf(ListBooks(ctx, *client, "fiction", 10, token));
-  ctx.Equal(page, Slice(BookIds(20, 1), 10, 20), "the fiction token still continues fiction with b-0011 to b-0020");
-  const auto history = ListBooks(ctx, *client, "history", 10, "");
-  ctx.Equal(ListCode(*client, "fiction", 10, history.next_page_token()), grpc::StatusCode::INVALID_ARGUMENT,
+  auto page = hIdsOf(hListBooks(ctx, *client, "fiction", 10, token));
+  ctx.Equal(page, hSlice(hBookIds(20, 1), 10, 20), "the fiction token still continues fiction with b-0011 to b-0020");
+  const auto history = hListBooks(ctx, *client, "history", 10, "");
+  ctx.Equal(hListCode(*client, "fiction", 10, history.next_page_token()), grpc::StatusCode::INVALID_ARGUMENT,
             "a token issued for shelf %q sent with shelf %q", "history", "fiction");
-  page = IdsOf(ListBooks(ctx, *client, "history", 10, history.next_page_token()));
-  ctx.Equal(page, Slice(BookIds(20, 1), 10, 20), "the history token still continues history with b-0011 to b-0020");
+  page = hIdsOf(hListBooks(ctx, *client, "history", 10, history.next_page_token()));
+  ctx.Equal(page, hSlice(hBookIds(20, 1), 10, 20), "the history token still continues history with b-0011 to b-0020");
 }
 
 void CheckMalformedToken(harness::Ctx& ctx) {
-  auto client = StartLibrary(ctx, {{"fiction", BookIds(30, 1)}});
+  auto client = hStartLibrary(ctx, {{"fiction", hBookIds(30, 1)}});
   const std::vector<std::string> tokens = {
       "not a token",
       "%%%",
@@ -1606,13 +1606,13 @@ void CheckMalformedToken(harness::Ctx& ctx) {
       absl::WebSafeBase64Escape(R"("b-0010")"),
   };
   for (const auto& token : tokens) {
-    const grpc::StatusCode got = ListCode(*client, "fiction", 10, token);
+    const grpc::StatusCode got = hListCode(*client, "fiction", 10, token);
     const std::string hint = got == grpc::StatusCode::UNKNOWN ? " (an exception escaped the handler)" : "";
     ctx.Assert(got == grpc::StatusCode::INVALID_ARGUMENT,
                "page_token %q is not a token this server issued: expected INVALID_ARGUMENT, got %v%s", token, got, hint);
   }
-  const auto page = IdsOf(ListBooks(ctx, *client, "fiction", 10, ""));
-  ctx.Equal(page, BookIds(10, 1), "an empty page_token is the first page, b-0001 to b-0010");
+  const auto page = hIdsOf(hListBooks(ctx, *client, "fiction", 10, ""));
+  ctx.Equal(page, hBookIds(10, 1), "an empty page_token is the first page, b-0001 to b-0010");
 }
 `,
   },

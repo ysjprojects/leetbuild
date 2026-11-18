@@ -914,7 +914,7 @@ import (
 )
 
 // seedTransfers puts transfers on one partition, in this order: account, delta, account, delta…
-func seedTransfers(ctx *harness.Ctx, partition int, pairs ...any) {
+func hSeedTransfers(ctx *harness.Ctx, partition int, pairs ...any) {
 	for i := 0; i+1 < len(pairs); i += 2 {
 		account := pairs[i].(string)
 		ctx.Kafka.SeedPartition("transfers", partition, account, fmt.Sprintf(\`{"account":%q,"delta":%d}\`, account, pairs[i+1]))
@@ -922,19 +922,19 @@ func seedTransfers(ctx *harness.Ctx, partition int, pairs ...any) {
 }
 
 // drainBalances runs the consumer until it waits for transfers that will not come.
-func drainBalances(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
+func hDrainBalances(ctx *harness.Ctx) { ctx.Drain(func() { run(context.Background()) }) }
 
 func CheckApplies(ctx *harness.Ctx) {
-	seedTransfers(ctx, 0, "a", 100, "a", -30)
-	seedTransfers(ctx, 1, "b", 50, "b", -50)
-	seedTransfers(ctx, 2, "c", 7)
-	drainBalances(ctx)
+	hSeedTransfers(ctx, 0, "a", 100, "a", -30)
+	hSeedTransfers(ctx, 1, "b", 50, "b", -50)
+	hSeedTransfers(ctx, 2, "c", 7)
+	hDrainBalances(ctx)
 	ctx.Equal(store().Applied, map[string]int64{"a": 70, "b": 0, "c": 7}, "the balances")
 }
 
 func CheckManualCommit(ctx *harness.Ctx) {
-	seedTransfers(ctx, 0, "a", 1, "b", 2)
-	drainBalances(ctx)
+	hSeedTransfers(ctx, 0, "a", 1, "b", 2)
+	hDrainBalances(ctx)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ok := len(subscriptions) > 0
 	if ok {
@@ -949,15 +949,15 @@ func CheckManualCommit(ctx *harness.Ctx) {
 }
 
 func CheckSkipsRedelivery(ctx *harness.Ctx) {
-	seedTransfers(ctx, 0, "a", 10, "a", 5, "b", 3)
-	seedTransfers(ctx, 1, "b", 4)
-	drainBalances(ctx)
+	hSeedTransfers(ctx, 0, "a", 10, "a", 5, "b", 3)
+	hSeedTransfers(ctx, 1, "b", 4)
+	hDrainBalances(ctx)
 	before := store()
 	ctx.Equal(before.Applied, map[string]int64{"a": 15, "b": 7}, "the balances after the first run")
 	// The commits for offsets 1 and 2 of partition 0 never landed: the group resumes from 1.
 	ctx.Kafka.Commit("balances", harness.KafkaOffsets{harness.KafkaTopicPartition{Topic: "transfers", Partition: 0}: 1})
 	restart()
-	drainBalances(ctx)
+	hDrainBalances(ctx)
 	after := store()
 	ctx.Equal(after.Applied, map[string]int64{"a": 15, "b": 7}, "redelivered records must not be applied again: the balances")
 	ctx.Equal(after.Watermark, before.Watermark, "the watermark must not move on a redelivery")
@@ -966,22 +966,22 @@ func CheckSkipsRedelivery(ctx *harness.Ctx) {
 }
 
 func CheckWatermark(ctx *harness.Ctx) {
-	seedTransfers(ctx, 0, "a", 1, "a", 1, "a", 1)
-	seedTransfers(ctx, 1, "b", 1, "b", 1)
-	drainBalances(ctx)
+	hSeedTransfers(ctx, 0, "a", 1, "a", 1, "a", 1)
+	hSeedTransfers(ctx, 1, "b", 1, "b", 1)
+	hDrainBalances(ctx)
 	ctx.Equal(store().Watermark, map[int]int64{0: 2, 1: 1}, "the watermark (the last applied offset per partition, no entry for partition 2)")
 }
 
 func CheckFreshPartition(ctx *harness.Ctx) {
-	seedTransfers(ctx, 2, "z", 9)
-	drainBalances(ctx)
+	hSeedTransfers(ctx, 2, "z", 9)
+	hDrainBalances(ctx)
 	s := store()
 	ctx.Equal(s.Applied, map[string]int64{"z": 9}, "the first record of a partition (offset 0) must be applied: the balances")
 	ctx.Equal(s.Watermark, map[int]int64{2: 0}, "the watermark")
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	seedTransfers(ctx, 0, "a", 5, "a", 6)
+	hSeedTransfers(ctx, 0, "a", 5, "a", 6)
 	type commitSnapshot struct {
 		offsets harness.KafkaOffsets
 		store   Store
@@ -990,7 +990,7 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 	ctx.Kafka.OnCommit(func(_ string, offsets harness.KafkaOffsets) {
 		atCommit = append(atCommit, commitSnapshot{offsets, store()})
 	})
-	drainBalances(ctx)
+	hDrainBalances(ctx)
 	ctx.Assert(len(atCommit) > 0, "the offsets were never committed")
 	expected := map[int64]int64{1: 5, 2: 11}
 	for _, c := range atCommit {
@@ -1018,28 +1018,28 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 namespace {
 
 // seedTransfers puts transfers on one partition, in this order.
-void seedTransfers(harness::Ctx& ctx, int partition, const std::vector<std::pair<std::string, int>>& transfers) {
+void hSeedTransfers(harness::Ctx& ctx, int partition, const std::vector<std::pair<std::string, int>>& transfers) {
   for (const auto& [account, delta] : transfers)
     ctx.Kafka.SeedPartition("transfers", partition, account,
                             R"({"account":")" + account + R"(","delta":)" + std::to_string(delta) + "}");
 }
 
 // drainBalances runs the consumer until it waits for transfers that will not come.
-void drainBalances(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
+void hDrainBalances(harness::Ctx& ctx) { ctx.Drain([] { run(); }); }
 
 }  // namespace
 
 void CheckApplies(harness::Ctx& ctx) {
-  seedTransfers(ctx, 0, {{"a", 100}, {"a", -30}});
-  seedTransfers(ctx, 1, {{"b", 50}, {"b", -50}});
-  seedTransfers(ctx, 2, {{"c", 7}});
-  drainBalances(ctx);
+  hSeedTransfers(ctx, 0, {{"a", 100}, {"a", -30}});
+  hSeedTransfers(ctx, 1, {{"b", 50}, {"b", -50}});
+  hSeedTransfers(ctx, 2, {{"c", 7}});
+  hDrainBalances(ctx);
   ctx.Equal(store().applied, std::map<std::string, int64_t>{{"a", 70}, {"b", 0}, {"c", 7}}, "the balances");
 }
 
 void CheckManualCommit(harness::Ctx& ctx) {
-  seedTransfers(ctx, 0, {{"a", 1}, {"b", 2}});
-  drainBalances(ctx);
+  hSeedTransfers(ctx, 0, {{"a", 1}, {"b", 2}});
+  hDrainBalances(ctx);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   bool ok = !subscriptions.empty();
   if (ok) {
@@ -1054,15 +1054,15 @@ void CheckManualCommit(harness::Ctx& ctx) {
 }
 
 void CheckSkipsRedelivery(harness::Ctx& ctx) {
-  seedTransfers(ctx, 0, {{"a", 10}, {"a", 5}, {"b", 3}});
-  seedTransfers(ctx, 1, {{"b", 4}});
-  drainBalances(ctx);
+  hSeedTransfers(ctx, 0, {{"a", 10}, {"a", 5}, {"b", 3}});
+  hSeedTransfers(ctx, 1, {{"b", 4}});
+  hDrainBalances(ctx);
   const Store before = store();
   ctx.Equal(before.applied, std::map<std::string, int64_t>{{"a", 15}, {"b", 7}}, "the balances after the first run");
   // The commits for offsets 1 and 2 of partition 0 never landed: the group resumes from 1.
   ctx.Kafka.Commit("balances", {{{"transfers", 0}, 1}});
   restart();
-  drainBalances(ctx);
+  hDrainBalances(ctx);
   const Store after = store();
   ctx.Equal(after.applied, std::map<std::string, int64_t>{{"a", 15}, {"b", 7}}, "redelivered records must not be applied again: the balances");
   ctx.Equal(after.watermark, before.watermark, "the watermark must not move on a redelivery");
@@ -1072,26 +1072,26 @@ void CheckSkipsRedelivery(harness::Ctx& ctx) {
 }
 
 void CheckWatermark(harness::Ctx& ctx) {
-  seedTransfers(ctx, 0, {{"a", 1}, {"a", 1}, {"a", 1}});
-  seedTransfers(ctx, 1, {{"b", 1}, {"b", 1}});
-  drainBalances(ctx);
+  hSeedTransfers(ctx, 0, {{"a", 1}, {"a", 1}, {"a", 1}});
+  hSeedTransfers(ctx, 1, {{"b", 1}, {"b", 1}});
+  hDrainBalances(ctx);
   ctx.Equal(store().watermark, std::map<int, int64_t>{{0, 2}, {1, 1}},
             "the watermark (the last applied offset per partition, no entry for partition 2)");
 }
 
 void CheckFreshPartition(harness::Ctx& ctx) {
-  seedTransfers(ctx, 2, {{"z", 9}});
-  drainBalances(ctx);
+  hSeedTransfers(ctx, 2, {{"z", 9}});
+  hDrainBalances(ctx);
   const Store s = store();
   ctx.Equal(s.applied, std::map<std::string, int64_t>{{"z", 9}}, "the first record of a partition (offset 0) must be applied: the balances");
   ctx.Equal(s.watermark, std::map<int, int64_t>{{2, 0}}, "the watermark");
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  seedTransfers(ctx, 0, {{"a", 5}, {"a", 6}});
+  hSeedTransfers(ctx, 0, {{"a", 5}, {"a", 6}});
   std::vector<std::pair<harness::KafkaOffsets, Store>> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets& offsets) { atCommit.emplace_back(offsets, store()); });
-  drainBalances(ctx);
+  hDrainBalances(ctx);
   ctx.Assert(!atCommit.empty(), "the offsets were never committed");
   const std::map<int64_t, int64_t> expected = {{1, 5}, {2, 11}};
   for (const auto& [offsets, s] : atCommit) {

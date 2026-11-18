@@ -938,13 +938,13 @@ import (
 )
 
 // providerPeer approves everything but tok_expired (INVALID_ARGUMENT) and records every request it saw.
-type providerPeer struct {
+type HProviderPeer struct {
 	pb.UnimplementedPaymentProviderServer
 	mu       sync.Mutex
 	requests []*pb.AuthorizeRequest
 }
 
-func (p *providerPeer) Authorize(_ context.Context, req *pb.AuthorizeRequest) (*pb.AuthorizeReply, error) {
+func (p *HProviderPeer) Authorize(_ context.Context, req *pb.AuthorizeRequest) (*pb.AuthorizeReply, error) {
 	p.mu.Lock()
 	p.requests = append(p.requests, req)
 	p.mu.Unlock()
@@ -954,54 +954,54 @@ func (p *providerPeer) Authorize(_ context.Context, req *pb.AuthorizeRequest) (*
 	return &pb.AuthorizeReply{AuthorizationId: "auth-" + req.GetIdempotencyKey()}, nil
 }
 
-func serveProvider(ctx *harness.Ctx) *providerPeer {
-	p := &providerPeer{}
+func hServeProvider(ctx *harness.Ctx) *HProviderPeer {
+	p := &HProviderPeer{}
 	pb.RegisterPaymentProviderServer(ctx.GRPC.Server(""), p)
 	return p
 }
 
-func authorizeCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Authorize", "") }
+func hAuthorizeCalls(ctx *harness.Ctx) []harness.Call { return ctx.GRPC.CallsTo("Authorize", "") }
 
-func authorizeWith(token, key string) (AuthResult, error) {
+func hAuthorizeWith(token, key string) (AuthResult, error) {
 	return authorize(context.Background(), 4999, "EUR", token, key)
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	serveProvider(ctx)
-	result, err := authorizeWith("tok_visa", "k1")
+	hServeProvider(ctx)
+	result, err := hAuthorizeWith("tok_visa", "k1")
 	ctx.NoError(err, "authorize against a provider that answers")
 	ctx.Equal(result.Status, Approved, "a provider that answers must give Approved")
 	ctx.Equal(result.AuthorizationID, "auth-k1", "AuthorizationID must be the provider's")
-	calls := authorizeCalls(ctx)
+	calls := hAuthorizeCalls(ctx)
 	ctx.Assert(len(calls) > 0, "the provider was never called")
 	call := calls[len(calls)-1]
 	ctx.Assert(call.HasDeadline(), "the RPC carries no deadline: a hung provider would hang checkout")
 	timeout := call.Timeout.Seconds()
 	ctx.Assert(2.5 <= timeout && timeout <= 3.5, "the deadline must be about 3 s, got %.2f s", timeout)
 	ctx.GRPC.SetLatency("Authorize", 30.0, "")
-	result, err = authorizeWith("tok_visa", "k2")
+	result, err = hAuthorizeWith("tok_visa", "k2")
 	ctx.NoError(err, "authorize against a provider slower than the deadline")
 	ctx.Assert(result.Status != Approved, "a provider slower than the deadline cannot have answered")
-	calls = authorizeCalls(ctx)
+	calls = hAuthorizeCalls(ctx)
 	ctx.Equal(len(calls), 2, "a DEADLINE_EXCEEDED attempt must not be retried: calls so far")
 	last := calls[len(calls)-1]
 	ctx.Assert(last.HasDeadline() && last.Timeout.Seconds() <= 3.5, "every attempt carries the deadline")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	p := serveProvider(ctx)
-	_, err := authorizeWith("tok_visa", "k1")
+	p := hServeProvider(ctx)
+	_, err := hAuthorizeWith("tok_visa", "k1")
 	ctx.NoError(err, "authorize against a provider that answers")
 	ctx.Assert(len(p.requests) > 0, "the provider was never called")
 	req := p.requests[len(p.requests)-1]
 	ctx.Equal(req.GetIdempotencyKey(), "k1", "the request's IdempotencyKey")
 	ctx.Equal([]any{req.GetAmountCents(), req.GetCurrency(), req.GetCardToken()}, []any{int64(4999), "EUR", "tok_visa"}, "amount, currency and card token must be in the request")
 	ctx.GRPC.Fail("Authorize", codes.Unavailable, "restarting", 1, "")
-	result, err := authorizeWith("tok_visa", "k2")
+	result, err := hAuthorizeWith("tok_visa", "k2")
 	ctx.NoError(err, "one UNAVAILABLE then success")
 	ctx.Equal(result.Status, Approved, "one UNAVAILABLE then success")
 	var keys []string
-	for _, call := range authorizeCalls(ctx)[1:] {
+	for _, call := range hAuthorizeCalls(ctx)[1:] {
 		sent, _ := call.Request.(*pb.AuthorizeRequest)
 		keys = append(keys, sent.GetIdempotencyKey())
 	}
@@ -1009,35 +1009,35 @@ func CheckIdempotencyKey(ctx *harness.Ctx) {
 }
 
 func CheckRetryUnavailable(ctx *harness.Ctx) {
-	serveProvider(ctx)
+	hServeProvider(ctx)
 	ctx.GRPC.Fail("Authorize", codes.Unavailable, "restarting", 1, "")
-	result, err := authorizeWith("tok_visa", "k1")
+	result, err := hAuthorizeWith("tok_visa", "k1")
 	ctx.NoError(err, "one UNAVAILABLE must be retried and succeed")
 	ctx.Equal(result.Status, Approved, "one UNAVAILABLE must be retried and succeed")
-	ctx.Equal(len(authorizeCalls(ctx)), 2, "attempts after one UNAVAILABLE")
+	ctx.Equal(len(hAuthorizeCalls(ctx)), 2, "attempts after one UNAVAILABLE")
 	// Down for exactly the three allowed attempts: a fourth attempt would reach a provider that is back.
 	ctx.GRPC.Fail("Authorize", codes.Unavailable, "down", 3, "")
-	result, err = authorizeWith("tok_visa", "k2")
+	result, err = hAuthorizeWith("tok_visa", "k2")
 	ctx.Assert(err != nil, "a provider that stays UNAVAILABLE must return an error after the last attempt, got %+v", result)
-	ctx.Equal(len(authorizeCalls(ctx))-2, 3, "attempts against a down provider")
+	ctx.Equal(len(hAuthorizeCalls(ctx))-2, 3, "attempts against a down provider")
 	ctx.GRPC.Fail("Authorize", codes.PermissionDenied, "bad api key", 5, "")
-	result, err = authorizeWith("tok_visa", "k3")
+	result, err = hAuthorizeWith("tok_visa", "k3")
 	ctx.Assert(err != nil, "PERMISSION_DENIED must propagate as an error, got %+v", result)
-	ctx.Equal(len(authorizeCalls(ctx)), 6, "only UNAVAILABLE is retried; PERMISSION_DENIED must be returned after one attempt: calls so far")
+	ctx.Equal(len(hAuthorizeCalls(ctx)), 6, "only UNAVAILABLE is retried; PERMISSION_DENIED must be returned after one attempt: calls so far")
 }
 
 func CheckBackoffJitter(ctx *harness.Ctx) {
-	serveProvider(ctx)
+	hServeProvider(ctx)
 	var gaps [][2]float64
 	var slept []int64 // virtual ms each authorization slept in total (sleeps are the only thing advancing the clock here)
 	for n := range 4 {
 		ctx.GRPC.Fail("Authorize", codes.Unavailable, "restarting", 2, "")
-		before := len(authorizeCalls(ctx))
+		before := len(hAuthorizeCalls(ctx))
 		start := ctx.Clock.Now()
-		result, err := authorizeWith("tok_visa", fmt.Sprintf("k%d", n))
+		result, err := hAuthorizeWith("tok_visa", fmt.Sprintf("k%d", n))
 		ctx.NoError(err, "two UNAVAILABLE then success")
 		ctx.Equal(result.Status, Approved, "two UNAVAILABLE then success")
-		attempts := authorizeCalls(ctx)[before:]
+		attempts := hAuthorizeCalls(ctx)[before:]
 		ctx.Equal(len(attempts), 3, "attempts")
 		gaps = append(gaps, [2]float64{
 			float64(attempts[1].Started.Sub(attempts[0].Started).Milliseconds()),
@@ -1058,19 +1058,19 @@ func CheckBackoffJitter(ctx *harness.Ctx) {
 }
 
 func CheckStatusMapping(ctx *harness.Ctx) {
-	serveProvider(ctx)
+	hServeProvider(ctx)
 	ctx.GRPC.SetLatency("Authorize", 30.0, "")
-	result, err := authorizeWith("tok_visa", "k1")
+	result, err := hAuthorizeWith("tok_visa", "k1")
 	ctx.NoError(err, "a timed-out authorization is a result, not an error")
 	ctx.Equal(result.Status, Pending, "a timed-out authorization must be Pending (the charge may exist)")
-	ctx.Equal(len(authorizeCalls(ctx)), 1, "DEADLINE_EXCEEDED must not be retried (a second attempt could charge twice): calls so far")
+	ctx.Equal(len(hAuthorizeCalls(ctx)), 1, "DEADLINE_EXCEEDED must not be retried (a second attempt could charge twice): calls so far")
 	ctx.GRPC.SetLatency("Authorize", 0.0, "")
-	result, err = authorizeWith("tok_expired", "k2")
+	result, err = hAuthorizeWith("tok_expired", "k2")
 	ctx.NoError(err, "a declined card is a result, not an error")
 	ctx.Equal(result.Status, Declined, "INVALID_ARGUMENT must be Declined")
 	ctx.Assert(strings.Contains(result.Reason, "card expired"), "Declined must carry the provider's message, got Reason %q", result.Reason)
-	ctx.Equal(len(authorizeCalls(ctx)), 2, "INVALID_ARGUMENT must not be retried: calls so far")
-	result, err = authorizeWith("tok_visa", "k3")
+	ctx.Equal(len(hAuthorizeCalls(ctx)), 2, "INVALID_ARGUMENT must not be retried: calls so far")
+	result, err = hAuthorizeWith("tok_visa", "k3")
 	ctx.NoError(err, "authorize against a provider that answers")
 	ctx.Assert(result.Status == Approved && result.AuthorizationID == "auth-k3", "a card the provider accepts must be Approved with its AuthorizationID, got %+v", result)
 }
@@ -1084,7 +1084,7 @@ func CheckStatusMapping(ctx *harness.Ctx) {
 namespace {
 
 // providerPeer approves everything but tok_expired (INVALID_ARGUMENT) and records every request it saw.
-class providerPeer final : public payments::PaymentProvider::Service {
+class HProviderPeer final : public payments::PaymentProvider::Service {
  public:
   std::mutex mu;
   std::vector<payments::AuthorizeRequest> requests;
@@ -1100,21 +1100,21 @@ class providerPeer final : public payments::PaymentProvider::Service {
   }
 };
 
-providerPeer* serveProvider(harness::Ctx& ctx) {
-  auto* peer = new providerPeer();  // the harness owns the implementation for the rest of the check
+HProviderPeer* hServeProvider(harness::Ctx& ctx) {
+  auto* peer = new HProviderPeer();  // the harness owns the implementation for the rest of the check
   ctx.GRPC.Server("")->RegisterService(peer);
   return peer;
 }
 
-std::vector<harness::Call> authorizeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Authorize", ""); }
+std::vector<harness::Call> hAuthorizeCalls(harness::Ctx& ctx) { return ctx.GRPC.CallsTo("Authorize", ""); }
 
 // authorize's outcome: the result, or the error it threw (Go's (AuthResult, error)).
-struct outcome {
+struct HOutcome {
   AuthResult result{};
   std::optional<std::string> err;
 };
 
-outcome authorizeWith(const std::string& token, const std::string& key) {
+HOutcome hAuthorizeWith(const std::string& token, const std::string& key) {
   try {
     return {authorize(4999, "EUR", token, key), std::nullopt};
   } catch (const std::exception& e) {
@@ -1122,11 +1122,11 @@ outcome authorizeWith(const std::string& token, const std::string& key) {
   }
 }
 
-void noError(harness::Ctx& ctx, const outcome& o, const std::string& what) {
+void hNoError(harness::Ctx& ctx, const HOutcome& o, const std::string& what) {
   if (o.err) ctx.Fatalf("%s: %s", what, *o.err);
 }
 
-std::string statusName(AuthStatus s) {
+std::string hStatusName(AuthStatus s) {
   switch (s) {
     case AuthStatus::kApproved: return "Approved";
     case AuthStatus::kDeclined: return "Declined";
@@ -1135,73 +1135,73 @@ std::string statusName(AuthStatus s) {
   return "?";
 }
 
-std::string showResult(const AuthResult& r) {
-  return harness::Sprintf("{Status:%s AuthorizationID:%s Reason:%s}", statusName(r.status), r.authorization_id, r.reason);
+std::string hShowResult(const AuthResult& r) {
+  return harness::Sprintf("{Status:%s AuthorizationID:%s Reason:%s}", hStatusName(r.status), r.authorization_id, r.reason);
 }
 
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  serveProvider(ctx);
-  auto o = authorizeWith("tok_visa", "k1");
-  noError(ctx, o, "authorize against a provider that answers");
-  ctx.Equal(statusName(o.result.status), "Approved", "a provider that answers must give Approved");
+  hServeProvider(ctx);
+  auto o = hAuthorizeWith("tok_visa", "k1");
+  hNoError(ctx, o, "authorize against a provider that answers");
+  ctx.Equal(hStatusName(o.result.status), "Approved", "a provider that answers must give Approved");
   ctx.Equal(o.result.authorization_id, "auth-k1", "AuthorizationID must be the provider's");
-  auto calls = authorizeCalls(ctx);
+  auto calls = hAuthorizeCalls(ctx);
   ctx.Assert(!calls.empty(), "the provider was never called");
   const auto& call = calls.back();
   ctx.Assert(call.HasDeadline(), "the RPC carries no deadline: a hung provider would hang checkout");
   const double timeout = call.TimeoutSeconds();
   ctx.Assert(2.5 <= timeout && timeout <= 3.5, "the deadline must be about 3 s, got %.2f s", timeout);
   ctx.GRPC.SetLatency("Authorize", 30.0, "");
-  o = authorizeWith("tok_visa", "k2");
-  noError(ctx, o, "authorize against a provider slower than the deadline");
+  o = hAuthorizeWith("tok_visa", "k2");
+  hNoError(ctx, o, "authorize against a provider slower than the deadline");
   ctx.Assert(o.result.status != AuthStatus::kApproved, "a provider slower than the deadline cannot have answered");
-  calls = authorizeCalls(ctx);
+  calls = hAuthorizeCalls(ctx);
   ctx.Equal(calls.size(), 2, "a DEADLINE_EXCEEDED attempt must not be retried: calls so far");
   const auto& last = calls.back();
   ctx.Assert(last.HasDeadline() && last.TimeoutSeconds() <= 3.5, "every attempt carries the deadline");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto* p = serveProvider(ctx);
-  auto o = authorizeWith("tok_visa", "k1");
-  noError(ctx, o, "authorize against a provider that answers");
+  auto* p = hServeProvider(ctx);
+  auto o = hAuthorizeWith("tok_visa", "k1");
+  hNoError(ctx, o, "authorize against a provider that answers");
   ctx.Assert(!p->requests.empty(), "the provider was never called");
   const auto req = p->requests.back();
   ctx.Equal(req.idempotency_key(), "k1", "the request's IdempotencyKey");
   ctx.Equal(std::make_tuple(req.amount_cents(), req.currency(), req.card_token()), std::make_tuple(int64_t{4999}, std::string("EUR"), std::string("tok_visa")),
             "amount, currency and card token must be in the request");
   ctx.GRPC.Fail("Authorize", grpc::StatusCode::UNAVAILABLE, "restarting", 1, "");
-  o = authorizeWith("tok_visa", "k2");
-  noError(ctx, o, "one UNAVAILABLE then success");
-  ctx.Equal(statusName(o.result.status), "Approved", "one UNAVAILABLE then success");
+  o = hAuthorizeWith("tok_visa", "k2");
+  hNoError(ctx, o, "one UNAVAILABLE then success");
+  ctx.Equal(hStatusName(o.result.status), "Approved", "one UNAVAILABLE then success");
   std::vector<std::string> keys;
-  const auto calls = authorizeCalls(ctx);
+  const auto calls = hAuthorizeCalls(ctx);
   for (size_t i = 1; i < calls.size(); i++) keys.push_back(calls[i].Request<payments::AuthorizeRequest>().idempotency_key());
   ctx.Equal(keys, {"k2", "k2"}, "every attempt of one authorization must carry the same key");
 }
 
 void CheckRetryUnavailable(harness::Ctx& ctx) {
-  serveProvider(ctx);
+  hServeProvider(ctx);
   ctx.GRPC.Fail("Authorize", grpc::StatusCode::UNAVAILABLE, "restarting", 1, "");
-  auto o = authorizeWith("tok_visa", "k1");
-  noError(ctx, o, "one UNAVAILABLE must be retried and succeed");
-  ctx.Equal(statusName(o.result.status), "Approved", "one UNAVAILABLE must be retried and succeed");
-  ctx.Equal(authorizeCalls(ctx).size(), 2, "attempts after one UNAVAILABLE");
+  auto o = hAuthorizeWith("tok_visa", "k1");
+  hNoError(ctx, o, "one UNAVAILABLE must be retried and succeed");
+  ctx.Equal(hStatusName(o.result.status), "Approved", "one UNAVAILABLE must be retried and succeed");
+  ctx.Equal(hAuthorizeCalls(ctx).size(), 2, "attempts after one UNAVAILABLE");
   // Down for exactly the three allowed attempts: a fourth attempt would reach a provider that is back.
   ctx.GRPC.Fail("Authorize", grpc::StatusCode::UNAVAILABLE, "down", 3, "");
-  o = authorizeWith("tok_visa", "k2");
-  ctx.Assert(o.err.has_value(), "a provider that stays UNAVAILABLE must return an error after the last attempt, got %s", showResult(o.result));
-  ctx.Equal(static_cast<int>(authorizeCalls(ctx).size()) - 2, 3, "attempts against a down provider");
+  o = hAuthorizeWith("tok_visa", "k2");
+  ctx.Assert(o.err.has_value(), "a provider that stays UNAVAILABLE must return an error after the last attempt, got %s", hShowResult(o.result));
+  ctx.Equal(static_cast<int>(hAuthorizeCalls(ctx).size()) - 2, 3, "attempts against a down provider");
   ctx.GRPC.Fail("Authorize", grpc::StatusCode::PERMISSION_DENIED, "bad api key", 5, "");
-  o = authorizeWith("tok_visa", "k3");
-  ctx.Assert(o.err.has_value(), "PERMISSION_DENIED must propagate as an error, got %s", showResult(o.result));
-  ctx.Equal(authorizeCalls(ctx).size(), 6, "only UNAVAILABLE is retried; PERMISSION_DENIED must be returned after one attempt: calls so far");
+  o = hAuthorizeWith("tok_visa", "k3");
+  ctx.Assert(o.err.has_value(), "PERMISSION_DENIED must propagate as an error, got %s", hShowResult(o.result));
+  ctx.Equal(hAuthorizeCalls(ctx).size(), 6, "only UNAVAILABLE is retried; PERMISSION_DENIED must be returned after one attempt: calls so far");
 }
 
 void CheckBackoffJitter(harness::Ctx& ctx) {
-  serveProvider(ctx);
+  hServeProvider(ctx);
   std::vector<std::pair<double, double>> gaps;
   std::vector<int64_t> slept;  // virtual ms each authorization slept in total (sleeps are the only thing advancing the clock here)
   const auto ms = [](std::chrono::system_clock::duration d) {
@@ -1209,12 +1209,12 @@ void CheckBackoffJitter(harness::Ctx& ctx) {
   };
   for (int n = 0; n < 4; n++) {
     ctx.GRPC.Fail("Authorize", grpc::StatusCode::UNAVAILABLE, "restarting", 2, "");
-    const size_t before = authorizeCalls(ctx).size();
+    const size_t before = hAuthorizeCalls(ctx).size();
     const int64_t start = ctx.Clock.Now();
-    auto o = authorizeWith("tok_visa", "k" + std::to_string(n));
-    noError(ctx, o, "two UNAVAILABLE then success");
-    ctx.Equal(statusName(o.result.status), "Approved", "two UNAVAILABLE then success");
-    const auto all = authorizeCalls(ctx);
+    auto o = hAuthorizeWith("tok_visa", "k" + std::to_string(n));
+    hNoError(ctx, o, "two UNAVAILABLE then success");
+    ctx.Equal(hStatusName(o.result.status), "Approved", "two UNAVAILABLE then success");
+    const auto all = hAuthorizeCalls(ctx);
     const std::vector<harness::Call> attempts(all.begin() + static_cast<long>(before), all.end());
     ctx.Equal(attempts.size(), 3, "attempts");
     gaps.emplace_back(ms(attempts[1].Started - attempts[0].Started), ms(attempts[2].Started - attempts[1].Started));
@@ -1231,22 +1231,22 @@ void CheckBackoffJitter(harness::Ctx& ctx) {
 }
 
 void CheckStatusMapping(harness::Ctx& ctx) {
-  serveProvider(ctx);
+  hServeProvider(ctx);
   ctx.GRPC.SetLatency("Authorize", 30.0, "");
-  auto o = authorizeWith("tok_visa", "k1");
-  noError(ctx, o, "a timed-out authorization is a result, not an error");
-  ctx.Equal(statusName(o.result.status), "Pending", "a timed-out authorization must be Pending (the charge may exist)");
-  ctx.Equal(authorizeCalls(ctx).size(), 1, "DEADLINE_EXCEEDED must not be retried (a second attempt could charge twice): calls so far");
+  auto o = hAuthorizeWith("tok_visa", "k1");
+  hNoError(ctx, o, "a timed-out authorization is a result, not an error");
+  ctx.Equal(hStatusName(o.result.status), "Pending", "a timed-out authorization must be Pending (the charge may exist)");
+  ctx.Equal(hAuthorizeCalls(ctx).size(), 1, "DEADLINE_EXCEEDED must not be retried (a second attempt could charge twice): calls so far");
   ctx.GRPC.SetLatency("Authorize", 0.0, "");
-  o = authorizeWith("tok_expired", "k2");
-  noError(ctx, o, "a declined card is a result, not an error");
-  ctx.Equal(statusName(o.result.status), "Declined", "INVALID_ARGUMENT must be Declined");
+  o = hAuthorizeWith("tok_expired", "k2");
+  hNoError(ctx, o, "a declined card is a result, not an error");
+  ctx.Equal(hStatusName(o.result.status), "Declined", "INVALID_ARGUMENT must be Declined");
   ctx.Assert(o.result.reason.find("card expired") != std::string::npos, "Declined must carry the provider's message, got Reason %q", o.result.reason);
-  ctx.Equal(authorizeCalls(ctx).size(), 2, "INVALID_ARGUMENT must not be retried: calls so far");
-  o = authorizeWith("tok_visa", "k3");
-  noError(ctx, o, "authorize against a provider that answers");
+  ctx.Equal(hAuthorizeCalls(ctx).size(), 2, "INVALID_ARGUMENT must not be retried: calls so far");
+  o = hAuthorizeWith("tok_visa", "k3");
+  hNoError(ctx, o, "authorize against a provider that answers");
   ctx.Assert(o.result.status == AuthStatus::kApproved && o.result.authorization_id == "auth-k3",
-             "a card the provider accepts must be Approved with its AuthorizationID, got %s", showResult(o.result));
+             "a card the provider accepts must be Approved with its AuthorizationID, got %s", hShowResult(o.result));
 }
 `,
   },

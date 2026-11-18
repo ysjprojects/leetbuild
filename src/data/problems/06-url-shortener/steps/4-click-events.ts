@@ -651,39 +651,39 @@ import (
 )
 
 // clickWarnings collects what the learner logs, still passing it on to the original output.
-type clickWarnings struct {
+type HClickWarnings struct {
 	guard sync.Mutex
 	lines []string
 }
 
-func (w *clickWarnings) Write(p []byte) (int, error) {
+func (w *HClickWarnings) Write(p []byte) (int, error) {
 	w.guard.Lock()
 	defer w.guard.Unlock()
 	w.lines = append(w.lines, string(p))
 	return len(p), nil
 }
 
-func (w *clickWarnings) count() int {
+func (w *HClickWarnings) count() int {
 	w.guard.Lock()
 	defer w.guard.Unlock()
 	return len(w.lines)
 }
 
-func watchClickLog() *clickWarnings {
-	w := &clickWarnings{}
+func hWatchClickLog() *HClickWarnings {
+	w := &HClickWarnings{}
 	log.SetOutput(io.MultiWriter(log.Writer(), w))
 	return w
 }
 
 // settleClicks lets the producer's linger pass and its deliveries settle.
-func settleClicks(ctx *harness.Ctx) {
+func hSettleClicks(ctx *harness.Ctx) {
 	ctx.Clock.Advance(1)
 	ctx.Settle()
 }
 
 func CheckTopic(ctx *harness.Ctx) {
 	recordClick(context.Background(), "g9Xc", "https://news.example/", "Mozilla/5.0")
-	settleClicks(ctx)
+	hSettleClicks(ctx)
 	produced := ctx.Kafka.Records("clicks")
 	ctx.Assert(len(produced) == 1, "expected one record on clicks, found %d (topics: %q)", len(produced), ctx.Kafka.Topics())
 	var event map[string]any
@@ -698,14 +698,14 @@ func CheckKeyed(ctx *harness.Ctx) {
 	recordClick(context.Background(), "g9Xc", "", "")
 	recordClick(context.Background(), "g9Xc", "https://other.example/", "")
 	recordClick(context.Background(), "zz12", "", "")
-	settleClicks(ctx)
+	hSettleClicks(ctx)
 	ctx.Equal(ctx.Kafka.Keys("clicks"), []string{"g9Xc", "g9Xc", "zz12"}, "records must be keyed by the code")
 	produced := ctx.Kafka.Records("clicks")
 	ctx.Equal(produced[0].Partition, produced[1].Partition, "the same code must land on the same partition")
 }
 
 // clickWhileStalled is recordClick while the broker sits on its acknowledgements for 2 s: it must not sit with it.
-func clickWhileStalled(ctx *harness.Ctx) {
+func hClickWhileStalled(ctx *harness.Ctx) {
 	ctx.Kafka.StallFor("clicks", 2)
 	before := ctx.Clock.Now()
 	recordClick(context.Background(), "g9Xc", "", "")
@@ -714,19 +714,19 @@ func clickWhileStalled(ctx *harness.Ctx) {
 }
 
 func CheckNonBlocking(ctx *harness.Ctx) {
-	clickWhileStalled(ctx)
-	settleClicks(ctx)
+	hClickWhileStalled(ctx)
+	hSettleClicks(ctx)
 	ctx.Equal(len(ctx.Kafka.Records("clicks")), 1, "the click must still be handed to the producer")
-	clickWhileStalled(ctx)
-	settleClicks(ctx)
+	hClickWhileStalled(ctx)
+	hSettleClicks(ctx)
 	ctx.Equal(len(ctx.Kafka.Records("clicks")), 2, "records on clicks after the second click")
 }
 
 func CheckCallback(ctx *harness.Ctx) {
-	warnings := watchClickLog()
+	warnings := hWatchClickLog()
 	ctx.Kafka.FailNext("clicks", 1)
 	recordClick(context.Background(), "g9Xc", "", "") // the failure arrives through the Completion callback, not as an error
-	settleClicks(ctx)
+	hSettleClicks(ctx)
 	recordClick(context.Background(), "g9Xc", "", "")
 	shutdown()
 	ctx.Assert(warnings.count() > 0, "a failed delivery must be logged by the Completion callback")
@@ -752,10 +752,10 @@ namespace {
 
 // clickWarnings collects what the learner writes to std::cerr (Go: the log package's output), still
 // passing it on to the original output, until it is destroyed.
-class clickWarnings : public std::streambuf {
+class HClickWarnings : public std::streambuf {
  public:
-  clickWarnings() : previous_(std::cerr.rdbuf(this)) {}
-  ~clickWarnings() override { std::cerr.rdbuf(previous_); }
+  HClickWarnings() : previous_(std::cerr.rdbuf(this)) {}
+  ~HClickWarnings() override { std::cerr.rdbuf(previous_); }
 
   // How many bytes were written so far.
   int written() {
@@ -791,14 +791,14 @@ class clickWarnings : public std::streambuf {
 // the broker sat on from its own threads once the broker answers; the model writes it at the
 // producer's next call, so the harness makes one (poll(0)) once a 2 s stall is over (Go's Settle
 // jumps the clock to the stall's end, where its producer goroutine waits).
-void settleClicks(harness::Ctx& ctx) {
+void hSettleClicks(harness::Ctx& ctx) {
   ctx.Clock.Advance(2);
   ctx.Settle();
   producer->poll(0);
 }
 
 // clickWhileStalled is record_click while the broker sits on its acknowledgements for 2 s: it must not sit with it.
-void clickWhileStalled(harness::Ctx& ctx) {
+void hClickWhileStalled(harness::Ctx& ctx) {
   ctx.Kafka.StallFor("clicks", 2);
   const int64_t before = ctx.Clock.Now();
   record_click("g9Xc", "", "");
@@ -810,7 +810,7 @@ void clickWhileStalled(harness::Ctx& ctx) {
 
 void CheckTopic(harness::Ctx& ctx) {
   record_click("g9Xc", "https://news.example/", "Mozilla/5.0");
-  settleClicks(ctx);
+  hSettleClicks(ctx);
   const auto produced = ctx.Kafka.Records("clicks");
   ctx.Assert(produced.size() == 1, "expected one record on clicks, found %d (topics: %q)", produced.size(), ctx.Kafka.Topics());
   const std::string value = produced[0].Value.value_or("");
@@ -828,26 +828,26 @@ void CheckKeyed(harness::Ctx& ctx) {
   record_click("g9Xc", "", "");
   record_click("g9Xc", "https://other.example/", "");
   record_click("zz12", "", "");
-  settleClicks(ctx);
+  hSettleClicks(ctx);
   ctx.Equal(ctx.Kafka.Keys("clicks"), std::vector<std::string>{"g9Xc", "g9Xc", "zz12"}, "records must be keyed by the code");
   const auto produced = ctx.Kafka.Records("clicks");
   ctx.Equal(produced[0].Partition, produced[1].Partition, "the same code must land on the same partition");
 }
 
 void CheckNonBlocking(harness::Ctx& ctx) {
-  clickWhileStalled(ctx);
-  settleClicks(ctx);
+  hClickWhileStalled(ctx);
+  hSettleClicks(ctx);
   ctx.Equal(ctx.Kafka.Records("clicks").size(), 1, "the click must still be handed to the producer");
-  clickWhileStalled(ctx);
-  settleClicks(ctx);
+  hClickWhileStalled(ctx);
+  hSettleClicks(ctx);
   ctx.Equal(ctx.Kafka.Records("clicks").size(), 2, "records on clicks after the second click");
 }
 
 void CheckCallback(harness::Ctx& ctx) {
-  clickWarnings warnings;
+  HClickWarnings warnings;
   ctx.Kafka.FailNext("clicks", 1);
   record_click("g9Xc", "", "");  // the failure arrives through the delivery report callback, not as an error
-  settleClicks(ctx);
+  hSettleClicks(ctx);
   record_click("g9Xc", "", "");
   shutdown();
   ctx.Assert(warnings.written() > 0, "a failed delivery must be logged by the delivery report callback");

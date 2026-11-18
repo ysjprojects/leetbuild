@@ -754,33 +754,33 @@ import (
 	"leetbuild/harness"
 )
 
-var offerCtx = context.Background()
+var hOfferCtx = context.Background()
 
 // standInDispatcher replaces the provided dispatcher.go: it records every ride handed to nextCandidate.
-func standInDispatcher() *[]string {
+func hStandInDispatcher() *[]string {
 	movedOn := &[]string{}
 	nextCandidate = func(_ context.Context, rideID string) { *movedOn = append(*movedOn, rideID) }
 	return movedOn
 }
 
-func offerTo(ctx *harness.Ctx, rideID, driverID string) bool {
-	ok, err := offer(offerCtx, rideID, driverID)
+func hOfferTo(ctx *harness.Ctx, rideID, driverID string) bool {
+	ok, err := offer(hOfferCtx, rideID, driverID)
 	ctx.NoError(err, "offer(%q, %q) returned an error", rideID, driverID)
 	return ok
 }
 
-func acceptOffer(ctx *harness.Ctx, rideID, driverID string) bool {
-	ok, err := accept(offerCtx, rideID, driverID)
+func hAcceptOffer(ctx *harness.Ctx, rideID, driverID string) bool {
+	ok, err := accept(hOfferCtx, rideID, driverID)
 	ctx.NoError(err, "accept(%q, %q) returned an error", rideID, driverID)
 	return ok
 }
 
-func declineOffer(ctx *harness.Ctx, rideID, driverID string) {
-	ctx.NoError(decline(offerCtx, rideID, driverID), "decline(%q, %q) returned an error", rideID, driverID)
+func hDeclineOffer(ctx *harness.Ctx, rideID, driverID string) {
+	ctx.NoError(decline(hOfferCtx, rideID, driverID), "decline(%q, %q) returned an error", rideID, driverID)
 }
 
 // keyValue is the string at key, nil when absent.
-func keyValue(ctx *harness.Ctx, key string) any {
+func hKeyValue(ctx *harness.Ctx, key string) any {
 	if v, ok := ctx.Redis.Get(key); ok {
 		return v
 	}
@@ -790,73 +790,73 @@ func keyValue(ctx *harness.Ctx, key string) any {
 // The race: right after the first command that reads the offer key, the offer is replaced by a newer
 // ride. A GET-then-DEL from the client has the swap land between its two steps and deletes the newer
 // offer; an atomic compare-and-delete finishes before the swap, so the newer offer survives it.
-func offerRace(ctx *harness.Ctx, key, newer string) {
+func hOfferRace(ctx *harness.Ctx, key, newer string) {
 	ctx.Redis.After(key, func() any { return ctx.Redis.Set(key, newer, "EX", 15) })
 }
 
 func CheckOfferNx(ctx *harness.Ctx) {
-	standInDispatcher()
-	ctx.Equal(offerTo(ctx, "r-42", "d-7"), true, "the first offer to a free driver must return true")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-42", "offer:driver:d-7 must hold the ride id")
+	hStandInDispatcher()
+	ctx.Equal(hOfferTo(ctx, "r-42", "d-7"), true, "the first offer to a free driver must return true")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-7"), "r-42", "offer:driver:d-7 must hold the ride id")
 	ttl := ctx.Redis.TTL("offer:driver:d-7")
 	ctx.Assert(0 < ttl && ttl <= 15, "offer:driver:d-7 has TTL %d, expected offerTTL (15 s)", ttl)
-	ctx.Equal(offerTo(ctx, "r-43", "d-7"), false, "a driver with an open offer must be skipped: the second offer must return false")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-42", "the second offer must not overwrite the first: the SET must be NX")
-	ctx.Equal(offerTo(ctx, "r-43", "d-8"), true, "another driver is free and must get the offer")
+	ctx.Equal(hOfferTo(ctx, "r-43", "d-7"), false, "a driver with an open offer must be skipped: the second offer must return false")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-7"), "r-42", "the second offer must not overwrite the first: the SET must be NX")
+	ctx.Equal(hOfferTo(ctx, "r-43", "d-8"), true, "another driver is free and must get the offer")
 	ctx.Clock.Advance(16)
-	ctx.Equal(offerTo(ctx, "r-44", "d-7"), true, "after the 15 s window the driver is free again")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-44", "offer:driver:d-7 after the new offer")
+	ctx.Equal(hOfferTo(ctx, "r-44", "d-7"), true, "after the 15 s window the driver is free again")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-7"), "r-44", "offer:driver:d-7 after the new offer")
 }
 
 func CheckCompareAndDelete(ctx *harness.Ctx) {
-	standInDispatcher()
-	offerTo(ctx, "r-42", "d-7")
-	ctx.Equal(acceptOffer(ctx, "r-99", "d-7"), false, "accepting a ride that is not the one on offer must return false")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), "r-42", "a mismatched accept must leave the offer in place")
-	ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer must return true")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), nil, "a successful accept must release the offer key")
-	ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), false, "the offer is gone: a second accept must return false")
-	offerTo(ctx, "r-50", "d-8")
+	hStandInDispatcher()
+	hOfferTo(ctx, "r-42", "d-7")
+	ctx.Equal(hAcceptOffer(ctx, "r-99", "d-7"), false, "accepting a ride that is not the one on offer must return false")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-7"), "r-42", "a mismatched accept must leave the offer in place")
+	ctx.Equal(hAcceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer must return true")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-7"), nil, "a successful accept must release the offer key")
+	ctx.Equal(hAcceptOffer(ctx, "r-42", "d-7"), false, "the offer is gone: a second accept must return false")
+	hOfferTo(ctx, "r-50", "d-8")
 	ctx.Clock.Advance(16)       // the offer expired unanswered ...
-	offerTo(ctx, "r-51", "d-8") // ... and a newer ride landed under the key
-	ctx.Equal(acceptOffer(ctx, "r-50", "d-8"), false, "a stale accept after the offer expired must return false")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-8"), "r-51", "the stale accept must not delete the newer offer r-51: compare and delete must be one atomic step")
+	hOfferTo(ctx, "r-51", "d-8") // ... and a newer ride landed under the key
+	ctx.Equal(hAcceptOffer(ctx, "r-50", "d-8"), false, "a stale accept after the offer expired must return false")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-8"), "r-51", "the stale accept must not delete the newer offer r-51: compare and delete must be one atomic step")
 	// The race itself: a GET-then-DEL from the client lets the key change in between.
-	offerTo(ctx, "r-60", "d-9")
-	offerRace(ctx, "offer:driver:d-9", "r-61")
-	ctx.Equal(acceptOffer(ctx, "r-60", "d-9"), true, "accept of the ride on offer must succeed")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so the stale accept must not delete it: the compare and the delete must run atomically (a Lua script or WATCH/MULTI)")
+	hOfferTo(ctx, "r-60", "d-9")
+	hOfferRace(ctx, "offer:driver:d-9", "r-61")
+	ctx.Equal(hAcceptOffer(ctx, "r-60", "d-9"), true, "accept of the ride on offer must succeed")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so the stale accept must not delete it: the compare and the delete must run atomically (a Lua script or WATCH/MULTI)")
 }
 
 func CheckAssignAfterAccept(ctx *harness.Ctx) {
-	standInDispatcher()
-	offerTo(ctx, "r-42", "d-7")
-	ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer")
-	ctx.Equal(keyValue(ctx, "ride:r-42:driver"), "d-7", "after a successful accept ride:r-42:driver")
-	offerTo(ctx, "r-50", "d-8")
-	ctx.Equal(acceptOffer(ctx, "r-51", "d-8"), false, "accepting a ride that is not on offer")
-	ctx.Equal(keyValue(ctx, "ride:r-51:driver"), nil, "the guarded delete returned 0, so ride:r-51:driver must not be written: assign only after the release succeeded")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-8"), "r-50", "a failed accept must not touch the offer")
-	ctx.Equal(acceptOffer(ctx, "r-42", "d-9"), false, "d-9 holds no offer: accept must return false")
-	ctx.Equal(keyValue(ctx, "ride:r-42:driver"), "d-7", "a failed accept must not reassign the ride")
+	hStandInDispatcher()
+	hOfferTo(ctx, "r-42", "d-7")
+	ctx.Equal(hAcceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer")
+	ctx.Equal(hKeyValue(ctx, "ride:r-42:driver"), "d-7", "after a successful accept ride:r-42:driver")
+	hOfferTo(ctx, "r-50", "d-8")
+	ctx.Equal(hAcceptOffer(ctx, "r-51", "d-8"), false, "accepting a ride that is not on offer")
+	ctx.Equal(hKeyValue(ctx, "ride:r-51:driver"), nil, "the guarded delete returned 0, so ride:r-51:driver must not be written: assign only after the release succeeded")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-8"), "r-50", "a failed accept must not touch the offer")
+	ctx.Equal(hAcceptOffer(ctx, "r-42", "d-9"), false, "d-9 holds no offer: accept must return false")
+	ctx.Equal(hKeyValue(ctx, "ride:r-42:driver"), "d-7", "a failed accept must not reassign the ride")
 }
 
 func CheckDeclineGuarded(ctx *harness.Ctx) {
-	movedOn := standInDispatcher()
-	offerTo(ctx, "r-42", "d-7")
-	declineOffer(ctx, "r-42", "d-7")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-7"), nil, "declining the ride on offer must release the key")
+	movedOn := hStandInDispatcher()
+	hOfferTo(ctx, "r-42", "d-7")
+	hDeclineOffer(ctx, "r-42", "d-7")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-7"), nil, "declining the ride on offer must release the key")
 	ctx.Equal(*movedOn, []string{"r-42"}, "decline must hand the ride to nextCandidate: the rides it saw")
-	offerTo(ctx, "r-50", "d-8")
+	hOfferTo(ctx, "r-50", "d-8")
 	ctx.Clock.Advance(16)
-	offerTo(ctx, "r-51", "d-8")
-	declineOffer(ctx, "r-50", "d-8")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-8"), "r-51", "a late decline of r-50 must not delete the newer offer r-51: the release must be the guarded delete, never a blind DEL")
+	hOfferTo(ctx, "r-51", "d-8")
+	hDeclineOffer(ctx, "r-50", "d-8")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-8"), "r-51", "a late decline of r-50 must not delete the newer offer r-51: the release must be the guarded delete, never a blind DEL")
 	ctx.Equal(*movedOn, []string{"r-42", "r-50"}, "a late decline still moves the ride on: the rides nextCandidate saw")
-	offerTo(ctx, "r-60", "d-9")
-	offerRace(ctx, "offer:driver:d-9", "r-61")
-	declineOffer(ctx, "r-60", "d-9")
-	ctx.Equal(keyValue(ctx, "offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so decline must not delete it: compare and delete atomically")
+	hOfferTo(ctx, "r-60", "d-9")
+	hOfferRace(ctx, "offer:driver:d-9", "r-61")
+	hDeclineOffer(ctx, "r-60", "d-9")
+	ctx.Equal(hKeyValue(ctx, "offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so decline must not delete it: compare and delete atomically")
 	ctx.Equal((*movedOn)[len(*movedOn)-1], "r-60", "decline must call nextCandidate with the declined ride")
 }
 `,
@@ -870,14 +870,14 @@ func CheckDeclineGuarded(ctx *harness.Ctx) {
 namespace {
 
 // movedOn: every ride handed to next_candidate, which the harness stands in for (dispatcher.cpp).
-std::vector<std::string> movedOn;
+std::vector<std::string> hMovedOn;
 
-std::vector<std::string>& standInDispatcher() {
-  movedOn.clear();
-  return movedOn;
+std::vector<std::string>& hStandInDispatcher() {
+  hMovedOn.clear();
+  return hMovedOn;
 }
 
-bool offerTo(harness::Ctx& ctx, const std::string& rideID, const std::string& driverID) {
+bool hOfferTo(harness::Ctx& ctx, const std::string& rideID, const std::string& driverID) {
   try {
     return offer(rideID, driverID);
   } catch (const std::exception& e) {
@@ -885,7 +885,7 @@ bool offerTo(harness::Ctx& ctx, const std::string& rideID, const std::string& dr
   }
 }
 
-bool acceptOffer(harness::Ctx& ctx, const std::string& rideID, const std::string& driverID) {
+bool hAcceptOffer(harness::Ctx& ctx, const std::string& rideID, const std::string& driverID) {
   try {
     return accept(rideID, driverID);
   } catch (const std::exception& e) {
@@ -893,7 +893,7 @@ bool acceptOffer(harness::Ctx& ctx, const std::string& rideID, const std::string
   }
 }
 
-void declineOffer(harness::Ctx& ctx, const std::string& rideID, const std::string& driverID) {
+void hDeclineOffer(harness::Ctx& ctx, const std::string& rideID, const std::string& driverID) {
   try {
     decline(rideID, driverID);
   } catch (const std::exception& e) {
@@ -904,76 +904,76 @@ void declineOffer(harness::Ctx& ctx, const std::string& rideID, const std::strin
 // The race: right after the first command that reads the offer key, the offer is replaced by a newer
 // ride. A GET-then-DEL from the client has the swap land between its two steps and deletes the newer
 // offer; an atomic compare-and-delete finishes before the swap, so the newer offer survives it.
-void offerRace(harness::Ctx& ctx, const std::string& key, const std::string& newer) {
+void hOfferRace(harness::Ctx& ctx, const std::string& key, const std::string& newer) {
   ctx.Redis.After(key, [&ctx, key, newer] { ctx.Redis.Set(key, newer, "EX", 15); });
 }
 
 }  // namespace
 
-void next_candidate(const std::string& ride_id) { movedOn.push_back(ride_id); }
+void next_candidate(const std::string& ride_id) { hMovedOn.push_back(ride_id); }
 
 void CheckOfferNx(harness::Ctx& ctx) {
-  standInDispatcher();
-  ctx.Equal(offerTo(ctx, "r-42", "d-7"), true, "the first offer to a free driver must return true");
+  hStandInDispatcher();
+  ctx.Equal(hOfferTo(ctx, "r-42", "d-7"), true, "the first offer to a free driver must return true");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-7"), "r-42", "offer:driver:d-7 must hold the ride id");
   const long long ttl = ctx.Redis.TTL("offer:driver:d-7");
   ctx.Assert(0 < ttl && ttl <= 15, "offer:driver:d-7 has TTL %d, expected kOfferTtl (15 s)", ttl);
-  ctx.Equal(offerTo(ctx, "r-43", "d-7"), false, "a driver with an open offer must be skipped: the second offer must return false");
+  ctx.Equal(hOfferTo(ctx, "r-43", "d-7"), false, "a driver with an open offer must be skipped: the second offer must return false");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-7"), "r-42", "the second offer must not overwrite the first: the SET must be NX");
-  ctx.Equal(offerTo(ctx, "r-43", "d-8"), true, "another driver is free and must get the offer");
+  ctx.Equal(hOfferTo(ctx, "r-43", "d-8"), true, "another driver is free and must get the offer");
   ctx.Clock.Advance(16);
-  ctx.Equal(offerTo(ctx, "r-44", "d-7"), true, "after the 15 s window the driver is free again");
+  ctx.Equal(hOfferTo(ctx, "r-44", "d-7"), true, "after the 15 s window the driver is free again");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-7"), "r-44", "offer:driver:d-7 after the new offer");
 }
 
 void CheckCompareAndDelete(harness::Ctx& ctx) {
-  standInDispatcher();
-  offerTo(ctx, "r-42", "d-7");
-  ctx.Equal(acceptOffer(ctx, "r-99", "d-7"), false, "accepting a ride that is not the one on offer must return false");
+  hStandInDispatcher();
+  hOfferTo(ctx, "r-42", "d-7");
+  ctx.Equal(hAcceptOffer(ctx, "r-99", "d-7"), false, "accepting a ride that is not the one on offer must return false");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-7"), "r-42", "a mismatched accept must leave the offer in place");
-  ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer must return true");
+  ctx.Equal(hAcceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer must return true");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-7"), nullptr, "a successful accept must release the offer key");
-  ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), false, "the offer is gone: a second accept must return false");
-  offerTo(ctx, "r-50", "d-8");
+  ctx.Equal(hAcceptOffer(ctx, "r-42", "d-7"), false, "the offer is gone: a second accept must return false");
+  hOfferTo(ctx, "r-50", "d-8");
   ctx.Clock.Advance(16);        // the offer expired unanswered ...
-  offerTo(ctx, "r-51", "d-8");  // ... and a newer ride landed under the key
-  ctx.Equal(acceptOffer(ctx, "r-50", "d-8"), false, "a stale accept after the offer expired must return false");
+  hOfferTo(ctx, "r-51", "d-8");  // ... and a newer ride landed under the key
+  ctx.Equal(hAcceptOffer(ctx, "r-50", "d-8"), false, "a stale accept after the offer expired must return false");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-8"), "r-51", "the stale accept must not delete the newer offer r-51: compare and delete must be one atomic step");
   // The race itself: a GET-then-DEL from the client lets the key change in between.
-  offerTo(ctx, "r-60", "d-9");
-  offerRace(ctx, "offer:driver:d-9", "r-61");
-  ctx.Equal(acceptOffer(ctx, "r-60", "d-9"), true, "accept of the ride on offer must succeed");
+  hOfferTo(ctx, "r-60", "d-9");
+  hOfferRace(ctx, "offer:driver:d-9", "r-61");
+  ctx.Equal(hAcceptOffer(ctx, "r-60", "d-9"), true, "accept of the ride on offer must succeed");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so the stale accept must not delete it: the compare and the delete must run atomically (a Lua script or WATCH/MULTI)");
 }
 
 void CheckAssignAfterAccept(harness::Ctx& ctx) {
-  standInDispatcher();
-  offerTo(ctx, "r-42", "d-7");
-  ctx.Equal(acceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer");
+  hStandInDispatcher();
+  hOfferTo(ctx, "r-42", "d-7");
+  ctx.Equal(hAcceptOffer(ctx, "r-42", "d-7"), true, "accepting the ride on offer");
   ctx.Equal(ctx.Redis.Get("ride:r-42:driver"), "d-7", "after a successful accept ride:r-42:driver");
-  offerTo(ctx, "r-50", "d-8");
-  ctx.Equal(acceptOffer(ctx, "r-51", "d-8"), false, "accepting a ride that is not on offer");
+  hOfferTo(ctx, "r-50", "d-8");
+  ctx.Equal(hAcceptOffer(ctx, "r-51", "d-8"), false, "accepting a ride that is not on offer");
   ctx.Equal(ctx.Redis.Get("ride:r-51:driver"), nullptr, "the guarded delete returned 0, so ride:r-51:driver must not be written: assign only after the release succeeded");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-8"), "r-50", "a failed accept must not touch the offer");
-  ctx.Equal(acceptOffer(ctx, "r-42", "d-9"), false, "d-9 holds no offer: accept must return false");
+  ctx.Equal(hAcceptOffer(ctx, "r-42", "d-9"), false, "d-9 holds no offer: accept must return false");
   ctx.Equal(ctx.Redis.Get("ride:r-42:driver"), "d-7", "a failed accept must not reassign the ride");
 }
 
 void CheckDeclineGuarded(harness::Ctx& ctx) {
-  const std::vector<std::string>& moved = standInDispatcher();
-  offerTo(ctx, "r-42", "d-7");
-  declineOffer(ctx, "r-42", "d-7");
+  const std::vector<std::string>& moved = hStandInDispatcher();
+  hOfferTo(ctx, "r-42", "d-7");
+  hDeclineOffer(ctx, "r-42", "d-7");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-7"), nullptr, "declining the ride on offer must release the key");
   ctx.Equal(moved, {"r-42"}, "decline must hand the ride to next_candidate: the rides it saw");
-  offerTo(ctx, "r-50", "d-8");
+  hOfferTo(ctx, "r-50", "d-8");
   ctx.Clock.Advance(16);
-  offerTo(ctx, "r-51", "d-8");
-  declineOffer(ctx, "r-50", "d-8");
+  hOfferTo(ctx, "r-51", "d-8");
+  hDeclineOffer(ctx, "r-50", "d-8");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-8"), "r-51", "a late decline of r-50 must not delete the newer offer r-51: the release must be the guarded delete, never a blind DEL");
   ctx.Equal(moved, {"r-42", "r-50"}, "a late decline still moves the ride on: the rides next_candidate saw");
-  offerTo(ctx, "r-60", "d-9");
-  offerRace(ctx, "offer:driver:d-9", "r-61");
-  declineOffer(ctx, "r-60", "d-9");
+  hOfferTo(ctx, "r-60", "d-9");
+  hOfferRace(ctx, "offer:driver:d-9", "r-61");
+  hDeclineOffer(ctx, "r-60", "d-9");
   ctx.Equal(ctx.Redis.Get("offer:driver:d-9"), "r-61", "the offer changed to r-61 between the GET and the DEL, so decline must not delete it: compare and delete atomically");
   ctx.Assert(!moved.empty(), "decline must call next_candidate with the declined ride; it was never called");
   ctx.Equal(moved.back(), "r-60", "decline must call next_candidate with the declined ride");

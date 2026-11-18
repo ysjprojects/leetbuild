@@ -736,19 +736,19 @@ import (
 	"notify/db"
 )
 
-var prefsRow = db.Prefs{Push: true, QuietStart: 22, QuietEnd: 7}
+var hPrefsRow = db.Prefs{Push: true, QuietStart: 22, QuietEnd: 7}
 
 // seedPrefs puts u42's row in the provided database the learner's code imported.
-func seedPrefs() { db.Rows["u42"] = prefsRow }
+func hSeedPrefs() { db.Rows["u42"] = hPrefsRow }
 
-func readPrefs(ctx *harness.Ctx, userID string) db.Prefs {
+func hReadPrefs(ctx *harness.Ctx, userID string) db.Prefs {
 	p, err := getPrefs(context.Background(), userID)
 	ctx.NoError(err, "getPrefs(%q) returned an error", userID)
 	return p
 }
 
 // prefsLoads are the users db.LoadPrefs was called for, in call order.
-func prefsLoads() []string {
+func hPrefsLoads() []string {
 	var users []string
 	for _, c := range db.Calls {
 		if c.Op == "load" {
@@ -758,7 +758,7 @@ func prefsLoads() []string {
 	return users
 }
 
-func cachedPrefs(ctx *harness.Ctx, key string) any {
+func hCachedPrefs(ctx *harness.Ctx, key string) any {
 	if v, ok := ctx.Redis.Get(key); ok {
 		return v
 	}
@@ -766,8 +766,8 @@ func cachedPrefs(ctx *harness.Ctx, key string) any {
 }
 
 func CheckKey(ctx *harness.Ctx) {
-	seedPrefs()
-	ctx.Equal(readPrefs(ctx, "u42"), prefsRow, "getPrefs must return the database row")
+	hSeedPrefs()
+	ctx.Equal(hReadPrefs(ctx, "u42"), hPrefsRow, "getPrefs must return the database row")
 	cached, ok := ctx.Redis.Get("prefs:u42")
 	ctx.Assert(ok, "the row must be cached under prefs:u42, keys are %v", ctx.Redis.Keys("*"))
 	var doc map[string]any
@@ -776,33 +776,33 @@ func CheckKey(ctx *harness.Ctx) {
 }
 
 func CheckReadFirst(ctx *harness.Ctx) {
-	seedPrefs()
-	stale := prefsRow
+	hSeedPrefs()
+	stale := hPrefsRow
 	stale.Push = false
 	encoded, _ := json.Marshal(stale)
 	ctx.Redis.Set("prefs:u42", string(encoded))
-	ctx.Equal(readPrefs(ctx, "u42"), stale, "a cached entry must be returned as is, without consulting the database")
-	ctx.Equal(prefsLoads(), []string(nil), "the cache held prefs:u42, yet db.LoadPrefs was called (calls %v): loads", db.Calls)
-	ctx.Equal(readPrefs(ctx, "u7"), db.DefaultPrefs, "a miss must load the row from the database")
-	ctx.Equal(prefsLoads(), []string{"u7"}, "expected one load for u7 (calls %v): loads", db.Calls)
-	readPrefs(ctx, "u7")
-	ctx.Equal(len(prefsLoads()), 1, "the second read of u7 must hit the cache, not the database: loads")
+	ctx.Equal(hReadPrefs(ctx, "u42"), stale, "a cached entry must be returned as is, without consulting the database")
+	ctx.Equal(hPrefsLoads(), []string(nil), "the cache held prefs:u42, yet db.LoadPrefs was called (calls %v): loads", db.Calls)
+	ctx.Equal(hReadPrefs(ctx, "u7"), db.DefaultPrefs, "a miss must load the row from the database")
+	ctx.Equal(hPrefsLoads(), []string{"u7"}, "expected one load for u7 (calls %v): loads", db.Calls)
+	hReadPrefs(ctx, "u7")
+	ctx.Equal(len(hPrefsLoads()), 1, "the second read of u7 must hit the cache, not the database: loads")
 }
 
 func CheckTtl(ctx *harness.Ctx) {
-	seedPrefs()
-	readPrefs(ctx, "u42")
+	hSeedPrefs()
+	hReadPrefs(ctx, "u42")
 	ttl := ctx.Redis.TTL("prefs:u42")
 	ctx.Assert(540 <= ttl && ttl <= 600, "prefs:u42 must expire after 600 s, TTL is %d", ttl)
 	ctx.Clock.Advance(601)
-	ctx.Equal(cachedPrefs(ctx, "prefs:u42"), nil, "the cached entry must be gone after 600 s")
-	readPrefs(ctx, "u42")
-	ctx.Equal(len(prefsLoads()), 2, "after the entry expired the next read must reload from the database: loads")
+	ctx.Equal(hCachedPrefs(ctx, "prefs:u42"), nil, "the cached entry must be gone after 600 s")
+	hReadPrefs(ctx, "u42")
+	ctx.Equal(len(hPrefsLoads()), 2, "after the entry expired the next read must reload from the database: loads")
 }
 
 func CheckInvalidate(ctx *harness.Ctx) {
-	seedPrefs()
-	readPrefs(ctx, "u42")
+	hSeedPrefs()
+	hReadPrefs(ctx, "u42")
 	ctx.Assert(ctx.Redis.Exists("prefs:u42") == 1, "warm the cache first")
 	var cacheAtSave []int64
 	savePrefs := db.SavePrefs
@@ -815,10 +815,10 @@ func CheckInvalidate(ctx *harness.Ctx) {
 	ctx.Assert(r.Status == 200 || r.Status == 204, "PUT answered %d, expected 204 (or 200)", r.Status)
 	ctx.Equal(db.Rows["u42"], next, "the database must hold the new preferences")
 	ctx.Equal(cacheAtSave, []int64{1}, "db.SavePrefs must run before the Del: the cache entry was already gone when the database was written")
-	ctx.Equal(ctx.Redis.Exists("prefs:u42"), 0, "PUT must delete prefs:u42, it holds %v (invalidate, never Set)", cachedPrefs(ctx, "prefs:u42"))
-	before := len(prefsLoads())
-	ctx.Equal(readPrefs(ctx, "u42"), next, "the next read must see the new preferences")
-	ctx.Equal(len(prefsLoads()), before+1, "the read after the PUT must reload from the database: loads")
+	ctx.Equal(ctx.Redis.Exists("prefs:u42"), 0, "PUT must delete prefs:u42, it holds %v (invalidate, never Set)", hCachedPrefs(ctx, "prefs:u42"))
+	before := len(hPrefsLoads())
+	ctx.Equal(hReadPrefs(ctx, "u42"), next, "the next read must see the new preferences")
+	ctx.Equal(len(hPrefsLoads()), before+1, "the read after the PUT must reload from the database: loads")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -828,13 +828,13 @@ func CheckInvalidate(ctx *harness.Ctx) {
 
 namespace {
 
-const Prefs prefsRow{true, 22, 7};
+const Prefs kHPrefsRow{true, 22, 7};
 
 // u42's row in the provided database.
-void seedPrefs() { db::rows["u42"] = prefsRow; }
+void hSeedPrefs() { db::rows["u42"] = kHPrefsRow; }
 
 // The users db::load_prefs was called for, in call order.
-std::vector<std::string> prefsLoads() {
+std::vector<std::string> hPrefsLoads() {
   std::vector<std::string> users;
   for (const auto& c : db::calls)
     if (c.op == "load") users.push_back(c.user_id);
@@ -842,7 +842,7 @@ std::vector<std::string> prefsLoads() {
 }
 
 // db::calls as "load u42" / "save u42 {…}".
-std::vector<std::string> prefsCalls() {
+std::vector<std::string> hPrefsCalls() {
   std::vector<std::string> out;
   for (const auto& c : db::calls) out.push_back(c.op + " " + c.user_id + (c.op == "save" ? " " + json(c.prefs).dump() : ""));
   return out;
@@ -851,8 +851,8 @@ std::vector<std::string> prefsCalls() {
 }  // namespace
 
 void CheckKey(harness::Ctx& ctx) {
-  seedPrefs();
-  ctx.Equal(get_prefs("u42"), prefsRow, "get_prefs must return the database row");
+  hSeedPrefs();
+  ctx.Equal(get_prefs("u42"), kHPrefsRow, "get_prefs must return the database row");
   const auto cached = ctx.Redis.Get("prefs:u42");
   ctx.Assert(cached.has_value(), "the row must be cached under prefs:u42, keys are %v", ctx.Redis.Keys("*"));
   const auto doc = harness::ParseJSON(*cached);
@@ -864,32 +864,32 @@ void CheckKey(harness::Ctx& ctx) {
 }
 
 void CheckReadFirst(harness::Ctx& ctx) {
-  seedPrefs();
-  Prefs stale = prefsRow;
+  hSeedPrefs();
+  Prefs stale = kHPrefsRow;
   stale.push = false;
   ctx.Redis.Set("prefs:u42", json(stale).dump());
   ctx.Equal(get_prefs("u42"), stale, "a cached entry must be returned as is, without consulting the database");
-  ctx.Equal(prefsLoads(), std::vector<std::string>{},
-            "the cache held prefs:u42, yet db::load_prefs was called (calls %v): loads", prefsCalls());
+  ctx.Equal(hPrefsLoads(), std::vector<std::string>{},
+            "the cache held prefs:u42, yet db::load_prefs was called (calls %v): loads", hPrefsCalls());
   ctx.Equal(get_prefs("u7"), db::default_prefs, "a miss must load the row from the database");
-  ctx.Equal(prefsLoads(), {"u7"}, "expected one load for u7 (calls %v): loads", prefsCalls());
+  ctx.Equal(hPrefsLoads(), {"u7"}, "expected one load for u7 (calls %v): loads", hPrefsCalls());
   get_prefs("u7");
-  ctx.Equal(prefsLoads().size(), 1, "the second read of u7 must hit the cache, not the database: loads");
+  ctx.Equal(hPrefsLoads().size(), 1, "the second read of u7 must hit the cache, not the database: loads");
 }
 
 void CheckTtl(harness::Ctx& ctx) {
-  seedPrefs();
+  hSeedPrefs();
   get_prefs("u42");
   const long long ttl = ctx.Redis.TTL("prefs:u42");
   ctx.Assert(540 <= ttl && ttl <= 600, "prefs:u42 must expire after 600 s, TTL is %d", ttl);
   ctx.Clock.Advance(601);
   ctx.Equal(ctx.Redis.Get("prefs:u42"), nullptr, "the cached entry must be gone after 600 s");
   get_prefs("u42");
-  ctx.Equal(prefsLoads().size(), 2, "after the entry expired the next read must reload from the database: loads");
+  ctx.Equal(hPrefsLoads().size(), 2, "after the entry expired the next read must reload from the database: loads");
 }
 
 void CheckInvalidate(harness::Ctx& ctx) {
-  seedPrefs();
+  hSeedPrefs();
   get_prefs("u42");
   ctx.Assert(ctx.Redis.Exists("prefs:u42") == 1, "warm the cache first");
   std::vector<long long> cacheAtSave;
@@ -907,9 +907,9 @@ void CheckInvalidate(harness::Ctx& ctx) {
             "db::save_prefs must run before the del: the cache entry was already gone when the database was written");
   ctx.Equal(ctx.Redis.Exists("prefs:u42"), 0, "PUT must delete prefs:u42, it holds %v (invalidate, never set)",
             ctx.Redis.Get("prefs:u42"));
-  const size_t before = prefsLoads().size();
+  const size_t before = hPrefsLoads().size();
   ctx.Equal(get_prefs("u42"), next, "the next read must see the new preferences");
-  ctx.Equal(prefsLoads().size(), before + 1, "the read after the PUT must reload from the database: loads");
+  ctx.Equal(hPrefsLoads().size(), before + 1, "the read after the PUT must reload from the database: loads");
 }
 `,
   },

@@ -905,13 +905,13 @@ import (
 )
 
 // pushPeer is the push gateway: it answers every token but "stale" (NOT_FOUND) and counts the calls that reached it.
-type pushPeer struct {
+type HPushPeer struct {
 	pb.UnimplementedPushGatewayServer
 	mu    sync.Mutex
 	calls int
 }
 
-func (p *pushPeer) Send(ctx context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
+func (p *HPushPeer) Send(ctx context.Context, req *pb.SendRequest) (*pb.SendReply, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.calls++
@@ -921,30 +921,30 @@ func (p *pushPeer) Send(ctx context.Context, req *pb.SendRequest) (*pb.SendReply
 	return &pb.SendReply{MessageId: fmt.Sprintf("m-%s-%d", req.GetDeviceToken(), p.calls)}, nil
 }
 
-func servePushPeer(ctx *harness.Ctx) *pushPeer {
-	p := &pushPeer{}
+func hServePushPeer(ctx *harness.Ctx) *HPushPeer {
+	p := &HPushPeer{}
 	pb.RegisterPushGatewayServer(ctx.GRPC.Server(""), p)
 	return p
 }
 
-func pushSend(token string) (string, error) {
+func hPushSend(token string) (string, error) {
 	return sendPush(context.Background(), token, "Shipped", "On its way", "order-1")
 }
 
 // pushWait is one sendPush that first met injected failures: its result, the virtual seconds it took and the sleeps it took.
-type pushWait struct {
+type HPushWait struct {
 	result  string
 	seconds float64
 	sleeps  int
 }
 
-func pushWaited(ctx *harness.Ctx, code codes.Code, times int) pushWait {
+func hPushWaited(ctx *harness.Ctx, code codes.Code, times int) HPushWait {
 	ctx.GRPC.Fail("Send", code, "", times, "")
 	started := ctx.Clock.Now()
 	sleeps := ctx.Clock.Sleeps()
-	result, err := pushSend("tok-1")
+	result, err := hPushSend("tok-1")
 	ctx.NoError(err, "sendPush after %d %v returned an error", times, code)
-	return pushWait{
+	return HPushWait{
 		result:  result,
 		seconds: math.Round(float64(ctx.Clock.Now()-started)/1000*1e6) / 1e6,
 		sleeps:  ctx.Clock.Sleeps() - sleeps,
@@ -952,12 +952,12 @@ func pushWaited(ctx *harness.Ctx, code codes.Code, times int) pushWait {
 }
 
 func CheckDeadline(ctx *harness.Ctx) {
-	servePushPeer(ctx)
-	id, err := pushSend("tok-1")
+	hServePushPeer(ctx)
+	id, err := hPushSend("tok-1")
 	ctx.NoError(err, "sendPush returned an error")
 	ctx.Equal(id, "m-tok-1-1", "sendPush must return the gateway's message_id")
 	ctx.GRPC.Fail("Send", codes.Unavailable, "", 1, "")
-	id, err = pushSend("tok-1")
+	id, err = hPushSend("tok-1")
 	ctx.NoError(err, "one UNAVAILABLE must be retried and succeed")
 	ctx.Equal(id, "m-tok-1-2", "one UNAVAILABLE must be retried and succeed")
 	calls := ctx.GRPC.CallsTo("Send", "")
@@ -977,26 +977,26 @@ func CheckDeadline(ctx *harness.Ctx) {
 }
 
 func CheckBackoff(ctx *harness.Ctx) {
-	servePushPeer(ctx)
-	one := pushWaited(ctx, codes.Unavailable, 1)
+	hServePushPeer(ctx)
+	one := hPushWaited(ctx, codes.Unavailable, 1)
 	ctx.Equal(one.result, "m-tok-1-1", "one UNAVAILABLE must be retried and succeed")
 	ctx.Equal(one.sleeps, 1, "expected one backoff sleep between the two attempts: sleeps")
 	ctx.Assert(0.2 <= one.seconds && one.seconds <= 0.45, "the first backoff must be about 200 ms plus jitter, it was %v s", one.seconds)
-	two := pushWaited(ctx, codes.ResourceExhausted, 2)
+	two := hPushWaited(ctx, codes.ResourceExhausted, 2)
 	ctx.Equal(two.result, "m-tok-1-2", "two RESOURCE_EXHAUSTED must be retried and the third attempt succeed")
 	ctx.Equal(two.sleeps, 2, "expected two backoff sleeps before the third attempt: sleeps")
 	ctx.Assert(0.6 <= two.seconds && two.seconds <= 1.05, "the two backoffs must be about 200 + 400 ms plus jitter, together they were %v s", two.seconds)
 	seen := map[float64]bool{one.seconds: true}
 	for range 6 {
-		seen[pushWaited(ctx, codes.Unavailable, 1).seconds] = true
+		seen[hPushWaited(ctx, codes.Unavailable, 1).seconds] = true
 	}
 	ctx.Assert(len(seen) > 1, "every first backoff lasted exactly %v s: add jitter so retries do not synchronise", one.seconds)
 }
 
 func CheckBounded(ctx *harness.Ctx) {
-	peer := servePushPeer(ctx)
+	peer := hServePushPeer(ctx)
 	ctx.GRPC.Fail("Send", codes.Unavailable, "", 50, "")
-	_, err := pushSend("tok-1")
+	_, err := hPushSend("tok-1")
 	ctx.Assert(err != nil, "a gateway that stays UNAVAILABLE must return an error wrapping ErrRetryable, sendPush returned nil")
 	ctx.ErrorIs(err, ErrRetryable, "a gateway that stays UNAVAILABLE must return an error wrapping ErrRetryable")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Send", "")), 3, "attempts against a down gateway")
@@ -1004,14 +1004,14 @@ func CheckBounded(ctx *harness.Ctx) {
 }
 
 func CheckStaleToken(ctx *harness.Ctx) {
-	servePushPeer(ctx)
-	id, err := pushSend("stale")
+	hServePushPeer(ctx)
+	id, err := hPushSend("stale")
 	ctx.NoError(err, "NOT_FOUND means the token is unregistered: sendPush must return a nil error")
 	ctx.Equal(id, "", "NOT_FOUND means the token is unregistered: the message id")
 	ctx.Equal(devices.Disabled, []string{"stale"}, "the stale token must be disabled: devices.Disabled")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Send", "")), 1, "NOT_FOUND must not be retried: calls to Send")
 	ctx.GRPC.Fail("Send", codes.InvalidArgument, "malformed token", 1, "")
-	id, err = pushSend("bad")
+	id, err = hPushSend("bad")
 	ctx.NoError(err, "INVALID_ARGUMENT means the token is bad: sendPush must return a nil error")
 	ctx.Equal(id, "", "INVALID_ARGUMENT means the token is bad: the message id")
 	ctx.Equal(devices.Disabled, []string{"stale", "bad"}, "the bad token must be disabled: devices.Disabled")
@@ -1020,19 +1020,19 @@ func CheckStaleToken(ctx *harness.Ctx) {
 }
 
 func CheckRetryable(ctx *harness.Ctx) {
-	servePushPeer(ctx)
+	hServePushPeer(ctx)
 	ctx.GRPC.SetLatency("Send", 5.0, "")
-	_, slow := pushSend("tok-1")
+	_, slow := hPushSend("tok-1")
 	ctx.Assert(slow != nil, "a gateway slower than the deadline must return an error wrapping ErrRetryable, sendPush returned nil")
 	ctx.ErrorIs(slow, ErrRetryable, "a gateway slower than the deadline must return an error wrapping ErrRetryable")
 	ctx.Equal(len(ctx.GRPC.CallsTo("Send", "")), 1, "DEADLINE_EXCEEDED must not be retried (the consumer re-queues the record instead): calls to Send")
 	ctx.GRPC.SetLatency("Send", 0.0, "")
 	ctx.GRPC.Fail("Send", codes.ResourceExhausted, "", 3, "")
-	_, exhausted := pushSend("tok-1")
+	_, exhausted := hPushSend("tok-1")
 	ctx.Assert(exhausted != nil, "exhausted retries must return an error wrapping ErrRetryable, sendPush returned nil")
 	ctx.ErrorIs(exhausted, ErrRetryable, "exhausted retries must return an error wrapping ErrRetryable")
 	ctx.GRPC.Fail("Send", codes.PermissionDenied, "bad credentials", 1, "")
-	_, denied := pushSend("tok-1")
+	_, denied := hPushSend("tok-1")
 	ctx.Assert(denied != nil, "PERMISSION_DENIED must propagate as an error, sendPush returned nil")
 	ctx.Assert(!errors.Is(denied, ErrRetryable), "PERMISSION_DENIED is not transient: it must propagate as a plain error, not ErrRetryable")
 	ctx.Equal(status.Code(denied), codes.PermissionDenied, "PERMISSION_DENIED must propagate with its status code (%v)", denied)
@@ -1053,7 +1053,7 @@ func CheckRetryable(ctx *harness.Ctx) {
 namespace {
 
 // The push gateway: it answers every token but "stale" (NOT_FOUND) and counts the calls that reached it.
-class PushPeer final : public notify::PushGateway::Service {
+class HPushPeer final : public notify::PushGateway::Service {
  public:
   grpc::Status Send(grpc::ServerContext*, const notify::SendRequest* req, notify::SendReply* reply) override {
     std::lock_guard<std::mutex> lock(mu);
@@ -1066,21 +1066,21 @@ class PushPeer final : public notify::PushGateway::Service {
   int calls = 0;
 };
 
-PushPeer& servePushPeer(harness::Ctx& ctx) {
-  static PushPeer peer;
+HPushPeer& hServePushPeer(harness::Ctx& ctx) {
+  static HPushPeer peer;
   ctx.GRPC.Server("")->RegisterService(&peer);
   return peer;
 }
 
 // How send_push ended: its result, or what it threw (retryable: a Retryable).
-struct PushResult {
+struct HPushResult {
   std::optional<std::string> id;
   std::string error;
   bool retryable = false;
   bool failed() const { return !error.empty(); }
 };
 
-PushResult pushSend(const std::string& token) {
+HPushResult hPushSend(const std::string& token) {
   try {
     return {send_push(token, "Shipped", "On its way", "order-1"), "", false};
   } catch (const Retryable& e) {
@@ -1091,17 +1091,17 @@ PushResult pushSend(const std::string& token) {
 }
 
 // One send_push that first met injected failures: its result, the virtual seconds it took and the sleeps it took.
-struct PushWait {
+struct HPushWait {
   std::optional<std::string> result;
   double seconds = 0;
   int sleeps = 0;
 };
 
-PushWait pushWaited(harness::Ctx& ctx, grpc::StatusCode code, int times) {
+HPushWait hPushWaited(harness::Ctx& ctx, grpc::StatusCode code, int times) {
   ctx.GRPC.Fail("Send", code, "", times, "");
   const int64_t started = ctx.Clock.Now();
   const int sleeps = ctx.Clock.Sleeps();
-  const PushResult r = pushSend("tok-1");
+  const HPushResult r = hPushSend("tok-1");
   ctx.Assert(!r.failed(), "send_push after %d %v threw %s", times, code, r.error);
   return {r.id, std::round(static_cast<double>(ctx.Clock.Now() - started) / 1000 * 1e6) / 1e6, ctx.Clock.Sleeps() - sleeps};
 }
@@ -1109,12 +1109,12 @@ PushWait pushWaited(harness::Ctx& ctx, grpc::StatusCode code, int times) {
 }  // namespace
 
 void CheckDeadline(harness::Ctx& ctx) {
-  servePushPeer(ctx);
-  PushResult r = pushSend("tok-1");
+  hServePushPeer(ctx);
+  HPushResult r = hPushSend("tok-1");
   ctx.Assert(!r.failed(), "send_push threw %s", r.error);
   ctx.Equal(r.id, "m-tok-1-1", "send_push must return the gateway's message_id");
   ctx.GRPC.Fail("Send", grpc::StatusCode::UNAVAILABLE, "", 1, "");
-  r = pushSend("tok-1");
+  r = hPushSend("tok-1");
   ctx.Assert(!r.failed(), "one UNAVAILABLE must be retried and succeed, send_push threw %s", r.error);
   ctx.Equal(r.id, "m-tok-1-2", "one UNAVAILABLE must be retried and succeed");
   const auto calls = ctx.GRPC.CallsTo("Send", "");
@@ -1131,26 +1131,26 @@ void CheckDeadline(harness::Ctx& ctx) {
 }
 
 void CheckBackoff(harness::Ctx& ctx) {
-  servePushPeer(ctx);
-  const PushWait one = pushWaited(ctx, grpc::StatusCode::UNAVAILABLE, 1);
+  hServePushPeer(ctx);
+  const HPushWait one = hPushWaited(ctx, grpc::StatusCode::UNAVAILABLE, 1);
   ctx.Equal(one.result, "m-tok-1-1", "one UNAVAILABLE must be retried and succeed");
   ctx.Equal(one.sleeps, 1, "expected one backoff sleep between the two attempts: sleeps");
   ctx.Assert(0.2 <= one.seconds && one.seconds <= 0.45, "the first backoff must be about 200 ms plus jitter, it was %v s",
              one.seconds);
-  const PushWait two = pushWaited(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED, 2);
+  const HPushWait two = hPushWaited(ctx, grpc::StatusCode::RESOURCE_EXHAUSTED, 2);
   ctx.Equal(two.result, "m-tok-1-2", "two RESOURCE_EXHAUSTED must be retried and the third attempt succeed");
   ctx.Equal(two.sleeps, 2, "expected two backoff sleeps before the third attempt: sleeps");
   ctx.Assert(0.6 <= two.seconds && two.seconds <= 1.05,
              "the two backoffs must be about 200 + 400 ms plus jitter, together they were %v s", two.seconds);
   std::set<double> seen = {one.seconds};
-  for (int i = 0; i < 6; i++) seen.insert(pushWaited(ctx, grpc::StatusCode::UNAVAILABLE, 1).seconds);
+  for (int i = 0; i < 6; i++) seen.insert(hPushWaited(ctx, grpc::StatusCode::UNAVAILABLE, 1).seconds);
   ctx.Assert(seen.size() > 1, "every first backoff lasted exactly %v s: add jitter so retries do not synchronise", one.seconds);
 }
 
 void CheckBounded(harness::Ctx& ctx) {
-  PushPeer& peer = servePushPeer(ctx);
+  HPushPeer& peer = hServePushPeer(ctx);
   ctx.GRPC.Fail("Send", grpc::StatusCode::UNAVAILABLE, "", 50, "");
-  const PushResult r = pushSend("tok-1");
+  const HPushResult r = hPushSend("tok-1");
   ctx.Assert(r.failed(), "a gateway that stays UNAVAILABLE must throw Retryable, send_push returned normally");
   ctx.Assert(r.retryable, "a gateway that stays UNAVAILABLE must throw Retryable, send_push threw %s", r.error);
   ctx.Equal(ctx.GRPC.CallsTo("Send", "").size(), 3, "attempts against a down gateway");
@@ -1158,14 +1158,14 @@ void CheckBounded(harness::Ctx& ctx) {
 }
 
 void CheckStaleToken(harness::Ctx& ctx) {
-  servePushPeer(ctx);
-  PushResult r = pushSend("stale");
+  hServePushPeer(ctx);
+  HPushResult r = hPushSend("stale");
   ctx.Assert(!r.failed(), "NOT_FOUND means the token is unregistered: send_push must not throw, it threw %s", r.error);
   ctx.Equal(r.id, nullptr, "NOT_FOUND means the token is unregistered: the message id");
   ctx.Equal(devices::disabled, {"stale"}, "the stale token must be disabled: devices::disabled");
   ctx.Equal(ctx.GRPC.CallsTo("Send", "").size(), 1, "NOT_FOUND must not be retried: calls to Send");
   ctx.GRPC.Fail("Send", grpc::StatusCode::INVALID_ARGUMENT, "malformed token", 1, "");
-  r = pushSend("bad");
+  r = hPushSend("bad");
   ctx.Assert(!r.failed(), "INVALID_ARGUMENT means the token is bad: send_push must not throw, it threw %s", r.error);
   ctx.Equal(r.id, nullptr, "INVALID_ARGUMENT means the token is bad: the message id");
   ctx.Equal(devices::disabled, {"stale", "bad"}, "the bad token must be disabled: devices::disabled");
@@ -1174,20 +1174,20 @@ void CheckStaleToken(harness::Ctx& ctx) {
 }
 
 void CheckRetryable(harness::Ctx& ctx) {
-  servePushPeer(ctx);
+  hServePushPeer(ctx);
   ctx.GRPC.SetLatency("Send", 5.0, "");
-  const PushResult slow = pushSend("tok-1");
+  const HPushResult slow = hPushSend("tok-1");
   ctx.Assert(slow.failed(), "a gateway slower than the deadline must throw Retryable, send_push returned normally");
   ctx.Assert(slow.retryable, "a gateway slower than the deadline must throw Retryable, send_push threw %s", slow.error);
   ctx.Equal(ctx.GRPC.CallsTo("Send", "").size(), 1,
             "DEADLINE_EXCEEDED must not be retried (the consumer re-queues the record instead): calls to Send");
   ctx.GRPC.SetLatency("Send", 0.0, "");
   ctx.GRPC.Fail("Send", grpc::StatusCode::RESOURCE_EXHAUSTED, "", 3, "");
-  const PushResult exhausted = pushSend("tok-1");
+  const HPushResult exhausted = hPushSend("tok-1");
   ctx.Assert(exhausted.failed(), "exhausted retries must throw Retryable, send_push returned normally");
   ctx.Assert(exhausted.retryable, "exhausted retries must throw Retryable, send_push threw %s", exhausted.error);
   ctx.GRPC.Fail("Send", grpc::StatusCode::PERMISSION_DENIED, "bad credentials", 1, "");
-  const PushResult denied = pushSend("tok-1");
+  const HPushResult denied = hPushSend("tok-1");
   ctx.Assert(denied.failed(), "PERMISSION_DENIED must propagate as an exception, send_push returned normally");
   // Go also reads the status code off the error; the C++ step throws a plain std::runtime_error
   // carrying the status message, so the check reads the message.

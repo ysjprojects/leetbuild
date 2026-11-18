@@ -876,15 +876,15 @@ import (
 	"leetbuild/harness"
 )
 
-var gatewayHeaders = []string{"X-Api-Key", "k-1f9c", "Idempotency-Key", "idem-1"}
+var hGatewayHeaders = []string{"X-Api-Key", "k-1f9c", "Idempotency-Key", "idem-1"}
 
-func gatewayOrder() map[string]any {
+func hGatewayOrder() map[string]any {
 	return map[string]any{"symbol": "ACME", "side": "BUY", "price": 10.05, "qty": 100, "client_order_id": "c-1"}
 }
 
 // gatewayUnderTest runs the learner's server with publishOrder replaced by a recorder (the real one is
 // built in step 2); fail makes it return the error Kafka's missing acknowledgement would.
-func gatewayUnderTest(ctx *harness.Ctx, fail bool) (*harness.HTTP, *[]Order) {
+func hGatewayUnderTest(ctx *harness.Ctx, fail bool) (*harness.HTTP, *[]Order) {
 	published := &[]Order{}
 	publishOrder = func(_ context.Context, order Order) error {
 		if fail {
@@ -897,36 +897,36 @@ func gatewayUnderTest(ctx *harness.Ctx, fail bool) (*harness.HTTP, *[]Order) {
 }
 
 func CheckAuth(ctx *harness.Ctx) {
-	c, published := gatewayUnderTest(ctx, false)
-	r := c.Post("/orders", gatewayOrder(), "Idempotency-Key", "idem-1")
+	c, published := hGatewayUnderTest(ctx, false)
+	r := c.Post("/orders", hGatewayOrder(), "Idempotency-Key", "idem-1")
 	ctx.Equal(r.Status, 401, "no X-Api-Key")
-	r = c.Post("/orders", gatewayOrder(), "X-Api-Key", "nope", "Idempotency-Key", "idem-1")
+	r = c.Post("/orders", hGatewayOrder(), "X-Api-Key", "nope", "Idempotency-Key", "idem-1")
 	ctx.Equal(r.Status, 401, "an unknown X-Api-Key")
 	r = c.Post("/orders", "not json", "Content-Type", "application/json")
 	ctx.Equal(r.Status, 401, "a request without a key and with a broken body: the key must be checked before the body is read")
 	ctx.Equal(len(*published), 0, "rejected requests must not reach publishOrder; calls")
-	r = c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	r = c.Post("/orders", hGatewayOrder(), hGatewayHeaders...)
 	ctx.Assert(r.Status != 401, "a known X-Api-Key must be accepted, got 401")
 }
 
 func CheckIdempotencyKey(ctx *harness.Ctx) {
-	c, published := gatewayUnderTest(ctx, false)
-	r := c.Post("/orders", gatewayOrder(), "X-Api-Key", "k-1f9c")
+	c, published := hGatewayUnderTest(ctx, false)
+	r := c.Post("/orders", hGatewayOrder(), "X-Api-Key", "k-1f9c")
 	ctx.Equal(r.Status, 400, "a request without Idempotency-Key")
 	ctx.Equal(len(*published), 0, "a request without Idempotency-Key must not be published; calls")
-	r = c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	r = c.Post("/orders", hGatewayOrder(), hGatewayHeaders...)
 	ctx.Assert(r.Status != 400, "a request with Idempotency-Key and a valid body answered 400")
 }
 
 func CheckValidate(ctx *harness.Ctx) {
-	c, published := gatewayUnderTest(ctx, false)
+	c, published := hGatewayUnderTest(ctx, false)
 	with := func(key string, value any) map[string]any {
-		body := gatewayOrder()
+		body := hGatewayOrder()
 		body[key] = value
 		return body
 	}
 	without := func(key string) map[string]any {
-		body := gatewayOrder()
+		body := hGatewayOrder()
 		delete(body, key)
 		return body
 	}
@@ -942,18 +942,18 @@ func CheckValidate(ctx *harness.Ctx) {
 		{"missing client_order_id", without("client_order_id")},
 	}
 	for _, b := range bad {
-		r := c.Post("/orders", b.body, gatewayHeaders...)
+		r := c.Post("/orders", b.body, hGatewayHeaders...)
 		ctx.Equal(r.Status, 400, "an order with a bad %s", b.label)
 	}
 	ctx.Equal(len(*published), 0, "invalid orders must never reach publishOrder; calls")
-	r := c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	r := c.Post("/orders", hGatewayOrder(), hGatewayHeaders...)
 	ctx.Assert(r.Status != 400, "a valid order (side BUY, price 10.05, qty 100) was rejected with 400")
 	ctx.Equal(len(*published), 1, "the valid order must reach publishOrder; calls")
 }
 
 func CheckAccepted(ctx *harness.Ctx) {
-	c, published := gatewayUnderTest(ctx, false)
-	r := c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	c, published := hGatewayUnderTest(ctx, false)
+	r := c.Post("/orders", hGatewayOrder(), hGatewayHeaders...)
 	ctx.Equal(r.Status, 202, "a valid order")
 	var body map[string]any
 	r.Decode(&body)
@@ -963,13 +963,13 @@ func CheckAccepted(ctx *harness.Ctx) {
 	ctx.Equal([]any{order.Symbol, order.Side, order.Price, order.Qty, order.ClientOrderID}, []any{"ACME", "BUY", 10.05, int64(100), "c-1"}, "the published Order does not carry the request's fields")
 	ctx.Assert(order.OrderID != "" && body["order_id"] == order.OrderID, "the 202 must return the published OrderID %q, got %v", order.OrderID, body["order_id"])
 	var second map[string]any
-	c.Post("/orders", gatewayOrder(), gatewayHeaders...).Decode(&second)
+	c.Post("/orders", hGatewayOrder(), hGatewayHeaders...).Decode(&second)
 	ctx.Assert(second["order_id"] != body["order_id"], "every order needs a fresh OrderID")
 }
 
 func CheckUnavailable(ctx *harness.Ctx) {
-	c, _ := gatewayUnderTest(ctx, true)
-	r := c.Post("/orders", gatewayOrder(), gatewayHeaders...)
+	c, _ := hGatewayUnderTest(ctx, true)
+	r := c.Post("/orders", hGatewayOrder(), hGatewayHeaders...)
 	ctx.Equal(r.Status, 503, "publishOrder returned an error")
 }
 `,
@@ -983,68 +983,68 @@ func CheckUnavailable(ctx *harness.Ctx) {
 
 namespace {
 
-nlohmann::json gatewayOrder() {
+nlohmann::json hGatewayOrder() {
   return {{"symbol", "ACME"}, {"side", "BUY"}, {"price", 10.05}, {"qty", 100}, {"client_order_id", "c-1"}};
 }
 
 // What publish_order's stand-in below (the real one is built in step 2) recorded, and whether it
 // throws the PublishFailed Kafka's missing acknowledgement would.
-std::vector<Order> gatewayPublished;
-bool gatewayFail = false;
+std::vector<Order> hGatewayPublished;
+bool hGatewayFail = false;
 
 // gatewayUnderTest runs the learner's server with publish_order replaced by the recorder.
-harness::HTTP gatewayUnderTest(harness::Ctx& ctx, bool fail) {
-  gatewayPublished.clear();
-  gatewayFail = fail;
+harness::HTTP hGatewayUnderTest(harness::Ctx& ctx, bool fail) {
+  hGatewayPublished.clear();
+  hGatewayFail = fail;
   return ctx.Main().HTTP();
 }
 
 // The Go harness's c.Post("/orders", body, gatewayHeaders...): the body as JSON, with both keys.
-harness::Response postOrder(harness::HTTP& c, const nlohmann::json& body) {
+harness::Response hPostOrder(harness::HTTP& c, const nlohmann::json& body) {
   return c.Post("/orders", body.dump(), "Content-Type", "application/json", "X-Api-Key", "k-1f9c", "Idempotency-Key", "idem-1");
 }
 
 // The response body decoded the way encoding/json decodes into map[string]any (nil when not JSON).
-harness::Any decode(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
+harness::Any hDecode(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
 
 }  // namespace
 
 void publish_order(const Order& order) {
-  if (gatewayFail) throw PublishFailed("broker did not acknowledge");
-  gatewayPublished.push_back(order);
+  if (hGatewayFail) throw PublishFailed("broker did not acknowledge");
+  hGatewayPublished.push_back(order);
 }
 
 void CheckAuth(harness::Ctx& ctx) {
-  auto c = gatewayUnderTest(ctx, false);
-  auto r = c.Post("/orders", gatewayOrder().dump(), "Content-Type", "application/json", "Idempotency-Key", "idem-1");
+  auto c = hGatewayUnderTest(ctx, false);
+  auto r = c.Post("/orders", hGatewayOrder().dump(), "Content-Type", "application/json", "Idempotency-Key", "idem-1");
   ctx.Equal(r.Status, 401, "no X-Api-Key");
-  r = c.Post("/orders", gatewayOrder().dump(), "Content-Type", "application/json", "X-Api-Key", "nope", "Idempotency-Key", "idem-1");
+  r = c.Post("/orders", hGatewayOrder().dump(), "Content-Type", "application/json", "X-Api-Key", "nope", "Idempotency-Key", "idem-1");
   ctx.Equal(r.Status, 401, "an unknown X-Api-Key");
   r = c.Post("/orders", "not json", "Content-Type", "application/json");
   ctx.Equal(r.Status, 401, "a request without a key and with a broken body: the key must be checked before the body is read");
-  ctx.Equal(gatewayPublished.size(), 0, "rejected requests must not reach publish_order; calls");
-  r = postOrder(c, gatewayOrder());
+  ctx.Equal(hGatewayPublished.size(), 0, "rejected requests must not reach publish_order; calls");
+  r = hPostOrder(c, hGatewayOrder());
   ctx.Assert(r.Status != 401, "a known X-Api-Key must be accepted, got 401");
 }
 
 void CheckIdempotencyKey(harness::Ctx& ctx) {
-  auto c = gatewayUnderTest(ctx, false);
-  auto r = c.Post("/orders", gatewayOrder().dump(), "Content-Type", "application/json", "X-Api-Key", "k-1f9c");
+  auto c = hGatewayUnderTest(ctx, false);
+  auto r = c.Post("/orders", hGatewayOrder().dump(), "Content-Type", "application/json", "X-Api-Key", "k-1f9c");
   ctx.Equal(r.Status, 400, "a request without Idempotency-Key");
-  ctx.Equal(gatewayPublished.size(), 0, "a request without Idempotency-Key must not be published; calls");
-  r = postOrder(c, gatewayOrder());
+  ctx.Equal(hGatewayPublished.size(), 0, "a request without Idempotency-Key must not be published; calls");
+  r = hPostOrder(c, hGatewayOrder());
   ctx.Assert(r.Status != 400, "a request with Idempotency-Key and a valid body answered 400");
 }
 
 void CheckValidate(harness::Ctx& ctx) {
-  auto c = gatewayUnderTest(ctx, false);
+  auto c = hGatewayUnderTest(ctx, false);
   const auto with = [](const std::string& key, const nlohmann::json& value) {
-    auto body = gatewayOrder();
+    auto body = hGatewayOrder();
     body[key] = value;
     return body;
   };
   const auto without = [](const std::string& key) {
-    auto body = gatewayOrder();
+    auto body = hGatewayOrder();
     body.erase(key);
     return body;
   };
@@ -1057,34 +1057,34 @@ void CheckValidate(harness::Ctx& ctx) {
       {"missing client_order_id", without("client_order_id")},
   };
   for (const auto& [label, body] : bad) {
-    const auto r = postOrder(c, body);
+    const auto r = hPostOrder(c, body);
     ctx.Equal(r.Status, 400, "an order with a bad %s", label);
   }
-  ctx.Equal(gatewayPublished.size(), 0, "invalid orders must never reach publish_order; calls");
-  const auto r = postOrder(c, gatewayOrder());
+  ctx.Equal(hGatewayPublished.size(), 0, "invalid orders must never reach publish_order; calls");
+  const auto r = hPostOrder(c, hGatewayOrder());
   ctx.Assert(r.Status != 400, "a valid order (side BUY, price 10.05, qty 100) was rejected with 400");
-  ctx.Equal(gatewayPublished.size(), 1, "the valid order must reach publish_order; calls");
+  ctx.Equal(hGatewayPublished.size(), 1, "the valid order must reach publish_order; calls");
 }
 
 void CheckAccepted(harness::Ctx& ctx) {
-  auto c = gatewayUnderTest(ctx, false);
-  const auto r = postOrder(c, gatewayOrder());
+  auto c = hGatewayUnderTest(ctx, false);
+  const auto r = hPostOrder(c, hGatewayOrder());
   ctx.Equal(r.Status, 202, "a valid order");
-  const harness::Any body = decode(r);
+  const harness::Any body = hDecode(r);
   ctx.Equal(body["status"], "accepted", "the 202 body must say status accepted, body %v; status", body);
-  ctx.Equal(gatewayPublished.size(), 1, "publish_order must be called exactly once; calls");
-  const Order order = gatewayPublished[0];
+  ctx.Equal(hGatewayPublished.size(), 1, "publish_order must be called exactly once; calls");
+  const Order order = hGatewayPublished[0];
   ctx.Equal(std::make_tuple(order.symbol, order.side, order.price, order.qty, order.client_order_id),
             std::make_tuple("ACME", "BUY", 10.05, 100, "c-1"), "the published Order does not carry the request's fields");
   ctx.Assert(!order.order_id.empty() && body["order_id"] == order.order_id,
              "the 202 must return the published order_id %q, got %v", order.order_id, body["order_id"]);
-  const harness::Any second = decode(postOrder(c, gatewayOrder()));
+  const harness::Any second = hDecode(hPostOrder(c, hGatewayOrder()));
   ctx.Assert(!(second["order_id"] == body["order_id"]), "every order needs a fresh order_id");
 }
 
 void CheckUnavailable(harness::Ctx& ctx) {
-  auto c = gatewayUnderTest(ctx, true);
-  const auto r = postOrder(c, gatewayOrder());
+  auto c = hGatewayUnderTest(ctx, true);
+  const auto r = hPostOrder(c, hGatewayOrder());
   ctx.Equal(r.Status, 503, "publish_order threw PublishFailed");
 }
 `,

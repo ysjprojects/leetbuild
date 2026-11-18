@@ -1212,46 +1212,46 @@ import (
 )
 
 const (
-	kbPayQ   = "Payout missing after five business days — bank details on file?"
-	kbLoginQ = "Forgot Password reset email, two-factor code, account locked"
+	kHKbPayQ   = "Payout missing after five business days — bank details on file?"
+	kHKbLoginQ = "Forgot Password reset email, two-factor code, account locked"
 )
 
 // kbRow is one chunk the knowledge base cuts into, computed without the learner.
-type kbRow struct {
+type HKbRow struct {
 	id, article string
 	position    int
 	text        string
 }
 
-func kbExpectedChunks() []kbRow {
-	var out []kbRow
+func hKbExpectedChunks() []HKbRow {
+	var out []HKbRow
 	for _, a := range kb.Articles {
 		for position, text := range chunk.Chunk(a.Body) {
-			out = append(out, kbRow{fmt.Sprintf("%s-%d", a.ID, position), a.ID, position, text})
+			out = append(out, HKbRow{fmt.Sprintf("%s-%d", a.ID, position), a.ID, position, text})
 		}
 	}
 	return out
 }
 
 // kbRanked is a chunk id and its cosine with the question.
-type kbRanked struct {
+type HKbRanked struct {
 	score float64
 	id    string
 }
 
 // kbExpectedRanking is the spec, independently: cosine of the question against every chunk, best first.
-func kbExpectedRanking(question string, k int) []kbRanked {
+func hKbExpectedRanking(question string, k int) []HKbRanked {
 	q := embed.Embed(question)
-	var out []kbRanked
-	for _, c := range kbExpectedChunks() {
-		out = append(out, kbRanked{embed.Cosine(q, embed.Embed(c.text)), c.id})
+	var out []HKbRanked
+	for _, c := range hKbExpectedChunks() {
+		out = append(out, HKbRanked{embed.Cosine(q, embed.Embed(c.text)), c.id})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].score > out[j].score })
 	return out[:k]
 }
 
 // kbIndexed is a fresh schema with the knowledge base indexed by the learner; the count indexArticles returned.
-func kbIndexed(ctx *harness.Ctx) int {
+func hKbIndexed(ctx *harness.Ctx) int {
 	ctx.DB.Reset(db.Schema)
 	defer func() {
 		if r := recover(); r != nil {
@@ -1266,8 +1266,8 @@ func kbIndexed(ctx *harness.Ctx) int {
 }
 
 func CheckIndexChunks(ctx *harness.Ctx) {
-	n := kbIndexed(ctx)
-	want := kbExpectedChunks()
+	n := hKbIndexed(ctx)
+	want := hKbExpectedChunks()
 	rows := ctx.DB.Query("SELECT id, article, position, text FROM kb_chunks ORDER BY article, position")
 	ctx.Assert(len(rows) == len(want), "the ten articles chunk into %d windows (chunk.Chunk, 48 words, overlap 12), kb_chunks holds %d row(s)", len(want), len(rows))
 	ctx.Assert(n == len(want), "indexArticles must return the number of chunks it inserted (%d), it returned %d", len(want), n)
@@ -1299,15 +1299,15 @@ func CheckIndexChunks(ctx *harness.Ctx) {
 }
 
 func CheckNearestChunks(ctx *harness.Ctx) {
-	kbIndexed(ctx)
+	hKbIndexed(ctx)
 	texts := map[string]string{}
-	for _, c := range kbExpectedChunks() {
+	for _, c := range hKbExpectedChunks() {
 		texts[c.id] = c.text
 	}
 	for _, tc := range []struct {
 		question, article string
 		k                 int
-	}{{kbPayQ, "pay", 4}, {kbLoginQ, "login", 3}} {
+	}{{kHKbPayQ, "pay", 4}, {kHKbLoginQ, "login", 3}} {
 		hits, err := search(context.Background(), tc.question, tc.k)
 		ctx.NoError(err, "search(%q, %d)", tc.question, tc.k)
 		ctx.Assert(len(hits) == tc.k, "search(%q, %d) must return exactly %d chunks, got %d", tc.question, tc.k, tc.k, len(hits))
@@ -1321,7 +1321,7 @@ func CheckNearestChunks(ctx *harness.Ctx) {
 			scores = append(scores, fmt.Sprint(h.Score))
 			ctx.Assert(i == 0 || hits[i-1].Score >= h.Score, "hits must come best first, scores were %v", scores)
 		}
-		want := kbExpectedRanking(tc.question, tc.k)
+		want := hKbExpectedRanking(tc.question, tc.k)
 		var wantIDs []string
 		for _, r := range want {
 			wantIDs = append(wantIDs, r.id)
@@ -1338,16 +1338,16 @@ func CheckNearestChunks(ctx *harness.Ctx) {
 			ctx.Equal(h.Text, texts[h.ID], "hit %s must carry the chunk's text", h.ID)
 		}
 	}
-	one, err := search(context.Background(), kbPayQ, 1)
-	ctx.NoError(err, "search(%q, 1)", kbPayQ)
+	one, err := search(context.Background(), kHKbPayQ, 1)
+	ctx.NoError(err, "search(%q, 1)", kHKbPayQ)
 	ctx.Assert(len(one) == 1 && strings.HasPrefix(one[0].ID, "pay-"), "k=1 returns the single best chunk, got %+v", one)
 }
 
 func CheckRankedInDatabase(ctx *harness.Ctx) {
-	kbIndexed(ctx)
+	hKbIndexed(ctx)
 	before := len(ctx.DB.Queries())
-	hits, err := search(context.Background(), kbPayQ, 4)
-	ctx.NoError(err, "search(%q, 4)", kbPayQ)
+	hits, err := search(context.Background(), kHKbPayQ, 4)
+	ctx.NoError(err, "search(%q, 4)", kHKbPayQ)
 	ctx.Equal(len(hits), 4, "search must return 4 chunks")
 	var during, selects []string
 	for _, q := range ctx.DB.Queries()[before:] {
@@ -1369,16 +1369,16 @@ func CheckRankedInDatabase(ctx *harness.Ctx) {
 	ctx.Assert(len(selects) == 1, "one query answers a search; %d SELECTs on kb_chunks ran: %q", len(selects), selects)
 }
 
-var kbSpaces = regexp.MustCompile(\`\\s+\`)
+var hKbSpaces = regexp.MustCompile(\`\\s+\`)
 
-func kbKeyOf(question string) string {
-	sum := sha256.Sum256([]byte(kbSpaces.ReplaceAllString(strings.TrimSpace(strings.ToLower(question)), " ")))
+func hKbKeyOf(question string) string {
+	sum := sha256.Sum256([]byte(hKbSpaces.ReplaceAllString(strings.TrimSpace(strings.ToLower(question)), " ")))
 	return "answer:" + hex.EncodeToString(sum[:])
 }
 
 func CheckCacheKey(ctx *harness.Ctx) {
 	key := cacheKey("How do I get paid?")
-	ctx.Equal(key, kbKeyOf("How do I get paid?"), "cacheKey must be \\"answer:\\" + sha256 hex of the normalised question")
+	ctx.Equal(key, hKbKeyOf("How do I get paid?"), "cacheKey must be \\"answer:\\" + sha256 hex of the normalised question")
 	for _, variant := range []string{"  how do i   get PAID? ", "HOW DO I GET PAID?", "how\\tdo i get paid?\\n"} {
 		ctx.Assert(cacheKey(variant) == key, "%q is the same question once lower-cased, whitespace-collapsed and trimmed, but it got the key %q instead of %q", variant, cacheKey(variant), key)
 	}
@@ -1398,7 +1398,7 @@ func CheckCacheRoundTrip(ctx *harness.Ctx) {
 	want := CachedAnswer{Answer: "Weekly, on Mondays [kb:pay-0].", Sources: []string{"pay-0", "pay-1"}}
 	ctx.Assert(hit != nil, "the same question written differently must hit with {answer, sources}, got nil")
 	ctx.Equal(*hit, want, "the same question written differently must hit with {answer, sources}")
-	key := kbKeyOf("When do I get paid?")
+	key := hKbKeyOf("When do I get paid?")
 	raw, ok := ctx.Redis.Get(key)
 	ctx.Assert(ok, "the answer must be stored under %s, Redis holds %q", key, ctx.Redis.Keys("*"))
 	var stored CachedAnswer
@@ -1422,18 +1422,18 @@ func CheckCacheRoundTrip(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string kbPayQ = "Payout missing after five business days — bank details on file?";
-const std::string kbLoginQ = "Forgot Password reset email, two-factor code, account locked";
+const std::string kHKbPayQ = "Payout missing after five business days — bank details on file?";
+const std::string kHKbLoginQ = "Forgot Password reset email, two-factor code, account locked";
 
 // kbRow is one chunk the knowledge base cuts into, computed without the learner.
-struct kbRow {
+struct HKbRow {
   std::string id, article;
   int position;
   std::string text;
 };
 
-std::vector<kbRow> kbExpectedChunks() {
-  std::vector<kbRow> out;
+std::vector<HKbRow> hKbExpectedChunks() {
+  std::vector<HKbRow> out;
   for (const auto& a : assistant::articles()) {
     const auto chunks = assistant::chunk(a.body);
     for (size_t position = 0; position < chunks.size(); position++) {
@@ -1444,24 +1444,24 @@ std::vector<kbRow> kbExpectedChunks() {
 }
 
 // kbRanked is a chunk id and its cosine with the question.
-struct kbRanked {
+struct HKbRanked {
   double score;
   std::string id;
 };
 
 // kbExpectedRanking is the spec, independently: cosine of the question against every chunk, best first.
-std::vector<kbRanked> kbExpectedRanking(const std::string& question, int k) {
+std::vector<HKbRanked> hKbExpectedRanking(const std::string& question, int k) {
   const auto q = assistant::embed(question);
-  std::vector<kbRanked> out;
-  for (const auto& c : kbExpectedChunks()) out.push_back({assistant::cosine(q, assistant::embed(c.text)), c.id});
-  std::stable_sort(out.begin(), out.end(), [](const kbRanked& a, const kbRanked& b) { return a.score > b.score; });
+  std::vector<HKbRanked> out;
+  for (const auto& c : hKbExpectedChunks()) out.push_back({assistant::cosine(q, assistant::embed(c.text)), c.id});
+  std::stable_sort(out.begin(), out.end(), [](const HKbRanked& a, const HKbRanked& b) { return a.score > b.score; });
   out.resize(static_cast<size_t>(k));
   return out;
 }
 
 // noError runs fn, the learner's call; what it throws fails the check with msg (Go's ctx.NoError).
 template <class F>
-auto noError(harness::Ctx& ctx, const std::string& msg, F fn) -> decltype(fn()) {
+auto hNoError(harness::Ctx& ctx, const std::string& msg, F fn) -> decltype(fn()) {
   try {
     return fn();
   } catch (const std::exception& e) {
@@ -1470,7 +1470,7 @@ auto noError(harness::Ctx& ctx, const std::string& msg, F fn) -> decltype(fn()) 
 }
 
 // kbIndexed is a fresh schema with the knowledge base indexed by the learner; the count index_articles returned.
-int kbIndexed(harness::Ctx& ctx) {
+int hKbIndexed(harness::Ctx& ctx) {
   ctx.DB.Reset(db::kSchema);
   try {
     return index_articles(assistant::articles());
@@ -1479,13 +1479,13 @@ int kbIndexed(harness::Ctx& ctx) {
   }
 }
 
-std::string join(const std::vector<std::string>& items, const std::string& sep) {
+std::string hJoin(const std::vector<std::string>& items, const std::string& sep) {
   std::string out;
   for (size_t i = 0; i < items.size(); i++) out += (i == 0 ? "" : sep) + items[i];
   return out;
 }
 
-std::string showHits(const std::vector<Hit>& hits) {
+std::string hShowHits(const std::vector<Hit>& hits) {
   std::string out = "[";
   for (size_t i = 0; i < hits.size(); i++) {
     out += (i == 0 ? "{" : " {") + harness::Sprintf("ID:%s Text:%s Score:%v", hits[i].id, hits[i].text, hits[i].score) + "}";
@@ -1493,25 +1493,25 @@ std::string showHits(const std::vector<Hit>& hits) {
   return out + "]";
 }
 
-std::string showAnswer(const std::optional<CachedAnswer>& a) {
+std::string hShowAnswer(const std::optional<CachedAnswer>& a) {
   if (!a) return "<nil>";
   return harness::Sprintf("&{Answer:%s Sources:%v}", a->answer, a->sources);
 }
 
-std::string kbKeyOf(const std::string& question) {
+std::string hKbKeyOf(const std::string& question) {
   std::string lower;
   for (unsigned char c : question) lower += static_cast<char>(std::tolower(c));
   std::istringstream words(lower);
   std::vector<std::string> parts;
   for (std::string w; words >> w;) parts.push_back(w);
-  return "answer:" + sha256_hex(join(parts, " "));
+  return "answer:" + sha256_hex(hJoin(parts, " "));
 }
 
 }  // namespace
 
 void CheckIndexChunks(harness::Ctx& ctx) {
-  const int n = kbIndexed(ctx);
-  const auto want = kbExpectedChunks();
+  const int n = hKbIndexed(ctx);
+  const auto want = hKbExpectedChunks();
   auto rows = ctx.DB.Query("SELECT id, article, position, text FROM kb_chunks ORDER BY article, position");
   ctx.Assert(rows.size() == want.size(), "the ten articles chunk into %d windows (chunk.Chunk, 48 words, overlap 12), kb_chunks holds %d row(s)", want.size(), rows.size());
   ctx.Assert(n == static_cast<int>(want.size()), "indexArticles must return the number of chunks it inserted (%d), it returned %d", want.size(), n);
@@ -1524,7 +1524,7 @@ void CheckIndexChunks(harness::Ctx& ctx) {
   std::sort(got.begin(), got.end());
   std::sort(wanted.begin(), wanted.end());
   std::sort(ids.begin(), ids.end());
-  ctx.Assert(join(got, "\\n") == join(wanted, "\\n"), "kb_chunks must hold one row per chunk with id <article>-<position>; ids found: %q", ids);
+  ctx.Assert(hJoin(got, "\\n") == hJoin(wanted, "\\n"), "kb_chunks must hold one row per chunk with id <article>-<position>; ids found: %q", ids);
   // Each stored vector is compared with embed(text) in Postgres (vector_dims, <=>) rather than parsed here.
   for (auto& r : rows) {
     const std::string text = r["text"].String();
@@ -1533,22 +1533,22 @@ void CheckIndexChunks(harness::Ctx& ctx) {
     const double cos = stored["cosine"].Float();
     ctx.Assert(cos > 0.999, "chunk %v's stored vector is not embed.Embed(text): cosine %.3f against the expected vector", r["id"], cos);
   }
-  const int again = noError(ctx, "indexArticles(kb.Articles) a second time", [] { return index_articles(assistant::articles()); });
+  const int again = hNoError(ctx, "indexArticles(kb.Articles) a second time", [] { return index_articles(assistant::articles()); });
   auto count = ctx.DB.Query("SELECT count(*) AS n FROM kb_chunks")[0]["n"];
   ctx.Assert(harness::Sprintf("%v", count) == std::to_string(want.size()), "indexing twice must leave the table unchanged (%d rows): ON CONFLICT (id) DO NOTHING — found %v", want.size(), count);
   ctx.Assert(again == 0, "a second indexArticles inserts nothing, so it returns 0, not %d", again);
 }
 
 void CheckNearestChunks(harness::Ctx& ctx) {
-  kbIndexed(ctx);
+  hKbIndexed(ctx);
   std::map<std::string, std::string> texts;
-  for (const auto& c : kbExpectedChunks()) texts[c.id] = c.text;
+  for (const auto& c : hKbExpectedChunks()) texts[c.id] = c.text;
   struct Case {
     std::string question, article;
     int k;
   };
-  for (const auto& tc : {Case{kbPayQ, "pay", 4}, Case{kbLoginQ, "login", 3}}) {
-    const auto hits = noError(ctx, harness::Sprintf("search(%q, %d)", tc.question, tc.k), [&] { return search(tc.question, tc.k); });
+  for (const auto& tc : {Case{kHKbPayQ, "pay", 4}, Case{kHKbLoginQ, "login", 3}}) {
+    const auto hits = hNoError(ctx, harness::Sprintf("search(%q, %d)", tc.question, tc.k), [&] { return search(tc.question, tc.k); });
     ctx.Assert(static_cast<int>(hits.size()) == tc.k, "search(%q, %d) must return exactly %d chunks, got %d", tc.question, tc.k, tc.k, hits.size());
     std::vector<std::string> got, scores;
     for (const auto& h : hits) {
@@ -1560,27 +1560,27 @@ void CheckNearestChunks(harness::Ctx& ctx) {
       scores.push_back(harness::Sprintf("%v", hits[i].score));
       ctx.Assert(i == 0 || hits[i - 1].score >= hits[i].score, "hits must come best first, scores were %v", scores);
     }
-    const auto want = kbExpectedRanking(tc.question, tc.k);
+    const auto want = hKbExpectedRanking(tc.question, tc.k);
     std::vector<std::string> wantIDs;
     for (const auto& r : want) wantIDs.push_back(r.id);
     auto gotSorted = got;
     auto wantSorted = wantIDs;
     std::sort(gotSorted.begin(), gotSorted.end());
     std::sort(wantSorted.begin(), wantSorted.end());
-    ctx.Assert(join(gotSorted, ",") == join(wantSorted, ","), "the %d nearest chunks to %q are %q, search returned %q", tc.k, tc.question, wantIDs, got);
+    ctx.Assert(hJoin(gotSorted, ",") == hJoin(wantSorted, ","), "the %d nearest chunks to %q are %q, search returned %q", tc.k, tc.question, wantIDs, got);
     for (size_t i = 0; i < hits.size(); i++) {
       ctx.Assert(std::fabs(hits[i].score - want[i].score) < 1e-3, "chunk %s must score 1 - distance = %.4f, got %v", hits[i].id, want[i].score, hits[i].score);
     }
     for (const auto& h : hits) ctx.Equal(h.text, texts[h.id], "hit %s must carry the chunk's text", h.id);
   }
-  const auto one = noError(ctx, harness::Sprintf("search(%q, 1)", kbPayQ), [] { return search(kbPayQ, 1); });
-  ctx.Assert(one.size() == 1 && one[0].id.rfind("pay-", 0) == 0, "k=1 returns the single best chunk, got %s", showHits(one));
+  const auto one = hNoError(ctx, harness::Sprintf("search(%q, 1)", kHKbPayQ), [] { return search(kHKbPayQ, 1); });
+  ctx.Assert(one.size() == 1 && one[0].id.rfind("pay-", 0) == 0, "k=1 returns the single best chunk, got %s", hShowHits(one));
 }
 
 void CheckRankedInDatabase(harness::Ctx& ctx) {
-  kbIndexed(ctx);
+  hKbIndexed(ctx);
   const size_t before = ctx.DB.Queries().size();
-  const auto hits = noError(ctx, harness::Sprintf("search(%q, 4)", kbPayQ), [] { return search(kbPayQ, 4); });
+  const auto hits = hNoError(ctx, harness::Sprintf("search(%q, 4)", kHKbPayQ), [] { return search(kHKbPayQ, 4); });
   ctx.Equal(hits.size(), 4, "search must return 4 chunks");
   std::vector<std::string> during, selects;
   const auto queries = ctx.DB.Queries();
@@ -1607,27 +1607,27 @@ void CheckRankedInDatabase(harness::Ctx& ctx) {
 }
 
 void CheckCacheKey(harness::Ctx& ctx) {
-  const std::string key = noError(ctx, "cacheKey", [] { return cache_key("How do I get paid?"); });
-  ctx.Equal(key, kbKeyOf("How do I get paid?"), "cacheKey must be \\"answer:\\" + sha256 hex of the normalised question");
+  const std::string key = hNoError(ctx, "cacheKey", [] { return cache_key("How do I get paid?"); });
+  ctx.Equal(key, hKbKeyOf("How do I get paid?"), "cacheKey must be \\"answer:\\" + sha256 hex of the normalised question");
   for (const std::string variant : {"  how do i   get PAID? ", "HOW DO I GET PAID?", "how\\tdo i get paid?\\n"}) {
     const std::string got = cache_key(variant);
     ctx.Assert(got == key, "%q is the same question once lower-cased, whitespace-collapsed and trimmed, but it got the key %q instead of %q", variant, got, key);
   }
   ctx.Assert(cache_key("How do I get a tip?") != key, "a different question must have a different key");
-  noError(ctx, "rememberAnswer", [] { remember_answer("How do I get paid?", "Weekly, on Mondays [kb:pay-0].", {"pay-0"}); });
+  hNoError(ctx, "rememberAnswer", [] { remember_answer("How do I get paid?", "Weekly, on Mondays [kb:pay-0].", {"pay-0"}); });
   ctx.Equal(ctx.Redis.Keys("*"), {key}, "rememberAnswer must write exactly the key %s", key);
 }
 
 void CheckCacheRoundTrip(harness::Ctx& ctx) {
-  const auto miss = noError(ctx, "cachedAnswer", [] { return cached_answer("When do I get paid?"); });
-  ctx.Assert(!miss, "nothing has been remembered yet: cachedAnswer must be nil, got %s", showAnswer(miss));
-  noError(ctx, "rememberAnswer", [] { remember_answer("When do I get paid?", "Weekly, on Mondays [kb:pay-0].", {"pay-0", "pay-1"}); });
-  const auto hit = noError(ctx, "cachedAnswer", [] { return cached_answer("  when DO i get   paid? "); });
+  const auto miss = hNoError(ctx, "cachedAnswer", [] { return cached_answer("When do I get paid?"); });
+  ctx.Assert(!miss, "nothing has been remembered yet: cachedAnswer must be nil, got %s", hShowAnswer(miss));
+  hNoError(ctx, "rememberAnswer", [] { remember_answer("When do I get paid?", "Weekly, on Mondays [kb:pay-0].", {"pay-0", "pay-1"}); });
+  const auto hit = hNoError(ctx, "cachedAnswer", [] { return cached_answer("  when DO i get   paid? "); });
   const std::string wantAnswer = "Weekly, on Mondays [kb:pay-0].";
   const std::vector<std::string> wantSources = {"pay-0", "pay-1"};
   ctx.Assert(hit.has_value(), "the same question written differently must hit with {answer, sources}, got nil");
   ctx.Equal(std::make_pair(hit->answer, hit->sources), std::make_pair(wantAnswer, wantSources), "the same question written differently must hit with {answer, sources}");
-  const std::string key = kbKeyOf("When do I get paid?");
+  const std::string key = hKbKeyOf("When do I get paid?");
   const auto raw = ctx.Redis.Get(key);
   ctx.Assert(raw.has_value(), "the answer must be stored under %s, Redis holds %q", key, ctx.Redis.Keys("*"));
   const auto stored = harness::ParseJSON(*raw);
@@ -1635,15 +1635,15 @@ void CheckCacheRoundTrip(harness::Ctx& ctx) {
   if (same) {
     std::vector<std::string> sources;
     for (const auto& s : (*stored)["sources"].Items()) sources.push_back(s.String());
-    same = join(sources, ",") == join(hit->sources, ",");
+    same = hJoin(sources, ",") == hJoin(hit->sources, ",");
   }
   ctx.Assert(same, "the stored value must be the JSON {answer, sources}, it is %q", *raw);
   const long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(config::kCacheTtlS - 5 <= ttl && ttl <= config::kCacheTtlS, "the cached answer must expire after config.CacheTTL = %d s, its TTL is %d", config::kCacheTtlS, ttl);
-  const auto other = noError(ctx, "cachedAnswer", [] { return cached_answer("How do tips work?"); });
+  const auto other = hNoError(ctx, "cachedAnswer", [] { return cached_answer("How do tips work?"); });
   ctx.Assert(!other, "a different question must still miss");
   ctx.Clock.Advance(config::kCacheTtlS + 1);
-  const auto gone = noError(ctx, "cachedAnswer", [] { return cached_answer("When do I get paid?"); });
+  const auto gone = hNoError(ctx, "cachedAnswer", [] { return cached_answer("When do I get paid?"); });
   ctx.Assert(!gone, "after config.CacheTTL the answer must be gone");
 }
 `,

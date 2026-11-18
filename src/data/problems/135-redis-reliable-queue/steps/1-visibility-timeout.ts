@@ -1249,199 +1249,199 @@ import (
 )
 
 const (
-	wqName     = "emails"
-	wqReady    = "q:emails:ready"
-	wqInflight = "q:emails:inflight"
-	wqOwner    = "q:emails:owner"
-	wqJobs     = "q:emails:jobs"
+	kHWqName     = "emails"
+	kHWqReady    = "q:emails:ready"
+	kHWqInflight = "q:emails:inflight"
+	kHWqOwner    = "q:emails:owner"
+	kHWqJobs     = "q:emails:jobs"
 )
 
-var wqBg = context.Background()
+var hWqBg = context.Background()
 
-func wqQueue(ctx *harness.Ctx, n int) {
+func hWqQueue(ctx *harness.Ctx, n int) {
 	for i := 1; i <= n; i++ {
-		ctx.Equal(wqEnqueue(ctx, fmt.Sprintf("j%d", i), fmt.Sprintf("p%d", i)), true, "enqueue of a fresh id j%d must return true", i)
+		ctx.Equal(hWqEnqueue(ctx, fmt.Sprintf("j%d", i), fmt.Sprintf("p%d", i)), true, "enqueue of a fresh id j%d must return true", i)
 	}
 }
 
-func wqEnqueue(ctx *harness.Ctx, jobID, payload string) bool {
-	ok, err := enqueue(wqBg, wqName, jobID, payload)
-	ctx.NoError(err, "enqueue(%q, %q, %q) returned an error", wqName, jobID, payload)
+func hWqEnqueue(ctx *harness.Ctx, jobID, payload string) bool {
+	ok, err := enqueue(hWqBg, kHWqName, jobID, payload)
+	ctx.NoError(err, "enqueue(%q, %q, %q) returned an error", kHWqName, jobID, payload)
 	return ok
 }
 
 // wqClaim is the claim as [jobID, payload], or nil when claim reported ok false.
-func wqClaim(ctx *harness.Ctx, worker string, visibility, now int64) []string {
-	jobID, payload, ok, err := claim(wqBg, wqName, worker, visibility, now)
-	ctx.NoError(err, "claim(%q, %q, %d, %d) returned an error", wqName, worker, visibility, now)
+func hWqClaim(ctx *harness.Ctx, worker string, visibility, now int64) []string {
+	jobID, payload, ok, err := claim(hWqBg, kHWqName, worker, visibility, now)
+	ctx.NoError(err, "claim(%q, %q, %d, %d) returned an error", kHWqName, worker, visibility, now)
 	if !ok {
 		return nil
 	}
 	return []string{jobID, payload}
 }
 
-func wqAck(ctx *harness.Ctx, jobID, worker string) bool {
-	ok, err := ack(wqBg, wqName, jobID, worker)
-	ctx.NoError(err, "ack(%q, %q, %q) returned an error", wqName, jobID, worker)
+func hWqAck(ctx *harness.Ctx, jobID, worker string) bool {
+	ok, err := ack(hWqBg, kHWqName, jobID, worker)
+	ctx.NoError(err, "ack(%q, %q, %q) returned an error", kHWqName, jobID, worker)
 	return ok
 }
 
-func wqRequeue(ctx *harness.Ctx, now int64) int64 {
-	n, err := requeueExpired(wqBg, wqName, now)
-	ctx.NoError(err, "requeueExpired(%q, %d) returned an error", wqName, now)
+func hWqRequeue(ctx *harness.Ctx, now int64) int64 {
+	n, err := requeueExpired(hWqBg, kHWqName, now)
+	ctx.NoError(err, "requeueExpired(%q, %d) returned an error", kHWqName, now)
 	return n
 }
 
-func wqStats(ctx *harness.Ctx) Stats {
-	s, err := stats(wqBg, wqName)
-	ctx.NoError(err, "stats(%q) returned an error", wqName)
+func hWqStats(ctx *harness.Ctx) Stats {
+	s, err := stats(hWqBg, kHWqName)
+	ctx.NoError(err, "stats(%q) returned an error", kHWqName)
 	return s
 }
 
 // wqScore is a job's inflight deadline, or nil when it is not inflight.
-func wqScore(ctx *harness.Ctx, id string) any {
-	if s, ok := ctx.Redis.ZScore(wqInflight, id); ok {
+func hWqScore(ctx *harness.Ctx, id string) any {
+	if s, ok := ctx.Redis.ZScore(kHWqInflight, id); ok {
 		return s
 	}
 	return nil
 }
 
 // wqHGet is a hash field, or nil when it is missing.
-func wqHGet(ctx *harness.Ctx, key, field string) any {
+func hWqHGet(ctx *harness.Ctx, key, field string) any {
 	if v, ok := ctx.Redis.HGet(key, field); ok {
 		return v
 	}
 	return nil
 }
 
-func wqHExists(ctx *harness.Ctx, key, field string) int {
+func hWqHExists(ctx *harness.Ctx, key, field string) int {
 	if _, ok := ctx.Redis.HGet(key, field); ok {
 		return 1
 	}
 	return 0
 }
 
-func wqInflightIDs(ctx *harness.Ctx) []string {
+func hWqInflightIDs(ctx *harness.Ctx) []string {
 	ids := []string{}
-	for _, z := range ctx.Redis.ZRangeWithScores(wqInflight, 0, -1) {
+	for _, z := range ctx.Redis.ZRangeWithScores(kHWqInflight, 0, -1) {
 		ids = append(ids, z.Member)
 	}
 	return ids
 }
 
 func CheckClaimInflight(ctx *harness.Ctx) {
-	wqQueue(ctx, 2)
-	ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), []string{"j1", "j2"}, "ready after two enqueues, expected [j1, j2] (RPUSH)")
-	got := wqClaim(ctx, "A", 30, 100)
+	hWqQueue(ctx, 2)
+	ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), []string{"j1", "j2"}, "ready after two enqueues, expected [j1, j2] (RPUSH)")
+	got := hWqClaim(ctx, "A", 30, 100)
 	ctx.Equal(got, []string{"j1", "p1"}, "claim must return the head of ready with its payload")
-	ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), []string{"j2"}, "ready after the claim: the claimed id must leave the list")
-	ctx.Assert(wqScore(ctx, "j1") != nil, "inflight is %q, expected j1: the claimed id must be ZADDed", wqInflightIDs(ctx))
-	ctx.Equal(wqScore(ctx, "j1"), 130, "j1's inflight score, expected now + visibility = 100 + 30 = 130")
-	ctx.Equal(wqHGet(ctx, wqOwner, "j1"), "A", "owner of j1")
-	ctx.Equal(wqHGet(ctx, wqJobs, "j1"), "p1", "the payload must stay in q:emails:jobs until the ack")
-	ctx.Equal(wqStats(ctx), Stats{Ready: 1, Inflight: 1}, "stats, expected ready 1 / inflight 1")
-	ctx.Equal(wqClaim(ctx, "B", 30, 101), []string{"j2", "p2"}, "the second claim gets j2")
-	ctx.Equal(wqClaim(ctx, "B", 30, 102), []string(nil), "a claim on an empty ready list must return ok false")
-	ctx.Equal(wqStats(ctx), Stats{Ready: 0, Inflight: 2}, "stats, expected ready 0 / inflight 2")
+	ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), []string{"j2"}, "ready after the claim: the claimed id must leave the list")
+	ctx.Assert(hWqScore(ctx, "j1") != nil, "inflight is %q, expected j1: the claimed id must be ZADDed", hWqInflightIDs(ctx))
+	ctx.Equal(hWqScore(ctx, "j1"), 130, "j1's inflight score, expected now + visibility = 100 + 30 = 130")
+	ctx.Equal(hWqHGet(ctx, kHWqOwner, "j1"), "A", "owner of j1")
+	ctx.Equal(hWqHGet(ctx, kHWqJobs, "j1"), "p1", "the payload must stay in q:emails:jobs until the ack")
+	ctx.Equal(hWqStats(ctx), Stats{Ready: 1, Inflight: 1}, "stats, expected ready 1 / inflight 1")
+	ctx.Equal(hWqClaim(ctx, "B", 30, 101), []string{"j2", "p2"}, "the second claim gets j2")
+	ctx.Equal(hWqClaim(ctx, "B", 30, 102), []string(nil), "a claim on an empty ready list must return ok false")
+	ctx.Equal(hWqStats(ctx), Stats{Ready: 0, Inflight: 2}, "stats, expected ready 0 / inflight 2")
 }
 
 func CheckFifoDedupe(ctx *harness.Ctx) {
-	wqQueue(ctx, 5)
+	hWqQueue(ctx, 5)
 	order := []string{}
 	for range 5 {
-		got := wqClaim(ctx, "A", 30, 100)
+		got := hWqClaim(ctx, "A", 30, 100)
 		ctx.Assert(got != nil, "claim returned ok false with jobs still ready (claims so far: %q)", order)
 		order = append(order, got[0])
 	}
 	ctx.Equal(order, []string{"j1", "j2", "j3", "j4", "j5"}, "claims must come out as j1..j5 in enqueue order (RPUSH in, LPOP out)")
-	ctx.Equal(wqClaim(ctx, "A", 30, 100), []string(nil), "the sixth claim must return ok false")
-	ctx.Equal(wqEnqueue(ctx, "j6", "p6"), true, "enqueue of a fresh id j6")
-	ctx.Equal(wqEnqueue(ctx, "j6", "other"), false, "enqueue of an id that already exists must return false")
-	ctx.Equal(wqHGet(ctx, wqJobs, "j6"), "p6", "a refused enqueue must not overwrite the payload")
-	ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), []string{"j6"}, "ready: a refused enqueue must not push a second entry")
-	got := wqClaim(ctx, "A", 30, 100)
+	ctx.Equal(hWqClaim(ctx, "A", 30, 100), []string(nil), "the sixth claim must return ok false")
+	ctx.Equal(hWqEnqueue(ctx, "j6", "p6"), true, "enqueue of a fresh id j6")
+	ctx.Equal(hWqEnqueue(ctx, "j6", "other"), false, "enqueue of an id that already exists must return false")
+	ctx.Equal(hWqHGet(ctx, kHWqJobs, "j6"), "p6", "a refused enqueue must not overwrite the payload")
+	ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), []string{"j6"}, "ready: a refused enqueue must not push a second entry")
+	got := hWqClaim(ctx, "A", 30, 100)
 	ctx.Assert(got != nil, "claim returned ok false with j6 ready")
 	ctx.Equal(got[0], "j6", "the claim after the refused enqueue")
-	ctx.Equal(wqEnqueue(ctx, "j6", "again"), false, "an id that is inflight still exists and must be refused")
-	ctx.Equal(ctx.Redis.LLen(wqReady), 0, "LLEN q:emails:ready")
+	ctx.Equal(hWqEnqueue(ctx, "j6", "again"), false, "an id that is inflight still exists and must be refused")
+	ctx.Equal(ctx.Redis.LLen(kHWqReady), 0, "LLEN q:emails:ready")
 }
 
 func CheckAckOwner(ctx *harness.Ctx) {
-	wqQueue(ctx, 2)
-	wqClaim(ctx, "A", 30, 100)
-	ctx.Equal(wqAck(ctx, "j1", "B"), false, "ack from a worker that does not own the job must return false")
-	ctx.Assert(wqScore(ctx, "j1") == 130.0 && wqHGet(ctx, wqOwner, "j1") == "A" && wqHGet(ctx, wqJobs, "j1") == "p1", "a refused ack must change nothing")
-	ctx.Equal(wqAck(ctx, "j2", "A"), false, "ack of a job that is not inflight (j2 is still ready) must return false")
-	ready := ctx.Redis.LRange(wqReady, 0, -1)
-	ctx.Assert(len(ready) > 0 && ready[0] == "j2" && wqHGet(ctx, wqJobs, "j2") == "p2", "a refused ack must leave the ready job alone")
-	ctx.Equal(wqAck(ctx, "ghost", "A"), false, "ack of an unknown id must return false")
-	ctx.Equal(wqAck(ctx, "j1", "A"), true, "the owner's ack must return true")
-	ctx.Equal(wqScore(ctx, "j1"), nil, "after the ack j1 must leave inflight")
-	ctx.Equal(wqHExists(ctx, wqOwner, "j1"), 0, "after the ack j1 must have no owner")
-	ctx.Equal(wqHExists(ctx, wqJobs, "j1"), 0, "after the ack the payload must be deleted from jobs")
-	ctx.Equal(wqAck(ctx, "j1", "A"), false, "a second ack must return false")
-	ctx.Equal(wqStats(ctx), Stats{Ready: 1, Inflight: 0}, "stats after the ack")
-	ctx.Equal(wqEnqueue(ctx, "j1", "p1-again"), true, "once acked, the id is free to be enqueued again")
+	hWqQueue(ctx, 2)
+	hWqClaim(ctx, "A", 30, 100)
+	ctx.Equal(hWqAck(ctx, "j1", "B"), false, "ack from a worker that does not own the job must return false")
+	ctx.Assert(hWqScore(ctx, "j1") == 130.0 && hWqHGet(ctx, kHWqOwner, "j1") == "A" && hWqHGet(ctx, kHWqJobs, "j1") == "p1", "a refused ack must change nothing")
+	ctx.Equal(hWqAck(ctx, "j2", "A"), false, "ack of a job that is not inflight (j2 is still ready) must return false")
+	ready := ctx.Redis.LRange(kHWqReady, 0, -1)
+	ctx.Assert(len(ready) > 0 && ready[0] == "j2" && hWqHGet(ctx, kHWqJobs, "j2") == "p2", "a refused ack must leave the ready job alone")
+	ctx.Equal(hWqAck(ctx, "ghost", "A"), false, "ack of an unknown id must return false")
+	ctx.Equal(hWqAck(ctx, "j1", "A"), true, "the owner's ack must return true")
+	ctx.Equal(hWqScore(ctx, "j1"), nil, "after the ack j1 must leave inflight")
+	ctx.Equal(hWqHExists(ctx, kHWqOwner, "j1"), 0, "after the ack j1 must have no owner")
+	ctx.Equal(hWqHExists(ctx, kHWqJobs, "j1"), 0, "after the ack the payload must be deleted from jobs")
+	ctx.Equal(hWqAck(ctx, "j1", "A"), false, "a second ack must return false")
+	ctx.Equal(hWqStats(ctx), Stats{Ready: 1, Inflight: 0}, "stats after the ack")
+	ctx.Equal(hWqEnqueue(ctx, "j1", "p1-again"), true, "once acked, the id is free to be enqueued again")
 }
 
 func CheckVisibilityTimeout(ctx *harness.Ctx) {
-	wqQueue(ctx, 2)
-	ctx.Equal(wqClaim(ctx, "A", 30, 100), []string{"j1", "p1"}, "the first claim")
-	ctx.Equal(wqRequeue(ctx, 129), 0, "before the deadline (130) nothing is expired: requeueExpired(129)")
-	ready := ctx.Redis.LRange(wqReady, 0, -1)
-	ctx.Assert(wqScore(ctx, "j1") == 130.0 && len(ready) > 0 && ready[0] == "j2", "requeueExpired before the deadline must move nothing")
-	got := wqClaim(ctx, "B", 30, 129)
+	hWqQueue(ctx, 2)
+	ctx.Equal(hWqClaim(ctx, "A", 30, 100), []string{"j1", "p1"}, "the first claim")
+	ctx.Equal(hWqRequeue(ctx, 129), 0, "before the deadline (130) nothing is expired: requeueExpired(129)")
+	ready := ctx.Redis.LRange(kHWqReady, 0, -1)
+	ctx.Assert(hWqScore(ctx, "j1") == 130.0 && len(ready) > 0 && ready[0] == "j2", "requeueExpired before the deadline must move nothing")
+	got := hWqClaim(ctx, "B", 30, 129)
 	ctx.Assert(got != nil && got[0] == "j2", "while j1 is inflight, another worker gets the next job, never j1: got %q", got)
-	n := wqRequeue(ctx, 130)
+	n := hWqRequeue(ctx, 130)
 	ctx.Equal(n, 1, "requeueExpired(130): j1's deadline is 130 and score <= now counts as expired")
-	ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), []string{"j1"}, "ready: the expired job goes back to the head (LPUSH)")
-	ctx.Equal(wqScore(ctx, "j1"), nil, "a requeued job must leave inflight")
-	ctx.Equal(wqHExists(ctx, wqOwner, "j1"), 0, "a requeued job must have no owner")
-	ctx.Equal(wqHGet(ctx, wqJobs, "j1"), "p1", "requeue keeps the payload")
-	ctx.Equal(wqAck(ctx, "j1", "A"), false, "the worker that lost the job cannot ack it any more")
-	got = wqClaim(ctx, "B", 60, 131)
+	ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), []string{"j1"}, "ready: the expired job goes back to the head (LPUSH)")
+	ctx.Equal(hWqScore(ctx, "j1"), nil, "a requeued job must leave inflight")
+	ctx.Equal(hWqHExists(ctx, kHWqOwner, "j1"), 0, "a requeued job must have no owner")
+	ctx.Equal(hWqHGet(ctx, kHWqJobs, "j1"), "p1", "requeue keeps the payload")
+	ctx.Equal(hWqAck(ctx, "j1", "A"), false, "the worker that lost the job cannot ack it any more")
+	got = hWqClaim(ctx, "B", 60, 131)
 	ctx.Equal(got, []string{"j1", "p1"}, "after the requeue another worker claims j1 again")
-	ctx.Equal(wqScore(ctx, "j1"), 191, "the re-claimed job's deadline, expected 131 + 60 = 191")
-	ctx.Equal(wqHGet(ctx, wqOwner, "j1"), "B", "owner of the re-claimed j1")
-	ctx.Equal(wqAck(ctx, "j1", "A"), false, "A's late ack must be refused: B owns j1 now")
-	ctx.Equal(wqAck(ctx, "j1", "B"), true, "B's ack of j1")
+	ctx.Equal(hWqScore(ctx, "j1"), 191, "the re-claimed job's deadline, expected 131 + 60 = 191")
+	ctx.Equal(hWqHGet(ctx, kHWqOwner, "j1"), "B", "owner of the re-claimed j1")
+	ctx.Equal(hWqAck(ctx, "j1", "A"), false, "A's late ack must be refused: B owns j1 now")
+	ctx.Equal(hWqAck(ctx, "j1", "B"), true, "B's ack of j1")
 }
 
 func CheckRequeueOnlyExpired(ctx *harness.Ctx) {
-	wqQueue(ctx, 4)
-	wqClaim(ctx, "A", 10, 100)
-	wqClaim(ctx, "B", 20, 100)
-	wqClaim(ctx, "C", 30, 100)
-	ctx.Equal(wqRequeue(ctx, 120), 2, "at 120 two deadlines (110, 120) have passed: requeueExpired(120)")
-	ready := ctx.Redis.LRange(wqReady, 0, -1)
+	hWqQueue(ctx, 4)
+	hWqClaim(ctx, "A", 10, 100)
+	hWqClaim(ctx, "B", 20, 100)
+	hWqClaim(ctx, "C", 30, 100)
+	ctx.Equal(hWqRequeue(ctx, 120), 2, "at 120 two deadlines (110, 120) have passed: requeueExpired(120)")
+	ready := ctx.Redis.LRange(kHWqReady, 0, -1)
 	sorted := append([]string{}, ready...)
 	sort.Strings(sorted)
 	ctx.Assert(fmt.Sprint(sorted) == "[j1 j2 j4]" && ready[2] == "j4", "ready is %q: j1 and j2 must be back ahead of the never-claimed j4", ready)
-	ctx.Equal(wqInflightIDs(ctx), []string{"j3"}, "inflight, expected only j3 (deadline 130)")
-	ctx.Equal(ctx.Redis.HGetAll(wqOwner), map[string]string{"j3": "C"}, "owner, expected only j3 -> C")
-	ctx.Equal(wqStats(ctx), Stats{Ready: 3, Inflight: 1}, "stats after the sweep")
-	ctx.Equal(wqRequeue(ctx, 120), 0, "a second sweep at the same instant has nothing left: requeueExpired(120)")
-	ctx.Equal(wqRequeue(ctx, 1000), 1, "requeueExpired(1000)")
-	ctx.Assert(ctx.Redis.ZCard(wqInflight) == 0 && ctx.Redis.HLen(wqOwner) == 0, "after the last sweep inflight and owner must be empty")
-	ctx.Equal(ctx.Redis.LLen(wqReady), 4, "LLEN q:emails:ready")
+	ctx.Equal(hWqInflightIDs(ctx), []string{"j3"}, "inflight, expected only j3 (deadline 130)")
+	ctx.Equal(ctx.Redis.HGetAll(kHWqOwner), map[string]string{"j3": "C"}, "owner, expected only j3 -> C")
+	ctx.Equal(hWqStats(ctx), Stats{Ready: 3, Inflight: 1}, "stats after the sweep")
+	ctx.Equal(hWqRequeue(ctx, 120), 0, "a second sweep at the same instant has nothing left: requeueExpired(120)")
+	ctx.Equal(hWqRequeue(ctx, 1000), 1, "requeueExpired(1000)")
+	ctx.Assert(ctx.Redis.ZCard(kHWqInflight) == 0 && ctx.Redis.HLen(kHWqOwner) == 0, "after the last sweep inflight and owner must be empty")
+	ctx.Equal(ctx.Redis.LLen(kHWqReady), 4, "LLEN q:emails:ready")
 }
 
 // wqSeen is what worker B saw and got, claiming right after A's first command on ready.
-type wqSeen struct {
+type HWqSeen struct {
 	ready, inflight []string
 	owner           map[string]string
 	got             []string
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	wqQueue(ctx, 2)
-	probe := ctx.Redis.After(wqReady, func() any {
-		seen := wqSeen{
-			ready:    ctx.Redis.LRange(wqReady, 0, -1),
-			inflight: wqInflightIDs(ctx),
-			owner:    ctx.Redis.HGetAll(wqOwner),
+	hWqQueue(ctx, 2)
+	probe := ctx.Redis.After(kHWqReady, func() any {
+		seen := HWqSeen{
+			ready:    ctx.Redis.LRange(kHWqReady, 0, -1),
+			inflight: hWqInflightIDs(ctx),
+			owner:    ctx.Redis.HGetAll(kHWqOwner),
 		}
-		jobID, payload, ok, err := claim(wqBg, wqName, "B", 30, 100)
+		jobID, payload, ok, err := claim(hWqBg, kHWqName, "B", 30, 100)
 		if err != nil {
 			panic(err)
 		}
@@ -1450,11 +1450,11 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 		}
 		return seen
 	})
-	gotA := wqClaim(ctx, "A", 30, 100)
+	gotA := hWqClaim(ctx, "A", 30, 100)
 	ctx.Assert(probe.Fired, "claim never touched q:emails:ready")
 	ctx.NoError(probe.Err, "worker B's claim failed")
 	ctx.Equal(gotA, []string{"j1", "p1"}, "worker A's claim, expected j1")
-	seen, _ := probe.Result.(wqSeen)
+	seen, _ := probe.Result.(HWqSeen)
 	popped := true
 	for _, id := range seen.ready {
 		popped = popped && id != "j1"
@@ -1466,8 +1466,8 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 	}
 	ctx.Assert(inflight && seen.owner["j1"] == "A", "right after ready was touched, inflight is %q and owner %v: j1 was popped but not yet inflight — a crash here loses the job; pop, ZADD and HSET must be one script", seen.inflight, seen.owner)
 	ctx.Equal(seen.got, []string{"j2", "p2"}, "worker B, claiming at that instant, must get j2: two workers must never hold the same job")
-	ctx.Equal(ctx.Redis.HGetAll(wqOwner), map[string]string{"j1": "A", "j2": "B"}, "owners, expected j1 -> A, j2 -> B")
-	ctx.Assert(ctx.Redis.ZCard(wqInflight) == 2 && ctx.Redis.LLen(wqReady) == 0, "after both claims inflight must hold 2 and ready 0")
+	ctx.Equal(ctx.Redis.HGetAll(kHWqOwner), map[string]string{"j1": "A", "j2": "B"}, "owners, expected j1 -> A, j2 -> B")
+	ctx.Assert(ctx.Redis.ZCard(kHWqInflight) == 2 && ctx.Redis.LLen(kHWqReady) == 0, "after both claims inflight must hold 2 and ready 0")
 }
 `,
     cpp: `// redis-reliable-queue/visibility-timeout checks: claim-inflight, fifo-dedupe, ack-owner, visibility-timeout, requeue-only-expired, atomic-claim
@@ -1482,179 +1482,179 @@ func CheckAtomicClaim(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string wqName = "emails";
-const std::string wqReady = "q:emails:ready";
-const std::string wqInflight = "q:emails:inflight";
-const std::string wqOwner = "q:emails:owner";
-const std::string wqJobs = "q:emails:jobs";
+const std::string kHWqName = "emails";
+const std::string kHWqReady = "q:emails:ready";
+const std::string kHWqInflight = "q:emails:inflight";
+const std::string kHWqOwner = "q:emails:owner";
+const std::string kHWqJobs = "q:emails:jobs";
 
-using Claimed = std::optional<std::vector<std::string>>;
+using HClaimed = std::optional<std::vector<std::string>>;
 
-bool wqEnqueue(harness::Ctx&, const std::string& jobID, const std::string& payload) {
-  return enqueue(wqName, jobID, payload);
+bool hWqEnqueue(harness::Ctx&, const std::string& jobID, const std::string& payload) {
+  return enqueue(kHWqName, jobID, payload);
 }
 
-void wqQueue(harness::Ctx& ctx, int n) {
+void hWqQueue(harness::Ctx& ctx, int n) {
   for (int i = 1; i <= n; i++) {
-    ctx.Equal(wqEnqueue(ctx, harness::Sprintf("j%d", i), harness::Sprintf("p%d", i)), true,
+    ctx.Equal(hWqEnqueue(ctx, harness::Sprintf("j%d", i), harness::Sprintf("p%d", i)), true,
               "enqueue of a fresh id j%d must return true", i);
   }
 }
 
 // wqClaim is the claim as [jobID, payload], or nullopt when claim returned nothing.
-Claimed wqClaim(harness::Ctx&, const std::string& worker, long long visibility, long long now) {
-  const auto c = claim(wqName, worker, visibility, now);
+HClaimed hWqClaim(harness::Ctx&, const std::string& worker, long long visibility, long long now) {
+  const auto c = claim(kHWqName, worker, visibility, now);
   if (!c) return std::nullopt;
   return std::vector<std::string>{c->first, c->second};
 }
 
-bool wqAck(harness::Ctx&, const std::string& jobID, const std::string& worker) { return ack(wqName, jobID, worker); }
+bool hWqAck(harness::Ctx&, const std::string& jobID, const std::string& worker) { return ack(kHWqName, jobID, worker); }
 
-long long wqRequeue(harness::Ctx&, long long now) { return requeue_expired(wqName, now); }
+long long hWqRequeue(harness::Ctx&, long long now) { return requeue_expired(kHWqName, now); }
 
 // Stats as {ready, inflight}.
-std::vector<long long> wqStats(harness::Ctx&) {
-  const Stats s = stats(wqName);
+std::vector<long long> hWqStats(harness::Ctx&) {
+  const Stats s = stats(kHWqName);
   return {s.ready, s.inflight};
 }
 
-std::optional<double> wqScore(harness::Ctx& ctx, const std::string& id) { return ctx.Redis.ZScore(wqInflight, id); }
+std::optional<double> hWqScore(harness::Ctx& ctx, const std::string& id) { return ctx.Redis.ZScore(kHWqInflight, id); }
 
-std::optional<std::string> wqHGet(harness::Ctx& ctx, const std::string& key, const std::string& field) {
+std::optional<std::string> hWqHGet(harness::Ctx& ctx, const std::string& key, const std::string& field) {
   return ctx.Redis.HGet(key, field);
 }
 
-int wqHExists(harness::Ctx& ctx, const std::string& key, const std::string& field) {
+int hWqHExists(harness::Ctx& ctx, const std::string& key, const std::string& field) {
   return ctx.Redis.HGet(key, field) ? 1 : 0;
 }
 
-std::vector<std::string> wqInflightIDs(harness::Ctx& ctx) {
+std::vector<std::string> hWqInflightIDs(harness::Ctx& ctx) {
   std::vector<std::string> ids;
-  for (const auto& z : ctx.Redis.ZRangeWithScores(wqInflight, 0, -1)) ids.push_back(z.Member);
+  for (const auto& z : ctx.Redis.ZRangeWithScores(kHWqInflight, 0, -1)) ids.push_back(z.Member);
   return ids;
 }
 
 }  // namespace
 
 void CheckClaimInflight(harness::Ctx& ctx) {
-  wqQueue(ctx, 2);
-  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j1", "j2"}, "ready after two enqueues, expected [j1, j2] (RPUSH)");
-  const auto got = wqClaim(ctx, "A", 30, 100);
+  hWqQueue(ctx, 2);
+  ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), {"j1", "j2"}, "ready after two enqueues, expected [j1, j2] (RPUSH)");
+  const auto got = hWqClaim(ctx, "A", 30, 100);
   ctx.Equal(got, {"j1", "p1"}, "claim must return the head of ready with its payload");
-  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j2"}, "ready after the claim: the claimed id must leave the list");
-  ctx.Assert(wqScore(ctx, "j1").has_value(), "inflight is %q, expected j1: the claimed id must be ZADDed", wqInflightIDs(ctx));
-  ctx.Equal(wqScore(ctx, "j1"), 130, "j1's inflight score, expected now + visibility = 100 + 30 = 130");
-  ctx.Equal(wqHGet(ctx, wqOwner, "j1"), "A", "owner of j1");
-  ctx.Equal(wqHGet(ctx, wqJobs, "j1"), "p1", "the payload must stay in q:emails:jobs until the ack");
-  ctx.Equal(wqStats(ctx), {1, 1}, "stats, expected ready 1 / inflight 1");
-  ctx.Equal(wqClaim(ctx, "B", 30, 101), {"j2", "p2"}, "the second claim gets j2");
-  ctx.Equal(wqClaim(ctx, "B", 30, 102), nullptr, "a claim on an empty ready list must return ok false");
-  ctx.Equal(wqStats(ctx), {0, 2}, "stats, expected ready 0 / inflight 2");
+  ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), {"j2"}, "ready after the claim: the claimed id must leave the list");
+  ctx.Assert(hWqScore(ctx, "j1").has_value(), "inflight is %q, expected j1: the claimed id must be ZADDed", hWqInflightIDs(ctx));
+  ctx.Equal(hWqScore(ctx, "j1"), 130, "j1's inflight score, expected now + visibility = 100 + 30 = 130");
+  ctx.Equal(hWqHGet(ctx, kHWqOwner, "j1"), "A", "owner of j1");
+  ctx.Equal(hWqHGet(ctx, kHWqJobs, "j1"), "p1", "the payload must stay in q:emails:jobs until the ack");
+  ctx.Equal(hWqStats(ctx), {1, 1}, "stats, expected ready 1 / inflight 1");
+  ctx.Equal(hWqClaim(ctx, "B", 30, 101), {"j2", "p2"}, "the second claim gets j2");
+  ctx.Equal(hWqClaim(ctx, "B", 30, 102), nullptr, "a claim on an empty ready list must return ok false");
+  ctx.Equal(hWqStats(ctx), {0, 2}, "stats, expected ready 0 / inflight 2");
 }
 
 void CheckFifoDedupe(harness::Ctx& ctx) {
-  wqQueue(ctx, 5);
+  hWqQueue(ctx, 5);
   std::vector<std::string> order;
   for (int i = 0; i < 5; i++) {
-    const auto got = wqClaim(ctx, "A", 30, 100);
+    const auto got = hWqClaim(ctx, "A", 30, 100);
     ctx.Assert(got.has_value(), "claim returned ok false with jobs still ready (claims so far: %q)", order);
     order.push_back((*got)[0]);
   }
   ctx.Equal(order, {"j1", "j2", "j3", "j4", "j5"}, "claims must come out as j1..j5 in enqueue order (RPUSH in, LPOP out)");
-  ctx.Equal(wqClaim(ctx, "A", 30, 100), nullptr, "the sixth claim must return ok false");
-  ctx.Equal(wqEnqueue(ctx, "j6", "p6"), true, "enqueue of a fresh id j6");
-  ctx.Equal(wqEnqueue(ctx, "j6", "other"), false, "enqueue of an id that already exists must return false");
-  ctx.Equal(wqHGet(ctx, wqJobs, "j6"), "p6", "a refused enqueue must not overwrite the payload");
-  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j6"}, "ready: a refused enqueue must not push a second entry");
-  const auto got = wqClaim(ctx, "A", 30, 100);
+  ctx.Equal(hWqClaim(ctx, "A", 30, 100), nullptr, "the sixth claim must return ok false");
+  ctx.Equal(hWqEnqueue(ctx, "j6", "p6"), true, "enqueue of a fresh id j6");
+  ctx.Equal(hWqEnqueue(ctx, "j6", "other"), false, "enqueue of an id that already exists must return false");
+  ctx.Equal(hWqHGet(ctx, kHWqJobs, "j6"), "p6", "a refused enqueue must not overwrite the payload");
+  ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), {"j6"}, "ready: a refused enqueue must not push a second entry");
+  const auto got = hWqClaim(ctx, "A", 30, 100);
   ctx.Assert(got.has_value(), "claim returned ok false with j6 ready");
   ctx.Equal((*got)[0], "j6", "the claim after the refused enqueue");
-  ctx.Equal(wqEnqueue(ctx, "j6", "again"), false, "an id that is inflight still exists and must be refused");
-  ctx.Equal(ctx.Redis.LLen(wqReady), 0, "LLEN q:emails:ready");
+  ctx.Equal(hWqEnqueue(ctx, "j6", "again"), false, "an id that is inflight still exists and must be refused");
+  ctx.Equal(ctx.Redis.LLen(kHWqReady), 0, "LLEN q:emails:ready");
 }
 
 void CheckAckOwner(harness::Ctx& ctx) {
-  wqQueue(ctx, 2);
-  wqClaim(ctx, "A", 30, 100);
-  ctx.Equal(wqAck(ctx, "j1", "B"), false, "ack from a worker that does not own the job must return false");
-  ctx.Assert(wqScore(ctx, "j1") == 130.0 && wqHGet(ctx, wqOwner, "j1") == "A" && wqHGet(ctx, wqJobs, "j1") == "p1",
+  hWqQueue(ctx, 2);
+  hWqClaim(ctx, "A", 30, 100);
+  ctx.Equal(hWqAck(ctx, "j1", "B"), false, "ack from a worker that does not own the job must return false");
+  ctx.Assert(hWqScore(ctx, "j1") == 130.0 && hWqHGet(ctx, kHWqOwner, "j1") == "A" && hWqHGet(ctx, kHWqJobs, "j1") == "p1",
              "a refused ack must change nothing");
-  ctx.Equal(wqAck(ctx, "j2", "A"), false, "ack of a job that is not inflight (j2 is still ready) must return false");
-  const auto ready = ctx.Redis.LRange(wqReady, 0, -1);
-  ctx.Assert(!ready.empty() && ready[0] == "j2" && wqHGet(ctx, wqJobs, "j2") == "p2", "a refused ack must leave the ready job alone");
-  ctx.Equal(wqAck(ctx, "ghost", "A"), false, "ack of an unknown id must return false");
-  ctx.Equal(wqAck(ctx, "j1", "A"), true, "the owner's ack must return true");
-  ctx.Equal(wqScore(ctx, "j1"), nullptr, "after the ack j1 must leave inflight");
-  ctx.Equal(wqHExists(ctx, wqOwner, "j1"), 0, "after the ack j1 must have no owner");
-  ctx.Equal(wqHExists(ctx, wqJobs, "j1"), 0, "after the ack the payload must be deleted from jobs");
-  ctx.Equal(wqAck(ctx, "j1", "A"), false, "a second ack must return false");
-  ctx.Equal(wqStats(ctx), {1, 0}, "stats after the ack");
-  ctx.Equal(wqEnqueue(ctx, "j1", "p1-again"), true, "once acked, the id is free to be enqueued again");
+  ctx.Equal(hWqAck(ctx, "j2", "A"), false, "ack of a job that is not inflight (j2 is still ready) must return false");
+  const auto ready = ctx.Redis.LRange(kHWqReady, 0, -1);
+  ctx.Assert(!ready.empty() && ready[0] == "j2" && hWqHGet(ctx, kHWqJobs, "j2") == "p2", "a refused ack must leave the ready job alone");
+  ctx.Equal(hWqAck(ctx, "ghost", "A"), false, "ack of an unknown id must return false");
+  ctx.Equal(hWqAck(ctx, "j1", "A"), true, "the owner's ack must return true");
+  ctx.Equal(hWqScore(ctx, "j1"), nullptr, "after the ack j1 must leave inflight");
+  ctx.Equal(hWqHExists(ctx, kHWqOwner, "j1"), 0, "after the ack j1 must have no owner");
+  ctx.Equal(hWqHExists(ctx, kHWqJobs, "j1"), 0, "after the ack the payload must be deleted from jobs");
+  ctx.Equal(hWqAck(ctx, "j1", "A"), false, "a second ack must return false");
+  ctx.Equal(hWqStats(ctx), {1, 0}, "stats after the ack");
+  ctx.Equal(hWqEnqueue(ctx, "j1", "p1-again"), true, "once acked, the id is free to be enqueued again");
 }
 
 void CheckVisibilityTimeout(harness::Ctx& ctx) {
-  wqQueue(ctx, 2);
-  ctx.Equal(wqClaim(ctx, "A", 30, 100), {"j1", "p1"}, "the first claim");
-  ctx.Equal(wqRequeue(ctx, 129), 0, "before the deadline (130) nothing is expired: requeueExpired(129)");
-  auto ready = ctx.Redis.LRange(wqReady, 0, -1);
-  ctx.Assert(wqScore(ctx, "j1") == 130.0 && !ready.empty() && ready[0] == "j2", "requeueExpired before the deadline must move nothing");
-  auto got = wqClaim(ctx, "B", 30, 129);
+  hWqQueue(ctx, 2);
+  ctx.Equal(hWqClaim(ctx, "A", 30, 100), {"j1", "p1"}, "the first claim");
+  ctx.Equal(hWqRequeue(ctx, 129), 0, "before the deadline (130) nothing is expired: requeueExpired(129)");
+  auto ready = ctx.Redis.LRange(kHWqReady, 0, -1);
+  ctx.Assert(hWqScore(ctx, "j1") == 130.0 && !ready.empty() && ready[0] == "j2", "requeueExpired before the deadline must move nothing");
+  auto got = hWqClaim(ctx, "B", 30, 129);
   ctx.Assert(got.has_value() && (*got)[0] == "j2", "while j1 is inflight, another worker gets the next job, never j1: got %q", got);
-  const auto n = wqRequeue(ctx, 130);
+  const auto n = hWqRequeue(ctx, 130);
   ctx.Equal(n, 1, "requeueExpired(130): j1's deadline is 130 and score <= now counts as expired");
-  ctx.Equal(ctx.Redis.LRange(wqReady, 0, -1), {"j1"}, "ready: the expired job goes back to the head (LPUSH)");
-  ctx.Equal(wqScore(ctx, "j1"), nullptr, "a requeued job must leave inflight");
-  ctx.Equal(wqHExists(ctx, wqOwner, "j1"), 0, "a requeued job must have no owner");
-  ctx.Equal(wqHGet(ctx, wqJobs, "j1"), "p1", "requeue keeps the payload");
-  ctx.Equal(wqAck(ctx, "j1", "A"), false, "the worker that lost the job cannot ack it any more");
-  got = wqClaim(ctx, "B", 60, 131);
+  ctx.Equal(ctx.Redis.LRange(kHWqReady, 0, -1), {"j1"}, "ready: the expired job goes back to the head (LPUSH)");
+  ctx.Equal(hWqScore(ctx, "j1"), nullptr, "a requeued job must leave inflight");
+  ctx.Equal(hWqHExists(ctx, kHWqOwner, "j1"), 0, "a requeued job must have no owner");
+  ctx.Equal(hWqHGet(ctx, kHWqJobs, "j1"), "p1", "requeue keeps the payload");
+  ctx.Equal(hWqAck(ctx, "j1", "A"), false, "the worker that lost the job cannot ack it any more");
+  got = hWqClaim(ctx, "B", 60, 131);
   ctx.Equal(got, {"j1", "p1"}, "after the requeue another worker claims j1 again");
-  ctx.Equal(wqScore(ctx, "j1"), 191, "the re-claimed job's deadline, expected 131 + 60 = 191");
-  ctx.Equal(wqHGet(ctx, wqOwner, "j1"), "B", "owner of the re-claimed j1");
-  ctx.Equal(wqAck(ctx, "j1", "A"), false, "A's late ack must be refused: B owns j1 now");
-  ctx.Equal(wqAck(ctx, "j1", "B"), true, "B's ack of j1");
+  ctx.Equal(hWqScore(ctx, "j1"), 191, "the re-claimed job's deadline, expected 131 + 60 = 191");
+  ctx.Equal(hWqHGet(ctx, kHWqOwner, "j1"), "B", "owner of the re-claimed j1");
+  ctx.Equal(hWqAck(ctx, "j1", "A"), false, "A's late ack must be refused: B owns j1 now");
+  ctx.Equal(hWqAck(ctx, "j1", "B"), true, "B's ack of j1");
 }
 
 void CheckRequeueOnlyExpired(harness::Ctx& ctx) {
-  wqQueue(ctx, 4);
-  wqClaim(ctx, "A", 10, 100);
-  wqClaim(ctx, "B", 20, 100);
-  wqClaim(ctx, "C", 30, 100);
-  ctx.Equal(wqRequeue(ctx, 120), 2, "at 120 two deadlines (110, 120) have passed: requeueExpired(120)");
-  const auto ready = ctx.Redis.LRange(wqReady, 0, -1);
+  hWqQueue(ctx, 4);
+  hWqClaim(ctx, "A", 10, 100);
+  hWqClaim(ctx, "B", 20, 100);
+  hWqClaim(ctx, "C", 30, 100);
+  ctx.Equal(hWqRequeue(ctx, 120), 2, "at 120 two deadlines (110, 120) have passed: requeueExpired(120)");
+  const auto ready = ctx.Redis.LRange(kHWqReady, 0, -1);
   auto sorted = ready;
   std::sort(sorted.begin(), sorted.end());
   ctx.Assert(sorted == std::vector<std::string>{"j1", "j2", "j4"} && ready[2] == "j4",
              "ready is %q: j1 and j2 must be back ahead of the never-claimed j4", ready);
-  ctx.Equal(wqInflightIDs(ctx), {"j3"}, "inflight, expected only j3 (deadline 130)");
-  ctx.Equal(ctx.Redis.HGetAll(wqOwner), std::map<std::string, std::string>{{"j3", "C"}}, "owner, expected only j3 -> C");
-  ctx.Equal(wqStats(ctx), {3, 1}, "stats after the sweep");
-  ctx.Equal(wqRequeue(ctx, 120), 0, "a second sweep at the same instant has nothing left: requeueExpired(120)");
-  ctx.Equal(wqRequeue(ctx, 1000), 1, "requeueExpired(1000)");
-  ctx.Assert(ctx.Redis.ZCard(wqInflight) == 0 && ctx.Redis.HLen(wqOwner) == 0, "after the last sweep inflight and owner must be empty");
-  ctx.Equal(ctx.Redis.LLen(wqReady), 4, "LLEN q:emails:ready");
+  ctx.Equal(hWqInflightIDs(ctx), {"j3"}, "inflight, expected only j3 (deadline 130)");
+  ctx.Equal(ctx.Redis.HGetAll(kHWqOwner), std::map<std::string, std::string>{{"j3", "C"}}, "owner, expected only j3 -> C");
+  ctx.Equal(hWqStats(ctx), {3, 1}, "stats after the sweep");
+  ctx.Equal(hWqRequeue(ctx, 120), 0, "a second sweep at the same instant has nothing left: requeueExpired(120)");
+  ctx.Equal(hWqRequeue(ctx, 1000), 1, "requeueExpired(1000)");
+  ctx.Assert(ctx.Redis.ZCard(kHWqInflight) == 0 && ctx.Redis.HLen(kHWqOwner) == 0, "after the last sweep inflight and owner must be empty");
+  ctx.Equal(ctx.Redis.LLen(kHWqReady), 4, "LLEN q:emails:ready");
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
-  wqQueue(ctx, 2);
+  hWqQueue(ctx, 2);
   // What worker B saw and got, claiming right after A's first command on ready.
   bool fired = false;
   std::optional<std::string> err;
   std::vector<std::string> seenReady, seenInflight;
   std::map<std::string, std::string> seenOwner;
-  Claimed seenGot;
-  ctx.Redis.After(wqReady, [&] {
+  HClaimed seenGot;
+  ctx.Redis.After(kHWqReady, [&] {
     fired = true;
-    seenReady = ctx.Redis.LRange(wqReady, 0, -1);
-    seenInflight = wqInflightIDs(ctx);
-    seenOwner = ctx.Redis.HGetAll(wqOwner);
+    seenReady = ctx.Redis.LRange(kHWqReady, 0, -1);
+    seenInflight = hWqInflightIDs(ctx);
+    seenOwner = ctx.Redis.HGetAll(kHWqOwner);
     try {
-      seenGot = wqClaim(ctx, "B", 30, 100);
+      seenGot = hWqClaim(ctx, "B", 30, 100);
     } catch (const std::exception& e) {
       err = e.what();
     }
   });
-  const auto gotA = wqClaim(ctx, "A", 30, 100);
+  const auto gotA = hWqClaim(ctx, "A", 30, 100);
   ctx.Assert(fired, "claim never touched q:emails:ready");
   ctx.Assert(!err, "worker B's claim failed: %s", err.value_or(""));
   ctx.Equal(gotA, {"j1", "p1"}, "worker A's claim, expected j1");
@@ -1665,8 +1665,8 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
              "right after ready was touched, inflight is %q and owner %v: j1 was popped but not yet inflight — a crash here loses the job; pop, ZADD and HSET must be one script",
              seenInflight, seenOwner);
   ctx.Equal(seenGot, {"j2", "p2"}, "worker B, claiming at that instant, must get j2: two workers must never hold the same job");
-  ctx.Equal(ctx.Redis.HGetAll(wqOwner), std::map<std::string, std::string>{{"j1", "A"}, {"j2", "B"}}, "owners, expected j1 -> A, j2 -> B");
-  ctx.Assert(ctx.Redis.ZCard(wqInflight) == 2 && ctx.Redis.LLen(wqReady) == 0, "after both claims inflight must hold 2 and ready 0");
+  ctx.Equal(ctx.Redis.HGetAll(kHWqOwner), std::map<std::string, std::string>{{"j1", "A"}, {"j2", "B"}}, "owners, expected j1 -> A, j2 -> B");
+  ctx.Assert(ctx.Redis.ZCard(kHWqInflight) == 2 && ctx.Redis.LLen(kHWqReady) == 0, "after both claims inflight must hold 2 and ready 0");
 }
 `,
   },

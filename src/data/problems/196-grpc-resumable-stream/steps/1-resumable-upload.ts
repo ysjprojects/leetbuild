@@ -992,9 +992,9 @@ import (
 	pb "ingest/gen/ingest"
 )
 
-const upLast = 7
+const kHUpLast = 7
 
-func upChunks() [][]byte {
+func hUpChunks() [][]byte {
 	var chunks [][]byte
 	for i := range 8 {
 		chunks = append(chunks, []byte(fmt.Sprintf("chunk-%d", i)))
@@ -1003,51 +1003,51 @@ func upChunks() [][]byte {
 }
 
 // upFault is how one Upload stream ends early: after \`after\` fresh commits, with code; dropAck loses that commit's Ack.
-type upFault struct {
+type HUpFault struct {
 	code    codes.Code
 	after   int
 	dropAck bool
 	details string
 }
 
-type upChunk struct {
+type HUpChunk struct {
 	uploadID string
 	seq      int32
 	data     string
 }
 
-type upStatusCall struct {
+type HUpStatusCall struct {
 	uploadID string
 	at       time.Time
 }
 
 // upPeer is the ingest server: a committed point per upload, when each GetStatus and stream came, every chunk each stream delivered.
-type upPeer struct {
+type HUpPeer struct {
 	mu           sync.Mutex
 	committed    map[string]int32
-	statusCalls  []upStatusCall
+	statusCalls  []HUpStatusCall
 	opened       []time.Time
-	streams      [][]upChunk
+	streams      [][]HUpChunk
 	closed       []bool
-	plan         []upFault
+	plan         []HUpFault
 	finalAcked   bool
 	holdFinalAck bool
 }
 
-func (p *upPeer) GetStatus(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
+func (p *HUpPeer) GetStatus(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.statusCalls = append(p.statusCalls, upStatusCall{uploadID: req.GetUploadId(), at: time.Now()})
+	p.statusCalls = append(p.statusCalls, HUpStatusCall{uploadID: req.GetUploadId(), at: time.Now()})
 	return &pb.StatusResponse{NextSeq: p.committed[req.GetUploadId()]}, nil
 }
 
-func (p *upPeer) Upload(stream pb.Ingest_UploadServer) error {
+func (p *HUpPeer) Upload(stream pb.Ingest_UploadServer) error {
 	p.mu.Lock()
 	n := len(p.streams)
 	p.opened = append(p.opened, time.Now())
 	p.streams = append(p.streams, nil)
 	p.closed = append(p.closed, false)
-	var f *upFault
+	var f *HUpFault
 	if len(p.plan) > 0 {
 		f = &p.plan[0]
 		p.plan = p.plan[1:]
@@ -1067,14 +1067,14 @@ func (p *upPeer) Upload(stream pb.Ingest_UploadServer) error {
 		}
 		id, seq := chunk.GetUploadId(), chunk.GetSeq()
 		p.mu.Lock()
-		p.streams[n] = append(p.streams[n], upChunk{uploadID: id, seq: seq, data: string(chunk.GetData())})
+		p.streams[n] = append(p.streams[n], HUpChunk{uploadID: id, seq: seq, data: string(chunk.GetData())})
 		expected := p.committed[id]
 		p.mu.Unlock()
 		if seq > expected {
 			return status.Errorf(codes.FailedPrecondition, "gap: expected seq %d, got %d", expected, seq)
 		}
 		if seq == expected {
-			if p.holdFinalAck && seq == upLast {
+			if p.holdFinalAck && seq == kHUpLast {
 				time.Sleep(50 * time.Millisecond) // a slow final commit: the Ack for seq 7 comes later
 			}
 			p.mu.Lock()
@@ -1095,7 +1095,7 @@ func (p *upPeer) Upload(stream pb.Ingest_UploadServer) error {
 			}
 			return status.Error(f.code, details)
 		}
-		if ack.GetSeq() == upLast {
+		if ack.GetSeq() == kHUpLast {
 			p.mu.Lock()
 			p.finalAcked = true
 			p.mu.Unlock()
@@ -1107,58 +1107,58 @@ func (p *upPeer) Upload(stream pb.Ingest_UploadServer) error {
 }
 
 // upFront is the one Ingest service at ingest:9000; it forwards to the server of the latest upStart.
-type upFront struct {
+type HUpFront struct {
 	pb.UnimplementedIngestServer
 	mu  sync.Mutex
-	cur *upPeer
+	cur *HUpPeer
 }
 
-func (f *upFront) peer() *upPeer {
+func (f *HUpFront) peer() *HUpPeer {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.cur
 }
 
-func (f *upFront) GetStatus(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
+func (f *HUpFront) GetStatus(ctx context.Context, req *pb.StatusRequest) (*pb.StatusResponse, error) {
 	return f.peer().GetStatus(ctx, req)
 }
 
-func (f *upFront) Upload(stream pb.Ingest_UploadServer) error { return f.peer().Upload(stream) }
+func (f *HUpFront) Upload(stream pb.Ingest_UploadServer) error { return f.peer().Upload(stream) }
 
-var upServing *upFront
+var hUpServing *HUpFront
 
 // upStart is a fresh ingest server with the given stream faults, and a client for it.
-func upStart(ctx *harness.Ctx, plan []upFault, holdFinalAck bool) (*upPeer, pb.IngestClient) {
-	p := &upPeer{committed: map[string]int32{}, plan: plan, holdFinalAck: holdFinalAck}
-	if upServing == nil {
-		upServing = &upFront{}
-		pb.RegisterIngestServer(ctx.GRPC.Server("ingest:9000"), upServing)
+func hUpStart(ctx *harness.Ctx, plan []HUpFault, holdFinalAck bool) (*HUpPeer, pb.IngestClient) {
+	p := &HUpPeer{committed: map[string]int32{}, plan: plan, holdFinalAck: holdFinalAck}
+	if hUpServing == nil {
+		hUpServing = &HUpFront{}
+		pb.RegisterIngestServer(ctx.GRPC.Server("ingest:9000"), hUpServing)
 	}
-	upServing.mu.Lock()
-	upServing.cur = p
-	upServing.mu.Unlock()
+	hUpServing.mu.Lock()
+	hUpServing.cur = p
+	hUpServing.mu.Unlock()
 	conn, err := grpc.NewClient("ingest:9000", grpc.WithTransportCredentials(insecure.NewCredentials()))
 	ctx.NoError(err, "grpc.NewClient")
 	return p, pb.NewIngestClient(conn)
 }
 
 // upFaultOf is a fault after one fresh commit.
-func upFaultOf(code codes.Code) upFault { return upFault{code: code, after: 1} }
+func hUpFaultOf(code codes.Code) HUpFault { return HUpFault{code: code, after: 1} }
 
 // upResult is how upload(ctx, client, "up-1", chunks, maxAttempts) ended.
-type upResult struct {
+type HUpResult struct {
 	returned int
 	err      error
 	finished time.Time
 }
 
-func upRun(client pb.IngestClient, maxAttempts int) upResult {
-	returned, err := upload(context.Background(), client, "up-1", upChunks(), maxAttempts)
-	return upResult{returned: returned, err: err, finished: time.Now()}
+func hUpRun(client pb.IngestClient, maxAttempts int) HUpResult {
+	returned, err := upload(context.Background(), client, "up-1", hUpChunks(), maxAttempts)
+	return HUpResult{returned: returned, err: err, finished: time.Now()}
 }
 
 // upSent are the seqs each stream delivered: [[0 1 2 3 4] [5 6 7]].
-func upSent(p *upPeer) [][]int32 {
+func hUpSent(p *HUpPeer) [][]int32 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	out := [][]int32{}
@@ -1172,11 +1172,11 @@ func upSent(p *upPeer) [][]int32 {
 	return out
 }
 
-func upOK(ctx *harness.Ctx, r upResult, what string) {
+func hUpOK(ctx *harness.Ctx, r HUpResult, what string) {
 	ctx.NoError(r.err, "%s: upload() returned an error", what)
 }
 
-func upRPCError(ctx *harness.Ctx, r upResult, code codes.Code, what string) {
+func hUpRPCError(ctx *harness.Ctx, r HUpResult, code codes.Code, what string) {
 	ctx.Assert(r.err != nil, "%s: upload() returned %d instead of an error with %v", what, r.returned, code)
 	st, ok := status.FromError(r.err)
 	ctx.Assert(ok, "%s: upload() returned %v, expected the gRPC status error with %v", what, r.err, code)
@@ -1184,16 +1184,16 @@ func upRPCError(ctx *harness.Ctx, r upResult, code codes.Code, what string) {
 }
 
 func CheckCleanUpload(ctx *harness.Ctx) {
-	p, client := upStart(ctx, nil, true)
-	r := upRun(client, 4)
+	p, client := hUpStart(ctx, nil, true)
+	r := hUpRun(client, 4)
 	p.mu.Lock()
 	ackedOnReturn := p.finalAcked
 	p.mu.Unlock()
-	upOK(ctx, r, "a clean upload")
+	hUpOK(ctx, r, "a clean upload")
 	ctx.Equal(len(p.statusCalls), 1, "a clean upload must call GetStatus once, before the stream: GetStatus calls")
 	ctx.Equal(p.statusCalls[0].uploadID, "up-1", "GetStatus must ask for the upload: its upload_id")
 	ctx.Equal(len(p.streams), 1, "a clean upload must open one stream: Upload streams")
-	ctx.Equal(upSent(p), [][]int32{{0, 1, 2, 3, 4, 5, 6, 7}}, "the stream must deliver each chunk once, in order: seqs per stream")
+	ctx.Equal(hUpSent(p), [][]int32{{0, 1, 2, 3, 4, 5, 6, 7}}, "the stream must deliver each chunk once, in order: seqs per stream")
 	for _, c := range p.streams[0] {
 		ctx.Equal(c.uploadID, "up-1", "Chunk seq %d must carry the upload_id", c.seq)
 		ctx.Equal(c.data, fmt.Sprintf("chunk-%d", c.seq), "Chunk seq %d must carry chunks[%d]", c.seq, c.seq)
@@ -1207,29 +1207,29 @@ func CheckCleanUpload(ctx *harness.Ctx) {
 }
 
 func CheckResumeFromStatus(ctx *harness.Ctx) {
-	p, client := upStart(ctx, nil, false)
+	p, client := hUpStart(ctx, nil, false)
 	p.committed["up-1"] = 3
-	r := upRun(client, 4)
-	upOK(ctx, r, "an upload the server already holds seqs 0 to 2 of")
-	ctx.Equal(upSent(p), [][]int32{{3, 4, 5, 6, 7}}, "with GetStatus at NextSeq 3 the streams must start at NextSeq, not at 0: seqs per stream")
+	r := hUpRun(client, 4)
+	hUpOK(ctx, r, "an upload the server already holds seqs 0 to 2 of")
+	ctx.Equal(hUpSent(p), [][]int32{{3, 4, 5, 6, 7}}, "with GetStatus at NextSeq 3 the streams must start at NextSeq, not at 0: seqs per stream")
 
-	p, client = upStart(ctx, []upFault{{code: codes.Unavailable, after: 5, dropAck: true}}, false)
-	r = upRun(client, 4)
-	upOK(ctx, r, "an upload whose stream died after seq 4 was committed")
-	streams := upSent(p)
+	p, client = hUpStart(ctx, []HUpFault{{code: codes.Unavailable, after: 5, dropAck: true}}, false)
+	r = hUpRun(client, 4)
+	hUpOK(ctx, r, "an upload whose stream died after seq 4 was committed")
+	streams := hUpSent(p)
 	ctx.Assert(len(streams) == 2 && fmt.Sprint(streams[1]) == "[5 6 7]", "seqs 0 to 4 were committed, the Ack for 4 was lost, then UNAVAILABLE; the streams delivered %v, expected [[0 1 2 3 4] [5 6 7]]: ask GetStatus (NextSeq 5) and resend nothing below it", streams)
 
-	p, client = upStart(ctx, []upFault{{code: codes.Unavailable, after: 8, dropAck: true}}, false)
-	r = upRun(client, 4)
-	upOK(ctx, r, "an upload whose final Ack was lost")
-	ctx.Equal(upSent(p), [][]int32{{0, 1, 2, 3, 4, 5, 6, 7}}, "every chunk was committed and only the final Ack lost: GetStatus says NextSeq 8, so there is nothing to send. Seqs per stream")
+	p, client = hUpStart(ctx, []HUpFault{{code: codes.Unavailable, after: 8, dropAck: true}}, false)
+	r = hUpRun(client, 4)
+	hUpOK(ctx, r, "an upload whose final Ack was lost")
+	ctx.Equal(hUpSent(p), [][]int32{{0, 1, 2, 3, 4, 5, 6, 7}}, "every chunk was committed and only the final Ack lost: GetStatus says NextSeq 8, so there is nothing to send. Seqs per stream")
 }
 
 func CheckBackoff(ctx *harness.Ctx) {
-	p, client := upStart(ctx, []upFault{upFaultOf(codes.Unavailable), upFaultOf(codes.Aborted), upFaultOf(codes.Unavailable)}, false)
+	p, client := hUpStart(ctx, []HUpFault{hUpFaultOf(codes.Unavailable), hUpFaultOf(codes.Aborted), hUpFaultOf(codes.Unavailable)}, false)
 	started := time.Now()
-	r := upRun(client, 4)
-	upOK(ctx, r, "three failed streams, then a clean one")
+	r := hUpRun(client, 4)
+	hUpOK(ctx, r, "three failed streams, then a clean one")
 	var times []float64
 	for _, c := range p.statusCalls {
 		times = append(times, c.at.Sub(started).Seconds())
@@ -1243,17 +1243,17 @@ func CheckBackoff(ctx *harness.Ctx) {
 	for i, want := range []float64{0.1, 0.2, 0.4} {
 		ctx.Assert(math.Abs(gaps[i]-want) < 0.05, "the GetStatus calls were %v s apart, expected [0.1 0.2 0.4]: wait baseBackoff << (attempt - 1) after attempt number attempt fails", gaps)
 	}
-	ctx.Equal(upSent(p), [][]int32{{0}, {1}, {2}, {3, 4, 5, 6, 7}}, "seqs per stream")
+	ctx.Equal(hUpSent(p), [][]int32{{0}, {1}, {2}, {3, 4, 5, 6, 7}}, "seqs per stream")
 }
 
 func CheckGivesUp(ctx *harness.Ctx) {
-	var plan []upFault
+	var plan []HUpFault
 	for i := range 10 {
-		plan = append(plan, upFault{code: codes.Unavailable, after: 1, details: fmt.Sprintf("ingest restarting (%d)", i+1)})
+		plan = append(plan, HUpFault{code: codes.Unavailable, after: 1, details: fmt.Sprintf("ingest restarting (%d)", i+1)})
 	}
-	p, client := upStart(ctx, plan, false)
-	r := upRun(client, 3)
-	upRPCError(ctx, r, codes.Unavailable, "a server that drops every stream, maxAttempts 3")
+	p, client := hUpStart(ctx, plan, false)
+	r := hUpRun(client, 3)
+	hUpRPCError(ctx, r, codes.Unavailable, "a server that drops every stream, maxAttempts 3")
 	ctx.Equal(len(p.streams), 3, "with maxAttempts 3 upload() must open 3 streams: streams")
 	ctx.Equal(status.Convert(r.err).Message(), "ingest restarting (3)", "upload() must return the last error, the third stream's: its message")
 	waited := r.finished.Sub(p.opened[len(p.opened)-1]).Seconds()
@@ -1261,20 +1261,20 @@ func CheckGivesUp(ctx *harness.Ctx) {
 
 	plan = nil
 	for range 10 {
-		plan = append(plan, upFaultOf(codes.Unavailable))
+		plan = append(plan, hUpFaultOf(codes.Unavailable))
 	}
-	p, client = upStart(ctx, plan, false)
-	r = upRun(client, 4)
-	upRPCError(ctx, r, codes.Unavailable, "a server that drops every stream, maxAttempts 4")
+	p, client = hUpStart(ctx, plan, false)
+	r = hUpRun(client, 4)
+	hUpRPCError(ctx, r, codes.Unavailable, "a server that drops every stream, maxAttempts 4")
 	ctx.Equal(len(p.streams), 4, "with maxAttempts 4 upload() must open 4 streams: streams")
 }
 
 func CheckOtherCodes(ctx *harness.Ctx) {
 	for _, code := range []codes.Code{codes.InvalidArgument, codes.PermissionDenied} {
-		p, client := upStart(ctx, []upFault{{code: code, after: 2}}, false)
+		p, client := hUpStart(ctx, []HUpFault{{code: code, after: 2}}, false)
 		started := time.Now()
-		r := upRun(client, 4)
-		upRPCError(ctx, r, code, "a stream that ends with "+code.String())
+		r := hUpRun(client, 4)
+		hUpRPCError(ctx, r, code, "a stream that ends with "+code.String())
 		ctx.Assert(len(p.statusCalls) == 1 && len(p.streams) == 1, "%v was retried (%d GetStatus calls, %d streams): only UNAVAILABLE and ABORTED are", code, len(p.statusCalls), len(p.streams))
 		waited := r.finished.Sub(started).Seconds()
 		ctx.Assert(waited < 0.05, "upload() waited %.2f s before returning %v: return it at once", waited, code)
@@ -1283,20 +1283,20 @@ func CheckOtherCodes(ctx *harness.Ctx) {
 
 func CheckReturnsAttempts(ctx *harness.Ctx) {
 	cases := []struct {
-		plan        []upFault
+		plan        []HUpFault
 		maxAttempts int
 		want        int
 		what        string
 	}{
 		{nil, 4, 1, "a clean upload"},
-		{[]upFault{{code: codes.Aborted, after: 3}}, 4, 2, "one ABORTED stream"},
-		{[]upFault{{code: codes.Unavailable, after: 8, dropAck: true}}, 4, 2, "a stream that lost only the final Ack"},
-		{[]upFault{upFaultOf(codes.Unavailable), upFaultOf(codes.Aborted)}, 3, 3, "two failed streams with maxAttempts 3"},
+		{[]HUpFault{{code: codes.Aborted, after: 3}}, 4, 2, "one ABORTED stream"},
+		{[]HUpFault{{code: codes.Unavailable, after: 8, dropAck: true}}, 4, 2, "a stream that lost only the final Ack"},
+		{[]HUpFault{hUpFaultOf(codes.Unavailable), hUpFaultOf(codes.Aborted)}, 3, 3, "two failed streams with maxAttempts 3"},
 	}
 	for _, tc := range cases {
-		_, client := upStart(ctx, tc.plan, false)
-		r := upRun(client, tc.maxAttempts)
-		upOK(ctx, r, tc.what)
+		_, client := hUpStart(ctx, tc.plan, false)
+		r := hUpRun(client, tc.maxAttempts)
+		hUpOK(ctx, r, tc.what)
 		ctx.Equal(r.returned, tc.want, "%s: upload() must return the attempts it used", tc.what)
 	}
 }
@@ -1317,57 +1317,57 @@ func CheckReturnsAttempts(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr int32_t kUpLast = 7;
+constexpr int32_t kHUpLast = 7;
 
-std::vector<std::string> UpChunks() {
+std::vector<std::string> hUpChunks() {
   std::vector<std::string> chunks;
   for (int i = 0; i < 8; ++i) chunks.push_back("chunk-" + std::to_string(i));
   return chunks;
 }
 
-int64_t UpNowMs() {
+int64_t hUpNowMs() {
   return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // How one Upload stream ends early: after that many fresh commits, with code; drop_ack loses that commit's Ack.
-struct UpFault {
+struct HUpFault {
   grpc::StatusCode code;
   int after;
   bool drop_ack = false;
   std::string details;
 };
 
-UpFault UpFaultOf(grpc::StatusCode code) { return UpFault{code, 1}; }
+HUpFault hUpFaultOf(grpc::StatusCode code) { return HUpFault{code, 1}; }
 
 // The details a fault's status carries.
-std::string UpDetails(const UpFault& f) { return f.details.empty() ? std::string("injected ") + grpc::EnumName(f.code) : f.details; }
+std::string hUpDetails(const HUpFault& f) { return f.details.empty() ? std::string("injected ") + grpc::EnumName(f.code) : f.details; }
 
-struct UpChunk {
+struct HUpChunk {
   std::string upload_id;
   int32_t seq;
   std::string data;
 };
 
-struct UpStatusCall {
+struct HUpStatusCall {
   std::string upload_id;
   int64_t at;  // ms
 };
 
 // The ingest server: a committed point per upload, when each GetStatus and stream came, every chunk each stream delivered.
-struct UpPeer {
+struct HUpPeer {
   std::mutex mu;
   std::map<std::string, int32_t> committed;
-  std::vector<UpStatusCall> status_calls;
+  std::vector<HUpStatusCall> status_calls;
   std::vector<int64_t> opened;
-  std::vector<std::vector<UpChunk>> streams;
+  std::vector<std::vector<HUpChunk>> streams;
   std::vector<bool> closed;
-  std::deque<UpFault> plan;
+  std::deque<HUpFault> plan;
   bool final_acked = false;
   bool hold_final_ack = false;
 
   grpc::Status GetStatus(const ingest::v1::StatusRequest* request, ingest::v1::StatusResponse* reply) {
     std::lock_guard<std::mutex> lock(mu);
-    status_calls.push_back({request->upload_id(), UpNowMs()});
+    status_calls.push_back({request->upload_id(), hUpNowMs()});
     reply->set_next_seq(committed[request->upload_id()]);
     return grpc::Status::OK;
   }
@@ -1375,10 +1375,10 @@ struct UpPeer {
   grpc::Status Upload(grpc::ServerContext* context, grpc::ServerReaderWriter<ingest::v1::Ack, ingest::v1::Chunk>* stream) {
     std::unique_lock<std::mutex> lock(mu);
     const size_t n = streams.size();
-    opened.push_back(UpNowMs());
+    opened.push_back(hUpNowMs());
     streams.emplace_back();
     closed.push_back(false);
-    std::optional<UpFault> fault;
+    std::optional<HUpFault> fault;
     if (!plan.empty()) {
       fault = plan.front();
       plan.pop_front();
@@ -1404,7 +1404,7 @@ struct UpPeer {
         return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                             harness::Sprintf("gap: expected seq %d, got %d", expected, seq));
       if (seq == expected) {
-        if (hold_final_ack && seq == kUpLast)
+        if (hold_final_ack && seq == kHUpLast)
           std::this_thread::sleep_for(std::chrono::milliseconds(50));  // a slow final commit: the Ack for seq 7 comes later
         lock.lock();
         committed[id] = expected + 1;
@@ -1417,9 +1417,9 @@ struct UpPeer {
       lock.unlock();
       if (fault && commits == fault->after) {
         if (!fault->drop_ack) stream->Write(ack);
-        return grpc::Status(fault->code, UpDetails(*fault));
+        return grpc::Status(fault->code, hUpDetails(*fault));
       }
-      if (ack.seq() == kUpLast) {
+      if (ack.seq() == kHUpLast) {
         lock.lock();
         final_acked = true;
         lock.unlock();
@@ -1430,9 +1430,9 @@ struct UpPeer {
 };
 
 // The one Ingest service at ingest:9000; it forwards to the server of the latest UpStart.
-class UpFront final : public ingest::v1::Ingest::Service {
+class HUpFront final : public ingest::v1::Ingest::Service {
  public:
-  UpPeer* cur = nullptr;
+  HUpPeer* cur = nullptr;
 
   grpc::Status GetStatus(grpc::ServerContext*, const ingest::v1::StatusRequest* request, ingest::v1::StatusResponse* reply) override {
     return cur->GetStatus(request, reply);
@@ -1442,48 +1442,48 @@ class UpFront final : public ingest::v1::Ingest::Service {
   }
 };
 
-UpFront* up_serving = nullptr;
+HUpFront* hUp_serving = nullptr;
 
-struct UpStarted {
-  UpPeer* peer;
+struct HUpStarted {
+  HUpPeer* peer;
   std::unique_ptr<ingest::v1::Ingest::Stub> client;
 };
 
 // A fresh ingest server with the given stream faults, and a client for it.
-UpStarted UpStart(harness::Ctx& ctx, std::deque<UpFault> plan, bool hold_final_ack) {
-  auto* p = new UpPeer();
+HUpStarted hUpStart(harness::Ctx& ctx, std::deque<HUpFault> plan, bool hold_final_ack) {
+  auto* p = new HUpPeer();
   p->plan = std::move(plan);
   p->hold_final_ack = hold_final_ack;
-  if (up_serving == nullptr) {
-    up_serving = new UpFront();
-    ctx.GRPC.Server("ingest:9000")->RegisterService(up_serving);
+  if (hUp_serving == nullptr) {
+    hUp_serving = new HUpFront();
+    ctx.GRPC.Server("ingest:9000")->RegisterService(hUp_serving);
   }
-  up_serving->cur = p;
+  hUp_serving->cur = p;
   return {p, ingest::v1::Ingest::NewStub(grpc::CreateChannel("ingest:9000", grpc::InsecureChannelCredentials()))};
 }
 
 // How upload(client, "up-1", chunks, max_attempts) ended.
-struct UpResult {
+struct HUpResult {
   int returned = 0;
   bool failed = false;
   std::string error;  // what() of the exception it threw
   int64_t finished = 0;
 };
 
-UpResult UpRun(ingest::v1::Ingest::Stub& client, int max_attempts) {
-  UpResult r;
+HUpResult hUpRun(ingest::v1::Ingest::Stub& client, int max_attempts) {
+  HUpResult r;
   try {
-    r.returned = upload(client, "up-1", UpChunks(), max_attempts);
+    r.returned = upload(client, "up-1", hUpChunks(), max_attempts);
   } catch (const std::exception& e) {
     r.failed = true;
     r.error = e.what();
   }
-  r.finished = UpNowMs();
+  r.finished = hUpNowMs();
   return r;
 }
 
 // The seqs each stream delivered: [[0 1 2 3 4] [5 6 7]].
-std::vector<std::vector<int32_t>> UpSent(UpPeer& p) {
+std::vector<std::vector<int32_t>> hUpSent(HUpPeer& p) {
   std::lock_guard<std::mutex> lock(p.mu);
   std::vector<std::vector<int32_t>> out;
   for (const auto& s : p.streams) {
@@ -1494,12 +1494,12 @@ std::vector<std::vector<int32_t>> UpSent(UpPeer& p) {
   return out;
 }
 
-void UpOK(harness::Ctx& ctx, const UpResult& r, const std::string& what) {
+void hUpOK(harness::Ctx& ctx, const HUpResult& r, const std::string& what) {
   ctx.Assert(!r.failed, "%s: upload() threw %q", what, r.error);
 }
 
 // upload() must have thrown the failed stream's error: its message carries the status's details.
-void UpRPCError(harness::Ctx& ctx, const UpResult& r, grpc::StatusCode code, const std::string& details, const std::string& what) {
+void hUpRPCError(harness::Ctx& ctx, const HUpResult& r, grpc::StatusCode code, const std::string& details, const std::string& what) {
   ctx.Assert(r.failed, "%s: upload() returned %d instead of throwing the %v error", what, r.returned, code);
   ctx.Assert(r.error.find(details) != std::string::npos, "%s: upload() threw %q, expected the %v stream's error (%q)", what, r.error,
              code, details);
@@ -1508,18 +1508,18 @@ void UpRPCError(harness::Ctx& ctx, const UpResult& r, grpc::StatusCode code, con
 }  // namespace
 
 void CheckCleanUpload(harness::Ctx& ctx) {
-  auto [p, client] = UpStart(ctx, {}, true);
-  const UpResult r = UpRun(*client, 4);
+  auto [p, client] = hUpStart(ctx, {}, true);
+  const HUpResult r = hUpRun(*client, 4);
   bool acked_on_return;
   {
     std::lock_guard<std::mutex> lock(p->mu);
     acked_on_return = p->final_acked;
   }
-  UpOK(ctx, r, "a clean upload");
+  hUpOK(ctx, r, "a clean upload");
   ctx.Equal(p->status_calls.size(), 1, "a clean upload must call GetStatus once, before the stream: GetStatus calls");
   ctx.Equal(p->status_calls[0].upload_id, "up-1", "GetStatus must ask for the upload: its upload_id");
   ctx.Equal(p->streams.size(), 1, "a clean upload must open one stream: Upload streams");
-  ctx.Equal(UpSent(*p), std::vector<std::vector<int32_t>>{{0, 1, 2, 3, 4, 5, 6, 7}},
+  ctx.Equal(hUpSent(*p), std::vector<std::vector<int32_t>>{{0, 1, 2, 3, 4, 5, 6, 7}},
             "the stream must deliver each chunk once, in order: seqs per stream");
   for (const auto& c : p->streams[0]) {
     ctx.Equal(c.upload_id, "up-1", "Chunk seq %d must carry the upload_id", c.seq);
@@ -1537,34 +1537,34 @@ void CheckCleanUpload(harness::Ctx& ctx) {
 }
 
 void CheckResumeFromStatus(harness::Ctx& ctx) {
-  auto [p, client] = UpStart(ctx, {}, false);
+  auto [p, client] = hUpStart(ctx, {}, false);
   p->committed["up-1"] = 3;
-  UpResult r = UpRun(*client, 4);
-  UpOK(ctx, r, "an upload the server already holds seqs 0 to 2 of");
-  ctx.Equal(UpSent(*p), std::vector<std::vector<int32_t>>{{3, 4, 5, 6, 7}},
+  HUpResult r = hUpRun(*client, 4);
+  hUpOK(ctx, r, "an upload the server already holds seqs 0 to 2 of");
+  ctx.Equal(hUpSent(*p), std::vector<std::vector<int32_t>>{{3, 4, 5, 6, 7}},
             "with GetStatus at next_seq 3 the streams must start at next_seq, not at 0: seqs per stream");
 
-  auto second = UpStart(ctx, {UpFault{grpc::StatusCode::UNAVAILABLE, 5, true}}, false);
-  r = UpRun(*second.client, 4);
-  UpOK(ctx, r, "an upload whose stream died after seq 4 was committed");
-  const auto streams = UpSent(*second.peer);
+  auto second = hUpStart(ctx, {HUpFault{grpc::StatusCode::UNAVAILABLE, 5, true}}, false);
+  r = hUpRun(*second.client, 4);
+  hUpOK(ctx, r, "an upload whose stream died after seq 4 was committed");
+  const auto streams = hUpSent(*second.peer);
   ctx.Assert(streams.size() == 2 && streams[1] == std::vector<int32_t>{5, 6, 7},
              "seqs 0 to 4 were committed, the Ack for 4 was lost, then UNAVAILABLE; the streams delivered %v, expected [[0 1 2 3 4] [5 6 7]]: ask GetStatus (next_seq 5) and resend nothing below it",
              streams);
 
-  auto third = UpStart(ctx, {UpFault{grpc::StatusCode::UNAVAILABLE, 8, true}}, false);
-  r = UpRun(*third.client, 4);
-  UpOK(ctx, r, "an upload whose final Ack was lost");
-  ctx.Equal(UpSent(*third.peer), std::vector<std::vector<int32_t>>{{0, 1, 2, 3, 4, 5, 6, 7}},
+  auto third = hUpStart(ctx, {HUpFault{grpc::StatusCode::UNAVAILABLE, 8, true}}, false);
+  r = hUpRun(*third.client, 4);
+  hUpOK(ctx, r, "an upload whose final Ack was lost");
+  ctx.Equal(hUpSent(*third.peer), std::vector<std::vector<int32_t>>{{0, 1, 2, 3, 4, 5, 6, 7}},
             "every chunk was committed and only the final Ack lost: GetStatus says next_seq 8, so there is nothing to send. Seqs per stream");
 }
 
 void CheckBackoff(harness::Ctx& ctx) {
-  auto [p, client] = UpStart(
-      ctx, {UpFaultOf(grpc::StatusCode::UNAVAILABLE), UpFaultOf(grpc::StatusCode::ABORTED), UpFaultOf(grpc::StatusCode::UNAVAILABLE)}, false);
-  const int64_t started = UpNowMs();
-  const UpResult r = UpRun(*client, 4);
-  UpOK(ctx, r, "three failed streams, then a clean one");
+  auto [p, client] = hUpStart(
+      ctx, {hUpFaultOf(grpc::StatusCode::UNAVAILABLE), hUpFaultOf(grpc::StatusCode::ABORTED), hUpFaultOf(grpc::StatusCode::UNAVAILABLE)}, false);
+  const int64_t started = hUpNowMs();
+  const HUpResult r = hUpRun(*client, 4);
+  hUpOK(ctx, r, "three failed streams, then a clean one");
   std::vector<double> times;
   for (const auto& c : p->status_calls) times.push_back(static_cast<double>(c.at - started) / 1000);
   ctx.Equal(times.size(), 4, "three failed streams then a clean one must call GetStatus once per attempt: GetStatus calls");
@@ -1577,15 +1577,15 @@ void CheckBackoff(harness::Ctx& ctx) {
                "the GetStatus calls were %v s apart, expected [0.1 0.2 0.4]: wait kBaseBackoff * (1 << (attempt - 1)) after attempt number attempt fails",
                gaps);
   }
-  ctx.Equal(UpSent(*p), std::vector<std::vector<int32_t>>{{0}, {1}, {2}, {3, 4, 5, 6, 7}}, "seqs per stream");
+  ctx.Equal(hUpSent(*p), std::vector<std::vector<int32_t>>{{0}, {1}, {2}, {3, 4, 5, 6, 7}}, "seqs per stream");
 }
 
 void CheckGivesUp(harness::Ctx& ctx) {
-  std::deque<UpFault> plan;
-  for (int i = 0; i < 10; ++i) plan.push_back(UpFault{grpc::StatusCode::UNAVAILABLE, 1, false, harness::Sprintf("ingest restarting (%d)", i + 1)});
-  auto [p, client] = UpStart(ctx, plan, false);
-  UpResult r = UpRun(*client, 3);
-  UpRPCError(ctx, r, grpc::StatusCode::UNAVAILABLE, "ingest restarting (3)", "a server that drops every stream, max_attempts 3");
+  std::deque<HUpFault> plan;
+  for (int i = 0; i < 10; ++i) plan.push_back(HUpFault{grpc::StatusCode::UNAVAILABLE, 1, false, harness::Sprintf("ingest restarting (%d)", i + 1)});
+  auto [p, client] = hUpStart(ctx, plan, false);
+  HUpResult r = hUpRun(*client, 3);
+  hUpRPCError(ctx, r, grpc::StatusCode::UNAVAILABLE, "ingest restarting (3)", "a server that drops every stream, max_attempts 3");
   ctx.Equal(p->streams.size(), 3, "with max_attempts 3 upload() must open 3 streams: streams");
   ctx.Assert(r.error.find("ingest restarting (3)") != std::string::npos && r.error.find("ingest restarting (2)") == std::string::npos,
              "upload() must throw the last error, the third stream's (ingest restarting (3)): it threw %q", r.error);
@@ -1593,20 +1593,20 @@ void CheckGivesUp(harness::Ctx& ctx) {
   ctx.Assert(waited < 0.05, "upload() returned %.2f s after its last stream opened: after the last attempt there is nothing to wait for", waited);
 
   plan.clear();
-  for (int i = 0; i < 10; ++i) plan.push_back(UpFaultOf(grpc::StatusCode::UNAVAILABLE));
-  auto second = UpStart(ctx, plan, false);
-  r = UpRun(*second.client, 4);
-  UpRPCError(ctx, r, grpc::StatusCode::UNAVAILABLE, UpDetails(plan.front()), "a server that drops every stream, max_attempts 4");
+  for (int i = 0; i < 10; ++i) plan.push_back(hUpFaultOf(grpc::StatusCode::UNAVAILABLE));
+  auto second = hUpStart(ctx, plan, false);
+  r = hUpRun(*second.client, 4);
+  hUpRPCError(ctx, r, grpc::StatusCode::UNAVAILABLE, hUpDetails(plan.front()), "a server that drops every stream, max_attempts 4");
   ctx.Equal(second.peer->streams.size(), 4, "with max_attempts 4 upload() must open 4 streams: streams");
 }
 
 void CheckOtherCodes(harness::Ctx& ctx) {
   for (const grpc::StatusCode code : {grpc::StatusCode::INVALID_ARGUMENT, grpc::StatusCode::PERMISSION_DENIED}) {
-    const UpFault fault{code, 2};
-    auto [p, client] = UpStart(ctx, {fault}, false);
-    const int64_t started = UpNowMs();
-    const UpResult r = UpRun(*client, 4);
-    UpRPCError(ctx, r, code, UpDetails(fault), std::string("a stream that ends with ") + grpc::EnumName(code));
+    const HUpFault fault{code, 2};
+    auto [p, client] = hUpStart(ctx, {fault}, false);
+    const int64_t started = hUpNowMs();
+    const HUpResult r = hUpRun(*client, 4);
+    hUpRPCError(ctx, r, code, hUpDetails(fault), std::string("a stream that ends with ") + grpc::EnumName(code));
     ctx.Assert(p->status_calls.size() == 1 && p->streams.size() == 1,
                "%v was retried (%d GetStatus calls, %d streams): only UNAVAILABLE and ABORTED are", code, p->status_calls.size(),
                p->streams.size());
@@ -1617,21 +1617,21 @@ void CheckOtherCodes(harness::Ctx& ctx) {
 
 void CheckReturnsAttempts(harness::Ctx& ctx) {
   struct Case {
-    std::deque<UpFault> plan;
+    std::deque<HUpFault> plan;
     int max_attempts;
     int want;
     std::string what;
   };
   const std::vector<Case> cases = {
       {{}, 4, 1, "a clean upload"},
-      {{UpFault{grpc::StatusCode::ABORTED, 3}}, 4, 2, "one ABORTED stream"},
-      {{UpFault{grpc::StatusCode::UNAVAILABLE, 8, true}}, 4, 2, "a stream that lost only the final Ack"},
-      {{UpFaultOf(grpc::StatusCode::UNAVAILABLE), UpFaultOf(grpc::StatusCode::ABORTED)}, 3, 3, "two failed streams with max_attempts 3"},
+      {{HUpFault{grpc::StatusCode::ABORTED, 3}}, 4, 2, "one ABORTED stream"},
+      {{HUpFault{grpc::StatusCode::UNAVAILABLE, 8, true}}, 4, 2, "a stream that lost only the final Ack"},
+      {{hUpFaultOf(grpc::StatusCode::UNAVAILABLE), hUpFaultOf(grpc::StatusCode::ABORTED)}, 3, 3, "two failed streams with max_attempts 3"},
   };
   for (const Case& tc : cases) {
-    auto started = UpStart(ctx, tc.plan, false);
-    const UpResult r = UpRun(*started.client, tc.max_attempts);
-    UpOK(ctx, r, tc.what);
+    auto started = hUpStart(ctx, tc.plan, false);
+    const HUpResult r = hUpRun(*started.client, tc.max_attempts);
+    hUpOK(ctx, r, tc.what);
     ctx.Equal(r.returned, tc.want, "%s: upload() must return the attempts it used", tc.what);
   }
 }

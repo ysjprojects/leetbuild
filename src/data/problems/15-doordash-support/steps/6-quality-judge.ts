@@ -1519,22 +1519,22 @@ import (
 )
 
 // qjKind is an answer as the API would have produced it.
-type qjKind struct {
+type HQjKind struct {
 	question, answer string
 	sources          []string
 }
 
 var (
 	// grounded cites only retrieved chunks.
-	qjGrounded = qjKind{"When do I get paid?", "Based on [kb:pay-0][kb:pay-1]: Dasher earnings for a week are paid out every Monday by direct deposit.", []string{"pay-0", "pay-1"}}
+	hQjGrounded = HQjKind{"When do I get paid?", "Based on [kb:pay-0][kb:pay-1]: Dasher earnings for a week are paid out every Monday by direct deposit.", []string{"pay-0", "pay-1"}}
 	// hallucinated invents a policy and a chunk.
-	qjHallucinated = qjKind{"The order was cancelled at the restaurant, do I still get paid?", "Your issue will be resolved within 7 days, guaranteed [kb:policy-404].", []string{"red-card-1"}}
+	hQjHallucinated = HQjKind{"The order was cancelled at the restaurant, do I still get paid?", "Your issue will be resolved within 7 days, guaranteed [kb:policy-404].", []string{"red-card-1"}}
 	// half-grounded has one citation outside its sources.
-	qjHalf = qjKind{"Do my tips come with Fast Pay?", "Based on [kb:tips-0][kb:pay-3]: Tips are included in the weekly payout and in Fast Pay.", []string{"tips-0"}}
+	hQjHalf = HQjKind{"Do my tips come with Fast Pay?", "Based on [kb:tips-0][kb:pay-3]: Tips are included in the weekly payout and in Fast Pay.", []string{"tips-0"}}
 )
 
 // qjSeed puts one turn record on the topic, keyed by its session.
-func qjSeed(ctx *harness.Ctx, sessionID string, n int, kind qjKind, escalated bool) {
+func hQjSeed(ctx *harness.Ctx, sessionID string, n int, kind HQjKind, escalated bool) {
 	record := map[string]any{"session_id": sessionID, "turn": n, "dasher_id": "d-" + sessionID, "question": kind.question, "answer": kind.answer, "sources": kind.sources, "escalated": false, "model": "large", "tokens": len(strings.Split(kind.answer, " "))}
 	if escalated {
 		record["answer"], record["sources"], record["escalated"], record["tokens"] = config.HandoffText, []string{}, true, len(strings.Split(config.HandoffText, " "))
@@ -1544,13 +1544,13 @@ func qjSeed(ctx *harness.Ctx, sessionID string, n int, kind qjKind, escalated bo
 }
 
 // qjJudge is the judge at judge:50051 (the deterministic rubric of assistant/model); it records what it was asked.
-type qjJudge struct {
+type HQjJudge struct {
 	pb.UnimplementedJudgeServer
 	mu    sync.Mutex
 	calls []*pb.EvaluateRequest
 }
 
-func (j *qjJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
+func (j *HQjJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scores, error) {
 	j.mu.Lock()
 	j.calls = append(j.calls, req)
 	j.mu.Unlock()
@@ -1558,23 +1558,23 @@ func (j *qjJudge) Evaluate(_ context.Context, req *pb.EvaluateRequest) (*pb.Scor
 	return &pb.Scores{Groundedness: float32(s.Groundedness), Coherence: float32(s.Coherence), Compliance: float32(s.Compliance), Pass: s.Pass}, nil
 }
 
-func (j *qjJudge) asked() []*pb.EvaluateRequest {
+func (j *HQjJudge) asked() []*pb.EvaluateRequest {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	return append([]*pb.EvaluateRequest(nil), j.calls...)
 }
 
 // qjWorker is the learner's consumer in front of the judge and an empty quality_scores table.
-func qjWorker(ctx *harness.Ctx) *qjJudge {
+func hQjWorker(ctx *harness.Ctx) *HQjJudge {
 	ctx.DB.Reset(db.Schema)
-	j := &qjJudge{}
+	j := &HQjJudge{}
 	pb.RegisterJudgeServer(ctx.GRPC.Server(config.Judge), j)
 	return j
 }
 
 // qjDrain runs the learner's loop until it returns or waits for records that will not come; the
 // error it returned with, nil while it was still waiting.
-func qjDrain(ctx *harness.Ctx) error {
+func hQjDrain(ctx *harness.Ctx) error {
 	loop, cancel := context.WithCancel(context.Background())
 	var err error
 	returned := ctx.Drain(func() { err = run(loop) })
@@ -1587,12 +1587,12 @@ func qjDrain(ctx *harness.Ctx) error {
 }
 
 // qjRun drains the loop; an error it returns fails the check.
-func qjRun(ctx *harness.Ctx) {
-	ctx.NoError(qjDrain(ctx), "run")
+func hQjRun(ctx *harness.Ctx) {
+	ctx.NoError(hQjDrain(ctx), "run")
 }
 
 // qjRestart is the consumer coming back: a new process opens the reader the file declares.
-func qjRestart() {
+func hQjRestart() {
 	reader.Close()
 	reader = kafka.NewReader(kafka.ReaderConfig{
 		Brokers:     []string{"kafka:9092"},
@@ -1603,7 +1603,7 @@ func qjRestart() {
 }
 
 // qjRows is {"session|turn": row} as the table holds it.
-func qjRows(ctx *harness.Ctx) map[string]harness.Row {
+func hQjRows(ctx *harness.Ctx) map[string]harness.Row {
 	out := map[string]harness.Row{}
 	for _, r := range ctx.DB.Query("SELECT * FROM quality_scores ORDER BY session_id, turn") {
 		out[fmt.Sprintf("%v|%v", r["session_id"], r["turn"])] = r
@@ -1611,7 +1611,7 @@ func qjRows(ctx *harness.Ctx) map[string]harness.Row {
 	return out
 }
 
-func qjKeys(rows map[string]harness.Row) []string {
+func hQjKeys(rows map[string]harness.Row) []string {
 	keys := []string{}
 	for k := range rows {
 		keys = append(keys, k)
@@ -1620,7 +1620,7 @@ func qjKeys(rows map[string]harness.Row) []string {
 	return keys
 }
 
-func qjSameScores(row harness.Row, want model.Scores) bool {
+func hQjSameScores(row harness.Row, want model.Scores) bool {
 	near := func(v any, w float64) bool {
 		f, ok := v.(float64)
 		return ok && math.Abs(f-w) < 1e-3
@@ -1630,29 +1630,29 @@ func qjSameScores(row harness.Row, want model.Scores) bool {
 }
 
 // qjCommit is a commit as the broker saw it, with the database's query log at that instant.
-type qjCommit struct {
+type HQjCommit struct {
 	group   string
 	offsets harness.KafkaOffsets
 	queries []harness.DBQuery
 }
 
-func qjWatchCommits(ctx *harness.Ctx) *[]qjCommit {
+func hQjWatchCommits(ctx *harness.Ctx) *[]HQjCommit {
 	var mu sync.Mutex
-	seen := &[]qjCommit{}
+	seen := &[]HQjCommit{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		copied := harness.KafkaOffsets{}
 		for tp, o := range offsets {
 			copied[tp] = o
 		}
 		mu.Lock()
-		*seen = append(*seen, qjCommit{group, copied, ctx.DB.Queries()})
+		*seen = append(*seen, HQjCommit{group, copied, ctx.DB.Queries()})
 		mu.Unlock()
 	})
 	return seen
 }
 
 // qjRowWritten reports whether an INSERT into quality_scores for (sessionID, turn) had run by the end of this query log.
-func qjRowWritten(queries []harness.DBQuery, sessionID string, turn int) bool {
+func hQjRowWritten(queries []harness.DBQuery, sessionID string, turn int) bool {
 	for _, q := range queries {
 		if !strings.Contains(strings.ToLower(q.SQL), "insert into quality_scores") {
 			continue
@@ -1670,14 +1670,14 @@ func qjRowWritten(queries []harness.DBQuery, sessionID string, turn int) bool {
 }
 
 // qjCommitted is a record of the topic and the query log at the commit that first covered its offset.
-type qjCommitted struct {
+type HQjCommitted struct {
 	sessionID string
 	turn      int
 	queries   []harness.DBQuery
 }
 
-func qjNewlyCommitted(ctx *harness.Ctx, commits []qjCommit) []qjCommitted {
-	var out []qjCommitted
+func hQjNewlyCommitted(ctx *harness.Ctx, commits []HQjCommit) []HQjCommitted {
+	var out []HQjCommitted
 	done := map[int]int64{}
 	for _, c := range commits {
 		if c.group != config.Group {
@@ -1694,7 +1694,7 @@ func qjNewlyCommitted(ctx *harness.Ctx, commits []qjCommit) []qjCommitted {
 						Turn      int    \`json:"turn"\`
 					}
 					_ = json.Unmarshal(r.Value, &t)
-					out = append(out, qjCommitted{t.SessionID, t.Turn, c.queries})
+					out = append(out, HQjCommitted{t.SessionID, t.Turn, c.queries})
 				}
 			}
 			if offset > done[tp.Partition] {
@@ -1705,17 +1705,17 @@ func qjNewlyCommitted(ctx *harness.Ctx, commits []qjCommit) []qjCommitted {
 	return out
 }
 
-func qjFullyCommitted(ctx *harness.Ctx) {
+func hQjFullyCommitted(ctx *harness.Ctx) {
 	lag := ctx.Kafka.Lag(config.Group, config.Topic)
 	ctx.Assert(lag == 0, "%d record(s) of %s are not committed for group %s after the consumer handled them", lag, config.Topic, config.Group)
 }
 
 func CheckGroupManualCommit(ctx *harness.Ctx) {
-	qjSeed(ctx, "s1", 1, qjGrounded, false)
-	qjSeed(ctx, "s2", 1, qjHallucinated, false)
-	qjSeed(ctx, "s1", 2, qjHalf, false)
-	qjWorker(ctx)
-	qjRun(ctx)
+	hQjSeed(ctx, "s1", 1, hQjGrounded, false)
+	hQjSeed(ctx, "s2", 1, hQjHallucinated, false)
+	hQjSeed(ctx, "s1", 2, hQjHalf, false)
+	hQjWorker(ctx)
+	hQjRun(ctx)
 	subscriptions := ctx.Kafka.EventsOf("subscribe")
 	ctx.Assert(len(subscriptions) > 0, "the consumer never subscribed to a topic")
 	last := subscriptions[len(subscriptions)-1]
@@ -1740,21 +1740,21 @@ func CheckGroupManualCommit(ctx *harness.Ctx) {
 		manual = manual || e.Group == config.Group
 	}
 	ctx.Assert(manual, "no explicit commit happened for group %s", config.Group)
-	held := qjRows(ctx)
+	held := hQjRows(ctx)
 	ctx.Assert(len(held) == 3, "three answered turns were on %s, quality_scores holds %d row(s): the consumer must read from the beginning (kafka.FirstOffset) and score every record", config.Topic, len(held))
-	qjFullyCommitted(ctx)
+	hQjFullyCommitted(ctx)
 }
 
 func CheckScoresPerTurn(ctx *harness.Ctx) {
-	qjSeed(ctx, "s1", 1, qjGrounded, false)
-	qjSeed(ctx, "s2", 1, qjHallucinated, false)
-	qjSeed(ctx, "s1", 2, qjHalf, false)
-	j := qjWorker(ctx)
-	qjRun(ctx)
+	hQjSeed(ctx, "s1", 1, hQjGrounded, false)
+	hQjSeed(ctx, "s2", 1, hQjHallucinated, false)
+	hQjSeed(ctx, "s1", 2, hQjHalf, false)
+	j := hQjWorker(ctx)
+	hQjRun(ctx)
 	ctx.Assert(len(ctx.GRPC.CallsTo("Evaluate", config.Judge)) > 0, "no Judge.Evaluate reached %s: every answered turn is judged", config.Judge)
 	asked := j.asked()
 	ctx.Assert(len(asked) == 3, "three answered turns must mean three Evaluate calls, the judge saw %d", len(asked))
-	for _, kind := range []qjKind{qjGrounded, qjHallucinated, qjHalf} {
+	for _, kind := range []HQjKind{hQjGrounded, hQjHallucinated, hQjHalf} {
 		var first *pb.EvaluateRequest
 		for _, c := range asked {
 			if c.GetAnswer() == kind.answer && first == nil {
@@ -1765,15 +1765,15 @@ func CheckScoresPerTurn(ctx *harness.Ctx) {
 		ctx.Equal(first.GetQuestion(), kind.question, "Evaluate must carry the record's question")
 		ctx.Equal(first.GetContextIds(), kind.sources, "ContextIds must be the record's sources")
 	}
-	held := qjRows(ctx)
-	ctx.Equal(qjKeys(held), []string{"s1|1", "s1|2", "s2|1"}, "one row per (session_id, turn) was expected in quality_scores")
+	held := hQjRows(ctx)
+	ctx.Equal(hQjKeys(held), []string{"s1|1", "s1|2", "s2|1"}, "one row per (session_id, turn) was expected in quality_scores")
 	for _, tc := range []struct {
 		key  string
-		kind qjKind
-	}{{"s1|1", qjGrounded}, {"s2|1", qjHallucinated}, {"s1|2", qjHalf}} {
+		kind HQjKind
+	}{{"s1|1", hQjGrounded}, {"s2|1", hQjHallucinated}, {"s1|2", hQjHalf}} {
 		want := model.Evaluate(tc.kind.question, tc.kind.answer, tc.kind.sources)
 		row := held[tc.key]
-		ctx.Assert(qjSameScores(row, want), "%s: the row holds groundedness %v, coherence %v, compliance %v, pass %v; the judge said %+v: store the judge's scores as they came", tc.key, row["groundedness"], row["coherence"], row["compliance"], row["pass"], want)
+		ctx.Assert(hQjSameScores(row, want), "%s: the row holds groundedness %v, coherence %v, compliance %v, pass %v; the judge said %+v: store the judge's scores as they came", tc.key, row["groundedness"], row["coherence"], row["compliance"], row["pass"], want)
 	}
 	ctx.Equal(held["s1|1"]["pass"], true, "the grounded answer cites only its sources: the judge passes it, and the row must say so")
 	ctx.Equal(held["s2|1"]["pass"], false, "the hallucinated answer cites [kb:policy-404], which was never retrieved, and promises an outcome: it must be stored as a failure")
@@ -1781,12 +1781,12 @@ func CheckScoresPerTurn(ctx *harness.Ctx) {
 }
 
 func CheckEscalatedCommitted(ctx *harness.Ctx) {
-	qjSeed(ctx, "s1", 1, qjGrounded, false)
-	qjSeed(ctx, "s1", 2, qjGrounded, true)
-	qjSeed(ctx, "s3", 1, qjGrounded, true)
-	qjSeed(ctx, "s2", 1, qjHallucinated, false)
-	j := qjWorker(ctx)
-	if err := qjDrain(ctx); err != nil {
+	hQjSeed(ctx, "s1", 1, hQjGrounded, false)
+	hQjSeed(ctx, "s1", 2, hQjGrounded, true)
+	hQjSeed(ctx, "s3", 1, hQjGrounded, true)
+	hQjSeed(ctx, "s2", 1, hQjHallucinated, false)
+	j := hQjWorker(ctx)
+	if err := hQjDrain(ctx); err != nil {
 		ctx.Fatalf("an escalated turn must not stop the consumer, but run() returned %v", err)
 	}
 	asked := j.asked()
@@ -1794,54 +1794,54 @@ func CheckEscalatedCommitted(ctx *harness.Ctx) {
 	for _, c := range asked {
 		ctx.Assert(c.GetAnswer() != config.HandoffText, "the handoff text is not an answer: an escalated turn must not be sent to the judge")
 	}
-	ctx.Equal(qjKeys(qjRows(ctx)), []string{"s1|1", "s2|1"}, "escalated turns produce no row in quality_scores")
+	ctx.Equal(hQjKeys(hQjRows(ctx)), []string{"s1|1", "s2|1"}, "escalated turns produce no row in quality_scores")
 	lag := ctx.Kafka.Lag(config.Group, config.Topic)
 	ctx.Assert(lag == 0, "%d record(s) not committed: an escalated turn's offset must be committed too, or it is redelivered forever", lag)
 }
 
 func CheckCommitAfterWrite(ctx *harness.Ctx) {
-	qjSeed(ctx, "s1", 1, qjGrounded, false)
-	qjSeed(ctx, "s2", 1, qjHalf, false)
-	qjWorker(ctx)
-	commits := qjWatchCommits(ctx)
-	qjRun(ctx)
-	committed := qjNewlyCommitted(ctx, *commits)
+	hQjSeed(ctx, "s1", 1, hQjGrounded, false)
+	hQjSeed(ctx, "s2", 1, hQjHalf, false)
+	hQjWorker(ctx)
+	commits := hQjWatchCommits(ctx)
+	hQjRun(ctx)
+	committed := hQjNewlyCommitted(ctx, *commits)
 	ctx.Assert(len(committed) > 0, "the offsets of s1 and s2 were never committed by group %s", config.Group)
 	for _, c := range committed {
-		ctx.Assert(qjRowWritten(c.queries, c.sessionID, c.turn), "the offset of (%s, %d) was committed before its row was in quality_scores: commit only after recordScores returned", c.sessionID, c.turn)
+		ctx.Assert(hQjRowWritten(c.queries, c.sessionID, c.turn), "the offset of (%s, %d) was committed before its row was in quality_scores: commit only after recordScores returned", c.sessionID, c.turn)
 	}
 	// Postgres starts refusing: turn 99 now violates a constraint, so the write fails.
 	ctx.DB.Exec("ALTER TABLE quality_scores ADD CONSTRAINT scores_down CHECK (turn <> 99) NOT VALID")
-	qjSeed(ctx, "s1", 99, qjGrounded, false)
-	_ = qjDrain(ctx) // the failed write surfaces here; what matters is what was committed
-	_, written := qjRows(ctx)["s1|99"]
+	hQjSeed(ctx, "s1", 99, hQjGrounded, false)
+	_ = hQjDrain(ctx) // the failed write surfaces here; what matters is what was committed
+	_, written := hQjRows(ctx)["s1|99"]
 	ctx.Assert(!written, "the write of turn 99 failed and must have left no row")
 	ctx.Equal(ctx.Kafka.Lag(config.Group, config.Topic), 1, "a record whose write failed must not be committed: it has to come back; records not committed")
 	ctx.DB.Exec("ALTER TABLE quality_scores DROP CONSTRAINT scores_down")
-	qjRestart()
-	qjRun(ctx)
-	held := qjRows(ctx)
+	hQjRestart()
+	hQjRun(ctx)
+	held := hQjRows(ctx)
 	_, written = held["s1|99"]
-	ctx.Assert(written, "after a restart turn 99 must be redelivered and written, quality_scores holds %q", qjKeys(held))
+	ctx.Assert(written, "after a restart turn 99 must be redelivered and written, quality_scores holds %q", hQjKeys(held))
 	ctx.Assert(len(held) == 3, "three answered turns, %d rows: each (session, turn) is written once", len(held))
-	qjFullyCommitted(ctx)
+	hQjFullyCommitted(ctx)
 }
 
 func CheckJudgeDownRetries(ctx *harness.Ctx) {
-	qjSeed(ctx, "s1", 1, qjGrounded, false)
-	qjSeed(ctx, "s2", 1, qjHalf, false)
-	qjSeed(ctx, "s1", 1, qjGrounded, false) // the producer retried: a duplicate
-	qjWorker(ctx)
-	commits := qjWatchCommits(ctx)
+	hQjSeed(ctx, "s1", 1, hQjGrounded, false)
+	hQjSeed(ctx, "s2", 1, hQjHalf, false)
+	hQjSeed(ctx, "s1", 1, hQjGrounded, false) // the producer retried: a duplicate
+	hQjWorker(ctx)
+	commits := hQjWatchCommits(ctx)
 	// The judge's first answer is UNAVAILABLE (a deploy, a restart); it is back for every call after that.
 	ctx.GRPC.Fail("Evaluate", codes.Unavailable, "", 1, config.Judge)
-	if err := qjDrain(ctx); err != nil && status.Code(err) != codes.Unavailable {
+	if err := hQjDrain(ctx); err != nil && status.Code(err) != codes.Unavailable {
 		ctx.Fatalf("run: %v", err)
 	}
 	if ctx.Kafka.Lag(config.Group, config.Topic) > 0 {
 		// The consumer stopped on the failure instead of retrying in place: acceptable only if nothing was committed for it.
-		qjRestart()
-		qjRun(ctx)
+		hQjRestart()
+		hQjRun(ctx)
 	}
 	calls := ctx.GRPC.CallsTo("Evaluate", config.Judge)
 	ctx.Assert(len(calls) >= 4, "three records (one a duplicate) and one UNAVAILABLE answer mean at least four Evaluate calls — the failed one and a retry — the judge saw %d: an UNAVAILABLE judge means ask again later, not skip", len(calls))
@@ -1850,13 +1850,13 @@ func CheckJudgeDownRetries(ctx *harness.Ctx) {
 		unavailable = unavailable || c.Code == codes.Unavailable
 	}
 	ctx.Assert(unavailable, "the UNAVAILABLE call never happened")
-	for _, c := range qjNewlyCommitted(ctx, *commits) {
-		ctx.Assert(qjRowWritten(c.queries, c.sessionID, c.turn), "the offset of (%s, %d) was committed while no row existed for it: a judge answering UNAVAILABLE must leave the offset uncommitted", c.sessionID, c.turn)
+	for _, c := range hQjNewlyCommitted(ctx, *commits) {
+		ctx.Assert(hQjRowWritten(c.queries, c.sessionID, c.turn), "the offset of (%s, %d) was committed while no row existed for it: a judge answering UNAVAILABLE must leave the offset uncommitted", c.sessionID, c.turn)
 	}
-	held := qjRows(ctx)
-	ctx.Equal(qjKeys(held), []string{"s1|1", "s2|1"}, "two distinct (session, turn) pairs were delivered three times: quality_scores must hold exactly those two rows")
-	ctx.Assert(qjSameScores(held["s1|1"], model.Evaluate(qjGrounded.question, qjGrounded.answer, qjGrounded.sources)) && qjSameScores(held["s2|1"], model.Evaluate(qjHalf.question, qjHalf.answer, qjHalf.sources)), "the retried record must end up with the judge's scores, as if it had never failed")
-	qjFullyCommitted(ctx)
+	held := hQjRows(ctx)
+	ctx.Equal(hQjKeys(held), []string{"s1|1", "s2|1"}, "two distinct (session, turn) pairs were delivered three times: quality_scores must hold exactly those two rows")
+	ctx.Assert(hQjSameScores(held["s1|1"], model.Evaluate(hQjGrounded.question, hQjGrounded.answer, hQjGrounded.sources)) && hQjSameScores(held["s2|1"], model.Evaluate(hQjHalf.question, hQjHalf.answer, hQjHalf.sources)), "the retried record must end up with the judge's scores, as if it had never failed")
+	hQjFullyCommitted(ctx)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1875,38 +1875,38 @@ func CheckJudgeDownRetries(ctx *harness.Ctx) {
 namespace {
 
 // qjKind is an answer as the API would have produced it.
-struct qjKind {
+struct HQjKind {
   std::string question, answer;
   std::vector<std::string> sources;
 };
 
 // grounded cites only retrieved chunks.
-const qjKind qjGrounded{"When do I get paid?", "Based on [kb:pay-0][kb:pay-1]: Dasher earnings for a week are paid out every Monday by direct deposit.", {"pay-0", "pay-1"}};
+const HQjKind kHQjGrounded{"When do I get paid?", "Based on [kb:pay-0][kb:pay-1]: Dasher earnings for a week are paid out every Monday by direct deposit.", {"pay-0", "pay-1"}};
 // hallucinated invents a policy and a chunk.
-const qjKind qjHallucinated{"The order was cancelled at the restaurant, do I still get paid?", "Your issue will be resolved within 7 days, guaranteed [kb:policy-404].", {"red-card-1"}};
+const HQjKind kHQjHallucinated{"The order was cancelled at the restaurant, do I still get paid?", "Your issue will be resolved within 7 days, guaranteed [kb:policy-404].", {"red-card-1"}};
 // half-grounded has one citation outside its sources.
-const qjKind qjHalf{"Do my tips come with Fast Pay?", "Based on [kb:tips-0][kb:pay-3]: Tips are included in the weekly payout and in Fast Pay.", {"tips-0"}};
+const HQjKind kHQjHalf{"Do my tips come with Fast Pay?", "Based on [kb:tips-0][kb:pay-3]: Tips are included in the weekly payout and in Fast Pay.", {"tips-0"}};
 
-int qjWords(const std::string& s) {
+int hQjWords(const std::string& s) {
   int n = 1;
   for (char c : s) n += c == ' ';
   return n;
 }
 
 // qjSeed puts one turn record on the topic, keyed by its session.
-void qjSeed(harness::Ctx& ctx, const std::string& session_id, int n, const qjKind& kind, bool escalated) {
-  nlohmann::json record = {{"session_id", session_id}, {"turn", n}, {"dasher_id", "d-" + session_id}, {"question", kind.question}, {"answer", kind.answer}, {"sources", kind.sources}, {"escalated", false}, {"model", "large"}, {"tokens", qjWords(kind.answer)}};
+void hQjSeed(harness::Ctx& ctx, const std::string& session_id, int n, const HQjKind& kind, bool escalated) {
+  nlohmann::json record = {{"session_id", session_id}, {"turn", n}, {"dasher_id", "d-" + session_id}, {"question", kind.question}, {"answer", kind.answer}, {"sources", kind.sources}, {"escalated", false}, {"model", "large"}, {"tokens", hQjWords(kind.answer)}};
   if (escalated) {
     record["answer"] = config::kHandoffText;
     record["sources"] = std::vector<std::string>{};
     record["escalated"] = true;
-    record["tokens"] = qjWords(config::kHandoffText);
+    record["tokens"] = hQjWords(config::kHandoffText);
   }
   ctx.Kafka.Seed(config::kTopic, session_id, record.dump());
 }
 
 // qjJudge is the judge at judge:50051 (the deterministic rubric of assistant/model); it records what it was asked.
-class qjJudge final : public support::Judge::Service {
+class HQjJudge final : public support::Judge::Service {
  public:
   grpc::Status Evaluate(grpc::ServerContext*, const support::EvaluateRequest* req, support::Scores* reply) override {
     {
@@ -1931,9 +1931,9 @@ class qjJudge final : public support::Judge::Service {
 };
 
 // qjWorker is the learner's consumer in front of the judge and an empty quality_scores table.
-qjJudge* qjWorker(harness::Ctx& ctx) {
+HQjJudge* hQjWorker(harness::Ctx& ctx) {
   ctx.DB.Reset(db::kSchema);
-  auto* j = new qjJudge();
+  auto* j = new HQjJudge();
   ctx.GRPC.Server(config::kJudge)->RegisterService(j);
   return j;
 }
@@ -1941,17 +1941,17 @@ qjJudge* qjWorker(harness::Ctx& ctx) {
 // Whether the learner's loop is still running (waiting for records). Go cancels run's context after
 // each drain; run() here cannot be stopped, so a loop still waiting keeps consuming and the next drain
 // lets it run (Settle) instead of starting a second loop on the same consumer.
-std::shared_ptr<bool> qjAlive = std::make_shared<bool>(false);
+std::shared_ptr<bool> hQjAlive = std::make_shared<bool>(false);
 
 // qjDrain runs the learner's loop until it returns or waits for records that will not come; what it
 // threw, nullopt while it was still waiting (Go: the error it returned with).
-std::optional<std::string> qjDrain(harness::Ctx& ctx) {
-  if (*qjAlive) {
+std::optional<std::string> hQjDrain(harness::Ctx& ctx) {
+  if (*hQjAlive) {
     ctx.Settle();
     return std::nullopt;
   }
-  *qjAlive = true;
-  auto alive = qjAlive;
+  *hQjAlive = true;
+  auto alive = hQjAlive;
   try {
     ctx.Drain([alive] {
       try {
@@ -1971,20 +1971,20 @@ std::optional<std::string> qjDrain(harness::Ctx& ctx) {
 }
 
 // qjRun drains the loop; what it throws fails the check.
-void qjRun(harness::Ctx& ctx) {
-  if (const auto err = qjDrain(ctx)) ctx.Fatalf("run: %s", *err);
+void hQjRun(harness::Ctx& ctx) {
+  if (const auto err = hQjDrain(ctx)) ctx.Fatalf("run: %s", *err);
 }
 
 // qjRestart is the consumer coming back: a new process opens the consumer the file declares. A loop
 // still running keeps its consumer (it never stopped, so there is nothing to restart).
-void qjRestart() {
-  if (*qjAlive) return;
+void hQjRestart() {
+  if (*hQjAlive) return;
   consumer->close();
   consumer = make_consumer();
 }
 
 // qjRows is {"session|turn": row} as the table holds it.
-std::map<std::string, harness::Row> qjRows(harness::Ctx& ctx) {
+std::map<std::string, harness::Row> hQjRows(harness::Ctx& ctx) {
   std::map<std::string, harness::Row> out;
   for (auto& r : ctx.DB.Query("SELECT * FROM quality_scores ORDER BY session_id, turn")) {
     out[harness::Sprintf("%v|%v", r["session_id"], r["turn"])] = r;
@@ -1992,39 +1992,39 @@ std::map<std::string, harness::Row> qjRows(harness::Ctx& ctx) {
   return out;
 }
 
-std::vector<std::string> qjKeys(const std::map<std::string, harness::Row>& rows) {
+std::vector<std::string> hQjKeys(const std::map<std::string, harness::Row>& rows) {
   std::vector<std::string> keys;
   for (const auto& [k, _] : rows) keys.push_back(k);
   return keys;
 }
 
-bool qjSameScores(harness::Row row, const model::Scores& want) {
+bool hQjSameScores(harness::Row row, const model::Scores& want) {
   const auto near = [](const harness::Any& v, double w) { return v.IsFloat() && std::abs(v.Float() - w) < 1e-3; };
   return near(row["groundedness"], want.groundedness) && near(row["coherence"], want.coherence) && near(row["compliance"], want.compliance) && row["pass"].Bool() == want.pass;
 }
 
 // Go's %+v of model.Scores.
-std::string qjShow(const model::Scores& s) {
+std::string hQjShow(const model::Scores& s) {
   return harness::Sprintf("{Groundedness:%v Coherence:%v Compliance:%v Pass:%v}", s.groundedness, s.coherence, s.compliance, s.pass);
 }
 
 // qjCommit is a commit as the broker saw it, with the database's query log at that instant.
-struct qjCommit {
+struct HQjCommit {
   std::string group;
   harness::KafkaOffsets offsets;
   std::vector<harness::DBQuery> queries;
 };
 
-std::shared_ptr<std::vector<qjCommit>> qjWatchCommits(harness::Ctx& ctx) {
-  auto seen = std::make_shared<std::vector<qjCommit>>();
+std::shared_ptr<std::vector<HQjCommit>> hQjWatchCommits(harness::Ctx& ctx) {
+  auto seen = std::make_shared<std::vector<HQjCommit>>();
   ctx.Kafka.OnCommit([&ctx, seen](const std::string& group, const harness::KafkaOffsets& offsets) {
-    seen->push_back(qjCommit{group, offsets, ctx.DB.Queries()});
+    seen->push_back(HQjCommit{group, offsets, ctx.DB.Queries()});
   });
   return seen;
 }
 
 // qjRowWritten reports whether an INSERT into quality_scores for (session_id, turn) had run by the end of this query log.
-bool qjRowWritten(const std::vector<harness::DBQuery>& queries, const std::string& session_id, int turn) {
+bool hQjRowWritten(const std::vector<harness::DBQuery>& queries, const std::string& session_id, int turn) {
   for (const auto& q : queries) {
     std::string sql = q.SQL;
     std::transform(sql.begin(), sql.end(), sql.begin(), [](unsigned char c) { return std::tolower(c); });
@@ -2040,14 +2040,14 @@ bool qjRowWritten(const std::vector<harness::DBQuery>& queries, const std::strin
 }
 
 // qjCommitted is a record of the topic and the query log at the commit that first covered its offset.
-struct qjCommitted {
+struct HQjCommitted {
   std::string session_id;
   int turn;
   std::vector<harness::DBQuery> queries;
 };
 
-std::vector<qjCommitted> qjNewlyCommitted(harness::Ctx& ctx, const std::vector<qjCommit>& commits) {
-  std::vector<qjCommitted> out;
+std::vector<HQjCommitted> hQjNewlyCommitted(harness::Ctx& ctx, const std::vector<HQjCommit>& commits) {
+  std::vector<HQjCommitted> out;
   std::map<int, int64_t> done;
   for (const auto& c : commits) {
     if (c.group != config::kGroup) continue;
@@ -2056,7 +2056,7 @@ std::vector<qjCommitted> qjNewlyCommitted(harness::Ctx& ctx, const std::vector<q
       for (const auto& r : ctx.Kafka.Records(config::kTopic)) {
         if (r.Partition == tp.Partition && done[tp.Partition] <= r.Offset && r.Offset < offset) {
           const auto t = harness::ParseJSON(r.Value.value_or(""));
-          out.push_back(qjCommitted{t ? (*t)["session_id"].String() : "", t ? static_cast<int>((*t)["turn"].Int()) : 0, c.queries});
+          out.push_back(HQjCommitted{t ? (*t)["session_id"].String() : "", t ? static_cast<int>((*t)["turn"].Int()) : 0, c.queries});
         }
       }
       if (offset > done[tp.Partition]) done[tp.Partition] = offset;
@@ -2065,7 +2065,7 @@ std::vector<qjCommitted> qjNewlyCommitted(harness::Ctx& ctx, const std::vector<q
   return out;
 }
 
-void qjFullyCommitted(harness::Ctx& ctx) {
+void hQjFullyCommitted(harness::Ctx& ctx) {
   const auto lag = ctx.Kafka.Lag(config::kGroup, config::kTopic);
   ctx.Assert(lag == 0, "%d record(s) of %s are not committed for group %s after the consumer handled them", lag, config::kTopic, config::kGroup);
 }
@@ -2073,11 +2073,11 @@ void qjFullyCommitted(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckGroupManualCommit(harness::Ctx& ctx) {
-  qjSeed(ctx, "s1", 1, qjGrounded, false);
-  qjSeed(ctx, "s2", 1, qjHallucinated, false);
-  qjSeed(ctx, "s1", 2, qjHalf, false);
-  qjWorker(ctx);
-  qjRun(ctx);
+  hQjSeed(ctx, "s1", 1, kHQjGrounded, false);
+  hQjSeed(ctx, "s2", 1, kHQjHallucinated, false);
+  hQjSeed(ctx, "s1", 2, kHQjHalf, false);
+  hQjWorker(ctx);
+  hQjRun(ctx);
   const auto subscriptions = ctx.Kafka.EventsOf("subscribe");
   ctx.Assert(!subscriptions.empty(), "the consumer never subscribed to a topic");
   const auto& last = subscriptions.back();
@@ -2097,21 +2097,21 @@ void CheckGroupManualCommit(harness::Ctx& ctx) {
   bool manual = false;
   for (const auto& e : ctx.Kafka.EventsOf("manual-commit")) manual = manual || e.Group == config::kGroup;
   ctx.Assert(manual, "no explicit commit happened for group %s", config::kGroup);
-  const auto held = qjRows(ctx);
+  const auto held = hQjRows(ctx);
   ctx.Assert(held.size() == 3, "three answered turns were on %s, quality_scores holds %d row(s): the consumer must read from the beginning (auto.offset.reset earliest) and score every record", config::kTopic, held.size());
-  qjFullyCommitted(ctx);
+  hQjFullyCommitted(ctx);
 }
 
 void CheckScoresPerTurn(harness::Ctx& ctx) {
-  qjSeed(ctx, "s1", 1, qjGrounded, false);
-  qjSeed(ctx, "s2", 1, qjHallucinated, false);
-  qjSeed(ctx, "s1", 2, qjHalf, false);
-  auto* j = qjWorker(ctx);
-  qjRun(ctx);
+  hQjSeed(ctx, "s1", 1, kHQjGrounded, false);
+  hQjSeed(ctx, "s2", 1, kHQjHallucinated, false);
+  hQjSeed(ctx, "s1", 2, kHQjHalf, false);
+  auto* j = hQjWorker(ctx);
+  hQjRun(ctx);
   ctx.Assert(!ctx.GRPC.CallsTo("Evaluate", config::kJudge).empty(), "no Judge.Evaluate reached %s: every answered turn is judged", config::kJudge);
   const auto asked = j->asked();
   ctx.Assert(asked.size() == 3, "three answered turns must mean three Evaluate calls, the judge saw %d", asked.size());
-  for (const auto& kind : {qjGrounded, qjHallucinated, qjHalf}) {
+  for (const auto& kind : {kHQjGrounded, kHQjHallucinated, kHQjHalf}) {
     const support::EvaluateRequest* first = nullptr;
     for (const auto& c : asked) {
       if (c.answer() == kind.answer && first == nullptr) first = &c;
@@ -2120,12 +2120,12 @@ void CheckScoresPerTurn(harness::Ctx& ctx) {
     ctx.Equal(first->question(), kind.question, "Evaluate must carry the record's question");
     ctx.Equal(std::vector<std::string>(first->context_ids().begin(), first->context_ids().end()), kind.sources, "context_ids must be the record's sources");
   }
-  auto held = qjRows(ctx);
-  ctx.Equal(qjKeys(held), std::vector<std::string>{"s1|1", "s1|2", "s2|1"}, "one row per (session_id, turn) was expected in quality_scores");
-  for (const auto& [key, kind] : std::vector<std::pair<std::string, qjKind>>{{"s1|1", qjGrounded}, {"s2|1", qjHallucinated}, {"s1|2", qjHalf}}) {
+  auto held = hQjRows(ctx);
+  ctx.Equal(hQjKeys(held), std::vector<std::string>{"s1|1", "s1|2", "s2|1"}, "one row per (session_id, turn) was expected in quality_scores");
+  for (const auto& [key, kind] : std::vector<std::pair<std::string, HQjKind>>{{"s1|1", kHQjGrounded}, {"s2|1", kHQjHallucinated}, {"s1|2", kHQjHalf}}) {
     const auto want = model::evaluate(kind.question, kind.answer, kind.sources);
     auto& row = held[key];
-    ctx.Assert(qjSameScores(row, want), "%s: the row holds groundedness %v, coherence %v, compliance %v, pass %v; the judge said %s: store the judge's scores as they came", key, row["groundedness"], row["coherence"], row["compliance"], row["pass"], qjShow(want));
+    ctx.Assert(hQjSameScores(row, want), "%s: the row holds groundedness %v, coherence %v, compliance %v, pass %v; the judge said %s: store the judge's scores as they came", key, row["groundedness"], row["coherence"], row["compliance"], row["pass"], hQjShow(want));
   }
   ctx.Equal(held["s1|1"]["pass"], true, "the grounded answer cites only its sources: the judge passes it, and the row must say so");
   ctx.Equal(held["s2|1"]["pass"], false, "the hallucinated answer cites [kb:policy-404], which was never retrieved, and promises an outcome: it must be stored as a failure");
@@ -2133,12 +2133,12 @@ void CheckScoresPerTurn(harness::Ctx& ctx) {
 }
 
 void CheckEscalatedCommitted(harness::Ctx& ctx) {
-  qjSeed(ctx, "s1", 1, qjGrounded, false);
-  qjSeed(ctx, "s1", 2, qjGrounded, true);
-  qjSeed(ctx, "s3", 1, qjGrounded, true);
-  qjSeed(ctx, "s2", 1, qjHallucinated, false);
-  auto* j = qjWorker(ctx);
-  if (const auto err = qjDrain(ctx)) {
+  hQjSeed(ctx, "s1", 1, kHQjGrounded, false);
+  hQjSeed(ctx, "s1", 2, kHQjGrounded, true);
+  hQjSeed(ctx, "s3", 1, kHQjGrounded, true);
+  hQjSeed(ctx, "s2", 1, kHQjHallucinated, false);
+  auto* j = hQjWorker(ctx);
+  if (const auto err = hQjDrain(ctx)) {
     ctx.Fatalf("an escalated turn must not stop the consumer, but run() threw %s", *err);
   }
   const auto asked = j->asked();
@@ -2146,67 +2146,67 @@ void CheckEscalatedCommitted(harness::Ctx& ctx) {
   for (const auto& c : asked) {
     ctx.Assert(c.answer() != config::kHandoffText, "the handoff text is not an answer: an escalated turn must not be sent to the judge");
   }
-  ctx.Equal(qjKeys(qjRows(ctx)), std::vector<std::string>{"s1|1", "s2|1"}, "escalated turns produce no row in quality_scores");
+  ctx.Equal(hQjKeys(hQjRows(ctx)), std::vector<std::string>{"s1|1", "s2|1"}, "escalated turns produce no row in quality_scores");
   const auto lag = ctx.Kafka.Lag(config::kGroup, config::kTopic);
   ctx.Assert(lag == 0, "%d record(s) not committed: an escalated turn's offset must be committed too, or it is redelivered forever", lag);
 }
 
 void CheckCommitAfterWrite(harness::Ctx& ctx) {
-  qjSeed(ctx, "s1", 1, qjGrounded, false);
-  qjSeed(ctx, "s2", 1, qjHalf, false);
-  qjWorker(ctx);
-  const auto commits = qjWatchCommits(ctx);
-  qjRun(ctx);
-  const auto committed = qjNewlyCommitted(ctx, *commits);
+  hQjSeed(ctx, "s1", 1, kHQjGrounded, false);
+  hQjSeed(ctx, "s2", 1, kHQjHalf, false);
+  hQjWorker(ctx);
+  const auto commits = hQjWatchCommits(ctx);
+  hQjRun(ctx);
+  const auto committed = hQjNewlyCommitted(ctx, *commits);
   ctx.Assert(!committed.empty(), "the offsets of s1 and s2 were never committed by group %s", config::kGroup);
   for (const auto& c : committed) {
-    ctx.Assert(qjRowWritten(c.queries, c.session_id, c.turn), "the offset of (%s, %d) was committed before its row was in quality_scores: commit only after record_scores returned", c.session_id, c.turn);
+    ctx.Assert(hQjRowWritten(c.queries, c.session_id, c.turn), "the offset of (%s, %d) was committed before its row was in quality_scores: commit only after record_scores returned", c.session_id, c.turn);
   }
   // Postgres starts refusing: turn 99 now violates a constraint, so the write fails.
   ctx.DB.Exec("ALTER TABLE quality_scores ADD CONSTRAINT scores_down CHECK (turn <> 99) NOT VALID");
-  qjSeed(ctx, "s1", 99, qjGrounded, false);
-  (void)qjDrain(ctx);  // the failed write surfaces here; what matters is what was committed
-  bool written = qjRows(ctx).count("s1|99") > 0;
+  hQjSeed(ctx, "s1", 99, kHQjGrounded, false);
+  (void)hQjDrain(ctx);  // the failed write surfaces here; what matters is what was committed
+  bool written = hQjRows(ctx).count("s1|99") > 0;
   ctx.Assert(!written, "the write of turn 99 failed and must have left no row");
   ctx.Equal(ctx.Kafka.Lag(config::kGroup, config::kTopic), 1, "a record whose write failed must not be committed: it has to come back; records not committed");
   ctx.DB.Exec("ALTER TABLE quality_scores DROP CONSTRAINT scores_down");
-  qjRestart();
-  qjRun(ctx);
-  const auto held = qjRows(ctx);
+  hQjRestart();
+  hQjRun(ctx);
+  const auto held = hQjRows(ctx);
   written = held.count("s1|99") > 0;
-  ctx.Assert(written, "after a restart turn 99 must be redelivered and written, quality_scores holds %q", qjKeys(held));
+  ctx.Assert(written, "after a restart turn 99 must be redelivered and written, quality_scores holds %q", hQjKeys(held));
   ctx.Assert(held.size() == 3, "three answered turns, %d rows: each (session, turn) is written once", held.size());
-  qjFullyCommitted(ctx);
+  hQjFullyCommitted(ctx);
 }
 
 void CheckJudgeDownRetries(harness::Ctx& ctx) {
-  qjSeed(ctx, "s1", 1, qjGrounded, false);
-  qjSeed(ctx, "s2", 1, qjHalf, false);
-  qjSeed(ctx, "s1", 1, qjGrounded, false);  // the producer retried: a duplicate
-  qjWorker(ctx);
-  const auto commits = qjWatchCommits(ctx);
+  hQjSeed(ctx, "s1", 1, kHQjGrounded, false);
+  hQjSeed(ctx, "s2", 1, kHQjHalf, false);
+  hQjSeed(ctx, "s1", 1, kHQjGrounded, false);  // the producer retried: a duplicate
+  hQjWorker(ctx);
+  const auto commits = hQjWatchCommits(ctx);
   // The judge's first answer is UNAVAILABLE (a deploy, a restart); it is back for every call after that.
   ctx.GRPC.Fail("Evaluate", grpc::StatusCode::UNAVAILABLE, "", 1, config::kJudge);
   // Go fails on an error other than Unavailable; a C++ exception carries no status code, so a loop
   // that throws is let through here and judged by its restart and the assertions below.
-  (void)qjDrain(ctx);
+  (void)hQjDrain(ctx);
   if (ctx.Kafka.Lag(config::kGroup, config::kTopic) > 0) {
     // The consumer stopped on the failure instead of retrying in place: acceptable only if nothing was committed for it.
-    qjRestart();
-    qjRun(ctx);
+    hQjRestart();
+    hQjRun(ctx);
   }
   const auto calls = ctx.GRPC.CallsTo("Evaluate", config::kJudge);
   ctx.Assert(calls.size() >= 4, "three records (one a duplicate) and one UNAVAILABLE answer mean at least four Evaluate calls — the failed one and a retry — the judge saw %d: an UNAVAILABLE judge means ask again later, not skip", calls.size());
   bool unavailable = false;
   for (const auto& c : calls) unavailable = unavailable || c.Code == grpc::StatusCode::UNAVAILABLE;
   ctx.Assert(unavailable, "the UNAVAILABLE call never happened");
-  for (const auto& c : qjNewlyCommitted(ctx, *commits)) {
-    ctx.Assert(qjRowWritten(c.queries, c.session_id, c.turn), "the offset of (%s, %d) was committed while no row existed for it: a judge answering UNAVAILABLE must leave the offset uncommitted", c.session_id, c.turn);
+  for (const auto& c : hQjNewlyCommitted(ctx, *commits)) {
+    ctx.Assert(hQjRowWritten(c.queries, c.session_id, c.turn), "the offset of (%s, %d) was committed while no row existed for it: a judge answering UNAVAILABLE must leave the offset uncommitted", c.session_id, c.turn);
   }
-  auto held = qjRows(ctx);
-  ctx.Equal(qjKeys(held), std::vector<std::string>{"s1|1", "s2|1"}, "two distinct (session, turn) pairs were delivered three times: quality_scores must hold exactly those two rows");
-  ctx.Assert(qjSameScores(held["s1|1"], model::evaluate(qjGrounded.question, qjGrounded.answer, qjGrounded.sources)) && qjSameScores(held["s2|1"], model::evaluate(qjHalf.question, qjHalf.answer, qjHalf.sources)), "the retried record must end up with the judge's scores, as if it had never failed");
-  qjFullyCommitted(ctx);
+  auto held = hQjRows(ctx);
+  ctx.Equal(hQjKeys(held), std::vector<std::string>{"s1|1", "s2|1"}, "two distinct (session, turn) pairs were delivered three times: quality_scores must hold exactly those two rows");
+  ctx.Assert(hQjSameScores(held["s1|1"], model::evaluate(kHQjGrounded.question, kHQjGrounded.answer, kHQjGrounded.sources)) && hQjSameScores(held["s2|1"], model::evaluate(kHQjHalf.question, kHQjHalf.answer, kHQjHalf.sources)), "the retried record must end up with the judge's scores, as if it had never failed");
+  hQjFullyCommitted(ctx);
 }
 `,
   },

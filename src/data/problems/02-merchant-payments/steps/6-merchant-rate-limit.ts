@@ -741,7 +741,7 @@ import (
 
 // limitedAPI is the learner's server with the provided authentication swapped for the X-Merchant
 // header, and step 1's checkout for a plain 200.
-func limitedAPI(ctx *harness.Ctx) *harness.HTTP {
+func hLimitedAPI(ctx *harness.Ctx) *harness.HTTP {
 	merchantOf = func(r *http.Request) string {
 		if m := r.Header.Get("X-Merchant"); m != "" {
 			return m
@@ -756,7 +756,7 @@ func limitedAPI(ctx *harness.Ctx) *harness.HTTP {
 }
 
 // minuteAt moves the clock so the current minute is at :second (plus half a second); returns the integer seconds now.
-func minuteAt(ctx *harness.Ctx, second float64) int64 {
+func hMinuteAt(ctx *harness.Ctx, second float64) int64 {
 	now := float64(ctx.Clock.Now()) / 1000
 	target := math.Floor(now) - math.Mod(math.Floor(now), 60) + second + 0.5
 	if target < now {
@@ -766,11 +766,11 @@ func minuteAt(ctx *harness.Ctx, second float64) int64 {
 	return ctx.Clock.Now() / 1000
 }
 
-func merchantPost(c *harness.HTTP, merchant string) *harness.Response {
+func hMerchantPost(c *harness.HTTP, merchant string) *harness.Response {
 	return c.Post("/checkout", nil, "X-Merchant", merchant)
 }
 
-func counter(ctx *harness.Ctx, key string) any {
+func hCounter(ctx *harness.Ctx, key string) any {
 	if v, ok := ctx.Redis.Get(key); ok {
 		return v
 	}
@@ -778,34 +778,34 @@ func counter(ctx *harness.Ctx, key string) any {
 }
 
 func CheckWindowKey(ctx *harness.Ctx) {
-	c := limitedAPI(ctx)
-	now := minuteAt(ctx, 5)
+	c := hLimitedAPI(ctx)
+	now := hMinuteAt(ctx, 5)
 	minute := now / 60
-	r := merchantPost(c, "m42")
+	r := hMerchantPost(c, "m42")
 	ctx.Equal(r.Status, 200, "the first request of the minute")
 	key := fmt.Sprintf("rl:m42:%d", minute)
-	ctx.Equal(counter(ctx, key), "1", "after one request %s (keys: %v)", key, ctx.Redis.Keys("rl:*"))
-	merchantPost(c, "m7")
-	ctx.Equal(counter(ctx, fmt.Sprintf("rl:m7:%d", minute)), "1", "each merchant has its own counter")
-	ctx.Equal(counter(ctx, key), "1", "another merchant's request must not count against m42")
+	ctx.Equal(hCounter(ctx, key), "1", "after one request %s (keys: %v)", key, ctx.Redis.Keys("rl:*"))
+	hMerchantPost(c, "m7")
+	ctx.Equal(hCounter(ctx, fmt.Sprintf("rl:m7:%d", minute)), "1", "each merchant has its own counter")
+	ctx.Equal(hCounter(ctx, key), "1", "another merchant's request must not count against m42")
 	ctx.Clock.Advance(60)
-	merchantPost(c, "m42")
-	ctx.Equal(counter(ctx, fmt.Sprintf("rl:m42:%d", minute+1)), "1", "a minute later the counter must live under rl:m42:%d (keys: %v)", minute+1, ctx.Redis.Keys("rl:*"))
-	ctx.Equal(counter(ctx, key), "1", "the previous window's counter is left alone: the key name is the window")
+	hMerchantPost(c, "m42")
+	ctx.Equal(hCounter(ctx, fmt.Sprintf("rl:m42:%d", minute+1)), "1", "a minute later the counter must live under rl:m42:%d (keys: %v)", minute+1, ctx.Redis.Keys("rl:*"))
+	ctx.Equal(hCounter(ctx, key), "1", "the previous window's counter is left alone: the key name is the window")
 }
 
 func CheckIncrExpire(ctx *harness.Ctx) {
-	c := limitedAPI(ctx)
-	now := minuteAt(ctx, 5)
+	c := hLimitedAPI(ctx)
+	now := hMinuteAt(ctx, 5)
 	key := fmt.Sprintf("rl:m42:%d", now/60)
 	for range 3 {
-		merchantPost(c, "m42")
+		hMerchantPost(c, "m42")
 	}
-	ctx.Equal(counter(ctx, key), "3", "after three requests %s", key)
+	ctx.Equal(hCounter(ctx, key), "3", "after three requests %s", key)
 	ttl := ctx.Redis.TTL(key)
 	ctx.Assert(110 <= ttl && ttl <= 120, "%s has TTL %d, expected 120 s set when the key was created", key, ttl)
 	ctx.Clock.Advance(30)
-	merchantPost(c, "m42")
+	hMerchantPost(c, "m42")
 	ttl = ctx.Redis.TTL(key)
 	ctx.Assert(80 <= ttl && ttl <= 90, "30 s later %s has TTL %d: the expiry is set once, when Incr returns 1, not on every request", key, ttl)
 	ctx.Clock.Advance(100)
@@ -813,16 +813,16 @@ func CheckIncrExpire(ctx *harness.Ctx) {
 }
 
 func CheckTooMany(ctx *harness.Ctx) {
-	c := limitedAPI(ctx)
-	now := minuteAt(ctx, 5)
+	c := hLimitedAPI(ctx)
+	now := hMinuteAt(ctx, 5)
 	ctx.Redis.Set(fmt.Sprintf("rl:m42:%d", now/60), 98) // 98 checkouts already this minute
-	r99 := merchantPost(c, "m42")
-	r100 := merchantPost(c, "m42")
-	r101 := merchantPost(c, "m42")
-	r102 := merchantPost(c, "m42")
-	other := merchantPost(c, "m7")
+	r99 := hMerchantPost(c, "m42")
+	r100 := hMerchantPost(c, "m42")
+	r101 := hMerchantPost(c, "m42")
+	r102 := hMerchantPost(c, "m42")
+	other := hMerchantPost(c, "m7")
 	ctx.Clock.Advance(60)
-	later := merchantPost(c, "m42")
+	later := hMerchantPost(c, "m42")
 	ctx.Assert(r99.Status == 200 && r100.Status == 200, "requests 99 and 100 are within the limit, got %d and %d", r99.Status, r100.Status)
 	ctx.Equal(r101.Status, 429, "the 101st request of the minute")
 	ctx.Equal(r102.Status, 429, "the 102nd request, for the rest of the window,")
@@ -831,12 +831,12 @@ func CheckTooMany(ctx *harness.Ctx) {
 }
 
 func CheckHeaders(ctx *harness.Ctx) {
-	c := limitedAPI(ctx)
-	now := minuteAt(ctx, 43)
+	c := hLimitedAPI(ctx)
+	now := hMinuteAt(ctx, 43)
 	ctx.Redis.Set(fmt.Sprintf("rl:m42:%d", now/60), 99)
-	lastOk := merchantPost(c, "m42")
-	over := merchantPost(c, "m42")
-	fresh := merchantPost(c, "m7")
+	lastOk := hMerchantPost(c, "m42")
+	over := hMerchantPost(c, "m42")
+	fresh := hMerchantPost(c, "m7")
 	ctx.Equal(over.Status, 429, "the 101st request")
 	ctx.Equal(over.Header.Get("Retry-After"), "17", "at :43 the 429 must say Retry-After: 17 (seconds left in the window)")
 	ctx.Equal(over.Header.Get("X-RateLimit-Remaining"), "0", "the 429 must carry X-RateLimit-Remaining: 0")
@@ -852,10 +852,10 @@ namespace {
 
 // The step's own stand-in checkout (inside main, where the harness cannot swap it as Go's does for a
 // plain 200) answers 201: an allowed request is a 201 here.
-constexpr int allowed = 201;
+constexpr int kHAllowed = 201;
 
 // minuteAt moves the clock so the current minute is at :second (plus half a second); returns the integer seconds now.
-int64_t minuteAt(harness::Ctx& ctx, double second) {
+int64_t hMinuteAt(harness::Ctx& ctx, double second) {
   const double now = static_cast<double>(ctx.Clock.Now()) / 1000;
   double target = std::floor(now) - std::fmod(std::floor(now), 60) + second + 0.5;
   if (target < now) target += 60;
@@ -863,11 +863,11 @@ int64_t minuteAt(harness::Ctx& ctx, double second) {
   return ctx.Clock.Now() / 1000;
 }
 
-harness::Response merchantPost(harness::HTTP& c, const std::string& merchant) { return c.Post("/checkout", "", "X-Merchant", merchant); }
+harness::Response hMerchantPost(harness::HTTP& c, const std::string& merchant) { return c.Post("/checkout", "", "X-Merchant", merchant); }
 
-std::optional<std::string> counter(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key); }
+std::optional<std::string> hCounter(harness::Ctx& ctx, const std::string& key) { return ctx.Redis.Get(key); }
 
-std::string rlKey(const std::string& merchant, int64_t minute) { return "rl:" + merchant + ":" + std::to_string(minute); }
+std::string hRlKey(const std::string& merchant, int64_t minute) { return "rl:" + merchant + ":" + std::to_string(minute); }
 
 }  // namespace
 
@@ -879,31 +879,31 @@ std::string merchant_of(const httplib::Request& req) {
 
 void CheckWindowKey(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  const int64_t now = minuteAt(ctx, 5);
+  const int64_t now = hMinuteAt(ctx, 5);
   const int64_t minute = now / 60;
-  const auto r = merchantPost(c, "m42");
-  ctx.Equal(r.Status, allowed, "the first request of the minute");
-  const std::string key = rlKey("m42", minute);
-  ctx.Equal(counter(ctx, key), "1", "after one request %s (keys: %v)", key, ctx.Redis.Keys("rl:*"));
-  merchantPost(c, "m7");
-  ctx.Equal(counter(ctx, rlKey("m7", minute)), "1", "each merchant has its own counter");
-  ctx.Equal(counter(ctx, key), "1", "another merchant's request must not count against m42");
+  const auto r = hMerchantPost(c, "m42");
+  ctx.Equal(r.Status, kHAllowed, "the first request of the minute");
+  const std::string key = hRlKey("m42", minute);
+  ctx.Equal(hCounter(ctx, key), "1", "after one request %s (keys: %v)", key, ctx.Redis.Keys("rl:*"));
+  hMerchantPost(c, "m7");
+  ctx.Equal(hCounter(ctx, hRlKey("m7", minute)), "1", "each merchant has its own counter");
+  ctx.Equal(hCounter(ctx, key), "1", "another merchant's request must not count against m42");
   ctx.Clock.Advance(60);
-  merchantPost(c, "m42");
-  ctx.Equal(counter(ctx, rlKey("m42", minute + 1)), "1", "a minute later the counter must live under rl:m42:%d (keys: %v)", minute + 1, ctx.Redis.Keys("rl:*"));
-  ctx.Equal(counter(ctx, key), "1", "the previous window's counter is left alone: the key name is the window");
+  hMerchantPost(c, "m42");
+  ctx.Equal(hCounter(ctx, hRlKey("m42", minute + 1)), "1", "a minute later the counter must live under rl:m42:%d (keys: %v)", minute + 1, ctx.Redis.Keys("rl:*"));
+  ctx.Equal(hCounter(ctx, key), "1", "the previous window's counter is left alone: the key name is the window");
 }
 
 void CheckIncrExpire(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  const int64_t now = minuteAt(ctx, 5);
-  const std::string key = rlKey("m42", now / 60);
-  for (int i = 0; i < 3; i++) merchantPost(c, "m42");
-  ctx.Equal(counter(ctx, key), "3", "after three requests %s", key);
+  const int64_t now = hMinuteAt(ctx, 5);
+  const std::string key = hRlKey("m42", now / 60);
+  for (int i = 0; i < 3; i++) hMerchantPost(c, "m42");
+  ctx.Equal(hCounter(ctx, key), "3", "after three requests %s", key);
   long long ttl = ctx.Redis.TTL(key);
   ctx.Assert(110 <= ttl && ttl <= 120, "%s has TTL %d, expected 120 s set when the key was created", key, ttl);
   ctx.Clock.Advance(30);
-  merchantPost(c, "m42");
+  hMerchantPost(c, "m42");
   ttl = ctx.Redis.TTL(key);
   ctx.Assert(80 <= ttl && ttl <= 90, "30 s later %s has TTL %d: the expiry is set once, when INCR returns 1, not on every request", key, ttl);
   ctx.Clock.Advance(100);
@@ -912,35 +912,35 @@ void CheckIncrExpire(harness::Ctx& ctx) {
 
 void CheckTooMany(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  const int64_t now = minuteAt(ctx, 5);
-  ctx.Redis.Set(rlKey("m42", now / 60), 98);  // 98 checkouts already this minute
-  const auto r99 = merchantPost(c, "m42");
-  const auto r100 = merchantPost(c, "m42");
-  const auto r101 = merchantPost(c, "m42");
-  const auto r102 = merchantPost(c, "m42");
-  const auto other = merchantPost(c, "m7");
+  const int64_t now = hMinuteAt(ctx, 5);
+  ctx.Redis.Set(hRlKey("m42", now / 60), 98);  // 98 checkouts already this minute
+  const auto r99 = hMerchantPost(c, "m42");
+  const auto r100 = hMerchantPost(c, "m42");
+  const auto r101 = hMerchantPost(c, "m42");
+  const auto r102 = hMerchantPost(c, "m42");
+  const auto other = hMerchantPost(c, "m7");
   ctx.Clock.Advance(60);
-  const auto later = merchantPost(c, "m42");
-  ctx.Assert(r99.Status == allowed && r100.Status == allowed, "requests 99 and 100 are within the limit, got %d and %d", r99.Status, r100.Status);
+  const auto later = hMerchantPost(c, "m42");
+  ctx.Assert(r99.Status == kHAllowed && r100.Status == kHAllowed, "requests 99 and 100 are within the limit, got %d and %d", r99.Status, r100.Status);
   ctx.Equal(r101.Status, 429, "the 101st request of the minute");
   ctx.Equal(r102.Status, 429, "the 102nd request, for the rest of the window,");
-  ctx.Equal(other.Status, allowed, "one merchant over its limit must not block another");
-  ctx.Equal(later.Status, allowed, "in the next minute the merchant is allowed again");
+  ctx.Equal(other.Status, kHAllowed, "one merchant over its limit must not block another");
+  ctx.Equal(later.Status, kHAllowed, "in the next minute the merchant is allowed again");
 }
 
 void CheckHeaders(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  const int64_t now = minuteAt(ctx, 43);
-  ctx.Redis.Set(rlKey("m42", now / 60), 99);
-  const auto lastOk = merchantPost(c, "m42");
-  const auto over = merchantPost(c, "m42");
-  const auto fresh = merchantPost(c, "m7");
+  const int64_t now = hMinuteAt(ctx, 43);
+  ctx.Redis.Set(hRlKey("m42", now / 60), 99);
+  const auto lastOk = hMerchantPost(c, "m42");
+  const auto over = hMerchantPost(c, "m42");
+  const auto fresh = hMerchantPost(c, "m7");
   ctx.Equal(over.Status, 429, "the 101st request");
   ctx.Equal(over.HeaderValue("Retry-After"), "17", "at :43 the 429 must say Retry-After: 17 (seconds left in the window)");
   ctx.Equal(over.HeaderValue("X-RateLimit-Remaining"), "0", "the 429 must carry X-RateLimit-Remaining: 0");
-  ctx.Assert(lastOk.Status == allowed && lastOk.HeaderValue("X-RateLimit-Remaining") == "0",
+  ctx.Assert(lastOk.Status == kHAllowed && lastOk.HeaderValue("X-RateLimit-Remaining") == "0",
              "the 100th request is allowed with X-RateLimit-Remaining: 0, got %d / %q", lastOk.Status, lastOk.HeaderValue("X-RateLimit-Remaining"));
-  ctx.Assert(fresh.Status == allowed && fresh.HeaderValue("X-RateLimit-Remaining") == "99",
+  ctx.Assert(fresh.Status == kHAllowed && fresh.HeaderValue("X-RateLimit-Remaining") == "99",
              "a merchant's first request leaves 99, got X-RateLimit-Remaining %q", fresh.HeaderValue("X-RateLimit-Remaining"));
 }
 `,

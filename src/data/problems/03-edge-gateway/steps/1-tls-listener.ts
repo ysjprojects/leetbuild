@@ -740,7 +740,7 @@ func CheckDrainBound(ctx *harness.Ctx) {
 
 namespace {
 
-std::string withoutSpaces(std::string s) {
+std::string hWithoutSpaces(std::string s) {
   std::string out;
   for (char c : s)
     if (c != ' ') out += c;
@@ -787,7 +787,7 @@ void CheckHsts(harness::Ctx& ctx) {
                "response has it",
                name, r->Status);
     const std::string value = r->HeaderValue("Strict-Transport-Security");
-    ctx.Assert(withoutSpaces(value).find("max-age=63072000") != std::string::npos,
+    ctx.Assert(hWithoutSpaces(value).find("max-age=63072000") != std::string::npos,
                "%s: Strict-Transport-Security is %q, expected max-age=63072000", name, value);
   }
 }

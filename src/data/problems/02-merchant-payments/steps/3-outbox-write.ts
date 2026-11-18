@@ -817,7 +817,7 @@ import (
 	"leetbuild/harness"
 )
 
-const outboxSchema = \`
+const kHOutboxSchema = \`
 CREATE TABLE orders (
     id text PRIMARY KEY,
     merchant_id text NOT NULL,
@@ -837,22 +837,22 @@ CREATE TABLE outbox (
 \`
 
 var (
-	firstOrder  = Order{ID: "o-1", MerchantID: "m-42"}
-	someCapture = Capture{AmountCents: 4999, Currency: "EUR"}
-	uuidV4      = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+	hFirstOrder  = Order{ID: "o-1", MerchantID: "m-42"}
+	hSomeCapture = Capture{AmountCents: 4999, Currency: "EUR"}
+	hUuidV4      = regexp.MustCompile("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
 )
 
-func tableRows(ctx *harness.Ctx, table string) []harness.Row {
+func hTableRows(ctx *harness.Ctx, table string) []harness.Row {
 	return ctx.DB.Query("SELECT * FROM " + table + " ORDER BY created_at, id")
 }
 
-func captureOrder(ctx *harness.Ctx, order Order) string {
-	eventID, err := recordCapture(context.Background(), order, someCapture)
+func hCaptureOrder(ctx *harness.Ctx, order Order) string {
+	eventID, err := recordCapture(context.Background(), order, hSomeCapture)
 	ctx.NoError(err, "recordCapture(%+v) returned an error", order)
 	return eventID
 }
 
-func decodePayload(ctx *harness.Ctx, row harness.Row) map[string]any {
+func hDecodePayload(ctx *harness.Ctx, row harness.Row) map[string]any {
 	text, _ := row["payload"].(string)
 	var event map[string]any
 	if json.Unmarshal([]byte(text), &event) != nil {
@@ -862,33 +862,33 @@ func decodePayload(ctx *harness.Ctx, row harness.Row) map[string]any {
 }
 
 func CheckAtomic(ctx *harness.Ctx) {
-	ctx.DB.Reset(outboxSchema)
-	captureOrder(ctx, firstOrder)
-	ctx.Equal(len(tableRows(ctx, "orders")), 1, "orders rows")
-	ctx.Equal(len(tableRows(ctx, "outbox")), 1, "outbox rows next to the order")
+	ctx.DB.Reset(kHOutboxSchema)
+	hCaptureOrder(ctx, hFirstOrder)
+	ctx.Equal(len(hTableRows(ctx, "orders")), 1, "orders rows")
+	ctx.Equal(len(hTableRows(ctx, "outbox")), 1, "outbox rows next to the order")
 	ctx.Equal(ctx.DB.Events(), []string{"BEGIN", "COMMIT"}, "both rows must be written in one transaction; the database saw")
 	// The outbox insert for merchant m-broken violates a constraint: the order must roll back with it.
-	_, err := recordCapture(context.Background(), Order{ID: "o-2", MerchantID: "m-broken"}, someCapture)
+	_, err := recordCapture(context.Background(), Order{ID: "o-2", MerchantID: "m-broken"}, hSomeCapture)
 	ctx.Assert(err != nil, "a failed outbox insert must propagate (the transaction rolls back), not be swallowed")
 	events := ctx.DB.Events()
 	ctx.Equal(events[len(events)-1], "ROLLBACK", "the failed transaction must roll back; the last event the database saw")
 	var ids []any
-	for _, o := range tableRows(ctx, "orders") {
+	for _, o := range hTableRows(ctx, "orders") {
 		ids = append(ids, o["id"])
 	}
 	ctx.Equal(ids, []any{"o-1"}, "the outbox insert failed, so the orders row o-2 must not be committed: the two writes belong in one transaction")
 }
 
 func CheckOutboxRow(ctx *harness.Ctx) {
-	ctx.DB.Reset(outboxSchema)
-	eventID := captureOrder(ctx, firstOrder)
-	outbox := tableRows(ctx, "outbox")
+	ctx.DB.Reset(kHOutboxSchema)
+	eventID := hCaptureOrder(ctx, hFirstOrder)
+	outbox := hTableRows(ctx, "outbox")
 	ctx.Equal(len(outbox), 1, "outbox rows")
 	row := outbox[0]
 	ctx.Equal(row["topic"], "payments", "outbox.topic")
 	ctx.Equal(row["key"], "m-42", "outbox.key must be the merchant id")
 	ctx.Equal(row["sent_at"], nil, "a fresh outbox row is unsent: outbox.sent_at")
-	event := decodePayload(ctx, row)
+	event := hDecodePayload(ctx, row)
 	for _, field := range []struct {
 		name  string
 		value any
@@ -900,22 +900,22 @@ func CheckOutboxRow(ctx *harness.Ctx) {
 }
 
 func CheckNoDualWrite(ctx *harness.Ctx) {
-	ctx.DB.Reset(outboxSchema)
-	captureOrder(ctx, firstOrder)
+	ctx.DB.Reset(kHOutboxSchema)
+	hCaptureOrder(ctx, hFirstOrder)
 	ctx.Equal(len(ctx.Kafka.EventsOf("producer", "client")), 0, "this file must not create a Kafka client or producer (the relay publishes committed outbox rows): producer events")
 	ctx.Equal(len(ctx.Kafka.Records("payments")), 0, "records recordCapture produced to Kafka from the request path")
-	ctx.Equal(len(tableRows(ctx, "outbox")), 1, "the event must be an outbox row instead: outbox rows")
+	ctx.Equal(len(hTableRows(ctx, "outbox")), 1, "the event must be an outbox row instead: outbox rows")
 }
 
 func CheckEventId(ctx *harness.Ctx) {
-	ctx.DB.Reset(outboxSchema)
-	first := captureOrder(ctx, firstOrder)
-	second := captureOrder(ctx, Order{ID: "o-2", MerchantID: "m-42"})
+	ctx.DB.Reset(kHOutboxSchema)
+	first := hCaptureOrder(ctx, hFirstOrder)
+	second := hCaptureOrder(ctx, Order{ID: "o-2", MerchantID: "m-42"})
 	for _, eventID := range []string{first, second} {
-		ctx.Assert(uuidV4.MatchString(eventID), "the event id must be a random (version 4) UUID, got %q", eventID)
+		ctx.Assert(hUuidV4.MatchString(eventID), "the event id must be a random (version 4) UUID, got %q", eventID)
 	}
 	ctx.Assert(first != second, "every event needs its own UUID")
-	outbox := tableRows(ctx, "outbox")
+	outbox := hTableRows(ctx, "outbox")
 	var ids []string
 	for _, row := range outbox {
 		id, _ := row["id"].(string)
@@ -926,7 +926,7 @@ func CheckEventId(ctx *harness.Ctx) {
 	sort.Strings(want)
 	ctx.Equal(ids, want, "outbox row ids must be the returned event ids")
 	for _, row := range outbox {
-		ctx.Equal(decodePayload(ctx, row)["event_id"], row["id"], "payload.event_id must be the same UUID as the row id")
+		ctx.Equal(hDecodePayload(ctx, row)["event_id"], row["id"], "payload.event_id must be the same UUID as the row id")
 	}
 }
 `,
@@ -937,7 +937,7 @@ func CheckEventId(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string outboxSchema = R"(
+const std::string kHOutboxSchema = R"(
 CREATE TABLE orders (
     id text PRIMARY KEY,
     merchant_id text NOT NULL,
@@ -956,23 +956,23 @@ CREATE TABLE outbox (
 );
 )";
 
-const Order firstOrder{"o-1", "m-42"};
-const Capture someCapture{4999, "EUR"};
-const std::regex uuidV4("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
+const Order kHFirstOrder{"o-1", "m-42"};
+const Capture kHSomeCapture{4999, "EUR"};
+const std::regex hUuidV4("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$");
 
-std::vector<harness::Row> tableRows(harness::Ctx& ctx, const std::string& table) {
+std::vector<harness::Row> hTableRows(harness::Ctx& ctx, const std::string& table) {
   return ctx.DB.Query("SELECT * FROM " + table + " ORDER BY created_at, id");
 }
 
-std::string captureOrder(harness::Ctx& ctx, const Order& order) {
+std::string hCaptureOrder(harness::Ctx& ctx, const Order& order) {
   try {
-    return record_capture(order, someCapture);
+    return record_capture(order, kHSomeCapture);
   } catch (const std::exception& e) {
     ctx.Fatalf("recordCapture({ID:%s MerchantID:%s}) returned an error: %v", order.id, order.merchant_id, std::string(e.what()));
   }
 }
 
-harness::Any decodePayload(harness::Ctx& ctx, harness::Row& row) {
+harness::Any hDecodePayload(harness::Ctx& ctx, harness::Row& row) {
   const auto event = harness::ParseJSON(row["payload"].String());
   if (!event || !event->IsObject()) ctx.Fatalf("outbox.payload must be the event as JSON, got %s", harness::ShowValue(row["payload"]));
   return *event;
@@ -981,15 +981,15 @@ harness::Any decodePayload(harness::Ctx& ctx, harness::Row& row) {
 }  // namespace
 
 void CheckAtomic(harness::Ctx& ctx) {
-  ctx.DB.Reset(outboxSchema);
-  captureOrder(ctx, firstOrder);
-  ctx.Equal(tableRows(ctx, "orders").size(), 1, "orders rows");
-  ctx.Equal(tableRows(ctx, "outbox").size(), 1, "outbox rows next to the order");
+  ctx.DB.Reset(kHOutboxSchema);
+  hCaptureOrder(ctx, kHFirstOrder);
+  ctx.Equal(hTableRows(ctx, "orders").size(), 1, "orders rows");
+  ctx.Equal(hTableRows(ctx, "outbox").size(), 1, "outbox rows next to the order");
   ctx.Equal(ctx.DB.Events(), {"BEGIN", "COMMIT"}, "both rows must be written in one transaction; the database saw");
   // The outbox insert for merchant m-broken violates a constraint: the order must roll back with it.
   bool failed = false;
   try {
-    record_capture(Order{"o-2", "m-broken"}, someCapture);
+    record_capture(Order{"o-2", "m-broken"}, kHSomeCapture);
   } catch (const std::exception&) {
     failed = true;
   }
@@ -997,20 +997,20 @@ void CheckAtomic(harness::Ctx& ctx) {
   const auto events = ctx.DB.Events();
   ctx.Equal(events.back(), "ROLLBACK", "the failed transaction must roll back; the last event the database saw");
   std::vector<harness::Any> ids;
-  for (auto& o : tableRows(ctx, "orders")) ids.push_back(o["id"]);
+  for (auto& o : hTableRows(ctx, "orders")) ids.push_back(o["id"]);
   ctx.Equal(ids, {"o-1"}, "the outbox insert failed, so the orders row o-2 must not be committed: the two writes belong in one transaction");
 }
 
 void CheckOutboxRow(harness::Ctx& ctx) {
-  ctx.DB.Reset(outboxSchema);
-  const std::string eventID = captureOrder(ctx, firstOrder);
-  auto outbox = tableRows(ctx, "outbox");
+  ctx.DB.Reset(kHOutboxSchema);
+  const std::string eventID = hCaptureOrder(ctx, kHFirstOrder);
+  auto outbox = hTableRows(ctx, "outbox");
   ctx.Equal(outbox.size(), 1, "outbox rows");
   auto& row = outbox[0];
   ctx.Equal(row["topic"], "payments", "outbox.topic");
   ctx.Equal(row["key"], "m-42", "outbox.key must be the merchant id");
   ctx.Equal(row["sent_at"], nullptr, "a fresh outbox row is unsent: outbox.sent_at");
-  const harness::Any event = decodePayload(ctx, row);
+  const harness::Any event = hDecodePayload(ctx, row);
   const std::vector<std::pair<std::string, harness::Any>> fields = {
       {"type", harness::Any::Of("payment.captured")}, {"merchant_id", harness::Any::Of("m-42")}, {"order_id", harness::Any::Of("o-1")},
       {"amount_cents", harness::Any::Of(4999)},         {"currency", harness::Any::Of("EUR")}};
@@ -1020,22 +1020,22 @@ void CheckOutboxRow(harness::Ctx& ctx) {
 }
 
 void CheckNoDualWrite(harness::Ctx& ctx) {
-  ctx.DB.Reset(outboxSchema);
-  captureOrder(ctx, firstOrder);
+  ctx.DB.Reset(kHOutboxSchema);
+  hCaptureOrder(ctx, kHFirstOrder);
   ctx.Equal(ctx.Kafka.EventsOf("producer", "client").size(), 0, "this file must not create a Kafka client or producer (the relay publishes committed outbox rows): producer events");
   ctx.Equal(ctx.Kafka.Records("payments").size(), 0, "records recordCapture produced to Kafka from the request path");
-  ctx.Equal(tableRows(ctx, "outbox").size(), 1, "the event must be an outbox row instead: outbox rows");
+  ctx.Equal(hTableRows(ctx, "outbox").size(), 1, "the event must be an outbox row instead: outbox rows");
 }
 
 void CheckEventId(harness::Ctx& ctx) {
-  ctx.DB.Reset(outboxSchema);
-  const std::string first = captureOrder(ctx, firstOrder);
-  const std::string second = captureOrder(ctx, Order{"o-2", "m-42"});
+  ctx.DB.Reset(kHOutboxSchema);
+  const std::string first = hCaptureOrder(ctx, kHFirstOrder);
+  const std::string second = hCaptureOrder(ctx, Order{"o-2", "m-42"});
   for (const auto& eventID : {first, second}) {
-    ctx.Assert(std::regex_match(eventID, uuidV4), "the event id must be a random (version 4) UUID, got %q", eventID);
+    ctx.Assert(std::regex_match(eventID, hUuidV4), "the event id must be a random (version 4) UUID, got %q", eventID);
   }
   ctx.Assert(first != second, "every event needs its own UUID");
-  auto outbox = tableRows(ctx, "outbox");
+  auto outbox = hTableRows(ctx, "outbox");
   std::vector<std::string> ids;
   for (auto& row : outbox) ids.push_back(row["id"].String());
   std::sort(ids.begin(), ids.end());
@@ -1043,7 +1043,7 @@ void CheckEventId(harness::Ctx& ctx) {
   std::sort(want.begin(), want.end());
   ctx.Equal(ids, want, "outbox row ids must be the returned event ids");
   for (auto& row : outbox) {
-    ctx.Equal(decodePayload(ctx, row)["event_id"], row["id"], "payload.event_id must be the same UUID as the row id");
+    ctx.Equal(hDecodePayload(ctx, row)["event_id"], row["id"], "payload.event_id must be the same UUID as the row id");
   }
 }
 `,

@@ -547,12 +547,12 @@ import (
 	"leetbuild/harness"
 )
 
-func seedBook(ctx *harness.Ctx, symbol, bid, ask, last string) {
+func hSeedBook(ctx *harness.Ctx, symbol, bid, ask, last string) {
 	ctx.Redis.Do("HSET", "book:"+symbol, "bid", bid, "ask", ask, "last", last)
 }
 
 // bodyNumber is the TypeScript Number(body[k] ?? -1): a JSON number, or a string holding one.
-func bodyNumber(v any) float64 {
+func hBodyNumber(v any) float64 {
 	switch n := v.(type) {
 	case nil:
 		return -1
@@ -568,7 +568,7 @@ func bodyNumber(v any) float64 {
 
 func CheckValidate(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	seedBook(ctx, "ACME", "10.05", "10.06", "10.05")
+	hSeedBook(ctx, "ACME", "10.05", "10.06", "10.05")
 	// A probe on each invalid symbol's key: it fires if any Redis command ever touches it.
 	var touched []string
 	for _, symbol := range []string{"acme", "ACME1", "TOOLONGX", "AC-ME"} {
@@ -587,8 +587,8 @@ func CheckValidate(ctx *harness.Ctx) {
 
 func CheckHash(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	seedBook(ctx, "ACME", "10.05", "10.06", "10.05")
-	seedBook(ctx, "BETA", "1", "2", "1.5")
+	hSeedBook(ctx, "ACME", "10.05", "10.06", "10.05")
+	hSeedBook(ctx, "BETA", "1", "2", "1.5")
 	r := c.Get("/book/ACME")
 	ctx.Equal(r.Status, 200, "GET /book/ACME")
 	var body map[string]any
@@ -596,7 +596,7 @@ func CheckHash(ctx *harness.Ctx) {
 	ctx.Equal(body["symbol"], "ACME", "the body must name the symbol, got %s; symbol", r.Text())
 	got := map[string]float64{}
 	for _, k := range []string{"bid", "ask", "last"} {
-		got[k] = bodyNumber(body[k])
+		got[k] = hBodyNumber(body[k])
 	}
 	ctx.Equal(got, map[string]float64{"bid": 10.05, "ask": 10.06, "last": 10.05}, "the body must carry bid/ask/last from book:ACME, got %s", r.Text())
 	r2 := c.Get("/book/BETA")
@@ -604,7 +604,7 @@ func CheckHash(ctx *harness.Ctx) {
 	if r2.Status == 200 {
 		var beta map[string]any
 		r2.Decode(&beta)
-		last = bodyNumber(beta["last"])
+		last = hBodyNumber(beta["last"])
 	}
 	ctx.Assert(r2.Status == 200 && last == 1.5, "GET /book/BETA must read book:BETA, got %d %s", r2.Status, r2.Text())
 }
@@ -613,14 +613,14 @@ func CheckNotFound(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
 	r := c.Get("/book/GHOST")
 	ctx.Equal(r.Status, 404, "GET /book/GHOST with no hash")
-	seedBook(ctx, "GHOST", "10.05", "10.06", "10.05")
+	hSeedBook(ctx, "GHOST", "10.05", "10.06", "10.05")
 	r = c.Get("/book/GHOST")
 	ctx.Equal(r.Status, 200, "once book:GHOST exists, GET /book/GHOST")
 }
 
 func CheckNoStore(ctx *harness.Ctx) {
 	c := ctx.Main(main).HTTP()
-	seedBook(ctx, "ACME", "10.05", "10.06", "10.05")
+	hSeedBook(ctx, "ACME", "10.05", "10.06", "10.05")
 	r := c.Get("/book/ACME")
 	ctx.Equal(r.Status, 200, "GET /book/ACME")
 	cacheControl := r.Header.Get("Cache-Control")
@@ -638,12 +638,12 @@ func CheckNoStore(ctx *harness.Ctx) {
 
 namespace {
 
-void seedBook(harness::Ctx& ctx, const std::string& symbol, const std::string& bid, const std::string& ask, const std::string& last) {
+void hSeedBook(harness::Ctx& ctx, const std::string& symbol, const std::string& bid, const std::string& ask, const std::string& last) {
   ctx.Redis.Do("HSET", "book:" + symbol, "bid", bid, "ask", ask, "last", last);
 }
 
 // bodyNumber is the TypeScript Number(body[k] ?? -1): a JSON number, or a string holding one.
-double bodyNumber(const harness::Any& v) {
+double hBodyNumber(const harness::Any& v) {
   if (v.IsNil()) return -1;
   if (v.IsNumber()) return v.Float();
   if (v.IsString()) {
@@ -656,13 +656,13 @@ double bodyNumber(const harness::Any& v) {
 }
 
 // The body decoded the way encoding/json decodes into map[string]any (nil when it is not JSON).
-harness::Any decode(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
+harness::Any hDecode(const harness::Response& r) { return harness::ParseJSON(r.Text()).value_or(harness::Any()); }
 
 }  // namespace
 
 void CheckValidate(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  seedBook(ctx, "ACME", "10.05", "10.06", "10.05");
+  hSeedBook(ctx, "ACME", "10.05", "10.06", "10.05");
   // A probe on each invalid symbol's key: it fires if any Redis command ever touches it.
   std::vector<std::string> touched;
   for (const std::string symbol : {"acme", "ACME1", "TOOLONGX", "AC-ME"}) {
@@ -678,19 +678,19 @@ void CheckValidate(harness::Ctx& ctx) {
 
 void CheckHash(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  seedBook(ctx, "ACME", "10.05", "10.06", "10.05");
-  seedBook(ctx, "BETA", "1", "2", "1.5");
+  hSeedBook(ctx, "ACME", "10.05", "10.06", "10.05");
+  hSeedBook(ctx, "BETA", "1", "2", "1.5");
   const auto r = c.Get("/book/ACME");
   ctx.Equal(r.Status, 200, "GET /book/ACME");
-  const harness::Any body = decode(r);
+  const harness::Any body = hDecode(r);
   ctx.Equal(body["symbol"], "ACME", "the body must name the symbol, got %s; symbol", r.Text());
   std::map<std::string, double> got;
-  for (const std::string k : {"bid", "ask", "last"}) got[k] = bodyNumber(body[k]);
+  for (const std::string k : {"bid", "ask", "last"}) got[k] = hBodyNumber(body[k]);
   ctx.Equal(got, std::map<std::string, double>{{"bid", 10.05}, {"ask", 10.06}, {"last", 10.05}},
             "the body must carry bid/ask/last from book:ACME, got %s", r.Text());
   const auto r2 = c.Get("/book/BETA");
   double last = -1.0;
-  if (r2.Status == 200) last = bodyNumber(decode(r2)["last"]);
+  if (r2.Status == 200) last = hBodyNumber(hDecode(r2)["last"]);
   ctx.Assert(r2.Status == 200 && last == 1.5, "GET /book/BETA must read book:BETA, got %d %s", r2.Status, r2.Text());
 }
 
@@ -698,14 +698,14 @@ void CheckNotFound(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
   auto r = c.Get("/book/GHOST");
   ctx.Equal(r.Status, 404, "GET /book/GHOST with no hash");
-  seedBook(ctx, "GHOST", "10.05", "10.06", "10.05");
+  hSeedBook(ctx, "GHOST", "10.05", "10.06", "10.05");
   r = c.Get("/book/GHOST");
   ctx.Equal(r.Status, 200, "once book:GHOST exists, GET /book/GHOST");
 }
 
 void CheckNoStore(harness::Ctx& ctx) {
   auto c = ctx.Main().HTTP();
-  seedBook(ctx, "ACME", "10.05", "10.06", "10.05");
+  hSeedBook(ctx, "ACME", "10.05", "10.06", "10.05");
   const auto r = c.Get("/book/ACME");
   ctx.Equal(r.Status, 200, "GET /book/ACME");
   const std::string cacheControl = r.HeaderValue("Cache-Control");

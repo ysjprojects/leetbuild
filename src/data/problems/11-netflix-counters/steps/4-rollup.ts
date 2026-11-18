@@ -1097,29 +1097,29 @@ import (
 )
 
 const (
-	ruTopic        = "counter-events"
-	ruKey          = "rollup:plays:stranger-things"
-	ruTs           = 1760616030 // inside the minute bucket starting at 1760616000
-	ruNextMinuteTs = ruTs + 60
+	kHRuTopic        = "counter-events"
+	kHRuKey          = "rollup:plays:stranger-things"
+	kHRuTs           = 1760616030 // inside the minute bucket starting at 1760616000
+	kHRuNextMinuteTs = kHRuTs + 60
 )
 
-var ruBg = context.Background()
+var hRuBg = context.Background()
 
 // ruEvent is an event other producers put on the topic for plays/stranger-things.
-type ruEvent struct {
+type HRuEvent struct {
 	token string
 	delta int64
 	ts    float64
 }
 
-func ruSeed(ctx *harness.Ctx, events ...ruEvent) {
+func hRuSeed(ctx *harness.Ctx, events ...HRuEvent) {
 	for _, e := range events {
 		value, _ := json.Marshal(map[string]any{"ns": "plays", "name": "stranger-things", "delta": e.delta, "token": e.token, "ts": e.ts})
-		ctx.Kafka.Seed(ruTopic, "plays:stranger-things", string(value))
+		ctx.Kafka.Seed(kHRuTopic, "plays:stranger-things", string(value))
 	}
 }
 
-func ruTotal(ctx *harness.Ctx, key string) int64 {
+func hRuTotal(ctx *harness.Ctx, key string) int64 {
 	var sum int64
 	for _, v := range ctx.Redis.HGetAll(key) {
 		n, _ := strconv.ParseInt(v, 10, 64)
@@ -1129,13 +1129,13 @@ func ruTotal(ctx *harness.Ctx, key string) int64 {
 }
 
 // ruCommit is a commit of group rollup: the committed offsets (by "topic|partition") and the total the hash held at that instant.
-type ruCommit struct {
+type HRuCommit struct {
 	offsets map[string]int64
 	total   int64
 }
 
-func ruFoldedAtCommits(ctx *harness.Ctx) *[]ruCommit {
-	seen := &[]ruCommit{}
+func hRuFoldedAtCommits(ctx *harness.Ctx) *[]HRuCommit {
+	seen := &[]HRuCommit{}
 	ctx.Kafka.OnCommit(func(group string, offsets harness.KafkaOffsets) {
 		if group != "rollup" {
 			return
@@ -1144,29 +1144,29 @@ func ruFoldedAtCommits(ctx *harness.Ctx) *[]ruCommit {
 		for tp, o := range offsets {
 			byKey[tp.String()] = o
 		}
-		*seen = append(*seen, ruCommit{byKey, ruTotal(ctx, ruKey)})
+		*seen = append(*seen, HRuCommit{byKey, hRuTotal(ctx, kHRuKey)})
 	})
 	return seen
 }
 
 // ruRun drains the learner's worker and returns what run returned.
-func ruRun(ctx *harness.Ctx) error {
+func hRuRun(ctx *harness.Ctx) error {
 	var err error
-	ctx.Drain(func() { err = run(ruBg) })
+	ctx.Drain(func() { err = run(hRuBg) })
 	return err
 }
 
 func CheckConsumerGroup(ctx *harness.Ctx) {
-	ruSeed(ctx, ruEvent{"t-1", 1, ruTs}, ruEvent{"t-2", 2, ruTs}, ruEvent{"t-3", 4, ruTs}) // produced before the worker started
+	hRuSeed(ctx, HRuEvent{"t-1", 1, kHRuTs}, HRuEvent{"t-2", 2, kHRuTs}, HRuEvent{"t-3", 4, kHRuTs}) // produced before the worker started
 	var deltas []int64
-	for _, v := range ctx.Kafka.Values(ruTopic) {
+	for _, v := range ctx.Kafka.Values(kHRuTopic) {
 		var e struct{ Delta int64 }
 		json.Unmarshal([]byte(v), &e)
 		deltas = append(deltas, e.Delta)
 	}
-	partition := ctx.Kafka.Records(ruTopic)[0].Partition
-	atCommit := ruFoldedAtCommits(ctx)
-	ruRun(ctx)
+	partition := ctx.Kafka.Records(kHRuTopic)[0].Partition
+	atCommit := hRuFoldedAtCommits(ctx)
+	hRuRun(ctx)
 	groups := map[string]bool{}
 	for _, c := range ctx.Kafka.Consumers() {
 		if c.Group != "rollup" {
@@ -1178,13 +1178,13 @@ func CheckConsumerGroup(ctx *harness.Ctx) {
 		others = append(others, g)
 	}
 	sort.Strings(others)
-	_, committed := ctx.Kafka.Committed("rollup", ruTopic, partition)
-	ctx.Assert(committed, "consumer group rollup never committed an offset on %s (other groups: %q): the worker must join group rollup and subscribe to %s", ruTopic, others, ruTopic)
-	lag := ctx.Kafka.Lag("rollup", ruTopic)
-	ctx.Assert(lag == 0, "group rollup left %d event(s) of %s uncommitted: events produced before the worker started must be read from the earliest offset, folded and committed", lag, ruTopic)
-	ctx.Equal(ruTotal(ctx, ruKey), 7, "the three events (+1, +2, +4) must fold to 7: the total of %v", ctx.Redis.HGetAll(ruKey))
+	_, committed := ctx.Kafka.Committed("rollup", kHRuTopic, partition)
+	ctx.Assert(committed, "consumer group rollup never committed an offset on %s (other groups: %q): the worker must join group rollup and subscribe to %s", kHRuTopic, others, kHRuTopic)
+	lag := ctx.Kafka.Lag("rollup", kHRuTopic)
+	ctx.Assert(lag == 0, "group rollup left %d event(s) of %s uncommitted: events produced before the worker started must be read from the earliest offset, folded and committed", lag, kHRuTopic)
+	ctx.Equal(hRuTotal(ctx, kHRuKey), 7, "the three events (+1, +2, +4) must fold to 7: the total of %v", ctx.Redis.HGetAll(kHRuKey))
 	for _, c := range *atCommit {
-		upto, ok := c.offsets[fmt.Sprintf("%s|%d", ruTopic, partition)]
+		upto, ok := c.offsets[fmt.Sprintf("%s|%d", kHRuTopic, partition)]
 		if !ok {
 			continue
 		}
@@ -1199,67 +1199,67 @@ func CheckConsumerGroup(ctx *harness.Ctx) {
 	// The worker stalls 6 s right after claiming an event (longer than an auto-commit interval), then its
 	// fold fails for real: rollup:plays:broken is not a hash, so HIncrBy fails and the worker dies.
 	ctx.Redis.Set("rollup:plays:broken", "not a hash")
-	broken, _ := json.Marshal(map[string]any{"ns": "plays", "name": "broken", "delta": 1, "token": "t-x", "ts": ruTs})
-	failed := ctx.Kafka.Seed(ruTopic, "plays:broken", string(broken))
+	broken, _ := json.Marshal(map[string]any{"ns": "plays", "name": "broken", "delta": 1, "token": "t-x", "ts": kHRuTs})
+	failed := ctx.Kafka.Seed(kHRuTopic, "plays:broken", string(broken))
 	probe := ctx.Redis.After("seen:t-x", func() any {
 		ctx.Clock.Advance(6)
 		return nil
 	})
-	ruRun(ctx) // the worker died on the failed fold, as it should: the event is not lost, it is redelivered
+	hRuRun(ctx) // the worker died on the failed fold, as it should: the event is not lost, it is redelivered
 	ctx.Assert(probe.Fired, "the worker never claimed seen:t-x before folding the event")
-	offset, _ := ctx.Kafka.Committed("rollup", ruTopic, failed.Partition)
+	offset, _ := ctx.Kafka.Committed("rollup", kHRuTopic, failed.Partition)
 	ctx.Assert(offset <= failed.Offset, "the fold of t-x failed and the worker died, yet group rollup has committed past it (offset %d): the event was committed while it was still being processed, so it is never redelivered. Commit only after the fold (FetchMessage, then CommitMessages)", offset)
 }
 
 func CheckDedupeFirst(ctx *harness.Ctx) {
-	ruSeed(ctx, ruEvent{"t-1", 1, ruTs}, ruEvent{"t-1", 1, ruTs}, ruEvent{"t-2", 5, ruTs}, ruEvent{"t-1", 1, ruTs})
-	ruRun(ctx)
-	ctx.Equal(ruTotal(ctx, ruKey), 6, "tokens t-1 (+1, redelivered twice) and t-2 (+5) must fold to 6: the total of %v", ctx.Redis.HGetAll(ruKey))
-	ctx.Equal(ctx.Kafka.Lag("rollup", ruTopic), 0, "a skipped duplicate must still be committed, or it is redelivered forever: the lag of group rollup")
+	hRuSeed(ctx, HRuEvent{"t-1", 1, kHRuTs}, HRuEvent{"t-1", 1, kHRuTs}, HRuEvent{"t-2", 5, kHRuTs}, HRuEvent{"t-1", 1, kHRuTs})
+	hRuRun(ctx)
+	ctx.Equal(hRuTotal(ctx, kHRuKey), 6, "tokens t-1 (+1, redelivered twice) and t-2 (+5) must fold to 6: the total of %v", ctx.Redis.HGetAll(kHRuKey))
+	ctx.Equal(ctx.Kafka.Lag("rollup", kHRuTopic), 0, "a skipped duplicate must still be committed, or it is redelivered forever: the lag of group rollup")
 	ttl := ctx.Redis.TTL("seen:t-1")
 	ctx.Assert(86400-60 <= ttl && ttl <= 86400, "seen:t-1 expires in %d s, expected seenTTL (86400): the claim must outlive any client retry, and not live forever", ttl)
 	// A redelivery 1000 s later is dropped, and does not extend the claim.
 	ctx.Clock.Advance(1000)
-	ruSeed(ctx, ruEvent{"t-1", 1, ruTs})
-	ruRun(ctx)
-	ctx.Equal(ruTotal(ctx, ruKey), 6, "a redelivery of t-1 1000 s later must be dropped: the total of %v", ctx.Redis.HGetAll(ruKey))
+	hRuSeed(ctx, HRuEvent{"t-1", 1, kHRuTs})
+	hRuRun(ctx)
+	ctx.Equal(hRuTotal(ctx, kHRuKey), 6, "a redelivery of t-1 1000 s later must be dropped: the total of %v", ctx.Redis.HGetAll(kHRuKey))
 	ttl = ctx.Redis.TTL("seen:t-1")
 	ctx.Assert(ttl <= 86400-1000+5, "a redelivery of t-1 re-armed its claim to %d s: the claim lives seenTTL from the first time the token was seen", ttl)
 	ctx.Clock.Advance(86400 - 1000)
 	ctx.Equal(ctx.Redis.Exists("seen:t-1"), 0, "seen:t-1 must be gone seenTTL after it was claimed: EXISTS")
 	// Another rollup replica takes over the partition while this one is mid-event (its session timed out):
 	// it processes the uncommitted t-9 (claim, then fold) at the first moment this worker touches seen:t-9.
-	ruSeed(ctx, ruEvent{"t-9", 10, ruTs})
+	hRuSeed(ctx, HRuEvent{"t-9", 10, kHRuTs})
 	probe := ctx.Redis.After("seen:t-9", func() any {
 		if ctx.Redis.Set("seen:t-9", 1, "EX", 86400, "NX") {
-			ctx.Redis.Do("HINCRBY", ruKey, strconv.FormatInt(window(ruTs), 10), 10)
+			ctx.Redis.Do("HINCRBY", kHRuKey, strconv.FormatInt(window(kHRuTs), 10), 10)
 		}
 		return nil
 	})
-	ruRun(ctx)
+	hRuRun(ctx)
 	ctx.Assert(probe.Fired, "the worker never touched seen:t-9: every event must be claimed under seen:{token} before it is folded")
-	got := ruTotal(ctx, ruKey)
+	got := hRuTotal(ctx, kHRuKey)
 	ctx.Assert(got == 16, "t-9 (+10) was redelivered to a second replica right after this worker first touched seen:t-9, and the hash now holds %d for it instead of 10: claim the token atomically (SetNX) before folding, so whoever loses the claim skips the event", got-6)
 }
 
 func CheckHincrbyWindow(ctx *harness.Ctx) {
-	ruSeed(ctx, ruEvent{"t-1", 1, ruTs}, ruEvent{"t-2", 2, ruTs}, ruEvent{"t-3", 4, ruNextMinuteTs}, ruEvent{"t-4", -1, ruNextMinuteTs})
-	crown, _ := json.Marshal(map[string]any{"ns": "plays", "name": "the-crown", "delta": 7, "token": "t-5", "ts": ruTs})
-	ctx.Kafka.Seed(ruTopic, "plays:the-crown", string(crown))
-	ruRun(ctx)
-	kind := ctx.Redis.Type(ruKey)
-	ctx.Assert(kind == "hash", "%s is %q, expected a hash (keys: %q)", ruKey, kind, ctx.Redis.Keys("*"))
-	first := strconv.FormatInt(window(ruTs), 10)
-	second := strconv.FormatInt(window(ruNextMinuteTs), 10)
-	ctx.Equal(ctx.Redis.HGetAll(ruKey), map[string]string{first: "3", second: "3"}, "expected one field per minute bucket")
+	hRuSeed(ctx, HRuEvent{"t-1", 1, kHRuTs}, HRuEvent{"t-2", 2, kHRuTs}, HRuEvent{"t-3", 4, kHRuNextMinuteTs}, HRuEvent{"t-4", -1, kHRuNextMinuteTs})
+	crown, _ := json.Marshal(map[string]any{"ns": "plays", "name": "the-crown", "delta": 7, "token": "t-5", "ts": kHRuTs})
+	ctx.Kafka.Seed(kHRuTopic, "plays:the-crown", string(crown))
+	hRuRun(ctx)
+	kind := ctx.Redis.Type(kHRuKey)
+	ctx.Assert(kind == "hash", "%s is %q, expected a hash (keys: %q)", kHRuKey, kind, ctx.Redis.Keys("*"))
+	first := strconv.FormatInt(window(kHRuTs), 10)
+	second := strconv.FormatInt(window(kHRuNextMinuteTs), 10)
+	ctx.Equal(ctx.Redis.HGetAll(kHRuKey), map[string]string{first: "3", second: "3"}, "expected one field per minute bucket")
 	ctx.Equal(ctx.Redis.HGetAll("rollup:plays:the-crown"), map[string]string{first: "7"}, "each counter has its own hash: rollup:plays:the-crown")
 }
 
 func CheckCommitAfter(ctx *harness.Ctx) {
-	ruSeed(ctx, ruEvent{"t-1", 1, ruTs}, ruEvent{"t-2", 2, ruTs})
-	records := ctx.Kafka.Records(ruTopic)
-	atCommit := ruFoldedAtCommits(ctx)
-	ruRun(ctx)
+	hRuSeed(ctx, HRuEvent{"t-1", 1, kHRuTs}, HRuEvent{"t-2", 2, kHRuTs})
+	records := ctx.Kafka.Records(kHRuTopic)
+	atCommit := hRuFoldedAtCommits(ctx)
+	hRuRun(ctx)
 	ctx.Assert(len(*atCommit) > 0, "no offset was ever committed by group rollup")
 	for i, want := range []struct {
 		expected int64
@@ -1268,7 +1268,7 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 		record := records[i]
 		var covering []int64
 		for _, c := range *atCommit {
-			if c.offsets[fmt.Sprintf("%s|%d", ruTopic, record.Partition)] > record.Offset {
+			if c.offsets[fmt.Sprintf("%s|%d", kHRuTopic, record.Partition)] > record.Offset {
 				covering = append(covering, c.total)
 			}
 		}
@@ -1276,31 +1276,31 @@ func CheckCommitAfter(ctx *harness.Ctx) {
 		ctx.Equal(covering[0], want.expected, "the commit must come after the fold: when %s was committed the hash held", want.label)
 	}
 	// Records the worker skips are committed too, even when nothing follows them to commit past them.
-	ctx.Kafka.Seed(ruTopic, "plays:stranger-things", "not json")
+	ctx.Kafka.Seed(kHRuTopic, "plays:stranger-things", "not json")
 	noToken, _ := json.Marshal(map[string]any{"ns": "plays", "name": "stranger-things"})
-	ctx.Kafka.Seed(ruTopic, "plays:stranger-things", string(noToken))
-	ruRun(ctx)
-	lag := ctx.Kafka.Lag("rollup", ruTopic)
+	ctx.Kafka.Seed(kHRuTopic, "plays:stranger-things", string(noToken))
+	hRuRun(ctx)
+	lag := ctx.Kafka.Lag("rollup", kHRuTopic)
 	ctx.Assert(lag == 0, "%d malformed record(s) left uncommitted: skip them (log) and commit, or they are redelivered forever", lag)
-	ruSeed(ctx, ruEvent{"t-1", 1, ruTs})
-	ruRun(ctx)
-	lag = ctx.Kafka.Lag("rollup", ruTopic)
+	hRuSeed(ctx, HRuEvent{"t-1", 1, kHRuTs})
+	hRuRun(ctx)
+	lag = ctx.Kafka.Lag("rollup", kHRuTopic)
 	ctx.Assert(lag == 0, "the redelivered t-1 was skipped but left uncommitted (%d record(s) of lag): a duplicate is committed too, or it is redelivered forever", lag)
-	ctx.Equal(ruTotal(ctx, ruKey), 3, "malformed records must not be folded and the duplicate t-1 only once: the total of %v", ctx.Redis.HGetAll(ruKey))
+	ctx.Equal(hRuTotal(ctx, kHRuKey), 3, "malformed records must not be folded and the duplicate t-1 only once: the total of %v", ctx.Redis.HGetAll(kHRuKey))
 }
 
 func CheckGetClear(ctx *harness.Ctx) {
-	count, err := getCount(ruBg, "plays", "stranger-things")
+	count, err := getCount(hRuBg, "plays", "stranger-things")
 	ctx.NoError(err, "getCount returned an error")
 	ctx.Equal(count, 0, "a counter without events reads as 0")
-	ruSeed(ctx, ruEvent{"t-1", 3, ruTs}, ruEvent{"t-2", 4, ruNextMinuteTs}, ruEvent{"t-3", -1, ruNextMinuteTs + 60})
-	ruRun(ctx)
-	count, err = getCount(ruBg, "plays", "stranger-things")
+	hRuSeed(ctx, HRuEvent{"t-1", 3, kHRuTs}, HRuEvent{"t-2", 4, kHRuNextMinuteTs}, HRuEvent{"t-3", -1, kHRuNextMinuteTs + 60})
+	hRuRun(ctx)
+	count, err = getCount(hRuBg, "plays", "stranger-things")
 	ctx.NoError(err, "getCount returned an error")
-	ctx.Equal(count, 6, "getCount must sum every minute bucket (3 + 4 - 1 = 6) of %v", ctx.Redis.HGetAll(ruKey))
-	ctx.NoError(clearCount(ruBg, "plays", "stranger-things"), "clearCount returned an error")
-	ctx.Equal(ctx.Redis.Exists(ruKey), 0, "clearCount must DEL %s: EXISTS", ruKey)
-	count, err = getCount(ruBg, "plays", "stranger-things")
+	ctx.Equal(count, 6, "getCount must sum every minute bucket (3 + 4 - 1 = 6) of %v", ctx.Redis.HGetAll(kHRuKey))
+	ctx.NoError(clearCount(hRuBg, "plays", "stranger-things"), "clearCount returned an error")
+	ctx.Equal(ctx.Redis.Exists(kHRuKey), 0, "clearCount must DEL %s: EXISTS", kHRuKey)
+	count, err = getCount(hRuBg, "plays", "stranger-things")
 	ctx.NoError(err, "getCount returned an error")
 	ctx.Equal(count, 0, "a cleared counter reads as 0")
 }
@@ -1313,50 +1313,50 @@ func CheckGetClear(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string ruTopic = "counter-events";
-const std::string ruKey = "rollup:plays:stranger-things";
-constexpr double ruTs = 1760616030;  // inside the minute bucket starting at 1760616000
-constexpr double ruNextMinuteTs = ruTs + 60;
+const std::string kHRuTopic = "counter-events";
+const std::string kHRuKey = "rollup:plays:stranger-things";
+constexpr double kHRuTs = 1760616030;  // inside the minute bucket starting at 1760616000
+constexpr double kHRuNextMinuteTs = kHRuTs + 60;
 
 // ruEvent is an event other producers put on the topic for plays/stranger-things.
-struct ruEvent {
+struct HRuEvent {
   std::string token;
   long long delta;
   double ts;
 };
 
-void ruSeed(harness::Ctx& ctx, const std::vector<ruEvent>& events) {
+void hRuSeed(harness::Ctx& ctx, const std::vector<HRuEvent>& events) {
   for (const auto& e : events) {
     const nlohmann::json value = {{"ns", "plays"}, {"name", "stranger-things"}, {"delta", e.delta}, {"token", e.token}, {"ts", e.ts}};
-    ctx.Kafka.Seed(ruTopic, "plays:stranger-things", value.dump());
+    ctx.Kafka.Seed(kHRuTopic, "plays:stranger-things", value.dump());
   }
 }
 
-long long ruTotal(harness::Ctx& ctx, const std::string& key) {
+long long hRuTotal(harness::Ctx& ctx, const std::string& key) {
   long long sum = 0;
   for (const auto& [field, v] : ctx.Redis.HGetAll(key)) sum += std::atoll(v.c_str());
   return sum;
 }
 
 // ruCommit is a commit of group rollup: the committed offsets (by "topic|partition") and the total the hash held at that instant.
-struct ruCommit {
+struct HRuCommit {
   std::map<std::string, int64_t> offsets;
   long long total;
 };
 
-std::shared_ptr<std::vector<ruCommit>> ruFoldedAtCommits(harness::Ctx& ctx) {
-  auto seen = std::make_shared<std::vector<ruCommit>>();
+std::shared_ptr<std::vector<HRuCommit>> hRuFoldedAtCommits(harness::Ctx& ctx) {
+  auto seen = std::make_shared<std::vector<HRuCommit>>();
   ctx.Kafka.OnCommit([&ctx, seen](const std::string& group, const harness::KafkaOffsets& offsets) {
     if (group != "rollup") return;
     std::map<std::string, int64_t> byKey;
     for (const auto& [tp, o] : offsets) byKey[tp.String()] = o;
-    seen->push_back({byKey, ruTotal(ctx, ruKey)});
+    seen->push_back({byKey, hRuTotal(ctx, kHRuKey)});
   });
   return seen;
 }
 
 // ruRun drains the learner's worker and returns what run threw (Go's run returns an error).
-std::optional<std::string> ruRun(harness::Ctx& ctx) {
+std::optional<std::string> hRuRun(harness::Ctx& ctx) {
   // The worker polls with consume(1000): a few idle seconds, then it counts as waiting (Go's reader
   // blocks without a clock).
   ctx.Clock.SetSleepLimit(ctx.Clock.Sleeps() + 5);
@@ -1374,24 +1374,24 @@ std::optional<std::string> ruRun(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckConsumerGroup(harness::Ctx& ctx) {
-  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-2", 2, ruTs}, {"t-3", 4, ruTs}});  // produced before the worker started
+  hRuSeed(ctx, {{"t-1", 1, kHRuTs}, {"t-2", 2, kHRuTs}, {"t-3", 4, kHRuTs}});  // produced before the worker started
   std::vector<long long> deltas;
-  for (const auto& v : ctx.Kafka.Values(ruTopic)) deltas.push_back(nlohmann::json::parse(v).value("delta", 0LL));
-  const int partition = ctx.Kafka.Records(ruTopic)[0].Partition;
-  auto atCommit = ruFoldedAtCommits(ctx);
-  ruRun(ctx);
+  for (const auto& v : ctx.Kafka.Values(kHRuTopic)) deltas.push_back(nlohmann::json::parse(v).value("delta", 0LL));
+  const int partition = ctx.Kafka.Records(kHRuTopic)[0].Partition;
+  auto atCommit = hRuFoldedAtCommits(ctx);
+  hRuRun(ctx);
   std::set<std::string> groups;
   for (const auto& c : ctx.Kafka.Consumers()) {
     if (c.Group != "rollup") groups.insert(c.Group);
   }
   const std::vector<std::string> others(groups.begin(), groups.end());
-  const bool committed = ctx.Kafka.Committed("rollup", ruTopic, partition).has_value();
-  ctx.Assert(committed, "consumer group rollup never committed an offset on %s (other groups: %q): the worker must join group rollup and subscribe to %s", ruTopic, others, ruTopic);
-  const int64_t lag = ctx.Kafka.Lag("rollup", ruTopic);
-  ctx.Assert(lag == 0, "group rollup left %d event(s) of %s uncommitted: events produced before the worker started must be read from the earliest offset, folded and committed", lag, ruTopic);
-  ctx.Equal(ruTotal(ctx, ruKey), 7, "the three events (+1, +2, +4) must fold to 7: the total of %v", ctx.Redis.HGetAll(ruKey));
+  const bool committed = ctx.Kafka.Committed("rollup", kHRuTopic, partition).has_value();
+  ctx.Assert(committed, "consumer group rollup never committed an offset on %s (other groups: %q): the worker must join group rollup and subscribe to %s", kHRuTopic, others, kHRuTopic);
+  const int64_t lag = ctx.Kafka.Lag("rollup", kHRuTopic);
+  ctx.Assert(lag == 0, "group rollup left %d event(s) of %s uncommitted: events produced before the worker started must be read from the earliest offset, folded and committed", lag, kHRuTopic);
+  ctx.Equal(hRuTotal(ctx, kHRuKey), 7, "the three events (+1, +2, +4) must fold to 7: the total of %v", ctx.Redis.HGetAll(kHRuKey));
   for (const auto& c : *atCommit) {
-    const auto it = c.offsets.find(ruTopic + "|" + std::to_string(partition));
+    const auto it = c.offsets.find(kHRuTopic + "|" + std::to_string(partition));
     if (it == c.offsets.end()) continue;
     const int64_t upto = it->second;
     long long expected = 0, last = 0;
@@ -1406,67 +1406,67 @@ void CheckConsumerGroup(harness::Ctx& ctx) {
   // The worker stalls 6 s right after claiming an event (longer than an auto-commit interval), then its
   // fold fails for real: rollup:plays:broken is not a hash, so HINCRBY fails and the worker dies.
   ctx.Redis.Set("rollup:plays:broken", "not a hash");
-  const nlohmann::json broken = {{"ns", "plays"}, {"name", "broken"}, {"delta", 1}, {"token", "t-x"}, {"ts", ruTs}};
-  const auto failed = ctx.Kafka.Seed(ruTopic, "plays:broken", broken.dump());
+  const nlohmann::json broken = {{"ns", "plays"}, {"name", "broken"}, {"delta", 1}, {"token", "t-x"}, {"ts", kHRuTs}};
+  const auto failed = ctx.Kafka.Seed(kHRuTopic, "plays:broken", broken.dump());
   bool fired = false;
   ctx.Redis.After("seen:t-x", [&] {
     fired = true;
     ctx.Clock.Advance(6);
   });
-  ruRun(ctx);  // the worker died on the failed fold, as it should: the event is not lost, it is redelivered
+  hRuRun(ctx);  // the worker died on the failed fold, as it should: the event is not lost, it is redelivered
   ctx.Assert(fired, "the worker never claimed seen:t-x before folding the event");
-  const int64_t offset = ctx.Kafka.Committed("rollup", ruTopic, failed.Partition).value_or(0);
+  const int64_t offset = ctx.Kafka.Committed("rollup", kHRuTopic, failed.Partition).value_or(0);
   ctx.Assert(offset <= failed.Offset, "the fold of t-x failed and the worker died, yet group rollup has committed past it (offset %d): the event was committed while it was still being processed, so it is never redelivered. Commit only after the fold (consume, fold, then commitSync)", offset);
 }
 
 void CheckDedupeFirst(harness::Ctx& ctx) {
-  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-1", 1, ruTs}, {"t-2", 5, ruTs}, {"t-1", 1, ruTs}});
-  ruRun(ctx);
-  ctx.Equal(ruTotal(ctx, ruKey), 6, "tokens t-1 (+1, redelivered twice) and t-2 (+5) must fold to 6: the total of %v", ctx.Redis.HGetAll(ruKey));
-  ctx.Equal(ctx.Kafka.Lag("rollup", ruTopic), 0, "a skipped duplicate must still be committed, or it is redelivered forever: the lag of group rollup");
+  hRuSeed(ctx, {{"t-1", 1, kHRuTs}, {"t-1", 1, kHRuTs}, {"t-2", 5, kHRuTs}, {"t-1", 1, kHRuTs}});
+  hRuRun(ctx);
+  ctx.Equal(hRuTotal(ctx, kHRuKey), 6, "tokens t-1 (+1, redelivered twice) and t-2 (+5) must fold to 6: the total of %v", ctx.Redis.HGetAll(kHRuKey));
+  ctx.Equal(ctx.Kafka.Lag("rollup", kHRuTopic), 0, "a skipped duplicate must still be committed, or it is redelivered forever: the lag of group rollup");
   long long ttl = ctx.Redis.TTL("seen:t-1");
   ctx.Assert(86400 - 60 <= ttl && ttl <= 86400, "seen:t-1 expires in %d s, expected kSeenTtl (86400): the claim must outlive any client retry, and not live forever", ttl);
   // A redelivery 1000 s later is dropped, and does not extend the claim.
   ctx.Clock.Advance(1000);
-  ruSeed(ctx, {{"t-1", 1, ruTs}});
-  ruRun(ctx);
-  ctx.Equal(ruTotal(ctx, ruKey), 6, "a redelivery of t-1 1000 s later must be dropped: the total of %v", ctx.Redis.HGetAll(ruKey));
+  hRuSeed(ctx, {{"t-1", 1, kHRuTs}});
+  hRuRun(ctx);
+  ctx.Equal(hRuTotal(ctx, kHRuKey), 6, "a redelivery of t-1 1000 s later must be dropped: the total of %v", ctx.Redis.HGetAll(kHRuKey));
   ttl = ctx.Redis.TTL("seen:t-1");
   ctx.Assert(ttl <= 86400 - 1000 + 5, "a redelivery of t-1 re-armed its claim to %d s: the claim lives kSeenTtl from the first time the token was seen", ttl);
   ctx.Clock.Advance(86400 - 1000);
   ctx.Equal(ctx.Redis.Exists("seen:t-1"), 0, "seen:t-1 must be gone kSeenTtl after it was claimed: EXISTS");
   // Another rollup replica takes over the partition while this one is mid-event (its session timed out):
   // it processes the uncommitted t-9 (claim, then fold) at the first moment this worker touches seen:t-9.
-  ruSeed(ctx, {{"t-9", 10, ruTs}});
+  hRuSeed(ctx, {{"t-9", 10, kHRuTs}});
   bool fired = false;
   ctx.Redis.After("seen:t-9", [&] {
     fired = true;
-    if (ctx.Redis.Set("seen:t-9", 1, "EX", 86400, "NX")) ctx.Redis.Do("HINCRBY", ruKey, std::to_string(window(ruTs)), 10);
+    if (ctx.Redis.Set("seen:t-9", 1, "EX", 86400, "NX")) ctx.Redis.Do("HINCRBY", kHRuKey, std::to_string(window(kHRuTs)), 10);
   });
-  ruRun(ctx);
+  hRuRun(ctx);
   ctx.Assert(fired, "the worker never touched seen:t-9: every event must be claimed under seen:{token} before it is folded");
-  const long long got = ruTotal(ctx, ruKey);
+  const long long got = hRuTotal(ctx, kHRuKey);
   ctx.Assert(got == 16, "t-9 (+10) was redelivered to a second replica right after this worker first touched seen:t-9, and the hash now holds %d for it instead of 10: claim the token atomically (SET NX) before folding, so whoever loses the claim skips the event", got - 6);
 }
 
 void CheckHincrbyWindow(harness::Ctx& ctx) {
-  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-2", 2, ruTs}, {"t-3", 4, ruNextMinuteTs}, {"t-4", -1, ruNextMinuteTs}});
-  const nlohmann::json crown = {{"ns", "plays"}, {"name", "the-crown"}, {"delta", 7}, {"token", "t-5"}, {"ts", ruTs}};
-  ctx.Kafka.Seed(ruTopic, "plays:the-crown", crown.dump());
-  ruRun(ctx);
-  const std::string kind = ctx.Redis.Type(ruKey);
-  ctx.Assert(kind == "hash", "%s is %q, expected a hash (keys: %q)", ruKey, kind, ctx.Redis.Keys("*"));
-  const std::string first = std::to_string(window(ruTs));
-  const std::string second = std::to_string(window(ruNextMinuteTs));
-  ctx.Equal(ctx.Redis.HGetAll(ruKey), std::map<std::string, std::string>{{first, "3"}, {second, "3"}}, "expected one field per minute bucket");
+  hRuSeed(ctx, {{"t-1", 1, kHRuTs}, {"t-2", 2, kHRuTs}, {"t-3", 4, kHRuNextMinuteTs}, {"t-4", -1, kHRuNextMinuteTs}});
+  const nlohmann::json crown = {{"ns", "plays"}, {"name", "the-crown"}, {"delta", 7}, {"token", "t-5"}, {"ts", kHRuTs}};
+  ctx.Kafka.Seed(kHRuTopic, "plays:the-crown", crown.dump());
+  hRuRun(ctx);
+  const std::string kind = ctx.Redis.Type(kHRuKey);
+  ctx.Assert(kind == "hash", "%s is %q, expected a hash (keys: %q)", kHRuKey, kind, ctx.Redis.Keys("*"));
+  const std::string first = std::to_string(window(kHRuTs));
+  const std::string second = std::to_string(window(kHRuNextMinuteTs));
+  ctx.Equal(ctx.Redis.HGetAll(kHRuKey), std::map<std::string, std::string>{{first, "3"}, {second, "3"}}, "expected one field per minute bucket");
   ctx.Equal(ctx.Redis.HGetAll("rollup:plays:the-crown"), std::map<std::string, std::string>{{first, "7"}}, "each counter has its own hash: rollup:plays:the-crown");
 }
 
 void CheckCommitAfter(harness::Ctx& ctx) {
-  ruSeed(ctx, {{"t-1", 1, ruTs}, {"t-2", 2, ruTs}});
-  const auto records = ctx.Kafka.Records(ruTopic);
-  auto atCommit = ruFoldedAtCommits(ctx);
-  ruRun(ctx);
+  hRuSeed(ctx, {{"t-1", 1, kHRuTs}, {"t-2", 2, kHRuTs}});
+  const auto records = ctx.Kafka.Records(kHRuTopic);
+  auto atCommit = hRuFoldedAtCommits(ctx);
+  hRuRun(ctx);
   ctx.Assert(!atCommit->empty(), "no offset was ever committed by group rollup");
   const std::vector<std::pair<long long, std::string>> wants = {{1, "t-1 (+1)"}, {3, "t-2 (+2)"}};
   for (size_t i = 0; i < wants.size(); i++) {
@@ -1474,23 +1474,23 @@ void CheckCommitAfter(harness::Ctx& ctx) {
     const auto& record = records[i];
     std::vector<long long> covering;
     for (const auto& c : *atCommit) {
-      const auto it = c.offsets.find(ruTopic + "|" + std::to_string(record.Partition));
+      const auto it = c.offsets.find(kHRuTopic + "|" + std::to_string(record.Partition));
       if (it != c.offsets.end() && it->second > record.Offset) covering.push_back(c.total);
     }
     ctx.Assert(!covering.empty(), "the %s event was never committed", label);
     ctx.Equal(covering[0], expected, "the commit must come after the fold: when %s was committed the hash held", label);
   }
   // Records the worker skips are committed too, even when nothing follows them to commit past them.
-  ctx.Kafka.Seed(ruTopic, "plays:stranger-things", "not json");
-  ctx.Kafka.Seed(ruTopic, "plays:stranger-things", R"({"name":"stranger-things","ns":"plays"})");
-  ruRun(ctx);
-  int64_t lag = ctx.Kafka.Lag("rollup", ruTopic);
+  ctx.Kafka.Seed(kHRuTopic, "plays:stranger-things", "not json");
+  ctx.Kafka.Seed(kHRuTopic, "plays:stranger-things", R"({"name":"stranger-things","ns":"plays"})");
+  hRuRun(ctx);
+  int64_t lag = ctx.Kafka.Lag("rollup", kHRuTopic);
   ctx.Assert(lag == 0, "%d malformed record(s) left uncommitted: skip them (log) and commit, or they are redelivered forever", lag);
-  ruSeed(ctx, {{"t-1", 1, ruTs}});
-  ruRun(ctx);
-  lag = ctx.Kafka.Lag("rollup", ruTopic);
+  hRuSeed(ctx, {{"t-1", 1, kHRuTs}});
+  hRuRun(ctx);
+  lag = ctx.Kafka.Lag("rollup", kHRuTopic);
   ctx.Assert(lag == 0, "the redelivered t-1 was skipped but left uncommitted (%d record(s) of lag): a duplicate is committed too, or it is redelivered forever", lag);
-  ctx.Equal(ruTotal(ctx, ruKey), 3, "malformed records must not be folded and the duplicate t-1 only once: the total of %v", ctx.Redis.HGetAll(ruKey));
+  ctx.Equal(hRuTotal(ctx, kHRuKey), 3, "malformed records must not be folded and the duplicate t-1 only once: the total of %v", ctx.Redis.HGetAll(kHRuKey));
 }
 
 void CheckGetClear(harness::Ctx& ctx) {
@@ -1502,15 +1502,15 @@ void CheckGetClear(harness::Ctx& ctx) {
     }
   };
   ctx.Equal(count(), 0, "a counter without events reads as 0");
-  ruSeed(ctx, {{"t-1", 3, ruTs}, {"t-2", 4, ruNextMinuteTs}, {"t-3", -1, ruNextMinuteTs + 60}});
-  ruRun(ctx);
-  ctx.Equal(count(), 6, "get_count must sum every minute bucket (3 + 4 - 1 = 6) of %v", ctx.Redis.HGetAll(ruKey));
+  hRuSeed(ctx, {{"t-1", 3, kHRuTs}, {"t-2", 4, kHRuNextMinuteTs}, {"t-3", -1, kHRuNextMinuteTs + 60}});
+  hRuRun(ctx);
+  ctx.Equal(count(), 6, "get_count must sum every minute bucket (3 + 4 - 1 = 6) of %v", ctx.Redis.HGetAll(kHRuKey));
   try {
     clear_count("plays", "stranger-things");
   } catch (const std::exception& e) {
     ctx.Fatalf("clear_count threw: %s", e.what());
   }
-  ctx.Equal(ctx.Redis.Exists(ruKey), 0, "clear_count must DEL %s: EXISTS", ruKey);
+  ctx.Equal(ctx.Redis.Exists(kHRuKey), 0, "clear_count must DEL %s: EXISTS", kHRuKey);
   ctx.Equal(count(), 0, "a cleared counter reads as 0");
 }
 `,

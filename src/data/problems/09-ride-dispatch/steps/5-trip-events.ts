@@ -1011,33 +1011,33 @@ import (
 	"leetbuild/harness"
 )
 
-func seedTripEvents(ctx *harness.Ctx, events ...[2]string) {
+func hSeedTripEvents(ctx *harness.Ctx, events ...[2]string) {
 	for _, e := range events {
 		ctx.Kafka.Seed("trip-events", e[0], map[string]any{"ride_id": e[0], "event": e[1], "ts": 0})
 	}
 }
 
 // rideStatuses stands in for ride_store.go: ride id → status; a ride nobody set is absent.
-func rideStatuses() map[string]string {
+func hRideStatuses() map[string]string {
 	rides := map[string]string{}
 	getStatus = func(_ context.Context, rideID string) string { return rides[rideID] }
 	setStatus = func(_ context.Context, rideID, status string) { rides[rideID] = status }
 	return rides
 }
 
-func publishTrip(ctx *harness.Ctx, rideID, event string) {
+func hPublishTrip(ctx *harness.Ctx, rideID, event string) {
 	ctx.NoError(publishEvent(context.Background(), rideID, event), "publishEvent(%q, %q) returned an error", rideID, event)
 }
 
-func drainRun(ctx *harness.Ctx) {
+func hDrainRun(ctx *harness.Ctx) {
 	ctx.Drain(func() { _ = run(context.Background()) })
 }
 
 func CheckDurableProducer(ctx *harness.Ctx) {
-	rideStatuses()
+	hRideStatuses()
 	// The broker writes the record but its acknowledgement is lost: the producer retries.
 	ctx.Kafka.LoseAcks("trip-events", 1)
-	publishTrip(ctx, "r-42", "requested")
+	hPublishTrip(ctx, "r-42", "requested")
 	records := ctx.Kafka.Records("trip-events")
 	ctx.Assert(len(records) >= 1, "publishEvent must produce one record")
 	// kafka-go has no idempotent producer (the step's Go detail): at least once, identical copies.
@@ -1045,7 +1045,7 @@ func CheckDurableProducer(ctx *harness.Ctx) {
 		ctx.Assert(string(r.Key) == string(records[0].Key) && string(r.Value) == string(records[0].Value), "a retry after a lost ack must write the same key and value, got %q=%q and %q=%q", records[0].Key, records[0].Value, r.Key, r.Value)
 	}
 	// A leader failover right after the ack: a record acknowledged by the leader alone (acks 0 or 1) is gone.
-	publishTrip(ctx, "r-42", "matched")
+	hPublishTrip(ctx, "r-42", "matched")
 	ctx.Kafka.Failover("trip-events")
 	distinct := map[string]bool{}
 	for _, r := range ctx.Kafka.Records("trip-events") {
@@ -1055,10 +1055,10 @@ func CheckDurableProducer(ctx *harness.Ctx) {
 }
 
 func CheckKeyedByRide(ctx *harness.Ctx) {
-	rideStatuses()
-	publishTrip(ctx, "r-42", "requested")
-	publishTrip(ctx, "r-42", "matched")
-	publishTrip(ctx, "r-7", "requested")
+	hRideStatuses()
+	hPublishTrip(ctx, "r-42", "requested")
+	hPublishTrip(ctx, "r-42", "matched")
+	hPublishTrip(ctx, "r-7", "requested")
 	produced := ctx.Kafka.Records("trip-events")
 	ctx.Equal(len(produced), 3, "records on trip-events")
 	ctx.Equal(ctx.Kafka.Keys("trip-events"), []string{"r-42", "r-42", "r-7"}, "records must be keyed by ride_id")
@@ -1072,9 +1072,9 @@ func CheckKeyedByRide(ctx *harness.Ctx) {
 }
 
 func CheckManualCommit(ctx *harness.Ctx) {
-	seedTripEvents(ctx, [2]string{"r-42", "requested"}, [2]string{"r-42", "matched"})
-	rides := rideStatuses()
-	drainRun(ctx)
+	hSeedTripEvents(ctx, [2]string{"r-42", "requested"}, [2]string{"r-42", "matched"})
+	rides := hRideStatuses()
+	hDrainRun(ctx)
 	consumers := ctx.Kafka.Consumers()
 	ctx.Assert(len(consumers) > 0, "no consumer joined the trip-state group")
 	ctx.Equal(consumers[len(consumers)-1].AutoCommit, false, "auto-commit must be off (FetchMessage, not ReadMessage): offsets are committed explicitly, after the status write")
@@ -1085,13 +1085,13 @@ func CheckManualCommit(ctx *harness.Ctx) {
 }
 
 func CheckIllegalSkipped(ctx *harness.Ctx) {
-	seedTripEvents(ctx, [2]string{"r-42", "requested"}, [2]string{"r-42", "matched"}, [2]string{"r-42", "matched"}, [2]string{"r-42", "completed"}, [2]string{"r-42", "started"}, [2]string{"r-99", "started"})
-	rides := rideStatuses()
+	hSeedTripEvents(ctx, [2]string{"r-42", "requested"}, [2]string{"r-42", "matched"}, [2]string{"r-42", "matched"}, [2]string{"r-42", "completed"}, [2]string{"r-42", "started"}, [2]string{"r-99", "started"})
+	rides := hRideStatuses()
 	var logged strings.Builder
 	prev := log.Writer()
 	log.SetOutput(&logged)
 	defer log.SetOutput(prev)
-	drainRun(ctx)
+	hDrainRun(ctx)
 	ctx.Equal(rides["r-42"], "started", "r-42's status (requested → matched → started; the duplicate matched and the early completed are illegal)")
 	_, created := rides["r-99"]
 	ctx.Assert(!created, "started on a ride nobody has seen is illegal and must not create r-99")
@@ -1101,8 +1101,8 @@ func CheckIllegalSkipped(ctx *harness.Ctx) {
 }
 
 func CheckSetThenCommit(ctx *harness.Ctx) {
-	seedTripEvents(ctx, [2]string{"r-42", "requested"})
-	rides := rideStatuses()
+	hSeedTripEvents(ctx, [2]string{"r-42", "requested"})
+	rides := hRideStatuses()
 	var atCommit []string
 	ctx.Kafka.OnCommit(func(string, harness.KafkaOffsets) {
 		status, ok := rides["r-42"]
@@ -1111,11 +1111,11 @@ func CheckSetThenCommit(ctx *harness.Ctx) {
 		}
 		atCommit = append(atCommit, status)
 	})
-	drainRun(ctx)
+	hDrainRun(ctx)
 	ctx.Assert(len(atCommit) > 0, "the offset was never committed")
 	ctx.Equal(atCommit[0], "requested", "the commit must come after setStatus: r-42's status at commit time")
 	// A failing status write must not be committed: the record has to be redelivered.
-	seedTripEvents(ctx, [2]string{"r-7", "requested"})
+	hSeedTripEvents(ctx, [2]string{"r-7", "requested"})
 	setStatus = func(_ context.Context, rideID, status string) {
 		if rideID == "r-7" {
 			panic("ride store unavailable")
@@ -1124,7 +1124,7 @@ func CheckSetThenCommit(ctx *harness.Ctx) {
 	}
 	func() {
 		defer func() { _ = recover() }() // the consumer loop surfaces the store's failure; what matters is what was committed
-		drainRun(ctx)
+		hDrainRun(ctx)
 	}()
 	_, written := rides["r-7"]
 	ctx.Assert(!written, "r-7's status write failed, yet r-7 has a status")
@@ -1146,7 +1146,7 @@ func CheckSetThenCommit(ctx *harness.Ctx) {
 
 namespace {
 
-void seedTripEvents(harness::Ctx& ctx, const std::vector<std::pair<std::string, std::string>>& events) {
+void hSeedTripEvents(harness::Ctx& ctx, const std::vector<std::pair<std::string, std::string>>& events) {
   for (const auto& [rideID, event] : events) {
     ctx.Kafka.Seed("trip-events", rideID, nlohmann::json{{"ride_id", rideID}, {"event", event}, {"ts", 0}});
   }
@@ -1154,16 +1154,16 @@ void seedTripEvents(harness::Ctx& ctx, const std::vector<std::pair<std::string, 
 
 // rides stands in for ride_store.h: ride id → status; a ride nobody set is absent. setStatus is
 // what set_status does, which a check may swap for a failing store.
-std::map<std::string, std::string> rides;
-std::function<void(const std::string&, const std::string&)> setStatus;
+std::map<std::string, std::string> hRides;
+std::function<void(const std::string&, const std::string&)> hSetStatus;
 
-std::map<std::string, std::string>& rideStatuses() {
-  rides.clear();
-  setStatus = [](const std::string& rideID, const std::string& status) { rides[rideID] = status; };
-  return rides;
+std::map<std::string, std::string>& hRideStatuses() {
+  hRides.clear();
+  hSetStatus = [](const std::string& rideID, const std::string& status) { hRides[rideID] = status; };
+  return hRides;
 }
 
-void publishTrip(harness::Ctx& ctx, const std::string& rideID, const std::string& event) {
+void hPublishTrip(harness::Ctx& ctx, const std::string& rideID, const std::string& event) {
   try {
     publish_event(rideID, event);
   } catch (const std::exception& e) {
@@ -1171,16 +1171,16 @@ void publishTrip(harness::Ctx& ctx, const std::string& rideID, const std::string
   }
 }
 
-void drainRun(harness::Ctx& ctx) {
+void hDrainRun(harness::Ctx& ctx) {
   ctx.Drain([] { run(); });
 }
 
 // tripLogs tees what the learner writes to std::cerr (Go: the log package's output) until it is
 // destroyed, which restores the previous buffer.
-class tripLogs : public std::streambuf {
+class HTripLogs : public std::streambuf {
  public:
-  tripLogs() : previous_(std::cerr.rdbuf(this)) {}
-  ~tripLogs() override { std::cerr.rdbuf(previous_); }
+  HTripLogs() : previous_(std::cerr.rdbuf(this)) {}
+  ~HTripLogs() override { std::cerr.rdbuf(previous_); }
   // The lines written so far.
   int lines() {
     std::lock_guard<std::mutex> lock(mu_);
@@ -1216,25 +1216,25 @@ class tripLogs : public std::streambuf {
 }  // namespace
 
 std::string get_status(const std::string& ride_id) {
-  const auto it = rides.find(ride_id);
-  return it == rides.end() ? "" : it->second;
+  const auto it = hRides.find(ride_id);
+  return it == hRides.end() ? "" : it->second;
 }
 
-void set_status(const std::string& ride_id, const std::string& status) { setStatus(ride_id, status); }
+void set_status(const std::string& ride_id, const std::string& status) { hSetStatus(ride_id, status); }
 
 void CheckDurableProducer(harness::Ctx& ctx) {
-  rideStatuses();
+  hRideStatuses();
   // The broker writes the record but its acknowledgement is lost: the producer retries. The C++
   // producer can be idempotent (kafka-go cannot), so, as the TypeScript and Python checks do, its
   // retry must write the event once.
   ctx.Kafka.LoseAcks("trip-events", 1);
-  publishTrip(ctx, "r-42", "requested");
+  hPublishTrip(ctx, "r-42", "requested");
   ctx.Settle();
   size_t n = ctx.Kafka.Records("trip-events").size();
   ctx.Assert(n >= 1, "publish_event must produce one record");
   ctx.Equal(n, 1, "a lost ack made the producer write the event more than once (enable.idempotence makes its own retries write once): records on trip-events");
   // A leader failover right after the ack: a record acknowledged by the leader alone (acks 0 or 1) is gone.
-  publishTrip(ctx, "r-42", "matched");
+  hPublishTrip(ctx, "r-42", "matched");
   ctx.Settle();
   ctx.Kafka.Failover("trip-events");
   n = ctx.Kafka.Records("trip-events").size();
@@ -1242,10 +1242,10 @@ void CheckDurableProducer(harness::Ctx& ctx) {
 }
 
 void CheckKeyedByRide(harness::Ctx& ctx) {
-  rideStatuses();
-  publishTrip(ctx, "r-42", "requested");
-  publishTrip(ctx, "r-42", "matched");
-  publishTrip(ctx, "r-7", "requested");
+  hRideStatuses();
+  hPublishTrip(ctx, "r-42", "requested");
+  hPublishTrip(ctx, "r-42", "matched");
+  hPublishTrip(ctx, "r-7", "requested");
   ctx.Settle();
   const auto produced = ctx.Kafka.Records("trip-events");
   ctx.Equal(produced.size(), 3, "records on trip-events");
@@ -1257,9 +1257,9 @@ void CheckKeyedByRide(harness::Ctx& ctx) {
 }
 
 void CheckManualCommit(harness::Ctx& ctx) {
-  seedTripEvents(ctx, {{"r-42", "requested"}, {"r-42", "matched"}});
-  const auto& statuses = rideStatuses();
-  drainRun(ctx);
+  hSeedTripEvents(ctx, {{"r-42", "requested"}, {"r-42", "matched"}});
+  const auto& statuses = hRideStatuses();
+  hDrainRun(ctx);
   const auto consumers = ctx.Kafka.Consumers();
   ctx.Assert(!consumers.empty(), "no consumer joined the trip-state group");
   ctx.Equal(consumers.back().AutoCommit, false, "auto-commit must be off (enable.auto.commit=false): offsets are committed explicitly, after the status write");
@@ -1270,10 +1270,10 @@ void CheckManualCommit(harness::Ctx& ctx) {
 }
 
 void CheckIllegalSkipped(harness::Ctx& ctx) {
-  seedTripEvents(ctx, {{"r-42", "requested"}, {"r-42", "matched"}, {"r-42", "matched"}, {"r-42", "completed"}, {"r-42", "started"}, {"r-99", "started"}});
-  const auto& statuses = rideStatuses();
-  tripLogs logged;
-  drainRun(ctx);
+  hSeedTripEvents(ctx, {{"r-42", "requested"}, {"r-42", "matched"}, {"r-42", "matched"}, {"r-42", "completed"}, {"r-42", "started"}, {"r-99", "started"}});
+  const auto& statuses = hRideStatuses();
+  HTripLogs logged;
+  hDrainRun(ctx);
   ctx.Equal(get_status("r-42"), "started", "r-42's status (requested → matched → started; the duplicate matched and the early completed are illegal)");
   ctx.Assert(statuses.count("r-99") == 0, "started on a ride nobody has seen is illegal and must not create r-99");
   ctx.Equal(ctx.Kafka.Lag("trip-state", "trip-events"), 0, "illegal events must be committed too, or the partition replays them forever: trip-state's lag");
@@ -1282,24 +1282,24 @@ void CheckIllegalSkipped(harness::Ctx& ctx) {
 }
 
 void CheckSetThenCommit(harness::Ctx& ctx) {
-  seedTripEvents(ctx, {{"r-42", "requested"}});
-  const auto& statuses = rideStatuses();
+  hSeedTripEvents(ctx, {{"r-42", "requested"}});
+  const auto& statuses = hRideStatuses();
   std::vector<std::string> atCommit;
   ctx.Kafka.OnCommit([&](const std::string&, const harness::KafkaOffsets&) {
     const auto it = statuses.find("r-42");
     atCommit.push_back(it == statuses.end() ? "<absent>" : it->second);
   });
-  drainRun(ctx);
+  hDrainRun(ctx);
   ctx.Assert(!atCommit.empty(), "the offset was never committed");
   ctx.Equal(atCommit[0], "requested", "the commit must come after set_status: r-42's status at commit time");
   // A failing status write must not be committed: the record has to be redelivered.
-  seedTripEvents(ctx, {{"r-7", "requested"}});
-  setStatus = [](const std::string& rideID, const std::string& status) {
+  hSeedTripEvents(ctx, {{"r-7", "requested"}});
+  hSetStatus = [](const std::string& rideID, const std::string& status) {
     if (rideID == "r-7") throw std::runtime_error("ride store unavailable");
-    rides[rideID] = status;
+    hRides[rideID] = status;
   };
   try {
-    drainRun(ctx);
+    hDrainRun(ctx);
   } catch (const std::exception&) {
     // the consumer loop surfaces the store's failure; what matters is what was committed
   }

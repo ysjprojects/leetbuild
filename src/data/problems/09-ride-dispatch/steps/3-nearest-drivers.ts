@@ -699,15 +699,15 @@ import (
 	"leetbuild/harness"
 )
 
-const pickupLat, pickupLng = 48.85, 2.35
+const kHPickupLat, kHPickupLng = 48.85, 2.35
 
-type seededDriver struct {
+type HSeededDriver struct {
 	id       string
 	lat, lng float64
 }
 
 // seedDrivers writes the GEO member and, when seen, a live presence key for every driver.
-func seedDrivers(ctx *harness.Ctx, city string, seen bool, drivers ...seededDriver) {
+func hSeedDrivers(ctx *harness.Ctx, city string, seen bool, drivers ...HSeededDriver) {
 	for _, d := range drivers {
 		ctx.Redis.Do("GEOADD", "drivers:"+city, d.lng, d.lat, d.id)
 		if seen {
@@ -718,10 +718,10 @@ func seedDrivers(ctx *harness.Ctx, city string, seen bool, drivers ...seededDriv
 
 // storeCalls stands in for driver_store.go: it answers from statuses (default available) and records
 // the ids of every call.
-type storeCalls struct{ calls [][]string }
+type HStoreCalls struct{ calls [][]string }
 
-func standInStore(statuses map[string]string) *storeCalls {
-	s := &storeCalls{}
+func hStandInStore(statuses map[string]string) *HStoreCalls {
+	s := &HStoreCalls{}
 	driverStatus = func(_ context.Context, ids []string) map[string]string {
 		s.calls = append(s.calls, append([]string(nil), ids...))
 		out := map[string]string{}
@@ -737,7 +737,7 @@ func standInStore(statuses map[string]string) *storeCalls {
 	return s
 }
 
-func nearestIDs(ctx *harness.Ctx, city string, lat, lng float64, k int) ([]Candidate, []string) {
+func hNearestIDs(ctx *harness.Ctx, city string, lat, lng float64, k int) ([]Candidate, []string) {
 	found, err := nearest(context.Background(), city, lat, lng, k)
 	ctx.NoError(err, "nearest(%q, %v, %v, %d) returned an error", city, lat, lng, k)
 	ids := []string{}
@@ -748,23 +748,23 @@ func nearestIDs(ctx *harness.Ctx, city string, lat, lng float64, k int) ([]Candi
 }
 
 func CheckGeosearch(ctx *harness.Ctx) {
-	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-9", 48.86, 2.37}, seededDriver{"d-far", 48.9, 2.35})
-	seedDrivers(ctx, "lyon", true, seededDriver{"d-l", 45.76, 4.84})
-	standInStore(nil)
-	_, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	hSeedDrivers(ctx, "paris", true, HSeededDriver{"d-7", 48.852, 2.352}, HSeededDriver{"d-9", 48.86, 2.37}, HSeededDriver{"d-far", 48.9, 2.35})
+	hSeedDrivers(ctx, "lyon", true, HSeededDriver{"d-l", 45.76, 4.84})
+	hStandInStore(nil)
+	_, ids := hNearestIDs(ctx, "paris", kHPickupLat, kHPickupLng, 10)
 	ctx.Equal(ids, []string{"d-7", "d-9"}, "nearest(paris): within 3 km of (lat 48.85, lng 2.35), lng before lat in the search")
 	for _, id := range ids {
 		ctx.Assert(id != "d-far", "d-far is 5.6 km away and must be outside the 3 km radius")
 	}
-	_, ids = nearestIDs(ctx, "lyon", 45.76, 4.84, 10)
+	_, ids = hNearestIDs(ctx, "lyon", 45.76, 4.84, 10)
 	ctx.Equal(ids, []string{"d-l"}, "nearest(lyon): the search is on drivers:{city}")
 }
 
 func CheckSortedBounded(ctx *harness.Ctx) {
 	// ~0.111 km apart, 25 within 3 km, seeded in a fixed shuffled order.
-	drivers := make([]seededDriver, 25)
+	drivers := make([]HSeededDriver, 25)
 	for i := range drivers {
-		drivers[i] = seededDriver{fmt.Sprintf("d-%d", i+1), 48.85 + float64(i+1)/1000, 2.35}
+		drivers[i] = HSeededDriver{fmt.Sprintf("d-%d", i+1), 48.85 + float64(i+1)/1000, 2.35}
 	}
 	state := int64(7)
 	for i := len(drivers) - 1; i > 0; i-- {
@@ -772,9 +772,9 @@ func CheckSortedBounded(ctx *harness.Ctx) {
 		j := state % int64(i+1)
 		drivers[i], drivers[j] = drivers[j], drivers[i]
 	}
-	seedDrivers(ctx, "paris", true, drivers...)
-	standInStore(nil)
-	found, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 25)
+	hSeedDrivers(ctx, "paris", true, drivers...)
+	hStandInStore(nil)
+	found, ids := hNearestIDs(ctx, "paris", kHPickupLat, kHPickupLng, 25)
 	ctx.Equal(len(found), 20, "drivers for k=25 with 25 in range: the search must ask Redis for Count 20 candidates")
 	dists := make([]float64, len(found))
 	for i, c := range found {
@@ -787,13 +787,13 @@ func CheckSortedBounded(ctx *harness.Ctx) {
 }
 
 func CheckPresenceMget(ctx *harness.Ctx) {
-	seedDrivers(ctx, "paris", true, seededDriver{"d-2", 48.857, 2.35})
+	hSeedDrivers(ctx, "paris", true, HSeededDriver{"d-2", 48.857, 2.35})
 	ctx.Clock.Advance(31) // d-2 went silent: its presence key expired
-	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-9", 48.86, 2.37})
-	seedDrivers(ctx, "paris", false, seededDriver{"d-5", 48.83, 2.35})
-	store := standInStore(nil)
+	hSeedDrivers(ctx, "paris", true, HSeededDriver{"d-7", 48.852, 2.352}, HSeededDriver{"d-9", 48.86, 2.37})
+	hSeedDrivers(ctx, "paris", false, HSeededDriver{"d-5", 48.83, 2.35})
+	store := hStandInStore(nil)
 	before := len(ctx.Redis.RoundTrips())
-	_, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	_, ids := hNearestIDs(ctx, "paris", kHPickupLat, kHPickupLng, 10)
 	var commands []string
 	for _, trip := range ctx.Redis.RoundTrips()[before:] {
 		commands = append(commands, trip...)
@@ -818,9 +818,9 @@ func CheckPresenceMget(ctx *harness.Ctx) {
 }
 
 func CheckAvailableOnly(ctx *harness.Ctx) {
-	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-2", 48.857, 2.35}, seededDriver{"d-9", 48.86, 2.37}, seededDriver{"d-5", 48.83, 2.35})
-	store := standInStore(map[string]string{"d-7": "on_trip", "d-9": "offline"})
-	_, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	hSeedDrivers(ctx, "paris", true, HSeededDriver{"d-7", 48.852, 2.352}, HSeededDriver{"d-2", 48.857, 2.35}, HSeededDriver{"d-9", 48.86, 2.37}, HSeededDriver{"d-5", 48.83, 2.35})
+	store := hStandInStore(map[string]string{"d-7": "on_trip", "d-9": "offline"})
+	_, ids := hNearestIDs(ctx, "paris", kHPickupLat, kHPickupLng, 10)
 	ctx.Equal(ids, []string{"d-2", "d-5"}, "nearest: d-7 is on_trip and d-9 offline")
 	ctx.Equal(len(store.calls), 1, "the driver store must be asked once with every live candidate (calls: %v)", store.calls)
 	asked := append([]string(nil), store.calls[0]...)
@@ -829,15 +829,15 @@ func CheckAvailableOnly(ctx *harness.Ctx) {
 }
 
 func CheckTopK(ctx *harness.Ctx) {
-	seedDrivers(ctx, "paris", true, seededDriver{"d-7", 48.852, 2.352}, seededDriver{"d-2", 48.857, 2.35}, seededDriver{"d-9", 48.86, 2.37}, seededDriver{"d-5", 48.83, 2.35}, seededDriver{"d-3", 48.87, 2.36})
-	standInStore(nil)
-	found, ids := nearestIDs(ctx, "paris", pickupLat, pickupLng, 2)
+	hSeedDrivers(ctx, "paris", true, HSeededDriver{"d-7", 48.852, 2.352}, HSeededDriver{"d-2", 48.857, 2.35}, HSeededDriver{"d-9", 48.86, 2.37}, HSeededDriver{"d-5", 48.83, 2.35}, HSeededDriver{"d-3", 48.87, 2.36})
+	hStandInStore(nil)
+	found, ids := hNearestIDs(ctx, "paris", kHPickupLat, kHPickupLng, 2)
 	ctx.Equal(len(found), 2, "k=2: drivers returned (%v)", ids)
 	ctx.Equal(ids, []string{"d-7", "d-2"}, "the two nearest")
-	found, _ = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10)
+	found, _ = hNearestIDs(ctx, "paris", kHPickupLat, kHPickupLng, 10)
 	ctx.Equal(len(found), 5, "k=10 with five drivers in range must return all five")
-	standInStore(map[string]string{"d-7": "on_trip"})
-	_, ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 2)
+	hStandInStore(map[string]string{"d-7": "on_trip"})
+	_, ids = hNearestIDs(ctx, "paris", kHPickupLat, kHPickupLng, 2)
 	ctx.Equal(ids, []string{"d-2", "d-9"}, "with d-7 on a trip the top 2 (filter first, then cut to k)")
 }
 `,
@@ -853,15 +853,15 @@ func CheckTopK(ctx *harness.Ctx) {
 
 namespace {
 
-constexpr double pickupLat = 48.85, pickupLng = 2.35;
+constexpr double kHPickupLat = 48.85, pickupLng = 2.35;
 
-struct seededDriver {
+struct HSeededDriver {
   std::string id;
   double lat, lng;
 };
 
 // seedDrivers writes the GEO member and, when seen, a live presence key for every driver.
-void seedDrivers(harness::Ctx& ctx, const std::string& city, bool seen, const std::vector<seededDriver>& drivers) {
+void hSeedDrivers(harness::Ctx& ctx, const std::string& city, bool seen, const std::vector<HSeededDriver>& drivers) {
   for (const auto& d : drivers) {
     ctx.Redis.Do("GEOADD", "drivers:" + city, d.lng, d.lat, d.id);
     if (seen) ctx.Redis.Set("driver:" + d.id + ":seen", "1000", "EX", 30);
@@ -870,19 +870,19 @@ void seedDrivers(harness::Ctx& ctx, const std::string& city, bool seen, const st
 
 // storeCalls stands in for driver_store.h: it answers from statuses (default available) and
 // records the ids of every call.
-struct storeCalls {
+struct HStoreCalls {
   std::map<std::string, std::string> statuses;
   std::vector<std::vector<std::string>> calls;
 };
 
-storeCalls store;
+HStoreCalls hStore;
 
-storeCalls& standInStore(std::map<std::string, std::string> statuses = {}) {
-  store = storeCalls{std::move(statuses), {}};
-  return store;
+HStoreCalls& hStandInStore(std::map<std::string, std::string> statuses = {}) {
+  hStore = HStoreCalls{std::move(statuses), {}};
+  return hStore;
 }
 
-std::pair<std::vector<Candidate>, std::vector<std::string>> nearestIDs(harness::Ctx& ctx, const std::string& city, double lat, double lng, std::size_t k) {
+std::pair<std::vector<Candidate>, std::vector<std::string>> hNearestIDs(harness::Ctx& ctx, const std::string& city, double lat, double lng, std::size_t k) {
   std::vector<Candidate> found;
   try {
     found = nearest(city, lat, lng, k);
@@ -897,29 +897,29 @@ std::pair<std::vector<Candidate>, std::vector<std::string>> nearestIDs(harness::
 }  // namespace
 
 std::map<std::string, std::string> driver_status(const std::vector<std::string>& ids) {
-  store.calls.push_back(ids);
+  hStore.calls.push_back(ids);
   std::map<std::string, std::string> out;
   for (const auto& id : ids) {
-    const auto it = store.statuses.find(id);
-    out[id] = it == store.statuses.end() ? "available" : it->second;
+    const auto it = hStore.statuses.find(id);
+    out[id] = it == hStore.statuses.end() ? "available" : it->second;
   }
   return out;
 }
 
 void CheckGeosearch(harness::Ctx& ctx) {
-  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-9", 48.86, 2.37}, {"d-far", 48.9, 2.35}});
-  seedDrivers(ctx, "lyon", true, {{"d-l", 45.76, 4.84}});
-  standInStore();
-  auto [found, ids] = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10);
+  hSeedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-9", 48.86, 2.37}, {"d-far", 48.9, 2.35}});
+  hSeedDrivers(ctx, "lyon", true, {{"d-l", 45.76, 4.84}});
+  hStandInStore();
+  auto [found, ids] = hNearestIDs(ctx, "paris", kHPickupLat, pickupLng, 10);
   ctx.Equal(ids, {"d-7", "d-9"}, "nearest(paris): within 3 km of (lat 48.85, lng 2.35), lng before lat in the search");
   for (const auto& id : ids) ctx.Assert(id != "d-far", "d-far is 5.6 km away and must be outside the 3 km radius");
-  ids = nearestIDs(ctx, "lyon", 45.76, 4.84, 10).second;
+  ids = hNearestIDs(ctx, "lyon", 45.76, 4.84, 10).second;
   ctx.Equal(ids, {"d-l"}, "nearest(lyon): the search is on drivers:{city}");
 }
 
 void CheckSortedBounded(harness::Ctx& ctx) {
   // ~0.111 km apart, 25 within 3 km, seeded in a fixed shuffled order.
-  std::vector<seededDriver> drivers;
+  std::vector<HSeededDriver> drivers;
   for (int i = 0; i < 25; i++) drivers.push_back({"d-" + std::to_string(i + 1), 48.85 + (i + 1) / 1000.0, 2.35});
   int64_t state = 7;
   for (int64_t i = static_cast<int64_t>(drivers.size()) - 1; i > 0; i--) {
@@ -927,9 +927,9 @@ void CheckSortedBounded(harness::Ctx& ctx) {
     const int64_t j = state % (i + 1);
     std::swap(drivers[static_cast<size_t>(i)], drivers[static_cast<size_t>(j)]);
   }
-  seedDrivers(ctx, "paris", true, drivers);
-  standInStore();
-  auto [found, ids] = nearestIDs(ctx, "paris", pickupLat, pickupLng, 25);
+  hSeedDrivers(ctx, "paris", true, drivers);
+  hStandInStore();
+  auto [found, ids] = hNearestIDs(ctx, "paris", kHPickupLat, pickupLng, 25);
   ctx.Equal(found.size(), 20, "drivers for k=25 with 25 in range: the search must ask Redis for COUNT 20 candidates");
   std::vector<double> dists;
   for (const auto& c : found) dists.push_back(c.dist_km);
@@ -940,13 +940,13 @@ void CheckSortedBounded(harness::Ctx& ctx) {
 }
 
 void CheckPresenceMget(harness::Ctx& ctx) {
-  seedDrivers(ctx, "paris", true, {{"d-2", 48.857, 2.35}});
+  hSeedDrivers(ctx, "paris", true, {{"d-2", 48.857, 2.35}});
   ctx.Clock.Advance(31);  // d-2 went silent: its presence key expired
-  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-9", 48.86, 2.37}});
-  seedDrivers(ctx, "paris", false, {{"d-5", 48.83, 2.35}});
-  const storeCalls& calls = standInStore();
+  hSeedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-9", 48.86, 2.37}});
+  hSeedDrivers(ctx, "paris", false, {{"d-5", 48.83, 2.35}});
+  const HStoreCalls& calls = hStandInStore();
   const size_t before = ctx.Redis.RoundTrips().size();
-  const auto ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10).second;
+  const auto ids = hNearestIDs(ctx, "paris", kHPickupLat, pickupLng, 10).second;
   std::vector<std::string> commands;
   const auto trips = ctx.Redis.RoundTrips();
   for (size_t i = before; i < trips.size(); i++) commands.insert(commands.end(), trips[i].begin(), trips[i].end());
@@ -966,9 +966,9 @@ void CheckPresenceMget(harness::Ctx& ctx) {
 }
 
 void CheckAvailableOnly(harness::Ctx& ctx) {
-  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-2", 48.857, 2.35}, {"d-9", 48.86, 2.37}, {"d-5", 48.83, 2.35}});
-  const storeCalls& calls = standInStore({{"d-7", "on_trip"}, {"d-9", "offline"}});
-  const auto ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10).second;
+  hSeedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-2", 48.857, 2.35}, {"d-9", 48.86, 2.37}, {"d-5", 48.83, 2.35}});
+  const HStoreCalls& calls = hStandInStore({{"d-7", "on_trip"}, {"d-9", "offline"}});
+  const auto ids = hNearestIDs(ctx, "paris", kHPickupLat, pickupLng, 10).second;
   ctx.Equal(ids, {"d-2", "d-5"}, "nearest: d-7 is on_trip and d-9 offline");
   ctx.Equal(calls.calls.size(), 1, "the driver store must be asked once with every live candidate (calls: %v)", calls.calls);
   std::vector<std::string> asked = calls.calls[0];
@@ -977,15 +977,15 @@ void CheckAvailableOnly(harness::Ctx& ctx) {
 }
 
 void CheckTopK(harness::Ctx& ctx) {
-  seedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-2", 48.857, 2.35}, {"d-9", 48.86, 2.37}, {"d-5", 48.83, 2.35}, {"d-3", 48.87, 2.36}});
-  standInStore();
-  auto [found, ids] = nearestIDs(ctx, "paris", pickupLat, pickupLng, 2);
+  hSeedDrivers(ctx, "paris", true, {{"d-7", 48.852, 2.352}, {"d-2", 48.857, 2.35}, {"d-9", 48.86, 2.37}, {"d-5", 48.83, 2.35}, {"d-3", 48.87, 2.36}});
+  hStandInStore();
+  auto [found, ids] = hNearestIDs(ctx, "paris", kHPickupLat, pickupLng, 2);
   ctx.Equal(found.size(), 2, "k=2: drivers returned (%v)", ids);
   ctx.Equal(ids, {"d-7", "d-2"}, "the two nearest");
-  found = nearestIDs(ctx, "paris", pickupLat, pickupLng, 10).first;
+  found = hNearestIDs(ctx, "paris", kHPickupLat, pickupLng, 10).first;
   ctx.Equal(found.size(), 5, "k=10 with five drivers in range must return all five");
-  standInStore({{"d-7", "on_trip"}});
-  ids = nearestIDs(ctx, "paris", pickupLat, pickupLng, 2).second;
+  hStandInStore({{"d-7", "on_trip"}});
+  ids = hNearestIDs(ctx, "paris", kHPickupLat, pickupLng, 2).second;
   ctx.Equal(ids, {"d-2", "d-9"}, "with d-7 on a trip the top 2 (filter first, then cut to k)");
 }
 `,

@@ -1042,9 +1042,9 @@ import (
 	"leetbuild/harness"
 )
 
-var djBg = context.Background()
+var hDjBg = context.Background()
 
-func djIDs(jobs []Job) []string {
+func hDjIDs(jobs []Job) []string {
 	ids := []string{}
 	for _, j := range jobs {
 		ids = append(ids, j.ID)
@@ -1052,19 +1052,19 @@ func djIDs(jobs []Job) []string {
 	return ids
 }
 
-func djSchedule(ctx *harness.Ctx, jobID, payload string, runAtMs int64) {
-	ctx.NoError(schedule(djBg, jobID, payload, runAtMs), "schedule(%q, %q, %d) returned an error", jobID, payload, runAtMs)
+func hDjSchedule(ctx *harness.Ctx, jobID, payload string, runAtMs int64) {
+	ctx.NoError(schedule(hDjBg, jobID, payload, runAtMs), "schedule(%q, %q, %d) returned an error", jobID, payload, runAtMs)
 }
 
-func djPop(ctx *harness.Ctx, nowMs int64, limit int) []Job {
-	jobs, err := popDue(djBg, nowMs, limit)
+func hDjPop(ctx *harness.Ctx, nowMs int64, limit int) []Job {
+	jobs, err := popDue(hDjBg, nowMs, limit)
 	ctx.NoError(err, "popDue(%d, %d) returned an error", nowMs, limit)
 	return jobs
 }
 
 // djFail is the new runAtMs, or nil when the job was not rescheduled.
-func djFail(ctx *harness.Ctx, jobID string, nowMs int64) any {
-	runAtMs, rescheduled, err := fail(djBg, jobID, nowMs)
+func hDjFail(ctx *harness.Ctx, jobID string, nowMs int64) any {
+	runAtMs, rescheduled, err := fail(hDjBg, jobID, nowMs)
 	ctx.NoError(err, "fail(%q, %d) returned an error", jobID, nowMs)
 	if !rescheduled {
 		return nil
@@ -1072,12 +1072,12 @@ func djFail(ctx *harness.Ctx, jobID string, nowMs int64) any {
 	return runAtMs
 }
 
-func djComplete(ctx *harness.Ctx, jobID string) {
-	ctx.NoError(complete(djBg, jobID), "complete(%q) returned an error", jobID)
+func hDjComplete(ctx *harness.Ctx, jobID string) {
+	ctx.NoError(complete(hDjBg, jobID), "complete(%q) returned an error", jobID)
 }
 
 // djScore is the job's score in jobs:delayed, or nil when it is not there.
-func djScore(ctx *harness.Ctx, id string) any {
+func hDjScore(ctx *harness.Ctx, id string) any {
 	if s, ok := ctx.Redis.ZScore("jobs:delayed", id); ok {
 		return s
 	}
@@ -1085,14 +1085,14 @@ func djScore(ctx *harness.Ctx, id string) any {
 }
 
 // djHGet is a hash field, or nil when it is missing.
-func djHGet(ctx *harness.Ctx, key, field string) any {
+func hDjHGet(ctx *harness.Ctx, key, field string) any {
 	if v, ok := ctx.Redis.HGet(key, field); ok {
 		return v
 	}
 	return nil
 }
 
-func djDelayed(ctx *harness.Ctx) []string {
+func hDjDelayed(ctx *harness.Ctx) []string {
 	ids := []string{}
 	for _, z := range ctx.Redis.ZRangeWithScores("jobs:delayed", 0, -1) {
 		ids = append(ids, z.Member)
@@ -1101,18 +1101,18 @@ func djDelayed(ctx *harness.Ctx) []string {
 }
 
 func CheckScheduled(ctx *harness.Ctx) {
-	djSchedule(ctx, "a", "send-email:a", 5000)
-	djSchedule(ctx, "b", "send-email:b", 2000)
-	ctx.Equal(djHGet(ctx, "jobs:payload", "a"), "send-email:a", "jobs:payload a must hold the payload")
-	ctx.Equal(djScore(ctx, "a"), 5000, "jobs:delayed must score a at runAtMs 5000")
-	ctx.Equal(djScore(ctx, "b"), 2000, "jobs:delayed must score b at runAtMs 2000")
+	hDjSchedule(ctx, "a", "send-email:a", 5000)
+	hDjSchedule(ctx, "b", "send-email:b", 2000)
+	ctx.Equal(hDjHGet(ctx, "jobs:payload", "a"), "send-email:a", "jobs:payload a must hold the payload")
+	ctx.Equal(hDjScore(ctx, "a"), 5000, "jobs:delayed must score a at runAtMs 5000")
+	ctx.Equal(hDjScore(ctx, "b"), 2000, "jobs:delayed must score b at runAtMs 2000")
 	ctx.Equal(ctx.Redis.Keys("*"), []string{"jobs:delayed", "jobs:payload"}, "schedule must write exactly jobs:payload and jobs:delayed")
-	early := djPop(ctx, 1999, 10)
+	early := hDjPop(ctx, 1999, 10)
 	ctx.Assert(len(early) == 0, "at 1999 ms nothing is due (b is due at 2000), got %+v", early)
 	ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 2, "a pop that returned nothing must remove nothing: ZCARD jobs:delayed")
-	ctx.Equal(djPop(ctx, 2000, 10), []Job{{ID: "b", Payload: "send-email:b", Attempt: 0}}, "at 2000 ms exactly b is due")
-	ctx.Equal(djDelayed(ctx), []string{"a"}, "after popping b jobs:delayed must hold only a")
-	ctx.Equal(djHGet(ctx, "jobs:payload", "b"), "send-email:b", "popping must not delete the payload: complete does")
+	ctx.Equal(hDjPop(ctx, 2000, 10), []Job{{ID: "b", Payload: "send-email:b", Attempt: 0}}, "at 2000 ms exactly b is due")
+	ctx.Equal(hDjDelayed(ctx), []string{"a"}, "after popping b jobs:delayed must hold only a")
+	ctx.Equal(hDjHGet(ctx, "jobs:payload", "b"), "send-email:b", "popping must not delete the payload: complete does")
 }
 
 func CheckDueInOrder(ctx *harness.Ctx) {
@@ -1120,74 +1120,74 @@ func CheckDueInOrder(ctx *harness.Ctx) {
 		id    string
 		runAt int64
 	}{{"j3", 3000}, {"j1", 1000}, {"j5", 5000}, {"j2", 2000}, {"j4", 4000}} {
-		djSchedule(ctx, s.id, "payload-"+s.id, s.runAt)
+		hDjSchedule(ctx, s.id, "payload-"+s.id, s.runAt)
 	}
-	first := djPop(ctx, 3500, 2)
-	ctx.Equal(djIDs(first), []string{"j1", "j2"}, "at 3500 ms with limit 2 the two earliest due jobs are j1, j2")
+	first := hDjPop(ctx, 3500, 2)
+	ctx.Equal(hDjIDs(first), []string{"j1", "j2"}, "at 3500 ms with limit 2 the two earliest due jobs are j1, j2")
 	ctx.Equal(first, []Job{{ID: "j1", Payload: "payload-j1", Attempt: 0}, {ID: "j2", Payload: "payload-j2", Attempt: 0}}, "each job is {ID, Payload, Attempt}")
-	ctx.Equal(djDelayed(ctx), []string{"j3", "j4", "j5"}, "the jobs beyond the limit must stay in jobs:delayed")
-	ctx.Equal(djIDs(djPop(ctx, 3500, 10)), []string{"j3"}, "j3 is the only job still due at 3500 ms")
-	ctx.Equal(djIDs(djPop(ctx, 10000, 10)), []string{"j4", "j5"}, "at 10000 ms the rest pop in runAt order")
-	drained := djPop(ctx, 10000, 10)
+	ctx.Equal(hDjDelayed(ctx), []string{"j3", "j4", "j5"}, "the jobs beyond the limit must stay in jobs:delayed")
+	ctx.Equal(hDjIDs(hDjPop(ctx, 3500, 10)), []string{"j3"}, "j3 is the only job still due at 3500 ms")
+	ctx.Equal(hDjIDs(hDjPop(ctx, 10000, 10)), []string{"j4", "j5"}, "at 10000 ms the rest pop in runAt order")
+	drained := hDjPop(ctx, 10000, 10)
 	ctx.Assert(len(drained) == 0, "a drained set pops nothing, got %+v", drained)
 	ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 0, "every job was popped; jobs:delayed must be empty")
 }
 
 func CheckAtomicClaim(ctx *harness.Ctx) {
-	djSchedule(ctx, "solo", "p", 100)
-	ctx.Equal(djIDs(djPop(ctx, 100, 10)), []string{"solo"}, "the jobs due at 100 ms")
-	ctx.Equal(djScore(ctx, "solo"), nil, "a popped job must be gone from jobs:delayed: the script ZREMs what it returns")
+	hDjSchedule(ctx, "solo", "p", 100)
+	ctx.Equal(hDjIDs(hDjPop(ctx, 100, 10)), []string{"solo"}, "the jobs due at 100 ms")
+	ctx.Equal(hDjScore(ctx, "solo"), nil, "a popped job must be gone from jobs:delayed: the script ZREMs what it returns")
 	for i := range 3 {
-		djSchedule(ctx, fmt.Sprintf("j%d", i), fmt.Sprintf("p%d", i), 1000)
+		hDjSchedule(ctx, fmt.Sprintf("j%d", i), fmt.Sprintf("p%d", i), 1000)
 	}
 	// A second worker's popDue lands right after the first command that touches jobs:delayed —
 	// between a client-side ZRANGEBYSCORE and its ZREM, or after the whole script.
 	rival := ctx.Redis.After("jobs:delayed", func() any {
-		jobs, err := popDue(djBg, 1000, 10)
+		jobs, err := popDue(hDjBg, 1000, 10)
 		if err != nil {
 			panic(err)
 		}
 		return jobs
 	})
-	mine := djPop(ctx, 1000, 10)
+	mine := hDjPop(ctx, 1000, 10)
 	ctx.Assert(rival.Fired, "popDue never touched jobs:delayed as a script key: pass it as KEYS[1]")
 	ctx.NoError(rival.Err, "the second worker's popDue failed")
 	his, _ := rival.Result.([]Job)
 	shared := []string{}
-	for _, a := range djIDs(mine) {
-		for _, b := range djIDs(his) {
+	for _, a := range hDjIDs(mine) {
+		for _, b := range hDjIDs(his) {
 			if a == b {
 				shared = append(shared, a)
 			}
 		}
 	}
 	ctx.Assert(len(shared) == 0, "two workers popping at once both got %q: a ZRANGEBYSCORE followed by a separate ZREM lets both read the same ids. Read and remove inside one Lua script", shared)
-	all := append(djIDs(mine), djIDs(his)...)
+	all := append(hDjIDs(mine), hDjIDs(his)...)
 	sort.Strings(all)
-	ctx.Assert(fmt.Sprint(all) == "[j0 j1 j2]", "between them the two workers must get every due job once: %q and %q", djIDs(mine), djIDs(his))
-	ctx.Assert(ctx.Redis.ZCard("jobs:delayed") == 0, "jobs:delayed still holds %q after both pops", djDelayed(ctx))
+	ctx.Assert(fmt.Sprint(all) == "[j0 j1 j2]", "between them the two workers must get every due job once: %q and %q", hDjIDs(mine), hDjIDs(his))
+	ctx.Assert(ctx.Redis.ZCard("jobs:delayed") == 0, "jobs:delayed still holds %q after both pops", hDjDelayed(ctx))
 }
 
 func CheckBackoff(ctx *harness.Ctx) {
-	djSchedule(ctx, "j", "p", 0)
+	hDjSchedule(ctx, "j", "p", 0)
 	now := int64(0)
 	for failures, delay := range []int64{1000, 2000, 4000, 8000} {
-		due := djPop(ctx, now, 10)
+		due := hDjPop(ctx, now, 10)
 		ctx.Equal(due, []Job{{ID: "j", Payload: "p", Attempt: failures}}, "at %d ms the job is due with %d failure(s) so far", now, failures)
-		ctx.Equal(djFail(ctx, "j", now), now+delay, "failure %d must reschedule at now + %d ms: the runAtMs fail returned", failures+1, delay)
-		ctx.Equal(djScore(ctx, "j"), now+delay, "after failure %d jobs:delayed must score j at now + %d ms", failures+1, delay)
-		ctx.Equal(djHGet(ctx, "jobs:attempts", "j"), fmt.Sprint(failures+1), "jobs:attempts j after %d failure(s)", failures+1)
-		early := djPop(ctx, now+delay-1, 10)
+		ctx.Equal(hDjFail(ctx, "j", now), now+delay, "failure %d must reschedule at now + %d ms: the runAtMs fail returned", failures+1, delay)
+		ctx.Equal(hDjScore(ctx, "j"), now+delay, "after failure %d jobs:delayed must score j at now + %d ms", failures+1, delay)
+		ctx.Equal(hDjHGet(ctx, "jobs:attempts", "j"), fmt.Sprint(failures+1), "jobs:attempts j after %d failure(s)", failures+1)
+		early := hDjPop(ctx, now+delay-1, 10)
 		ctx.Assert(len(early) == 0, "1 ms before its new runAt the job must not pop, got %+v", early)
 		now += delay
 	}
-	ctx.Equal(djPop(ctx, now, 10), []Job{{ID: "j", Payload: "p", Attempt: 4}}, "the fifth run sees 4 failures")
-	ctx.Equal(djFail(ctx, "j", now), nil, "the fifth failure must not reschedule: fail returns rescheduled false")
-	ctx.Equal(djScore(ctx, "j"), nil, "a dead job must not be in jobs:delayed")
+	ctx.Equal(hDjPop(ctx, now, 10), []Job{{ID: "j", Payload: "p", Attempt: 4}}, "the fifth run sees 4 failures")
+	ctx.Equal(hDjFail(ctx, "j", now), nil, "the fifth failure must not reschedule: fail returns rescheduled false")
+	ctx.Equal(hDjScore(ctx, "j"), nil, "a dead job must not be in jobs:delayed")
 	ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), []string{"j"}, "jobs:dead")
-	ctx.Equal(djHGet(ctx, "jobs:attempts", "j"), nil, "a dead job's attempt count is dropped")
-	ctx.Equal(djHGet(ctx, "jobs:payload", "j"), "p", "a dead job's payload stays for inspection")
-	late := djPop(ctx, 1_000_000_000, 10)
+	ctx.Equal(hDjHGet(ctx, "jobs:attempts", "j"), nil, "a dead job's attempt count is dropped")
+	ctx.Equal(hDjHGet(ctx, "jobs:payload", "j"), "p", "a dead job's payload stays for inspection")
+	late := hDjPop(ctx, 1_000_000_000, 10)
 	ctx.Assert(len(late) == 0, "a dead job never pops again, got %+v", late)
 }
 
@@ -1195,31 +1195,31 @@ func CheckBackoffCap(ctx *harness.Ctx) {
 	for _, c := range [][2]int64{{1, 1000}, {2, 2000}, {3, 4000}, {4, 8000}, {5, 16000}, {6, 32000}, {7, 60000}, {8, 60000}, {12, 60000}} {
 		ctx.Equal(backoffMs(int(c[0])), c[1], "backoffMs(%d): baseMs * 2^(attempt - 1) capped at maxBackoffMs", c[0])
 	}
-	djSchedule(ctx, "j", "p", 0)
-	djPop(ctx, 0, 10)
-	ctx.Equal(djFail(ctx, "j", 500000), 501000, "the first failure at 500000 ms must reschedule at 501000")
-	djPop(ctx, 501000, 10)
-	ctx.Equal(djFail(ctx, "j", 501000), 503000, "the second failure at 501000 ms must reschedule at 503000")
+	hDjSchedule(ctx, "j", "p", 0)
+	hDjPop(ctx, 0, 10)
+	ctx.Equal(hDjFail(ctx, "j", 500000), 501000, "the first failure at 500000 ms must reschedule at 501000")
+	hDjPop(ctx, 501000, 10)
+	ctx.Equal(hDjFail(ctx, "j", 501000), 503000, "the second failure at 501000 ms must reschedule at 503000")
 }
 
 func CheckComplete(ctx *harness.Ctx) {
-	djSchedule(ctx, "a", "pa", 0)
-	djSchedule(ctx, "b", "pb", 5000)
-	ctx.Equal(djIDs(djPop(ctx, 0, 10)), []string{"a"}, "the jobs due at 0 ms")
-	djFail(ctx, "a", 0)
-	ctx.Equal(djIDs(djPop(ctx, 1000, 10)), []string{"a"}, "the jobs due at 1000 ms")
-	djComplete(ctx, "a")
-	ctx.Equal(djHGet(ctx, "jobs:payload", "a"), nil, "complete must delete the payload")
-	ctx.Equal(djHGet(ctx, "jobs:attempts", "a"), nil, "complete must delete the attempt count")
-	ctx.Equal(djScore(ctx, "a"), nil, "a completed job is not in jobs:delayed")
+	hDjSchedule(ctx, "a", "pa", 0)
+	hDjSchedule(ctx, "b", "pb", 5000)
+	ctx.Equal(hDjIDs(hDjPop(ctx, 0, 10)), []string{"a"}, "the jobs due at 0 ms")
+	hDjFail(ctx, "a", 0)
+	ctx.Equal(hDjIDs(hDjPop(ctx, 1000, 10)), []string{"a"}, "the jobs due at 1000 ms")
+	hDjComplete(ctx, "a")
+	ctx.Equal(hDjHGet(ctx, "jobs:payload", "a"), nil, "complete must delete the payload")
+	ctx.Equal(hDjHGet(ctx, "jobs:attempts", "a"), nil, "complete must delete the attempt count")
+	ctx.Equal(hDjScore(ctx, "a"), nil, "a completed job is not in jobs:delayed")
 	dead := false
 	for _, id := range ctx.Redis.LRange("jobs:dead", 0, -1) {
 		dead = dead || id == "a"
 	}
 	ctx.Assert(!dead, "a completed job is not in jobs:dead")
-	ctx.Assert(djHGet(ctx, "jobs:payload", "b") == "pb" && djScore(ctx, "b") == 5000.0, "completing a must leave b untouched")
-	ctx.Equal(djIDs(djPop(ctx, 5000, 10)), []string{"b"}, "the jobs due at 5000 ms")
-	djComplete(ctx, "b")
+	ctx.Assert(hDjHGet(ctx, "jobs:payload", "b") == "pb" && hDjScore(ctx, "b") == 5000.0, "completing a must leave b untouched")
+	ctx.Equal(hDjIDs(hDjPop(ctx, 5000, 10)), []string{"b"}, "the jobs due at 5000 ms")
+	hDjComplete(ctx, "b")
 	keys := ctx.Redis.Keys("*")
 	ctx.Assert(len(keys) == 0, "after completing every job nothing remains, but Redis holds %q", keys)
 }
@@ -1235,24 +1235,24 @@ func CheckComplete(ctx *harness.Ctx) {
 namespace {
 
 // A job as {ID Payload Attempt}, comparable and printable the way Go's Job struct is.
-using DjJob = std::tuple<std::string, std::string, int>;
+using HDjJob = std::tuple<std::string, std::string, int>;
 
-std::vector<DjJob> djJobs(const std::vector<Job>& jobs) {
-  std::vector<DjJob> out;
+std::vector<HDjJob> hDjJobs(const std::vector<Job>& jobs) {
+  std::vector<HDjJob> out;
   for (const auto& j : jobs) out.emplace_back(j.id, j.payload, j.attempt);
   return out;
 }
 
-std::vector<std::string> djIDs(const std::vector<Job>& jobs) {
+std::vector<std::string> hDjIDs(const std::vector<Job>& jobs) {
   std::vector<std::string> ids;
   for (const auto& j : jobs) ids.push_back(j.id);
   return ids;
 }
 
 // The job's score in jobs:delayed, or nullopt when it is not there.
-std::optional<double> djScore(harness::Ctx& ctx, const std::string& id) { return ctx.Redis.ZScore("jobs:delayed", id); }
+std::optional<double> hDjScore(harness::Ctx& ctx, const std::string& id) { return ctx.Redis.ZScore("jobs:delayed", id); }
 
-std::vector<std::string> djDelayed(harness::Ctx& ctx) {
+std::vector<std::string> hDjDelayed(harness::Ctx& ctx) {
   std::vector<std::string> ids;
   for (const auto& z : ctx.Redis.ZRangeWithScores("jobs:delayed", 0, -1)) ids.push_back(z.Member);
   return ids;
@@ -1264,14 +1264,14 @@ void CheckScheduled(harness::Ctx& ctx) {
   schedule("a", "send-email:a", 5000);
   schedule("b", "send-email:b", 2000);
   ctx.Equal(ctx.Redis.HGet("jobs:payload", "a"), "send-email:a", "jobs:payload a must hold the payload");
-  ctx.Equal(djScore(ctx, "a"), 5000, "jobs:delayed must score a at runAtMs 5000");
-  ctx.Equal(djScore(ctx, "b"), 2000, "jobs:delayed must score b at runAtMs 2000");
+  ctx.Equal(hDjScore(ctx, "a"), 5000, "jobs:delayed must score a at runAtMs 5000");
+  ctx.Equal(hDjScore(ctx, "b"), 2000, "jobs:delayed must score b at runAtMs 2000");
   ctx.Equal(ctx.Redis.Keys("*"), std::vector<std::string>{"jobs:delayed", "jobs:payload"}, "schedule must write exactly jobs:payload and jobs:delayed");
-  const auto early = djJobs(pop_due(1999, 10));
+  const auto early = hDjJobs(pop_due(1999, 10));
   ctx.Assert(early.empty(), "at 1999 ms nothing is due (b is due at 2000), got %+v", early);
   ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 2, "a pop that returned nothing must remove nothing: ZCARD jobs:delayed");
-  ctx.Equal(djJobs(pop_due(2000, 10)), std::vector<DjJob>{{"b", "send-email:b", 0}}, "at 2000 ms exactly b is due");
-  ctx.Equal(djDelayed(ctx), std::vector<std::string>{"a"}, "after popping b jobs:delayed must hold only a");
+  ctx.Equal(hDjJobs(pop_due(2000, 10)), std::vector<HDjJob>{{"b", "send-email:b", 0}}, "at 2000 ms exactly b is due");
+  ctx.Equal(hDjDelayed(ctx), std::vector<std::string>{"a"}, "after popping b jobs:delayed must hold only a");
   ctx.Equal(ctx.Redis.HGet("jobs:payload", "b"), "send-email:b", "popping must not delete the payload: complete does");
 }
 
@@ -1279,20 +1279,20 @@ void CheckDueInOrder(harness::Ctx& ctx) {
   const std::vector<std::pair<std::string, long long>> seed{{"j3", 3000}, {"j1", 1000}, {"j5", 5000}, {"j2", 2000}, {"j4", 4000}};
   for (const auto& [id, runAt] : seed) schedule(id, "payload-" + id, runAt);
   const auto first = pop_due(3500, 2);
-  ctx.Equal(djIDs(first), std::vector<std::string>{"j1", "j2"}, "at 3500 ms with limit 2 the two earliest due jobs are j1, j2");
-  ctx.Equal(djJobs(first), std::vector<DjJob>{{"j1", "payload-j1", 0}, {"j2", "payload-j2", 0}}, "each job is {ID, Payload, Attempt}");
-  ctx.Equal(djDelayed(ctx), std::vector<std::string>{"j3", "j4", "j5"}, "the jobs beyond the limit must stay in jobs:delayed");
-  ctx.Equal(djIDs(pop_due(3500, 10)), std::vector<std::string>{"j3"}, "j3 is the only job still due at 3500 ms");
-  ctx.Equal(djIDs(pop_due(10000, 10)), std::vector<std::string>{"j4", "j5"}, "at 10000 ms the rest pop in runAt order");
-  const auto drained = djJobs(pop_due(10000, 10));
+  ctx.Equal(hDjIDs(first), std::vector<std::string>{"j1", "j2"}, "at 3500 ms with limit 2 the two earliest due jobs are j1, j2");
+  ctx.Equal(hDjJobs(first), std::vector<HDjJob>{{"j1", "payload-j1", 0}, {"j2", "payload-j2", 0}}, "each job is {ID, Payload, Attempt}");
+  ctx.Equal(hDjDelayed(ctx), std::vector<std::string>{"j3", "j4", "j5"}, "the jobs beyond the limit must stay in jobs:delayed");
+  ctx.Equal(hDjIDs(pop_due(3500, 10)), std::vector<std::string>{"j3"}, "j3 is the only job still due at 3500 ms");
+  ctx.Equal(hDjIDs(pop_due(10000, 10)), std::vector<std::string>{"j4", "j5"}, "at 10000 ms the rest pop in runAt order");
+  const auto drained = hDjJobs(pop_due(10000, 10));
   ctx.Assert(drained.empty(), "a drained set pops nothing, got %+v", drained);
   ctx.Equal(ctx.Redis.ZCard("jobs:delayed"), 0, "every job was popped; jobs:delayed must be empty");
 }
 
 void CheckAtomicClaim(harness::Ctx& ctx) {
   schedule("solo", "p", 100);
-  ctx.Equal(djIDs(pop_due(100, 10)), std::vector<std::string>{"solo"}, "the jobs due at 100 ms");
-  ctx.Equal(djScore(ctx, "solo"), nullptr, "a popped job must be gone from jobs:delayed: the script ZREMs what it returns");
+  ctx.Equal(hDjIDs(pop_due(100, 10)), std::vector<std::string>{"solo"}, "the jobs due at 100 ms");
+  ctx.Equal(hDjScore(ctx, "solo"), nullptr, "a popped job must be gone from jobs:delayed: the script ZREMs what it returns");
   for (int i = 0; i < 3; i++) {
     schedule(harness::Sprintf("j%d", i), harness::Sprintf("p%d", i), 1000);
   }
@@ -1313,17 +1313,17 @@ void CheckAtomicClaim(harness::Ctx& ctx) {
   ctx.Assert(fired, "popDue never touched jobs:delayed as a script key: pass it as KEYS[1]");
   ctx.Assert(!rivalErr, "the second worker's popDue failed: %v", rivalErr);
   std::vector<std::string> shared;
-  for (const auto& a : djIDs(mine)) {
-    for (const auto& b : djIDs(his)) {
+  for (const auto& a : hDjIDs(mine)) {
+    for (const auto& b : hDjIDs(his)) {
       if (a == b) shared.push_back(a);
     }
   }
   ctx.Assert(shared.empty(), "two workers popping at once both got %q: a ZRANGEBYSCORE followed by a separate ZREM lets both read the same ids. Read and remove inside one Lua script", shared);
-  auto all = djIDs(mine);
-  for (const auto& id : djIDs(his)) all.push_back(id);
+  auto all = hDjIDs(mine);
+  for (const auto& id : hDjIDs(his)) all.push_back(id);
   std::sort(all.begin(), all.end());
-  ctx.Assert(harness::Value(all) == "[j0 j1 j2]", "between them the two workers must get every due job once: %q and %q", djIDs(mine), djIDs(his));
-  ctx.Assert(ctx.Redis.ZCard("jobs:delayed") == 0, "jobs:delayed still holds %q after both pops", djDelayed(ctx));
+  ctx.Assert(harness::Value(all) == "[j0 j1 j2]", "between them the two workers must get every due job once: %q and %q", hDjIDs(mine), hDjIDs(his));
+  ctx.Assert(ctx.Redis.ZCard("jobs:delayed") == 0, "jobs:delayed still holds %q after both pops", hDjDelayed(ctx));
 }
 
 void CheckBackoff(harness::Ctx& ctx) {
@@ -1332,21 +1332,21 @@ void CheckBackoff(harness::Ctx& ctx) {
   const std::vector<long long> delays{1000, 2000, 4000, 8000};
   for (int failures = 0; failures < static_cast<int>(delays.size()); failures++) {
     const long long delay = delays[static_cast<size_t>(failures)];
-    ctx.Equal(djJobs(pop_due(now, 10)), std::vector<DjJob>{{"j", "p", failures}}, "at %d ms the job is due with %d failure(s) so far", now, failures);
+    ctx.Equal(hDjJobs(pop_due(now, 10)), std::vector<HDjJob>{{"j", "p", failures}}, "at %d ms the job is due with %d failure(s) so far", now, failures);
     ctx.Equal(fail("j", now), now + delay, "failure %d must reschedule at now + %d ms: the runAtMs fail returned", failures + 1, delay);
-    ctx.Equal(djScore(ctx, "j"), now + delay, "after failure %d jobs:delayed must score j at now + %d ms", failures + 1, delay);
+    ctx.Equal(hDjScore(ctx, "j"), now + delay, "after failure %d jobs:delayed must score j at now + %d ms", failures + 1, delay);
     ctx.Equal(ctx.Redis.HGet("jobs:attempts", "j"), std::to_string(failures + 1), "jobs:attempts j after %d failure(s)", failures + 1);
-    const auto early = djJobs(pop_due(now + delay - 1, 10));
+    const auto early = hDjJobs(pop_due(now + delay - 1, 10));
     ctx.Assert(early.empty(), "1 ms before its new runAt the job must not pop, got %+v", early);
     now += delay;
   }
-  ctx.Equal(djJobs(pop_due(now, 10)), std::vector<DjJob>{{"j", "p", 4}}, "the fifth run sees 4 failures");
+  ctx.Equal(hDjJobs(pop_due(now, 10)), std::vector<HDjJob>{{"j", "p", 4}}, "the fifth run sees 4 failures");
   ctx.Equal(fail("j", now), nullptr, "the fifth failure must not reschedule: fail returns rescheduled false");
-  ctx.Equal(djScore(ctx, "j"), nullptr, "a dead job must not be in jobs:delayed");
+  ctx.Equal(hDjScore(ctx, "j"), nullptr, "a dead job must not be in jobs:delayed");
   ctx.Equal(ctx.Redis.LRange("jobs:dead", 0, -1), std::vector<std::string>{"j"}, "jobs:dead");
   ctx.Equal(ctx.Redis.HGet("jobs:attempts", "j"), nullptr, "a dead job's attempt count is dropped");
   ctx.Equal(ctx.Redis.HGet("jobs:payload", "j"), "p", "a dead job's payload stays for inspection");
-  const auto late = djJobs(pop_due(1000000000, 10));
+  const auto late = hDjJobs(pop_due(1000000000, 10));
   ctx.Assert(late.empty(), "a dead job never pops again, got %+v", late);
 }
 
@@ -1365,18 +1365,18 @@ void CheckBackoffCap(harness::Ctx& ctx) {
 void CheckComplete(harness::Ctx& ctx) {
   schedule("a", "pa", 0);
   schedule("b", "pb", 5000);
-  ctx.Equal(djIDs(pop_due(0, 10)), std::vector<std::string>{"a"}, "the jobs due at 0 ms");
+  ctx.Equal(hDjIDs(pop_due(0, 10)), std::vector<std::string>{"a"}, "the jobs due at 0 ms");
   fail("a", 0);
-  ctx.Equal(djIDs(pop_due(1000, 10)), std::vector<std::string>{"a"}, "the jobs due at 1000 ms");
+  ctx.Equal(hDjIDs(pop_due(1000, 10)), std::vector<std::string>{"a"}, "the jobs due at 1000 ms");
   complete("a");
   ctx.Equal(ctx.Redis.HGet("jobs:payload", "a"), nullptr, "complete must delete the payload");
   ctx.Equal(ctx.Redis.HGet("jobs:attempts", "a"), nullptr, "complete must delete the attempt count");
-  ctx.Equal(djScore(ctx, "a"), nullptr, "a completed job is not in jobs:delayed");
+  ctx.Equal(hDjScore(ctx, "a"), nullptr, "a completed job is not in jobs:delayed");
   bool dead = false;
   for (const auto& id : ctx.Redis.LRange("jobs:dead", 0, -1)) dead = dead || id == "a";
   ctx.Assert(!dead, "a completed job is not in jobs:dead");
-  ctx.Assert(ctx.Redis.HGet("jobs:payload", "b") == "pb" && djScore(ctx, "b") == 5000.0, "completing a must leave b untouched");
-  ctx.Equal(djIDs(pop_due(5000, 10)), std::vector<std::string>{"b"}, "the jobs due at 5000 ms");
+  ctx.Assert(ctx.Redis.HGet("jobs:payload", "b") == "pb" && hDjScore(ctx, "b") == 5000.0, "completing a must leave b untouched");
+  ctx.Equal(hDjIDs(pop_due(5000, 10)), std::vector<std::string>{"b"}, "the jobs due at 5000 ms");
   complete("b");
   const auto keys = ctx.Redis.Keys("*");
   ctx.Assert(keys.empty(), "after completing every job nothing remains, but Redis holds %q", keys);

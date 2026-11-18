@@ -1129,51 +1129,51 @@ import (
 )
 
 var (
-	invTargets = []string{"inv-a:50051", "inv-b:50051", "inv-c:50051"}
-	invStock   = map[string]int32{"sku-1": 7, "sku-2": 42, "sku-3": 0}
-	invSkus    = []string{"sku-1", "sku-2", "sku-3"}
+	hInvTargets = []string{"inv-a:50051", "inv-b:50051", "inv-c:50051"}
+	hInvStock   = map[string]int32{"sku-1": 7, "sku-2": 42, "sku-3": 0}
+	hInvSkus    = []string{"sku-1", "sku-2", "sku-3"}
 )
 
 // invPeer is one Inventory instance.
-type invPeer struct {
+type HInvPeer struct {
 	pb.UnimplementedInventoryServer
 }
 
-func (invPeer) GetStock(ctx context.Context, req *pb.StockRequest) (*pb.Stock, error) {
+func (HInvPeer) GetStock(ctx context.Context, req *pb.StockRequest) (*pb.Stock, error) {
 	sku := req.GetSku()
 	if sku == "" {
 		return nil, status.Error(codes.InvalidArgument, "sku is required")
 	}
-	count, ok := invStock[sku]
+	count, ok := hInvStock[sku]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "no sku %s", sku)
 	}
 	return &pb.Stock{Sku: sku, Count: count}, nil
 }
 
-func invServe(ctx *harness.Ctx) {
-	for _, t := range invTargets {
-		pb.RegisterInventoryServer(ctx.GRPC.Server(t), invPeer{})
+func hInvServe(ctx *harness.Ctx) {
+	for _, t := range hInvTargets {
+		pb.RegisterInventoryServer(ctx.GRPC.Server(t), HInvPeer{})
 	}
 }
 
 // invBalancer is three Inventory instances up, and a fresh Balancer over all of them.
-func invBalancer(ctx *harness.Ctx) *Balancer {
-	invServe(ctx)
-	return NewBalancer(append([]string(nil), invTargets...))
+func hInvBalancer(ctx *harness.Ctx) *Balancer {
+	hInvServe(ctx)
+	return NewBalancer(append([]string(nil), hInvTargets...))
 }
 
 // invAfter is the target steps places after target in the list.
-func invAfter(target string, steps int) string {
-	for i, t := range invTargets {
+func hInvAfter(target string, steps int) string {
+	for i, t := range hInvTargets {
 		if t == target {
-			return invTargets[(i+steps)%len(invTargets)]
+			return hInvTargets[(i+steps)%len(hInvTargets)]
 		}
 	}
 	return ""
 }
 
-func invTargetsOf(calls []harness.Call) []string {
+func hInvTargetsOf(calls []harness.Call) []string {
 	out := []string{}
 	for _, c := range calls {
 		out = append(out, c.Target)
@@ -1181,7 +1181,7 @@ func invTargetsOf(calls []harness.Call) []string {
 	return out
 }
 
-func invCount(xs []string) map[string]int {
+func hInvCount(xs []string) map[string]int {
 	out := map[string]int{}
 	for _, x := range xs {
 		out[x]++
@@ -1190,57 +1190,57 @@ func invCount(xs []string) map[string]int {
 }
 
 // invGet is one GetStock that must succeed: the count it returned and the GetStock calls it made, in order.
-func invGet(ctx *harness.Ctx, lb *Balancer, sku string) (int32, []harness.Call) {
+func hInvGet(ctx *harness.Ctx, lb *Balancer, sku string) (int32, []harness.Call) {
 	n := len(ctx.GRPC.CallsTo("GetStock", ""))
 	count, err := lb.GetStock(context.Background(), sku)
 	made := ctx.GRPC.CallsTo("GetStock", "")[n:]
 	if err != nil {
-		ctx.Fatalf("GetStock(%q) returned %v (%v) after calls to %v, expected the count from a healthy instance", sku, status.Code(err), err, invTargetsOf(made))
+		ctx.Fatalf("GetStock(%q) returned %v (%v) after calls to %v, expected the count from a healthy instance", sku, status.Code(err), err, hInvTargetsOf(made))
 	}
 	return count, made
 }
 
 // invFails is one GetStock that must return a gRPC error: the error and the calls it made.
-func invFails(ctx *harness.Ctx, lb *Balancer, sku string) (error, []harness.Call) {
+func hInvFails(ctx *harness.Ctx, lb *Balancer, sku string) (error, []harness.Call) {
 	n := len(ctx.GRPC.CallsTo("GetStock", ""))
 	count, err := lb.GetStock(context.Background(), sku)
 	made := ctx.GRPC.CallsTo("GetStock", "")[n:]
 	if err == nil {
-		ctx.Fatalf("GetStock(%q) returned %d after calls to %v, expected a gRPC error", sku, count, invTargetsOf(made))
+		ctx.Fatalf("GetStock(%q) returned %d after calls to %v, expected a gRPC error", sku, count, hInvTargetsOf(made))
 	}
 	return err, made
 }
 
 // invOne is a GetStock("sku-1") that makes exactly one call: the target it reached.
-func invOne(ctx *harness.Ctx, lb *Balancer) string {
-	count, made := invGet(ctx, lb, "sku-1")
-	ctx.Equal(len(made), 1, "one GetStock over healthy instances made calls to %v, expected one: calls", invTargetsOf(made))
-	ctx.Equal(count, invStock["sku-1"], "GetStock(%q) must return the count the instance answered", "sku-1")
+func hInvOne(ctx *harness.Ctx, lb *Balancer) string {
+	count, made := hInvGet(ctx, lb, "sku-1")
+	ctx.Equal(len(made), 1, "one GetStock over healthy instances made calls to %v, expected one: calls", hInvTargetsOf(made))
+	ctx.Equal(count, hInvStock["sku-1"], "GetStock(%q) must return the count the instance answered", "sku-1")
 	return made[0].Target
 }
 
-func invMany(ctx *harness.Ctx, lb *Balancer, n int) []string {
+func hInvMany(ctx *harness.Ctx, lb *Balancer, n int) []string {
 	var out []string
 	for range n {
-		out = append(out, invOne(ctx, lb))
+		out = append(out, hInvOne(ctx, lb))
 	}
 	return out
 }
 
 func CheckEvenRotation(ctx *harness.Ctx) {
-	lb := invBalancer(ctx)
+	lb := hInvBalancer(ctx)
 	var seq []string
 	for i := range 9 {
-		sku := invSkus[i%3]
-		count, made := invGet(ctx, lb, sku)
-		ctx.Equal(len(made), 1, "call %d over three healthy instances made GetStock calls to %v, expected one: calls", i+1, invTargetsOf(made))
+		sku := hInvSkus[i%3]
+		count, made := hInvGet(ctx, lb, sku)
+		ctx.Equal(len(made), 1, "call %d over three healthy instances made GetStock calls to %v, expected one: calls", i+1, hInvTargetsOf(made))
 		request, _ := made[0].Request.(*pb.StockRequest)
 		ctx.Equal(request.GetSku(), sku, "the request must carry the sku: the instance received")
-		ctx.Equal(count, invStock[sku], "GetStock(%q) must return the count the instance answered", sku)
+		ctx.Equal(count, hInvStock[sku], "GetStock(%q) must return the count the instance answered", sku)
 		seq = append(seq, made[0].Target)
 	}
 	start := -1
-	for i, t := range invTargets {
+	for i, t := range hInvTargets {
 		if t == seq[0] {
 			start = i
 		}
@@ -1248,34 +1248,34 @@ func CheckEvenRotation(ctx *harness.Ctx) {
 	ctx.Assert(start >= 0, "the first call reached %s, which is not one of the targets", seq[0])
 	var want []string
 	for i := range 9 {
-		want = append(want, invTargets[(start+i)%3])
+		want = append(want, hInvTargets[(start+i)%3])
 	}
 	ctx.Equal(seq, want, "9 calls: round robin continues after the last target used, in list order")
-	pair := NewBalancer([]string{invTargets[0], invTargets[2]})
-	two := invMany(ctx, pair, 4)
+	pair := NewBalancer([]string{hInvTargets[0], hInvTargets[2]})
+	two := hInvMany(ctx, pair, 4)
 	ctx.Assert(
-		invCount(two)[invTargets[1]] == 0 && two[0] != two[1] && two[2] == two[0] && two[3] == two[1],
-		"a Balancer over %v must alternate between exactly those, it reached %v", []string{invTargets[0], invTargets[2]}, two,
+		hInvCount(two)[hInvTargets[1]] == 0 && two[0] != two[1] && two[2] == two[0] && two[3] == two[1],
+		"a Balancer over %v must alternate between exactly those, it reached %v", []string{hInvTargets[0], hInvTargets[2]}, two,
 	)
 }
 
 func CheckStoppedInstance(ctx *harness.Ctx) {
-	lb := invBalancer(ctx)
-	seq := invMany(ctx, lb, 3)
+	lb := hInvBalancer(ctx)
+	seq := hInvMany(ctx, lb, 3)
 	down, survivor := seq[0], seq[1] // down is next in the rotation
 	ctx.GRPC.Stop(down)
-	count, made := invGet(ctx, lb, "sku-2")
-	ctx.Equal(invTargetsOf(made), []string{down, survivor}, "with %s stopped, the call that lands on it must try it once and then %s in the same call: calls", down, survivor)
+	count, made := hInvGet(ctx, lb, "sku-2")
+	ctx.Equal(hInvTargetsOf(made), []string{down, survivor}, "with %s stopped, the call that lands on it must try it once and then %s in the same call: calls", down, survivor)
 	ctx.Equal(count, 42, "the failover call must return the count from %s", survivor)
 	before := len(ctx.GRPC.CallsTo("GetStock", down))
-	rest := invMany(ctx, lb, 6)
-	ctx.Assert(invCount(rest)[down] == 0, "%s is down and was ejected, yet the next 6 calls reached %v", down, rest)
+	rest := hInvMany(ctx, lb, 6)
+	ctx.Assert(hInvCount(rest)[down] == 0, "%s is down and was ejected, yet the next 6 calls reached %v", down, rest)
 	ctx.Equal(len(ctx.GRPC.CallsTo("GetStock", down)), before, "%s received calls after it failed (an ejected target gets none): calls to it", down)
 	alternates := true
 	for i := 1; i < len(rest); i++ {
 		alternates = alternates && rest[i] != rest[i-1]
 	}
-	c := invCount(rest)
+	c := hInvCount(rest)
 	evenly := len(c) == 2
 	for _, n := range c {
 		evenly = evenly && n == 3
@@ -1284,35 +1284,35 @@ func CheckStoppedInstance(ctx *harness.Ctx) {
 }
 
 func CheckReadmission(ctx *harness.Ctx) {
-	lb := invBalancer(ctx)
-	first := invOne(ctx, lb)
-	out := invAfter(first, 1)
+	lb := hInvBalancer(ctx)
+	first := hInvOne(ctx, lb)
+	out := hInvAfter(first, 1)
 	ctx.GRPC.Fail("GetStock", codes.Unavailable, "", 1, out)
-	count, made := invGet(ctx, lb, "sku-1")
-	ctx.Equal(invTargetsOf(made), []string{out, invAfter(out, 1)}, "%s answered UNAVAILABLE: the call must go on to %s; calls", out, invAfter(out, 1))
-	ctx.Equal(count, invStock["sku-1"], "the failover call must return the count")
+	count, made := hInvGet(ctx, lb, "sku-1")
+	ctx.Equal(hInvTargetsOf(made), []string{out, hInvAfter(out, 1)}, "%s answered UNAVAILABLE: the call must go on to %s; calls", out, hInvAfter(out, 1))
+	ctx.Equal(count, hInvStock["sku-1"], "the failover call must return the count")
 	for i := range 10 {
 		ctx.Clock.Advance(2.9)
-		target := invOne(ctx, lb)
+		target := hInvOne(ctx, lb)
 		ctx.Assert(target != out, "%s was ejected %.1f s ago and was called again: ejection lasts 30 s", out, 2.9*float64(i+1))
 	}
 	ctx.Clock.Advance(1.5) // 30.5 s since the ejection
-	back := invMany(ctx, lb, 3)
+	back := hInvMany(ctx, lb, 3)
 	sorted := append([]string(nil), back...)
 	sort.Strings(sorted)
-	ctx.Equal(sorted, invTargets, "30.5 s after the ejection %s is back: the next 3 calls (%v) must reach each target once", out, back)
+	ctx.Equal(sorted, hInvTargets, "30.5 s after the ejection %s is back: the next 3 calls (%v) must reach each target once", out, back)
 }
 
 func CheckAttemptDeadline(ctx *harness.Ctx) {
-	lb := invBalancer(ctx)
-	first := invOne(ctx, lb)
-	slow := invAfter(first, 1)
-	next := invAfter(first, 2)
+	lb := hInvBalancer(ctx)
+	first := hInvOne(ctx, lb)
+	slow := hInvAfter(first, 1)
+	next := hInvAfter(first, 2)
 	ctx.GRPC.SetLatency("GetStock", 1.0, slow)
 	t0 := ctx.Clock.Now()
-	count, made := invGet(ctx, lb, "sku-2")
+	count, made := hInvGet(ctx, lb, "sku-2")
 	took := float64(ctx.Clock.Now()-t0) / 1000
-	ctx.Equal(invTargetsOf(made), []string{slow, next}, "%s takes 1 s: its attempt must time out and %s serve the same call; calls", slow, next)
+	ctx.Equal(hInvTargetsOf(made), []string{slow, next}, "%s takes 1 s: its attempt must time out and %s serve the same call; calls", slow, next)
 	ctx.Equal(count, 42, "the call must return the count from %s", next)
 	for _, c := range made {
 		ctx.Assert(c.HasDeadline(), "the attempt to %s carries no deadline: a stalled instance would hold the call forever", c.Target)
@@ -1321,65 +1321,65 @@ func CheckAttemptDeadline(ctx *harness.Ctx) {
 	}
 	ctx.Equal(made[0].Code, codes.DeadlineExceeded, "the attempt to %s must end DEADLINE_EXCEEDED", slow)
 	ctx.Assert(took <= 0.25, "the call took %.2f s: one attempt waits at most 0.2 s, not the instance's 1 s", took)
-	rest := invMany(ctx, lb, 4)
-	ctx.Assert(invCount(rest)[slow] == 0, "%s timed out and must be ejected, yet the next 4 calls reached %v", slow, rest)
-	keeper := invAfter(slow, 2) // the one that is neither slow nor the last used
+	rest := hInvMany(ctx, lb, 4)
+	ctx.Assert(hInvCount(rest)[slow] == 0, "%s timed out and must be ejected, yet the next 4 calls reached %v", slow, rest)
+	keeper := hInvAfter(slow, 2) // the one that is neither slow nor the last used
 	ctx.GRPC.SetLatency("GetStock", 0.15, keeper)
-	more := invMany(ctx, lb, 4)
-	ctx.Equal(invCount(more)[keeper], 2, "%s answers in 0.15 s, inside the deadline: it keeps its turn (the next 4 calls reached %v); its calls", keeper, more)
+	more := hInvMany(ctx, lb, 4)
+	ctx.Equal(hInvCount(more)[keeper], 2, "%s answers in 0.15 s, inside the deadline: it keeps its turn (the next 4 calls reached %v); its calls", keeper, more)
 }
 
 func CheckApplicationErrors(ctx *harness.Ctx) {
-	lb := invBalancer(ctx)
+	lb := hInvBalancer(ctx)
 	cases := []struct {
 		sku  string
 		code codes.Code
 	}{{"ghost", codes.NotFound}, {"", codes.InvalidArgument}}
 	for _, tc := range cases {
 		for range 3 {
-			err, made := invFails(ctx, lb, tc.sku)
+			err, made := hInvFails(ctx, lb, tc.sku)
 			ctx.Equal(status.Code(err), tc.code, "GetStock(%q) failed (%v): an application error is returned as is", tc.sku, err)
-			ctx.Equal(len(made), 1, "GetStock(%q) made calls to %v: %v is the same answer from every instance, so no retry; calls", tc.sku, invTargetsOf(made), tc.code)
+			ctx.Equal(len(made), 1, "GetStock(%q) made calls to %v: %v is the same answer from every instance, so no retry; calls", tc.sku, hInvTargetsOf(made), tc.code)
 		}
 	}
 	ctx.GRPC.Fail("GetStock", codes.PermissionDenied, "", 1, "")
-	err, made := invFails(ctx, lb, "sku-1")
-	ctx.Assert(status.Code(err) == codes.PermissionDenied && len(made) == 1, "an injected PERMISSION_DENIED must surface after one call, got %v after %v", status.Code(err), invTargetsOf(made))
-	seq := invMany(ctx, lb, 6)
-	c := invCount(seq)
+	err, made := hInvFails(ctx, lb, "sku-1")
+	ctx.Assert(status.Code(err) == codes.PermissionDenied && len(made) == 1, "an injected PERMISSION_DENIED must surface after one call, got %v after %v", status.Code(err), hInvTargetsOf(made))
+	seq := hInvMany(ctx, lb, 6)
+	c := hInvCount(seq)
 	inRotation := true
 	for i, t := range seq[3:] {
 		inRotation = inRotation && t == seq[i]
 	}
-	for _, t := range invTargets {
+	for _, t := range hInvTargets {
 		inRotation = inRotation && c[t] == 2
 	}
 	ctx.Assert(inRotation, "application errors eject nothing: the next 6 calls must reach every target twice, in rotation, they reached %v", seq)
 }
 
 func CheckAllEjected(ctx *harness.Ctx) {
-	lb := invBalancer(ctx)
-	for _, t := range invTargets {
+	lb := hInvBalancer(ctx)
+	for _, t := range hInvTargets {
 		ctx.GRPC.Stop(t)
 	}
-	err, made := invFails(ctx, lb, "sku-1")
-	targets := invTargetsOf(made)
+	err, made := hInvFails(ctx, lb, "sku-1")
+	targets := hInvTargetsOf(made)
 	sort.Strings(targets)
-	ctx.Equal(targets, invTargets, "with all three down, one call tries each target exactly once (it called %v)", invTargetsOf(made))
+	ctx.Equal(targets, hInvTargets, "with all three down, one call tries each target exactly once (it called %v)", hInvTargetsOf(made))
 	ctx.Equal(status.Code(err), codes.Unavailable, "with nothing left to try the call returns UNAVAILABLE")
 	t0 := ctx.Clock.Now()
 	for range 5 {
-		err, made = invFails(ctx, lb, "sku-1")
+		err, made = hInvFails(ctx, lb, "sku-1")
 		ctx.Equal(status.Code(err), codes.Unavailable, "with every target ejected the call returns UNAVAILABLE")
-		ctx.Equal(len(made), 0, "every target is ejected, yet the call reached %v (fail fast, no RPC): calls", invTargetsOf(made))
+		ctx.Equal(len(made), 0, "every target is ejected, yet the call reached %v (fail fast, no RPC): calls", hInvTargetsOf(made))
 	}
 	ctx.Assert(ctx.Clock.Now()-t0 <= 50, "failing fast spends no time; the 5 calls took %v s", float64(ctx.Clock.Now()-t0)/1000)
 	ctx.Clock.Advance(10)
-	err, made = invFails(ctx, lb, "sku-1")
-	ctx.Assert(status.Code(err) == codes.Unavailable && len(made) == 0, "10 s later every target is still ejected: UNAVAILABLE with no RPC, got %v after %v", status.Code(err), invTargetsOf(made))
-	invServe(ctx) // the instances come back
+	err, made = hInvFails(ctx, lb, "sku-1")
+	ctx.Assert(status.Code(err) == codes.Unavailable && len(made) == 0, "10 s later every target is still ejected: UNAVAILABLE with no RPC, got %v after %v", status.Code(err), hInvTargetsOf(made))
+	hInvServe(ctx) // the instances come back
 	ctx.Clock.Advance(20.5)
-	invOne(ctx, lb)
+	hInvOne(ctx, lb)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1393,56 +1393,56 @@ func CheckAllEjected(ctx *harness.Ctx) {
 
 namespace {
 
-const std::vector<std::string> kInvTargets = {"inv-a:50051", "inv-b:50051", "inv-c:50051"};
-const std::map<std::string, int32_t> kInvStock = {{"sku-1", 7}, {"sku-2", 42}, {"sku-3", 0}};
-const std::vector<std::string> kInvSkus = {"sku-1", "sku-2", "sku-3"};
+const std::vector<std::string> kHInvTargets = {"inv-a:50051", "inv-b:50051", "inv-c:50051"};
+const std::map<std::string, int32_t> kHInvStock = {{"sku-1", 7}, {"sku-2", 42}, {"sku-3", 0}};
+const std::vector<std::string> kHInvSkus = {"sku-1", "sku-2", "sku-3"};
 
 // One Inventory instance.
-class InvPeer final : public inventory::v1::Inventory::Service {
+class HInvPeer final : public inventory::v1::Inventory::Service {
  public:
   grpc::Status GetStock(grpc::ServerContext*, const inventory::v1::StockRequest* request, inventory::v1::Stock* reply) override {
     const std::string& sku = request->sku();
     if (sku.empty()) return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "sku is required");
-    const auto count = kInvStock.find(sku);
-    if (count == kInvStock.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no sku " + sku);
+    const auto count = kHInvStock.find(sku);
+    if (count == kHInvStock.end()) return grpc::Status(grpc::StatusCode::NOT_FOUND, "no sku " + sku);
     reply->set_sku(sku);
     reply->set_count(count->second);
     return grpc::Status::OK;
   }
 };
 
-void InvServe(harness::Ctx& ctx) {
-  for (const auto& t : kInvTargets) ctx.GRPC.Server(t)->RegisterService(new InvPeer());
+void hInvServe(harness::Ctx& ctx) {
+  for (const auto& t : kHInvTargets) ctx.GRPC.Server(t)->RegisterService(new HInvPeer());
 }
 
 // Three Inventory instances up, and a fresh Balancer over all of them.
-std::unique_ptr<Balancer> InvBalancer(harness::Ctx& ctx) {
-  InvServe(ctx);
-  return std::make_unique<Balancer>(kInvTargets);
+std::unique_ptr<Balancer> hInvBalancer(harness::Ctx& ctx) {
+  hInvServe(ctx);
+  return std::make_unique<Balancer>(kHInvTargets);
 }
 
 // The target steps places after target in the list.
-std::string InvAfter(const std::string& target, int steps) {
-  for (size_t i = 0; i < kInvTargets.size(); ++i) {
-    if (kInvTargets[i] == target) return kInvTargets[(i + static_cast<size_t>(steps)) % kInvTargets.size()];
+std::string hInvAfter(const std::string& target, int steps) {
+  for (size_t i = 0; i < kHInvTargets.size(); ++i) {
+    if (kHInvTargets[i] == target) return kHInvTargets[(i + static_cast<size_t>(steps)) % kHInvTargets.size()];
   }
   return "";
 }
 
-std::vector<std::string> InvTargetsOf(const std::vector<harness::Call>& calls) {
+std::vector<std::string> hInvTargetsOf(const std::vector<harness::Call>& calls) {
   std::vector<std::string> out;
   for (const auto& c : calls) out.push_back(c.Target);
   return out;
 }
 
-std::map<std::string, int> InvCount(const std::vector<std::string>& xs) {
+std::map<std::string, int> hInvCount(const std::vector<std::string>& xs) {
   std::map<std::string, int> out;
   for (const auto& x : xs) out[x]++;
   return out;
 }
 
 // How one get_stock ended: the count, or the error it threw (its gRPC status, when an RpcError).
-struct InvResult {
+struct HInvResult {
   bool failed = false;
   int32_t count = 0;
   grpc::StatusCode code = grpc::StatusCode::OK;
@@ -1450,9 +1450,9 @@ struct InvResult {
   std::vector<harness::Call> made;  // the GetStock calls it made, in order
 };
 
-InvResult InvRun(harness::Ctx& ctx, Balancer& bal, const std::string& sku) {
+HInvResult hInvRun(harness::Ctx& ctx, Balancer& bal, const std::string& sku) {
   const size_t n = ctx.GRPC.CallsTo("GetStock").size();
-  InvResult r;
+  HInvResult r;
   try {
     r.count = bal.get_stock(sku);
   } catch (const RpcError& e) {
@@ -1470,117 +1470,117 @@ InvResult InvRun(harness::Ctx& ctx, Balancer& bal, const std::string& sku) {
 }
 
 // One get_stock that must succeed.
-InvResult InvGet(harness::Ctx& ctx, Balancer& bal, const std::string& sku) {
-  InvResult r = InvRun(ctx, bal, sku);
+HInvResult hInvGet(harness::Ctx& ctx, Balancer& bal, const std::string& sku) {
+  HInvResult r = hInvRun(ctx, bal, sku);
   if (r.failed)
     ctx.Fatalf("get_stock(%q) threw %v (%s) after calls to %v, expected the count from a healthy instance", sku, r.code, r.error,
-               InvTargetsOf(r.made));
+               hInvTargetsOf(r.made));
   return r;
 }
 
 // One get_stock that must throw a gRPC error (an RpcError).
-InvResult InvFails(harness::Ctx& ctx, Balancer& bal, const std::string& sku) {
-  InvResult r = InvRun(ctx, bal, sku);
-  if (!r.failed) ctx.Fatalf("get_stock(%q) returned %d after calls to %v, expected an RpcError", sku, r.count, InvTargetsOf(r.made));
+HInvResult hInvFails(harness::Ctx& ctx, Balancer& bal, const std::string& sku) {
+  HInvResult r = hInvRun(ctx, bal, sku);
+  if (!r.failed) ctx.Fatalf("get_stock(%q) returned %d after calls to %v, expected an RpcError", sku, r.count, hInvTargetsOf(r.made));
   return r;
 }
 
 // A get_stock("sku-1") that makes exactly one call: the target it reached.
-std::string InvOne(harness::Ctx& ctx, Balancer& bal) {
-  const InvResult r = InvGet(ctx, bal, "sku-1");
-  ctx.Equal(r.made.size(), 1, "one get_stock over healthy instances made calls to %v, expected one: calls", InvTargetsOf(r.made));
-  ctx.Equal(r.count, kInvStock.at("sku-1"), "get_stock(%q) must return the count the instance answered", "sku-1");
+std::string hInvOne(harness::Ctx& ctx, Balancer& bal) {
+  const HInvResult r = hInvGet(ctx, bal, "sku-1");
+  ctx.Equal(r.made.size(), 1, "one get_stock over healthy instances made calls to %v, expected one: calls", hInvTargetsOf(r.made));
+  ctx.Equal(r.count, kHInvStock.at("sku-1"), "get_stock(%q) must return the count the instance answered", "sku-1");
   return r.made[0].Target;
 }
 
-std::vector<std::string> InvMany(harness::Ctx& ctx, Balancer& bal, int n) {
+std::vector<std::string> hInvMany(harness::Ctx& ctx, Balancer& bal, int n) {
   std::vector<std::string> out;
-  for (int i = 0; i < n; ++i) out.push_back(InvOne(ctx, bal));
+  for (int i = 0; i < n; ++i) out.push_back(hInvOne(ctx, bal));
   return out;
 }
 
 }  // namespace
 
 void CheckEvenRotation(harness::Ctx& ctx) {
-  auto bal = InvBalancer(ctx);
+  auto bal = hInvBalancer(ctx);
   std::vector<std::string> seq;
   for (int i = 0; i < 9; ++i) {
-    const std::string& sku = kInvSkus[static_cast<size_t>(i % 3)];
-    const InvResult r = InvGet(ctx, *bal, sku);
+    const std::string& sku = kHInvSkus[static_cast<size_t>(i % 3)];
+    const HInvResult r = hInvGet(ctx, *bal, sku);
     ctx.Equal(r.made.size(), 1, "call %d over three healthy instances made GetStock calls to %v, expected one: calls", i + 1,
-              InvTargetsOf(r.made));
+              hInvTargetsOf(r.made));
     ctx.Equal(r.made[0].Request<inventory::v1::StockRequest>().sku(), sku, "the request must carry the sku: the instance received");
-    ctx.Equal(r.count, kInvStock.at(sku), "get_stock(%q) must return the count the instance answered", sku);
+    ctx.Equal(r.count, kHInvStock.at(sku), "get_stock(%q) must return the count the instance answered", sku);
     seq.push_back(r.made[0].Target);
   }
   int start = -1;
-  for (size_t i = 0; i < kInvTargets.size(); ++i) {
-    if (kInvTargets[i] == seq[0]) start = static_cast<int>(i);
+  for (size_t i = 0; i < kHInvTargets.size(); ++i) {
+    if (kHInvTargets[i] == seq[0]) start = static_cast<int>(i);
   }
   ctx.Assert(start >= 0, "the first call reached %s, which is not one of the targets", seq[0]);
   std::vector<std::string> want;
-  for (int i = 0; i < 9; ++i) want.push_back(kInvTargets[static_cast<size_t>((start + i) % 3)]);
+  for (int i = 0; i < 9; ++i) want.push_back(kHInvTargets[static_cast<size_t>((start + i) % 3)]);
   ctx.Equal(seq, want, "9 calls: round robin continues after the last target used, in list order");
-  Balancer pair({kInvTargets[0], kInvTargets[2]});
-  const auto two = InvMany(ctx, pair, 4);
-  ctx.Assert(InvCount(two)[kInvTargets[1]] == 0 && two[0] != two[1] && two[2] == two[0] && two[3] == two[1],
+  Balancer pair({kHInvTargets[0], kHInvTargets[2]});
+  const auto two = hInvMany(ctx, pair, 4);
+  ctx.Assert(hInvCount(two)[kHInvTargets[1]] == 0 && two[0] != two[1] && two[2] == two[0] && two[3] == two[1],
              "a Balancer over %v must alternate between exactly those, it reached %v",
-             std::vector<std::string>{kInvTargets[0], kInvTargets[2]}, two);
+             std::vector<std::string>{kHInvTargets[0], kHInvTargets[2]}, two);
 }
 
 void CheckStoppedInstance(harness::Ctx& ctx) {
-  auto bal = InvBalancer(ctx);
-  const auto seq = InvMany(ctx, *bal, 3);
+  auto bal = hInvBalancer(ctx);
+  const auto seq = hInvMany(ctx, *bal, 3);
   const std::string down = seq[0], survivor = seq[1];  // down is next in the rotation
   ctx.GRPC.Stop(down);
-  const InvResult r = InvGet(ctx, *bal, "sku-2");
-  ctx.Equal(InvTargetsOf(r.made), {down, survivor},
+  const HInvResult r = hInvGet(ctx, *bal, "sku-2");
+  ctx.Equal(hInvTargetsOf(r.made), {down, survivor},
             "with %s stopped, the call that lands on it must try it once and then %s in the same call: calls", down, survivor);
   ctx.Equal(r.count, 42, "the failover call must return the count from %s", survivor);
   const size_t before = ctx.GRPC.CallsTo("GetStock", down).size();
-  const auto rest = InvMany(ctx, *bal, 6);
-  ctx.Assert(InvCount(rest)[down] == 0, "%s is down and was ejected, yet the next 6 calls reached %v", down, rest);
+  const auto rest = hInvMany(ctx, *bal, 6);
+  ctx.Assert(hInvCount(rest)[down] == 0, "%s is down and was ejected, yet the next 6 calls reached %v", down, rest);
   ctx.Equal(ctx.GRPC.CallsTo("GetStock", down).size(), before, "%s received calls after it failed (an ejected target gets none): calls to it",
             down);
   bool alternates = true;
   for (size_t i = 1; i < rest.size(); ++i) alternates = alternates && rest[i] != rest[i - 1];
-  const auto c = InvCount(rest);
+  const auto c = hInvCount(rest);
   bool evenly = c.size() == 2;
   for (const auto& [target, n] : c) evenly = evenly && n == 3;
   ctx.Assert(alternates && evenly, "the 6 calls after the failover must alternate between the two survivors, they reached %v", rest);
 }
 
 void CheckReadmission(harness::Ctx& ctx) {
-  auto bal = InvBalancer(ctx);
-  const std::string first = InvOne(ctx, *bal);
-  const std::string out = InvAfter(first, 1);
+  auto bal = hInvBalancer(ctx);
+  const std::string first = hInvOne(ctx, *bal);
+  const std::string out = hInvAfter(first, 1);
   ctx.GRPC.Fail("GetStock", grpc::StatusCode::UNAVAILABLE, "", 1, out);
-  const InvResult r = InvGet(ctx, *bal, "sku-1");
-  ctx.Equal(InvTargetsOf(r.made), {out, InvAfter(out, 1)}, "%s answered UNAVAILABLE: the call must go on to %s; calls", out,
-            InvAfter(out, 1));
-  ctx.Equal(r.count, kInvStock.at("sku-1"), "the failover call must return the count");
+  const HInvResult r = hInvGet(ctx, *bal, "sku-1");
+  ctx.Equal(hInvTargetsOf(r.made), {out, hInvAfter(out, 1)}, "%s answered UNAVAILABLE: the call must go on to %s; calls", out,
+            hInvAfter(out, 1));
+  ctx.Equal(r.count, kHInvStock.at("sku-1"), "the failover call must return the count");
   for (int i = 0; i < 10; ++i) {
     ctx.Clock.Advance(2.9);
-    const std::string target = InvOne(ctx, *bal);
+    const std::string target = hInvOne(ctx, *bal);
     ctx.Assert(target != out, "%s was ejected %.1f s ago and was called again: ejection lasts 30 s", out, 2.9 * (i + 1));
   }
   ctx.Clock.Advance(1.5);  // 30.5 s since the ejection
-  const auto back = InvMany(ctx, *bal, 3);
+  const auto back = hInvMany(ctx, *bal, 3);
   auto sorted = back;
   std::sort(sorted.begin(), sorted.end());
-  ctx.Equal(sorted, kInvTargets, "30.5 s after the ejection %s is back: the next 3 calls (%v) must reach each target once", out, back);
+  ctx.Equal(sorted, kHInvTargets, "30.5 s after the ejection %s is back: the next 3 calls (%v) must reach each target once", out, back);
 }
 
 void CheckAttemptDeadline(harness::Ctx& ctx) {
-  auto bal = InvBalancer(ctx);
-  const std::string first = InvOne(ctx, *bal);
-  const std::string slow = InvAfter(first, 1);
-  const std::string next = InvAfter(first, 2);
+  auto bal = hInvBalancer(ctx);
+  const std::string first = hInvOne(ctx, *bal);
+  const std::string slow = hInvAfter(first, 1);
+  const std::string next = hInvAfter(first, 2);
   ctx.GRPC.SetLatency("GetStock", 1.0, slow);
   const int64_t t0 = ctx.Clock.Now();
-  const InvResult r = InvGet(ctx, *bal, "sku-2");
+  const HInvResult r = hInvGet(ctx, *bal, "sku-2");
   const double took = static_cast<double>(ctx.Clock.Now() - t0) / 1000;
-  ctx.Equal(InvTargetsOf(r.made), {slow, next}, "%s takes 1 s: its attempt must time out and %s serve the same call; calls", slow, next);
+  ctx.Equal(hInvTargetsOf(r.made), {slow, next}, "%s takes 1 s: its attempt must time out and %s serve the same call; calls", slow, next);
   ctx.Equal(r.count, 42, "the call must return the count from %s", next);
   for (const auto& c : r.made) {
     ctx.Assert(c.HasDeadline(), "the attempt to %s carries no deadline: a stalled instance would hold the call forever", c.Target);
@@ -1589,60 +1589,60 @@ void CheckAttemptDeadline(harness::Ctx& ctx) {
   }
   ctx.Equal(r.made[0].Code, grpc::StatusCode::DEADLINE_EXCEEDED, "the attempt to %s must end DEADLINE_EXCEEDED", slow);
   ctx.Assert(took <= 0.25, "the call took %.2f s: one attempt waits at most 0.2 s, not the instance's 1 s", took);
-  const auto rest = InvMany(ctx, *bal, 4);
-  ctx.Assert(InvCount(rest)[slow] == 0, "%s timed out and must be ejected, yet the next 4 calls reached %v", slow, rest);
-  const std::string keeper = InvAfter(slow, 2);  // the one that is neither slow nor the last used
+  const auto rest = hInvMany(ctx, *bal, 4);
+  ctx.Assert(hInvCount(rest)[slow] == 0, "%s timed out and must be ejected, yet the next 4 calls reached %v", slow, rest);
+  const std::string keeper = hInvAfter(slow, 2);  // the one that is neither slow nor the last used
   ctx.GRPC.SetLatency("GetStock", 0.15, keeper);
-  const auto more = InvMany(ctx, *bal, 4);
-  ctx.Equal(InvCount(more)[keeper], 2, "%s answers in 0.15 s, inside the deadline: it keeps its turn (the next 4 calls reached %v); its calls",
+  const auto more = hInvMany(ctx, *bal, 4);
+  ctx.Equal(hInvCount(more)[keeper], 2, "%s answers in 0.15 s, inside the deadline: it keeps its turn (the next 4 calls reached %v); its calls",
             keeper, more);
 }
 
 void CheckApplicationErrors(harness::Ctx& ctx) {
-  auto bal = InvBalancer(ctx);
+  auto bal = hInvBalancer(ctx);
   for (const auto& [sku, code] : std::vector<std::pair<std::string, grpc::StatusCode>>{
            {"ghost", grpc::StatusCode::NOT_FOUND}, {"", grpc::StatusCode::INVALID_ARGUMENT}}) {
     for (int i = 0; i < 3; ++i) {
-      const InvResult r = InvFails(ctx, *bal, sku);
+      const HInvResult r = hInvFails(ctx, *bal, sku);
       ctx.Equal(r.code, code, "get_stock(%q) failed (%s): an application error is thrown as is", sku, r.error);
       ctx.Equal(r.made.size(), 1, "get_stock(%q) made calls to %v: %v is the same answer from every instance, so no retry; calls", sku,
-                InvTargetsOf(r.made), code);
+                hInvTargetsOf(r.made), code);
     }
   }
   ctx.GRPC.Fail("GetStock", grpc::StatusCode::PERMISSION_DENIED, "", 1, "");
-  const InvResult r = InvFails(ctx, *bal, "sku-1");
+  const HInvResult r = hInvFails(ctx, *bal, "sku-1");
   ctx.Assert(r.code == grpc::StatusCode::PERMISSION_DENIED && r.made.size() == 1,
-             "an injected PERMISSION_DENIED must surface after one call, got %v after %v", r.code, InvTargetsOf(r.made));
-  const auto seq = InvMany(ctx, *bal, 6);
-  auto c = InvCount(seq);
+             "an injected PERMISSION_DENIED must surface after one call, got %v after %v", r.code, hInvTargetsOf(r.made));
+  const auto seq = hInvMany(ctx, *bal, 6);
+  auto c = hInvCount(seq);
   bool in_rotation = true;
   for (size_t i = 3; i < seq.size(); ++i) in_rotation = in_rotation && seq[i] == seq[i - 3];
-  for (const auto& t : kInvTargets) in_rotation = in_rotation && c[t] == 2;
+  for (const auto& t : kHInvTargets) in_rotation = in_rotation && c[t] == 2;
   ctx.Assert(in_rotation, "application errors eject nothing: the next 6 calls must reach every target twice, in rotation, they reached %v", seq);
 }
 
 void CheckAllEjected(harness::Ctx& ctx) {
-  auto bal = InvBalancer(ctx);
-  for (const auto& t : kInvTargets) ctx.GRPC.Stop(t);
-  InvResult r = InvFails(ctx, *bal, "sku-1");
-  auto targets = InvTargetsOf(r.made);
+  auto bal = hInvBalancer(ctx);
+  for (const auto& t : kHInvTargets) ctx.GRPC.Stop(t);
+  HInvResult r = hInvFails(ctx, *bal, "sku-1");
+  auto targets = hInvTargetsOf(r.made);
   std::sort(targets.begin(), targets.end());
-  ctx.Equal(targets, kInvTargets, "with all three down, one call tries each target exactly once (it called %v)", InvTargetsOf(r.made));
+  ctx.Equal(targets, kHInvTargets, "with all three down, one call tries each target exactly once (it called %v)", hInvTargetsOf(r.made));
   ctx.Equal(r.code, grpc::StatusCode::UNAVAILABLE, "with nothing left to try the call throws UNAVAILABLE");
   const int64_t t0 = ctx.Clock.Now();
   for (int i = 0; i < 5; ++i) {
-    r = InvFails(ctx, *bal, "sku-1");
+    r = hInvFails(ctx, *bal, "sku-1");
     ctx.Equal(r.code, grpc::StatusCode::UNAVAILABLE, "with every target ejected the call throws UNAVAILABLE");
-    ctx.Equal(r.made.size(), 0, "every target is ejected, yet the call reached %v (fail fast, no RPC): calls", InvTargetsOf(r.made));
+    ctx.Equal(r.made.size(), 0, "every target is ejected, yet the call reached %v (fail fast, no RPC): calls", hInvTargetsOf(r.made));
   }
   ctx.Assert(ctx.Clock.Now() - t0 <= 50, "failing fast spends no time; the 5 calls took %v s", static_cast<double>(ctx.Clock.Now() - t0) / 1000);
   ctx.Clock.Advance(10);
-  r = InvFails(ctx, *bal, "sku-1");
+  r = hInvFails(ctx, *bal, "sku-1");
   ctx.Assert(r.code == grpc::StatusCode::UNAVAILABLE && r.made.empty(),
-             "10 s later every target is still ejected: UNAVAILABLE with no RPC, got %v after %v", r.code, InvTargetsOf(r.made));
-  InvServe(ctx);  // the instances come back
+             "10 s later every target is still ejected: UNAVAILABLE with no RPC, got %v after %v", r.code, hInvTargetsOf(r.made));
+  hInvServe(ctx);  // the instances come back
   ctx.Clock.Advance(20.5);
-  InvOne(ctx, *bal);
+  hInvOne(ctx, *bal);
 }
 `,
   },

@@ -845,34 +845,34 @@ import (
 )
 
 const (
-	replayTopic = "order-events"
-	liveGroup   = "orders"
+	kHReplayTopic = "order-events"
+	kHLiveGroup   = "orders"
 )
 
 // seedAt appends keyless records to one partition of the topic.
-func seedAt(ctx *harness.Ctx, partition int, values ...string) {
+func hSeedAt(ctx *harness.Ctx, partition int, values ...string) {
 	for _, v := range values {
-		ctx.Kafka.SeedPartition(replayTopic, partition, nil, v)
+		ctx.Kafka.SeedPartition(kHReplayTopic, partition, nil, v)
 	}
 }
 
 // replayed runs replay until it returns (or waits for records that will not come); an error fails
 // the check.
-func replayed(ctx *harness.Ctx, from int64, handler func(ReplayRecord)) int {
+func hReplayed(ctx *harness.Ctx, from int64, handler func(ReplayRecord)) int {
 	var n int
 	var err error
 	ctx.Drain(func() {
-		n, err = replay(context.Background(), replayTopic, from, func(r ReplayRecord) error {
+		n, err = replay(context.Background(), kHReplayTopic, from, func(r ReplayRecord) error {
 			handler(r)
 			return nil
 		})
 	})
-	ctx.NoError(err, "replay(%q, %d) returned an error", replayTopic, from)
+	ctx.NoError(err, "replay(%q, %d) returned an error", kHReplayTopic, from)
 	return n
 }
 
 // perPartition lists the handled records as "offset:value", per partition.
-func perPartition(records []ReplayRecord) map[int][]string {
+func hPerPartition(records []ReplayRecord) map[int][]string {
 	out := map[int][]string{}
 	for _, r := range records {
 		out[r.Partition] = append(out[r.Partition], fmt.Sprintf("%d:%s", r.Offset, r.Value))
@@ -880,16 +880,16 @@ func perPartition(records []ReplayRecord) map[int][]string {
 	return out
 }
 
-func countEvents(ctx *harness.Ctx, kind string) int { return len(ctx.Kafka.EventsOf(kind)) }
+func hCountEvents(ctx *harness.Ctx, kind string) int { return len(ctx.Kafka.EventsOf(kind)) }
 
 func CheckReplaysInOrder(ctx *harness.Ctx) {
-	seedAt(ctx, 0, "a0", "a1", "a2")
-	seedAt(ctx, 1, "b0")
-	seedAt(ctx, 2, "c0", "c1")
+	hSeedAt(ctx, 0, "a0", "a1", "a2")
+	hSeedAt(ctx, 1, "b0")
+	hSeedAt(ctx, 2, "c0", "c1")
 	var seen []ReplayRecord
-	count := replayed(ctx, 0, func(r ReplayRecord) { seen = append(seen, r) })
+	count := hReplayed(ctx, 0, func(r ReplayRecord) { seen = append(seen, r) })
 	ctx.Equal(count, 6, "replay's return value (the number of records handled)")
-	got := perPartition(seen)
+	got := hPerPartition(seen)
 	ctx.Equal(got[0], []string{"0:a0", "1:a1", "2:a2"}, "partition 0 must be handled at offsets 0..2 in order")
 	ctx.Equal(got[1], []string{"0:b0"}, "partition 1")
 	ctx.Equal(got[2], []string{"0:c0", "1:c1"}, "partition 2 must be handled at offsets 0..1 in order")
@@ -899,20 +899,20 @@ func CheckReplaysInOrder(ctx *harness.Ctx) {
 }
 
 func CheckSnapshotEnd(ctx *harness.Ctx) {
-	seedAt(ctx, 0, "a0", "a1")
-	seedAt(ctx, 1, "b0")
-	seedAt(ctx, 2, "c0", "c1", "c2")
+	hSeedAt(ctx, 0, "a0", "a1")
+	hSeedAt(ctx, 1, "b0")
+	hSeedAt(ctx, 2, "c0", "c1", "c2")
 	var seen []ReplayRecord
-	count := replayed(ctx, 0, func(r ReplayRecord) {
+	count := hReplayed(ctx, 0, func(r ReplayRecord) {
 		if len(seen) == 0 {
 			// Producers keep writing while the replay runs: one more record on every partition.
-			seedAt(ctx, 0, "a-late")
-			seedAt(ctx, 1, "b-late")
-			seedAt(ctx, 2, "c-late")
+			hSeedAt(ctx, 0, "a-late")
+			hSeedAt(ctx, 1, "b-late")
+			hSeedAt(ctx, 2, "c-late")
 		}
 		seen = append(seen, r)
 	})
-	ctx.Equal(ctx.Kafka.EndOffset(replayTopic, 0), 3, "the harness appended a record to partition 0 mid-replay: its end offset")
+	ctx.Equal(ctx.Kafka.EndOffset(kHReplayTopic, 0), 3, "the harness appended a record to partition 0 mid-replay: its end offset")
 	var late []string
 	for _, r := range seen {
 		if strings.HasSuffix(string(r.Value), "-late") {
@@ -925,26 +925,26 @@ func CheckSnapshotEnd(ctx *harness.Ctx) {
 }
 
 func CheckNoCommits(ctx *harness.Ctx) {
-	seedAt(ctx, 0, "a0", "a1", "a2")
-	seedAt(ctx, 1, "b0", "b1")
-	seedAt(ctx, 2, "c0")
+	hSeedAt(ctx, 0, "a0", "a1", "a2")
+	hSeedAt(ctx, 1, "b0", "b1")
+	hSeedAt(ctx, 2, "c0")
 	// The live group is half-way through the topic.
 	live := map[int]int64{0: 1, 1: 2, 2: 0}
 	offsets := harness.KafkaOffsets{}
 	for p, o := range live {
-		offsets[harness.KafkaTopicPartition{Topic: replayTopic, Partition: p}] = o
+		offsets[harness.KafkaTopicPartition{Topic: kHReplayTopic, Partition: p}] = o
 	}
-	ctx.Kafka.Commit(liveGroup, offsets)
+	ctx.Kafka.Commit(kHLiveGroup, offsets)
 	var seen []ReplayRecord
-	count := replayed(ctx, 0, func(r ReplayRecord) { seen = append(seen, r) })
+	count := hReplayed(ctx, 0, func(r ReplayRecord) { seen = append(seen, r) })
 	ctx.Clock.Advance(30)
 	ctx.Equal(count, 6, "replay's return value")
 	for p := range 3 {
-		ctx.Equal(ctx.Kafka.CommittedOffset(liveGroup, replayTopic, p), live[p], "group orders' committed offset for partition %d must not move: the replay must not touch the live group", p)
+		ctx.Equal(ctx.Kafka.CommittedOffset(kHLiveGroup, kHReplayTopic, p), live[p], "group orders' committed offset for partition %d must not move: the replay must not touch the live group", p)
 	}
 	ctx.Equal(len(ctx.Kafka.Commits("replay-tool")), 0, "commits by group replay-tool (a replay tool never commits)")
 	ctx.Equal(len(ctx.Kafka.Commits(""))-1, 0, "commits made during the replay")
-	ctx.Equal(countEvents(ctx, "auto-commit"), 0, "auto-commits (the replay consumer must not commit on a timer)")
+	ctx.Equal(hCountEvents(ctx, "auto-commit"), 0, "auto-commits (the replay consumer must not commit on a timer)")
 	// The step's Go readers are partition readers without a GroupID (nothing to commit), where the
 	// other languages use group replay-tool: no consumer may join any group.
 	groups := map[string]bool{}
@@ -955,34 +955,34 @@ func CheckNoCommits(ctx *harness.Ctx) {
 }
 
 func CheckFromOffset(ctx *harness.Ctx) {
-	seedAt(ctx, 0, "a0", "a1", "a2", "a3")
-	seedAt(ctx, 1, "b0")
-	seedAt(ctx, 2, "c0", "c1", "c2")
+	hSeedAt(ctx, 0, "a0", "a1", "a2", "a3")
+	hSeedAt(ctx, 1, "b0")
+	hSeedAt(ctx, 2, "c0", "c1", "c2")
 	var seen []ReplayRecord
-	count := replayed(ctx, 2, func(r ReplayRecord) { seen = append(seen, r) })
-	got := perPartition(seen)
+	count := hReplayed(ctx, 2, func(r ReplayRecord) { seen = append(seen, r) })
+	got := hPerPartition(seen)
 	ctx.Equal(got[0], []string{"2:a2", "3:a3"}, "partition 0 must be handled at offsets 2 and 3 only")
 	ctx.Equal(got[1], []string(nil), "partition 1 has one record (offset 0) and must contribute nothing from offset 2")
 	ctx.Equal(got[2], []string{"2:c2"}, "partition 2 must be handled at offset 2 only")
 	ctx.Equal(count, 3, "replay's return value")
 	var beyond []ReplayRecord
-	none := replayed(ctx, 10, func(r ReplayRecord) { beyond = append(beyond, r) })
+	none := hReplayed(ctx, 10, func(r ReplayRecord) { beyond = append(beyond, r) })
 	ctx.Assert(none == 0 && len(beyond) == 0, "replay from beyond every end handled %d record(s) and returned %d; expected 0", len(beyond), none)
 }
 
 func CheckIndependent(ctx *harness.Ctx) {
-	seedAt(ctx, 0, "a0", "a1")
-	seedAt(ctx, 1, "b0")
+	hSeedAt(ctx, 0, "a0", "a1")
+	hSeedAt(ctx, 1, "b0")
 	var first []ReplayRecord
-	ctx.Equal(replayed(ctx, 1, func(r ReplayRecord) { first = append(first, r) }), 1, "the first replay from offset 1 should handle exactly a1")
-	ctx.Equal(perPartition(first), map[int][]string{0: {"1:a1"}}, "records handled by the first replay")
-	firstReaders := countEvents(ctx, "consumer")
-	seedAt(ctx, 0, "a2")
-	seedAt(ctx, 2, "c0")
+	ctx.Equal(hReplayed(ctx, 1, func(r ReplayRecord) { first = append(first, r) }), 1, "the first replay from offset 1 should handle exactly a1")
+	ctx.Equal(hPerPartition(first), map[int][]string{0: {"1:a1"}}, "records handled by the first replay")
+	firstReaders := hCountEvents(ctx, "consumer")
+	hSeedAt(ctx, 0, "a2")
+	hSeedAt(ctx, 2, "c0")
 	var second []ReplayRecord
-	count := replayed(ctx, 0, func(r ReplayRecord) { second = append(second, r) })
+	count := hReplayed(ctx, 0, func(r ReplayRecord) { second = append(second, r) })
 	ctx.Equal(count, 5, "the second replay from 0 starts over and sees the records appended since the first")
-	got := perPartition(second)
+	got := hPerPartition(second)
 	ctx.Equal(got[0], []string{"0:a0", "1:a1", "2:a2"}, "partition 0 in the second replay")
 	ctx.Equal(got[2], []string{"0:c0"}, "partition 2 in the second replay")
 	ctx.Equal(len(ctx.Kafka.Commits("")), 0, "neither replay may commit: commits")
@@ -991,8 +991,8 @@ func CheckIndependent(ctx *harness.Ctx) {
 	for _, e := range ctx.Kafka.EventsOf("close") {
 		ctx.Equal(e.Group, "", "a closed consumer's group (partition readers join none)")
 	}
-	ctx.Assert(firstReaders > 0 && countEvents(ctx, "consumer") > firstReaders, "each replay creates its own readers")
-	ctx.Equal(countEvents(ctx, "close"), countEvents(ctx, "consumer"), "each replay closes the readers it created: closes")
+	ctx.Assert(firstReaders > 0 && hCountEvents(ctx, "consumer") > firstReaders, "each replay creates its own readers")
+	ctx.Equal(hCountEvents(ctx, "close"), hCountEvents(ctx, "consumer"), "each replay closes the readers it created: closes")
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1005,44 +1005,44 @@ func CheckIndependent(ctx *harness.Ctx) {
 
 namespace {
 
-const std::string replayTopic = "order-events";
-const std::string liveGroup = "orders";
+const std::string kHReplayTopic = "order-events";
+const std::string kHLiveGroup = "orders";
 
 // seedAt appends keyless records to one partition of the topic.
-void seedAt(harness::Ctx& ctx, int partition, const std::vector<std::string>& values) {
-  for (const auto& v : values) ctx.Kafka.SeedPartition(replayTopic, partition, nullptr, v);
+void hSeedAt(harness::Ctx& ctx, int partition, const std::vector<std::string>& values) {
+  for (const auto& v : values) ctx.Kafka.SeedPartition(kHReplayTopic, partition, nullptr, v);
 }
 
 // replayed runs replay until it returns (or waits for records that will not come); a throw fails the check.
-int replayed(harness::Ctx& ctx, int64_t from, const std::function<void(const ReplayRecord&)>& handler) {
+int hReplayed(harness::Ctx& ctx, int64_t from, const std::function<void(const ReplayRecord&)>& handler) {
   int n = 0;
   try {
-    ctx.Drain([&] { n = replay(replayTopic, from, handler); });
+    ctx.Drain([&] { n = replay(kHReplayTopic, from, handler); });
   } catch (const std::exception& e) {
-    ctx.Fatalf("replay(%q, %d) threw: %v", replayTopic, from, e.what());
+    ctx.Fatalf("replay(%q, %d) threw: %v", kHReplayTopic, from, e.what());
   }
   return n;
 }
 
 // perPartition lists the handled records as "offset:value", per partition.
-std::map<int, std::vector<std::string>> perPartition(const std::vector<ReplayRecord>& records) {
+std::map<int, std::vector<std::string>> hPerPartition(const std::vector<ReplayRecord>& records) {
   std::map<int, std::vector<std::string>> out;
   for (const auto& r : records) out[r.partition].push_back(std::to_string(r.offset) + ":" + r.value);
   return out;
 }
 
-size_t countEvents(harness::Ctx& ctx, const std::string& kind) { return ctx.Kafka.EventsOf(kind).size(); }
+size_t hCountEvents(harness::Ctx& ctx, const std::string& kind) { return ctx.Kafka.EventsOf(kind).size(); }
 
 }  // namespace
 
 void CheckReplaysInOrder(harness::Ctx& ctx) {
-  seedAt(ctx, 0, {"a0", "a1", "a2"});
-  seedAt(ctx, 1, {"b0"});
-  seedAt(ctx, 2, {"c0", "c1"});
+  hSeedAt(ctx, 0, {"a0", "a1", "a2"});
+  hSeedAt(ctx, 1, {"b0"});
+  hSeedAt(ctx, 2, {"c0", "c1"});
   std::vector<ReplayRecord> seen;
-  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) { seen.push_back(r); });
+  const int count = hReplayed(ctx, 0, [&](const ReplayRecord& r) { seen.push_back(r); });
   ctx.Equal(count, 6, "replay's return value (the number of records handled)");
-  auto got = perPartition(seen);
+  auto got = hPerPartition(seen);
   ctx.Equal(got[0], {"0:a0", "1:a1", "2:a2"}, "partition 0 must be handled at offsets 0..2 in order");
   ctx.Equal(got[1], {"0:b0"}, "partition 1");
   ctx.Equal(got[2], {"0:c0", "1:c1"}, "partition 2 must be handled at offsets 0..1 in order");
@@ -1051,20 +1051,20 @@ void CheckReplaysInOrder(harness::Ctx& ctx) {
 }
 
 void CheckSnapshotEnd(harness::Ctx& ctx) {
-  seedAt(ctx, 0, {"a0", "a1"});
-  seedAt(ctx, 1, {"b0"});
-  seedAt(ctx, 2, {"c0", "c1", "c2"});
+  hSeedAt(ctx, 0, {"a0", "a1"});
+  hSeedAt(ctx, 1, {"b0"});
+  hSeedAt(ctx, 2, {"c0", "c1", "c2"});
   std::vector<ReplayRecord> seen;
-  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) {
+  const int count = hReplayed(ctx, 0, [&](const ReplayRecord& r) {
     if (seen.empty()) {
       // Producers keep writing while the replay runs: one more record on every partition.
-      seedAt(ctx, 0, {"a-late"});
-      seedAt(ctx, 1, {"b-late"});
-      seedAt(ctx, 2, {"c-late"});
+      hSeedAt(ctx, 0, {"a-late"});
+      hSeedAt(ctx, 1, {"b-late"});
+      hSeedAt(ctx, 2, {"c-late"});
     }
     seen.push_back(r);
   });
-  ctx.Equal(ctx.Kafka.EndOffset(replayTopic, 0), 3, "the harness appended a record to partition 0 mid-replay: its end offset");
+  ctx.Equal(ctx.Kafka.EndOffset(kHReplayTopic, 0), 3, "the harness appended a record to partition 0 mid-replay: its end offset");
   std::vector<std::string> late;
   for (const auto& r : seen)
     if (r.value.size() >= 5 && r.value.compare(r.value.size() - 5, 5, "-late") == 0) late.push_back(r.value);
@@ -1075,24 +1075,24 @@ void CheckSnapshotEnd(harness::Ctx& ctx) {
 }
 
 void CheckNoCommits(harness::Ctx& ctx) {
-  seedAt(ctx, 0, {"a0", "a1", "a2"});
-  seedAt(ctx, 1, {"b0", "b1"});
-  seedAt(ctx, 2, {"c0"});
+  hSeedAt(ctx, 0, {"a0", "a1", "a2"});
+  hSeedAt(ctx, 1, {"b0", "b1"});
+  hSeedAt(ctx, 2, {"c0"});
   // The live group is half-way through the topic.
   const std::map<int, int64_t> live = {{0, 1}, {1, 2}, {2, 0}};
   harness::KafkaOffsets offsets;
-  for (const auto& [p, o] : live) offsets[{replayTopic, p}] = o;
-  ctx.Kafka.Commit(liveGroup, offsets);
+  for (const auto& [p, o] : live) offsets[{kHReplayTopic, p}] = o;
+  ctx.Kafka.Commit(kHLiveGroup, offsets);
   std::vector<ReplayRecord> seen;
-  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) { seen.push_back(r); });
+  const int count = hReplayed(ctx, 0, [&](const ReplayRecord& r) { seen.push_back(r); });
   ctx.Clock.Advance(30);
   ctx.Equal(count, 6, "replay's return value");
   for (int p = 0; p < 3; p++)
-    ctx.Equal(ctx.Kafka.CommittedOffset(liveGroup, replayTopic, p), live.at(p),
+    ctx.Equal(ctx.Kafka.CommittedOffset(kHLiveGroup, kHReplayTopic, p), live.at(p),
               "group orders' committed offset for partition %d must not move: the replay must not touch the live group", p);
   ctx.Equal(ctx.Kafka.Commits("replay-tool").size(), 0, "commits by group replay-tool (a replay tool never commits)");
   ctx.Equal(ctx.Kafka.Commits("").size() - 1, 0, "commits made during the replay");
-  ctx.Equal(countEvents(ctx, "auto-commit"), 0, "auto-commits (the replay consumer must not commit on a timer)");
+  ctx.Equal(hCountEvents(ctx, "auto-commit"), 0, "auto-commits (the replay consumer must not commit on a timer)");
   // A replay assigns the partitions it reads: no consumer may join a group (subscribe), which
   // would take partitions from the live consumers of that group.
   std::vector<std::string> groups;
@@ -1101,42 +1101,42 @@ void CheckNoCommits(harness::Ctx& ctx) {
 }
 
 void CheckFromOffset(harness::Ctx& ctx) {
-  seedAt(ctx, 0, {"a0", "a1", "a2", "a3"});
-  seedAt(ctx, 1, {"b0"});
-  seedAt(ctx, 2, {"c0", "c1", "c2"});
+  hSeedAt(ctx, 0, {"a0", "a1", "a2", "a3"});
+  hSeedAt(ctx, 1, {"b0"});
+  hSeedAt(ctx, 2, {"c0", "c1", "c2"});
   std::vector<ReplayRecord> seen;
-  const int count = replayed(ctx, 2, [&](const ReplayRecord& r) { seen.push_back(r); });
-  auto got = perPartition(seen);
+  const int count = hReplayed(ctx, 2, [&](const ReplayRecord& r) { seen.push_back(r); });
+  auto got = hPerPartition(seen);
   ctx.Equal(got[0], {"2:a2", "3:a3"}, "partition 0 must be handled at offsets 2 and 3 only");
   ctx.Equal(got[1], std::vector<std::string>{}, "partition 1 has one record (offset 0) and must contribute nothing from offset 2");
   ctx.Equal(got[2], {"2:c2"}, "partition 2 must be handled at offset 2 only");
   ctx.Equal(count, 3, "replay's return value");
   std::vector<ReplayRecord> beyond;
-  const int none = replayed(ctx, 10, [&](const ReplayRecord& r) { beyond.push_back(r); });
+  const int none = hReplayed(ctx, 10, [&](const ReplayRecord& r) { beyond.push_back(r); });
   ctx.Assert(none == 0 && beyond.empty(), "replay from beyond every end handled %d record(s) and returned %d; expected 0",
              beyond.size(), none);
 }
 
 void CheckIndependent(harness::Ctx& ctx) {
-  seedAt(ctx, 0, {"a0", "a1"});
-  seedAt(ctx, 1, {"b0"});
+  hSeedAt(ctx, 0, {"a0", "a1"});
+  hSeedAt(ctx, 1, {"b0"});
   std::vector<ReplayRecord> first;
-  ctx.Equal(replayed(ctx, 1, [&](const ReplayRecord& r) { first.push_back(r); }), 1,
+  ctx.Equal(hReplayed(ctx, 1, [&](const ReplayRecord& r) { first.push_back(r); }), 1,
             "the first replay from offset 1 should handle exactly a1");
-  ctx.Equal(perPartition(first), std::map<int, std::vector<std::string>>{{0, {"1:a1"}}}, "records handled by the first replay");
-  const size_t firstReaders = countEvents(ctx, "consumer");
-  seedAt(ctx, 0, {"a2"});
-  seedAt(ctx, 2, {"c0"});
+  ctx.Equal(hPerPartition(first), std::map<int, std::vector<std::string>>{{0, {"1:a1"}}}, "records handled by the first replay");
+  const size_t firstReaders = hCountEvents(ctx, "consumer");
+  hSeedAt(ctx, 0, {"a2"});
+  hSeedAt(ctx, 2, {"c0"});
   std::vector<ReplayRecord> second;
-  const int count = replayed(ctx, 0, [&](const ReplayRecord& r) { second.push_back(r); });
+  const int count = hReplayed(ctx, 0, [&](const ReplayRecord& r) { second.push_back(r); });
   ctx.Equal(count, 5, "the second replay from 0 starts over and sees the records appended since the first");
-  auto got = perPartition(second);
+  auto got = hPerPartition(second);
   ctx.Equal(got[0], {"0:a0", "1:a1", "2:a2"}, "partition 0 in the second replay");
   ctx.Equal(got[2], {"0:c0"}, "partition 2 in the second replay");
   ctx.Equal(ctx.Kafka.Commits("").size(), 0, "neither replay may commit: commits");
   // Each replay creates its own consumer, and closes it.
-  ctx.Assert(firstReaders > 0 && countEvents(ctx, "consumer") > firstReaders, "each replay creates its own consumer");
-  ctx.Equal(countEvents(ctx, "close"), countEvents(ctx, "consumer"), "each replay closes the consumer it created: closes");
+  ctx.Assert(firstReaders > 0 && hCountEvents(ctx, "consumer") > firstReaders, "each replay creates its own consumer");
+  ctx.Equal(hCountEvents(ctx, "close"), hCountEvents(ctx, "consumer"), "each replay closes the consumer it created: closes");
 }
 `,
   },

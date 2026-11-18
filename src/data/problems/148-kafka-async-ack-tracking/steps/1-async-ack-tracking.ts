@@ -1526,7 +1526,7 @@ import (
 
 // ackGates is the harness's handler: every record waits on its own gate, so the harness decides the
 // completion order. Each handler runs on its own goroutine, so records start in any order.
-type ackGates struct {
+type HAckGates struct {
 	mu        sync.Mutex
 	gates     map[string]chan struct{}
 	opened    map[string]bool
@@ -1534,11 +1534,11 @@ type ackGates struct {
 	completed []string
 }
 
-func newAckGates() *ackGates {
-	return &ackGates{gates: map[string]chan struct{}{}, opened: map[string]bool{}}
+func hNewAckGates() *HAckGates {
+	return &HAckGates{gates: map[string]chan struct{}{}, opened: map[string]bool{}}
 }
 
-func (g *ackGates) gate(value string) chan struct{} {
+func (g *HAckGates) gate(value string) chan struct{} {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.gates[value] == nil {
@@ -1547,7 +1547,7 @@ func (g *ackGates) gate(value string) chan struct{} {
 	return g.gates[value]
 }
 
-func (g *ackGates) handler(value string) error {
+func (g *HAckGates) handler(value string) error {
 	g.mu.Lock()
 	g.started = append(g.started, value)
 	g.mu.Unlock()
@@ -1558,7 +1558,7 @@ func (g *ackGates) handler(value string) error {
 	return nil
 }
 
-func (g *ackGates) open(values ...string) {
+func (g *HAckGates) open(values ...string) {
 	for _, value := range values {
 		gate := g.gate(value)
 		g.mu.Lock()
@@ -1571,7 +1571,7 @@ func (g *ackGates) open(values ...string) {
 }
 
 // snapshot is what started and completed so far, each sorted.
-func (g *ackGates) snapshot() (started, completed []string) {
+func (g *HAckGates) snapshot() (started, completed []string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	started = append([]string{}, g.started...)
@@ -1581,13 +1581,13 @@ func (g *ackGates) snapshot() (started, completed []string) {
 	return started, completed
 }
 
-func (g *ackGates) running() int {
+func (g *HAckGates) running() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return len(g.started) - len(g.completed)
 }
 
-func seedRequests(ctx *harness.Ctx, n, partition int, prefix string) []string {
+func hSeedRequests(ctx *harness.Ctx, n, partition int, prefix string) []string {
 	var values []string
 	for i := range n {
 		value := fmt.Sprintf("%s%d", prefix, i)
@@ -1597,14 +1597,14 @@ func seedRequests(ctx *harness.Ctx, n, partition int, prefix string) []string {
 	return values
 }
 
-func sortedCopy(values []string) []string {
+func hSortedCopy(values []string) []string {
 	out := append([]string{}, values...)
 	sort.Strings(out)
 	return out
 }
 
 // startConsumer runs the learner's loop and lets it settle with the clock held; the channel closes when run returns.
-func startConsumer(ctx *harness.Ctx, g *ackGates) chan struct{} {
+func hStartConsumer(ctx *harness.Ctx, g *HAckGates) chan struct{} {
 	runDone := make(chan struct{})
 	go func() {
 		defer close(runDone)
@@ -1614,7 +1614,7 @@ func startConsumer(ctx *harness.Ctx, g *ackGates) chan struct{} {
 	return runDone
 }
 
-func stopConsumer(ctx *harness.Ctx, runDone chan struct{}) {
+func hStopConsumer(ctx *harness.Ctx, runDone chan struct{}) {
 	ctx.Drain(func() { shutdown() })
 	ctx.Tick()
 	ctx.Drain(func() { <-runDone })
@@ -1622,30 +1622,30 @@ func stopConsumer(ctx *harness.Ctx, runDone chan struct{}) {
 }
 
 func CheckConcurrency(ctx *harness.Ctx) {
-	values := seedRequests(ctx, 20, 0, "r")
-	g := newAckGates()
-	runDone := startConsumer(ctx, g)
+	values := hSeedRequests(ctx, 20, 0, "r")
+	g := hNewAckGates()
+	runDone := hStartConsumer(ctx, g)
 	started, _ := g.snapshot()
-	ctx.Equal(started, sortedCopy(values[:8]), "with every handler still running exactly concurrency = 8 records may be started")
+	ctx.Equal(started, hSortedCopy(values[:8]), "with every handler still running exactly concurrency = 8 records may be started")
 	running, _ := stats()
 	ctx.Equal(running, 8, "stats() must count 8 in flight while 8 handlers run")
 	g.open("r0")
 	ctx.Tick()
 	started, _ = g.snapshot()
-	ctx.Equal(started, sortedCopy(values[:9]), "one completion frees exactly one slot: the 9th record starts, no more")
+	ctx.Equal(started, hSortedCopy(values[:9]), "one completion frees exactly one slot: the 9th record starts, no more")
 	ctx.Equal(g.running(), 8, "handlers running after one finished and one started")
 	g.open(values...)
 	ctx.Tick()
 	_, completed := g.snapshot()
 	ctx.Assert(g.running() == 0 && len(completed) == 20, "every record must be handled once the gates open: %d of 20 completed, %d running", len(completed), g.running())
-	stopConsumer(ctx, runDone)
+	hStopConsumer(ctx, runDone)
 	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 20, "with everything finished the committed offset")
 	ctx.Assert(len(ctx.Kafka.EventsOf("auto-commit")) == 0, "auto-commit is on: offsets were committed on a timer, not by the tracker")
 }
 
 func CheckFrontier(ctx *harness.Ctx) {
-	values := seedRequests(ctx, 12, 0, "r")
-	g := newAckGates()
+	values := hSeedRequests(ctx, 12, 0, "r")
+	g := hNewAckGates()
 	lowestUnfinished := func() int64 {
 		_, completed := g.snapshot()
 		done := map[string]bool{}
@@ -1666,7 +1666,7 @@ func CheckFrontier(ctx *harness.Ctx) {
 			violations = append(violations, [2]int64{offset, lowest})
 		}
 	})
-	runDone := startConsumer(ctx, g)
+	runDone := hStartConsumer(ctx, g)
 	for _, value := range []string{"r3", "r1", "r0", "r6", "r5", "r2", "r4", "r9", "r7", "r11", "r8", "r10"} {
 		g.open(value)
 		ctx.Tick()
@@ -1677,16 +1677,16 @@ func CheckFrontier(ctx *harness.Ctx) {
 		ctx.Assert(max(committedNow, 0) <= lowestUnfinished(), "committed %d but offset %d is still running", committedNow, lowestUnfinished())
 	}
 	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 12, "once every record has finished the committed offset must reach 12")
-	stopConsumer(ctx, runDone)
+	hStopConsumer(ctx, runDone)
 	_, completed := g.snapshot()
-	ctx.Equal(completed, sortedCopy(values), "each record must be handled exactly once")
+	ctx.Equal(completed, hSortedCopy(values), "each record must be handled exactly once")
 }
 
 func CheckGap(ctx *harness.Ctx) {
-	seedRequests(ctx, 5, 0, "a")
-	seedRequests(ctx, 3, 1, "b")
-	g := newAckGates()
-	runDone := startConsumer(ctx, g)
+	hSeedRequests(ctx, 5, 0, "a")
+	hSeedRequests(ctx, 3, 1, "b")
+	g := hNewAckGates()
+	runDone := hStartConsumer(ctx, g)
 	g.open("a1", "a2", "a3", "a4", "b0", "b1", "b2")
 	ctx.Tick()
 	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 1), 3, "partition 1 is fully done: it must be committed to 3 while partition 0 waits")
@@ -1706,13 +1706,13 @@ func CheckGap(ctx *harness.Ctx) {
 	ctx.Equal(onP0, []int64{5}, "partition 0 must be committed exactly once, straight to 5 — never 1, 2, 3 or 4 while a0 ran: its commits")
 	_, committedNow := stats()
 	ctx.Equal(committedNow, map[int32]int64{0: 5, 1: 3}, "stats() committed")
-	stopConsumer(ctx, runDone)
+	hStopConsumer(ctx, runDone)
 }
 
 func CheckShutdown(ctx *harness.Ctx) {
-	seedRequests(ctx, 6, 0, "r")
-	g := newAckGates()
-	runDone := startConsumer(ctx, g)
+	hSeedRequests(ctx, 6, 0, "r")
+	g := hNewAckGates()
+	runDone := hStartConsumer(ctx, g)
 	g.open("r0", "r1", "r3", "r4", "r5")
 	ctx.Tick()
 	ctx.Equal(ctx.Kafka.CommittedOffset(group, "requests", 0), 2, "r2 still runs: the frontier")
@@ -1747,15 +1747,15 @@ func CheckComplete(ctx *harness.Ctx) {
 		values = append(values, value)
 		ctx.Kafka.Seed("requests", value, value)
 	}
-	g := newAckGates()
-	runDone := startConsumer(ctx, g)
+	g := hNewAckGates()
+	runDone := hStartConsumer(ctx, g)
 	for i := len(values) - 1; i >= 0; i-- {
 		g.open(values[i])
 	}
 	ctx.Tick()
 	started, completed := g.snapshot()
-	ctx.Equal(started, sortedCopy(values), "each record must reach the handler exactly once")
-	ctx.Equal(completed, sortedCopy(values), "each record must finish exactly once")
+	ctx.Equal(started, hSortedCopy(values), "each record must reach the handler exactly once")
+	ctx.Equal(completed, hSortedCopy(values), "each record must finish exactly once")
 	ends := map[int32]int64{}
 	for p := range 3 {
 		if end := ctx.Kafka.EndOffset("requests", p); end > 0 {
@@ -1769,7 +1769,7 @@ func CheckComplete(ctx *harness.Ctx) {
 	running, committedNow := stats()
 	ctx.Equal(committedNow, ends, "stats() committed")
 	ctx.Equal(running, 0, "stats() in flight")
-	stopConsumer(ctx, runDone)
+	hStopConsumer(ctx, runDone)
 }
 `,
     cpp: `#include <leetbuild/harness.h>
@@ -1790,7 +1790,7 @@ namespace {
 
 // ackGates is the harness's handler: every record waits on its own gate, so the harness decides the
 // completion order. Each handler runs on its own thread, so records start in any order.
-struct ackGates {
+struct HAckGates {
   std::mutex mu;
   std::condition_variable cv;
   std::set<std::string> opened;
@@ -1826,7 +1826,7 @@ struct ackGates {
   }
 };
 
-std::vector<std::string> seedRequests(harness::Ctx& ctx, int n, int partition, const std::string& prefix) {
+std::vector<std::string> hSeedRequests(harness::Ctx& ctx, int n, int partition, const std::string& prefix) {
   std::vector<std::string> values;
   for (int i = 0; i < n; i++) {
     const std::string value = prefix + std::to_string(i);
@@ -1836,35 +1836,35 @@ std::vector<std::string> seedRequests(harness::Ctx& ctx, int n, int partition, c
   return values;
 }
 
-std::vector<std::string> sortedCopy(std::vector<std::string> values) {
+std::vector<std::string> hSortedCopy(std::vector<std::string> values) {
   std::sort(values.begin(), values.end());
   return values;
 }
 
 // A thread still running when the check ends (a failed assertion) is left behind, not joined.
-struct detachOnExit {
+struct HDetachOnExit {
   std::thread& thread;
-  ~detachOnExit() {
+  ~HDetachOnExit() {
     if (thread.joinable()) thread.detach();
   }
 };
 
 // The learner's loop on a thread of its own, started and settled with the clock held.
-struct consumerRun {
+struct HConsumerRun {
   std::thread thread;
-  ~consumerRun() {
+  ~HConsumerRun() {
     if (thread.joinable()) thread.detach();
   }
 };
 
-std::unique_ptr<consumerRun> startConsumer(harness::Ctx& ctx, ackGates& g) {
-  auto r = std::make_unique<consumerRun>();
+std::unique_ptr<HConsumerRun> hStartConsumer(harness::Ctx& ctx, HAckGates& g) {
+  auto r = std::make_unique<HConsumerRun>();
   r->thread = std::thread([&g] { run([&g](const std::string& value) { g.handler(value); }); });
   ctx.Tick();
   return r;
 }
 
-void stopConsumer(harness::Ctx& ctx, consumerRun& r) {
+void hStopConsumer(harness::Ctx& ctx, HConsumerRun& r) {
   ctx.Drain([] { shutdown(); });
   ctx.Tick();
   if (!ctx.Drain([&r] { r.thread.join(); })) r.thread.detach();
@@ -1873,7 +1873,7 @@ void stopConsumer(harness::Ctx& ctx, consumerRun& r) {
 
 // After gates open: every thread runs with the clock held, then the poll loop comes round — its
 // consume(100) times out, it applies the completions and commits — and runs again.
-void passAcks(harness::Ctx& ctx) {
+void hPassAcks(harness::Ctx& ctx) {
   ctx.Tick();
   ctx.Clock.Advance(0.2);
   ctx.Tick();
@@ -1882,30 +1882,30 @@ void passAcks(harness::Ctx& ctx) {
 }  // namespace
 
 void CheckConcurrency(harness::Ctx& ctx) {
-  const auto values = seedRequests(ctx, 20, 0, "r");
-  ackGates g;
-  auto runDone = startConsumer(ctx, g);
-  ctx.Equal(g.snapshot().first, sortedCopy({values.begin(), values.begin() + 8}),
+  const auto values = hSeedRequests(ctx, 20, 0, "r");
+  HAckGates g;
+  auto runDone = hStartConsumer(ctx, g);
+  ctx.Equal(g.snapshot().first, hSortedCopy({values.begin(), values.begin() + 8}),
             "with every handler still running exactly concurrency = 8 records may be started");
   ctx.Equal(stats().in_flight, 8, "stats() must count 8 in flight while 8 handlers run");
   g.open({"r0"});
-  passAcks(ctx);
-  ctx.Equal(g.snapshot().first, sortedCopy({values.begin(), values.begin() + 9}),
+  hPassAcks(ctx);
+  ctx.Equal(g.snapshot().first, hSortedCopy({values.begin(), values.begin() + 9}),
             "one completion frees exactly one slot: the 9th record starts, no more");
   ctx.Equal(g.running(), 8, "handlers running after one finished and one started");
   g.open(values);
-  passAcks(ctx);
+  hPassAcks(ctx);
   const auto completed = g.snapshot().second;
   ctx.Assert(g.running() == 0 && completed.size() == 20,
              "every record must be handled once the gates open: %d of 20 completed, %d running", completed.size(), g.running());
-  stopConsumer(ctx, *runDone);
+  hStopConsumer(ctx, *runDone);
   ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 20, "with everything finished the committed offset");
   ctx.Assert(ctx.Kafka.EventsOf("auto-commit").empty(), "auto-commit is on: offsets were committed on a timer, not by the tracker");
 }
 
 void CheckFrontier(harness::Ctx& ctx) {
-  const auto values = seedRequests(ctx, 12, 0, "r");
-  ackGates g;
+  const auto values = hSeedRequests(ctx, 12, 0, "r");
+  HAckGates g;
   const auto lowestUnfinished = [&g]() -> int64_t {
     const auto completed = g.snapshot().second;
     const std::set<std::string> done(completed.begin(), completed.end());
@@ -1919,10 +1919,10 @@ void CheckFrontier(harness::Ctx& ctx) {
     const int64_t lowest = lowestUnfinished();
     if (it != offsets.end() && it->second > lowest) violations.emplace_back(it->second, lowest);
   });
-  auto runDone = startConsumer(ctx, g);
+  auto runDone = hStartConsumer(ctx, g);
   for (const std::string value : {"r3", "r1", "r0", "r6", "r5", "r2", "r4", "r9", "r7", "r11", "r8", "r10"}) {
     g.open({value});
-    passAcks(ctx);
+    hPassAcks(ctx);
     if (!violations.empty())
       ctx.Fatalf("offset %d was committed while offset %d was still running: the commit passed an unfinished record",
                  violations[0].first, violations[0].second);
@@ -1931,23 +1931,23 @@ void CheckFrontier(harness::Ctx& ctx) {
                lowestUnfinished());
   }
   ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 12, "once every record has finished the committed offset must reach 12");
-  stopConsumer(ctx, *runDone);
-  ctx.Equal(g.snapshot().second, sortedCopy(values), "each record must be handled exactly once");
+  hStopConsumer(ctx, *runDone);
+  ctx.Equal(g.snapshot().second, hSortedCopy(values), "each record must be handled exactly once");
 }
 
 void CheckGap(harness::Ctx& ctx) {
-  seedRequests(ctx, 5, 0, "a");
-  seedRequests(ctx, 3, 1, "b");
-  ackGates g;
-  auto runDone = startConsumer(ctx, g);
+  hSeedRequests(ctx, 5, 0, "a");
+  hSeedRequests(ctx, 3, 1, "b");
+  HAckGates g;
+  auto runDone = hStartConsumer(ctx, g);
   g.open({"a1", "a2", "a3", "a4", "b0", "b1", "b2"});
-  passAcks(ctx);
+  hPassAcks(ctx);
   ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 1), 3, "partition 1 is fully done: it must be committed to 3 while partition 0 waits");
   const int64_t p0 = ctx.Kafka.CommittedOffset(kGroup, "requests", 0);
   ctx.Assert(p0 == -1 || p0 == 0, "a0 is still running: partition 0 must not be committed past 0, got %d", p0);
   ctx.Equal(stats().in_flight, 1, "only a0 should be running: stats() in flight");
   g.open({"a0"});
-  passAcks(ctx);
+  hPassAcks(ctx);
   ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 5, "a1..a4 were already done when a0 finished: partition 0 must jump to 5");
   std::vector<int64_t> onP0;
   for (const auto& commit : ctx.Kafka.Commits(kGroup)) {
@@ -1956,28 +1956,28 @@ void CheckGap(harness::Ctx& ctx) {
   }
   ctx.Equal(onP0, {5}, "partition 0 must be committed exactly once, straight to 5 — never 1, 2, 3 or 4 while a0 ran: its commits");
   ctx.Equal(stats().committed, std::map<int32_t, int64_t>{{0, 5}, {1, 3}}, "stats() committed");
-  stopConsumer(ctx, *runDone);
+  hStopConsumer(ctx, *runDone);
 }
 
 void CheckShutdown(harness::Ctx& ctx) {
-  seedRequests(ctx, 6, 0, "r");
-  ackGates g;
-  auto runDone = startConsumer(ctx, g);
+  hSeedRequests(ctx, 6, 0, "r");
+  HAckGates g;
+  auto runDone = hStartConsumer(ctx, g);
   g.open({"r0", "r1", "r3", "r4", "r5"});
-  passAcks(ctx);
+  hPassAcks(ctx);
   ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 2, "r2 still runs: the frontier");
   bool shutDone = false;
   std::thread shutter([&shutDone] {
     shutdown();
     shutDone = true;
   });
-  detachOnExit shutterGuard{shutter};
+  HDetachOnExit shutterGuard{shutter};
   ctx.Tick();
   if (shutDone) ctx.Fatalf("shutdown() must wait for the handler still running (r2), not return under it");
   ctx.Assert(ctx.Kafka.EventsOf("close").empty(), "the consumer was closed while a handler was still running");
   ctx.Equal(ctx.Kafka.CommittedOffset(kGroup, "requests", 0), 2, "shutdown() must not commit past the frontier while r2 runs");
   g.open({"r2"});
-  passAcks(ctx);
+  hPassAcks(ctx);
   const bool returned = ctx.Drain([&shutter] { shutter.join(); });
   if (!returned) shutter.detach();
   ctx.Assert(returned, "shutdown() must return once the last in-flight handler has finished");
@@ -1994,13 +1994,13 @@ void CheckComplete(harness::Ctx& ctx) {
     values.push_back(value);
     ctx.Kafka.Seed("requests", value, value);
   }
-  ackGates g;
-  auto runDone = startConsumer(ctx, g);
+  HAckGates g;
+  auto runDone = hStartConsumer(ctx, g);
   g.open(std::vector<std::string>(values.rbegin(), values.rend()));
-  passAcks(ctx);
+  hPassAcks(ctx);
   const auto [started, completed] = g.snapshot();
-  ctx.Equal(started, sortedCopy(values), "each record must reach the handler exactly once");
-  ctx.Equal(completed, sortedCopy(values), "each record must finish exactly once");
+  ctx.Equal(started, hSortedCopy(values), "each record must reach the handler exactly once");
+  ctx.Equal(completed, hSortedCopy(values), "each record must finish exactly once");
   std::map<int32_t, int64_t> ends;
   for (int p = 0; p < 3; p++) {
     const int64_t end = ctx.Kafka.EndOffset("requests", p);
@@ -2012,7 +2012,7 @@ void CheckComplete(harness::Ctx& ctx) {
   const Stats s = stats();
   ctx.Equal(s.committed, ends, "stats() committed");
   ctx.Equal(s.in_flight, 0, "stats() in flight");
-  stopConsumer(ctx, *runDone);
+  hStopConsumer(ctx, *runDone);
 }
 `,
   },
