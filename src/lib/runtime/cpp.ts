@@ -539,9 +539,10 @@ class Instance {
     }
   }
 
-  private setReply(value: unknown): number {
-    this.current.reply = encoder.encode(JSON.stringify(value ?? null));
-    return this.current.reply.length;
+  /** `value` as the reply `thread` reads (lb_reply) when it next runs. */
+  private setReply(thread: Thread, value: unknown): number {
+    thread.reply = encoder.encode(JSON.stringify(value ?? null));
+    return thread.reply.length;
   }
 
   /** The world as a bridge module sees it: callbacks into this program, in-flight tracking. */
@@ -675,7 +676,8 @@ class Instance {
         const [op, body] = request(opPtr, opLen, reqPtr, reqLen);
         const handler = calls[op];
         if (handler === undefined) throw new Error(`the C++ runtime has no call ${op}`);
-        const length = this.setReply(handler(body as never));
+        const reply = handler(body as never);
+        const length = this.setReply(this.current, reply);
         // A callback the call ran blocked: the caller waits for it (lb_join) before reading the reply.
         return this.current.awaiting.length > 0 ? -1 - length : length;
       },
@@ -688,8 +690,9 @@ class Instance {
         const reply = await handler(body as never);
         // A callback the call ran that blocked (a probe after a command that answered at once): the reply waits for it.
         await Promise.all(self.awaiting.splice(0));
-        this.current = self;
-        return this.setReply(reply);
+        // Another thread may hold the CPU by now: the reply is this one's, read once it runs again (`current`
+        // stays the running thread's, or that thread would read this one's id and replies as its own).
+        return this.setReply(self, reply);
       }),
       reply: (into: number): void => {
         this.bytes(into, this.current.reply.length).set(this.current.reply);
